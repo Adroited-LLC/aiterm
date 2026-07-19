@@ -10,6 +10,10 @@ export interface SessionDisplayOpts {
 interface Props {
   sessions: Session[];
   activeProject: string | null;
+  /** Slot ids that currently have a live terminal. */
+  liveSlots: Set<string>;
+  /** Slot id of the terminal currently displayed. */
+  activeSlot: string | null;
   opts: SessionDisplayOpts;
   onOptsChange: (o: SessionDisplayOpts) => void;
   onSelect: (s: Session) => void;
@@ -42,7 +46,8 @@ function AgentIcon({ agent }: { agent: string }) {
 }
 
 export default function SessionsPanel({
-  sessions, activeProject, opts, onOptsChange, onSelect, onResume, onNewShell, onRefresh,
+  sessions, activeProject, liveSlots, activeSlot, opts,
+  onOptsChange, onSelect, onResume, onNewShell, onRefresh,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
@@ -88,15 +93,26 @@ export default function SessionsPanel({
         </div>
       </div>
       <div className="sessions-list">
-        {filtered.map((s) => (
+        {filtered.map((s) => {
+          const isLive = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
+          const isShowing = activeSlot !== null &&
+            (activeSlot === s.id || activeSlot === `shell:${s.project_path}`);
+          return (
           <div
             key={s.id}
-            className={"session-item" + (s.project_path === activeProject ? " active" : "")}
+            className={
+              "session-item" +
+              (s.project_path === activeProject ? " active" : "") +
+              (isShowing ? " showing" : "")
+            }
             onClick={() => onSelect(s)}
           >
             <AgentIcon agent={s.agent} />
             <div className="session-text">
-              <div className="session-title">{s.title}</div>
+              <div className="session-title">
+                {isLive && <span className="live-dot" title="Terminal running" />}
+                {s.title}
+              </div>
               {opts.showPath && <div className="session-sub">{homeAbbrev(s.project_path)}</div>}
               <div className="session-meta">
                 {opts.showBranch && s.branch && <span className="branch">⎇ {s.branch}</span>}
@@ -114,7 +130,8 @@ export default function SessionsPanel({
               >＋</button>
             </div>
           </div>
-        ))}
+          );
+        })}
         {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
       </div>
     </div>

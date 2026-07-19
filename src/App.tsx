@@ -65,10 +65,17 @@ export default function App() {
   }, [refreshSessions]);
 
   const openTab = useCallback(
-    (title: string, cwd: string | null, command: string | null, sessionId?: string) => {
-      const key = nextKey.current++;
-      setTabs((t) => [...t, { key, title, cwd, command, sessionId }]);
-      setActiveTab(key);
+    (title: string, cwd: string | null, command: string | null, slotId: string, sessionId?: string) => {
+      setTabs((t) => {
+        const existing = t.find((x) => x.slotId === slotId);
+        if (existing) {
+          setActiveTab(existing.key);
+          return t;
+        }
+        const key = nextKey.current++;
+        setActiveTab(key);
+        return [...t, { key, title, cwd, command, sessionId, slotId }];
+      });
     },
     [],
   );
@@ -133,18 +140,26 @@ export default function App() {
 
   useEffect(() => {
     // Start with one shell in the home directory.
-    if (tabs.length === 0 && nextKey.current === 1) openTab("shell", null, null);
+    if (tabs.length === 0 && nextKey.current === 1) openTab("shell", null, null, "shell:home");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const selectSession = (s: Session) => setActiveProject(s.project_path);
+  const selectSession = (s: Session) => {
+    setActiveProject(s.project_path);
+    // Warp-style: the sidebar is the tab list — switch to this item's live
+    // terminal if it has one (resume first, then a project shell).
+    const live =
+      tabs.find((t) => t.slotId === s.id) ??
+      tabs.find((t) => t.slotId === `shell:${s.project_path}`);
+    if (live) setActiveTab(live.key);
+  };
   const resumeSession = (s: Session) => {
     setActiveProject(s.project_path);
-    openTab(s.title, s.project_path, `claude --resume ${s.id}`, s.id);
+    openTab(s.title, s.project_path, `claude --resume ${s.id}`, s.id, s.id);
   };
   const newShell = (s: Session) => {
     setActiveProject(s.project_path);
-    openTab(basename(s.project_path), s.project_path, null);
+    openTab(basename(s.project_path), s.project_path, null, `shell:${s.project_path}`);
   };
 
   // --- splitter dragging ---
@@ -211,6 +226,18 @@ export default function App() {
             title="Toggle input composer"
             onClick={() => setShowComposer(!showComposer)}
           >⌨</button>
+          <button
+            className="icon-btn"
+            title={activeProject ? `New shell in ${basename(activeProject)}` : "New shell"}
+            onClick={() =>
+              openTab(
+                activeProject ? basename(activeProject) : "shell",
+                activeProject,
+                null,
+                activeProject ? `shell:${activeProject}` : "shell:home",
+              )
+            }
+          >＋</button>
         </div>
         <div className="topbar-title">
           {activeProject ? activeProject.replace(/^\/home\/[^/]+/, "~") : "aiterm"}
@@ -224,6 +251,8 @@ export default function App() {
               <SessionsPanel
                 sessions={sessions}
                 activeProject={activeProject}
+                liveSlots={new Set(tabs.map((t) => t.slotId))}
+                activeSlot={activeTabObj?.slotId ?? null}
                 opts={opts}
                 onOptsChange={setOpts}
                 onSelect={selectSession}
@@ -237,26 +266,6 @@ export default function App() {
         )}
 
         <div className="panel terminal-panel">
-          <div className="tabbar">
-            {tabs.map((t) => (
-              <div
-                key={t.key}
-                className={"tab" + (t.key === activeTab ? " on" : "")}
-                onClick={() => setActiveTab(t.key)}
-              >
-                <span className="tab-title">{t.title}</span>
-                <button
-                  className="tab-close"
-                  onClick={(e) => { e.stopPropagation(); closeTab(t.key); }}
-                >✕</button>
-              </div>
-            ))}
-            <button
-              className="icon-btn new-tab"
-              title="New shell"
-              onClick={() => openTab(activeProject ? basename(activeProject) : "shell", activeProject, null)}
-            >＋</button>
-          </div>
           <div className="term-stack">
             {tabs.map((t) => (
               <TerminalView

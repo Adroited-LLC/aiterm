@@ -12,6 +12,9 @@ export interface TermTab {
   command: string | null;
   /** Claude session id when this tab was opened via resume. */
   sessionId?: string;
+  /** Dedupe key linking this terminal to a sidebar item: a session id for
+   *  resumes, "shell:<path>" for project shells. One terminal per slot. */
+  slotId: string;
 }
 
 /** Control surface a mounted terminal registers with the app. */
