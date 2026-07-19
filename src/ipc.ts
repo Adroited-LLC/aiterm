@@ -58,9 +58,17 @@ export interface SessionTask {
   blocked_by: string[];
 }
 
+export interface Artifact {
+  path: string;
+  tool: string;
+  at: string;
+}
+
 export const listSessions = () => invoke<Session[]>("list_sessions");
 export const sessionTasks = (sessionId: string) =>
   invoke<SessionTask[]>("session_tasks", { sessionId });
+export const sessionArtifacts = (sessionId: string) =>
+  invoke<Artifact[]>("session_artifacts", { sessionId });
 export const sessionStatus = (sessionId: string) =>
   invoke<SessionStatus>("session_status", { sessionId });
 export interface ProjectInfo {

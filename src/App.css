@@ -472,6 +472,45 @@ body.dragging * { pointer-events: none; }
   min-width: 0;
 }
 
+/* ---------- agent panel (tasks + artifacts) ---------- */
+.agent-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.agent-tabs {
+  margin: 0 8px 4px 0;
+  justify-content: flex-end;
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.artifact-row { cursor: pointer; }
+.artifact-row:hover { background: var(--bg-hover); }
+.artifact-tool {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-active);
+  color: var(--yellow);
+  align-self: center;
+}
+.artifact-tool.write { color: var(--green); }
+.artifact-dir { color: var(--text-faint); font-size: 10.5px; }
+.artifact-time {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--text-faint);
+  font-size: 10.5px;
+}
+
 /* ---------- tasks panel ---------- */
 .tasks-body {
   overflow-y: auto;

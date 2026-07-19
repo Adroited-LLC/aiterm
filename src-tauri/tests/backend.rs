@@ -62,6 +62,18 @@ fn lists_projects_dir() {
 }
 
 #[test]
+fn artifacts_parse_from_transcripts() {
+    // Across all real sessions, artifact parsing must not choke and should
+    // find at least one Write/Edit somewhere (this build session guarantees it).
+    let total: usize = ClaudeProvider
+        .scan()
+        .iter()
+        .map(|s| aiterm_lib::sessions::session_artifacts(s.id.clone()).len())
+        .sum();
+    assert!(total > 0, "expected some artifacts across sessions");
+}
+
+#[test]
 fn full_text_search_finds_sessions() {
     let r = aiterm_lib::indexer::reindex_sessions();
     assert!(r.total > 0, "expected sessions to index");

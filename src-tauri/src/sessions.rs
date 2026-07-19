@@ -213,48 +213,38 @@ pub struct SessionStatus {
 /// appended over time, so the last occurrence in the file wins.
 #[tauri::command]
 pub fn session_status(session_id: String) -> SessionStatus {
-    let Some(home) = dirs::home_dir() else {
+    let Some(path) = find_session_file(&session_id) else {
         return SessionStatus::default();
     };
-    let root = home.join(".claude/projects");
-    let Ok(projects) = std::fs::read_dir(&root) else {
+    let Ok(file) = File::open(&path) else {
         return SessionStatus::default();
     };
-    let file_name = format!("{session_id}.jsonl");
-    for project in projects.flatten() {
-        let path = project.path().join(&file_name);
-        if !path.exists() {
+    let mut status = SessionStatus {
+        exists: true,
+        ..Default::default()
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        // Cheap substring filter before JSON parsing.
+        if !line.contains("\"permission-mode\"") && !line.contains("\"type\":\"mode\"") {
             continue;
         }
-        let Ok(file) = File::open(&path) else { break };
-        let mut status = SessionStatus {
-            exists: true,
-            ..Default::default()
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
         };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            // Cheap substring filter before JSON parsing.
-            if !line.contains("\"permission-mode\"") && !line.contains("\"type\":\"mode\"") {
-                continue;
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("permission-mode") => {
+                status.permission_mode = v
+                    .get("permissionMode")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            match v.get("type").and_then(|t| t.as_str()) {
-                Some("permission-mode") => {
-                    status.permission_mode = v
-                        .get("permissionMode")
-                        .and_then(|m| m.as_str())
-                        .map(String::from)
-                }
-                Some("mode") => {
-                    status.mode = v.get("mode").and_then(|m| m.as_str()).map(String::from)
-                }
-                _ => {}
+            Some("mode") => {
+                status.mode = v.get("mode").and_then(|m| m.as_str()).map(String::from)
             }
+            _ => {}
         }
-        return status;
     }
-    SessionStatus::default()
+    status
 }
 
 #[derive(Serialize)]
@@ -309,6 +299,75 @@ pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
         .collect();
     tasks.sort_by_key(|t| t.id.parse::<u64>().unwrap_or(u64::MAX));
     tasks
+}
+
+#[derive(Serialize)]
+pub struct Artifact {
+    pub path: String,
+    pub tool: String,
+    /// ISO timestamp of the last touch.
+    pub at: String,
+}
+
+fn find_session_file(session_id: &str) -> Option<std::path::PathBuf> {
+    let root = dirs::home_dir()?.join(".claude/projects");
+    let file_name = format!("{session_id}.jsonl");
+    std::fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .map(|p| p.path().join(&file_name))
+        .find(|p| p.exists())
+}
+
+/// Files this session created or modified, newest first — parsed from
+/// Write/Edit/NotebookEdit tool calls in the transcript.
+#[tauri::command]
+pub fn session_artifacts(session_id: String) -> Vec<Artifact> {
+    let Some(path) = find_session_file(&session_id) else {
+        return vec![];
+    };
+    let Ok(file) = File::open(&path) else {
+        return vec![];
+    };
+    const TOOLS: [&str; 4] = ["Write", "Edit", "NotebookEdit", "MultiEdit"];
+    let mut latest: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("file_path") || !line.contains("tool_use") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let Some(tool) = block.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            if !TOOLS.contains(&tool) {
+                continue;
+            }
+            if let Some(fp) = block.pointer("/input/file_path").and_then(|f| f.as_str()) {
+                latest.insert(fp.to_string(), (tool.to_string(), ts.clone()));
+            }
+        }
+    }
+    let mut artifacts: Vec<Artifact> = latest
+        .into_iter()
+        .map(|(path, (tool, at))| Artifact { path, tool, at })
+        .collect();
+    artifacts.sort_by(|a, b| b.at.cmp(&a.at));
+    artifacts
 }
 
 #[cfg(test)]

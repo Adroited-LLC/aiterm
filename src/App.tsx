@@ -407,7 +407,7 @@ export default function App() {
                   <div className="splitter h" onMouseDown={() => startDrag("agentsplit")} />
                   <div className="panel agent" style={{ flex: 1, minHeight: 0 }}>
                     <div className="panel-header">
-                      <span>TASKS{activeTabObj?.title ? ` — ${activeTabObj.title}` : ""}</span>
+                      <span>AGENT{activeTabObj?.title ? ` — ${activeTabObj.title}` : ""}</span>
                       <button className="icon-btn" onClick={() => setShowAgent(false)}>✕</button>
                     </div>
                     <AgentPanel sessionId={activeSessionId} />

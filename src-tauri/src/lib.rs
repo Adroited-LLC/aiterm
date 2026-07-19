@@ -17,6 +17,7 @@ pub fn run() {
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_tasks,
+            sessions::session_artifacts,
             fsx::list_dir,
             fsx::open_path,
             fsx::list_projects,
