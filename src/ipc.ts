@@ -1,0 +1,76 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export interface Session {
+  id: string;
+  agent: string;
+  title: string;
+  project_path: string;
+  branch: string | null;
+  last_active: number;
+}
+
+export interface DirEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+}
+
+export interface FileStatus {
+  path: string;
+  status: string;
+  staged: boolean;
+}
+
+export interface BranchInfo {
+  name: string;
+  is_head: boolean;
+  upstream: string | null;
+}
+
+export interface CommitInfo {
+  id: string;
+  short_id: string;
+  summary: string;
+  author: string;
+  time: number;
+  refs: string[];
+}
+
+export interface RepoState {
+  is_repo: boolean;
+  branch: string | null;
+  ahead: number;
+  behind: number;
+}
+
+export const listSessions = () => invoke<Session[]>("list_sessions");
+export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
+
+export const ptySpawn = (cwd: string | null, command: string | null, cols: number, rows: number) =>
+  invoke<number>("pty_spawn", { cwd, command, cols, rows });
+export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
+export const ptyResize = (id: number, cols: number, rows: number) =>
+  invoke<void>("pty_resize", { id, cols, rows });
+export const ptyKill = (id: number) => invoke<void>("pty_kill", { id });
+
+export const gitRepoState = (path: string) => invoke<RepoState>("git_repo_state", { path });
+export const gitStatus = (path: string) => invoke<FileStatus[]>("git_status", { path });
+export const gitBranches = (path: string) => invoke<BranchInfo[]>("git_branches", { path });
+export const gitLog = (path: string, limit: number) =>
+  invoke<CommitInfo[]>("git_log", { path, limit });
+export const gitDiffFile = (path: string, file: string) =>
+  invoke<string>("git_diff_file", { path, file });
+export const gitCommitDiff = (path: string, commitId: string) =>
+  invoke<string>("git_commit_diff", { path, commitId });
+
+export function homeAbbrev(p: string): string {
+  return p.replace(/^\/home\/[^/]+/, "~");
+}
+
+export function relTime(ms: number): string {
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
