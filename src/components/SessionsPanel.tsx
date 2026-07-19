@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Session, homeAbbrev, relTime } from "../ipc";
 
 export interface SessionDisplayOpts {
@@ -75,8 +75,13 @@ export default function SessionsPanel({
   const [groups, setGroups] = useState<Group[]>(loadGroups);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
+  const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameText, setRenameText] = useState("");
+  // Pointer-based drag: HTML5 DnD never fires in webkit2gtk on Wayland.
+  const dragArm = useRef<{ path: string; x: number; y: number } | null>(null);
+  const dragActive = useRef(false);
+  const suppressClick = useRef(false);
 
   useEffect(() => localStorage.setItem(GROUPS_KEY, JSON.stringify(groups)), [groups]);
 
@@ -143,19 +148,48 @@ export default function SessionsPanel({
     setRenaming(null);
   };
 
-  const dropProps = (target: string, onDropId: (sessionId: string) => void) => ({
-    onDragOver: (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragOver(target);
-    },
-    onDragLeave: () => setDragOver((d) => (d === target ? null : d)),
-    onDrop: (e: React.DragEvent) => {
-      e.preventDefault();
+  // Global pointer tracking while a drag is armed/active.
+  useEffect(() => {
+    const move = (e: PointerEvent) => {
+      const arm = dragArm.current;
+      if (!arm) return;
+      if (!dragActive.current) {
+        if (Math.abs(e.clientX - arm.x) + Math.abs(e.clientY - arm.y) < 7) return;
+        dragActive.current = true;
+        setDragId(arm.path);
+      }
+      setDragPos({ x: e.clientX, y: e.clientY });
+      const el = document.elementFromPoint(e.clientX, e.clientY);
+      setDragOver(el?.closest<HTMLElement>("[data-drop]")?.dataset.drop ?? null);
+    };
+    const up = (e: PointerEvent) => {
+      const arm = dragArm.current;
+      if (!arm) return;
+      if (dragActive.current) {
+        suppressClick.current = true;
+        // The suppressed click (if any) dispatches synchronously after
+        // pointerup; clear the flag so the next real click works.
+        setTimeout(() => { suppressClick.current = false; }, 0);
+        const el = document.elementFromPoint(e.clientX, e.clientY);
+        const target = el?.closest<HTMLElement>("[data-drop]")?.dataset.drop;
+        if (target === "new") createGroup(arm.path);
+        else if (target === "ungrouped") moveToGroup(null, arm.path);
+        else if (target) moveToGroup(target, arm.path);
+      }
+      dragArm.current = null;
+      dragActive.current = false;
+      setDragId(null);
       setDragOver(null);
-      const id = e.dataTransfer.getData("text/aiterm-session");
-      if (id) onDropId(id);
-    },
-  });
+      setDragPos(null);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const renderItem = (s: Session) => {
     const isLive = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
@@ -164,19 +198,24 @@ export default function SessionsPanel({
     return (
       <div
         key={s.id}
-        draggable
-        onDragStart={(e) => {
-          e.dataTransfer.setData("text/aiterm-session", s.project_path);
-          e.dataTransfer.effectAllowed = "move";
-          setDragId(s.project_path);
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          if ((e.target as HTMLElement).closest("button")) return;
+          dragArm.current = { path: s.project_path, x: e.clientX, y: e.clientY };
         }}
-        onDragEnd={() => { setDragId(null); setDragOver(null); }}
         className={
           "session-item" +
           (s.project_path === activeProject ? " active" : "") +
-          (isShowing ? " showing" : "")
+          (isShowing ? " showing" : "") +
+          (dragId === s.project_path ? " dragging" : "")
         }
-        onClick={() => onSelect(s)}
+        onClick={() => {
+          if (suppressClick.current) {
+            suppressClick.current = false;
+            return;
+          }
+          onSelect(s);
+        }}
       >
         <AgentIcon agent={s.agent} />
         <div className="session-text">
@@ -235,7 +274,7 @@ export default function SessionsPanel({
         {dragId && (
           <div
             className={"drop-zone" + (dragOver === "new" ? " over" : "")}
-            {...dropProps("new", createGroup)}
+            data-drop="new"
           >
             ＋ Drop here to create a group
           </div>
@@ -248,9 +287,9 @@ export default function SessionsPanel({
             <div key={g.id} className="session-group">
               <div
                 className={"group-header" + (dragOver === g.id ? " over" : "")}
+                data-drop={g.id}
                 onClick={() => setGroups((gs) =>
                   gs.map((x) => (x.id === g.id ? { ...x, collapsed: !x.collapsed } : x)))}
-                {...dropProps(g.id, (sid) => moveToGroup(g.id, sid))}
               >
                 <span className={"chevron" + (open ? " open" : "")}>›</span>
                 <span
@@ -296,12 +335,17 @@ export default function SessionsPanel({
         })}
         <div
           className={"ungrouped" + (dragOver === "ungrouped" ? " over" : "")}
-          {...dropProps("ungrouped", (sid) => moveToGroup(null, sid))}
+          data-drop="ungrouped"
         >
           {ungrouped.map(renderItem)}
           {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
         </div>
       </div>
+      {dragId && dragPos && (
+        <div className="drag-ghost" style={{ left: dragPos.x + 12, top: dragPos.y + 8 }}>
+          {dragId.split("/").filter(Boolean).pop()}
+        </div>
+      )}
     </div>
   );
 }
