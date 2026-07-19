@@ -580,6 +580,9 @@ body.dragging * { pointer-events: none; }
 .st-deleted { color: var(--red); }
 .st-untracked { color: var(--blue); }
 
+.graph-row { padding-top: 0; padding-bottom: 0; }
+.graph-svg { flex-shrink: 0; display: block; }
+
 .commit-id {
   font-family: var(--font-mono);
   font-size: 11px;

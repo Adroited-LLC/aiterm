@@ -39,6 +39,8 @@ fn reads_git_repo() {
     let log = git_log(repo(), 10).expect("git_log");
     assert!(!log.is_empty());
     assert!(!log[0].short_id.is_empty());
+    // Every commit except the root has parents recorded (graph edges).
+    assert!(log[..log.len() - 1].iter().all(|c| !c.parents.is_empty()));
 
     let branches = git_branches(repo()).expect("git_branches");
     assert!(branches.iter().any(|b| b.name == "main" && b.is_head));

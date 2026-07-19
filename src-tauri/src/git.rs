@@ -24,6 +24,7 @@ pub struct CommitInfo {
     pub author: String,
     pub time: i64,
     pub refs: Vec<String>,
+    pub parents: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -144,7 +145,16 @@ pub fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
 pub fn git_log(path: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
     let repo = open(&path)?;
     let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+    // Topological order across all local branches so the graph has proper lanes.
+    let _ = walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME);
     walk.push_head().map_err(|e| e.to_string())?;
+    if let Ok(branches) = repo.branches(Some(BranchType::Local)) {
+        for (b, _) in branches.flatten() {
+            if let Some(oid) = b.get().target() {
+                let _ = walk.push(oid);
+            }
+        }
+    }
 
     // Collect ref decorations (branch/tag tips) for GitLens-style labels.
     let mut ref_map: std::collections::HashMap<git2::Oid, Vec<String>> =
@@ -171,6 +181,7 @@ pub fn git_log(path: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
             author: commit.author().name().ok().unwrap_or("").to_string(),
             time: commit.time().seconds(),
             refs: ref_map.get(&oid).cloned().unwrap_or_default(),
+            parents: commit.parent_ids().map(|p| p.to_string()).collect(),
         });
     }
     Ok(out)

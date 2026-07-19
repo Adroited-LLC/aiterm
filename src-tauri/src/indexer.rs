@@ -19,7 +19,9 @@ struct SessionIndex {
     index: Index,
     reader: IndexReader,
     schema: Schema,
-    writer: Mutex<IndexWriter>,
+    /// None when another aiterm instance holds the tantivy writer lock —
+    /// searches still work read-only; reindexing is skipped.
+    writer: Mutex<Option<IndexWriter>>,
 }
 
 fn build_schema() -> Schema {
@@ -51,7 +53,7 @@ fn global() -> Option<&'static SessionIndex> {
         let index = Index::open_in_dir(&dir)
             .or_else(|_| Index::create_in_dir(&dir, schema.clone()))
             .ok()?;
-        let writer = index.writer(30_000_000).ok()?;
+        let writer = index.writer(30_000_000).ok();
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -82,8 +84,13 @@ impl SessionIndex {
         doc.get_first(mtime_field)?.as_u64()
     }
 
+    fn has_writer(&self) -> bool {
+        self.writer.lock().map(|w| w.is_some()).unwrap_or(false)
+    }
+
     fn upsert(&self, s: &Session, mtime: u64, user_text: &str, assistant_text: &str) {
-        let Ok(writer) = self.writer.lock() else { return };
+        let Ok(guard) = self.writer.lock() else { return };
+        let Some(writer) = guard.as_ref() else { return };
         let id_field = self.schema.get_field("session_id").unwrap();
         writer.delete_term(Term::from_field_text(id_field, &s.id));
         let _ = writer.add_document(doc!(
@@ -97,8 +104,10 @@ impl SessionIndex {
     }
 
     fn commit(&self) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.commit();
+        if let Ok(mut guard) = self.writer.lock() {
+            if let Some(writer) = guard.as_mut() {
+                let _ = writer.commit();
+            }
         }
         let _ = self.reader.reload();
     }
@@ -183,11 +192,15 @@ pub struct ReindexResult {
 /// new/changed transcripts get re-read).
 #[tauri::command]
 pub fn reindex_sessions() -> ReindexResult {
-    let Some(idx) = global() else {
-        return ReindexResult { indexed: 0, total: 0 };
-    };
     let sessions = ClaudeProvider.scan_with_paths();
     let total = sessions.len();
+    let Some(idx) = global() else {
+        return ReindexResult { indexed: 0, total };
+    };
+    if !idx.has_writer() {
+        // Another instance owns the index writer; it will do the reindexing.
+        return ReindexResult { indexed: 0, total };
+    }
     let mut indexed = 0;
     for (s, path) in &sessions {
         if idx.stored_mtime(&s.id) == Some(s.last_active) {

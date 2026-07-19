@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BranchInfo, CommitInfo, FileStatus, RepoState,
   gitBranches, gitCommitDiff, gitDiffFile, gitLog, gitRepoState, gitStatus, relTime,
 } from "../ipc";
+import { computeGraph, laneColor } from "../graph";
+
+const COL = 13;
+const ROW_H = 30;
 
 type Tab = "changes" | "branches" | "log";
 
@@ -43,6 +47,11 @@ export default function GitPanel({ root, refreshKey }: { root: string | null; re
   const [branches, setBranches] = useState<BranchInfo[]>([]);
   const [log, setLog] = useState<CommitInfo[]>([]);
   const [diff, setDiff] = useState<{ title: string; text: string } | null>(null);
+  const graph = useMemo(() => computeGraph(log), [log]);
+  const graphWidth = useMemo(
+    () => (Math.max(0, ...graph.map((r) => r.maxLane)) + 1) * COL + 4,
+    [graph],
+  );
 
   const refresh = useCallback(async () => {
     setDiff(null);
@@ -125,18 +134,51 @@ export default function GitPanel({ root, refreshKey }: { root: string | null; re
             </div>
           ))
         ) : (
-          log.map((c) => (
-            <div key={c.id} className="git-row commit" onClick={() => showCommitDiff(c)}>
-              <span className="commit-id">{c.short_id}</span>
-              <span className="git-row-text">
-                {c.refs.map((r) => (
-                  <span key={r} className="ref-badge">{r}</span>
-                ))}
-                {c.summary}
-              </span>
-              <span className="commit-meta">{c.author} · {relTime(c.time * 1000)}</span>
-            </div>
-          ))
+          graph.map((row) => {
+            const c = row.commit;
+            const cx = (l: number) => l * COL + 7;
+            return (
+              <div
+                key={c.id}
+                className="git-row commit graph-row"
+                style={{ height: ROW_H }}
+                onClick={() => showCommitDiff(c)}
+              >
+                <svg width={graphWidth} height={ROW_H} className="graph-svg">
+                  {row.inputs.map(([f, t], i) =>
+                    f === t ? (
+                      <line key={`i${i}`} x1={cx(f)} y1={0} x2={cx(f)} y2={ROW_H / 2}
+                        stroke={laneColor(f)} strokeWidth="2" />
+                    ) : (
+                      <path key={`i${i}`}
+                        d={`M ${cx(f)} 0 C ${cx(f)} ${ROW_H / 3}, ${cx(t)} ${ROW_H / 6}, ${cx(t)} ${ROW_H / 2}`}
+                        stroke={laneColor(f)} strokeWidth="2" fill="none" />
+                    ),
+                  )}
+                  {row.outputs.map(([f, t], i) =>
+                    f === t ? (
+                      <line key={`o${i}`} x1={cx(f)} y1={ROW_H / 2} x2={cx(f)} y2={ROW_H}
+                        stroke={laneColor(f)} strokeWidth="2" />
+                    ) : (
+                      <path key={`o${i}`}
+                        d={`M ${cx(f)} ${ROW_H / 2} C ${cx(f)} ${ROW_H * 0.83}, ${cx(t)} ${ROW_H * 0.66}, ${cx(t)} ${ROW_H}`}
+                        stroke={laneColor(t)} strokeWidth="2" fill="none" />
+                    ),
+                  )}
+                  <circle cx={cx(row.lane)} cy={ROW_H / 2} r="4"
+                    fill={laneColor(row.lane)} stroke="var(--bg-panel)" strokeWidth="1.5" />
+                </svg>
+                <span className="commit-id">{c.short_id}</span>
+                <span className="git-row-text">
+                  {c.refs.map((r) => (
+                    <span key={r} className="ref-badge">{r}</span>
+                  ))}
+                  {c.summary}
+                </span>
+                <span className="commit-meta">{c.author} · {relTime(c.time * 1000)}</span>
+              </div>
+            );
+          })
         )}
       </div>
     </div>

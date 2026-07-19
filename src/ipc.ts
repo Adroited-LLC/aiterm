@@ -34,6 +34,7 @@ export interface CommitInfo {
   author: string;
   time: number;
   refs: string[];
+  parents: string[];
 }
 
 export interface RepoState {
