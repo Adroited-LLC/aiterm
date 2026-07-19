@@ -1,5 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Session, homeAbbrev, relTime } from "../ipc";
+import { ProjectInfo, Session, homeAbbrev, relTime, searchSessions } from "../ipc";
+
+type ViewMode = "recent" | "project" | "date";
+
+function dateBucket(ms: number): string {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  if (ms >= startOfDay) return "Today";
+  if (ms >= startOfDay - 86400_000) return "Yesterday";
+  if (ms >= startOfDay - 6 * 86400_000) return "This week";
+  if (ms >= startOfDay - 29 * 86400_000) return "This month";
+  return "Older";
+}
 
 export interface SessionDisplayOpts {
   showPath: boolean;
@@ -30,6 +42,7 @@ function loadGroups(): Group[] {
 
 interface Props {
   sessions: Session[];
+  projects: ProjectInfo[];
   activeProject: string | null;
   /** Slot ids that currently have a live terminal. */
   liveSlots: Set<string>;
@@ -40,6 +53,9 @@ interface Props {
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
   onNewShell: (s: Session) => void;
+  onSelectProject: (p: ProjectInfo) => void;
+  onProjectShell: (p: ProjectInfo) => void;
+  onProjectClaude: (p: ProjectInfo) => void;
   onRefresh: () => void;
 }
 
@@ -67,11 +83,30 @@ function AgentIcon({ agent }: { agent: string }) {
 }
 
 export default function SessionsPanel({
-  sessions, activeProject, liveSlots, activeSlot, opts,
-  onOptsChange, onSelect, onResume, onNewShell, onRefresh,
+  sessions, projects, activeProject, liveSlots, activeSlot, opts,
+  onOptsChange, onSelect, onResume, onNewShell,
+  onSelectProject, onProjectShell, onProjectClaude, onRefresh,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>(
+    () => (localStorage.getItem("aiterm.viewMode") as ViewMode) || "recent",
+  );
+  const [ftResults, setFtResults] = useState<Session[] | null>(null);
+
+  useEffect(() => localStorage.setItem("aiterm.viewMode", viewMode), [viewMode]);
+
+  // Debounced full-text search (tantivy index over titles + message text).
+  useEffect(() => {
+    if (!query.trim()) {
+      setFtResults(null);
+      return;
+    }
+    const t = setTimeout(() => {
+      searchSessions(query).then(setFtResults).catch(() => setFtResults(null));
+    }, 250);
+    return () => clearTimeout(t);
+  }, [query]);
   const [groups, setGroups] = useState<Group[]>(loadGroups);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
@@ -96,8 +131,51 @@ export default function SessionsPanel({
     );
   }, [sessions, query]);
 
+  // When searching: ranked full-text hits first, then substring matches the
+  // index may have missed (still catching up, etc).
+  const searchList = useMemo(() => {
+    if (!query.trim()) return null;
+    const seen = new Set((ftResults ?? []).map((s) => s.id));
+    return [...(ftResults ?? []), ...filtered.filter((s) => !seen.has(s.id))];
+  }, [query, ftResults, filtered]);
+
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
   const ungrouped = filtered.filter((s) => !grouped.has(s.project_path));
+
+  const sessionPaths = useMemo(
+    () => new Set(sessions.map((s) => s.project_path)),
+    [sessions],
+  );
+  const sessionlessProjects = useMemo(() => {
+    const q = query.toLowerCase();
+    return projects.filter(
+      (p) => !sessionPaths.has(p.path) && (!q || p.name.toLowerCase().includes(q)),
+    );
+  }, [projects, sessionPaths, query]);
+
+  // Auto sub-grouping for the Project / Date view modes.
+  const autoSections = useMemo(() => {
+    if (viewMode === "recent" || searchList) return null;
+    const map = new Map<string, Session[]>();
+    for (const s of filtered) {
+      const key = viewMode === "project"
+        ? s.project_path
+        : dateBucket(s.last_active);
+      (map.get(key) ?? map.set(key, []).get(key)!).push(s);
+    }
+    if (viewMode === "date") {
+      const order = ["Today", "Yesterday", "This week", "This month", "Older"];
+      return order
+        .filter((k) => map.has(k))
+        .map((k) => ({ label: k, sessions: map.get(k)! }));
+    }
+    return [...map.entries()]
+      .sort((a, b) => b[1][0].last_active - a[1][0].last_active)
+      .map(([path, ss]) => ({
+        label: path.split("/").filter(Boolean).pop() ?? path,
+        sessions: ss,
+      }));
+  }, [viewMode, filtered, searchList]);
 
   const toggle = (k: keyof SessionDisplayOpts) => onOptsChange({ ...opts, [k]: !opts[k] });
 
@@ -199,7 +277,7 @@ export default function SessionsPanel({
       <div
         key={s.id}
         onPointerDown={(e) => {
-          if (e.button !== 0) return;
+          if (e.button !== 0 || viewMode !== "recent" || searchList) return;
           if ((e.target as HTMLElement).closest("button")) return;
           dragArm.current = { path: s.project_path, x: e.clientX, y: e.clientY };
         }}
@@ -243,6 +321,44 @@ export default function SessionsPanel({
     );
   };
 
+  const renderProject = (p: ProjectInfo) => {
+    const isLive = liveSlots.has(`claude:${p.path}`) || liveSlots.has(`shell:${p.path}`);
+    const isShowing = activeSlot === `claude:${p.path}` || activeSlot === `shell:${p.path}`;
+    return (
+      <div
+        key={p.path}
+        className={
+          "session-item project-item" +
+          (p.path === activeProject ? " active" : "") +
+          (isShowing ? " showing" : "")
+        }
+        onClick={() => onSelectProject(p)}
+      >
+        <svg className="agent-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
+          stroke="currentColor" strokeWidth="2">
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+        </svg>
+        <div className="session-text">
+          <div className="session-title">
+            {isLive && <span className="live-dot" title="Terminal running" />}
+            {p.name}
+          </div>
+          {opts.showPath && <div className="session-sub">{homeAbbrev(p.path)}</div>}
+        </div>
+        <div className="session-actions">
+          <button
+            className="icon-btn" title="Start claude here"
+            onClick={(e) => { e.stopPropagation(); onProjectClaude(p); }}
+          >▶</button>
+          <button
+            className="icon-btn" title="New shell here"
+            onClick={(e) => { e.stopPropagation(); onProjectShell(p); }}
+          >＋</button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="sessions-panel">
       <div className="panel-toolbar">
@@ -270,7 +386,37 @@ export default function SessionsPanel({
           )}
         </div>
       </div>
+      <div className="view-tabs">
+        {(["recent", "project", "date"] as ViewMode[]).map((m) => (
+          <button
+            key={m}
+            className={"view-tab" + (viewMode === m ? " on" : "")}
+            onClick={() => setViewMode(m)}
+          >
+            {m === "recent" ? "Recent" : m === "project" ? "Project" : "Date"}
+          </button>
+        ))}
+      </div>
       <div className="sessions-list">
+        {searchList ? (
+          <>
+            {searchList.map(renderItem)}
+            {searchList.length === 0 && sessionlessProjects.length === 0 && (
+              <div className="empty-note">No matches</div>
+            )}
+          </>
+        ) : autoSections ? (
+          autoSections.map((sec) => (
+            <div key={sec.label} className="session-group">
+              <div className="group-header static">
+                <span className="group-name">{sec.label}</span>
+                <span className="group-count">{sec.sessions.length}</span>
+              </div>
+              {sec.sessions.map(renderItem)}
+            </div>
+          ))
+        ) : (
+          <>
         {dragId && (
           <div
             className={"drop-zone" + (dragOver === "new" ? " over" : "")}
@@ -340,6 +486,17 @@ export default function SessionsPanel({
           {ungrouped.map(renderItem)}
           {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
         </div>
+          </>
+        )}
+        {sessionlessProjects.length > 0 && (
+          <div className="session-group">
+            <div className="group-header static projects-header">
+              <span className="group-name">PROJECTS</span>
+              <span className="group-count">{sessionlessProjects.length}</span>
+            </div>
+            {sessionlessProjects.map(renderProject)}
+          </div>
+        )}
       </div>
       {dragId && dragPos && (
         <div className="drag-ghost" style={{ left: dragPos.x + 12, top: dragPos.y + 8 }}>

@@ -51,3 +51,18 @@ fn non_repo_reports_cleanly() {
     let state = git_repo_state("/tmp".into());
     assert!(!state.is_repo);
 }
+
+#[test]
+fn lists_projects_dir() {
+    let projects = aiterm_lib::fsx::list_projects();
+    assert!(projects.iter().any(|p| p.name == "aiterm" && p.is_git));
+    assert!(projects.iter().any(|p| p.name == "toponet"));
+}
+
+#[test]
+fn full_text_search_finds_sessions() {
+    let r = aiterm_lib::indexer::reindex_sessions();
+    assert!(r.total > 0, "expected sessions to index");
+    let hits = aiterm_lib::indexer::search_sessions("aiterm".into());
+    assert!(!hits.is_empty(), "searching 'aiterm' should hit this session");
+}

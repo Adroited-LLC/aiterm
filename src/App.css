@@ -187,6 +187,35 @@ body.dragging * { pointer-events: none; }
   padding: 0 6px 8px;
 }
 
+.view-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 8px 6px;
+  flex-shrink: 0;
+}
+.view-tab {
+  flex: 1;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+  padding: 3px 0;
+  cursor: pointer;
+}
+.view-tab:first-child { border-radius: 6px 0 0 6px; }
+.view-tab:last-child { border-radius: 0 6px 6px 0; }
+.view-tab:hover { color: var(--text); }
+.view-tab.on { color: var(--accent); background: var(--bg-active); }
+
+.group-header.static { cursor: default; }
+.group-header.static:hover { background: none; }
+.projects-header .group-name {
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--text-faint);
+}
+.project-item .agent-icon { color: var(--text-dim); }
+
 /* ---------- session groups (Edge-style) ---------- */
 .drop-zone {
   margin: 4px 2px 8px;

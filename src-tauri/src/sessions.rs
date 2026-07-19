@@ -21,8 +21,9 @@ pub trait SessionProvider {
 
 pub struct ClaudeProvider;
 
-impl SessionProvider for ClaudeProvider {
-    fn scan(&self) -> Vec<Session> {
+impl ClaudeProvider {
+    /// Scan sessions along with their jsonl paths (needed by the indexer).
+    pub fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
         let Some(home) = dirs::home_dir() else {
             return vec![];
         };
@@ -42,12 +43,18 @@ impl SessionProvider for ClaudeProvider {
                     continue;
                 }
                 if let Some(s) = parse_session(&path) {
-                    sessions.push(s);
+                    sessions.push((s, path));
                 }
             }
         }
-        sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        sessions.sort_by(|a, b| b.0.last_active.cmp(&a.0.last_active));
         sessions
+    }
+}
+
+impl SessionProvider for ClaudeProvider {
+    fn scan(&self) -> Vec<Session> {
+        self.scan_with_paths().into_iter().map(|(s, _)| s).collect()
     }
 }
 

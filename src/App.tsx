@@ -4,7 +4,10 @@ import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
-import { Session, SessionStatus, gitRepoState, listSessions, sessionStatus } from "./ipc";
+import {
+  ProjectInfo, Session, SessionStatus,
+  gitRepoState, listProjects, listSessions, reindexSessions, sessionStatus,
+} from "./ipc";
 import "./App.css";
 
 const OPTS_KEY = "aiterm.sessionOpts";
@@ -82,8 +85,13 @@ export default function App() {
   const termFont = Math.round(13 * fontScale);
   const panelZoom = { zoom: fontScale } as React.CSSProperties;
 
+  const [projects, setProjects] = useState<ProjectInfo[]>([]);
+
   const refreshSessions = useCallback(() => {
     listSessions().then(setSessions).catch(console.error);
+    listProjects().then(setProjects).catch(console.error);
+    // Keep the full-text index warm in the background.
+    reindexSessions().catch(() => {});
   }, []);
   useEffect(() => {
     refreshSessions();
@@ -182,6 +190,21 @@ export default function App() {
     setActiveProject(s.project_path);
     openTab(basename(s.project_path), s.project_path, null, `shell:${s.project_path}`);
   };
+  const selectProject = (p: ProjectInfo) => {
+    setActiveProject(p.path);
+    const live =
+      tabs.find((t) => t.slotId === `claude:${p.path}`) ??
+      tabs.find((t) => t.slotId === `shell:${p.path}`);
+    if (live) setActiveTab(live.key);
+  };
+  const projectShell = (p: ProjectInfo) => {
+    setActiveProject(p.path);
+    openTab(p.name, p.path, null, `shell:${p.path}`);
+  };
+  const projectClaude = (p: ProjectInfo) => {
+    setActiveProject(p.path);
+    openTab(p.name, p.path, "claude", `claude:${p.path}`);
+  };
 
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit">(null);
@@ -279,6 +302,7 @@ export default function App() {
             <div className="panel sessions" style={{ width: sizes.left, ...panelZoom }}>
               <SessionsPanel
                 sessions={sessions}
+                projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
                 activeSlot={activeTabObj?.slotId ?? null}
@@ -287,6 +311,9 @@ export default function App() {
                 onSelect={selectSession}
                 onResume={resumeSession}
                 onNewShell={newShell}
+                onSelectProject={selectProject}
+                onProjectShell={projectShell}
+                onProjectClaude={projectClaude}
                 onRefresh={refreshSessions}
               />
             </div>

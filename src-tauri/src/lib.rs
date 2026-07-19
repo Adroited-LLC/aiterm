@@ -1,5 +1,6 @@
 pub mod fsx;
 pub mod git;
+pub mod indexer;
 pub mod pty;
 pub mod sessions;
 
@@ -17,6 +18,9 @@ pub fn run() {
             sessions::session_status,
             fsx::list_dir,
             fsx::open_path,
+            fsx::list_projects,
+            indexer::reindex_sessions,
+            indexer::search_sessions,
             git::git_repo_state,
             git::git_status,
             git::git_branches,

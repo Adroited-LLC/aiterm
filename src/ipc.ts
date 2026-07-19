@@ -52,8 +52,20 @@ export interface SessionStatus {
 export const listSessions = () => invoke<Session[]>("list_sessions");
 export const sessionStatus = (sessionId: string) =>
   invoke<SessionStatus>("session_status", { sessionId });
+export interface ProjectInfo {
+  name: string;
+  path: string;
+  is_git: boolean;
+  last_modified: number;
+}
+
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
 export const openPath = (path: string) => invoke<void>("open_path", { path });
+export const listProjects = () => invoke<ProjectInfo[]>("list_projects");
+export const searchSessions = (query: string) =>
+  invoke<Session[]>("search_sessions", { query });
+export const reindexSessions = () =>
+  invoke<{ indexed: number; total: number }>("reindex_sessions");
 
 export const ptySpawn = (cwd: string | null, command: string | null, cols: number, rows: number) =>
   invoke<number>("pty_spawn", { cwd, command, cols, rows });
