@@ -457,14 +457,59 @@ body.dragging * { pointer-events: none; }
   50% { opacity: 0.35; }
 }
 
-/* ---------- right area: explorer | git side by side ---------- */
+/* ---------- right area: (explorer | git) over tasks ---------- */
 .right-col {
   display: flex;
-  flex-direction: row;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
   flex-shrink: 0;
 }
+.right-top {
+  display: flex;
+  flex-direction: row;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* ---------- tasks panel ---------- */
+.tasks-body {
+  overflow-y: auto;
+  flex: 1;
+  padding: 0 8px 8px;
+}
+.tasks-progress {
+  height: 3px;
+  background: var(--bg-raised);
+  border-radius: 2px;
+  margin: 2px 0 8px;
+  overflow: hidden;
+}
+.tasks-progress-bar {
+  height: 100%;
+  background: var(--green);
+  border-radius: 2px;
+  transition: width 0.4s;
+}
+.task-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 4px;
+  font-size: 12px;
+  border-radius: 5px;
+}
+.task-row.completed .task-subject { color: var(--text-faint); text-decoration: line-through; }
+.task-row.in_progress .task-subject { color: var(--text); }
+.task-subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-icon { color: var(--text-faint); flex-shrink: 0; font-size: 11px; }
+.task-icon.done { color: var(--green); }
+.task-icon.busy { color: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
+.task-icon.blocked { color: var(--yellow); }
 
 /* ---------- file explorer ---------- */
 .open-error {

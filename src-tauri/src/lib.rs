@@ -16,6 +16,7 @@ pub fn run() {
             pty::pty_kill,
             sessions::list_sessions,
             sessions::session_status,
+            sessions::session_tasks,
             fsx::list_dir,
             fsx::open_path,
             fsx::list_projects,

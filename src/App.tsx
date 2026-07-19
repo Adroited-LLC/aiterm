@@ -4,6 +4,7 @@ import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
+import AgentPanel from "./components/AgentPanel";
 import {
   ProjectInfo, Session, SessionStatus,
   gitRepoState, listProjects, listSessions, reindexSessions, sessionStatus,
@@ -18,6 +19,8 @@ interface PanelSizes {
   left: number;
   right: number;
   explorerFrac: number;
+  /** Height fraction of the right column taken by the agent (tasks) panel. */
+  agentFrac: number;
 }
 
 function loadJSON<T>(key: string, fallback: T): T {
@@ -48,12 +51,13 @@ export default function App() {
   const [showGit, setShowGit] = useState(true);
   // Collapsed by default: claude draws its own input bar, so the composer is opt-in.
   const [showComposer, setShowComposer] = useState(false);
+  const [showAgent, setShowAgent] = useState(true);
 
   const [opts, setOpts] = useState<SessionDisplayOpts>(() =>
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
   );
   const [sizes, setSizes] = useState<PanelSizes>(() =>
-    loadJSON(SIZES_KEY, { left: 280, right: 560, explorerFrac: 0.5 }),
+    loadJSON(SIZES_KEY, { left: 280, right: 560, explorerFrac: 0.5, agentFrac: 0.3 }),
   );
 
   const [fontScale, setFontScale] = useState<number>(
@@ -207,7 +211,7 @@ export default function App() {
   };
 
   // --- splitter dragging ---
-  const dragging = useRef<null | "left" | "right" | "rightsplit">(null);
+  const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
   const rightColRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -225,6 +229,10 @@ export default function App() {
         const r = rightColRef.current.getBoundingClientRect();
         const frac = (e.clientX - r.left) / r.width;
         setSizes((s) => ({ ...s, explorerFrac: Math.max(0.15, Math.min(0.85, frac)) }));
+      } else if (dragging.current === "agentsplit" && rightColRef.current) {
+        const r = rightColRef.current.getBoundingClientRect();
+        const frac = (r.bottom - e.clientY) / r.height;
+        setSizes((s) => ({ ...s, agentFrac: Math.max(0.12, Math.min(0.7, frac)) }));
       }
     };
     const up = () => {
@@ -239,7 +247,7 @@ export default function App() {
     };
   }, []);
 
-  const startDrag = (which: "left" | "right" | "rightsplit") => {
+  const startDrag = (which: "left" | "right" | "rightsplit" | "agentsplit") => {
     dragging.current = which;
     document.body.classList.add("dragging");
   };
@@ -265,6 +273,11 @@ export default function App() {
             title="Toggle repository panel"
             onClick={() => setShowGit(!showGit)}
           >⎇</button>
+          <button
+            className={"icon-btn" + (showAgent ? " on" : "")}
+            title="Toggle tasks panel"
+            onClick={() => setShowAgent(!showAgent)}
+          >☑</button>
           <button
             className={"icon-btn" + (showComposer ? " on" : "")}
             title="Toggle input composer"
@@ -356,33 +369,50 @@ export default function App() {
           <>
             <div className="splitter v" onMouseDown={() => startDrag("right")} />
             <div className="right-col" ref={rightColRef} style={{ width: sizes.right, ...panelZoom }}>
-              {showExplorer && (
-                <div
-                  className="panel explorer"
-                  style={{ width: showGit ? `${sizes.explorerFrac * 100}%` : "100%" }}
-                >
-                  <div className="panel-header">
-                    <span>EXPLORER</span>
-                    <button className="icon-btn" onClick={() => setShowExplorer(false)}>✕</button>
-                  </div>
-                  <FileExplorer root={activeProject} />
-                </div>
-              )}
-              {showExplorer && showGit && (
-                <div className="splitter v" onMouseDown={() => startDrag("rightsplit")} />
-              )}
-              {showGit && (
-                <div className="panel git" style={{ flex: 1, minWidth: 0 }}>
-                  <div className="panel-header">
-                    <span>REPOSITORY</span>
-                    <div>
-                      <button className="icon-btn" title="Refresh"
-                        onClick={() => setGitRefresh((n) => n + 1)}>⟳</button>
-                      <button className="icon-btn" onClick={() => setShowGit(false)}>✕</button>
+              <div
+                className="right-top"
+                style={{ height: showAgent ? `${(1 - sizes.agentFrac) * 100}%` : "100%" }}
+              >
+                {showExplorer && (
+                  <div
+                    className="panel explorer"
+                    style={{ width: showGit ? `${sizes.explorerFrac * 100}%` : "100%" }}
+                  >
+                    <div className="panel-header">
+                      <span>EXPLORER</span>
+                      <button className="icon-btn" onClick={() => setShowExplorer(false)}>✕</button>
                     </div>
+                    <FileExplorer root={activeProject} />
                   </div>
-                  <GitPanel root={activeProject} refreshKey={gitRefresh} />
-                </div>
+                )}
+                {showExplorer && showGit && (
+                  <div className="splitter v" onMouseDown={() => startDrag("rightsplit")} />
+                )}
+                {showGit && (
+                  <div className="panel git" style={{ flex: 1, minWidth: 0 }}>
+                    <div className="panel-header">
+                      <span>REPOSITORY</span>
+                      <div>
+                        <button className="icon-btn" title="Refresh"
+                          onClick={() => setGitRefresh((n) => n + 1)}>⟳</button>
+                        <button className="icon-btn" onClick={() => setShowGit(false)}>✕</button>
+                      </div>
+                    </div>
+                    <GitPanel root={activeProject} refreshKey={gitRefresh} />
+                  </div>
+                )}
+              </div>
+              {showAgent && (
+                <>
+                  <div className="splitter h" onMouseDown={() => startDrag("agentsplit")} />
+                  <div className="panel agent" style={{ flex: 1, minHeight: 0 }}>
+                    <div className="panel-header">
+                      <span>TASKS{activeTabObj?.title ? ` — ${activeTabObj.title}` : ""}</span>
+                      <button className="icon-btn" onClick={() => setShowAgent(false)}>✕</button>
+                    </div>
+                    <AgentPanel sessionId={activeSessionId} />
+                  </div>
+                </>
               )}
             </div>
           </>

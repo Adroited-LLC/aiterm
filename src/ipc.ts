@@ -50,7 +50,17 @@ export interface SessionStatus {
   mode: string | null;
 }
 
+export interface SessionTask {
+  id: string;
+  subject: string;
+  status: "pending" | "in_progress" | "completed" | string;
+  active_form: string | null;
+  blocked_by: string[];
+}
+
 export const listSessions = () => invoke<Session[]>("list_sessions");
+export const sessionTasks = (sessionId: string) =>
+  invoke<SessionTask[]>("session_tasks", { sessionId });
 export const sessionStatus = (sessionId: string) =>
   invoke<SessionStatus>("session_status", { sessionId });
 export interface ProjectInfo {

@@ -257,6 +257,60 @@ pub fn session_status(session_id: String) -> SessionStatus {
     SessionStatus::default()
 }
 
+#[derive(Serialize)]
+pub struct SessionTask {
+    pub id: String,
+    pub subject: String,
+    pub status: String,
+    pub active_form: Option<String>,
+    pub blocked_by: Vec<String>,
+}
+
+/// Task list Claude Code keeps for a session (~/.claude/tasks/<session-id>/<n>.json).
+#[tauri::command]
+pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
+    let Some(home) = dirs::home_dir() else {
+        return vec![];
+    };
+    let dir = home.join(".claude/tasks").join(&session_id);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
+    let mut tasks: Vec<SessionTask> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+            Some(SessionTask {
+                id: v.get("id")?.as_str()?.to_string(),
+                subject: v.get("subject")?.as_str()?.to_string(),
+                status: v
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("pending")
+                    .to_string(),
+                active_form: v
+                    .get("activeForm")
+                    .and_then(|s| s.as_str())
+                    .map(String::from),
+                blocked_by: v
+                    .get("blockedBy")
+                    .and_then(|b| b.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .filter(|t| t.status != "deleted")
+        .collect();
+    tasks.sort_by_key(|t| t.id.parse::<u64>().unwrap_or(u64::MAX));
+    tasks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
