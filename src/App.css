@@ -424,6 +424,14 @@ body.dragging * { pointer-events: none; }
 }
 
 /* ---------- file explorer ---------- */
+.open-error {
+  margin: 4px 8px;
+  padding: 5px 8px;
+  background: #e06c7522;
+  color: var(--red);
+  border-radius: 6px;
+  font-size: 11px;
+}
 .file-tree {
   overflow: auto;
   flex: 1;

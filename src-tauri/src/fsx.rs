@@ -7,6 +7,16 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+/// Open a file with the desktop's default application.
+#[tauri::command]
+pub fn open_path(path: String) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("xdg-open {path}: {e}"))
+}
+
 #[tauri::command]
 pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let mut entries: Vec<DirEntry> = std::fs::read_dir(&path)

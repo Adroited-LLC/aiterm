@@ -16,6 +16,7 @@ pub fn run() {
             sessions::list_sessions,
             sessions::session_status,
             fsx::list_dir,
+            fsx::open_path,
             git::git_repo_state,
             git::git_status,
             git::git_branches,

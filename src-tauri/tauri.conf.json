@@ -14,7 +14,8 @@
       {
         "title": "aiterm",
         "width": 1500,
-        "height": 950
+        "height": 950,
+        "dragDropEnabled": false
       }
     ],
     "security": {

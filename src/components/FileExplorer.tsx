@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { openPath } from "@tauri-apps/plugin-opener";
-import { DirEntry, listDir } from "../ipc";
+import { DirEntry, listDir, openPath } from "../ipc";
 
 interface Node extends DirEntry {
   depth: number;
@@ -33,6 +32,15 @@ function FileIcon() {
 export default function FileExplorer({ root }: { root: string | null }) {
   const [tree, setTree] = useState<Node[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [openErr, setOpenErr] = useState<string | null>(null);
+
+  const openFile = (path: string) => {
+    setOpenErr(null);
+    openPath(path).catch((e) => {
+      setOpenErr(String(e));
+      setTimeout(() => setOpenErr(null), 6000);
+    });
+  };
 
   const load = useCallback(async (path: string, depth: number): Promise<Node[]> => {
     const entries = await listDir(path).catch(() => [] as DirEntry[]);
@@ -78,7 +86,7 @@ export default function FileExplorer({ root }: { root: string | null }) {
           className="tree-row"
           style={{ paddingLeft: 8 + n.depth * 14 }}
           onClick={() => toggleNode(n)}
-          onDoubleClick={() => !n.is_dir && openPath(n.path).catch(() => {})}
+          onDoubleClick={() => !n.is_dir && openFile(n.path)}
           title={n.path}
         >
           {n.is_dir ? <Chevron open={n.expanded} /> : <span className="chevron-spacer" />}
@@ -92,5 +100,10 @@ export default function FileExplorer({ root }: { root: string | null }) {
   if (!root) return <div className="empty-note">Select a project to browse files</div>;
   if (error) return <div className="empty-note">Can't read {root}: {error}</div>;
   if (tree.length === 0) return <div className="empty-note">Empty folder</div>;
-  return <div className="file-tree">{renderNodes(tree)}</div>;
+  return (
+    <>
+      {openErr && <div className="open-error">{openErr}</div>}
+      <div className="file-tree">{renderNodes(tree)}</div>
+    </>
+  );
 }
