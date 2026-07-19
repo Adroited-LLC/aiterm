@@ -34,10 +34,11 @@ interface Props {
   onActivity: (key: number) => void;
   /** Focus the terminal itself when it becomes active (composer hidden). */
   autoFocus: boolean;
+  fontSize: number;
 }
 
 export default function TerminalView({
-  tab, active, onExit, onRegister, onActivity, autoFocus,
+  tab, active, onExit, onRegister, onActivity, autoFocus, fontSize,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -51,7 +52,7 @@ export default function TerminalView({
 
     const term = new Terminal({
       fontFamily: "'JetBrainsMono Nerd Font', 'JetBrains Mono', 'Fira Code', monospace",
-      fontSize: 13,
+      fontSize,
       cursorBlink: true,
       allowProposedApi: true,
       theme: {
@@ -139,6 +140,13 @@ export default function TerminalView({
       if (autoFocus) termRef.current?.focus();
     }
   }, [active, autoFocus]);
+
+  useEffect(() => {
+    if (termRef.current && termRef.current.options.fontSize !== fontSize) {
+      termRef.current.options.fontSize = fontSize;
+      fitRef.current?.fit();
+    }
+  }, [fontSize]);
 
   return <div ref={elRef} className="term-host" style={{ display: active ? "block" : "none" }} />;
 }

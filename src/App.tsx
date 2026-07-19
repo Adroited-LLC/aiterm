@@ -9,6 +9,7 @@ import "./App.css";
 
 const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
+const FONT_KEY = "aiterm.fontScale";
 
 interface PanelSizes {
   left: number;
@@ -52,8 +53,34 @@ export default function App() {
     loadJSON(SIZES_KEY, { left: 280, right: 560, explorerFrac: 0.5 }),
   );
 
+  const [fontScale, setFontScale] = useState<number>(
+    () => loadJSON(FONT_KEY, { scale: 1 }).scale,
+  );
+
   useEffect(() => localStorage.setItem(OPTS_KEY, JSON.stringify(opts)), [opts]);
   useEffect(() => localStorage.setItem(SIZES_KEY, JSON.stringify(sizes)), [sizes]);
+  useEffect(() => localStorage.setItem(FONT_KEY, JSON.stringify({ scale: fontScale })), [fontScale]);
+
+  const bumpFont = useCallback((dir: 1 | -1 | 0) => {
+    setFontScale((s) =>
+      dir === 0 ? 1 : Math.max(0.7, Math.min(1.6, +(s + dir * 0.1).toFixed(2))),
+    );
+  }, []);
+
+  // Ctrl+= / Ctrl+- / Ctrl+0 font zoom, captured before xterm sees the keys.
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.altKey || e.metaKey) return;
+      if (e.key === "=" || e.key === "+") { e.preventDefault(); bumpFont(1); }
+      else if (e.key === "-") { e.preventDefault(); bumpFont(-1); }
+      else if (e.key === "0") { e.preventDefault(); bumpFont(0); }
+    };
+    window.addEventListener("keydown", h, true);
+    return () => window.removeEventListener("keydown", h, true);
+  }, [bumpFont]);
+
+  const termFont = Math.round(13 * fontScale);
+  const panelZoom = { zoom: fontScale } as React.CSSProperties;
 
   const refreshSessions = useCallback(() => {
     listSessions().then(setSessions).catch(console.error);
@@ -236,12 +263,20 @@ export default function App() {
         <div className="topbar-title">
           {activeProject ? activeProject.replace(/^\/home\/[^/]+/, "~") : "aiterm"}
         </div>
-        <div className="topbar-right" />
+        <div className="topbar-right">
+          <button className="icon-btn" title="Smaller fonts (Ctrl+-)" onClick={() => bumpFont(-1)}>A−</button>
+          <button
+            className="icon-btn"
+            title="Reset font size (Ctrl+0)"
+            onClick={() => bumpFont(0)}
+          >{Math.round(fontScale * 100)}%</button>
+          <button className="icon-btn" title="Larger fonts (Ctrl+=)" onClick={() => bumpFont(1)}>A+</button>
+        </div>
       </div>
       <div className="main">
         {showSessions && (
           <>
-            <div className="panel sessions" style={{ width: sizes.left }}>
+            <div className="panel sessions" style={{ width: sizes.left, ...panelZoom }}>
               <SessionsPanel
                 sessions={sessions}
                 activeProject={activeProject}
@@ -270,6 +305,7 @@ export default function App() {
                 onRegister={registerHandle}
                 onActivity={noteActivity}
                 autoFocus={!showComposer}
+                fontSize={termFont}
               />
             ))}
             {tabs.length === 0 && (
@@ -292,7 +328,7 @@ export default function App() {
         {showRight && (
           <>
             <div className="splitter v" onMouseDown={() => startDrag("right")} />
-            <div className="right-col" ref={rightColRef} style={{ width: sizes.right }}>
+            <div className="right-col" ref={rightColRef} style={{ width: sizes.right, ...panelZoom }}>
               {showExplorer && (
                 <div
                   className="panel explorer"
