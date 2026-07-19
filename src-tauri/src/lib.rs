@@ -14,6 +14,7 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             sessions::list_sessions,
+            sessions::session_status,
             fsx::list_dir,
             git::git_repo_state,
             git::git_status,

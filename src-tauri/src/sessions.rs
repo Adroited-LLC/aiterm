@@ -131,6 +131,62 @@ fn basename(p: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
+#[derive(Serialize, Default)]
+pub struct SessionStatus {
+    pub exists: bool,
+    /// e.g. "bypassPermissions", "acceptEdits", "plan", "default"
+    pub permission_mode: Option<String>,
+    pub mode: Option<String>,
+}
+
+/// Read the current mode lines from a Claude session jsonl. Mode changes are
+/// appended over time, so the last occurrence in the file wins.
+#[tauri::command]
+pub fn session_status(session_id: String) -> SessionStatus {
+    let Some(home) = dirs::home_dir() else {
+        return SessionStatus::default();
+    };
+    let root = home.join(".claude/projects");
+    let Ok(projects) = std::fs::read_dir(&root) else {
+        return SessionStatus::default();
+    };
+    let file_name = format!("{session_id}.jsonl");
+    for project in projects.flatten() {
+        let path = project.path().join(&file_name);
+        if !path.exists() {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else { break };
+        let mut status = SessionStatus {
+            exists: true,
+            ..Default::default()
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            // Cheap substring filter before JSON parsing.
+            if !line.contains("\"permission-mode\"") && !line.contains("\"type\":\"mode\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            match v.get("type").and_then(|t| t.as_str()) {
+                Some("permission-mode") => {
+                    status.permission_mode = v
+                        .get("permissionMode")
+                        .and_then(|m| m.as_str())
+                        .map(String::from)
+                }
+                Some("mode") => {
+                    status.mode = v.get("mode").and_then(|m| m.as_str()).map(String::from)
+                }
+                _ => {}
+            }
+        }
+        return status;
+    }
+    SessionStatus::default()
+}
+
 #[tauri::command]
 pub fn list_sessions() -> Vec<Session> {
     // Future agents (codex, gemini, ...) get added to this list.

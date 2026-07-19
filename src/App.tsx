@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
-import TerminalView, { TermTab } from "./components/TerminalView";
+import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
-import { Session, listSessions } from "./ipc";
+import Composer from "./components/Composer";
+import { Session, SessionStatus, gitRepoState, listSessions, sessionStatus } from "./ipc";
 import "./App.css";
 
 const OPTS_KEY = "aiterm.sessionOpts";
@@ -32,6 +33,12 @@ export default function App() {
   const nextKey = useRef(1);
   const [gitRefresh, setGitRefresh] = useState(0);
 
+  const handles = useRef<Map<number, TermHandle>>(new Map());
+  const lastOutput = useRef<Map<number, number>>(new Map());
+  const [working, setWorking] = useState(false);
+  const [claudeStatus, setClaudeStatus] = useState<SessionStatus | null>(null);
+  const [branch, setBranch] = useState<string | null>(null);
+
   const [showSessions, setShowSessions] = useState(true);
   const [showExplorer, setShowExplorer] = useState(true);
   const [showGit, setShowGit] = useState(true);
@@ -55,11 +62,64 @@ export default function App() {
     return () => clearInterval(iv);
   }, [refreshSessions]);
 
-  const openTab = useCallback((title: string, cwd: string | null, command: string | null) => {
-    const key = nextKey.current++;
-    setTabs((t) => [...t, { key, title, cwd, command }]);
-    setActiveTab(key);
+  const openTab = useCallback(
+    (title: string, cwd: string | null, command: string | null, sessionId?: string) => {
+      const key = nextKey.current++;
+      setTabs((t) => [...t, { key, title, cwd, command, sessionId }]);
+      setActiveTab(key);
+    },
+    [],
+  );
+
+  const registerHandle = useCallback((key: number, handle: TermHandle | null) => {
+    if (handle) handles.current.set(key, handle);
+    else handles.current.delete(key);
   }, []);
+
+  const noteActivity = useCallback((key: number) => {
+    lastOutput.current.set(key, Date.now());
+  }, []);
+
+  // "working" pulse: active tab produced output within the last 2.5s.
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const last = activeTab !== null ? (lastOutput.current.get(activeTab) ?? 0) : 0;
+      setWorking(Date.now() - last < 2500);
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [activeTab]);
+
+  // Poll the claude session status for the active tab (if it's a resume tab).
+  const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
+  const activeSessionId = activeTabObj?.sessionId ?? null;
+  useEffect(() => {
+    if (!activeSessionId) {
+      setClaudeStatus(null);
+      return;
+    }
+    let stop = false;
+    const poll = () =>
+      sessionStatus(activeSessionId)
+        .then((s) => !stop && setClaudeStatus(s.exists ? s : null))
+        .catch(() => {});
+    poll();
+    const iv = setInterval(poll, 5000);
+    return () => {
+      stop = true;
+      clearInterval(iv);
+    };
+  }, [activeSessionId]);
+
+  // Branch for the status bar follows the active project.
+  useEffect(() => {
+    if (!activeProject) {
+      setBranch(null);
+      return;
+    }
+    gitRepoState(activeProject)
+      .then((s) => setBranch(s.is_repo ? s.branch : null))
+      .catch(() => setBranch(null));
+  }, [activeProject, gitRefresh]);
 
   const closeTab = useCallback((key: number) => {
     setTabs((t) => {
@@ -78,7 +138,7 @@ export default function App() {
   const selectSession = (s: Session) => setActiveProject(s.project_path);
   const resumeSession = (s: Session) => {
     setActiveProject(s.project_path);
-    openTab(s.title, s.project_path, `claude --resume ${s.id}`);
+    openTab(s.title, s.project_path, `claude --resume ${s.id}`, s.id);
   };
   const newShell = (s: Session) => {
     setActiveProject(s.project_path);
@@ -192,12 +252,30 @@ export default function App() {
           </div>
           <div className="term-stack">
             {tabs.map((t) => (
-              <TerminalView key={t.key} tab={t} active={t.key === activeTab} onExit={closeTab} />
+              <TerminalView
+                key={t.key}
+                tab={t}
+                active={t.key === activeTab}
+                onExit={closeTab}
+                onRegister={registerHandle}
+                onActivity={noteActivity}
+              />
             ))}
             {tabs.length === 0 && (
               <div className="empty-note big">No terminal open — press ＋ or pick a session</div>
             )}
           </div>
+          <Composer
+            tabKey={activeTab}
+            tabTitle={activeTabObj?.title ?? null}
+            shells={tabs.length}
+            working={working}
+            claudeStatus={claudeStatus}
+            projectLabel={activeProject ? activeProject.replace(/^\/home\/[^/]+/, "~") : null}
+            branch={branch}
+            onSend={(text) => activeTab !== null && handles.current.get(activeTab)?.sendComposed(text)}
+            onControl={(seq) => activeTab !== null && handles.current.get(activeTab)?.write(seq)}
+          />
         </div>
 
         {showRight && (

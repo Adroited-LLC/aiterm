@@ -10,15 +10,28 @@ export interface TermTab {
   title: string;
   cwd: string | null;
   command: string | null;
+  /** Claude session id when this tab was opened via resume. */
+  sessionId?: string;
+}
+
+/** Control surface a mounted terminal registers with the app. */
+export interface TermHandle {
+  /** Send raw bytes to the PTY. */
+  write: (data: string) => void;
+  /** Send composed input from the bottom input box (adds Enter, wraps
+   *  multiline text in bracketed paste when the running app supports it). */
+  sendComposed: (text: string) => void;
 }
 
 interface Props {
   tab: TermTab;
   active: boolean;
   onExit: (key: number) => void;
+  onRegister: (key: number, handle: TermHandle | null) => void;
+  onActivity: (key: number) => void;
 }
 
-export default function TerminalView({ tab, active, onExit }: Props) {
+export default function TerminalView({ tab, active, onExit, onRegister, onActivity }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
@@ -66,13 +79,31 @@ export default function TerminalView({ tab, active, onExit }: Props) {
         return;
       }
       ptyIdRef.current = id;
-      unlistenOut = await listen<string>(`pty://output/${id}`, (e) => term.write(e.payload));
+      unlistenOut = await listen<string>(`pty://output/${id}`, (e) => {
+        term.write(e.payload);
+        onActivity(tab.key);
+      });
       unlistenExit = await listen<{ id: number }>("pty://exit", (e) => {
         if (e.payload.id === id) onExit(tab.key);
       });
       term.onData((data) => ptyWrite(id, data));
       term.onResize(({ cols, rows }) => ptyResize(id, cols, rows));
-      term.focus();
+
+      onRegister(tab.key, {
+        write: (data) => ptyWrite(id, data),
+        sendComposed: (text) => {
+          const bracketed = term.modes.bracketedPasteMode;
+          let payload: string;
+          if (text.includes("\n")) {
+            payload = bracketed
+              ? `\x1b[200~${text}\x1b[201~\r`
+              : text.replace(/\n/g, "\r") + "\r";
+          } else {
+            payload = text + "\r";
+          }
+          ptyWrite(id, payload);
+        },
+      });
     })();
 
     const ro = new ResizeObserver(() => {
@@ -85,6 +116,7 @@ export default function TerminalView({ tab, active, onExit }: Props) {
       ro.disconnect();
       unlistenOut?.();
       unlistenExit?.();
+      onRegister(tab.key, null);
       if (ptyIdRef.current !== null) ptyKill(ptyIdRef.current);
       term.dispose();
       started.current = false;
@@ -93,11 +125,7 @@ export default function TerminalView({ tab, active, onExit }: Props) {
   }, []);
 
   useEffect(() => {
-    if (active) {
-      fitRef.current?.fit();
-      const term = elRef.current?.querySelector<HTMLElement>(".xterm-helper-textarea");
-      term?.focus();
-    }
+    if (active) fitRef.current?.fit();
   }, [active]);
 
   return <div ref={elRef} className="term-host" style={{ display: active ? "block" : "none" }} />;

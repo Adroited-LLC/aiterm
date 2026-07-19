@@ -43,7 +43,15 @@ export interface RepoState {
   behind: number;
 }
 
+export interface SessionStatus {
+  exists: boolean;
+  permission_mode: string | null;
+  mode: string | null;
+}
+
 export const listSessions = () => invoke<Session[]>("list_sessions");
+export const sessionStatus = (sessionId: string) =>
+  invoke<SessionStatus>("session_status", { sessionId });
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
 
 export const ptySpawn = (cwd: string | null, command: string | null, cols: number, rows: number) =>

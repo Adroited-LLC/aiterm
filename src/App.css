@@ -13,6 +13,7 @@
   --red: #e06c75;
   --yellow: #e5c07b;
   --blue: #61afef;
+  --cyan: #56b6c2;
   --font-ui: -apple-system, "Segoe UI", "Inter", system-ui, sans-serif;
   --font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", "Fira Code", monospace;
 }
@@ -290,6 +291,83 @@ body.dragging * { pointer-events: none; }
   padding: 6px 0 6px 10px;
 }
 .term-host .xterm { height: 100%; }
+
+/* ---------- composer + status bar ---------- */
+.composer-wrap {
+  flex-shrink: 0;
+  background: var(--bg);
+  padding: 10px 10px 0;
+}
+.composer {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  padding: 7px 10px;
+  font-family: var(--font-mono);
+}
+.composer:focus-within { border-color: var(--accent); }
+.composer-chip {
+  position: absolute;
+  top: -9px;
+  right: 14px;
+  background: var(--cyan);
+  color: #062a30;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: 3px;
+  font-family: var(--font-ui);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer-prompt {
+  color: var(--accent);
+  margin-right: 9px;
+  font-size: 13px;
+  line-height: 1.5;
+  user-select: none;
+}
+.composer textarea {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  resize: none;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 0;
+  caret-color: var(--accent);
+}
+.composer textarea::placeholder { color: var(--text-faint); }
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 6px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  white-space: nowrap;
+}
+.st-red { color: var(--red); }
+.st-yellow { color: var(--yellow); }
+.st-cyan { color: var(--cyan); }
+.st-dim { color: var(--text-faint); }
+.st-right { margin-left: auto; overflow: hidden; text-overflow: ellipsis; }
+.st-working { color: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
 
 /* ---------- right column ---------- */
 .right-col {
