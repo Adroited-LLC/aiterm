@@ -1,7 +1,7 @@
-mod fsx;
-mod git;
-mod pty;
-mod sessions;
+pub mod fsx;
+pub mod git;
+pub mod pty;
+pub mod sessions;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
