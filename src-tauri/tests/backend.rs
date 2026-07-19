@@ -2,7 +2,9 @@
 //! store in ~/.claude/projects and the aiterm repo itself.
 
 use aiterm_lib::fsx::list_dir;
-use aiterm_lib::git::{git_branches, git_log, git_repo_state, git_status};
+use aiterm_lib::git::{
+    git_branch_files, git_branch_log, git_branches, git_log, git_repo_state, git_status,
+};
 use aiterm_lib::sessions::{ClaudeProvider, SessionProvider};
 
 fn repo() -> String {
@@ -46,6 +48,14 @@ fn reads_git_repo() {
     assert!(branches.iter().any(|b| b.name == "main" && b.is_head));
 
     git_status(repo()).expect("git_status");
+
+    // Branch structure browsing: root tree has src-tauri/, subtree lists lib.rs.
+    let files = git_branch_files(repo(), "main".into(), "".into()).expect("branch files");
+    assert!(files.iter().any(|f| f.name == "src-tauri" && f.is_dir));
+    let sub = git_branch_files(repo(), "main".into(), "src-tauri/src".into()).expect("subtree");
+    assert!(sub.iter().any(|f| f.name == "lib.rs" && !f.is_dir));
+    let blog = git_branch_log(repo(), "main".into(), 5).expect("branch log");
+    assert!(!blog.is_empty() && !blog[0].summary.is_empty());
 }
 
 #[test]

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  BranchInfo, CommitInfo, FileStatus, RepoState,
-  gitBranches, gitCommitDiff, gitDiffFile, gitLog, gitRepoState, gitStatus, relTime,
+  BranchInfo, CommitInfo, FileStatus, RepoState, TreeEntry,
+  gitBranches, gitBranchFiles, gitBranchLog, gitCommitDiff, gitDiffFile,
+  gitLog, gitRepoState, gitStatus, relTime,
 } from "../ipc";
 import { computeGraph, laneColor } from "../graph";
 
@@ -38,6 +39,178 @@ function DiffView({ text, onClose, title }: { text: string; onClose: () => void;
       </pre>
     </div>
   );
+}
+
+interface BranchTreeNode {
+  label: string;
+  branch?: BranchInfo;
+  children: BranchTreeNode[];
+}
+
+/** Group "feature/foo" style names into nested folders, GitLens-style. */
+function buildBranchTree(branches: BranchInfo[]): BranchTreeNode[] {
+  const root: BranchTreeNode[] = [];
+  for (const b of branches) {
+    const parts = b.name.split("/");
+    let level = root;
+    for (let i = 0; i < parts.length; i++) {
+      if (i === parts.length - 1) {
+        level.push({ label: parts[i], branch: b, children: [] });
+      } else {
+        let node = level.find((n) => n.label === parts[i] && !n.branch);
+        if (!node) {
+          node = { label: parts[i], children: [] };
+          level.push(node);
+        }
+        level = node.children;
+      }
+    }
+  }
+  return root;
+}
+
+interface BFNode extends TreeEntry {
+  sub: string;
+  depth: number;
+  expanded: boolean;
+  children: BFNode[] | null;
+}
+
+function BranchesView({
+  root, branches, onCommit,
+}: {
+  root: string;
+  branches: BranchInfo[];
+  onCommit: (c: CommitInfo) => void;
+}) {
+  const tree = useMemo(() => buildBranchTree(branches), [branches]);
+  const [closedFolders, setClosedFolders] = useState<Set<string>>(new Set());
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [commits, setCommits] = useState<CommitInfo[]>([]);
+  const [files, setFiles] = useState<BFNode[]>([]);
+
+  useEffect(() => {
+    setExpanded(null);
+  }, [root]);
+
+  const loadEntries = useCallback(
+    async (branch: string, sub: string, depth: number): Promise<BFNode[]> => {
+      const entries = await gitBranchFiles(root, branch, sub).catch(() => [] as TreeEntry[]);
+      return entries.map((e) => ({
+        ...e,
+        sub: sub ? `${sub}/${e.name}` : e.name,
+        depth,
+        expanded: false,
+        children: null,
+      }));
+    },
+    [root],
+  );
+
+  const toggleBranch = async (name: string) => {
+    if (expanded === name) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(name);
+    setCommits([]);
+    setFiles([]);
+    gitBranchLog(root, name, 8).then(setCommits).catch(() => {});
+    loadEntries(name, "", 0).then(setFiles);
+  };
+
+  const toggleFile = async (target: BFNode) => {
+    if (!target.is_dir || !expanded) return;
+    const children = target.children ?? (await loadEntries(expanded, target.sub, target.depth + 1));
+    const update = (nodes: BFNode[]): BFNode[] =>
+      nodes.map((n) =>
+        n.sub === target.sub
+          ? { ...n, expanded: !n.expanded, children }
+          : n.children
+            ? { ...n, children: update(n.children) }
+            : n,
+      );
+    setFiles(update);
+  };
+
+  const renderFiles = (nodes: BFNode[]): React.ReactNode =>
+    nodes.map((n) => (
+      <div key={n.sub}>
+        <div
+          className="tree-row"
+          style={{ paddingLeft: 20 + n.depth * 14 }}
+          onClick={() => toggleFile(n)}
+          title={n.sub}
+        >
+          {n.is_dir ? <span className={"chevron" + (n.expanded ? " open" : "")}>›</span>
+            : <span className="chevron-spacer" />}
+          <span className="tree-name">{n.name}</span>
+        </div>
+        {n.expanded && n.children && renderFiles(n.children)}
+      </div>
+    ));
+
+  const renderNodes = (nodes: BranchTreeNode[], depth: number, prefix: string): React.ReactNode =>
+    nodes.map((n) => {
+      const key = prefix ? `${prefix}/${n.label}` : n.label;
+      if (!n.branch) {
+        const closed = closedFolders.has(key);
+        return (
+          <div key={key}>
+            <div
+              className="git-row branch-folder"
+              style={{ paddingLeft: 8 + depth * 14 }}
+              onClick={() =>
+                setClosedFolders((s) => {
+                  const next = new Set(s);
+                  if (closed) next.delete(key);
+                  else next.add(key);
+                  return next;
+                })}
+            >
+              <span className={"chevron" + (!closed ? " open" : "")}>›</span>
+              <span className="git-row-text">{n.label}/</span>
+            </div>
+            {!closed && renderNodes(n.children, depth + 1, key)}
+          </div>
+        );
+      }
+      const b = n.branch;
+      const open = expanded === b.name;
+      return (
+        <div key={key}>
+          <div
+            className={"git-row" + (b.is_head ? " head" : "")}
+            style={{ paddingLeft: 8 + depth * 14 }}
+            onClick={() => toggleBranch(b.name)}
+          >
+            <span className="st-code">{b.is_head ? "●" : "⎇"}</span>
+            <span className="git-row-text">{n.label}</span>
+            {b.upstream && <span className="upstream">{b.upstream}</span>}
+            <span className={"chevron" + (open ? " open" : "")}>›</span>
+          </div>
+          {open && (
+            <div className="branch-detail">
+              {commits.map((c) => (
+                <div
+                  key={c.id}
+                  className="git-row branch-commit"
+                  onClick={(e) => { e.stopPropagation(); onCommit(c); }}
+                >
+                  <span className="commit-id">{c.short_id}</span>
+                  <span className="git-row-text">{c.summary}</span>
+                  <span className="commit-meta">{relTime(c.time * 1000)}</span>
+                </div>
+              ))}
+              <div className="branch-files-label">FILES</div>
+              {renderFiles(files)}
+            </div>
+          )}
+        </div>
+      );
+    });
+
+  return <>{renderNodes(tree, 0, "")}</>;
 }
 
 export default function GitPanel({ root, refreshKey }: { root: string | null; refreshKey: number }) {
@@ -126,13 +299,7 @@ export default function GitPanel({ root, refreshKey }: { root: string | null; re
             ))
           )
         ) : tab === "branches" ? (
-          branches.map((b) => (
-            <div key={b.name} className={"git-row" + (b.is_head ? " head" : "")}>
-              <span className="st-code">{b.is_head ? "●" : " "}</span>
-              <span className="git-row-text">{b.name}</span>
-              {b.upstream && <span className="upstream">{b.upstream}</span>}
-            </div>
-          ))
+          <BranchesView root={root} branches={branches} onCommit={showCommitDiff} />
         ) : (
           graph.map((row) => {
             const c = row.commit;

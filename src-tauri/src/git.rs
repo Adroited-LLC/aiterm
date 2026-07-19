@@ -187,6 +187,78 @@ pub fn git_log(path: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
     Ok(out)
 }
 
+#[derive(Serialize)]
+pub struct TreeEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Structure (not content) of a branch tip's tree at `subpath` ("" = root).
+#[tauri::command]
+pub fn git_branch_files(
+    path: String,
+    branch: String,
+    subpath: String,
+) -> Result<Vec<TreeEntry>, String> {
+    let repo = open(&path)?;
+    let b = repo
+        .find_branch(&branch, BranchType::Local)
+        .map_err(|e| e.message().to_string())?;
+    let commit = b.get().peel_to_commit().map_err(|e| e.to_string())?;
+    let root = commit.tree().map_err(|e| e.to_string())?;
+    let tree = if subpath.is_empty() {
+        root
+    } else {
+        root.get_path(std::path::Path::new(&subpath))
+            .map_err(|e| e.to_string())?
+            .to_object(&repo)
+            .map_err(|e| e.to_string())?
+            .peel_to_tree()
+            .map_err(|e| e.to_string())?
+    };
+    let mut entries: Vec<TreeEntry> = tree
+        .iter()
+        .map(|e| TreeEntry {
+            name: e.name().unwrap_or("").to_string(),
+            is_dir: e.kind() == Some(git2::ObjectType::Tree),
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+/// Recent commits reachable from one branch tip.
+#[tauri::command]
+pub fn git_branch_log(path: String, branch: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    let repo = open(&path)?;
+    let b = repo
+        .find_branch(&branch, BranchType::Local)
+        .map_err(|e| e.message().to_string())?;
+    let tip = b.get().target().ok_or("branch has no target")?;
+    let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+    walk.push(tip).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for oid in walk.flatten().take(limit) {
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        out.push(CommitInfo {
+            id: oid.to_string(),
+            short_id: oid.to_string()[..7].to_string(),
+            summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
+            author: commit.author().name().ok().unwrap_or("").to_string(),
+            time: commit.time().seconds(),
+            refs: vec![],
+            parents: commit.parent_ids().map(|p| p.to_string()).collect(),
+        });
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 pub fn git_diff_file(path: String, file: String) -> Result<String, String> {
     let repo = open(&path)?;

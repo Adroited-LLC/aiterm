@@ -98,6 +98,15 @@ export const gitStatus = (path: string) => invoke<FileStatus[]>("git_status", { 
 export const gitBranches = (path: string) => invoke<BranchInfo[]>("git_branches", { path });
 export const gitLog = (path: string, limit: number) =>
   invoke<CommitInfo[]>("git_log", { path, limit });
+export interface TreeEntry {
+  name: string;
+  is_dir: boolean;
+}
+
+export const gitBranchFiles = (path: string, branch: string, subpath: string) =>
+  invoke<TreeEntry[]>("git_branch_files", { path, branch, subpath });
+export const gitBranchLog = (path: string, branch: string, limit: number) =>
+  invoke<CommitInfo[]>("git_branch_log", { path, branch, limit });
 export const gitDiffFile = (path: string, file: string) =>
   invoke<string>("git_diff_file", { path, file });
 export const gitCommitDiff = (path: string, commitId: string) =>

@@ -664,6 +664,26 @@ body.dragging * { pointer-events: none; }
 .st-deleted { color: var(--red); }
 .st-untracked { color: var(--blue); }
 
+/* branches tree */
+.branch-folder { color: var(--text-dim); }
+.branch-folder .git-row-text { font-weight: 600; }
+.git-row .chevron { margin-left: auto; }
+.branch-folder .chevron { margin-left: 0; order: -1; }
+.branch-detail {
+  margin: 2px 0 6px 18px;
+  border-left: 1px solid var(--border);
+  padding-left: 4px;
+}
+.branch-commit { padding-top: 2px; padding-bottom: 2px; }
+.branch-commit .git-row-text { font-size: 11.5px; }
+.branch-files-label {
+  font-size: 9.5px;
+  letter-spacing: 1px;
+  color: var(--text-faint);
+  padding: 6px 8px 2px;
+}
+.branch-detail .tree-row { font-size: 11.5px; padding-top: 2px; padding-bottom: 2px; }
+
 .graph-row { padding-top: 0; padding-bottom: 0; }
 .graph-svg { flex-shrink: 0; display: block; }
 

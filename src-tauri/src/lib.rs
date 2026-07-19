@@ -26,6 +26,8 @@ pub fn run() {
             git::git_repo_state,
             git::git_status,
             git::git_branches,
+            git::git_branch_files,
+            git::git_branch_log,
             git::git_log,
             git::git_diff_file,
             git::git_commit_diff,
