@@ -180,6 +180,7 @@ body.dragging * { pointer-events: none; }
 }
 .settings-pop label:hover { color: var(--text); }
 .settings-pop input { accent-color: var(--accent); }
+.settings-sep { border-top: 1px solid var(--border); margin: 2px 0; }
 
 .sessions-list {
   overflow-y: auto;

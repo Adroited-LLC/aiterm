@@ -7,13 +7,33 @@ import Composer from "./components/Composer";
 import AgentPanel from "./components/AgentPanel";
 import {
   ProjectInfo, Session, SessionStatus,
-  gitRepoState, listProjects, listSessions, reindexSessions, sessionStatus,
+  gitRepoState, hasTmux, listProjects, listSessions, reindexSessions,
+  sessionStatus, tmuxSessions,
 } from "./ipc";
 import "./App.css";
 
 const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
+const TMUX_KEY = "aiterm.tmux";
+const TMUX_TABS_KEY = "aiterm.tmuxTabs";
+
+interface SavedTab {
+  slotId: string;
+  title: string;
+  cwd: string | null;
+  command: string | null;
+  sessionId?: string;
+}
+
+const tmuxName = (slotId: string) =>
+  "aiterm-" + slotId.replace(/[^a-zA-Z0-9_-]/g, "_");
+
+/** Wrap a tab's command in a reattachable tmux session (status bar off). */
+function tmuxWrap(slotId: string, command: string | null): string {
+  const inner = command ? ` '${command.replace(/'/g, "'\\''")}'` : "";
+  return `tmux new-session -A -s ${tmuxName(slotId)}${inner} \\; set-option status off`;
+}
 
 interface PanelSizes {
   left: number;
@@ -52,6 +72,15 @@ export default function App() {
   // Collapsed by default: claude draws its own input bar, so the composer is opt-in.
   const [showComposer, setShowComposer] = useState(false);
   const [showAgent, setShowAgent] = useState(true);
+
+  const [tmuxOk, setTmuxOk] = useState(false);
+  const [persistTmux, setPersistTmux] = useState<boolean>(
+    () => loadJSON(TMUX_KEY, { on: true }).on,
+  );
+  useEffect(() => localStorage.setItem(TMUX_KEY, JSON.stringify({ on: persistTmux })), [persistTmux]);
+  const useTmux = tmuxOk && persistTmux;
+  const useTmuxRef = useRef(useTmux);
+  useTmuxRef.current = useTmux;
 
   const [opts, setOpts] = useState<SessionDisplayOpts>(() =>
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
@@ -111,13 +140,41 @@ export default function App() {
           setActiveTab(existing.key);
           return t;
         }
+        const wrapped = useTmuxRef.current ? tmuxWrap(slotId, command) : command;
+        if (useTmuxRef.current) {
+          const saved = loadJSON<Record<string, SavedTab>>(TMUX_TABS_KEY, {});
+          saved[tmuxName(slotId)] = { slotId, title, cwd, command, sessionId };
+          localStorage.setItem(TMUX_TABS_KEY, JSON.stringify(saved));
+        }
         const key = nextKey.current++;
         setActiveTab(key);
-        return [...t, { key, title, cwd, command, sessionId, slotId }];
+        return [...t, { key, title, cwd, command: wrapped, sessionId, slotId }];
       });
     },
     [],
   );
+
+  // On launch: reattach tabs for aiterm tmux sessions that survived a restart.
+  useEffect(() => {
+    (async () => {
+      const ok = await hasTmux().catch(() => false);
+      setTmuxOk(ok);
+      if (!ok || !loadJSON(TMUX_KEY, { on: true }).on) return;
+      const alive = new Set(await tmuxSessions().catch(() => [] as string[]));
+      const saved = loadJSON<Record<string, SavedTab>>(TMUX_TABS_KEY, {});
+      let restoredProject: string | null = null;
+      for (const [name, t] of Object.entries(saved)) {
+        if (alive.has(name)) {
+          openTab(t.title, t.cwd, t.command, t.slotId, t.sessionId);
+          restoredProject = t.cwd ?? restoredProject;
+        } else {
+          delete saved[name];
+        }
+      }
+      localStorage.setItem(TMUX_TABS_KEY, JSON.stringify(saved));
+      if (restoredProject) setActiveProject((p) => p ?? restoredProject);
+    })();
+  }, [openTab]);
 
   const registerHandle = useCallback((key: number, handle: TermHandle | null) => {
     if (handle) handles.current.set(key, handle);
@@ -171,6 +228,13 @@ export default function App() {
 
   const closeTab = useCallback((key: number) => {
     setTabs((t) => {
+      const closing = t.find((x) => x.key === key);
+      if (closing) {
+        // The pty exiting means the tmux session ended — drop its saved entry.
+        const saved = loadJSON<Record<string, SavedTab>>(TMUX_TABS_KEY, {});
+        delete saved[tmuxName(closing.slotId)];
+        localStorage.setItem(TMUX_TABS_KEY, JSON.stringify(saved));
+      }
       const next = t.filter((x) => x.key !== key);
       setActiveTab((cur) => (cur === key ? (next[next.length - 1]?.key ?? null) : cur));
       return next;
@@ -328,6 +392,9 @@ export default function App() {
                 onProjectShell={projectShell}
                 onProjectClaude={projectClaude}
                 onRefresh={refreshSessions}
+                tmuxAvailable={tmuxOk}
+                tmuxOn={persistTmux}
+                onTmuxChange={setPersistTmux}
               />
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
