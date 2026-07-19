@@ -12,10 +12,12 @@ interface Group {
   name: string;
   color: string;
   collapsed: boolean;
+  /** Project paths — a group holds projects, and every session of a member
+   *  project shows under it. */
   members: string[];
 }
 
-const GROUPS_KEY = "aiterm.sessionGroups";
+const GROUPS_KEY = "aiterm.projectGroups";
 const PALETTE = ["#61afef", "#98c379", "#e5c07b", "#e06c75", "#c678dd", "#56b6c2", "#da7756"];
 
 function loadGroups(): Group[] {
@@ -90,31 +92,31 @@ export default function SessionsPanel({
   }, [sessions, query]);
 
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
-  const ungrouped = filtered.filter((s) => !grouped.has(s.id));
+  const ungrouped = filtered.filter((s) => !grouped.has(s.project_path));
 
   const toggle = (k: keyof SessionDisplayOpts) => onOptsChange({ ...opts, [k]: !opts[k] });
 
-  const moveToGroup = (groupId: string | null, sessionId: string) => {
+  const moveToGroup = (groupId: string | null, projectPath: string) => {
     setGroups((gs) =>
       gs.map((g) => ({
         ...g,
         members:
           g.id === groupId
-            ? [...g.members.filter((m) => m !== sessionId), sessionId]
-            : g.members.filter((m) => m !== sessionId),
+            ? [...g.members.filter((m) => m !== projectPath), projectPath]
+            : g.members.filter((m) => m !== projectPath),
       })),
     );
   };
 
-  const createGroup = (sessionId: string) => {
+  const createGroup = (projectPath: string) => {
     setGroups((gs) => [
-      ...gs.map((g) => ({ ...g, members: g.members.filter((m) => m !== sessionId) })),
+      ...gs.map((g) => ({ ...g, members: g.members.filter((m) => m !== projectPath) })),
       {
         id: crypto.randomUUID(),
-        name: `Group ${gs.length + 1}`,
+        name: projectPath.split("/").filter(Boolean).pop() ?? `Group ${gs.length + 1}`,
         color: PALETTE[gs.length % PALETTE.length],
         collapsed: false,
-        members: [sessionId],
+        members: [projectPath],
       },
     ]);
   };
@@ -164,9 +166,9 @@ export default function SessionsPanel({
         key={s.id}
         draggable
         onDragStart={(e) => {
-          e.dataTransfer.setData("text/aiterm-session", s.id);
+          e.dataTransfer.setData("text/aiterm-session", s.project_path);
           e.dataTransfer.effectAllowed = "move";
-          setDragId(s.id);
+          setDragId(s.project_path);
         }}
         onDragEnd={() => { setDragId(null); setDragOver(null); }}
         className={
@@ -239,7 +241,7 @@ export default function SessionsPanel({
           </div>
         )}
         {groups.map((g) => {
-          const members = filtered.filter((s) => g.members.includes(s.id));
+          const members = filtered.filter((s) => g.members.includes(s.project_path));
           if (members.length === 0 && query) return null;
           const open = !g.collapsed || query.length > 0;
           return (
