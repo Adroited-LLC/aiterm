@@ -138,12 +138,6 @@ export default function App() {
     });
   }, []);
 
-  useEffect(() => {
-    // Start with one shell in the home directory.
-    if (tabs.length === 0 && nextKey.current === 1) openTab("shell", null, null, "shell:home");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   const selectSession = (s: Session) => {
     setActiveProject(s.project_path);
     // Warp-style: the sidebar is the tab list — switch to this item's live
@@ -279,7 +273,7 @@ export default function App() {
               />
             ))}
             {tabs.length === 0 && (
-              <div className="empty-note big">No terminal open — press ＋ or pick a session</div>
+              <div className="empty-note big">Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
             )}
           </div>
           {showComposer && <Composer
