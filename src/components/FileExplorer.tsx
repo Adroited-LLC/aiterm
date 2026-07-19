@@ -32,6 +32,7 @@ function FileIcon() {
 
 export default function FileExplorer({ root }: { root: string | null }) {
   const [tree, setTree] = useState<Node[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (path: string, depth: number): Promise<Node[]> => {
     const entries = await listDir(path).catch(() => [] as DirEntry[]);
@@ -41,9 +42,18 @@ export default function FileExplorer({ root }: { root: string | null }) {
   useEffect(() => {
     if (!root) {
       setTree([]);
+      setError(null);
       return;
     }
-    load(root, 0).then(setTree);
+    listDir(root)
+      .then((entries) => {
+        setError(null);
+        setTree(entries.map((e) => ({ ...e, depth: 0, expanded: false, children: null })));
+      })
+      .catch((e) => {
+        setTree([]);
+        setError(String(e));
+      });
   }, [root, load]);
 
   const toggleNode = async (target: Node) => {
@@ -80,5 +90,7 @@ export default function FileExplorer({ root }: { root: string | null }) {
     ));
 
   if (!root) return <div className="empty-note">Select a project to browse files</div>;
+  if (error) return <div className="empty-note">Can't read {root}: {error}</div>;
+  if (tree.length === 0) return <div className="empty-note">Empty folder</div>;
   return <div className="file-tree">{renderNodes(tree)}</div>;
 }

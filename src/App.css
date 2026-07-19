@@ -343,11 +343,12 @@ body.dragging * { pointer-events: none; }
   50% { opacity: 0.35; }
 }
 
-/* ---------- right column ---------- */
+/* ---------- right area: explorer | git side by side ---------- */
 .right-col {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   min-height: 0;
+  min-width: 0;
   flex-shrink: 0;
 }
 

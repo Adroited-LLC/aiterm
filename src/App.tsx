@@ -49,7 +49,7 @@ export default function App() {
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
   );
   const [sizes, setSizes] = useState<PanelSizes>(() =>
-    loadJSON(SIZES_KEY, { left: 280, right: 380, explorerFrac: 0.5 }),
+    loadJSON(SIZES_KEY, { left: 280, right: 560, explorerFrac: 0.5 }),
   );
 
   useEffect(() => localStorage.setItem(OPTS_KEY, JSON.stringify(opts)), [opts]);
@@ -173,7 +173,7 @@ export default function App() {
         }));
       } else if (dragging.current === "rightsplit" && rightColRef.current) {
         const r = rightColRef.current.getBoundingClientRect();
-        const frac = (e.clientY - r.top) / r.height;
+        const frac = (e.clientX - r.left) / r.width;
         setSizes((s) => ({ ...s, explorerFrac: Math.max(0.15, Math.min(0.85, frac)) }));
       }
     };
@@ -296,7 +296,7 @@ export default function App() {
               {showExplorer && (
                 <div
                   className="panel explorer"
-                  style={{ height: showGit ? `${sizes.explorerFrac * 100}%` : "100%" }}
+                  style={{ width: showGit ? `${sizes.explorerFrac * 100}%` : "100%" }}
                 >
                   <div className="panel-header">
                     <span>EXPLORER</span>
@@ -306,10 +306,10 @@ export default function App() {
                 </div>
               )}
               {showExplorer && showGit && (
-                <div className="splitter h" onMouseDown={() => startDrag("rightsplit")} />
+                <div className="splitter v" onMouseDown={() => startDrag("rightsplit")} />
               )}
               {showGit && (
-                <div className="panel git" style={{ flex: 1, minHeight: 0 }}>
+                <div className="panel git" style={{ flex: 1, minWidth: 0 }}>
                   <div className="panel-header">
                     <span>REPOSITORY</span>
                     <div>
