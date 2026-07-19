@@ -42,6 +42,8 @@ export default function App() {
   const [showSessions, setShowSessions] = useState(true);
   const [showExplorer, setShowExplorer] = useState(true);
   const [showGit, setShowGit] = useState(true);
+  // Collapsed by default: claude draws its own input bar, so the composer is opt-in.
+  const [showComposer, setShowComposer] = useState(false);
 
   const [opts, setOpts] = useState<SessionDisplayOpts>(() =>
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
@@ -204,6 +206,11 @@ export default function App() {
             title="Toggle repository panel"
             onClick={() => setShowGit(!showGit)}
           >⎇</button>
+          <button
+            className={"icon-btn" + (showComposer ? " on" : "")}
+            title="Toggle input composer"
+            onClick={() => setShowComposer(!showComposer)}
+          >⌨</button>
         </div>
         <div className="topbar-title">
           {activeProject ? activeProject.replace(/^\/home\/[^/]+/, "~") : "aiterm"}
@@ -259,13 +266,14 @@ export default function App() {
                 onExit={closeTab}
                 onRegister={registerHandle}
                 onActivity={noteActivity}
+                autoFocus={!showComposer}
               />
             ))}
             {tabs.length === 0 && (
               <div className="empty-note big">No terminal open — press ＋ or pick a session</div>
             )}
           </div>
-          <Composer
+          {showComposer && <Composer
             tabKey={activeTab}
             tabTitle={activeTabObj?.title ?? null}
             shells={tabs.length}
@@ -275,7 +283,7 @@ export default function App() {
             branch={branch}
             onSend={(text) => activeTab !== null && handles.current.get(activeTab)?.sendComposed(text)}
             onControl={(seq) => activeTab !== null && handles.current.get(activeTab)?.write(seq)}
-          />
+          />}
         </div>
 
         {showRight && (

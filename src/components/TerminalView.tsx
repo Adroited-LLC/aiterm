@@ -29,13 +29,18 @@ interface Props {
   onExit: (key: number) => void;
   onRegister: (key: number, handle: TermHandle | null) => void;
   onActivity: (key: number) => void;
+  /** Focus the terminal itself when it becomes active (composer hidden). */
+  autoFocus: boolean;
 }
 
-export default function TerminalView({ tab, active, onExit, onRegister, onActivity }: Props) {
+export default function TerminalView({
+  tab, active, onExit, onRegister, onActivity, autoFocus,
+}: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
   const ptyIdRef = useRef<number | null>(null);
+  const termRef = useRef<Terminal | null>(null);
 
   useEffect(() => {
     if (!elRef.current || started.current) return;
@@ -64,6 +69,7 @@ export default function TerminalView({ tab, active, onExit, onRegister, onActivi
     });
     const fit = new FitAddon();
     fitRef.current = fit;
+    termRef.current = term;
     term.loadAddon(fit);
     term.open(elRef.current);
     fit.fit();
@@ -125,8 +131,11 @@ export default function TerminalView({ tab, active, onExit, onRegister, onActivi
   }, []);
 
   useEffect(() => {
-    if (active) fitRef.current?.fit();
-  }, [active]);
+    if (active) {
+      fitRef.current?.fit();
+      if (autoFocus) termRef.current?.focus();
+    }
+  }, [active, autoFocus]);
 
   return <div ref={elRef} className="term-host" style={{ display: active ? "block" : "none" }} />;
 }
