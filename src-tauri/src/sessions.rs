@@ -247,18 +247,58 @@ pub fn session_status(session_id: String) -> SessionStatus {
     status
 }
 
-/// Permanently delete a session: its transcript jsonl and its task store.
+/// How long trashed sessions are kept before the next delete purges them.
+const TRASH_KEEP_DAYS: u64 = 7;
+
+/// Delete a session: its transcript jsonl and task store move to
+/// ~/.claude/trash (kept for TRASH_KEEP_DAYS as an undo safety net,
+/// purged lazily on later deletes).
 #[tauri::command]
 pub fn session_delete(session_id: String) -> Result<(), String> {
     if session_id.contains('/') || session_id.contains("..") {
         return Err("invalid session id".into());
     }
     let path = find_session_file(&session_id).ok_or("session not found")?;
-    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-    if let Some(home) = dirs::home_dir() {
-        let tasks = home.join(".claude/tasks").join(&session_id);
-        if tasks.is_dir() {
-            let _ = std::fs::remove_dir_all(tasks);
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let trash = home.join(".claude/trash");
+    std::fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
+
+    // Lazy purge of old trash entries.
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(TRASH_KEEP_DAYS * 86400);
+    if let Ok(entries) = std::fs::read_dir(&trash) {
+        for e in entries.flatten() {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|m| m < cutoff)
+                .unwrap_or(false);
+            if old {
+                let p = e.path();
+                let _ = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+            }
+        }
+    }
+
+    // Same filesystem (~/.claude), so rename is atomic and cheap. Rename
+    // keeps the old mtime, which the purge above reads as age — reset it so
+    // the entry gets its full keep window.
+    let touch = |p: &std::path::Path| {
+        if let Ok(f) = File::open(p) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    };
+    let dest = trash.join(format!("{session_id}.jsonl"));
+    std::fs::rename(&path, &dest).map_err(|e| e.to_string())?;
+    touch(&dest);
+    let tasks = home.join(".claude/tasks").join(&session_id);
+    if tasks.is_dir() {
+        let tasks_dest = trash.join(format!("{session_id}.tasks"));
+        if std::fs::rename(&tasks, &tasks_dest).is_ok() {
+            touch(&tasks_dest);
         }
     }
     Ok(())

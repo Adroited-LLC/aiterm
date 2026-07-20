@@ -103,21 +103,31 @@ fn preview_returns_conversation_tail() {
 }
 
 #[test]
-fn deletes_session_transcript() {
+fn deletes_session_to_trash() {
     // Synthetic session file in a scratch project dir — never touches real data.
-    let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".claude/projects/-aiterm-delete-test");
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let dir = home.join(".claude/projects/-aiterm-delete-test");
     std::fs::create_dir_all(&dir).unwrap();
     let id = "00000000-0000-4000-8000-aitermdelete";
     let file = dir.join(format!("{id}.jsonl"));
     std::fs::write(&file, "{\"type\":\"user\",\"cwd\":\"/tmp\"}\n").unwrap();
 
     aiterm_lib::sessions::session_delete(id.into()).expect("delete should succeed");
-    assert!(!file.exists(), "transcript should be gone");
+    assert!(!file.exists(), "transcript should leave the project dir");
+    let trashed = home.join(".claude/trash").join(format!("{id}.jsonl"));
+    assert!(trashed.exists(), "transcript should land in ~/.claude/trash");
+    // Fresh mtime = full keep window (rename alone would keep the old one).
+    let age = trashed
+        .metadata()
+        .and_then(|m| m.modified())
+        .map(|m| m.elapsed().unwrap_or_default())
+        .unwrap();
+    assert!(age.as_secs() < 60, "trashed file should have a fresh mtime");
     assert!(
         aiterm_lib::sessions::session_delete("../../etc/passwd".into()).is_err(),
         "path traversal must be rejected"
     );
+    let _ = std::fs::remove_file(&trashed);
     let _ = std::fs::remove_dir(&dir);
 }
 

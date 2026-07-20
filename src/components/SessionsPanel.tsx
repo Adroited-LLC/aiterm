@@ -341,7 +341,7 @@ export default function SessionsPanel({
               <span className="confirm-label">Delete session?</span>
               <button
                 className="act-btn danger"
-                title="Delete this session's transcript and task data"
+                title="Move this session's transcript and task data to ~/.claude/trash (kept 7 days)"
                 onClick={() => { setConfirmDel(null); onDelete(s); }}
               >Delete</button>
               <button
