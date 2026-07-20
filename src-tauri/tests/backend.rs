@@ -103,6 +103,25 @@ fn preview_returns_conversation_tail() {
 }
 
 #[test]
+fn deletes_session_transcript() {
+    // Synthetic session file in a scratch project dir — never touches real data.
+    let dir = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".claude/projects/-aiterm-delete-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = "00000000-0000-4000-8000-aitermdelete";
+    let file = dir.join(format!("{id}.jsonl"));
+    std::fs::write(&file, "{\"type\":\"user\",\"cwd\":\"/tmp\"}\n").unwrap();
+
+    aiterm_lib::sessions::session_delete(id.into()).expect("delete should succeed");
+    assert!(!file.exists(), "transcript should be gone");
+    assert!(
+        aiterm_lib::sessions::session_delete("../../etc/passwd".into()).is_err(),
+        "path traversal must be rejected"
+    );
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
 fn full_text_search_finds_sessions() {
     let r = aiterm_lib::indexer::reindex_sessions();
     assert!(r.total > 0, "expected sessions to index");

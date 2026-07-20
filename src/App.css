@@ -484,6 +484,15 @@ body.dragging * { pointer-events: none; }
   line-height: 1.2;
 }
 .act-btn:hover { background: var(--bg-hover); color: var(--accent); }
+.act-btn.danger:hover { color: var(--red); }
+.session-actions.confirming { display: flex; align-items: center; }
+.confirm-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 0 4px 0 8px;
+  white-space: nowrap;
+}
+.session-actions.confirming .act-btn.danger { color: var(--red); }
 
 /* ---------- terminal ---------- */
 .terminal-panel {

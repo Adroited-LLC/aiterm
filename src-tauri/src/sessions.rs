@@ -247,6 +247,23 @@ pub fn session_status(session_id: String) -> SessionStatus {
     status
 }
 
+/// Permanently delete a session: its transcript jsonl and its task store.
+#[tauri::command]
+pub fn session_delete(session_id: String) -> Result<(), String> {
+    if session_id.contains('/') || session_id.contains("..") {
+        return Err("invalid session id".into());
+    }
+    let path = find_session_file(&session_id).ok_or("session not found")?;
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    if let Some(home) = dirs::home_dir() {
+        let tasks = home.join(".claude/tasks").join(&session_id);
+        if tasks.is_dir() {
+            let _ = std::fs::remove_dir_all(tasks);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct PreviewMsg {
     pub role: String,

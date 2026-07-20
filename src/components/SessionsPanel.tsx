@@ -63,6 +63,7 @@ interface Props {
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
   onNewShell: (s: Session) => void;
+  onDelete: (s: Session) => void;
   onSelectProject: (p: ProjectInfo) => void;
   onProjectShell: (p: ProjectInfo) => void;
   onProjectClaude: (p: ProjectInfo) => void;
@@ -94,10 +95,11 @@ function AgentIcon({ agent }: { agent: string }) {
 
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, activeSlot, opts,
-  onOptsChange, onSelect, onResume, onNewShell,
+  onOptsChange, onSelect, onResume, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onRefresh,
 }: Props) {
   const [query, setQuery] = useState("");
+  const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>(
     () => (localStorage.getItem("aiterm.viewMode") as ViewMode) || "recent",
@@ -330,15 +332,46 @@ export default function SessionsPanel({
             </div>
           )}
         </div>
-        <div className="session-actions">
-          <button
-            className="act-btn" title="Resume claude session"
-            onClick={(e) => { e.stopPropagation(); onResume(s); }}
-          >▶</button>
-          <button
-            className="act-btn" title="New shell here"
-            onClick={(e) => { e.stopPropagation(); onNewShell(s); }}
-          >＋</button>
+        <div
+          className={"session-actions" + (confirmDel === s.id ? " confirming" : "")}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {confirmDel === s.id ? (
+            <>
+              <span className="confirm-label">Delete session?</span>
+              <button
+                className="act-btn danger"
+                title="Delete this session's transcript and task data"
+                onClick={() => { setConfirmDel(null); onDelete(s); }}
+              >Delete</button>
+              <button
+                className="act-btn" title="Keep it"
+                onClick={() => setConfirmDel(null)}
+              >Cancel</button>
+            </>
+          ) : (
+            <>
+              <button
+                className="act-btn" title="Resume claude session"
+                onClick={() => onResume(s)}
+              >▶</button>
+              <button
+                className="act-btn" title="New shell here"
+                onClick={() => onNewShell(s)}
+              >＋</button>
+              {!liveSlots.has(s.id) && (
+                <button
+                  className="act-btn danger" title="Delete session…"
+                  onClick={() => setConfirmDel(s.id)}
+                >
+                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none"
+                    stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                    <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.8 9.5a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9L12 4M6.5 7v4.5M9.5 7v4.5" />
+                  </svg>
+                </button>
+              )}
+            </>
+          )}
         </div>
       </div>
     );

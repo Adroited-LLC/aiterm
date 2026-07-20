@@ -73,6 +73,8 @@ export interface PreviewMsg {
 export const listSessions = () => invoke<Session[]>("list_sessions");
 export const sessionPreview = (sessionId: string) =>
   invoke<PreviewMsg[]>("session_preview", { sessionId });
+export const sessionDelete = (sessionId: string) =>
+  invoke<void>("session_delete", { sessionId });
 export const sessionTasks = (sessionId: string) =>
   invoke<SessionTask[]>("session_tasks", { sessionId });
 export const sessionArtifacts = (sessionId: string) =>

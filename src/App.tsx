@@ -12,7 +12,8 @@ import {
 } from "./settings";
 import {
   ProjectInfo, Session, SessionStatus,
-  gitRepoState, listProjects, listSessions, reindexSessions, sessionStatus,
+  gitRepoState, listProjects, listSessions, reindexSessions,
+  sessionDelete, sessionStatus,
 } from "./ipc";
 import "./App.css";
 
@@ -224,6 +225,15 @@ export default function App() {
     setActiveProject(s.project_path);
     openTab(basename(s.project_path), s.project_path, null, `shell:${s.project_path}`);
   };
+  const deleteSession = async (s: Session) => {
+    try {
+      await sessionDelete(s.id);
+    } catch (e) {
+      console.error("delete failed:", e);
+    }
+    setPreviewSession((p) => (p?.id === s.id ? null : p));
+    refreshSessions();
+  };
   const selectProject = (p: ProjectInfo) => {
     setActiveProject(p.path);
     const live =
@@ -359,6 +369,7 @@ export default function App() {
                 onSelect={selectSession}
                 onResume={resumeSession}
                 onNewShell={newShell}
+                onDelete={deleteSession}
                 onSelectProject={selectProject}
                 onProjectShell={projectShell}
                 onProjectClaude={projectClaude}
