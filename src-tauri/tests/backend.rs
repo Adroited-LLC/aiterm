@@ -84,6 +84,25 @@ fn artifacts_parse_from_transcripts() {
 }
 
 #[test]
+fn preview_returns_conversation_tail() {
+    // Any listed session with recent activity should yield preview text; the
+    // messages must be non-empty, role-tagged, and oldest-first.
+    let sessions = ClaudeProvider.scan();
+    let with_msgs = sessions
+        .iter()
+        .find_map(|s| {
+            let p = aiterm_lib::sessions::session_preview(s.id.clone());
+            (!p.is_empty()).then_some(p)
+        })
+        .expect("at least one session should have preview messages");
+    assert!(with_msgs.len() <= 12);
+    for m in &with_msgs {
+        assert!(m.role == "user" || m.role == "assistant");
+        assert!(!m.text.trim().is_empty());
+    }
+}
+
+#[test]
 fn full_text_search_finds_sessions() {
     let r = aiterm_lib::indexer::reindex_sessions();
     assert!(r.total > 0, "expected sessions to index");

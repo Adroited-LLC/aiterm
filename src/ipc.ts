@@ -64,7 +64,15 @@ export interface Artifact {
   at: string;
 }
 
+export interface PreviewMsg {
+  role: "user" | "assistant" | string;
+  text: string;
+  at: string | null;
+}
+
 export const listSessions = () => invoke<Session[]>("list_sessions");
+export const sessionPreview = (sessionId: string) =>
+  invoke<PreviewMsg[]>("session_preview", { sessionId });
 export const sessionTasks = (sessionId: string) =>
   invoke<SessionTask[]>("session_tasks", { sessionId });
 export const sessionArtifacts = (sessionId: string) =>

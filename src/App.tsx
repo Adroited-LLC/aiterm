@@ -6,6 +6,7 @@ import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
 import AgentPanel from "./components/AgentPanel";
 import SettingsModal from "./components/SettingsModal";
+import SessionPreview from "./components/SessionPreview";
 import {
   AppSettings, applySettings, loadSettings, saveSettings, termFontFamily, termTheme,
 } from "./settings";
@@ -41,6 +42,7 @@ export default function App() {
   const [activeProject, setActiveProject] = useState<string | null>(null);
   const [tabs, setTabs] = useState<TermTab[]>([]);
   const [activeTab, setActiveTab] = useState<number | null>(null);
+  const [previewSession, setPreviewSession] = useState<Session | null>(null);
   const nextKey = useRef(1);
   const [gitRefresh, setGitRefresh] = useState(0);
 
@@ -125,6 +127,7 @@ export default function App() {
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string, sessionId?: string) => {
+      setPreviewSession(null);
       setTabs((t) => {
         const existing = t.find((x) => x.slotId === slotId);
         if (existing) {
@@ -200,11 +203,18 @@ export default function App() {
   const selectSession = (s: Session) => {
     setActiveProject(s.project_path);
     // Warp-style: the sidebar is the tab list — switch to this item's live
-    // terminal if it has one (resume first, then a project shell).
+    // terminal if it has one (resume first, then a project shell). Without
+    // one, show a read-only conversation preview so ▶ can be an informed
+    // choice.
     const live =
       tabs.find((t) => t.slotId === s.id) ??
       tabs.find((t) => t.slotId === `shell:${s.project_path}`);
-    if (live) setActiveTab(live.key);
+    if (live) {
+      setPreviewSession(null);
+      setActiveTab(live.key);
+    } else {
+      setPreviewSession(s);
+    }
   };
   const resumeSession = (s: Session) => {
     setActiveProject(s.project_path);
@@ -375,8 +385,15 @@ export default function App() {
                 theme={xtermTheme}
               />
             ))}
-            {tabs.length === 0 && (
+            {tabs.length === 0 && !previewSession && (
               <div className="empty-note big">Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
+            )}
+            {previewSession && (
+              <SessionPreview
+                session={previewSession}
+                onResume={resumeSession}
+                onClose={() => setPreviewSession(null)}
+              />
             )}
           </div>
           {showComposer && <Composer

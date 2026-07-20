@@ -248,6 +248,78 @@ pub fn session_status(session_id: String) -> SessionStatus {
 }
 
 #[derive(Serialize)]
+pub struct PreviewMsg {
+    pub role: String,
+    pub text: String,
+    pub at: Option<String>,
+}
+
+/// Tail of the human-visible conversation for a session — used by the
+/// pre-resume preview pane. Returns the last few user/assistant text
+/// messages, oldest first.
+#[tauri::command]
+pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
+    const KEEP: usize = 12;
+    const MAX_CHARS: usize = 700;
+    let Some(path) = find_session_file(&session_id) else {
+        return vec![];
+    };
+    let Ok(file) = File::open(&path) else {
+        return vec![];
+    };
+    let mut out: std::collections::VecDeque<PreviewMsg> = std::collections::VecDeque::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        // Cheap substring filter before JSON parsing.
+        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\":\"assistant\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let role = match v.get("type").and_then(|t| t.as_str()) {
+            Some(r @ ("user" | "assistant")) => r.to_string(),
+            _ => continue,
+        };
+        // Subagent traffic isn't part of the main conversation.
+        if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+            continue;
+        }
+        let mut text = String::new();
+        match v.pointer("/message/content") {
+            Some(serde_json::Value::String(s)) => text = s.clone(),
+            Some(serde_json::Value::Array(blocks)) => {
+                for b in blocks {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let text = strip_system_tags(&text);
+        if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
+            continue;
+        }
+        let truncated = text.chars().count() > MAX_CHARS;
+        let mut text: String = text.chars().take(MAX_CHARS).collect();
+        if truncated {
+            text.push('…');
+        }
+        let at = v.get("timestamp").and_then(|t| t.as_str()).map(String::from);
+        out.push_back(PreviewMsg { role, text, at });
+        if out.len() > KEEP {
+            out.pop_front();
+        }
+    }
+    out.into()
+}
+
+#[derive(Serialize)]
 pub struct SessionTask {
     pub id: String,
     pub subject: String,
