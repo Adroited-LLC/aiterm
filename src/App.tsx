@@ -259,11 +259,14 @@ export default function App() {
       if (!dragging.current) return;
       e.preventDefault();
       if (dragging.current === "left") {
-        setSizes((s) => ({ ...s, left: Math.max(180, Math.min(500, e.clientX)) }));
+        setSizes((s) => ({
+          ...s,
+          left: Math.max(140, Math.min(window.innerWidth - 260, e.clientX)),
+        }));
       } else if (dragging.current === "right") {
         setSizes((s) => ({
           ...s,
-          right: Math.max(220, Math.min(700, window.innerWidth - e.clientX)),
+          right: Math.max(150, Math.min(window.innerWidth - 260, window.innerWidth - e.clientX)),
         }));
       } else if (dragging.current === "rightsplit" && rightColRef.current) {
         const r = rightColRef.current.getBoundingClientRect();

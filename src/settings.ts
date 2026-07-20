@@ -155,8 +155,8 @@ export const THEMES: Theme[] = [
     id: "carbon",
     name: "Carbon",
     vars: {
-      bg: "#000000", bgPanel: "#161616", bgRaised: "#1f1f1f", bgHover: "#262626",
-      bgActive: "#303030", border: "#2a2a2a", text: "#e4e4e4", textDim: "#9a9a9a",
+      bg: "#000000", bgPanel: "#0f0f0f", bgRaised: "#181818", bgHover: "#1f1f1f",
+      bgActive: "#2a2a2a", border: "#222222", text: "#e4e4e4", textDim: "#9a9a9a",
       textFaint: "#666666", accent: "#e8e8e8", green: "#0dbc79", red: "#f14c4c",
       yellow: "#cca700", blue: "#3b8eea", cyan: "#29b8db",
     },
