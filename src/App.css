@@ -332,14 +332,29 @@ body.dragging * { pointer-events: none; }
 .session-item {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 6px 8px;
+  gap: 10px;
+  padding: 9px 9px;
   margin: 1px 0;
   border-radius: 8px;
   cursor: pointer;
   position: relative;
   transition: background 0.1s;
 }
+
+/* Hairline between rows in group/section lists, inset past the badge. */
+.session-group .session-item + .session-item::after {
+  content: "";
+  position: absolute;
+  top: -1.5px;
+  left: 47px;
+  right: 8px;
+  height: 1px;
+  background: var(--border);
+  opacity: 0.55;
+  pointer-events: none;
+}
+.session-group .session-item:hover::after,
+.session-group .session-item.active::after { opacity: 0; }
 .session-item:hover { background: var(--bg-hover); }
 .session-item.active { background: var(--bg-active); }
 .session-item.dragging { opacity: 0.45; }
@@ -439,7 +454,7 @@ body.dragging * { pointer-events: none; }
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 1.5px;
+  margin-top: 3px;
   font-size: 10.5px;
   color: var(--text-faint);
 }
