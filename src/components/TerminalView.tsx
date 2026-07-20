@@ -35,10 +35,12 @@ interface Props {
   /** Focus the terminal itself when it becomes active (composer hidden). */
   autoFocus: boolean;
   fontSize: number;
+  fontFamily: string;
+  theme: Record<string, string>;
 }
 
 export default function TerminalView({
-  tab, active, onExit, onRegister, onActivity, autoFocus, fontSize,
+  tab, active, onExit, onRegister, onActivity, autoFocus, fontSize, fontFamily, theme,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -51,25 +53,11 @@ export default function TerminalView({
     started.current = true;
 
     const term = new Terminal({
-      fontFamily: "'JetBrainsMono Nerd Font', 'JetBrains Mono', 'Fira Code', monospace",
+      fontFamily,
       fontSize,
       cursorBlink: true,
       allowProposedApi: true,
-      theme: {
-        background: "#121317",
-        foreground: "#d8dae5",
-        cursor: "#da7756",
-        selectionBackground: "#33364180",
-        black: "#1c1e24",
-        red: "#e06c75",
-        green: "#98c379",
-        yellow: "#e5c07b",
-        blue: "#61afef",
-        magenta: "#c678dd",
-        cyan: "#56b6c2",
-        white: "#d8dae5",
-        brightBlack: "#5c6370",
-      },
+      theme,
     });
     const fit = new FitAddon();
     fitRef.current = fit;
@@ -147,6 +135,18 @@ export default function TerminalView({
       fitRef.current?.fit();
     }
   }, [fontSize]);
+
+  useEffect(() => {
+    const term = termRef.current;
+    if (term && term.options.fontFamily !== fontFamily) {
+      term.options.fontFamily = fontFamily;
+      fitRef.current?.fit();
+    }
+  }, [fontFamily]);
+
+  useEffect(() => {
+    if (termRef.current) termRef.current.options.theme = theme;
+  }, [theme]);
 
   return <div ref={elRef} className="term-host" style={{ display: active ? "block" : "none" }} />;
 }

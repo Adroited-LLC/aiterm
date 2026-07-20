@@ -126,7 +126,15 @@ export default function Composer({
     }
   };
 
-  const rows = Math.min(8, Math.max(1, text.split("\n").length));
+  // Auto-grow with the content (counting "\n" misses wrapped lines and cut
+  // text off): measure scrollHeight, cap via CSS max-height + scrolling.
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${ta.scrollHeight}px`;
+  }, [text]);
+
   const perm = claudeStatus?.permission_mode ? permissionLabel(claudeStatus.permission_mode) : null;
 
   return (
@@ -136,7 +144,7 @@ export default function Composer({
         <span className="composer-prompt">❯</span>
         <textarea
           ref={taRef}
-          rows={rows}
+          rows={1}
           value={text}
           spellCheck={false}
           placeholder={tabKey === null ? "No terminal open" : "Type a command or prompt — Enter to send, Shift+Enter for newline"}

@@ -1,10 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
 import AgentPanel from "./components/AgentPanel";
+import SettingsModal from "./components/SettingsModal";
+import {
+  AppSettings, applySettings, loadSettings, saveSettings, termFontFamily, termTheme,
+} from "./settings";
 import {
   ProjectInfo, Session, SessionStatus,
   gitRepoState, hasTmux, listProjects, listSessions, reindexSessions,
@@ -93,6 +97,19 @@ export default function App() {
     () => loadJSON(FONT_KEY, { scale: 1 }).scale,
   );
 
+  const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  useEffect(() => {
+    applySettings(settings);
+    saveSettings(settings);
+  }, [settings]);
+  useEffect(() => {
+    if (!showSettingsModal) return;
+    const h = (e: KeyboardEvent) => e.key === "Escape" && setShowSettingsModal(false);
+    window.addEventListener("keydown", h, true);
+    return () => window.removeEventListener("keydown", h, true);
+  }, [showSettingsModal]);
+
   useEffect(() => localStorage.setItem(OPTS_KEY, JSON.stringify(opts)), [opts]);
   useEffect(() => localStorage.setItem(SIZES_KEY, JSON.stringify(sizes)), [sizes]);
   useEffect(() => localStorage.setItem(FONT_KEY, JSON.stringify({ scale: fontScale })), [fontScale]);
@@ -115,8 +132,11 @@ export default function App() {
     return () => window.removeEventListener("keydown", h, true);
   }, [bumpFont]);
 
-  const termFont = Math.round(13 * fontScale);
-  const panelZoom = { zoom: fontScale } as React.CSSProperties;
+  const termFont = Math.round(settings.termFontSize * fontScale);
+  const xtermTheme = useMemo(() => termTheme(settings), [settings]);
+  const xtermFont = useMemo(() => termFontFamily(settings), [settings]);
+  const zoomFor = (panel: keyof AppSettings["panelScale"]): React.CSSProperties =>
+    ({ zoom: fontScale * settings.panelScale[panel] } as React.CSSProperties);
 
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
 
@@ -371,12 +391,17 @@ export default function App() {
             onClick={() => bumpFont(0)}
           >{Math.round(fontScale * 100)}%</button>
           <button className="icon-btn" title="Larger fonts (Ctrl+=)" onClick={() => bumpFont(1)}>A+</button>
+          <button
+            className={"icon-btn" + (showSettingsModal ? " on" : "")}
+            title="Settings"
+            onClick={() => setShowSettingsModal(!showSettingsModal)}
+          >⚙</button>
         </div>
       </div>
       <div className="main">
         {showSessions && (
           <>
-            <div className="panel sessions" style={{ width: sizes.left, ...panelZoom }}>
+            <div className="panel sessions" style={{ width: sizes.left, ...zoomFor("sessions") }}>
               <SessionsPanel
                 sessions={sessions}
                 projects={projects}
@@ -413,6 +438,8 @@ export default function App() {
                 onActivity={noteActivity}
                 autoFocus={!showComposer}
                 fontSize={termFont}
+                fontFamily={xtermFont}
+                theme={xtermTheme}
               />
             ))}
             {tabs.length === 0 && (
@@ -435,7 +462,7 @@ export default function App() {
         {showRight && (
           <>
             <div className="splitter v" onMouseDown={() => startDrag("right")} />
-            <div className="right-col" ref={rightColRef} style={{ width: sizes.right, ...panelZoom }}>
+            <div className="right-col" ref={rightColRef} style={{ width: sizes.right }}>
               <div
                 className="right-top"
                 style={{ height: showAgent ? `${(1 - sizes.agentFrac) * 100}%` : "100%" }}
@@ -443,7 +470,7 @@ export default function App() {
                 {showExplorer && (
                   <div
                     className="panel explorer"
-                    style={{ width: showGit ? `${sizes.explorerFrac * 100}%` : "100%" }}
+                    style={{ width: showGit ? `${sizes.explorerFrac * 100}%` : "100%", ...zoomFor("explorer") }}
                   >
                     <div className="panel-header">
                       <span>EXPLORER</span>
@@ -456,7 +483,7 @@ export default function App() {
                   <div className="splitter v" onMouseDown={() => startDrag("rightsplit")} />
                 )}
                 {showGit && (
-                  <div className="panel git" style={{ flex: 1, minWidth: 0 }}>
+                  <div className="panel git" style={{ flex: 1, minWidth: 0, ...zoomFor("git") }}>
                     <div className="panel-header">
                       <span>REPOSITORY</span>
                       <div>
@@ -472,7 +499,7 @@ export default function App() {
               {showAgent && (
                 <>
                   <div className="splitter h" onMouseDown={() => startDrag("agentsplit")} />
-                  <div className="panel agent" style={{ flex: 1, minHeight: 0 }}>
+                  <div className="panel agent" style={{ flex: 1, minHeight: 0, ...zoomFor("agent") }}>
                     <div className="panel-header">
                       <span>AGENT{activeTabObj?.title ? ` — ${activeTabObj.title}` : ""}</span>
                       <button className="icon-btn" onClick={() => setShowAgent(false)}>✕</button>
@@ -485,6 +512,13 @@ export default function App() {
           </>
         )}
       </div>
+      {showSettingsModal && (
+        <SettingsModal
+          settings={settings}
+          onChange={setSettings}
+          onClose={() => setShowSettingsModal(false)}
+        />
+      )}
     </div>
   );
 }

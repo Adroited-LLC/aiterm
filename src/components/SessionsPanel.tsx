@@ -1,5 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ProjectInfo, Session, homeAbbrev, relTime, searchSessions } from "../ipc";
+import { ProjectInfo, Session, homeAbbrev, searchSessions } from "../ipc";
+
+/** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
+function shortTime(ms: number): string {
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60) return "now";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  if (s < 30 * 86400) return `${Math.floor(s / 86400)}d`;
+  return `${Math.floor(s / (30 * 86400))}mo`;
+}
 
 type ViewMode = "recent" | "project" | "date";
 
@@ -299,25 +309,38 @@ export default function SessionsPanel({
           onSelect(s);
         }}
       >
-        <AgentIcon agent={s.agent} />
+        <div className={"agent-badge" + (s.agent === "claude" ? " claude" : "")}>
+          <AgentIcon agent={s.agent} />
+          {isLive && <span className="live-dot badge-dot" title="Terminal running" />}
+        </div>
         <div className="session-text">
-          <div className="session-title">
-            {isLive && <span className="live-dot" title="Terminal running" />}
-            {s.title}
+          <div className="session-title-row">
+            <span className="session-title">{s.title}</span>
+            {opts.showTime && <span className="session-time">{shortTime(s.last_active)}</span>}
           </div>
-          {opts.showPath && <div className="session-sub">{homeAbbrev(s.project_path)}</div>}
-          <div className="session-meta">
-            {opts.showBranch && s.branch && <span className="branch">⎇ {s.branch}</span>}
-            {opts.showTime && <span className="time">{relTime(s.last_active)}</span>}
-          </div>
+          {(opts.showPath || (opts.showBranch && s.branch)) && (
+            <div className="session-meta">
+              {opts.showPath && (
+                <span className="session-sub">{homeAbbrev(s.project_path)}</span>
+              )}
+              {opts.showBranch && s.branch && (
+                <span className="branch">
+                  <svg viewBox="0 0 16 16" width="9" height="9" fill="currentColor">
+                    <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628a2.25 2.25 0 0 1-1.5-2.122z" />
+                  </svg>
+                  {s.branch}
+                </span>
+              )}
+            </div>
+          )}
         </div>
         <div className="session-actions">
           <button
-            className="icon-btn" title="Resume session"
+            className="act-btn" title="Resume claude session"
             onClick={(e) => { e.stopPropagation(); onResume(s); }}
           >▶</button>
           <button
-            className="icon-btn" title="New shell here"
+            className="act-btn" title="New shell here"
             onClick={(e) => { e.stopPropagation(); onNewShell(s); }}
           >＋</button>
         </div>
@@ -338,24 +361,30 @@ export default function SessionsPanel({
         }
         onClick={() => onSelectProject(p)}
       >
-        <svg className="agent-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
-          stroke="currentColor" strokeWidth="2">
-          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-        </svg>
+        <div className="agent-badge folder">
+          <svg className="agent-icon" viewBox="0 0 24 24" width="15" height="15" fill="none"
+            stroke="currentColor" strokeWidth="2">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+          </svg>
+          {isLive && <span className="live-dot badge-dot" title="Terminal running" />}
+        </div>
         <div className="session-text">
-          <div className="session-title">
-            {isLive && <span className="live-dot" title="Terminal running" />}
-            {p.name}
+          <div className="session-title-row">
+            <span className="session-title">{p.name}</span>
           </div>
-          {opts.showPath && <div className="session-sub">{homeAbbrev(p.path)}</div>}
+          {opts.showPath && (
+            <div className="session-meta">
+              <span className="session-sub">{homeAbbrev(p.path)}</span>
+            </div>
+          )}
         </div>
         <div className="session-actions">
           <button
-            className="icon-btn" title="Start claude here"
+            className="act-btn" title="Start claude here"
             onClick={(e) => { e.stopPropagation(); onProjectClaude(p); }}
           >▶</button>
           <button
-            className="icon-btn" title="New shell here"
+            className="act-btn" title="New shell here"
             onClick={(e) => { e.stopPropagation(); onProjectShell(p); }}
           >＋</button>
         </div>
@@ -366,12 +395,23 @@ export default function SessionsPanel({
   return (
     <div className="sessions-panel">
       <div className="panel-toolbar">
-        <input
-          className="search-input"
-          placeholder="Search sessions..."
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-        />
+        <div className="search-box">
+          <svg className="search-icon" viewBox="0 0 16 16" width="12" height="12"
+            fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+            <circle cx="7" cy="7" r="4.5" />
+            <path d="M10.5 10.5L14 14" />
+          </svg>
+          <input
+            className="search-input"
+            placeholder="Search sessions…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+          />
+          {query && (
+            <button className="search-clear" title="Clear" onClick={() => setQuery("")}>✕</button>
+          )}
+        </div>
         <button className="icon-btn" title="Refresh" onClick={onRefresh}>⟳</button>
         <div className="settings-wrap">
           <button
