@@ -56,6 +56,8 @@ interface Props {
   activeProject: string | null;
   /** Slot ids that currently have a live terminal. */
   liveSlots: Set<string>;
+  /** Slot ids whose terminal rang the bell (claude waiting on input). */
+  attentionSlots: Set<string>;
   /** Slot id of the terminal currently displayed. */
   activeSlot: string | null;
   opts: SessionDisplayOpts;
@@ -98,7 +100,7 @@ function AgentIcon({ agent }: { agent: string }) {
 }
 
 export default function SessionsPanel({
-  sessions, projects, activeProject, liveSlots, activeSlot, opts,
+  sessions, projects, activeProject, liveSlots, attentionSlots, activeSlot, opts,
   onOptsChange, onSelect, onResume, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty,
@@ -396,6 +398,8 @@ export default function SessionsPanel({
 
   const renderItem = (s: Session) => {
     const isLive = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
+    const hasAttn =
+      attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
     const isShowing = activeSlot !== null &&
       (activeSlot === s.id || activeSlot === `shell:${s.project_path}`);
     return (
@@ -422,7 +426,12 @@ export default function SessionsPanel({
       >
         <div className={"agent-badge" + (s.agent === "claude" ? " claude" : "")}>
           <AgentIcon agent={s.agent} />
-          {isLive && <span className="live-dot badge-dot" title="Terminal running" />}
+          {(isLive || hasAttn) && (
+            <span
+              className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
+              title={hasAttn ? "Waiting for your input" : "Terminal running"}
+            />
+          )}
         </div>
         <div className="session-text">
           <div className="session-title-row">
@@ -492,6 +501,8 @@ export default function SessionsPanel({
 
   const renderProject = (p: ProjectInfo) => {
     const isLive = liveSlots.has(`claude:${p.path}`) || liveSlots.has(`shell:${p.path}`);
+    const hasAttn =
+      attentionSlots.has(`claude:${p.path}`) || attentionSlots.has(`shell:${p.path}`);
     const isShowing = activeSlot === `claude:${p.path}` || activeSlot === `shell:${p.path}`;
     return (
       <div
@@ -508,7 +519,12 @@ export default function SessionsPanel({
             stroke="currentColor" strokeWidth="2">
             <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
           </svg>
-          {isLive && <span className="live-dot badge-dot" title="Terminal running" />}
+          {(isLive || hasAttn) && (
+            <span
+              className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
+              title={hasAttn ? "Waiting for your input" : "Terminal running"}
+            />
+          )}
         </div>
         <div className="session-text">
           <div className="session-title-row">

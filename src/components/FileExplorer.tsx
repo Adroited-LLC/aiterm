@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { DirEntry, listDir, openPath } from "../ipc";
 
 interface Node extends DirEntry {
@@ -29,10 +29,16 @@ function FileIcon() {
   );
 }
 
-export default function FileExplorer({ root }: { root: string | null }) {
+export default function FileExplorer({
+  root, refreshKey = 0,
+}: { root: string | null; refreshKey?: number }) {
   const [tree, setTree] = useState<Node[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [openErr, setOpenErr] = useState<string | null>(null);
+  const treeRef = useRef<Node[]>([]);
+  useEffect(() => {
+    treeRef.current = tree;
+  }, [tree]);
 
   const openFile = (path: string) => {
     setOpenErr(null);
@@ -63,6 +69,39 @@ export default function FileExplorer({ root }: { root: string | null }) {
         setError(String(e));
       });
   }, [root, load]);
+
+  // File-watcher refresh: re-list the root and every expanded dir, keeping
+  // the expansion state intact.
+  useEffect(() => {
+    if (!refreshKey || !root) return;
+    const expanded = new Set<string>();
+    const collect = (nodes: Node[]) =>
+      nodes.forEach((n) => {
+        if (n.expanded) {
+          expanded.add(n.path);
+          if (n.children) collect(n.children);
+        }
+      });
+    collect(treeRef.current);
+    const build = async (path: string, depth: number): Promise<Node[]> => {
+      const entries = await load(path, depth);
+      return Promise.all(
+        entries.map(async (n) =>
+          n.is_dir && expanded.has(n.path)
+            ? { ...n, expanded: true, children: await build(n.path, depth + 1) }
+            : n,
+        ),
+      );
+    };
+    let stale = false;
+    build(root, 0).then((t) => {
+      if (!stale) setTree(t);
+    });
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   const toggleNode = async (target: Node) => {
     if (!target.is_dir) return;

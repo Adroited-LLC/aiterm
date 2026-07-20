@@ -389,6 +389,14 @@ body.dragging * { pointer-events: none; }
   border: 2px solid var(--bg-panel);
   box-sizing: content-box;
 }
+.badge-dot.attn {
+  background: var(--yellow);
+  animation: attn-pulse 1s ease-in-out infinite;
+}
+@keyframes attn-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.35); opacity: 0.6; }
+}
 
 .session-title-row {
   display: flex;

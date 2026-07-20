@@ -32,6 +32,8 @@ interface Props {
   onExit: (key: number) => void;
   onRegister: (key: number, handle: TermHandle | null) => void;
   onActivity: (key: number) => void;
+  /** Bell = the program wants eyes (claude prompts ring it); typing clears. */
+  onAttention: (key: number, on: boolean) => void;
   /** Focus the terminal itself when it becomes active (composer hidden). */
   autoFocus: boolean;
   fontSize: number;
@@ -40,7 +42,7 @@ interface Props {
 }
 
 export default function TerminalView({
-  tab, active, onExit, onRegister, onActivity, autoFocus, fontSize, fontFamily, theme,
+  tab, active, onExit, onRegister, onActivity, onAttention, autoFocus, fontSize, fontFamily, theme,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -84,7 +86,11 @@ export default function TerminalView({
       unlistenExit = await listen<{ id: number }>("pty://exit", (e) => {
         if (e.payload.id === id) onExit(tab.key);
       });
-      term.onData((data) => ptyWrite(id, data));
+      term.onBell(() => onAttention(tab.key, true));
+      term.onData((data) => {
+        onAttention(tab.key, false);
+        ptyWrite(id, data);
+      });
       term.onResize(({ cols, rows }) => ptyResize(id, cols, rows));
 
       onRegister(tab.key, {

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
@@ -15,6 +17,7 @@ import {
   TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
+  watchProject,
 } from "./ipc";
 import "./App.css";
 
@@ -47,6 +50,11 @@ export default function App() {
   const [previewSession, setPreviewSession] = useState<Session | null>(null);
   const nextKey = useRef(1);
   const [gitRefresh, setGitRefresh] = useState(0);
+  const [explorerRefresh, setExplorerRefresh] = useState(0);
+
+  // Tabs whose terminal rang the bell while not being looked at.
+  const [attention, setAttention] = useState<Set<number>>(new Set());
+  const activeTabRef = useRef<number | null>(null);
 
   const handles = useRef<Map<number, TermHandle>>(new Map());
   const lastOutput = useRef<Map<number, number>>(new Map());
@@ -153,6 +161,58 @@ export default function App() {
 
   const noteActivity = useCallback((key: number) => {
     lastOutput.current.set(key, Date.now());
+  }, []);
+
+  const noteAttention = useCallback((key: number, on: boolean) => {
+    // A bell on the tab you're actively looking at isn't news.
+    if (on && key === activeTabRef.current && document.hasFocus()) return;
+    setAttention((prev) => {
+      if (on === prev.has(key)) return prev;
+      const next = new Set(prev);
+      if (on) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+    if (on && !document.hasFocus()) {
+      getCurrentWindow()
+        .requestUserAttention(UserAttentionType.Informational)
+        .catch(() => {});
+    }
+  }, []);
+
+  // Viewing a tab (with the window focused) clears its badge.
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+    if (activeTab === null) return;
+    const clear = () => {
+      if (document.hasFocus() && activeTabRef.current !== null) {
+        setAttention((prev) => {
+          if (!prev.has(activeTabRef.current!)) return prev;
+          const next = new Set(prev);
+          next.delete(activeTabRef.current!);
+          return next;
+        });
+      }
+    };
+    clear();
+    window.addEventListener("focus", clear);
+    return () => window.removeEventListener("focus", clear);
+  }, [activeTab]);
+
+  // Watch the active project: git changes refresh the repo panel, tree
+  // changes refresh the explorer (git status also follows tree edits).
+  useEffect(() => {
+    if (!activeProject) return;
+    watchProject(activeProject).catch(console.error);
+  }, [activeProject]);
+  useEffect(() => {
+    const un = listen<{ git: boolean; tree: boolean }>("fs://changed", (e) => {
+      setGitRefresh((n) => n + 1);
+      if (e.payload.tree) setExplorerRefresh((n) => n + 1);
+    });
+    return () => {
+      un.then((f) => f());
+    };
   }, []);
 
   // "working" pulse: active tab produced output within the last 2.5s.
@@ -393,6 +453,9 @@ export default function App() {
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
+                attentionSlots={new Set(
+                  tabs.filter((t) => attention.has(t.key)).map((t) => t.slotId),
+                )}
                 activeSlot={activeTabObj?.slotId ?? null}
                 opts={opts}
                 onOptsChange={setOpts}
@@ -424,6 +487,7 @@ export default function App() {
                 onExit={closeTab}
                 onRegister={registerHandle}
                 onActivity={noteActivity}
+                onAttention={noteAttention}
                 autoFocus={!showComposer}
                 fontSize={termFont}
                 fontFamily={xtermFont}
@@ -471,7 +535,7 @@ export default function App() {
                       <span>EXPLORER</span>
                       <button className="icon-btn" onClick={() => setShowExplorer(false)}>✕</button>
                     </div>
-                    <FileExplorer root={activeProject} />
+                    <FileExplorer root={activeProject} refreshKey={explorerRefresh} />
                   </div>
                 )}
                 {showExplorer && showGit && (

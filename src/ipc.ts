@@ -102,6 +102,7 @@ export interface ProjectInfo {
   last_modified: number;
 }
 
+export const watchProject = (path: string) => invoke<void>("watch_project", { path });
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
 export const openPath = (path: string) => invoke<void>("open_path", { path });
 export const listProjects = () => invoke<ProjectInfo[]>("list_projects");

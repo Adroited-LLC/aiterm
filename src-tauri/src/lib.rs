@@ -3,6 +3,7 @@ pub mod git;
 pub mod indexer;
 pub mod pty;
 pub mod sessions;
+pub mod watcher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -10,6 +11,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty::PtyManager::default())
+        .manage(watcher::WatchState::default())
         .invoke_handler(tauri::generate_handler![
             pty::pty_spawn,
             pty::pty_write,
@@ -25,6 +27,7 @@ pub fn run() {
             sessions::trash_empty,
             sessions::session_tasks,
             sessions::session_artifacts,
+            watcher::watch_project,
             fsx::list_dir,
             fsx::open_path,
             fsx::list_projects,
