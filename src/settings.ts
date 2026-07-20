@@ -151,11 +151,40 @@ export const THEMES: Theme[] = [
       magenta: "#bb9af7", cyan: "#7dcfff", selection: "#343a5580",
     },
   },
+  {
+    id: "carbon",
+    name: "Carbon",
+    vars: {
+      bg: "#000000", bgPanel: "#161616", bgRaised: "#1f1f1f", bgHover: "#262626",
+      bgActive: "#303030", border: "#2a2a2a", text: "#e4e4e4", textDim: "#9a9a9a",
+      textFaint: "#666666", accent: "#e8e8e8", green: "#0dbc79", red: "#f14c4c",
+      yellow: "#cca700", blue: "#3b8eea", cyan: "#29b8db",
+    },
+    term: {
+      red: "#cd3131", green: "#0dbc79", yellow: "#e5e510", blue: "#2472c8",
+      magenta: "#bc3fbc", cyan: "#11a8cd", selection: "#ffffff22",
+    },
+  },
+  {
+    id: "solarized",
+    name: "Solarized",
+    vars: {
+      bg: "#001a21", bgPanel: "#002b36", bgRaised: "#073642", bgHover: "#0a4252",
+      bgActive: "#10505f", border: "#0a3d4a", text: "#adbcbc", textDim: "#839496",
+      textFaint: "#586e75", accent: "#268bd2", green: "#859900", red: "#dc322f",
+      yellow: "#b58900", blue: "#268bd2", cyan: "#2aa198",
+    },
+    term: {
+      red: "#dc322f", green: "#859900", yellow: "#b58900", blue: "#268bd2",
+      magenta: "#d33682", cyan: "#2aa198", selection: "#07364299",
+    },
+  },
 ];
 
 export const ACCENT_SWATCHES = [
-  "#da7756", "#fe8019", "#e5c07b", "#98c379", "#56b6c2",
-  "#61afef", "#7aa2f7", "#bd93f9", "#c678dd", "#e06c75",
+  "#e8e8e8", "#9aa4b5", "#da7756", "#fe8019", "#e5c07b", "#cca700", "#98c379",
+  "#50fa7b", "#2aa198", "#56b6c2", "#61afef", "#7aa2f7", "#bd93f9", "#c678dd",
+  "#ff79c6", "#e06c75",
 ];
 
 export function themeById(id: string): Theme {

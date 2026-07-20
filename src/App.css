@@ -248,6 +248,9 @@ body.dragging * { pointer-events: none; }
   background: var(--bg-panel);
 }
 .group-header.static:hover { background: var(--bg-panel); }
+.group-header.static.clickable { cursor: pointer; }
+.group-header.static.clickable:hover { background: var(--bg-hover); }
+.group-header.static .group-name { text-transform: uppercase; }
 .group-header.static .group-name {
   font-size: 10px;
   font-weight: 600;

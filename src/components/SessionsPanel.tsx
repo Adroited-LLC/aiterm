@@ -100,6 +100,28 @@ export default function SessionsPanel({
 }: Props) {
   const [query, setQuery] = useState("");
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  // Folded auto-sections (Recent list, Project/Date buckets, PROJECTS),
+  // keyed "<viewMode>:<label>" so each view remembers its own folds.
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("aiterm.collapsedSections") ?? "[]"));
+    } catch {
+      return new Set();
+    }
+  });
+  useEffect(
+    () => localStorage.setItem("aiterm.collapsedSections", JSON.stringify([...collapsedSections])),
+    [collapsedSections],
+  );
+  const toggleSection = (key: string) =>
+    setCollapsedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  // Searching always shows everything regardless of folds.
+  const sectionOpen = (key: string) => !collapsedSections.has(key) || query.trim().length > 0;
   const [showSettings, setShowSettings] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>(
     () => (localStorage.getItem("aiterm.viewMode") as ViewMode) || "recent",
@@ -479,15 +501,23 @@ export default function SessionsPanel({
             )}
           </>
         ) : autoSections ? (
-          autoSections.map((sec) => (
-            <div key={sec.label} className="session-group">
-              <div className="group-header static">
-                <span className="group-name">{sec.label}</span>
-                <span className="group-count">{sec.sessions.length}</span>
+          autoSections.map((sec) => {
+            const key = `${viewMode}:${sec.label}`;
+            const open = sectionOpen(key);
+            return (
+              <div key={sec.label} className="session-group">
+                <div
+                  className="group-header static clickable"
+                  onClick={() => toggleSection(key)}
+                >
+                  <span className={"chevron" + (open ? " open" : "")}>›</span>
+                  <span className="group-name">{sec.label}</span>
+                  <span className="group-count">{sec.sessions.length}</span>
+                </div>
+                {open && sec.sessions.map(renderItem)}
               </div>
-              {sec.sessions.map(renderItem)}
-            </div>
-          ))
+            );
+          })
         ) : (
           <>
         {dragId && (
@@ -552,22 +582,36 @@ export default function SessionsPanel({
             </div>
           );
         })}
-        <div
-          className={"ungrouped" + (dragOver === "ungrouped" ? " over" : "")}
-          data-drop="ungrouped"
-        >
-          {ungrouped.map(renderItem)}
-          {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
+        <div className="session-group">
+          <div
+            className="group-header static clickable"
+            onClick={() => toggleSection("recent:all")}
+          >
+            <span className={"chevron" + (sectionOpen("recent:all") ? " open" : "")}>›</span>
+            <span className="group-name">Recent</span>
+            <span className="group-count">{ungrouped.length}</span>
+          </div>
+          <div
+            className={"ungrouped" + (dragOver === "ungrouped" ? " over" : "")}
+            data-drop="ungrouped"
+          >
+            {sectionOpen("recent:all") && ungrouped.map(renderItem)}
+            {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
+          </div>
         </div>
           </>
         )}
         {sessionlessProjects.length > 0 && (
           <div className="session-group">
-            <div className="group-header static projects-header">
-              <span className="group-name">PROJECTS</span>
+            <div
+              className="group-header static clickable projects-header"
+              onClick={() => toggleSection("projects")}
+            >
+              <span className={"chevron" + (sectionOpen("projects") ? " open" : "")}>›</span>
+              <span className="group-name">Projects</span>
               <span className="group-count">{sessionlessProjects.length}</span>
             </div>
-            {sessionlessProjects.map(renderProject)}
+            {sectionOpen("projects") && sessionlessProjects.map(renderProject)}
           </div>
         )}
       </div>
