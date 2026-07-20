@@ -86,10 +86,7 @@ export const searchSessions = (query: string) =>
 export const reindexSessions = () =>
   invoke<{ indexed: number; total: number }>("reindex_sessions");
 
-export const hasTmux = () => invoke<boolean>("has_tmux");
-export const tmuxSessions = () => invoke<string[]>("tmux_sessions");
-
-export const ptySpawn = (cwd: string | null, command: string | null, cols: number, rows: number) =>
+export const ptySpawn =(cwd: string | null, command: string | null, cols: number, rows: number) =>
   invoke<number>("pty_spawn", { cwd, command, cols, rows });
 export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
 export const ptyResize = (id: number, cols: number, rows: number) =>

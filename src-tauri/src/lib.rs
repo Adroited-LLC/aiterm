@@ -14,8 +14,6 @@ pub fn run() {
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
-            pty::has_tmux,
-            pty::tmux_sessions,
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_tasks,

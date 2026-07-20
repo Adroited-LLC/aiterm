@@ -94,30 +94,6 @@ pub fn pty_spawn(
 }
 
 #[tauri::command]
-pub fn has_tmux() -> bool {
-    std::process::Command::new("tmux")
-        .arg("-V")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Names of detached/running aiterm-owned tmux sessions.
-#[tauri::command]
-pub fn tmux_sessions() -> Vec<String> {
-    let Ok(out) = std::process::Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    else {
-        return vec![];
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.starts_with("aiterm-"))
-        .map(String::from)
-        .collect()
-}
-
-#[tauri::command]
 pub fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
     let mut ptys = state.ptys.lock().unwrap();
     let pty = ptys.get_mut(&id).ok_or("no such pty")?;

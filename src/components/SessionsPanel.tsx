@@ -67,9 +67,6 @@ interface Props {
   onProjectShell: (p: ProjectInfo) => void;
   onProjectClaude: (p: ProjectInfo) => void;
   onRefresh: () => void;
-  tmuxAvailable: boolean;
-  tmuxOn: boolean;
-  onTmuxChange: (on: boolean) => void;
 }
 
 function AgentIcon({ agent }: { agent: string }) {
@@ -99,7 +96,6 @@ export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, activeSlot, opts,
   onOptsChange, onSelect, onResume, onNewShell,
   onSelectProject, onProjectShell, onProjectClaude, onRefresh,
-  tmuxAvailable, tmuxOn, onTmuxChange,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showSettings, setShowSettings] = useState(false);
@@ -426,17 +422,6 @@ export default function SessionsPanel({
               <label><input type="checkbox" checked={opts.showPath} onChange={() => toggle("showPath")} /> Project path</label>
               <label><input type="checkbox" checked={opts.showBranch} onChange={() => toggle("showBranch")} /> Git branch</label>
               <label><input type="checkbox" checked={opts.showTime} onChange={() => toggle("showTime")} /> Last active</label>
-              <div className="settings-sep" />
-              <label title={tmuxAvailable
-                ? "New terminals run inside tmux and survive app restarts"
-                : "tmux is not installed"}>
-                <input
-                  type="checkbox"
-                  disabled={!tmuxAvailable}
-                  checked={tmuxAvailable && tmuxOn}
-                  onChange={() => onTmuxChange(!tmuxOn)}
-                /> Persistent terminals
-              </label>
             </div>
           )}
         </div>
