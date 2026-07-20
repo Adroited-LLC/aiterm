@@ -497,6 +497,19 @@ body.dragging * { pointer-events: none; }
 }
 .session-actions.confirming .act-btn.danger { color: var(--red); }
 
+/* trash section */
+.trash-group { opacity: 0.9; }
+.trash-item .session-title { color: var(--text-dim); font-weight: 400; }
+.trash-badge { color: var(--text-faint); }
+.trash-empty-confirm {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+.trash-empty-confirm .confirm-label { font-size: 10.5px; }
+.trash-empty-confirm .act-btn { font-size: 10.5px; padding: 1px 6px; }
+
 /* ---------- terminal ---------- */
 .terminal-panel {
   flex: 1;

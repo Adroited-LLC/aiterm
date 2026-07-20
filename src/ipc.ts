@@ -75,6 +75,20 @@ export const sessionPreview = (sessionId: string) =>
   invoke<PreviewMsg[]>("session_preview", { sessionId });
 export const sessionDelete = (sessionId: string) =>
   invoke<void>("session_delete", { sessionId });
+
+export interface TrashedSession {
+  id: string;
+  title: string;
+  project_path: string;
+  deleted_at: number;
+}
+
+export const trashList = () => invoke<TrashedSession[]>("trash_list");
+export const trashRestore = (sessionId: string) =>
+  invoke<void>("trash_restore", { sessionId });
+export const trashDelete = (sessionId: string) =>
+  invoke<void>("trash_delete", { sessionId });
+export const trashEmpty = () => invoke<void>("trash_empty");
 export const sessionTasks = (sessionId: string) =>
   invoke<SessionTask[]>("session_tasks", { sessionId });
 export const sessionArtifacts = (sessionId: string) =>

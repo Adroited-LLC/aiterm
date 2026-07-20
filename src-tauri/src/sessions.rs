@@ -305,6 +305,136 @@ pub fn session_delete(session_id: String) -> Result<(), String> {
 }
 
 #[derive(Serialize)]
+pub struct TrashedSession {
+    pub id: String,
+    pub title: String,
+    pub project_path: String,
+    pub deleted_at: u64,
+}
+
+fn trash_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude/trash"))
+}
+
+fn valid_id(session_id: &str) -> Result<(), String> {
+    if session_id.is_empty() || session_id.contains('/') || session_id.contains("..") {
+        return Err("invalid session id".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn trash_list() -> Vec<TrashedSession> {
+    let Some(trash) = trash_dir() else {
+        return vec![];
+    };
+    let Ok(rd) = std::fs::read_dir(&trash) else {
+        return vec![];
+    };
+    let mut out: Vec<TrashedSession> = rd
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                return None;
+            }
+            let id = p.file_stem()?.to_string_lossy().to_string();
+            let deleted_at = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // parse_session rejects some transcripts (noise filters); trash
+            // still lists those with a fallback label so nothing is invisible.
+            let (title, project_path) = match parse_session(&p) {
+                Some(s) => (s.title, s.project_path),
+                None => (format!("session {}", &id[..8.min(id.len())]), String::new()),
+            };
+            Some(TrashedSession { id, title, project_path, deleted_at })
+        })
+        .collect();
+    out.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
+    out
+}
+
+/// Claude Code's project-dir flattening: path separators and dots become '-'.
+fn flatten_project_dir(cwd: &str) -> String {
+    cwd.chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+#[tauri::command]
+pub fn trash_restore(session_id: String) -> Result<(), String> {
+    valid_id(&session_id)?;
+    let trash = trash_dir().ok_or("no home dir")?;
+    let src = trash.join(format!("{session_id}.jsonl"));
+    if !src.exists() {
+        return Err("session not in trash".into());
+    }
+    // The transcript's cwd decides which project dir it goes back to.
+    let mut cwd: Option<String> = None;
+    if let Ok(f) = File::open(&src) {
+        for line in BufReader::new(f).lines().take(400).map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                    cwd = Some(c.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    let cwd = cwd.ok_or("transcript has no cwd; can't pick a project dir")?;
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    // Prefer the dir live sessions of this project already use; fall back to
+    // the flattening convention for projects with no other sessions.
+    let proj_dir = ClaudeProvider
+        .scan_with_paths()
+        .into_iter()
+        .find(|(s, _)| s.project_path == cwd)
+        .and_then(|(_, p)| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| home.join(".claude/projects").join(flatten_project_dir(&cwd)));
+    std::fs::create_dir_all(&proj_dir).map_err(|e| e.to_string())?;
+    std::fs::rename(&src, proj_dir.join(format!("{session_id}.jsonl")))
+        .map_err(|e| e.to_string())?;
+    let tasks_src = trash.join(format!("{session_id}.tasks"));
+    if tasks_src.is_dir() {
+        let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(&session_id));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn trash_delete(session_id: String) -> Result<(), String> {
+    valid_id(&session_id)?;
+    let trash = trash_dir().ok_or("no home dir")?;
+    std::fs::remove_file(trash.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
+    let tasks = trash.join(format!("{session_id}.tasks"));
+    if tasks.is_dir() {
+        let _ = std::fs::remove_dir_all(tasks);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn trash_empty() -> Result<(), String> {
+    let trash = trash_dir().ok_or("no home dir")?;
+    if let Ok(rd) = std::fs::read_dir(&trash) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let _ = if p.is_dir() {
+                std::fs::remove_dir_all(&p)
+            } else {
+                std::fs::remove_file(&p)
+            };
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
 pub struct PreviewMsg {
     pub role: String,
     pub text: String,

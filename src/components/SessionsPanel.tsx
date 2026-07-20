@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ProjectInfo, Session, homeAbbrev, searchSessions } from "../ipc";
+import { ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -68,6 +68,10 @@ interface Props {
   onProjectShell: (p: ProjectInfo) => void;
   onProjectClaude: (p: ProjectInfo) => void;
   onRefresh: () => void;
+  trashed: TrashedSession[];
+  onRestore: (id: string) => void;
+  onTrashDelete: (id: string) => void;
+  onTrashEmpty: () => void;
 }
 
 function AgentIcon({ agent }: { agent: string }) {
@@ -97,6 +101,7 @@ export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, activeSlot, opts,
   onOptsChange, onSelect, onResume, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onRefresh,
+  trashed, onRestore, onTrashDelete, onTrashEmpty,
 }: Props) {
   const [query, setQuery] = useState("");
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
@@ -122,6 +127,7 @@ export default function SessionsPanel({
     });
   // Searching always shows everything regardless of folds.
   const sectionOpen = (key: string) => !collapsedSections.has(key) || query.trim().length > 0;
+  const [emptyConfirm, setEmptyConfirm] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>(
     () => (localStorage.getItem("aiterm.viewMode") as ViewMode) || "recent",
@@ -213,6 +219,14 @@ export default function SessionsPanel({
 
   const toggle = (k: keyof SessionDisplayOpts) => onOptsChange({ ...opts, [k]: !opts[k] });
 
+  const filteredTrash = useMemo(() => {
+    const q = query.toLowerCase();
+    if (!q) return trashed;
+    return trashed.filter(
+      (t) => t.title.toLowerCase().includes(q) || t.project_path.toLowerCase().includes(q),
+    );
+  }, [trashed, query]);
+
   const moveToGroup = (groupId: string | null, projectPath: string) => {
     setGroups((gs) =>
       gs.map((g) => ({
@@ -302,6 +316,83 @@ export default function SessionsPanel({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Every foldable section key visible in the current view, for the
+  // collapse/expand-all toolbar button.
+  const sectionKeys = useMemo(() => {
+    const keys: string[] = ["projects", "trash"];
+    if (viewMode === "recent") keys.push("recent:all");
+    else if (autoSections) keys.push(...autoSections.map((s) => `${viewMode}:${s.label}`));
+    return keys;
+  }, [viewMode, autoSections]);
+  const anyOpen =
+    sectionKeys.some((k) => !collapsedSections.has(k)) ||
+    (viewMode === "recent" && groups.some((g) => !g.collapsed));
+  const toggleAll = () => {
+    if (anyOpen) {
+      setCollapsedSections((prev) => new Set([...prev, ...sectionKeys]));
+      if (viewMode === "recent") {
+        setGroups((gs) => gs.map((g) => ({ ...g, collapsed: true })));
+      }
+    } else {
+      setCollapsedSections((prev) => {
+        const next = new Set(prev);
+        sectionKeys.forEach((k) => next.delete(k));
+        return next;
+      });
+      if (viewMode === "recent") {
+        setGroups((gs) => gs.map((g) => ({ ...g, collapsed: false })));
+      }
+    }
+  };
+
+  const renderTrash = (t: TrashedSession) => (
+    <div key={t.id} className="session-item trash-item">
+      <div className="agent-badge trash-badge">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="none"
+          stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+          <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.8 9.5a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9L12 4M6.5 7v4.5M9.5 7v4.5" />
+        </svg>
+      </div>
+      <div className="session-text">
+        <div className="session-title-row">
+          <span className="session-title">{t.title}</span>
+          <span className="session-time">{shortTime(t.deleted_at)}</span>
+        </div>
+        <div className="session-meta">
+          <span className="session-sub">
+            {t.project_path ? homeAbbrev(t.project_path) : "unknown project"}
+          </span>
+        </div>
+      </div>
+      <div
+        className={"session-actions" + (confirmDel === `trash:${t.id}` ? " confirming" : "")}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {confirmDel === `trash:${t.id}` ? (
+          <>
+            <span className="confirm-label">Delete forever?</span>
+            <button
+              className="act-btn danger"
+              onClick={() => { setConfirmDel(null); onTrashDelete(t.id); }}
+            >Delete</button>
+            <button className="act-btn" onClick={() => setConfirmDel(null)}>Cancel</button>
+          </>
+        ) : (
+          <>
+            <button
+              className="act-btn" title="Restore session"
+              onClick={() => onRestore(t.id)}
+            >↩</button>
+            <button
+              className="act-btn danger" title="Delete forever…"
+              onClick={() => setConfirmDel(`trash:${t.id}`)}
+            >✕</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
 
   const renderItem = (s: Session) => {
     const isLive = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
@@ -464,6 +555,20 @@ export default function SessionsPanel({
           )}
         </div>
         <button className="icon-btn" title="Refresh" onClick={onRefresh}>⟳</button>
+        <button
+          className="icon-btn"
+          title={anyOpen ? "Collapse all" : "Expand all"}
+          onClick={toggleAll}
+        >
+          <svg viewBox="0 0 16 16" width="12" height="12" fill="none"
+            stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            {anyOpen ? (
+              <path d="M4 9.5L8 6l4 3.5M4 13.5L8 10l4 3.5" transform="translate(0 -1.5)" />
+            ) : (
+              <path d="M4 3l4 3.5L12 3M4 8l4 3.5L12 8" transform="translate(0 1)" />
+            )}
+          </svg>
+        </button>
         <div className="settings-wrap">
           <button
             className={"icon-btn" + (showSettings ? " on" : "")}
@@ -612,6 +717,35 @@ export default function SessionsPanel({
               <span className="group-count">{sessionlessProjects.length}</span>
             </div>
             {sectionOpen("projects") && sessionlessProjects.map(renderProject)}
+          </div>
+        )}
+        {filteredTrash.length > 0 && (
+          <div className="session-group trash-group">
+            <div
+              className="group-header static clickable"
+              onClick={() => toggleSection("trash")}
+            >
+              <span className={"chevron" + (sectionOpen("trash") ? " open" : "")}>›</span>
+              <span className="group-name">Trash</span>
+              <span className="group-count">{filteredTrash.length}</span>
+              {emptyConfirm ? (
+                <span className="trash-empty-confirm" onClick={(e) => e.stopPropagation()}>
+                  <span className="confirm-label">Empty trash?</span>
+                  <button
+                    className="act-btn danger"
+                    onClick={() => { setEmptyConfirm(false); onTrashEmpty(); }}
+                  >Empty</button>
+                  <button className="act-btn" onClick={() => setEmptyConfirm(false)}>Cancel</button>
+                </span>
+              ) : (
+                <button
+                  className="icon-btn group-del"
+                  title="Empty trash…"
+                  onClick={(e) => { e.stopPropagation(); setEmptyConfirm(true); }}
+                >✕</button>
+              )}
+            </div>
+            {sectionOpen("trash") && filteredTrash.map(renderTrash)}
           </div>
         )}
       </div>

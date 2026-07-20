@@ -127,7 +127,19 @@ fn deletes_session_to_trash() {
         aiterm_lib::sessions::session_delete("../../etc/passwd".into()).is_err(),
         "path traversal must be rejected"
     );
-    let _ = std::fs::remove_file(&trashed);
+
+    // Trash listing shows it, restore brings it back to a project dir
+    // derived from the transcript's cwd.
+    assert!(
+        aiterm_lib::sessions::trash_list().iter().any(|t| t.id == id),
+        "trash_list should include the trashed session"
+    );
+    aiterm_lib::sessions::trash_restore(id.into()).expect("restore should succeed");
+    assert!(!trashed.exists(), "restore should empty the trash entry");
+    let restored = home.join(".claude/projects/-tmp").join(format!("{id}.jsonl"));
+    assert!(restored.exists(), "cwd /tmp flattens to projects/-tmp");
+    let _ = std::fs::remove_file(&restored);
+    let _ = std::fs::remove_dir(home.join(".claude/projects/-tmp"));
     let _ = std::fs::remove_dir(&dir);
 }
 

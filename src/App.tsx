@@ -12,8 +12,9 @@ import {
 } from "./settings";
 import {
   ProjectInfo, Session, SessionStatus,
+  TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
-  sessionDelete, sessionStatus,
+  sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
 } from "./ipc";
 import "./App.css";
 
@@ -113,10 +114,12 @@ export default function App() {
     ({ zoom: fontScale * settings.panelScale[panel] } as React.CSSProperties);
 
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
+  const [trashed, setTrashed] = useState<TrashedSession[]>([]);
 
   const refreshSessions = useCallback(() => {
     listSessions().then(setSessions).catch(console.error);
     listProjects().then(setProjects).catch(console.error);
+    trashList().then(setTrashed).catch(() => setTrashed([]));
     // Keep the full-text index warm in the background.
     reindexSessions().catch(() => {});
   }, []);
@@ -232,6 +235,30 @@ export default function App() {
       console.error("delete failed:", e);
     }
     setPreviewSession((p) => (p?.id === s.id ? null : p));
+    refreshSessions();
+  };
+  const restoreTrashed = async (id: string) => {
+    try {
+      await trashRestore(id);
+    } catch (e) {
+      console.error("restore failed:", e);
+    }
+    refreshSessions();
+  };
+  const deleteTrashed = async (id: string) => {
+    try {
+      await trashDelete(id);
+    } catch (e) {
+      console.error("trash delete failed:", e);
+    }
+    refreshSessions();
+  };
+  const emptyTrash = async () => {
+    try {
+      await trashEmpty();
+    } catch (e) {
+      console.error("empty trash failed:", e);
+    }
     refreshSessions();
   };
   const selectProject = (p: ProjectInfo) => {
@@ -377,6 +404,10 @@ export default function App() {
                 onProjectShell={projectShell}
                 onProjectClaude={projectClaude}
                 onRefresh={refreshSessions}
+                trashed={trashed}
+                onRestore={restoreTrashed}
+                onTrashDelete={deleteTrashed}
+                onTrashEmpty={emptyTrash}
               />
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
