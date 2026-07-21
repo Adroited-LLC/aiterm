@@ -21,6 +21,8 @@ export interface TermTab {
 export interface TermHandle {
   /** Send raw bytes to the PTY. */
   write: (data: string) => void;
+  /** Force a clean TUI repaint (SIGWINCH jiggle) — Ctrl+Shift+L. */
+  redraw: () => void;
   /** Paste text: bracketed when the running app enabled paste mode, so TUIs
    *  (claude turns image paths into [Image #N]) can tell it from typing. */
   paste: (text: string) => void;
@@ -75,6 +77,34 @@ export default function TerminalView({
     let unlistenExit: UnlistenFn | null = null;
     let disposed = false;
 
+    // Startup nudge: claude's TUI paints while panels/window-state are
+    // still settling and only repaints on SIGWINCH, leaving stale lines on
+    // screen until something resizes. Once the FIRST output burst goes
+    // quiet (a fixed delay fires too early — resuming a big session can
+    // take seconds to paint), resize one column down and fit back — two
+    // SIGWINCHs force a clean full redraw, same as a manual window-drag.
+    let jiggled = false;
+    let quietTimer: number | null = null;
+    const doJiggle = () => {
+      if (term.cols > 2) {
+        term.resize(term.cols - 1, term.rows);
+        window.setTimeout(() => {
+          fit.fit();
+          term.refresh(0, term.rows - 1);
+        }, 80);
+      }
+    };
+    const scheduleJiggle = () => {
+      if (jiggled) return;
+      if (quietTimer !== null) clearTimeout(quietTimer);
+      quietTimer = window.setTimeout(() => {
+        if (jiggled || disposed) return;
+        jiggled = true;
+        doJiggle();
+      }, 800);
+    };
+    scheduleJiggle();
+
     (async () => {
       const id = await ptySpawn(tab.cwd, tab.command, term.cols, term.rows);
       if (disposed) {
@@ -85,6 +115,12 @@ export default function TerminalView({
       unlistenOut = await listen<string>(`pty://output/${id}`, (e) => {
         term.write(e.payload);
         onActivity(tab.key);
+        // A clear-screen means a full view transition (claude's agents
+        // view, etc.) — those can strand stale rows, so re-arm the
+        // quiet-time cleanup nudge.
+        if (e.payload.includes("\x1b[2J") || e.payload.includes("\x1b[3J")) {
+          jiggled = false;
+        }
         scheduleJiggle();
       });
       unlistenExit = await listen<{ id: number }>("pty://exit", (e) => {
@@ -99,6 +135,7 @@ export default function TerminalView({
 
       onRegister(tab.key, {
         write: (data) => ptyWrite(id, data),
+        redraw: doJiggle,
         paste: (text) =>
           ptyWrite(
             id,
@@ -118,31 +155,6 @@ export default function TerminalView({
         },
       });
     })();
-
-    // Startup nudge: claude's TUI paints while panels/window-state are
-    // still settling and only repaints on SIGWINCH, leaving stale lines on
-    // screen until something resizes. Once the FIRST output burst goes
-    // quiet (a fixed delay fires too early — resuming a big session can
-    // take seconds to paint), resize one column down and fit back — two
-    // SIGWINCHs force a clean full redraw, same as a manual window-drag.
-    let jiggled = false;
-    let quietTimer: number | null = null;
-    const scheduleJiggle = () => {
-      if (jiggled) return;
-      if (quietTimer !== null) clearTimeout(quietTimer);
-      quietTimer = window.setTimeout(() => {
-        if (jiggled || disposed) return;
-        jiggled = true;
-        if (term.cols > 2) {
-          term.resize(term.cols - 1, term.rows);
-          window.setTimeout(() => {
-            fit.fit();
-            term.refresh(0, term.rows - 1);
-          }, 80);
-        }
-      }, 800);
-    };
-    scheduleJiggle();
 
     // Debounce resize→fit: splitter drags fire the observer continuously,
     // and a SIGWINCH storm makes TUIs (claude's input box) redraw over

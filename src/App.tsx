@@ -106,9 +106,17 @@ export default function App() {
   }, []);
 
   // Ctrl+= / Ctrl+- / Ctrl+0 font zoom, captured before xterm sees the keys.
+  // Ctrl+Shift+L: force a clean repaint of the active terminal.
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if (!e.ctrlKey || e.altKey || e.metaKey) return;
+      if (e.shiftKey && (e.key === "L" || e.key === "l")) {
+        e.preventDefault();
+        const key = activeTabRef.current;
+        if (key !== null) handles.current.get(key)?.redraw();
+        return;
+      }
+      if (e.shiftKey) return;
       if (e.key === "=" || e.key === "+") { e.preventDefault(); bumpFont(1); }
       else if (e.key === "-") { e.preventDefault(); bumpFont(-1); }
       else if (e.key === "0") { e.preventDefault(); bumpFont(0); }
