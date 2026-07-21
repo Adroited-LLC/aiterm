@@ -40,6 +40,7 @@ interface Group {
 }
 
 const GROUPS_KEY = "aiterm.projectGroups";
+const ORDER_KEY = "aiterm.sessionOrder";
 const PALETTE = ["#61afef", "#98c379", "#e5c07b", "#e06c75", "#c678dd", "#56b6c2", "#da7756"];
 
 function loadGroups(): Group[] {
@@ -48,6 +49,40 @@ function loadGroups(): Group[] {
   } catch {
     return [];
   }
+}
+
+/** Manual drag-rearranged order per container ("recent" or "group:<id>"). */
+function loadOrders(): Record<string, string[]> {
+  try {
+    return JSON.parse(localStorage.getItem(ORDER_KEY) ?? "{}");
+  } catch {
+    return {};
+  }
+}
+
+/** Sessions the user hand-ordered keep that order; ones not ordered yet
+ *  (new arrivals) stay on top in recency order. */
+function applyOrder(list: Session[], order?: string[]): Session[] {
+  if (!order || order.length === 0) return list;
+  const idx = new Map(order.map((id, i) => [id, i]));
+  const fresh = list.filter((s) => !idx.has(s.id));
+  const ordered = list
+    .filter((s) => idx.has(s.id))
+    .sort((a, b) => idx.get(a.id)! - idx.get(b.id)!);
+  return [...fresh, ...ordered];
+}
+
+interface DragArm {
+  kind: "session" | "group";
+  /** Session id or group id. */
+  id: string;
+  /** Session's project path (session drags — group membership drops). */
+  path: string;
+  /** Container the session was dragged from ("recent" or "group:<id>"). */
+  container: string;
+  label: string;
+  x: number;
+  y: number;
 }
 
 interface Props {
@@ -150,17 +185,26 @@ export default function SessionsPanel({
     return () => clearTimeout(t);
   }, [query]);
   const [groups, setGroups] = useState<Group[]>(loadGroups);
+  const [orders, setOrders] = useState<Record<string, string[]>>(loadOrders);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
+  const [dragOverItem, setDragOverItem] = useState<string | null>(null);
+  const [dragOverAfter, setDragOverAfter] = useState(false);
   const [dragPos, setDragPos] = useState<{ x: number; y: number } | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameText, setRenameText] = useState("");
   // Pointer-based drag: HTML5 DnD never fires in webkit2gtk on Wayland.
-  const dragArm = useRef<{ path: string; x: number; y: number } | null>(null);
+  const dragArm = useRef<DragArm | null>(null);
   const dragActive = useRef(false);
   const suppressClick = useRef(false);
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  // Displayed id sequence per container, read by the drop handler.
+  const containerSeq = useRef<Map<string, string[]>>(new Map());
 
   useEffect(() => localStorage.setItem(GROUPS_KEY, JSON.stringify(groups)), [groups]);
+  useEffect(() => localStorage.setItem(ORDER_KEY, JSON.stringify(orders)), [orders]);
 
   const filtered = useMemo(() => {
     const q = query.toLowerCase();
@@ -182,7 +226,29 @@ export default function SessionsPanel({
   }, [query, ftResults, filtered]);
 
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
-  const ungrouped = filtered.filter((s) => !grouped.has(s.project_path));
+  const ungrouped = useMemo(
+    () => applyOrder(filtered.filter((s) => !grouped.has(s.project_path)), orders["recent"]),
+    [filtered, grouped, orders],
+  );
+  const groupMembers = useMemo(() => {
+    const m = new Map<string, Session[]>();
+    for (const g of groups) {
+      m.set(
+        g.id,
+        applyOrder(
+          filtered.filter((s) => g.members.includes(s.project_path)),
+          orders[`group:${g.id}`],
+        ),
+      );
+    }
+    return m;
+  }, [groups, filtered, orders]);
+  containerSeq.current = new Map([
+    ["recent", ungrouped.map((s) => s.id)],
+    ...groups.map(
+      (g) => [`group:${g.id}`, (groupMembers.get(g.id) ?? []).map((s) => s.id)] as const,
+    ),
+  ]);
 
   const sessionPaths = useMemo(
     () => new Set(sessions.map((s) => s.project_path)),
@@ -284,11 +350,24 @@ export default function SessionsPanel({
       if (!dragActive.current) {
         if (Math.abs(e.clientX - arm.x) + Math.abs(e.clientY - arm.y) < 7) return;
         dragActive.current = true;
-        setDragId(arm.path);
+        setDragId(arm.id);
       }
       setDragPos({ x: e.clientX, y: e.clientY });
       const el = document.elementFromPoint(e.clientX, e.clientY);
       setDragOver(el?.closest<HTMLElement>("[data-drop]")?.dataset.drop ?? null);
+      // Hovering a sibling row shows the insertion line (reorder).
+      const itemEl = el?.closest<HTMLElement>("[data-item]");
+      const hoverId =
+        arm.kind === "session" &&
+        itemEl?.dataset.container === arm.container &&
+        itemEl.dataset.item !== arm.id
+          ? itemEl.dataset.item ?? null
+          : null;
+      setDragOverItem(hoverId);
+      if (hoverId) {
+        const seq = containerSeq.current.get(arm.container) ?? [];
+        setDragOverAfter(seq.indexOf(arm.id) < seq.indexOf(hoverId));
+      }
     };
     const up = (e: PointerEvent) => {
       const arm = dragArm.current;
@@ -299,8 +378,41 @@ export default function SessionsPanel({
         // pointerup; clear the flag so the next real click works.
         setTimeout(() => { suppressClick.current = false; }, 0);
         const el = document.elementFromPoint(e.clientX, e.clientY);
+        const itemEl = el?.closest<HTMLElement>("[data-item]");
         const target = el?.closest<HTMLElement>("[data-drop]")?.dataset.drop;
-        if (target === "new") createGroup(arm.path);
+        if (arm.kind === "group") {
+          // Dropping a group header on another header reorders the groups.
+          if (target && target !== arm.id) {
+            setGroups((gs) => {
+              const from = gs.findIndex((g) => g.id === arm.id);
+              const to = gs.findIndex((g) => g.id === target);
+              if (from < 0 || to < 0) return gs;
+              const next = [...gs];
+              const [moved] = next.splice(from, 1);
+              next.splice(to, 0, moved);
+              return next;
+            });
+          }
+        } else if (
+          itemEl?.dataset.container === arm.container &&
+          itemEl.dataset.item &&
+          itemEl.dataset.item !== arm.id
+        ) {
+          // Dropped on a sibling row: rearrange within the container. A drag
+          // of a selected row carries the whole selection along.
+          const targetId = itemEl.dataset.item;
+          const seq = containerSeq.current.get(arm.container) ?? [];
+          const sel = selectedRef.current;
+          const moving = sel.has(arm.id)
+            ? seq.filter((id) => sel.has(id))
+            : [arm.id];
+          if (!moving.includes(targetId)) {
+            const rest = seq.filter((id) => !moving.includes(id));
+            const after = seq.indexOf(arm.id) < seq.indexOf(targetId);
+            rest.splice(rest.indexOf(targetId) + (after ? 1 : 0), 0, ...moving);
+            setOrders((o) => ({ ...o, [arm.container]: rest }));
+          }
+        } else if (target === "new") createGroup(arm.path);
         else if (target === "ungrouped") moveToGroup(null, arm.path);
         else if (target) moveToGroup(target, arm.path);
       }
@@ -308,6 +420,7 @@ export default function SessionsPanel({
       dragActive.current = false;
       setDragId(null);
       setDragOver(null);
+      setDragOverItem(null);
       setDragPos(null);
     };
     window.addEventListener("pointermove", move);
@@ -396,31 +509,51 @@ export default function SessionsPanel({
     </div>
   );
 
-  const renderItem = (s: Session) => {
+  const renderItem = (s: Session, container?: string) => {
     const isLive = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
     const hasAttn =
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
     const isShowing = activeSlot !== null &&
       (activeSlot === s.id || activeSlot === `shell:${s.project_path}`);
+    const isDragging =
+      dragId === s.id || (dragId !== null && dragActive.current && selected.has(dragId) && selected.has(s.id));
     return (
       <div
         key={s.id}
+        data-item={container ? s.id : undefined}
+        data-container={container}
         onPointerDown={(e) => {
-          if (e.button !== 0 || viewMode !== "recent" || searchList) return;
+          if (e.button !== 0 || !container || searchList) return;
           if ((e.target as HTMLElement).closest("button")) return;
-          dragArm.current = { path: s.project_path, x: e.clientX, y: e.clientY };
+          dragArm.current = {
+            kind: "session", id: s.id, path: s.project_path,
+            container, label: s.title, x: e.clientX, y: e.clientY,
+          };
         }}
         className={
           "session-item" +
           (s.project_path === activeProject ? " active" : "") +
+          (selected.has(s.id) ? " selected" : "") +
           (isShowing ? " showing" : "") +
-          (dragId === s.project_path ? " dragging" : "")
+          (isDragging ? " dragging" : "") +
+          (dragOverItem === s.id ? " drop-mark" + (dragOverAfter ? " drop-after" : "") : "")
         }
-        onClick={() => {
+        onClick={(e) => {
           if (suppressClick.current) {
             suppressClick.current = false;
             return;
           }
+          if (e.ctrlKey || e.metaKey) {
+            // Ctrl-click builds a multi-selection without switching sessions.
+            setSelected((prev) => {
+              const next = new Set(prev);
+              if (next.has(s.id)) next.delete(s.id);
+              else next.add(s.id);
+              return next;
+            });
+            return;
+          }
+          setSelected(new Set([s.id]));
           onSelect(s);
         }}
       >
@@ -616,7 +749,7 @@ export default function SessionsPanel({
       <div className="sessions-list">
         {searchList ? (
           <>
-            {searchList.map(renderItem)}
+            {searchList.map((s) => renderItem(s))}
             {searchList.length === 0 && sessionlessProjects.length === 0 && (
               <div className="empty-note">No matches</div>
             )}
@@ -635,13 +768,13 @@ export default function SessionsPanel({
                   <span className="group-name">{sec.label}</span>
                   <span className="group-count">{sec.sessions.length}</span>
                 </div>
-                {open && sec.sessions.map(renderItem)}
+                {open && sec.sessions.map((s) => renderItem(s))}
               </div>
             );
           })
         ) : (
           <>
-        {dragId && (
+        {dragId && dragArm.current?.kind === "session" && (
           <div
             className={"drop-zone" + (dragOver === "new" ? " over" : "")}
             data-drop="new"
@@ -650,16 +783,34 @@ export default function SessionsPanel({
           </div>
         )}
         {groups.map((g) => {
-          const members = filtered.filter((s) => g.members.includes(s.project_path));
+          const members = groupMembers.get(g.id) ?? [];
           if (members.length === 0 && query) return null;
           const open = !g.collapsed || query.length > 0;
           return (
             <div key={g.id} className="session-group">
               <div
-                className={"group-header" + (dragOver === g.id ? " over" : "")}
+                className={
+                  "group-header" +
+                  (dragOver === g.id ? " over" : "") +
+                  (dragId === g.id ? " dragging" : "")
+                }
                 data-drop={g.id}
-                onClick={() => setGroups((gs) =>
-                  gs.map((x) => (x.id === g.id ? { ...x, collapsed: !x.collapsed } : x)))}
+                onPointerDown={(e) => {
+                  if (e.button !== 0) return;
+                  if ((e.target as HTMLElement).closest("button, input")) return;
+                  dragArm.current = {
+                    kind: "group", id: g.id, path: "", container: "",
+                    label: g.name, x: e.clientX, y: e.clientY,
+                  };
+                }}
+                onClick={() => {
+                  if (suppressClick.current) {
+                    suppressClick.current = false;
+                    return;
+                  }
+                  setGroups((gs) =>
+                    gs.map((x) => (x.id === g.id ? { ...x, collapsed: !x.collapsed } : x)));
+                }}
               >
                 <span className={"chevron" + (open ? " open" : "")}>›</span>
                 <span
@@ -699,7 +850,7 @@ export default function SessionsPanel({
                   onClick={(e) => { e.stopPropagation(); deleteGroup(g.id); }}
                 >✕</button>
               </div>
-              {open && members.map(renderItem)}
+              {open && members.map((s) => renderItem(s, `group:${g.id}`))}
             </div>
           );
         })}
@@ -716,7 +867,7 @@ export default function SessionsPanel({
             className={"ungrouped" + (dragOver === "ungrouped" ? " over" : "")}
             data-drop="ungrouped"
           >
-            {sectionOpen("recent:all") && ungrouped.map(renderItem)}
+            {sectionOpen("recent:all") && ungrouped.map((s) => renderItem(s, "recent"))}
             {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
           </div>
         </div>
@@ -767,7 +918,7 @@ export default function SessionsPanel({
       </div>
       {dragId && dragPos && (
         <div className="drag-ghost" style={{ left: dragPos.x + 12, top: dragPos.y + 8 }}>
-          {dragId.split("/").filter(Boolean).pop()}
+          {dragArm.current?.label ?? ""}
         </div>
       )}
     </div>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
@@ -198,6 +199,25 @@ export default function App() {
     window.addEventListener("focus", clear);
     return () => window.removeEventListener("focus", clear);
   }, [activeTab]);
+
+  // Dropping files onto the window pastes their quoted paths into the
+  // active terminal (like any terminal emulator) instead of letting the
+  // webview navigate to the file.
+  const previewRef = useRef<Session | null>(null);
+  useEffect(() => {
+    previewRef.current = previewSession;
+  }, [previewSession]);
+  useEffect(() => {
+    const un = getCurrentWebview().onDragDropEvent((e) => {
+      if (e.payload.type !== "drop" || e.payload.paths.length === 0) return;
+      const key = activeTabRef.current;
+      if (key === null || previewRef.current) return;
+      handles.current.get(key)?.write(e.payload.paths.map(shellQuote).join(" ") + " ");
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
 
   // Watch the active project: git changes refresh the repo panel, tree
   // changes refresh the explorer (git status also follows tree edits).
@@ -584,4 +604,8 @@ export default function App() {
 
 function basename(p: string): string {
   return p.split("/").filter(Boolean).pop() ?? p;
+}
+
+function shellQuote(p: string): string {
+  return /^[A-Za-z0-9_\-./~:@%+=]+$/.test(p) ? p : "'" + p.replace(/'/g, "'\\''") + "'";
 }

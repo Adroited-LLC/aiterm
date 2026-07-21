@@ -144,6 +144,53 @@ fn deletes_session_to_trash() {
 }
 
 #[test]
+fn hides_fork_and_orphaned_transcripts() {
+    // Orchestrator/compact fork files (no human prompt) and .orphaned-*
+    // leftovers must not show up as sessions.
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let dir = home.join(".claude/projects/-aiterm-fork-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fork = dir.join("00000000-0000-4000-8000-aitermfork00.jsonl");
+    std::fs::write(
+        &fork,
+        concat!(
+            "{\"type\":\"custom-title\",\"customTitle\":\"aiterm\",\"cwd\":\"/aiterm-fork-test\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"cwd\":\"/aiterm-fork-test\"}\n",
+            "{\"type\":\"user\",\"cwd\":\"/aiterm-fork-test\",\"message\":{\"content\":\"This session is being continued from a previous conversation that ran out of context.\"}}\n",
+        ),
+    )
+    .unwrap();
+    let orphaned = dir.join("00000000-0000-4000-8000-aitermfork00.orphaned-1-ab.jsonl");
+    std::fs::write(
+        &orphaned,
+        "{\"type\":\"user\",\"cwd\":\"/aiterm-fork-test\",\"message\":{\"content\":\"real prompt\"}}\n",
+    )
+    .unwrap();
+    // A real session in the same dir keeps showing.
+    let real = dir.join("00000000-0000-4000-8000-aitermfork01.jsonl");
+    std::fs::write(
+        &real,
+        "{\"type\":\"user\",\"cwd\":\"/aiterm-fork-test\",\"message\":{\"content\":\"hello there\"}}\n",
+    )
+    .unwrap();
+
+    let ids: Vec<String> = ClaudeProvider.scan().into_iter().map(|s| s.id).collect();
+    assert!(
+        !ids.iter().any(|i| i.contains("aitermfork00")),
+        "fork/orphaned transcripts must be hidden"
+    );
+    assert!(
+        ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermfork01"),
+        "real sessions must still be listed"
+    );
+
+    let _ = std::fs::remove_file(&fork);
+    let _ = std::fs::remove_file(&orphaned);
+    let _ = std::fs::remove_file(&real);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
 fn full_text_search_finds_sessions() {
     let r = aiterm_lib::indexer::reindex_sessions();
     assert!(r.total > 0, "expected sessions to index");
