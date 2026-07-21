@@ -118,6 +118,20 @@ export default function TerminalView({
       });
     })();
 
+    // Startup nudge: claude's TUI paints once while panels/window-state are
+    // still settling and only repaints on SIGWINCH, leaving stale lines on
+    // screen. Resize one column down and fit back — two SIGWINCHs force a
+    // clean full redraw at the real size (what a manual window-drag does).
+    const jiggle = window.setTimeout(() => {
+      if (term.cols > 2) {
+        term.resize(term.cols - 1, term.rows);
+        window.setTimeout(() => {
+          fit.fit();
+          term.refresh(0, term.rows - 1);
+        }, 80);
+      }
+    }, 1200);
+
     // Debounce resize→fit: splitter drags fire the observer continuously,
     // and a SIGWINCH storm makes TUIs (claude's input box) redraw over
     // half-painted frames. One fit at the end + a full repaint instead.
@@ -136,6 +150,7 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
+      clearTimeout(jiggle);
       if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();
       unlistenOut?.();
