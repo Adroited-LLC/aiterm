@@ -387,6 +387,10 @@ body.dragging * { pointer-events: none; }
 
 .group-header.dragging { opacity: 0.45; }
 
+/* Insertion line when drag-reordering whole sections (project view). */
+.session-group.sec-drop-before { box-shadow: inset 0 2px 0 var(--accent); }
+.session-group.sec-drop-after { box-shadow: inset 0 -2px 0 var(--accent); }
+
 .agent-badge {
   position: relative;
   width: 28px;

@@ -367,7 +367,7 @@ export default function SessionsPanel({
       const el = document.elementFromPoint(e.clientX, e.clientY);
       setDragOver(
         arm.kind === "section"
-          ? el?.closest<HTMLElement>("[data-sec]")?.dataset.sec ?? null
+          ? el?.closest<HTMLElement>("[data-secwrap]")?.dataset.secwrap ?? null
           : el?.closest<HTMLElement>("[data-drop]")?.dataset.drop ?? null,
       );
       // Hovering a sibling row shows the insertion line (reorder).
@@ -396,8 +396,9 @@ export default function SessionsPanel({
         const itemEl = el?.closest<HTMLElement>("[data-item]");
         const target = el?.closest<HTMLElement>("[data-drop]")?.dataset.drop;
         if (arm.kind === "section") {
-          // Project-view section headers reorder among themselves.
-          const sec = el?.closest<HTMLElement>("[data-sec]")?.dataset.sec;
+          // Project-view sections reorder — dropping anywhere on another
+          // section (header or its rows) targets that section.
+          const sec = el?.closest<HTMLElement>("[data-secwrap]")?.dataset.secwrap;
           if (sec && sec !== arm.id) {
             const seq = containerSeq.current.get("sections:project") ?? [];
             const rest = seq.filter((k) => k !== arm.id);
@@ -784,15 +785,26 @@ export default function SessionsPanel({
             const key = `${viewMode}:${sec.label}`;
             const open = sectionOpen(key);
             const draggable = viewMode === "project";
+            const secKeys = autoSections.map((x) => x.key);
+            const isTarget =
+              dragArm.current?.kind === "section" &&
+              dragId !== null && dragId !== sec.key && dragOver === sec.key;
+            const targetCls = isTarget
+              ? secKeys.indexOf(dragId!) < secKeys.indexOf(sec.key)
+                ? " sec-drop-after"
+                : " sec-drop-before"
+              : "";
             return (
-              <div key={sec.key} className="session-group">
+              <div
+                key={sec.key}
+                className={"session-group" + targetCls}
+                data-secwrap={draggable ? sec.key : undefined}
+              >
                 <div
                   className={
                     "group-header static clickable" +
-                    (dragId === sec.key ? " dragging" : "") +
-                    (dragOver === sec.key && dragId && dragId !== sec.key ? " over" : "")
+                    (dragId === sec.key ? " dragging" : "")
                   }
-                  data-sec={draggable ? sec.key : undefined}
                   onPointerDown={(e) => {
                     if (e.button !== 0 || !draggable) return;
                     if ((e.target as HTMLElement).closest("button, input")) return;

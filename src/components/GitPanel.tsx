@@ -226,8 +226,14 @@ export default function GitPanel({ root, refreshKey }: { root: string | null; re
     [graph],
   );
 
-  const refresh = useCallback(async () => {
+  // Switching projects closes any open diff; background refreshes (the
+  // file watcher fires constantly while claude works) must NOT — they'd
+  // yank the view away milliseconds after the user opened it.
+  useEffect(() => {
     setDiff(null);
+  }, [root]);
+
+  const refresh = useCallback(async () => {
     if (!root) {
       setState(null);
       return;

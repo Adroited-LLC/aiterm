@@ -118,13 +118,25 @@ export default function TerminalView({
       });
     })();
 
+    // Debounce resize→fit: splitter drags fire the observer continuously,
+    // and a SIGWINCH storm makes TUIs (claude's input box) redraw over
+    // half-painted frames. One fit at the end + a full repaint instead.
+    let fitTimer: number | null = null;
     const ro = new ResizeObserver(() => {
-      if (elRef.current && elRef.current.offsetWidth > 0) fit.fit();
+      if (fitTimer !== null) clearTimeout(fitTimer);
+      fitTimer = window.setTimeout(() => {
+        fitTimer = null;
+        if (elRef.current && elRef.current.offsetWidth > 0) {
+          fit.fit();
+          term.refresh(0, term.rows - 1);
+        }
+      }, 120);
     });
     ro.observe(elRef.current);
 
     return () => {
       disposed = true;
+      if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();
       unlistenOut?.();
       unlistenExit?.();
@@ -139,6 +151,8 @@ export default function TerminalView({
   useEffect(() => {
     if (active) {
       fitRef.current?.fit();
+      const t = termRef.current;
+      t?.refresh(0, t.rows - 1);
       if (autoFocus) termRef.current?.focus();
     }
   }, [active, autoFocus]);
