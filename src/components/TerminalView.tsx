@@ -115,12 +115,10 @@ export default function TerminalView({
       unlistenOut = await listen<string>(`pty://output/${id}`, (e) => {
         term.write(e.payload);
         onActivity(tab.key);
-        // A clear-screen means a full view transition (claude's agents
-        // view, etc.) — those can strand stale rows, so re-arm the
-        // quiet-time cleanup nudge.
-        if (e.payload.includes("\x1b[2J") || e.payload.includes("\x1b[3J")) {
-          jiggled = false;
-        }
+        // NOTE: do NOT re-arm the jiggle on clear-screen sequences —
+        // claude emits them during ordinary streaming redraws, and the
+        // jiggle's own repaint contains one too, which loops the nudge
+        // forever (nonstop resizing). Startup-only + Ctrl+Shift+L.
         scheduleJiggle();
       });
       unlistenExit = await listen<{ id: number }>("pty://exit", (e) => {
