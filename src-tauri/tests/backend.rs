@@ -191,6 +191,48 @@ fn hides_fork_and_orphaned_transcripts() {
 }
 
 #[test]
+fn parses_tasks_and_agents_from_transcript() {
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let dir = home.join(".claude/projects/-aiterm-agent-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = "00000000-0000-4000-8000-aitermagents";
+    let file = dir.join(format!("{id}.jsonl"));
+    std::fs::write(&file, concat!(
+        // Two TodoWrite calls — the later list wins.
+        r#"{"type":"assistant","cwd":"/x","message":{"content":[{"type":"tool_use","name":"TodoWrite","id":"t1","input":{"todos":[{"content":"old","status":"pending","activeForm":"Olding"}]}}]}}"#, "\n",
+        r#"{"type":"assistant","cwd":"/x","message":{"content":[{"type":"tool_use","name":"TodoWrite","id":"t2","input":{"todos":[{"content":"build it","status":"completed","activeForm":"Building"},{"content":"ship it","status":"in_progress","activeForm":"Shipping"}]}}]}}"#, "\n",
+        // Sync agent: tool_result = final report -> done.
+        r#"{"type":"assistant","timestamp":"2026-07-21T10:00:00Z","message":{"content":[{"type":"tool_use","name":"Agent","id":"a1","input":{"description":"sweep tests","subagent_type":"grunt","prompt":"run tests"}}]}}"#, "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a1","content":"All 12 tests pass."}]}}"#, "\n",
+        // Background agent: launched, completion via task-notification.
+        r#"{"type":"assistant","timestamp":"2026-07-21T10:01:00Z","message":{"content":[{"type":"tool_use","name":"Agent","id":"a2","input":{"description":"long refactor","subagent_type":"builder","prompt":"refactor"}}]}}"#, "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a2","content":"Async agent launched successfully."}]}}"#, "\n",
+        // Still-running background agent: launched, no notification yet.
+        r#"{"type":"assistant","timestamp":"2026-07-21T10:02:00Z","message":{"content":[{"type":"tool_use","name":"Agent","id":"a3","input":{"description":"watch build","subagent_type":"grunt","prompt":"watch"}}]}}"#, "\n",
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a3","content":"Async agent launched successfully."}]}}"#, "\n",
+        r#"{"type":"user","message":{"content":"<task-notification><task-id>xyz</task-id><tool-use-id>a2</tool-use-id><status>completed</status><summary>Refactor finished, 8 files.</summary></task-notification>"}}"#, "\n",
+    )).unwrap();
+
+    let tasks = aiterm_lib::sessions::session_tasks(id.into());
+    assert_eq!(tasks.len(), 2, "latest TodoWrite list should win");
+    assert_eq!(tasks[0].subject, "build it");
+    assert_eq!(tasks[1].status, "in_progress");
+
+    let agents = aiterm_lib::sessions::session_agents(id.into());
+    assert_eq!(agents.len(), 3);
+    let by_id = |i: &str| agents.iter().find(|a| a.id == i).unwrap();
+    assert_eq!(by_id("a1").status, "done");
+    assert!(by_id("a1").result.as_deref().unwrap().contains("12 tests"));
+    assert_eq!(by_id("a2").status, "done");
+    assert!(by_id("a2").result.as_deref().unwrap().contains("Refactor finished"));
+    assert_eq!(by_id("a3").status, "running", "no notification yet = still running");
+    assert_eq!(by_id("a3").agent_type, "grunt");
+
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
 fn full_text_search_finds_sessions() {
     let r = aiterm_lib::indexer::reindex_sessions();
     assert!(r.total > 0, "expected sessions to index");

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
-  Artifact, SessionTask, homeAbbrev, openPath, relTime, sessionArtifacts, sessionTasks,
+  AgentRun, Artifact, SessionTask, homeAbbrev, openPath, relTime,
+  sessionAgents, sessionArtifacts, sessionTasks,
 } from "../ipc";
 
 interface Props {
@@ -19,17 +20,20 @@ export default function AgentPanel({ sessionId }: Props) {
   const [tab, setTab] = useState<"tasks" | "artifacts">("tasks");
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [agents, setAgents] = useState<AgentRun[]>([]);
 
   useEffect(() => {
     if (!sessionId) {
       setTasks([]);
       setArtifacts([]);
+      setAgents([]);
       return;
     }
     let stop = false;
     const poll = () => {
       sessionTasks(sessionId).then((t) => !stop && setTasks(t)).catch(() => {});
       sessionArtifacts(sessionId).then((a) => !stop && setArtifacts(a)).catch(() => {});
+      sessionAgents(sessionId).then((a) => !stop && setAgents(a)).catch(() => {});
     };
     poll();
     const iv = setInterval(poll, 4000);
@@ -44,9 +48,36 @@ export default function AgentPanel({ sessionId }: Props) {
   }
 
   const done = tasks.filter((t) => t.status === "completed").length;
+  const running = agents.filter((a) => a.status === "running").length;
+  // Running agents lead; finished ones follow, newest first.
+  const pills = [
+    ...agents.filter((a) => a.status === "running"),
+    ...agents.filter((a) => a.status !== "running").reverse(),
+  ];
 
   return (
     <div className="agent-body">
+      {agents.length > 0 && (
+        <div className="agent-pills">
+          {pills.map((a) => (
+            <span
+              key={a.id}
+              className={"agent-pill" + (a.status === "running" ? " running" : "")}
+              title={
+                `${a.agent_type} — ${a.description}` +
+                (a.result ? `\n\n${a.result}` : a.status === "running" ? "\n\nworking…" : "")
+              }
+            >
+              <span className="agent-pill-dot" />
+              <span className="agent-pill-type">{a.agent_type}</span>
+              <span className="agent-pill-desc">{a.description}</span>
+            </span>
+          ))}
+          {running > 0 && (
+            <span className="agent-pill-count">{running} active</span>
+          )}
+        </div>
+      )}
       <div className="git-tabs agent-tabs">
         <button
           className={"git-tab" + (tab === "tasks" ? " on" : "")}

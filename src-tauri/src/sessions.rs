@@ -546,13 +546,72 @@ pub struct SessionTask {
     pub blocked_by: Vec<String>,
 }
 
-/// Task list Claude Code keeps for a session (~/.claude/tasks/<session-id>/<n>.json).
+/// Task list for a session. Current Claude Code keeps the live list in
+/// TodoWrite tool calls in the transcript (last write wins) — the old
+/// per-task json dir only holds lock files now, but stays as a fallback
+/// for transcripts written by older versions.
 #[tauri::command]
 pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
+    if let Some(path) = find_session_file(&session_id) {
+        if let Ok(file) = File::open(&path) {
+            let mut last: Option<Vec<SessionTask>> = None;
+            for line in BufReader::new(file).lines().map_while(Result::ok) {
+                if !line.contains("\"TodoWrite\"") {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array())
+                else {
+                    continue;
+                };
+                for b in blocks {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_use")
+                        || b.get("name").and_then(|n| n.as_str()) != Some("TodoWrite")
+                    {
+                        continue;
+                    }
+                    if let Some(todos) = b.pointer("/input/todos").and_then(|t| t.as_array()) {
+                        last = Some(
+                            todos
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, t)| {
+                                    Some(SessionTask {
+                                        id: i.to_string(),
+                                        subject: t.get("content")?.as_str()?.to_string(),
+                                        status: t
+                                            .get("status")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or("pending")
+                                            .to_string(),
+                                        active_form: t
+                                            .get("activeForm")
+                                            .and_then(|s| s.as_str())
+                                            .map(String::from),
+                                        blocked_by: vec![],
+                                    })
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+            }
+            if let Some(tasks) = last {
+                return tasks;
+            }
+        }
+    }
+    session_tasks_dir(&session_id)
+}
+
+/// Legacy fallback: per-task json files in ~/.claude/tasks/<session-id>/.
+fn session_tasks_dir(session_id: &str) -> Vec<SessionTask> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
     };
-    let dir = home.join(".claude/tasks").join(&session_id);
+    let dir = home.join(".claude/tasks").join(session_id);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
     };
@@ -589,6 +648,145 @@ pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
         .collect();
     tasks.sort_by_key(|t| t.id.parse::<u64>().unwrap_or(u64::MAX));
     tasks
+}
+
+#[derive(Serialize)]
+pub struct AgentRun {
+    /// tool_use id of the spawning call.
+    pub id: String,
+    pub agent_type: String,
+    pub description: String,
+    /// "running" | "done"
+    pub status: String,
+    pub started_at: Option<String>,
+    /// Final report snippet (or completion summary for background agents).
+    pub result: Option<String>,
+}
+
+/// Text of a tool_result block (plain string or text-block array).
+fn tool_result_text(block: &serde_json::Value) -> String {
+    match block.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+fn xml_tag<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim())
+}
+
+fn snippet(text: &str, max: usize) -> String {
+    let s: String = text.trim().chars().take(max).collect();
+    if text.trim().chars().count() > max {
+        s + "…"
+    } else {
+        s
+    }
+}
+
+/// Subagents this session spawned (Agent/Task tool calls), with liveness:
+/// a sync agent is done when its tool_result lands; a background agent's
+/// tool_result is just "Async agent launched…" and completion arrives later
+/// as a <task-notification> carrying the original tool-use-id.
+#[tauri::command]
+pub fn session_agents(session_id: String) -> Vec<AgentRun> {
+    let Some(path) = find_session_file(&session_id) else {
+        return vec![];
+    };
+    let Ok(file) = File::open(&path) else {
+        return vec![];
+    };
+    let mut runs: Vec<AgentRun> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("tool_use") && !line.contains("task-notification") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+            continue;
+        }
+        match v.pointer("/message/content") {
+            Some(serde_json::Value::Array(blocks)) => {
+                for b in blocks {
+                    match b.get("type").and_then(|t| t.as_str()) {
+                        Some("tool_use")
+                            if matches!(
+                                b.get("name").and_then(|n| n.as_str()),
+                                Some("Agent") | Some("Task")
+                            ) =>
+                        {
+                            let Some(id) = b.get("id").and_then(|i| i.as_str()) else {
+                                continue;
+                            };
+                            let input = b.get("input");
+                            let get = |k: &str| {
+                                input
+                                    .and_then(|i| i.get(k))
+                                    .and_then(|x| x.as_str())
+                                    .map(String::from)
+                            };
+                            let description = get("description")
+                                .or_else(|| get("prompt").map(|p| snippet(&p, 60)))
+                                .unwrap_or_else(|| "agent".into());
+                            index.insert(id.to_string(), runs.len());
+                            runs.push(AgentRun {
+                                id: id.to_string(),
+                                agent_type: get("subagent_type")
+                                    .unwrap_or_else(|| "general".into()),
+                                description,
+                                status: "running".into(),
+                                started_at: v
+                                    .get("timestamp")
+                                    .and_then(|t| t.as_str())
+                                    .map(String::from),
+                                result: None,
+                            });
+                        }
+                        Some("tool_result") => {
+                            let Some(&i) = b
+                                .get("tool_use_id")
+                                .and_then(|i| i.as_str())
+                                .and_then(|i| index.get(i))
+                            else {
+                                continue;
+                            };
+                            let text = tool_result_text(b);
+                            if text.starts_with("Async agent launched") {
+                                continue; // still running in the background
+                            }
+                            runs[i].status = "done".into();
+                            runs[i].result = Some(snippet(&text, 240));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Background completion notification (plain-string user record).
+            Some(serde_json::Value::String(text)) if text.contains("<task-notification>") => {
+                let Some(&i) = xml_tag(text, "tool-use-id").and_then(|id| index.get(id)) else {
+                    continue;
+                };
+                runs[i].status = "done".into();
+                if let Some(sum) = xml_tag(text, "summary") {
+                    runs[i].result = Some(snippet(sum, 240));
+                }
+            }
+            _ => {}
+        }
+    }
+    runs
 }
 
 #[derive(Serialize)]

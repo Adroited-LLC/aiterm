@@ -772,6 +772,55 @@ body.dragging * { pointer-events: none; }
   gap: 2px;
   flex-shrink: 0;
 }
+
+/* Subagent pills: who's out working and what they're up to. */
+.agent-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+  padding: 6px 8px 2px;
+  max-height: 84px;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.agent-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 10px 3px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: default;
+}
+.agent-pill-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  flex-shrink: 0;
+}
+.agent-pill.running { border-color: color-mix(in srgb, var(--green) 45%, var(--border)); }
+.agent-pill.running .agent-pill-dot {
+  background: var(--green);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.agent-pill-type { color: var(--text); font-weight: 600; }
+.agent-pill-desc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-pill-count {
+  font-size: 10px;
+  color: var(--green);
+  margin-left: 2px;
+  flex-shrink: 0;
+}
 .artifact-row { cursor: pointer; }
 .artifact-row:hover { background: var(--bg-hover); }
 .artifact-tool {

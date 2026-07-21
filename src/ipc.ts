@@ -64,6 +64,15 @@ export interface Artifact {
   at: string;
 }
 
+export interface AgentRun {
+  id: string;
+  agent_type: string;
+  description: string;
+  status: "running" | "done" | string;
+  started_at: string | null;
+  result: string | null;
+}
+
 export interface PreviewMsg {
   role: "user" | "assistant" | string;
   text: string;
@@ -93,6 +102,8 @@ export const sessionTasks = (sessionId: string) =>
   invoke<SessionTask[]>("session_tasks", { sessionId });
 export const sessionArtifacts = (sessionId: string) =>
   invoke<Artifact[]>("session_artifacts", { sessionId });
+export const sessionAgents = (sessionId: string) =>
+  invoke<AgentRun[]>("session_agents", { sessionId });
 export const sessionStatus = (sessionId: string) =>
   invoke<SessionStatus>("session_status", { sessionId });
 export interface ProjectInfo {

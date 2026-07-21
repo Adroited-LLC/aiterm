@@ -26,6 +26,7 @@ pub fn run() {
             sessions::trash_delete,
             sessions::trash_empty,
             sessions::session_tasks,
+            sessions::session_agents,
             sessions::session_artifacts,
             watcher::watch_project,
             fsx::list_dir,
