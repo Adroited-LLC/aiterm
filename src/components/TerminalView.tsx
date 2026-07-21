@@ -21,6 +21,9 @@ export interface TermTab {
 export interface TermHandle {
   /** Send raw bytes to the PTY. */
   write: (data: string) => void;
+  /** Paste text: bracketed when the running app enabled paste mode, so TUIs
+   *  (claude turns image paths into [Image #N]) can tell it from typing. */
+  paste: (text: string) => void;
   /** Send composed input from the bottom input box (adds Enter, wraps
    *  multiline text in bracketed paste when the running app supports it). */
   sendComposed: (text: string) => void;
@@ -95,6 +98,11 @@ export default function TerminalView({
 
       onRegister(tab.key, {
         write: (data) => ptyWrite(id, data),
+        paste: (text) =>
+          ptyWrite(
+            id,
+            term.modes.bracketedPasteMode ? `\x1b[200~${text}\x1b[201~` : text,
+          ),
         sendComposed: (text) => {
           const bracketed = term.modes.bracketedPasteMode;
           let payload: string;

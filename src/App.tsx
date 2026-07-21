@@ -212,7 +212,13 @@ export default function App() {
       if (e.payload.type !== "drop" || e.payload.paths.length === 0) return;
       const key = activeTabRef.current;
       if (key === null || previewRef.current) return;
-      handles.current.get(key)?.write(e.payload.paths.map(shellQuote).join(" ") + " ");
+      const h = handles.current.get(key);
+      // One paste per path, like a real terminal drop — pasted (not typed)
+      // so claude recognizes image/file paths and shows [Image #N].
+      e.payload.paths.forEach((p, i) => {
+        if (i > 0) h?.write(" ");
+        h?.paste(shellEscape(p));
+      });
     });
     return () => {
       un.then((f) => f());
@@ -606,6 +612,8 @@ function basename(p: string): string {
   return p.split("/").filter(Boolean).pop() ?? p;
 }
 
-function shellQuote(p: string): string {
-  return /^[A-Za-z0-9_\-./~:@%+=]+$/.test(p) ? p : "'" + p.replace(/'/g, "'\\''") + "'";
+// Backslash-escape (the way terminals escape dropped paths) — claude's
+// pasted-path detection understands this form, unlike single quotes.
+function shellEscape(p: string): string {
+  return p.replace(/[^A-Za-z0-9_\-./~+:@%=]/g, (c) => "\\" + c);
 }

@@ -60,25 +60,30 @@ function loadOrders(): Record<string, string[]> {
   }
 }
 
-/** Sessions the user hand-ordered keep that order; ones not ordered yet
- *  (new arrivals) stay on top in recency order. */
-function applyOrder(list: Session[], order?: string[]): Session[] {
+/** Items the user hand-ordered keep that order; ones not ordered yet
+ *  (new arrivals) stay on top in their natural order. */
+function orderBy<T>(list: T[], id: (t: T) => string, order?: string[]): T[] {
   if (!order || order.length === 0) return list;
-  const idx = new Map(order.map((id, i) => [id, i]));
-  const fresh = list.filter((s) => !idx.has(s.id));
+  const idx = new Map(order.map((k, i) => [k, i]));
+  const fresh = list.filter((t) => !idx.has(id(t)));
   const ordered = list
-    .filter((s) => idx.has(s.id))
-    .sort((a, b) => idx.get(a.id)! - idx.get(b.id)!);
+    .filter((t) => idx.has(id(t)))
+    .sort((a, b) => idx.get(id(a))! - idx.get(id(b))!);
   return [...fresh, ...ordered];
 }
+const applyOrder = (list: Session[], order?: string[]) =>
+  orderBy(list, (s) => s.id, order);
 
 interface DragArm {
-  kind: "session" | "group";
-  /** Session id or group id. */
+  /** session = a row; group = a custom group header (recent view);
+   *  section = an auto-section header (project view). */
+  kind: "session" | "group" | "section";
+  /** Session id, group id, or section key. */
   id: string;
   /** Session's project path (session drags — group membership drops). */
   path: string;
-  /** Container the session was dragged from ("recent" or "group:<id>"). */
+  /** Container the session was dragged from ("recent", "group:<id>",
+   *  or "sec:<view>:<key>"). */
   container: string;
   label: string;
   x: number;
@@ -261,7 +266,8 @@ export default function SessionsPanel({
     );
   }, [projects, sessionPaths, query]);
 
-  // Auto sub-grouping for the Project / Date view modes.
+  // Auto sub-grouping for the Project / Date view modes. Project sections
+  // drag-reorder by their header; date buckets stay chronological.
   const autoSections = useMemo(() => {
     if (viewMode === "recent" || searchList) return null;
     const map = new Map<string, Session[]>();
@@ -275,15 +281,20 @@ export default function SessionsPanel({
       const order = ["Today", "Yesterday", "This week", "This month", "Older"];
       return order
         .filter((k) => map.has(k))
-        .map((k) => ({ label: k, sessions: map.get(k)! }));
+        .map((k) => ({ key: k, label: k, sessions: map.get(k)! }));
     }
-    return [...map.entries()]
+    const secs = [...map.entries()]
       .sort((a, b) => b[1][0].last_active - a[1][0].last_active)
       .map(([path, ss]) => ({
+        key: path,
         label: path.split("/").filter(Boolean).pop() ?? path,
         sessions: ss,
       }));
-  }, [viewMode, filtered, searchList]);
+    return orderBy(secs, (s) => s.key, orders["sections:project"]);
+  }, [viewMode, filtered, searchList, orders]);
+  if (viewMode === "project" && autoSections) {
+    containerSeq.current.set("sections:project", autoSections.map((s) => s.key));
+  }
 
   const toggle = (k: keyof SessionDisplayOpts) => onOptsChange({ ...opts, [k]: !opts[k] });
 
@@ -354,7 +365,11 @@ export default function SessionsPanel({
       }
       setDragPos({ x: e.clientX, y: e.clientY });
       const el = document.elementFromPoint(e.clientX, e.clientY);
-      setDragOver(el?.closest<HTMLElement>("[data-drop]")?.dataset.drop ?? null);
+      setDragOver(
+        arm.kind === "section"
+          ? el?.closest<HTMLElement>("[data-sec]")?.dataset.sec ?? null
+          : el?.closest<HTMLElement>("[data-drop]")?.dataset.drop ?? null,
+      );
       // Hovering a sibling row shows the insertion line (reorder).
       const itemEl = el?.closest<HTMLElement>("[data-item]");
       const hoverId =
@@ -380,7 +395,17 @@ export default function SessionsPanel({
         const el = document.elementFromPoint(e.clientX, e.clientY);
         const itemEl = el?.closest<HTMLElement>("[data-item]");
         const target = el?.closest<HTMLElement>("[data-drop]")?.dataset.drop;
-        if (arm.kind === "group") {
+        if (arm.kind === "section") {
+          // Project-view section headers reorder among themselves.
+          const sec = el?.closest<HTMLElement>("[data-sec]")?.dataset.sec;
+          if (sec && sec !== arm.id) {
+            const seq = containerSeq.current.get("sections:project") ?? [];
+            const rest = seq.filter((k) => k !== arm.id);
+            const after = seq.indexOf(arm.id) < seq.indexOf(sec);
+            rest.splice(rest.indexOf(sec) + (after ? 1 : 0), 0, arm.id);
+            setOrders((o) => ({ ...o, "sections:project": rest }));
+          }
+        } else if (arm.kind === "group") {
           // Dropping a group header on another header reorders the groups.
           if (target && target !== arm.id) {
             setGroups((gs) => {
@@ -758,11 +783,31 @@ export default function SessionsPanel({
           autoSections.map((sec) => {
             const key = `${viewMode}:${sec.label}`;
             const open = sectionOpen(key);
+            const draggable = viewMode === "project";
             return (
-              <div key={sec.label} className="session-group">
+              <div key={sec.key} className="session-group">
                 <div
-                  className="group-header static clickable"
-                  onClick={() => toggleSection(key)}
+                  className={
+                    "group-header static clickable" +
+                    (dragId === sec.key ? " dragging" : "") +
+                    (dragOver === sec.key && dragId && dragId !== sec.key ? " over" : "")
+                  }
+                  data-sec={draggable ? sec.key : undefined}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0 || !draggable) return;
+                    if ((e.target as HTMLElement).closest("button, input")) return;
+                    dragArm.current = {
+                      kind: "section", id: sec.key, path: "", container: "",
+                      label: sec.label, x: e.clientX, y: e.clientY,
+                    };
+                  }}
+                  onClick={() => {
+                    if (suppressClick.current) {
+                      suppressClick.current = false;
+                      return;
+                    }
+                    toggleSection(key);
+                  }}
                 >
                   <span className={"chevron" + (open ? " open" : "")}>›</span>
                   <span className="group-name">{sec.label}</span>
