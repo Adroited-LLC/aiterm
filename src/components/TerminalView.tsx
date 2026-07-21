@@ -85,6 +85,7 @@ export default function TerminalView({
       unlistenOut = await listen<string>(`pty://output/${id}`, (e) => {
         term.write(e.payload);
         onActivity(tab.key);
+        scheduleJiggle();
       });
       unlistenExit = await listen<{ id: number }>("pty://exit", (e) => {
         if (e.payload.id === id) onExit(tab.key);
@@ -118,19 +119,30 @@ export default function TerminalView({
       });
     })();
 
-    // Startup nudge: claude's TUI paints once while panels/window-state are
+    // Startup nudge: claude's TUI paints while panels/window-state are
     // still settling and only repaints on SIGWINCH, leaving stale lines on
-    // screen. Resize one column down and fit back — two SIGWINCHs force a
-    // clean full redraw at the real size (what a manual window-drag does).
-    const jiggle = window.setTimeout(() => {
-      if (term.cols > 2) {
-        term.resize(term.cols - 1, term.rows);
-        window.setTimeout(() => {
-          fit.fit();
-          term.refresh(0, term.rows - 1);
-        }, 80);
-      }
-    }, 1200);
+    // screen until something resizes. Once the FIRST output burst goes
+    // quiet (a fixed delay fires too early — resuming a big session can
+    // take seconds to paint), resize one column down and fit back — two
+    // SIGWINCHs force a clean full redraw, same as a manual window-drag.
+    let jiggled = false;
+    let quietTimer: number | null = null;
+    const scheduleJiggle = () => {
+      if (jiggled) return;
+      if (quietTimer !== null) clearTimeout(quietTimer);
+      quietTimer = window.setTimeout(() => {
+        if (jiggled || disposed) return;
+        jiggled = true;
+        if (term.cols > 2) {
+          term.resize(term.cols - 1, term.rows);
+          window.setTimeout(() => {
+            fit.fit();
+            term.refresh(0, term.rows - 1);
+          }, 80);
+        }
+      }, 800);
+    };
+    scheduleJiggle();
 
     // Debounce resize→fit: splitter drags fire the observer continuously,
     // and a SIGWINCH storm makes TUIs (claude's input box) redraw over
@@ -150,7 +162,7 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
-      clearTimeout(jiggle);
+      if (quietTimer !== null) clearTimeout(quietTimer);
       if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();
       unlistenOut?.();
