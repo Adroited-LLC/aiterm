@@ -210,7 +210,7 @@ fn parses_tasks_and_agents_from_transcript() {
         // Still-running background agent: launched, no notification yet.
         r#"{"type":"assistant","timestamp":"2026-07-21T10:02:00Z","message":{"content":[{"type":"tool_use","name":"Agent","id":"a3","input":{"description":"watch build","subagent_type":"grunt","prompt":"watch"}}]}}"#, "\n",
         r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a3","content":"Async agent launched successfully."}]}}"#, "\n",
-        r#"{"type":"user","message":{"content":"<task-notification><task-id>xyz</task-id><tool-use-id>a2</tool-use-id><status>completed</status><summary>Refactor finished, 8 files.</summary></task-notification>"}}"#, "\n",
+        r#"{"type":"user","message":{"content":"<task-notification><task-id>xyz</task-id><tool-use-id>a2</tool-use-id><status>completed</status><summary>Refactor finished, 8 files.</summary><result>Refactored 8 files, all tests green.</result></task-notification>"}}"#, "\n",
     )).unwrap();
 
     let tasks = aiterm_lib::sessions::session_tasks(id.into());
@@ -224,7 +224,10 @@ fn parses_tasks_and_agents_from_transcript() {
     assert_eq!(by_id("a1").status, "done");
     assert!(by_id("a1").result.as_deref().unwrap().contains("12 tests"));
     assert_eq!(by_id("a2").status, "done");
-    assert!(by_id("a2").result.as_deref().unwrap().contains("Refactor finished"));
+    assert!(
+        by_id("a2").result.as_deref().unwrap().contains("all tests green"),
+        "full <result> report should win over the <summary> one-liner"
+    );
     assert_eq!(by_id("a3").status, "running", "no notification yet = still running");
     assert_eq!(by_id("a3").agent_type, "grunt");
 

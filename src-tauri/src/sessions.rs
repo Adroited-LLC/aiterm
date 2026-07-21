@@ -779,8 +779,10 @@ pub fn session_agents(session_id: String) -> Vec<AgentRun> {
                     continue;
                 };
                 runs[i].status = "done".into();
-                if let Some(sum) = xml_tag(text, "summary") {
-                    runs[i].result = Some(snippet(sum, 240));
+                // The notification carries the agent's full report in
+                // <result>; fall back to the one-line <summary>.
+                if let Some(r) = xml_tag(text, "result").or_else(|| xml_tag(text, "summary")) {
+                    runs[i].result = Some(snippet(r, 600));
                 }
             }
             _ => {}
