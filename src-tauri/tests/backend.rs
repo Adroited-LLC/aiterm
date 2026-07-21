@@ -218,6 +218,25 @@ fn parses_tasks_and_agents_from_transcript() {
     assert_eq!(tasks[0].subject, "build it");
     assert_eq!(tasks[1].status, "in_progress");
 
+    // Newer TaskCreate/TaskUpdate system, written after the TodoWrite: wins.
+    let id2 = "00000000-0000-4000-8000-aitermtasks2";
+    let file2 = dir.join(format!("{id2}.jsonl"));
+    std::fs::write(&file2, concat!(
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","id":"t0","input":{"todos":[{"content":"stale list","status":"pending"}]}}]}}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskCreate","id":"c1","input":{"subject":"first task","activeForm":"Doing first"}}]}}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskCreate","id":"c2","input":{"subject":"second task","activeForm":"Doing second"}}]}}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskCreate","id":"c3","input":{"subject":"doomed task"}}]}}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","id":"u1","input":{"taskId":"1","status":"completed"}}]}}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","id":"u2","input":{"taskId":"2","status":"in_progress"}}]}}"#, "\n",
+        r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","id":"u3","input":{"taskId":"3","status":"deleted"}}]}}"#, "\n",
+    )).unwrap();
+    let tasks2 = aiterm_lib::sessions::session_tasks(id2.into());
+    assert_eq!(tasks2.len(), 2, "deleted tasks drop; TaskCreate list beats stale TodoWrite");
+    assert_eq!(tasks2[0].subject, "first task");
+    assert_eq!(tasks2[0].status, "completed");
+    assert_eq!(tasks2[1].status, "in_progress");
+    let _ = std::fs::remove_file(&file2);
+
     let agents = aiterm_lib::sessions::session_agents(id.into());
     assert_eq!(agents.len(), 3);
     let by_id = |i: &str| agents.iter().find(|a| a.id == i).unwrap();

@@ -546,17 +546,23 @@ pub struct SessionTask {
     pub blocked_by: Vec<String>,
 }
 
-/// Task list for a session. Current Claude Code keeps the live list in
-/// TodoWrite tool calls in the transcript (last write wins) — the old
-/// per-task json dir only holds lock files now, but stays as a fallback
-/// for transcripts written by older versions.
+/// Task list for a session, parsed from the transcript. Claude Code has two
+/// task systems: the newer TaskCreate/TaskUpdate tools (sequential ids) and
+/// the older TodoWrite snapshots (last write wins). Whichever wrote later in
+/// the file is the live one; the legacy per-task json dir is a last resort.
 #[tauri::command]
 pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
     if let Some(path) = find_session_file(&session_id) {
         if let Ok(file) = File::open(&path) {
-            let mut last: Option<Vec<SessionTask>> = None;
-            for line in BufReader::new(file).lines().map_while(Result::ok) {
-                if !line.contains("\"TodoWrite\"") {
+            let mut todo: Option<Vec<SessionTask>> = None;
+            let mut todo_at = 0usize;
+            let mut created: Vec<SessionTask> = Vec::new();
+            let mut task_at = 0usize;
+            for (n, line) in BufReader::new(file).lines().map_while(Result::ok).enumerate() {
+                if !line.contains("\"TodoWrite\"")
+                    && !line.contains("\"TaskCreate\"")
+                    && !line.contains("\"TaskUpdate\"")
+                {
                     continue;
                 }
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -567,38 +573,85 @@ pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
                     continue;
                 };
                 for b in blocks {
-                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_use")
-                        || b.get("name").and_then(|n| n.as_str()) != Some("TodoWrite")
-                    {
+                    if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
                         continue;
                     }
-                    if let Some(todos) = b.pointer("/input/todos").and_then(|t| t.as_array()) {
-                        last = Some(
-                            todos
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(i, t)| {
-                                    Some(SessionTask {
-                                        id: i.to_string(),
-                                        subject: t.get("content")?.as_str()?.to_string(),
-                                        status: t
-                                            .get("status")
-                                            .and_then(|s| s.as_str())
-                                            .unwrap_or("pending")
-                                            .to_string(),
-                                        active_form: t
-                                            .get("activeForm")
-                                            .and_then(|s| s.as_str())
-                                            .map(String::from),
-                                        blocked_by: vec![],
-                                    })
-                                })
-                                .collect(),
-                        );
+                    let input = b.get("input");
+                    let get = |k: &str| {
+                        input
+                            .and_then(|i| i.get(k))
+                            .and_then(|x| x.as_str())
+                            .map(String::from)
+                    };
+                    match b.get("name").and_then(|n| n.as_str()) {
+                        Some("TodoWrite") => {
+                            if let Some(todos) =
+                                b.pointer("/input/todos").and_then(|t| t.as_array())
+                            {
+                                todo = Some(
+                                    todos
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(i, t)| {
+                                            Some(SessionTask {
+                                                id: i.to_string(),
+                                                subject: t
+                                                    .get("content")?
+                                                    .as_str()?
+                                                    .to_string(),
+                                                status: t
+                                                    .get("status")
+                                                    .and_then(|s| s.as_str())
+                                                    .unwrap_or("pending")
+                                                    .to_string(),
+                                                active_form: t
+                                                    .get("activeForm")
+                                                    .and_then(|s| s.as_str())
+                                                    .map(String::from),
+                                                blocked_by: vec![],
+                                            })
+                                        })
+                                        .collect(),
+                                );
+                                todo_at = n;
+                            }
+                        }
+                        Some("TaskCreate") => {
+                            if let Some(subject) = get("subject") {
+                                created.push(SessionTask {
+                                    id: (created.len() + 1).to_string(),
+                                    subject,
+                                    status: "pending".into(),
+                                    active_form: get("activeForm"),
+                                    blocked_by: vec![],
+                                });
+                                task_at = n;
+                            }
+                        }
+                        Some("TaskUpdate") => {
+                            if let Some(tid) = get("taskId") {
+                                if let Some(t) = created.iter_mut().find(|t| t.id == tid) {
+                                    if let Some(s) = get("status") {
+                                        t.status = s;
+                                    }
+                                    if let Some(s) = get("subject") {
+                                        t.subject = s;
+                                    }
+                                    if let Some(a) = get("activeForm") {
+                                        t.active_form = Some(a);
+                                    }
+                                    task_at = n;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-            if let Some(tasks) = last {
+            if !created.is_empty() && (todo.is_none() || task_at > todo_at) {
+                return created.into_iter().filter(|t| t.status != "deleted").collect();
+            }
+            if let Some(tasks) = todo {
                 return tasks;
             }
         }
