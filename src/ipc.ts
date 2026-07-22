@@ -106,6 +106,14 @@ export const sessionAgents = (sessionId: string) =>
   invoke<AgentRun[]>("session_agents", { sessionId });
 export const runningSessionIds = () =>
   invoke<string[]>("running_session_ids");
+export interface UsageBar {
+  kind: string;
+  label: string;
+  percent: number;
+  severity: string;
+  resets_at: string;
+}
+export const usageLimits = () => invoke<UsageBar[]>("usage_limits");
 export const sessionStatus = (sessionId: string) =>
   invoke<SessionStatus>("session_status", { sessionId });
 export interface ProjectInfo {

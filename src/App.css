@@ -63,6 +63,57 @@ body.dragging * { pointer-events: none; }
 .topbar-right { display: flex; gap: 2px; align-items: center; }
 .topbar-right .icon-btn { font-size: 11px; }
 
+/* ---------- plan usage bars (top-bar widget) ---------- */
+.usage-bars {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  margin-left: 10px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+.usage-bar {
+  position: relative;
+  padding: 2px 0;
+  cursor: default;
+}
+.usage-track {
+  width: 42px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-active);
+  overflow: hidden;
+}
+.usage-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+.usage-fill.sev-normal { background: #4a9eff; }
+.usage-fill.sev-warning { background: #e0a34e; }
+.usage-fill.sev-severe,
+.usage-fill.sev-critical { background: #e05a4e; }
+.usage-tip {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  white-space: nowrap;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 9px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+.usage-tip-label { color: var(--text); font-size: 12px; font-weight: 600; }
+.usage-tip-pct { color: var(--text-dim); font-size: 11px; }
+.usage-tip-reset { color: var(--text-faint); font-size: 11px; }
+
 /* ---------- generic ---------- */
 .icon-btn {
   background: none;

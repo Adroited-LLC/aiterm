@@ -3,6 +3,7 @@ pub mod git;
 pub mod indexer;
 pub mod pty;
 pub mod sessions;
+pub mod usage;
 pub mod watcher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,6 +30,7 @@ pub fn run() {
             sessions::session_agents,
             sessions::session_artifacts,
             sessions::running_session_ids,
+            usage::usage_limits,
             watcher::watch_project,
             fsx::list_dir,
             fsx::open_path,
