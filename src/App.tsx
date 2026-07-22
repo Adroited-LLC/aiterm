@@ -468,18 +468,6 @@ export default function App() {
             title="Toggle input composer"
             onClick={() => setShowComposer(!showComposer)}
           >⌨</button>
-          <button
-            className="icon-btn"
-            title={activeProject ? `New shell in ${basename(activeProject)}` : "New shell"}
-            onClick={() =>
-              openTab(
-                activeProject ? basename(activeProject) : "shell",
-                activeProject,
-                null,
-                activeProject ? `shell:${activeProject}` : "shell:home",
-              )
-            }
-          >＋</button>
         </div>
         <div className="topbar-title">
           {activeProject ? activeProject.replace(/^\/home\/[^/]+/, "~") : "aiterm"}
