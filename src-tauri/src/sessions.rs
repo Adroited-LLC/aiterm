@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -56,8 +56,58 @@ impl ClaudeProvider {
             }
         }
         sessions.sort_by(|a, b| b.0.last_active.cmp(&a.0.last_active));
+
+        // Collapse fork duplicates. Claude Code forks a live conversation
+        // (orchestrator view, resume-on-select) into a NEW transcript file
+        // that carries the same `bridgeSessionId` as the original. That used
+        // to surface as two identical rows, and resuming the wrong one landed
+        // on stale context. Keep only the newest fork per bridge id — already
+        // sorted newest-first, so the first occurrence wins — giving one row
+        // that always resumes the live, full-context session. Sessions with
+        // no bridge id can't fork-duplicate this way and are all kept.
+        let mut seen_bridge = std::collections::HashSet::new();
+        sessions.retain(|(_, path)| match read_bridge_id(path) {
+            Some(bridge) => seen_bridge.insert(bridge),
+            None => true,
+        });
         sessions
     }
+}
+
+/// Read a transcript's `bridgeSessionId` — the stable id shared across every
+/// fork of one logical conversation. The `bridge-session` record is appended
+/// periodically (its `lastSequenceNum` grows), so it lives near the end of
+/// the file; read only a tail window instead of the whole (multi-MB) file.
+fn read_bridge_id(path: &Path) -> Option<String> {
+    const TAIL: u64 = 128 * 1024;
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    // Arbitrary byte offset may split a UTF-8 char / a line — lossy-decode,
+    // then drop the first (partial) line when we didn't start at byte 0.
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines();
+    if start > 0 {
+        lines.next();
+    }
+    // Last bridge-session record wins (id is constant across them anyway).
+    let mut found = None;
+    for line in lines {
+        if !line.contains("\"bridge-session\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("bridge-session") {
+                if let Some(id) = v.get("bridgeSessionId").and_then(|b| b.as_str()) {
+                    found = Some(id.to_string());
+                }
+            }
+        }
+    }
+    found
 }
 
 impl SessionProvider for ClaudeProvider {

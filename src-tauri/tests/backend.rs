@@ -36,7 +36,10 @@ fn lists_directories() {
 fn reads_git_repo() {
     let state = git_repo_state(repo());
     assert!(state.is_repo);
-    assert_eq!(state.branch.as_deref(), Some("main"));
+    // Don't hardcode the branch name — this suite must pass on feature
+    // branches too. Just require a non-empty current branch.
+    let head_branch = state.branch.clone().expect("current branch");
+    assert!(!head_branch.is_empty());
 
     let log = git_log(repo(), 10).expect("git_log");
     assert!(!log.is_empty());
@@ -45,7 +48,8 @@ fn reads_git_repo() {
     assert!(log[..log.len() - 1].iter().all(|c| !c.parents.is_empty()));
 
     let branches = git_branches(repo()).expect("git_branches");
-    assert!(branches.iter().any(|b| b.name == "main" && b.is_head));
+    // The reported HEAD branch is the one flagged is_head in the list.
+    assert!(branches.iter().any(|b| b.name == head_branch && b.is_head));
 
     git_status(repo()).expect("git_status");
 
@@ -251,6 +255,46 @@ fn parses_tasks_and_agents_from_transcript() {
     assert_eq!(by_id("a3").agent_type, "grunt");
 
     let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[test]
+fn collapses_forked_session_duplicates() {
+    // A forked conversation writes a new transcript sharing the original's
+    // bridgeSessionId; only the newest fork should appear in the list.
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let dir = home.join(".claude/projects/-aiterm-fork-dup-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bridge = "cse_aitermforkduptest";
+    let mk = |id: &str, prompt: &str| {
+        let f = dir.join(format!("{id}.jsonl"));
+        let l1 = format!(
+            r#"{{"type":"user","cwd":"/aiterm-fork-dup","message":{{"content":"{prompt}"}}}}"#
+        );
+        let l2 = format!(
+            r#"{{"type":"bridge-session","sessionId":"{id}","bridgeSessionId":"{bridge}","lastSequenceNum":1}}"#
+        );
+        std::fs::write(&f, format!("{l1}\n{l2}\n")).unwrap();
+        f
+    };
+    let older = mk("00000000-0000-4000-8000-aitermforkold", "older fork");
+    let newer = mk("00000000-0000-4000-8000-aitermforknew", "newer fork");
+    // Make `older` genuinely older so newest-wins is deterministic.
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::open(&older).unwrap().set_modified(past).unwrap();
+
+    let ids: Vec<String> = ClaudeProvider.scan().into_iter().map(|s| s.id).collect();
+    assert!(
+        ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermforknew"),
+        "newest fork should be listed"
+    );
+    assert!(
+        !ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermforkold"),
+        "older fork sharing the bridge id should be collapsed away"
+    );
+
+    let _ = std::fs::remove_file(&older);
+    let _ = std::fs::remove_file(&newer);
     let _ = std::fs::remove_dir(&dir);
 }
 
