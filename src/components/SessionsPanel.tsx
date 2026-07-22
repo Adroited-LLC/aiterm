@@ -558,7 +558,10 @@ export default function SessionsPanel({
         }}
         className={
           "session-item" +
-          (s.project_path === activeProject ? " active" : "") +
+          // Only the single focused session tints — not every session that
+          // happens to share the active project. Multi-highlight is opt-in
+          // via ctrl/shift-click (builds the `selected` set below).
+          (isShowing ? " active" : "") +
           (selected.has(s.id) ? " selected" : "") +
           (isShowing ? " showing" : "") +
           (isDragging ? " dragging" : "") +
@@ -569,8 +572,9 @@ export default function SessionsPanel({
             suppressClick.current = false;
             return;
           }
-          if (e.ctrlKey || e.metaKey) {
-            // Ctrl-click builds a multi-selection without switching sessions.
+          if (e.ctrlKey || e.metaKey || e.shiftKey) {
+            // Ctrl/Shift-click builds a multi-selection without switching
+            // sessions; a plain click selects just this one.
             setSelected((prev) => {
               const next = new Set(prev);
               if (next.has(s.id)) next.delete(s.id);
