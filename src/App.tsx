@@ -337,7 +337,13 @@ export default function App() {
   };
   const resumeSession = (s: Session) => {
     setActiveProject(s.project_path);
-    openTab(s.title, s.project_path, `claude --resume ${s.id}`, s.id, s.id);
+    // --fork-session: a plain `claude --resume <id>` on a session that's
+    // still running (a live bg agent) exits with "…currently running as a
+    // background agent… add --fork-session to branch off a copy", leaving a
+    // black pane. Forking always succeeds — running or not — and branches a
+    // copy carrying full history; the bridge-id collapse keeps the list to
+    // one row. (This is also exactly how Claude Code launches these.)
+    openTab(s.title, s.project_path, `claude --fork-session --resume ${s.id}`, s.id, s.id);
   };
   const newShell = (s: Session) => {
     setActiveProject(s.project_path);
