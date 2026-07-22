@@ -28,6 +28,7 @@ pub fn run() {
             sessions::session_tasks,
             sessions::session_agents,
             sessions::session_artifacts,
+            sessions::running_session_ids,
             watcher::watch_project,
             fsx::list_dir,
             fsx::open_path,

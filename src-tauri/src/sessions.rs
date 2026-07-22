@@ -602,7 +602,7 @@ pub struct SessionTask {
 /// the file is the live one; the legacy per-task json dir is a last resort.
 #[tauri::command]
 pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
-    if let Some(path) = find_session_file(&session_id) {
+    if let Some(path) = resolve_live_session_file(&session_id) {
         if let Ok(file) = File::open(&path) {
             let mut todo: Option<Vec<SessionTask>> = None;
             let mut todo_at = 0usize;
@@ -802,7 +802,7 @@ fn snippet(text: &str, max: usize) -> String {
 /// as a <task-notification> carrying the original tool-use-id.
 #[tauri::command]
 pub fn session_agents(session_id: String) -> Vec<AgentRun> {
-    let Some(path) = find_session_file(&session_id) else {
+    let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];
     };
     let Ok(file) = File::open(&path) else {
@@ -902,21 +902,151 @@ pub struct Artifact {
     pub at: String,
 }
 
+fn mtime_of(path: &Path) -> Option<u64> {
+    Some(
+        std::fs::metadata(path)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64,
+    )
+}
+
+/// Locate the transcript for a bare session id. Fast path is the exact
+/// `<id>.jsonl`; if that's gone, Claude Code may have renamed it to
+/// `<id>.orphaned-<ts>-<hash>.jsonl` (compaction/supersede), so fall back to
+/// the newest such variant rather than returning nothing (which would blank
+/// the tasks/agents/artifacts panels).
 fn find_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     let root = dirs::home_dir()?.join(".claude/projects");
-    let file_name = format!("{session_id}.jsonl");
-    std::fs::read_dir(&root)
-        .ok()?
-        .flatten()
-        .map(|p| p.path().join(&file_name))
-        .find(|p| p.exists())
+    let exact = format!("{session_id}.jsonl");
+    if let Ok(projects) = std::fs::read_dir(&root) {
+        for project in projects.flatten() {
+            let p = project.path().join(&exact);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    let orphaned_prefix = format!("{session_id}.orphaned-");
+    let mut best: Option<(std::path::PathBuf, u64)> = None;
+    for project in std::fs::read_dir(&root).ok()?.flatten() {
+        let Ok(files) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let p = f.path();
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if name.starts_with(&orphaned_prefix) && name.ends_with(".jsonl") {
+                let m = mtime_of(&p).unwrap_or(0);
+                if best.as_ref().is_none_or(|(_, bm)| m > *bm) {
+                    best = Some((p, m));
+                }
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Resolve the transcript to actually read for a UI-pinned session id. The id a
+/// tab stores is captured at resume time and never changes, but the live
+/// transcript can drift out from under it two ways: the file gets
+/// orphaned-renamed (handled by `find_session_file`), or the session was
+/// resumed with `--fork-session`, which branches a NEW transcript sharing the
+/// original's `bridgeSessionId`. In the fork case the pinned id keeps pointing
+/// at the frozen pre-fork file while the terminal writes to the new one — so
+/// follow the bridge to the newest sibling in the fork family (forks keep the
+/// same cwd → same project dir). This is what keeps the agents/tasks panels in
+/// sync with the running session instead of stuck at the moment of the fork.
+fn resolve_live_session_file(session_id: &str) -> Option<std::path::PathBuf> {
+    let start = find_session_file(session_id)?;
+    let Some(bridge) = read_bridge_id(&start) else {
+        return Some(start);
+    };
+    let project_dir = start.parent()?;
+    let mut best = start.clone();
+    let mut best_mtime = mtime_of(&start).unwrap_or(0);
+    if let Ok(files) = std::fs::read_dir(project_dir) {
+        for f in files.flatten() {
+            let p = f.path();
+            if p == start || p.extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            // A live fork is a normal <id>.jsonl; never pick an orphaned file
+            // as the "newest" winner.
+            if p.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
+            {
+                continue;
+            }
+            if read_bridge_id(&p).as_deref() == Some(bridge.as_str()) {
+                let m = mtime_of(&p).unwrap_or(0);
+                if m > best_mtime {
+                    best = p;
+                    best_mtime = m;
+                }
+            }
+        }
+    }
+    Some(best)
+}
+
+/// Session ids that currently have a live Claude Code process, read from
+/// `/proc`. A session counts as running if some process names it via
+/// `--session-id <id>` or `--resume <id|/path/<id>.jsonl>`. The UI uses this to
+/// decide fork-vs-resume: a plain `claude --resume` fails on a session that's
+/// still running (leaving a black pane), so those must fork; everything else
+/// resumes in place, which avoids minting a duplicate forked transcript.
+#[tauri::command]
+pub fn running_session_ids() -> Vec<String> {
+    let mut ids = std::collections::HashSet::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return vec![];
+    };
+    for entry in procs.flatten() {
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        for (i, a) in args.iter().enumerate() {
+            if a == "--session-id" || a == "--resume" {
+                if let Some(id) = args.get(i + 1).and_then(|v| extract_session_id(v)) {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+/// Pull a session UUID out of a `--session-id`/`--resume` value, which is
+/// either a bare id or a path like `/…/<id>.jsonl` (possibly `.orphaned-…`).
+fn extract_session_id(val: &str) -> Option<String> {
+    let stem = Path::new(val).file_stem()?.to_string_lossy().into_owned();
+    let candidate = stem.split(".orphaned-").next().unwrap_or(&stem);
+    if candidate.len() == 36 && candidate.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
 }
 
 /// Files this session created or modified, newest first — parsed from
 /// Write/Edit/NotebookEdit tool calls in the transcript.
 #[tauri::command]
 pub fn session_artifacts(session_id: String) -> Vec<Artifact> {
-    let Some(path) = find_session_file(&session_id) else {
+    let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];
     };
     let Ok(file) = File::open(&path) else {

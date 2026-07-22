@@ -18,6 +18,7 @@ import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
+  runningSessionIds,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -335,15 +336,27 @@ export default function App() {
       setPreviewSession(s);
     }
   };
-  const resumeSession = (s: Session) => {
+  const resumeSession = async (s: Session) => {
     setActiveProject(s.project_path);
-    // --fork-session: a plain `claude --resume <id>` on a session that's
-    // still running (a live bg agent) exits with "…currently running as a
-    // background agent… add --fork-session to branch off a copy", leaving a
-    // black pane. Forking always succeeds — running or not — and branches a
-    // copy carrying full history; the bridge-id collapse keeps the list to
-    // one row. (This is also exactly how Claude Code launches these.)
-    openTab(s.title, s.project_path, `claude --fork-session --resume ${s.id}`, s.id, s.id);
+    // A plain `claude --resume <id>` on a session that's still running (a live
+    // bg agent) exits with "…currently running as a background agent… add
+    // --fork-session to branch off a copy", leaving a black pane — so those
+    // MUST fork. But forking unconditionally mints a new transcript on every
+    // resume, which is what buried the sessions/agents lists in duplicates.
+    // So fork only when the session is actually running (authoritative: a live
+    // claude process names it in /proc); otherwise resume in place, same id,
+    // no duplicate. The agents panel follows either path because the backend
+    // resolves a pinned id to the newest transcript in its fork family.
+    let running: string[] = [];
+    try {
+      running = await runningSessionIds();
+    } catch {
+      running = [];
+    }
+    const command = running.includes(s.id)
+      ? `claude --fork-session --resume ${s.id}`
+      : `claude --resume ${s.id}`;
+    openTab(s.title, s.project_path, command, s.id, s.id);
   };
   const newShell = (s: Session) => {
     setActiveProject(s.project_path);

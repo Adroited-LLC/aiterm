@@ -104,6 +104,8 @@ export const sessionArtifacts = (sessionId: string) =>
   invoke<Artifact[]>("session_artifacts", { sessionId });
 export const sessionAgents = (sessionId: string) =>
   invoke<AgentRun[]>("session_agents", { sessionId });
+export const runningSessionIds = () =>
+  invoke<string[]>("running_session_ids");
 export const sessionStatus = (sessionId: string) =>
   invoke<SessionStatus>("session_status", { sessionId });
 export interface ProjectInfo {
