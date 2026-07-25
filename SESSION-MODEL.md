@@ -132,12 +132,33 @@ different traces.
 | jobs state | `forkSessionId` + `forkParentSessionId` **present** | fork fields all `null` |
 | `parentUuid` | no message records at all | resolves **in-file** (history was copied) |
 | `bridgeSessionId` | — | child gets its **own**, not the parent's |
+| background | **always** `template: "bg"` | inherits the caller |
+
+- **`/fork` always produces a background agent, regardless of
+  `remoteControlAtStartup`.** That setting governs startup, not this command.
+  *Verified 2026-07-25: with `remoteControlAtStartup: false` in **both**
+  `~/.claude.json` and `~/.claude/settings.json`, `/fork` still wrote a job
+  state with `template: "bg"`. The forked row is therefore live, daemon-held,
+  and owned by no tab — green dot, no exit button — from the moment it exists.*
+- `/fork` branches **beside** the conversation; it does not relocate it. The
+  parent keeps its session id and its transcript keeps growing in the same tab.
+  *Verified 2026-07-25: forked `8a576195` → `7f8edb5a`; the parent kept its id
+  and grew afterwards in place.*
 
 - So `/fork` lineage is discoverable from job state, and **`--fork-session`
   lineage is discoverable from nothing on disk.** *Verified three independent
   ways for the `--fork-session` case.*
 - Consequence: a GUI that forks must **mint the child id itself**
   (`--session-id`) and record the pair, or it can never link them afterward.
+- There is a **third** mechanism, which aiterm uses as of 0.4.4: copy the
+  transcript and rewrite its id fields (see *Resuming*). It leaves no job
+  state, starts no process, and produces no background agent — so its lineage
+  must be recorded by the app (`~/.local/share/aiterm/forks.json`). Unlike
+  `/fork`, the branch is complete and idle the instant it appears rather than
+  being a stub that fills in on resume.
+- Useful side effect for a GUI: `/fork` titles its stub `<project> ⑂`, so a
+  console-made fork is visually distinguishable from an app-made one without
+  any extra bookkeeping. Worth *not* stripping.
 - `sessionKind: "bg"` in a transcript is a **permanent scar** — it stays true
   long after the agent exits, so it answers "was this ever a background
   session", never "is it running now". *Verified: a dead session still
@@ -163,14 +184,20 @@ different traces.
   *Verified the hard way.*
 - Job state for a conversation that has moved to the background records
   `template: "bg"`, `backend: "daemon"`, `interactiveLineage: true`.
+- It governs **startup**, not every path into the background: `/fork` ignores
+  it entirely (see *Telling forks apart*). Do not treat `false` as "nothing
+  will become a background agent".
 
 ---
 
 ## Open questions
 
 1. **Does `remoteControlAtStartup: false` actually stop sessions becoming
-   background agents?** Both files now read `false`; nothing beyond that is
-   established. One fresh (not resumed) session settles it.
+   background agents?** Both files now read `false`. **Partly answered
+   2026-07-25: it does not govern `/fork`, which still produces `template:
+   "bg"` with the setting off** (see *Telling forks apart*). Whether it governs
+   an ordinary fresh session is still open — one fresh (not resumed) session
+   settles that half.
 2. Does a conversation whose job state carries `template: "bg"` **always**
    re-spawn as a background job when resumed?
 3. What exactly triggers "Your conversation moved to the background"?
