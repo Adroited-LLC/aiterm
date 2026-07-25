@@ -151,6 +151,10 @@ export const sessionFork = (sessionId: string) =>
 // really is an empty /fork stub with its parent still on disk.
 export const materializeFork = (sessionId: string) =>
   invoke<void>("materialize_fork", { sessionId });
+// The permission mode Claude Code's own config asks for in this directory.
+// null when nothing is configured (or it names a mode the CLI would reject).
+export const claudePermissionMode = (projectPath: string) =>
+  invoke<string | null>("claude_permission_mode", { projectPath });
 export interface UsageBar {
   kind: string;
   label: string;

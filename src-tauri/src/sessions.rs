@@ -1570,6 +1570,56 @@ pub fn session_artifacts(session_id: String) -> Vec<Artifact> {
     artifacts
 }
 
+/// The permission mode Claude Code would start a *new* session in here, read
+/// from its own config chain — project-local first, then the user's.
+///
+/// This exists because permission mode is session state, not config state: a
+/// resumed session replays whatever mode it last recorded, and `defaultMode`
+/// only ever applies to new ones. Resuming through aiterm passed no flag, so a
+/// session that had drifted to `acceptEdits` could never be lifted back to the
+/// mode the config asks for — it stayed drifted forever. Passing the config's
+/// answer on resume is what makes an aiterm resume behave like a fresh start.
+///
+/// Returns `None` when nothing is configured, or when the configured value
+/// isn't one the CLI accepts — passing an unknown mode makes `claude` exit, and
+/// a terminal that dies on open is worse than a permission prompt.
+#[tauri::command]
+pub fn claude_permission_mode(project_path: String) -> Option<String> {
+    const ACCEPTED: [&str; 6] = [
+        "acceptEdits",
+        "auto",
+        "bypassPermissions",
+        "manual",
+        "dontAsk",
+        "plan",
+    ];
+    let home = dirs::home_dir()?;
+    let project = std::path::Path::new(&project_path);
+    // Most specific wins, matching how Claude Code layers its own settings.
+    let candidates = [
+        project.join(".claude/settings.local.json"),
+        project.join(".claude/settings.json"),
+        home.join(".claude/settings.json"),
+    ];
+    for path in candidates {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(mode) = v
+            .get("permissions")
+            .and_then(|p| p.get("defaultMode"))
+            .and_then(|m| m.as_str())
+        else {
+            continue;
+        };
+        return ACCEPTED.contains(&mode).then(|| mode.to_string());
+    }
+    None
+}
+
 /// A v4 UUID from `/dev/urandom`. `claude --resume` only accepts well-formed
 /// UUIDs, and a transcript is named for its id, so the shape is load-bearing.
 fn uuid_v4() -> Result<String, String> {
@@ -1785,6 +1835,81 @@ mod tests {
         // The two content mentions survive untouched.
         assert!(out.contains(&format!("see /tmp/{old}/out and id {old}")));
         assert!(!out.contains(&format!("\"sessionId\":\"{old}\"")));
+    }
+
+    #[test]
+    fn permission_mode_prefers_the_project_and_rejects_junk() {
+        let root = std::env::temp_dir().join("aiterm-test-permmode");
+        let _ = std::fs::remove_dir_all(&root);
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+
+        // Project settings.json only: that's the answer.
+        std::fs::write(
+            proj.join(".claude/settings.json"),
+            "{\"permissions\":{\"defaultMode\":\"acceptEdits\"}}",
+        )
+        .unwrap();
+        assert_eq!(mode_from(&[proj.join(".claude/settings.json")]), Some("acceptEdits".into()));
+
+        // settings.local.json outranks it.
+        std::fs::write(
+            proj.join(".claude/settings.local.json"),
+            "{\"permissions\":{\"defaultMode\":\"bypassPermissions\"}}",
+        )
+        .unwrap();
+        assert_eq!(
+            mode_from(&[
+                proj.join(".claude/settings.local.json"),
+                proj.join(".claude/settings.json"),
+            ]),
+            Some("bypassPermissions".into())
+        );
+
+        // A mode the CLI would reject yields None — `claude` exits on an
+        // unknown value, and a terminal that dies on open is worse than a prompt.
+        std::fs::write(
+            proj.join(".claude/settings.local.json"),
+            "{\"permissions\":{\"defaultMode\":\"yolo\"}}",
+        )
+        .unwrap();
+        assert_eq!(mode_from(&[proj.join(".claude/settings.local.json")]), None);
+
+        // Missing file, and a file with no permissions block, both fall through.
+        assert_eq!(mode_from(&[root.join("nope.json")]), None);
+        std::fs::write(proj.join(".claude/bare.json"), "{\"tui\":\"fullscreen\"}").unwrap();
+        assert_eq!(mode_from(&[proj.join(".claude/bare.json")]), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The lookup half of `claude_permission_mode`, over an explicit candidate
+    /// list so precedence is testable without a fake $HOME.
+    fn mode_from(candidates: &[std::path::PathBuf]) -> Option<String> {
+        const ACCEPTED: [&str; 6] = [
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan",
+        ];
+        for path in candidates {
+            let Ok(raw) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(mode) = v
+                .get("permissions")
+                .and_then(|p| p.get("defaultMode"))
+                .and_then(|m| m.as_str())
+            else {
+                continue;
+            };
+            return ACCEPTED.contains(&mode).then(|| mode.to_string());
+        }
+        None
     }
 
     #[test]

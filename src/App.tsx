@@ -18,7 +18,8 @@ import {
 import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
-  gitRepoState, listProjects, listSessions, materializeFork, reindexSessions, sessionFork,
+  claudePermissionMode, gitRepoState, listProjects, listSessions, materializeFork,
+  reindexSessions, sessionFork,
   resolveResumableId, liveSessionIds, stopSession,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
@@ -432,7 +433,21 @@ export default function App() {
       setNotice(`Couldn't stop "${s.title}" to resume it: ${e}`);
       return;
     }
-    openTab(s.title, s.project_path, `claude --resume ${liveId}`, liveId, liveId);
+    // Carry the configured permission mode. A resumed session otherwise
+    // replays the mode it last recorded, so one that drifted to `acceptEdits`
+    // could never be lifted back to what the config asks for — the flag is the
+    // only thing that outranks the recording. A new session needs no help
+    // here: `claude` reads the same config itself on a cold start.
+    let mode: string | null = null;
+    try {
+      mode = await claudePermissionMode(s.project_path);
+    } catch {
+      /* no config, or unreadable — resume without the flag */
+    }
+    const cmd = mode
+      ? `claude --permission-mode ${mode} --resume ${liveId}`
+      : `claude --resume ${liveId}`;
+    openTab(s.title, s.project_path, cmd, liveId, liveId);
   };
   // Branch a session into its own tab, resumable later on its own row. The
   // parent is left intact and frozen at its own context — `--fork-session`
