@@ -11,6 +11,7 @@ import AgentPanel from "./components/AgentPanel";
 import SettingsModal from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
 import { UsageBars } from "./components/UsageBars";
+import { Clock } from "./components/Clock";
 import {
   AppSettings, applySettings, loadSettings, saveSettings, termFontFamily, termTheme,
 } from "./settings";
@@ -679,6 +680,7 @@ export default function App() {
             onClick={() => setShowComposer(!showComposer)}
           >⌨</button>
           <UsageBars />
+          <Clock />
         </div>
         <div className="topbar-title">
           {activeProject ? activeProject.replace(/^\/home\/[^/]+/, "~") : "aiterm"}
