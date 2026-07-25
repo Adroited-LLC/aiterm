@@ -19,7 +19,7 @@ import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
-  runningSessionIds,
+  resolveResumableId, runningSessionIds,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -49,6 +49,13 @@ function loadJSON<T>(key: string, fallback: T): T {
 export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [activeProject, setActiveProject] = useState<string | null>(null);
+  // Transient bottom toast (e.g. a resume with nothing resumable left).
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 6000);
+    return () => clearTimeout(t);
+  }, [notice]);
   const [tabs, setTabs] = useState<TermTab[]>([]);
   const [activeTab, setActiveTab] = useState<number | null>(null);
   const [previewSession, setPreviewSession] = useState<Session | null>(null);
@@ -339,14 +346,30 @@ export default function App() {
   };
   const resumeSession = async (s: Session) => {
     setActiveProject(s.project_path);
-    // A plain `claude --resume <id>` on a session that's still running (a live
-    // bg agent) exits with "…currently running as a background agent… add
-    // --fork-session to branch off a copy", leaving a black pane — so those
-    // MUST fork. But forking unconditionally mints a new transcript on every
-    // resume, which is what buried the sessions/agents lists in duplicates.
-    // So fork only when the session is actually running (authoritative: a live
-    // claude process names it in /proc); otherwise resume in place, same id,
-    // no duplicate. The agents panel follows either path because the backend
+    // The pinned id can go stale: a `/clear` or `--fork-session` retires the
+    // original transcript (Claude Code deletes it or renames it to
+    // `<id>.orphaned-…`), so `claude --resume <original-id>` dies with "no
+    // conversation found" — a black pane, the core "broken feel" of resume.
+    // Resolve to the surviving transcript in the fork family first; if nothing
+    // resumable is left, say so instead of launching a doomed resume.
+    let liveId = s.id;
+    try {
+      const resolved = await resolveResumableId(s.id);
+      if (resolved === null) {
+        setNotice(`"${s.title}" was cleared or superseded — no resumable transcript remains.`);
+        return;
+      }
+      liveId = resolved;
+    } catch {
+      liveId = s.id; // resolver unavailable → fall back to the pinned id
+    }
+    // A plain `claude --resume` on a session still running as a bg agent exits
+    // with "…add --fork-session to branch off a copy", leaving a black pane —
+    // so those MUST fork. But forking unconditionally mints a new transcript on
+    // every resume, which is what buried the sessions/agents lists in
+    // duplicates. So fork only when actually running (authoritative: a live
+    // claude process names it in /proc); otherwise resume in place, same id, no
+    // duplicate. The agents panel follows either path because the backend
     // resolves a pinned id to the newest transcript in its fork family.
     let running: string[] = [];
     try {
@@ -354,10 +377,10 @@ export default function App() {
     } catch {
       running = [];
     }
-    const command = running.includes(s.id)
-      ? `claude --fork-session --resume ${s.id}`
-      : `claude --resume ${s.id}`;
-    openTab(s.title, s.project_path, command, s.id, s.id);
+    const command = running.includes(liveId)
+      ? `claude --fork-session --resume ${liveId}`
+      : `claude --resume ${liveId}`;
+    openTab(s.title, s.project_path, command, liveId, liveId);
   };
   const newShell = (s: Session) => {
     setActiveProject(s.project_path);
@@ -461,6 +484,11 @@ export default function App() {
 
   return (
     <div className="app">
+      {notice && (
+        <div className="app-toast" role="status" onClick={() => setNotice(null)}>
+          {notice}
+        </div>
+      )}
       <div className="topbar">
         <div className="topbar-left">
           <button

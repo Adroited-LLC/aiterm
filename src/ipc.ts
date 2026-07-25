@@ -106,6 +106,11 @@ export const sessionAgents = (sessionId: string) =>
   invoke<AgentRun[]>("session_agents", { sessionId });
 export const runningSessionIds = () =>
   invoke<string[]>("running_session_ids");
+// Resolve a pinned session id to one `claude --resume` can open now (follows
+// the fork family). null → the original was cleared/superseded and nothing
+// resumable survives.
+export const resolveResumableId = (sessionId: string) =>
+  invoke<string | null>("resolve_resumable_id", { sessionId });
 export interface UsageBar {
   kind: string;
   label: string;

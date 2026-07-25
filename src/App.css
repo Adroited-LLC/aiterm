@@ -114,6 +114,25 @@ body.dragging * { pointer-events: none; }
 .usage-tip-pct { color: var(--text-dim); font-size: 11px; }
 .usage-tip-reset { color: var(--text-faint); font-size: 11px; }
 
+/* Transient bottom-center toast (resume-not-resumable, etc.). */
+.app-toast {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 50;
+  max-width: 60ch;
+  background: var(--bg-raised);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--yellow);
+  border-radius: 6px;
+  padding: 9px 13px;
+  font-size: 12px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+}
+
 /* ---------- generic ---------- */
 .icon-btn {
   background: none;

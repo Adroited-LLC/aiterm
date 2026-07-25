@@ -995,6 +995,30 @@ fn resolve_live_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     Some(best)
 }
 
+/// Resolve a UI-pinned session id to an id that `claude --resume` can actually
+/// open *right now*. Follows the same fork-family logic as the panels
+/// (`resolve_live_session_file`) but returns the id (filename stem) and refuses
+/// to hand back an orphaned/superseded transcript. When a session is `/clear`ed
+/// or forked, Claude Code retires the original `<id>.jsonl` (deletes it, or
+/// renames it to `<id>.orphaned-…`); `claude --resume <that-id>` then dies with
+/// "no conversation found", leaving a black pane. This returns `Some(live_id)`
+/// pointing at the surviving transcript in the fork family, or `None` when
+/// nothing resumable is left — so the UI can say so instead of launching a
+/// doomed resume.
+#[tauri::command]
+pub fn resolve_resumable_id(session_id: String) -> Option<String> {
+    let path = resolve_live_session_file(&session_id)?;
+    // A resumable transcript is a plain `<id>.jsonl`. If resolution could only
+    // land on an orphaned remnant, there is nothing `claude` can resume.
+    if path
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
+    {
+        return None;
+    }
+    Some(path.file_stem()?.to_string_lossy().into_owned())
+}
+
 /// Session ids that currently have a live Claude Code process, read from
 /// `/proc`. A session counts as running if some process names it via
 /// `--session-id <id>` or `--resume <id|/path/<id>.jsonl>`. The UI uses this to
