@@ -28,6 +28,16 @@ import "./App.css";
 const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
+const SUPERSEDED_KEY = "aiterm.superseded";
+
+function loadSuperseded(): Set<string> {
+  try {
+    const raw = localStorage.getItem(SUPERSEDED_KEY);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
 
 interface PanelSizes {
   left: number;
@@ -66,6 +76,26 @@ export default function App() {
   // Tabs whose terminal rang the bell while not being looked at.
   const [attention, setAttention] = useState<Set<number>>(new Set());
   const activeTabRef = useRef<number | null>(null);
+  // Latest tabs, read by the [sessions] supersession effect without putting
+  // `tabs` in its deps (which would re-run it on every tab change).
+  const tabsRef = useRef<TermTab[]>(tabs);
+  tabsRef.current = tabs;
+
+  // Sessions hidden because a focused-tab `/clear` spawned a fresh sibling
+  // that superseded them. Persisted; purely a hide + tab-rebind (reversible).
+  const [superseded, setSuperseded] = useState<Set<string>>(loadSuperseded);
+  useEffect(() => {
+    localStorage.setItem(SUPERSEDED_KEY, JSON.stringify([...superseded]));
+  }, [superseded]);
+  // Undo affordance for the most recent supersession.
+  const [undoInfo, setUndoInfo] = useState<{ id: string; title: string } | null>(null);
+  useEffect(() => {
+    if (!undoInfo) return;
+    const t = setTimeout(() => setUndoInfo(null), 8000);
+    return () => clearTimeout(t);
+  }, [undoInfo]);
+  // Previous scan's session ids, to detect newly-appeared continuations.
+  const knownIdsRef = useRef<Set<string> | null>(null);
 
   const handles = useRef<Map<number, TermHandle>>(new Map());
   const lastOutput = useRef<Map<number, number>>(new Map());
@@ -168,6 +198,74 @@ export default function App() {
       un.then((f) => f());
     };
   }, [refreshSessionList]);
+
+  // Detect a focused-tab `/clear`: it writes a brand-new, fully unlinked
+  // session in the same folder (new id, no bridge/fork link), so the disk-based
+  // fork-collapse can't catch it. We catch it live: when a session that *newly
+  // appeared this scan* is a strict continuation of the focused resume tab's
+  // session, hide the old row and rebind the tab to the new session. The six
+  // guards below jointly identify exactly this case — do not weaken them.
+  useEffect(() => {
+    const cur = new Set(sessions.map((s) => s.id));
+    const known = knownIdsRef.current;
+    knownIdsRef.current = cur;
+
+    // Light pruning: forget hidden ids no longer present on disk.
+    setSuperseded((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of prev) {
+        if (!cur.has(id)) { next.delete(id); changed = true; }
+      }
+      return changed ? next : prev;
+    });
+
+    if (known === null) return; // (6) baseline on first load — never supersede
+    const fresh = sessions.filter((s) => !known.has(s.id)); // (1) newly-appeared
+    if (fresh.length === 0) return;
+
+    // (2) focused tab only, and only a real Claude resume tab (session-id slot).
+    const tab = tabsRef.current.find((t) => t.key === activeTabRef.current) ?? null;
+    const sid = tab?.sessionId;
+    if (!tab || !sid || sid.startsWith("shell:") || sid.startsWith("claude:")) return;
+    // (4) the tab's current session row must still exist to compare against.
+    const curRow = sessions.find((s) => s.id === sid);
+    if (!curRow) return;
+    // (5) never steal another open tab's session.
+    const otherSlots = new Set(
+      tabsRef.current.filter((t) => t.key !== tab.key).map((t) => t.slotId),
+    );
+    const candidates = fresh.filter(
+      (s) =>
+        s.project_path === tab.cwd &&           // (3) same project as the tab
+        s.id !== sid &&                          // (4) strictly a different session
+        s.last_active >= curRow.last_active &&   // (4) the continuation, not older
+        !otherSlots.has(s.id),                   // (5) not another open tab
+    );
+    if (candidates.length === 0) return;
+    // Newest wins if several qualify.
+    const cont = candidates.reduce((a, b) => (b.last_active > a.last_active ? b : a));
+
+    setSuperseded((prev) => {
+      const next = new Set(prev);
+      next.add(sid);
+      return next;
+    });
+    // Rebind both sessionId AND slotId (slotId drives the live dot + tab dedup;
+    // resumed tabs keep them equal). The Agents panel follows via sessionId.
+    setTabs((ts) =>
+      ts.map((t) => (t.key === tab.key ? { ...t, sessionId: cont.id, slotId: cont.id } : t)),
+    );
+    setUndoInfo({ id: sid, title: curRow.title });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions]);
+
+  // Render the sessions list without hidden (superseded) rows; detection and
+  // knownIds diffing still run against the unfiltered `sessions`.
+  const visibleSessions = useMemo(
+    () => sessions.filter((s) => !superseded.has(s.id)),
+    [sessions, superseded],
+  );
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string, sessionId?: string) => {
@@ -502,6 +600,23 @@ export default function App() {
           {notice}
         </div>
       )}
+      {undoInfo && (
+        <div className="app-toast undo-toast" role="status">
+          <span className="undo-msg">Hid superseded session “{undoInfo.title}”</span>
+          <button
+            className="undo-btn"
+            onClick={() => {
+              const id = undoInfo.id;
+              setSuperseded((prev) => {
+                const next = new Set(prev);
+                next.delete(id);
+                return next;
+              });
+              setUndoInfo(null);
+            }}
+          >Undo</button>
+        </div>
+      )}
       <div className="topbar">
         <div className="topbar-left">
           <button
@@ -554,7 +669,7 @@ export default function App() {
           <>
             <div className="panel sessions" style={{ width: sizes.left, ...zoomFor("sessions") }}>
               <SessionsPanel
-                sessions={sessions}
+                sessions={visibleSessions}
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
