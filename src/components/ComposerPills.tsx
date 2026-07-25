@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import GitPanel from "./GitPanel";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
   homeAbbrev, openPath, relTime,
@@ -75,7 +76,7 @@ function loadPicks(): Picks {
  * them disagreeing whenever one request was refused.
  */
 
-type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "model" | "effort";
+type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "model" | "effort" | "git";
 
 /** Relative "resets in 3h 55m"; "" when unknown or past. */
 function resetsIn(iso: string): string {
@@ -93,6 +94,8 @@ function resetsIn(iso: string): string {
 
 interface Props {
   sessionId: string | null;
+  /** Repo the git pill reports on — the active project. */
+  projectRoot: string | null;
   /** Plan usage, owned by App. Fetched once there and shared with the top-bar
    *  gauges: the endpoint rate limits, so a second poller would both double
    *  the requests and let the two views disagree when one is refused. */
@@ -102,7 +105,7 @@ interface Props {
   onCommand?: (text: string) => void;
 }
 
-export default function ComposerPills({ sessionId, usage, onCommand }: Props) {
+export default function ComposerPills({ sessionId, projectRoot, usage, onCommand }: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
   const [tasks, setTasks] = useState<SessionTask[]>([]);
@@ -286,17 +289,25 @@ export default function ComposerPills({ sessionId, usage, onCommand }: Props) {
           )}
         </div>
       )}
+      {open === "git" && (
+        <div className="cpill-panel cpill-git">
+          {/* The same component the right-hand panel uses. Reusing it means the
+              two can never drift apart, and the pill costs no new git code. */}
+          <GitPanel root={projectRoot} refreshKey={0} />
+        </div>
+      )}
       <div className="cpill-row">
         {onCommand && pill("model", "◆", "Model", pick.model ?? shortModel(choice.model))}
         {onCommand && pill("effort", "≡", "Effort", pick.effort ?? choice.effort ?? "—")}
         {sessionId && pill("tasks", "◑", "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
-        {sessionId && pill("artifacts", "▤", "Files", artifacts.length ? `${artifacts.length}` : "")}
+        {sessionId && pill("artifacts", "▤", "Artifacts", artifacts.length ? `${artifacts.length}` : "")}
         {sessionId && pill(
           "agents", "✳", "Agents",
           agents.length ? (running ? `${running} active` : `${agents.length}`) : "",
           running ? "busy" : "",
         )}
         {session && pill("usage", "▮", "Usage", `${Math.round(session.percent)}%`, "sev-" + session.severity)}
+        {projectRoot && pill("git", "⎇", "Git", "")}
       </div>
     </div>
   );

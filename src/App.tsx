@@ -30,6 +30,20 @@ import "./App.css";
 const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
+const PANELS_KEY = "aiterm.panelToggles";
+
+interface PanelToggles {
+  sessions: boolean;
+  explorer: boolean;
+  git: boolean;
+  composer: boolean;
+  agent: boolean;
+}
+// Composer starts closed: it is opt-in chrome, not something to force on a
+// first run. Everything else matches how the app has always opened.
+const DEFAULT_PANELS: PanelToggles = {
+  sessions: true, explorer: true, git: true, composer: false, agent: true,
+};
 
 // Sessions used to be hidden when a heuristic decided a newly-appeared one
 // "superseded" them. That's gone — the list shows what is on disk, always —
@@ -82,12 +96,24 @@ export default function App() {
   const handles = useRef<Map<number, TermHandle>>(new Map());
   const lastOutput = useRef<Map<number, number>>(new Map());
 
-  const [showSessions, setShowSessions] = useState(true);
-  const [showExplorer, setShowExplorer] = useState(true);
-  const [showGit, setShowGit] = useState(true);
-  // Collapsed by default: claude draws its own input bar, so the composer is opt-in.
-  const [showComposer, setShowComposer] = useState(false);
-  const [showAgent, setShowAgent] = useState(true);
+  // Which panels are open. These were plain state, so every restart threw the
+  // layout away and you rebuilt it by hand — the sizes and fonts beside them
+  // had always persisted, which made the loss look arbitrary. Saved as one
+  // object rather than five keys: it is one decision, "how I have it set up".
+  const [panels, setPanels] = useState<PanelToggles>(() =>
+    loadJSON(PANELS_KEY, DEFAULT_PANELS),
+  );
+  useEffect(() => localStorage.setItem(PANELS_KEY, JSON.stringify(panels)), [panels]);
+  const { sessions: showSessions, explorer: showExplorer, git: showGit,
+          composer: showComposer, agent: showAgent } = panels;
+  // Same shape the old `useState` setters had, so every call site is unchanged.
+  const setPanel = (k: keyof PanelToggles) => (v: boolean) =>
+    setPanels((p) => ({ ...p, [k]: v }));
+  const setShowSessions = setPanel("sessions");
+  const setShowExplorer = setPanel("explorer");
+  const setShowGit = setPanel("git");
+  const setShowComposer = setPanel("composer");
+  const setShowAgent = setPanel("agent");
 
   const [opts, setOpts] = useState<SessionDisplayOpts>(() =>
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
@@ -679,6 +705,7 @@ export default function App() {
               model/effort when there is a live session to run them in. */}
           {showComposer && <Composer
             sessionId={activeSessionId}
+            projectRoot={activeProject}
             usage={usage}
             onCommand={activeTab === null ? undefined : (text) =>
               handles.current.get(activeTab)?.sendComposed(text)}

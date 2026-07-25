@@ -16,15 +16,21 @@ import { UsageBar } from "../ipc";
  * toggle keeps working unchanged.
  */
 export default function Composer({
-  sessionId, usage, onCommand,
+  sessionId, projectRoot, usage, onCommand,
 }: {
   sessionId: string | null;
+  projectRoot: string | null;
   usage: UsageBar[];
   onCommand?: (text: string) => void;
 }) {
   return (
     <div className="composer-wrap">
-      <ComposerPills sessionId={sessionId} usage={usage} onCommand={onCommand} />
+      <ComposerPills
+        sessionId={sessionId}
+        projectRoot={projectRoot}
+        usage={usage}
+        onCommand={onCommand}
+      />
     </div>
   );
 }

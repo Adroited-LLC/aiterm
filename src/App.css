@@ -1594,3 +1594,8 @@ input[type="range"]::-webkit-slider-thumb {
   margin-top: 3px;
 }
 .cpill-choice-note b { color: var(--text-dim); font-weight: 600; }
+
+/* The git pill reuses the right-hand panel wholesale, which expects to fill a
+   column — give it a bounded height here so the overlay stays a panel. */
+.cpill-git { padding: 0; max-height: 380px; display: flex; }
+.cpill-git > * { flex: 1; min-height: 0; }
