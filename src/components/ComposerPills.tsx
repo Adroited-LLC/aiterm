@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
   homeAbbrev, openPath, relTime,
-  sessionAgents, sessionArtifacts, sessionModel, sessionTasks, usageLimits,
+  sessionAgents, sessionArtifacts, sessionModel, sessionTasks,
 } from "../ipc";
 
 /** `/model <name>` choices, straight from the command's own usage line. The
@@ -69,9 +69,10 @@ function loadPicks(): Picks {
  * what the session is doing, visible without giving up a panel to it, and one
  * click from the detail.
  *
- * Deliberately self-contained. It reads the same commands the right-hand panels
- * read and owns no state they own, so it can be removed by deleting this file
- * and one line in Composer — nothing that currently works depends on it.
+ * Reads the same session commands the right-hand panels read. Plan usage is
+ * the exception: App owns that one reading and hands it to both this and the
+ * top-bar gauges, because the endpoint rate limits and two pollers would have
+ * them disagreeing whenever one request was refused.
  */
 
 type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "model" | "effort";
@@ -92,17 +93,21 @@ function resetsIn(iso: string): string {
 
 interface Props {
   sessionId: string | null;
+  /** Plan usage, owned by App. Fetched once there and shared with the top-bar
+   *  gauges: the endpoint rate limits, so a second poller would both double
+   *  the requests and let the two views disagree when one is refused. */
+  usage: UsageBar[];
   /** Run a slash command in the live terminal (adds Enter). Absent when no
    *  terminal is focused, which is what disables the model/effort pills. */
   onCommand?: (text: string) => void;
 }
 
-export default function ComposerPills({ sessionId, onCommand }: Props) {
+export default function ComposerPills({ sessionId, usage, onCommand }: Props) {
+  const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
-  const [bars, setBars] = useState<UsageBar[]>([]);
   const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null });
   const [picks, setPicks] = useState<Picks>(loadPicks);
   const pick = (sessionId && picks[sessionId]) || {};
@@ -143,17 +148,6 @@ export default function ComposerPills({ sessionId, onCommand }: Props) {
     }
     setOpen(null);
   };
-
-  useEffect(() => {
-    let alive = true;
-    // Same rule as the top-bar gauges: keep the last good reading. A transient
-    // failure returns [], and replacing the value with that makes the pill
-    // blink out for a whole interval.
-    const load = () => usageLimits().then((b) => alive && b.length && setBars(b)).catch(() => {});
-    load();
-    const iv = setInterval(load, 60_000);
-    return () => { alive = false; clearInterval(iv); };
-  }, []);
 
   const done = tasks.filter((t) => t.status === "completed").length;
   const running = agents.filter((a) => a.status === "running").length;
@@ -246,14 +240,16 @@ export default function ComposerPills({ sessionId, onCommand }: Props) {
           ) : (
             bars.map((b, i) => (
               <div key={b.kind + i} className="cpill-usage-row">
-                <span className="cpill-usage-label">{b.label}</span>
+                <div className="cpill-usage-head">
+                  <span className="cpill-usage-label">{b.label}</span>
+                  <span className="cpill-usage-pct">{Math.round(b.percent)}%</span>
+                </div>
                 <div className="usage-track">
                   <div
                     className={"usage-fill sev-" + b.severity}
                     style={{ width: Math.min(100, Math.max(0, b.percent)) + "%" }}
                   />
                 </div>
-                <span className="cpill-usage-pct">{Math.round(b.percent)}%</span>
                 <span className="cpill-usage-reset">{resetsIn(b.resets_at)}</span>
               </div>
             ))

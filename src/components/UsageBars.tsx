@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { UsageBar, usageLimits } from "../ipc";
+import { useState } from "react";
+import { UsageBar } from "../ipc";
 
 /** Relative "resets in 3h 55m" from an ISO timestamp; "" if unknown/past. */
 function resetsIn(iso: string): string {
@@ -20,28 +20,14 @@ function resetsIn(iso: string): string {
  * weekly-all / weekly-scoped). No text inline — hovering a bar shows a popup
  * with that limit's label, percent, and reset time. Colour comes from the
  * API severity. Hidden entirely when there's no data (offline / not signed in).
+ *
+ * The reading is passed in rather than fetched here. `/api/oauth/usage` rate
+ * limits, and two components polling it independently both doubled the request
+ * rate and let them disagree — one showing bars while the other, refused,
+ * showed nothing. One owner, two views.
  */
-export function UsageBars() {
-  const [bars, setBars] = useState<UsageBar[]>([]);
+export function UsageBars({ bars }: { bars: UsageBar[] }) {
   const [hover, setHover] = useState<number | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    // Keep the last good reading. `usage_limits` returns [] on any transient
-    // failure (curl hiccup, token mid-refresh); replacing bars with [] on those
-    // makes them blink out for up to a poll interval — the "flaky" behaviour.
-    // Only replace when we actually got data.
-    const load = () =>
-      usageLimits()
-        .then((b) => alive && b.length && setBars(b))
-        .catch(() => {});
-    load();
-    const iv = setInterval(load, 60_000);
-    return () => {
-      alive = false;
-      clearInterval(iv);
-    };
-  }, []);
 
   if (!bars.length) return null;
 

@@ -1,4 +1,5 @@
 import ComposerPills from "./ComposerPills";
+import { UsageBar } from "../ipc";
 
 /**
  * The strip above the terminal.
@@ -15,14 +16,15 @@ import ComposerPills from "./ComposerPills";
  * toggle keeps working unchanged.
  */
 export default function Composer({
-  sessionId, onCommand,
+  sessionId, usage, onCommand,
 }: {
   sessionId: string | null;
+  usage: UsageBar[];
   onCommand?: (text: string) => void;
 }) {
   return (
     <div className="composer-wrap">
-      <ComposerPills sessionId={sessionId} onCommand={onCommand} />
+      <ComposerPills sessionId={sessionId} usage={usage} onCommand={onCommand} />
     </div>
   );
 }

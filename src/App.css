@@ -1513,23 +1513,33 @@ input[type="range"]::-webkit-slider-thumb {
   max-height: 320px;
   overflow-y: auto;
 }
+/* Stacked like the model/effort choosers: label and figure on one line, the
+   bar full width beneath it, reset time as the quiet third line. Reads down
+   the panel rather than across, so the three limits compare at a glance. */
 .cpill-usage-row {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 6px;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 9px;
   font-family: var(--font-ui);
   font-size: 11px;
   color: var(--text-dim);
+  border-radius: 6px;
 }
-.cpill-usage-label { min-width: 96px; color: var(--text); }
-.cpill-usage-row .usage-track { flex: 1; }
+.cpill-usage-row + .cpill-usage-row { border-top: 1px solid var(--border); }
+.cpill-usage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cpill-usage-label { color: var(--text); font-size: 12px; font-weight: 600; }
 .cpill-usage-pct {
-  min-width: 34px;
-  text-align: right;
+  color: var(--text);
   font-variant-numeric: tabular-nums;
 }
-.cpill-usage-reset { min-width: 108px; color: var(--text-faint); }
+.cpill-usage-row .usage-track { width: 100%; }
+.cpill-usage-reset { color: var(--text-faint); }
 
 /* Model / effort choosers: a wrapped row of options rather than a list, since
    there are few of them and they are single words. */

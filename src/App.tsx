@@ -18,8 +18,9 @@ import {
 import {
   ProjectInfo, Session,
   TrashedSession,
+  UsageBar,
   claudePermissionMode, listProjects, listSessions, materializeFork,
-  reindexSessions, sessionFork,
+  reindexSessions, sessionFork, usageLimits,
   resolveResumableId, liveSessionIds, stopSession,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
@@ -164,6 +165,20 @@ export default function App() {
     tick();
     const t = setInterval(tick, 6000);
     return () => { stop = true; clearInterval(t); };
+  }, []);
+
+  // Plan usage, fetched once for everything that shows it. `/api/oauth/usage`
+  // rate limits, so a second poller is not just waste — a refused request
+  // returns [] and that view blanks while the other still shows bars.
+  // Keep the last good reading: [] means "couldn't ask", never "zero usage".
+  const [usage, setUsage] = useState<UsageBar[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const load = () =>
+      usageLimits().then((b) => alive && b.length && setUsage(b)).catch(() => {});
+    load();
+    const iv = setInterval(load, 60_000);
+    return () => { alive = false; clearInterval(iv); };
   }, []);
 
   // List-only refresh: cheap, safe to run on every fs event.
@@ -571,7 +586,7 @@ export default function App() {
             title="Toggle input composer"
             onClick={() => setShowComposer(!showComposer)}
           >⌨</button>
-          <UsageBars />
+          <UsageBars bars={usage} />
           <Clock />
         </div>
         <div className="topbar-title">
@@ -664,6 +679,7 @@ export default function App() {
               model/effort when there is a live session to run them in. */}
           {showComposer && <Composer
             sessionId={activeSessionId}
+            usage={usage}
             onCommand={activeTab === null ? undefined : (text) =>
               handles.current.get(activeTab)?.sendComposed(text)}
           />}
