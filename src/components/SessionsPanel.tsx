@@ -153,6 +153,9 @@ export default function SessionsPanel({
 }: Props) {
   const [query, setQuery] = useState("");
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  // Resuming a session that's still running stops it first, which throws away
+  // whatever it was mid-way through — worth one click of confirmation.
+  const [confirmStop, setConfirmStop] = useState<string | null>(null);
   // Folded auto-sections (Recent list, Project/Date buckets, PROJECTS),
   // keyed "<viewMode>:<label>" so each view remembers its own folds.
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => {
@@ -657,10 +660,26 @@ export default function SessionsPanel({
           )}
         </div>
         <div
-          className={"session-actions" + (confirmDel === s.id ? " confirming" : "")}
+          className={
+            "session-actions" +
+            (confirmDel === s.id || confirmStop === s.id ? " confirming" : "")
+          }
           onClick={(e) => e.stopPropagation()}
         >
-          {confirmDel === s.id ? (
+          {confirmStop === s.id ? (
+            <>
+              <span className="confirm-label">Stop it and resume?</span>
+              <button
+                className="act-btn"
+                title="Stop the running session, then reopen it with claude --resume"
+                onClick={() => { setConfirmStop(null); onResume(s); }}
+              >Resume</button>
+              <button
+                className="act-btn" title="Leave it running"
+                onClick={() => setConfirmStop(null)}
+              >Cancel</button>
+            </>
+          ) : confirmDel === s.id ? (
             <>
               <span className="confirm-label">Delete session?</span>
               <button
@@ -675,30 +694,33 @@ export default function SessionsPanel({
             </>
           ) : (
             <>
-              {/* Each action is offered only when it can actually do
-                  something. Branching needs a session; exiting needs a tab to
-                  close; resuming needs the session NOT to be running already.
-                  These used to hang off one flag, so a frozen snapshot got
-                  Fork/Exit (branching stale history, closing a tab that wasn't
-                  driving the conversation) while the running session got
-                  Resume. */}
-              {isRunning && (
-                <button
-                  className="act-btn" title="Fork into a new tab (branch a copy)"
-                  onClick={() => onFork(s)}
-                >⑂</button>
-              )}
+              {/* Resume is the way into a session, always — the same move you
+                  make in a shell: quit what's running, then `claude --resume`.
+                  It used to be hidden whenever the roster called the session
+                  live, which left ⑂ as the only door in; every attempt to
+                  reopen a conversation branched a copy of it instead. */}
+              <button
+                className="act-btn"
+                title={
+                  isRunning || hasTab
+                    ? "Resume — stops the running session first"
+                    : "Resume claude session"
+                }
+                onClick={() =>
+                  isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
+                }
+              >▶</button>
+              {/* Branching is a deliberate act (two divergent lines from one
+                  history), not a workaround for resume being unavailable. */}
+              <button
+                className="act-btn" title="Fork into a new tab (branch a copy)"
+                onClick={() => onFork(s)}
+              >⑂</button>
               {hasTab && (
                 <button
                   className="act-btn" title="Exit — close this tab"
                   onClick={() => onExit(s)}
                 >⏻</button>
-              )}
-              {!isRunning && !hasTab && (
-                <button
-                  className="act-btn" title="Resume claude session"
-                  onClick={() => onResume(s)}
-                >▶</button>
               )}
               <button
                 className="act-btn" title="New shell here"

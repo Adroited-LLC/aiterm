@@ -1288,6 +1288,26 @@ fn extract_session_id(val: &str) -> Option<String> {
 /// actually running.
 #[tauri::command]
 pub fn live_session_ids() -> Vec<String> {
+    read_roster()
+        .into_iter()
+        .map(|e| e.session_id)
+        .collect()
+}
+
+/// One live entry from `claude agents --json`.
+pub struct RosterEntry {
+    pub session_id: String,
+    /// Absent for sessions the daemon holds without a client process of their
+    /// own — those can't be signalled, only stopped from the agents view.
+    pub pid: Option<u32>,
+    pub background: bool,
+}
+
+/// The roster, minus finished sessions. `claude agents --json` keeps reporting
+/// a session with `state: "done"`, so "appears in the roster" is not the same
+/// question as "is running" — counting those made dead sessions look alive and
+/// suppressed Resume on rows that were perfectly resumable.
+pub fn read_roster() -> Vec<RosterEntry> {
     let Ok(out) = std::process::Command::new("claude")
         .args(["agents", "--json"])
         .output()
@@ -1298,9 +1318,71 @@ pub fn live_session_ids() -> Vec<String> {
         return Vec::new();
     };
     list.iter()
-        .filter_map(|a| a.get("sessionId").and_then(|s| s.as_str()))
-        .map(str::to_owned)
+        .filter(|a| a.get("state").and_then(|s| s.as_str()) != Some("done"))
+        .filter_map(|a| {
+            let session_id = a.get("sessionId")?.as_str()?.to_owned();
+            let pid = a.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
+            // A pid the roster still lists but /proc doesn't know is a stale
+            // entry; treat it as gone rather than as an unstoppable session.
+            let pid = pid.filter(|&p| crate::pty::pid_alive(p));
+            if a.get("pid").is_some() && pid.is_none() {
+                return None;
+            }
+            Some(RosterEntry {
+                session_id,
+                pid,
+                background: a.get("kind").and_then(|k| k.as_str()) == Some("background"),
+            })
+        })
         .collect()
+}
+
+/// Stop a running session so it can be resumed in place.
+///
+/// This is the shell workflow: you don't branch a copy to get back into a
+/// conversation, you close the one that's running and `claude --resume` it.
+/// `--resume` refuses a session that's currently live, so the stop has to
+/// actually complete before the resume is spawned — hence the verified kill
+/// and the error return rather than a fire-and-forget signal.
+/// Off the main thread: this signals, then polls the roster for up to five
+/// seconds. Run inline it would freeze the window for that whole time.
+#[tauri::command]
+pub async fn stop_session(session_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || stop_session_blocking(session_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn stop_session_blocking(session_id: String) -> Result<(), String> {
+    let Some(entry) = read_roster()
+        .into_iter()
+        .find(|e| e.session_id == session_id)
+    else {
+        return Ok(()); // already gone — resuming is safe
+    };
+    // Signal the pid the roster gave us, when it gave us one. For an
+    // interactive session that pid is the real `claude` process. For a
+    // *background* agent it is not: the roster reports a `bg-spare` helper
+    // parented to the daemon, while the conversation runs under a different
+    // process carrying a different session id. Killing it there is a no-op.
+    if let Some(pid) = entry.pid {
+        crate::pty::kill_tree(pid, std::time::Duration::from_millis(1500));
+    }
+    // So success is defined by the roster, never by the pid dying: the session
+    // is stopped when Claude Code stops listing it. Anything else would report
+    // a stop that didn't happen and then launch a `--resume` doomed to refuse.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !read_roster().iter().any(|e| e.session_id == session_id) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err(
+        "Claude Code still lists this session as running — it's held by the daemon, \
+         so stop it from `claude agents` and try again."
+            .into(),
+    )
 }
 
 /// Full session UUIDs of live *background* agents only. A session on this list
@@ -1309,19 +1391,10 @@ pub fn live_session_ids() -> Vec<String> {
 /// launching a doomed one.
 #[tauri::command]
 pub fn bg_agent_session_ids() -> Vec<String> {
-    let Ok(out) = std::process::Command::new("claude")
-        .args(["agents", "--json"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let Ok(list) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
-        return Vec::new();
-    };
-    list.iter()
-        .filter(|a| a.get("kind").and_then(|k| k.as_str()) == Some("background"))
-        .filter_map(|a| a.get("sessionId").and_then(|s| s.as_str()))
-        .map(str::to_owned)
+    read_roster()
+        .into_iter()
+        .filter(|e| e.background)
+        .map(|e| e.session_id)
         .collect()
 }
 

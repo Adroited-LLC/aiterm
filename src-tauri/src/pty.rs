@@ -11,6 +11,9 @@ pub struct PtyInstance {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The pty's direct child — the login shell, not the command it runs.
+    /// Killing only this leaves the real process orphaned; see `pty_kill`.
+    child_pid: Option<u32>,
 }
 
 #[derive(Default)]
@@ -60,6 +63,7 @@ pub fn pty_spawn(
     }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    let child_pid = child.process_id();
     let killer = child.clone_killer();
     drop(pair.slave);
 
@@ -73,6 +77,7 @@ pub fn pty_spawn(
             master: pair.master,
             writer,
             killer,
+            child_pid,
         },
     );
 
@@ -122,11 +127,145 @@ pub fn pty_resize(state: State<'_, PtyManager>, id: u32, cols: u16, rows: u16) -
         .map_err(|e| e.to_string())
 }
 
+/// True while `pid` names a *running* process. A killed child keeps its
+/// `/proc/<pid>` entry until its parent reaps it, so presence alone would call
+/// every zombie alive — and a "did the kill work?" check built on that never
+/// succeeds. State `Z` counts as dead.
+pub fn pid_alive(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    !status
+        .lines()
+        .any(|l| l.starts_with("State:") && l.contains('Z'))
+}
+
+/// Every descendant of `root` (not including `root`), deepest last — read from
+/// /proc rather than from process groups. `zsh -i -c <cmd>` runs with job
+/// control on, so the command lands in its **own** process group; signalling
+/// the shell's group misses it entirely.
+fn descendants(root: u32) -> Vec<u32> {
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in procs.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        if let Some(ppid) = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            children.entry(ppid).or_default().push(pid);
+        }
+    }
+    let mut out = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        for &kid in children.get(&pid).into_iter().flatten() {
+            out.push(kid);
+            queue.push(kid);
+        }
+    }
+    out
+}
+
+/// Stop `root` and everything under it: SIGTERM, then SIGKILL whatever is left
+/// after `grace`. Children go first so a shell can't respawn or reparent one
+/// mid-teardown. Returns false if anything is still alive at the end.
+pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
+    let mut tree = descendants(root);
+    tree.reverse(); // deepest first
+    tree.push(root);
+    for &pid in &tree {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        if !tree.iter().any(|&p| pid_alive(p)) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for &pid in &tree {
+        if pid_alive(pid) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    !tree.iter().any(|&p| pid_alive(p))
+}
+
 #[tauri::command]
 pub fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
-    let mut ptys = state.ptys.lock().unwrap();
-    if let Some(mut pty) = ptys.remove(&id) {
+    // Take the instance out under the lock, then release it: the kill below
+    // can block for over a second, and holding the map would stall every other
+    // tab's writes and resizes for that whole time.
+    let taken = state.ptys.lock().unwrap().remove(&id);
+    if let Some(mut pty) = taken {
+        // `killer.kill()` only reaches the pty's direct child — the login
+        // shell. zsh forks the command rather than exec'ing it, so killing the
+        // shell orphaned every `claude` aiterm ever launched: they stayed in
+        // `claude agents` forever, which made their rows permanently "running"
+        // and left fork-a-copy as the only action the UI would offer.
+        if let Some(pid) = pty.child_pid {
+            kill_tree(pid, std::time::Duration::from_millis(1500));
+        }
         let _ = pty.killer.kill();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The regression that started all of this: killing a shell does not kill
+    /// what the shell forked. `zsh -i -c claude …` forks rather than execs, so
+    /// every `claude` aiterm launched outlived its tab and stayed in the
+    /// roster forever, which made its row permanently "running".
+    #[test]
+    fn kill_tree_reaps_grandchildren() {
+        let mut sh = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .expect("spawn sh");
+        let root = sh.id();
+        // Give the shell a moment to fork the `sleep`.
+        let mut kids = Vec::new();
+        for _ in 0..40 {
+            kids = descendants(root);
+            if !kids.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!kids.is_empty(), "sh never forked a child to test against");
+
+        assert!(kill_tree(root, Duration::from_millis(1500)), "tree survived");
+        assert!(!pid_alive(root), "shell still alive");
+        for kid in kids {
+            assert!(!pid_alive(kid), "grandchild {kid} outlived the kill");
+        }
+        let _ = sh.wait();
+    }
+
+    #[test]
+    fn pid_alive_tracks_reality() {
+        assert!(pid_alive(std::process::id()));
+        // Not a pid Linux will hand out (default pid_max is 4194304).
+        assert!(!pid_alive(u32::MAX));
+    }
+
+    #[test]
+    fn descendants_excludes_the_root_itself() {
+        let me = std::process::id();
+        assert!(!descendants(me).contains(&me));
+    }
 }

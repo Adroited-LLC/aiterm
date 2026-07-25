@@ -19,7 +19,7 @@ import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
-  resolveResumableId, bgAgentSessionIds, liveSessionIds,
+  resolveResumableId, liveSessionIds, stopSession,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -397,27 +397,26 @@ export default function App() {
     } catch {
       liveId = s.id; // resolver unavailable → fall back to the pinned id
     }
-    // Resume is `claude -r <id>`, nothing else. It does not fork, it does not
-    // substitute a copy, and it does not route anywhere. A session aiterm ran
-    // is not running once its tab is closed (TerminalView kills the pty on
-    // unmount), so this is the ordinary case and it just works.
+    // Resume the way you would from a shell: if the conversation is still
+    // running, close it, then `claude --resume <id>`. `--resume` refuses a live
+    // session ("…add --fork-session to branch off a copy"), and the old answer
+    // to that was to offer ⑂ instead — which made branching a copy the only
+    // way back into your own conversation, and minted an immortal fork on
+    // every attempt. Stopping first is what the user actually means by "open
+    // this session".
     //
-    // The exception is a session held by the Claude Code daemon as a
-    // *background* agent — a `/fork`, or anything started with `--bg`. Those
-    // are running with no tab of ours, and `--resume` on them exits with
-    // "…add --fork-session to branch off a copy", i.e. a black pane. Say that
-    // plainly and let the ⑂ button be the answer, rather than silently
-    // branching a copy the user didn't ask for and calling it a resume.
-    let bgAgents: string[] = [];
-    try {
-      bgAgents = await bgAgentSessionIds();
-    } catch {
-      /* roster unavailable → attempt the resume; a failure is visible anyway */
+    // Our own tab goes through closeTab so React state stays in step; anything
+    // else is signalled through the roster.
+    // Match on both ids: a tab opened before a compaction is slotted under the
+    // row's pinned id, not the continuation `liveId` resolves to.
+    for (const t of tabsRef.current) {
+      if (t.slotId === liveId || t.slotId === s.id) closeTab(t.key);
     }
-    if (bgAgents.includes(liveId)) {
-      setNotice(
-        `"${s.title}" is running as a background agent, so it can't be resumed in place — use ⑂ to branch a copy.`,
-      );
+    try {
+      await stopSession(liveId);
+      if (liveId !== s.id) await stopSession(s.id);
+    } catch (e) {
+      setNotice(`Couldn't stop "${s.title}" to resume it: ${e}`);
       return;
     }
     openTab(s.title, s.project_path, `claude --resume ${liveId}`, liveId, liveId);

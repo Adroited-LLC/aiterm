@@ -26,8 +26,22 @@ Last updated 2026-07-25.
 - `claude --resume <id>` refuses a session that is **currently running**, with
   "…add --fork-session to branch off a copy". Nearly every awkward behaviour in
   a GUI wrapper descends from this one constraint.
-  *Not re-verified 2026-07-25 — inherited from earlier work and from Claude
-  Code's own error text. Worth reproducing once.*
+  *Verified 2026-07-25: `--resume` on live bg agent `f0768f17` exited with
+  "Session … is currently running as a background agent (bg). Use `claude
+  agents` to find and attach to it, or add --fork-session to branch off a
+  copy."*
+- **`--resume <id>` with no `<id>.jsonl` on disk prints "No conversation found
+  with session ID: <id>" — and interactively does not stop there.** It falls
+  through into a fresh, empty session under whatever `--session-id` was passed.
+  That session has no transcript, so it never gets a row in the list, while its
+  process sits in the roster forever. This is what "I click ⑂ and nothing
+  happens" actually is: the fork ran, and produced an invisible empty session.
+  *Verified: five live processes resuming the long-deleted `8e6ad72e`, none
+  with a transcript; reproduced directly in `-p` mode.*
+- Forking a session that is **live** works fine, as long as its transcript
+  exists. *Verified: forked live bg agent `f0768f17` (still 51,103 B and still
+  running afterwards) into `92bd2404`, which got 54,321 B of copied history and
+  answered a prompt.*
 - `--fork-session` copies the full history into a **new** session id and leaves
   the parent byte-identical and independently resumable.
   *Verified: parent `32cb631d` unchanged at 64358 bytes with its original
@@ -57,9 +71,20 @@ Last updated 2026-07-25.
   does not merely sort. A fork started in a different tree is therefore absent
   from a view filtered by the row's project path. *Verified: help text plus the
   observed empty view.*
-- The roster reports a real `pid`, and SIGTERM to it stops the agent.
-  *Verified: stopped three agents this way; all three left the roster and
-  stayed gone.*
+- For an **interactive** session the roster's `pid` is the real `claude`
+  process. For a **background** agent it is not: it points at a `claude
+  bg-spare` helper parented to `claude bg-pty-host`, itself parented to the
+  daemon. The conversation actually runs as
+  `…/versions/<v> --session-id <other-id> --agent…`, and *that* id is not in
+  the roster at all. Killing the roster pid for a bg agent therefore kills a
+  spare, not the session. *Verified: full /proc tree, 2026-07-25.*
+  (An earlier note claimed SIGTERM to the roster pid stops the agent; that
+  held for the interactive agents it was tested on, not for background ones.)
+- So **"did the stop work?" must be answered by the roster**, never by watching
+  the pid die.
+- The roster lists sessions that have **no transcript on disk** — an empty
+  session from a failed `--resume` keeps an entry indefinitely. "In the roster"
+  therefore does not imply "has a row in the session list".
 
 ## Deleting
 
@@ -125,16 +150,34 @@ different traces.
 2. Does a conversation whose job state carries `template: "bg"` **always**
    re-spawn as a background job when resumed?
 3. What exactly triggers "Your conversation moved to the background"?
-4. Reproduce the `--resume`-refuses-a-running-session error directly.
+4. ~~Reproduce the `--resume`-refuses-a-running-session error directly.~~
+   *Answered 2026-07-25 — see Resuming.*
+5. How do you stop a **background** agent, given the roster pid is a spare?
+   `stop_session` signals what it can and then reports honestly if the roster
+   still lists the session; it does not yet know the real move.
 
 ---
 
 ## What this implies for aiterm
 
-- **A tab owns its session's lifetime.** `TerminalView` kills the pty on
-  unmount, so closing a tab ends the session and a plain `--resume` works
-  afterwards. *Verified: read the unmount path.* The whole fork-on-resume
-  apparatus existed to work around sessions that outlived their tabs.
+- **A tab owns its session's lifetime** — but it did not, for a long time.
+  `pty_kill` called `killer.kill()`, which reaches only the pty's direct child:
+  the `zsh -i -c claude …` wrapper. **zsh forks the command rather than
+  exec'ing it** (verified: each `claude`'s `PPid` is its `zsh`), so closing a
+  tab killed the shell and orphaned `claude`. Every session aiterm ever
+  launched stayed in the roster, which made its row permanently "running",
+  which left fork-a-copy as the only action offered — and each fork orphaned
+  another one. *Verified 2026-07-25: seven live `claude --fork-session` from
+  aiterm, all parented to one aiterm pid.* Fixed by killing the whole /proc
+  descendant tree, deepest first, SIGTERM then SIGKILL.
+- **Resume means: stop what's running, then `--resume`** — the shell workflow.
+  Since `--resume` refuses a live session, the alternative was to offer ⑂
+  instead, which made branching a copy the only way back into a conversation.
+  The stop must be *confirmed complete* (roster no longer lists it) before the
+  resume is spawned, or the resume just hits the refusal.
+- A **zombie keeps its `/proc/<pid>` entry** until reaped, so a liveness check
+  built on directory existence calls every killed process alive. Check
+  `State:` for `Z`.
 - **"Has a tab" and "is running" are different questions** and must not share a
   flag. They name the same row right up until a conversation moves to the
   background, and then every consequence — the live dot, which actions are

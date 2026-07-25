@@ -1,6 +1,6 @@
 [package]
 name = "aiterm"
-version = "0.4.1"
+version = "0.4.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -28,4 +28,5 @@ dirs = "6.0.0"
 tantivy = "0.26"
 tauri-plugin-window-state = "2.4.1"
 notify = "8.2.0"
+libc = "0.2"
 

@@ -129,6 +129,12 @@ export const bgAgentSessionIds = () =>
 // conversation runs under a new one, so the two point at different rows.
 export const liveSessionIds = () =>
   invoke<string[]>("live_session_ids");
+// Stop a running session (SIGTERM its process tree, SIGKILL what survives) so
+// `claude --resume` will take it. Resolves only once it's actually dead;
+// rejects if it can't be stopped. Same move as quitting claude in a shell
+// before resuming it.
+export const stopSession = (sessionId: string) =>
+  invoke<void>("stop_session", { sessionId });
 // Resolve a pinned session id to one `claude --resume` can open now (follows
 // the fork family). null → the original was cleared/superseded and nothing
 // resumable survives.
