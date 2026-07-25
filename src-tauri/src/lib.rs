@@ -30,6 +30,7 @@ pub fn run() {
             sessions::session_agents,
             sessions::session_artifacts,
             sessions::running_session_ids,
+            sessions::bg_agent_session_ids,
             sessions::resolve_resumable_id,
             usage::usage_limits,
             watcher::watch_project,

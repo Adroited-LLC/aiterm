@@ -106,6 +106,11 @@ export const sessionAgents = (sessionId: string) =>
   invoke<AgentRun[]>("session_agents", { sessionId });
 export const runningSessionIds = () =>
   invoke<string[]>("running_session_ids");
+// Session UUIDs held by the Claude Code daemon as background agents (incl.
+// prompt-less /fork stubs). These can't be resumed as-is — reach them via
+// the agent view (`claude agents`).
+export const bgAgentSessionIds = () =>
+  invoke<string[]>("bg_agent_session_ids");
 // Resolve a pinned session id to one `claude --resume` can open now (follows
 // the fork family). null → the original was cleared/superseded and nothing
 // resumable survives.

@@ -1151,6 +1151,30 @@ fn extract_session_id(val: &str) -> Option<String> {
     }
 }
 
+/// Full session UUIDs of live *background* agents, from `claude agents --json`
+/// (the sanctioned roster; sockets only give short ids and no kind). A session
+/// on this list is held by the daemon — a plain or `--fork-session` resume
+/// either errors (prompt-less `/fork` stub with a title-only transcript) or
+/// mints a detached copy. The real session is reachable only through the
+/// agent view (`claude agents`), so the UI routes these rows there.
+#[tauri::command]
+pub fn bg_agent_session_ids() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("claude")
+        .args(["agents", "--json"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter(|a| a.get("kind").and_then(|k| k.as_str()) == Some("background"))
+        .filter_map(|a| a.get("sessionId").and_then(|s| s.as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Files this session created or modified, newest first — parsed from
 /// Write/Edit/NotebookEdit tool calls in the transcript.
 #[tauri::command]
