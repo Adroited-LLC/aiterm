@@ -223,17 +223,37 @@ export default function App() {
     const fresh = sessions.filter((s) => !known.has(s.id)); // (1) newly-appeared
     if (fresh.length === 0) return;
 
-    // (2) focused tab only, and only a real Claude resume tab (session-id slot).
+    // (2) focused tab only.
     const tab = tabsRef.current.find((t) => t.key === activeTabRef.current) ?? null;
-    const sid = tab?.sessionId;
-    if (!tab || !sid || sid.startsWith("shell:") || sid.startsWith("claude:")) return;
-    // (4) the tab's current session row must still exist to compare against.
-    const curRow = sessions.find((s) => s.id === sid);
-    if (!curRow) return;
+    if (!tab) return;
+    const sid = tab.sessionId;
     // (5) never steal another open tab's session.
     const otherSlots = new Set(
       tabsRef.current.filter((t) => t.key !== tab.key).map((t) => t.slotId),
     );
+
+    // A fork tab (slot `fork:<id>:<n>`, opened by forkSession) has no listed
+    // session row until `--fork-session` writes its new transcript. Adopt the
+    // newest fresh session in the tab's project that no other tab holds — no
+    // parent-row comparison, because forking supersedes the parent (collapsed
+    // away by bridge id). This gives the fork its own row in the project group.
+    if (tab.slotId.startsWith("fork:")) {
+      const adopt = fresh
+        .filter((s) => s.project_path === tab.cwd && !otherSlots.has(s.id))
+        .reduce<Session | null>((a, b) => (!a || b.last_active > a.last_active ? b : a), null);
+      if (!adopt) return;
+      setTabs((ts) =>
+        ts.map((t) => (t.key === tab.key ? { ...t, sessionId: adopt.id, slotId: adopt.id } : t)),
+      );
+      return;
+    }
+
+    // Otherwise: a real Claude resume tab (session-id slot) whose live session
+    // was replaced by a continuation (compact/fork on resume).
+    if (!sid || sid.startsWith("shell:") || sid.startsWith("claude:")) return;
+    // (4) the tab's current session row must still exist to compare against.
+    const curRow = sessions.find((s) => s.id === sid);
+    if (!curRow) return;
     const candidates = fresh.filter(
       (s) =>
         s.project_path === tab.cwd &&           // (3) same project as the tab
