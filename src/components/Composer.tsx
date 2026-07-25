@@ -8,15 +8,21 @@ import ComposerPills from "./ComposerPills";
  * what claude's own footer says (permission mode, branch) or described keys
  * that only mattered to the input it sat beneath. What is left is the part
  * that says something the terminal cannot — how much work is outstanding, what
- * has been written, what is running, and how much plan usage is left.
+ * has been written, what is running, how much plan usage is left, and which
+ * model and effort the session is actually running at.
  *
  * Kept as a component rather than folded into App so the existing show/hide
  * toggle keeps working unchanged.
  */
-export default function Composer({ sessionId }: { sessionId: string | null }) {
+export default function Composer({
+  sessionId, onCommand,
+}: {
+  sessionId: string | null;
+  onCommand?: (text: string) => void;
+}) {
   return (
     <div className="composer-wrap">
-      <ComposerPills sessionId={sessionId} />
+      <ComposerPills sessionId={sessionId} onCommand={onCommand} />
     </div>
   );
 }

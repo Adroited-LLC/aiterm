@@ -660,7 +660,13 @@ export default function App() {
               />
             )}
           </div>
-          {showComposer && <Composer sessionId={activeSessionId} />}
+          {/* onCommand goes to the focused terminal, so the pills only offer
+              model/effort when there is a live session to run them in. */}
+          {showComposer && <Composer
+            sessionId={activeSessionId}
+            onCommand={activeTab === null ? undefined : (text) =>
+              handles.current.get(activeTab)?.sendComposed(text)}
+          />}
         </div>
 
         {showRight && (

@@ -1570,6 +1570,75 @@ pub fn session_artifacts(session_id: String) -> Vec<Artifact> {
     artifacts
 }
 
+#[derive(Serialize, Default)]
+pub struct ModelChoice {
+    /// Full id as recorded, e.g. "claude-opus-5". None before the first reply.
+    pub model: Option<String>,
+    /// "low" | "medium" | "high" | "xhigh" | "max" | … as recorded.
+    pub effort: Option<String>,
+}
+
+/// What model and effort the session last actually ran with.
+///
+/// Read from the transcript rather than tracked in the app: claude records the
+/// model and effort on every assistant record, so the file is the authority and
+/// stays right no matter who changed it — the pill, a `/model` typed into the
+/// terminal, or a flag on launch. Nothing to keep in sync.
+///
+/// Only the tail is read; these files reach several MB.
+#[tauri::command]
+pub fn session_model(session_id: String) -> ModelChoice {
+    let Some(path) = find_session_file(&session_id) else {
+        return ModelChoice::default();
+    };
+    const TAIL: u64 = 256 * 1024;
+    let Ok(mut file) = File::open(&path) else {
+        return ModelChoice::default();
+    };
+    let Ok(meta) = file.metadata() else {
+        return ModelChoice::default();
+    };
+    let start = meta.len().saturating_sub(TAIL);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return ModelChoice::default();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return ModelChoice::default();
+    }
+    // An arbitrary offset can split a line or a UTF-8 char — decode lossily and
+    // drop the first partial line, as the bridge-id reader does.
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines();
+    if start > 0 {
+        lines.next();
+    }
+    let mut out = ModelChoice::default();
+    for line in lines {
+        if !line.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        // Last one wins: a model change mid-session leaves both in the file.
+        if let Some(m) = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(|m| m.as_str())
+        {
+            out.model = Some(m.to_string());
+        }
+        if let Some(e) = v.get("effort").and_then(|e| e.as_str()) {
+            out.effort = Some(e.to_string());
+        }
+    }
+    out
+}
+
 /// The permission mode Claude Code would start a *new* session in here, read
 /// from its own config chain — project-local first, then the user's.
 ///

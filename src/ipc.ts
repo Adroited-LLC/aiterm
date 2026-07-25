@@ -155,6 +155,15 @@ export const materializeFork = (sessionId: string) =>
 // null when nothing is configured (or it names a mode the CLI would reject).
 export const claudePermissionMode = (projectPath: string) =>
   invoke<string | null>("claude_permission_mode", { projectPath });
+export interface ModelChoice {
+  /** Full id as recorded, e.g. "claude-opus-5". null before the first reply. */
+  model: string | null;
+  effort: string | null;
+}
+// What the session last actually ran with, read from its transcript — so it
+// stays right whether the pill, a typed /model, or a launch flag changed it.
+export const sessionModel = (sessionId: string) =>
+  invoke<ModelChoice>("session_model", { sessionId });
 export interface UsageBar {
   kind: string;
   label: string;

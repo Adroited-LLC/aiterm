@@ -1,9 +1,22 @@
 import { useEffect, useState } from "react";
 import {
-  AgentRun, Artifact, SessionTask, UsageBar,
+  AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
   homeAbbrev, openPath, relTime,
-  sessionAgents, sessionArtifacts, sessionTasks, usageLimits,
+  sessionAgents, sessionArtifacts, sessionModel, sessionTasks, usageLimits,
 } from "../ipc";
+
+/** `/model <name>` choices, straight from the command's own usage line. */
+const MODELS = ["default", "best", "opus", "opusplan", "sonnet", "haiku", "fable"];
+/** `/effort <level>` choices, likewise. */
+const EFFORTS = ["auto", "low", "medium", "high", "xhigh", "max", "ultracode"];
+
+/** "claude-opus-5" → "opus". Falls back to the raw id when unrecognised, so a
+ *  new model shows *something* rather than going blank. */
+function shortModel(id: string | null): string {
+  if (!id) return "—";
+  const m = MODELS.find((n) => n !== "default" && n !== "best" && id.includes(n));
+  return m ?? id.replace(/^claude-/, "");
+}
 
 /**
  * The composer's control strip: a row of counts that open a panel when clicked.
@@ -18,7 +31,7 @@ import {
  * and one line in Composer — nothing that currently works depends on it.
  */
 
-type PanelKey = "tasks" | "artifacts" | "agents" | "usage";
+type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "model" | "effort";
 
 /** Relative "resets in 3h 55m"; "" when unknown or past. */
 function resetsIn(iso: string): string {
@@ -34,18 +47,27 @@ function resetsIn(iso: string): string {
   return `resets in ${m}m`;
 }
 
-export default function ComposerPills({ sessionId }: { sessionId: string | null }) {
+interface Props {
+  sessionId: string | null;
+  /** Run a slash command in the live terminal (adds Enter). Absent when no
+   *  terminal is focused, which is what disables the model/effort pills. */
+  onCommand?: (text: string) => void;
+}
+
+export default function ComposerPills({ sessionId, onCommand }: Props) {
   const [open, setOpen] = useState<PanelKey | null>(null);
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
   const [bars, setBars] = useState<UsageBar[]>([]);
+  const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null });
 
   useEffect(() => {
     if (!sessionId) {
       setTasks([]);
       setArtifacts([]);
       setAgents([]);
+      setChoice({ model: null, effort: null });
       return;
     }
     let stop = false;
@@ -53,11 +75,20 @@ export default function ComposerPills({ sessionId }: { sessionId: string | null 
       sessionTasks(sessionId).then((t) => !stop && setTasks(t)).catch(() => {});
       sessionArtifacts(sessionId).then((a) => !stop && setArtifacts(a)).catch(() => {});
       sessionAgents(sessionId).then((a) => !stop && setAgents(a)).catch(() => {});
+      sessionModel(sessionId).then((c) => !stop && setChoice(c)).catch(() => {});
     };
     poll();
     const iv = setInterval(poll, 5000);
     return () => { stop = true; clearInterval(iv); };
   }, [sessionId]);
+
+  // Sending is fire-and-forget: claude writes the change into the transcript,
+  // and the next poll reads it back. Nothing optimistic to get out of step —
+  // if the command doesn't take, the pill keeps showing the truth.
+  const run = (cmd: string) => {
+    onCommand?.(cmd);
+    setOpen(null);
+  };
 
   useEffect(() => {
     let alive = true;
@@ -175,7 +206,28 @@ export default function ComposerPills({ sessionId }: { sessionId: string | null 
           )}
         </div>
       )}
+      {(open === "model" || open === "effort") && (
+        <div className="cpill-panel cpill-choices">
+          {(open === "model" ? MODELS : EFFORTS).map((name) => {
+            const current = open === "model"
+              ? shortModel(choice.model) === name
+              : choice.effort === name;
+            return (
+              <button
+                key={name}
+                className={"cpill-choice" + (current ? " on" : "")}
+                onClick={() => run(`/${open} ${name}`)}
+              >
+                {name}
+                {current && <span className="cpill-choice-mark">current</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
       <div className="cpill-row">
+        {onCommand && pill("model", "◆", "Model", shortModel(choice.model))}
+        {onCommand && pill("effort", "≡", "Effort", choice.effort ?? "—")}
         {sessionId && pill("tasks", "◑", "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
         {sessionId && pill("artifacts", "▤", "Files", artifacts.length ? `${artifacts.length}` : "")}
         {sessionId && pill(

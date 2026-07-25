@@ -37,6 +37,7 @@ pub fn run() {
             sessions::session_fork,
             sessions::materialize_fork,
             sessions::claude_permission_mode,
+            sessions::session_model,
             usage::usage_limits,
             watcher::watch_project,
             fsx::list_dir,

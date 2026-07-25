@@ -1530,3 +1530,31 @@ input[type="range"]::-webkit-slider-thumb {
   font-variant-numeric: tabular-nums;
 }
 .cpill-usage-reset { min-width: 108px; color: var(--text-faint); }
+
+/* Model / effort choosers: a wrapped row of options rather than a list, since
+   there are few of them and they are single words. */
+.cpill-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px;
+}
+.cpill-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.cpill-choice:hover { background: var(--bg-hover); border-color: var(--accent); }
+.cpill-choice.on { border-color: var(--accent); background: var(--bg-active); }
+.cpill-choice-mark {
+  color: var(--text-faint);
+  font-size: 10px;
+}
