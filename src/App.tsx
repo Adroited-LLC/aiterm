@@ -235,9 +235,10 @@ export default function App() {
 
     // A fork tab (slot `fork:<id>:<n>`, opened by forkSession) has no listed
     // session row until `--fork-session` writes its new transcript. Adopt the
-    // newest fresh session in the tab's project that no other tab holds — no
-    // parent-row comparison, because forking supersedes the parent (collapsed
-    // away by bridge id). This gives the fork its own row in the project group.
+    // newest fresh session in the tab's project that no other tab holds. The
+    // parent row can't be adopted by accident — it already existed, so it's
+    // never in `fresh` — and it stays listed: forking leaves the parent
+    // intact, frozen at its own context, independently resumable.
     if (tab.slotId.startsWith("fork:")) {
       const adopt = fresh
         .filter((s) => s.project_path === tab.cwd && !otherSlots.has(s.id))
@@ -462,12 +463,13 @@ export default function App() {
   };
   const resumeSession = async (s: Session) => {
     setActiveProject(s.project_path);
-    // The pinned id can go stale: a `/clear` or `--fork-session` retires the
+    // The pinned id can go stale: a `/clear` or compaction retires the
     // original transcript (Claude Code deletes it or renames it to
     // `<id>.orphaned-…`), so `claude --resume <original-id>` dies with "no
     // conversation found" — a black pane, the core "broken feel" of resume.
-    // Resolve to the surviving transcript in the fork family first; if nothing
-    // resumable is left, say so instead of launching a doomed resume.
+    // Resolve to the surviving continuation first; if nothing resumable is
+    // left, say so instead of launching a doomed resume. (A forked parent is
+    // NOT stale — forking leaves it intact, and it resolves to itself.)
     let liveId = s.id;
     try {
       const resolved = await resolveResumableId(s.id);
@@ -526,6 +528,15 @@ export default function App() {
       `claude --fork-session --resume ${liveId}`,
       `fork:${liveId}:${nextKey.current}`, liveId,
     );
+    // The fork carries the conversation forward — exit the parent's live
+    // terminal so one context isn't running twice. Its row stays listed
+    // (scan keeps fork siblings) and resumes later at its pre-fork context.
+    // Focus stays on the fork tab: closeTab only refocuses when closing the
+    // active tab. A parent running as a bg agent has no tab here; that's
+    // Claude Code's process to manage, not ours. (tabsRef, not tabs: the
+    // resolver await above means the render-time snapshot can be stale.)
+    const parent = tabsRef.current.find((t) => t.slotId === liveId);
+    if (parent) closeTab(parent.key);
   };
   // Exit an active session: close its live terminal tab (ends the running
   // claude process). The transcript stays on disk, so it's resumable later.

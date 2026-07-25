@@ -59,19 +59,16 @@ impl ClaudeProvider {
         }
         sessions.sort_by(|a, b| b.0.last_active.cmp(&a.0.last_active));
 
-        // Collapse fork duplicates. Claude Code forks a live conversation
-        // (orchestrator view, resume-on-select) into a NEW transcript file
-        // that carries the same `bridgeSessionId` as the original. That used
-        // to surface as two identical rows, and resuming the wrong one landed
-        // on stale context. Keep only the newest fork per bridge id — already
-        // sorted newest-first, so the first occurrence wins — giving one row
-        // that always resumes the live, full-context session. Sessions with
-        // no bridge id can't fork-duplicate this way and are all kept.
-        let mut seen_bridge = std::collections::HashSet::new();
-        sessions.retain(|(_, path)| match read_bridge_id(path) {
-            Some(bridge) => seen_bridge.insert(bridge),
-            None => true,
-        });
+        // One live `<id>.jsonl` = one row, even when several share a
+        // `bridgeSessionId`. An explicit `--fork-session` leaves the original
+        // transcript intact and independently resumable — the fork and its
+        // parent are BOTH real sessions, each frozen at its own point, so
+        // collapsing the family to the newest row (as we used to) hid the
+        // parent and made its context unreachable. The duplicate-row problem
+        // that collapse solved came from resume minting a fork on every
+        // select; resume now forks only when the session is actually running,
+        // and /clear/compact retire the old file via the `.orphaned-` rename
+        // filtered above — so no collapse is needed.
         sessions
     }
 }
@@ -987,18 +984,23 @@ fn find_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     best.map(|(p, _)| p)
 }
 
-/// Resolve the transcript to actually read for a UI-pinned session id. The id a
-/// tab stores is captured at resume time and never changes, but the live
-/// transcript can drift out from under it two ways: the file gets
-/// orphaned-renamed (handled by `find_session_file`), or the session was
-/// resumed with `--fork-session`, which branches a NEW transcript sharing the
-/// original's `bridgeSessionId`. In the fork case the pinned id keeps pointing
-/// at the frozen pre-fork file while the terminal writes to the new one — so
-/// follow the bridge to the newest sibling in the fork family (forks keep the
-/// same cwd → same project dir). This is what keeps the agents/tasks panels in
-/// sync with the running session instead of stuck at the moment of the fork.
+/// Resolve the transcript to actually read for a UI-pinned session id. A live
+/// `<id>.jsonl` IS the session: an explicit `--fork-session` leaves the
+/// original intact and independently resumable, so a healthy pinned id must
+/// never be redirected to a fork sibling — that silently swapped the
+/// original's frozen context for the fork's. Only when the pinned file was
+/// retired (/clear or compact renames it to `<id>.orphaned-…`) does the
+/// conversation truly continue elsewhere: then follow the `bridgeSessionId`
+/// to the newest live sibling in the family (continuations keep the same
+/// cwd → same project dir), which keeps the agents/tasks panels in sync.
 fn resolve_live_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     let start = find_session_file(session_id)?;
+    if !start
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
+    {
+        return Some(start);
+    }
     let Some(bridge) = read_bridge_id(&start) else {
         return Some(start);
     };
@@ -1031,15 +1033,16 @@ fn resolve_live_session_file(session_id: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Resolve a UI-pinned session id to an id that `claude --resume` can actually
-/// open *right now*. Follows the same fork-family logic as the panels
+/// open *right now*. Follows the same logic as the panels
 /// (`resolve_live_session_file`) but returns the id (filename stem) and refuses
 /// to hand back an orphaned/superseded transcript. When a session is `/clear`ed
-/// or forked, Claude Code retires the original `<id>.jsonl` (deletes it, or
+/// or compacted, Claude Code retires the original `<id>.jsonl` (deletes it, or
 /// renames it to `<id>.orphaned-…`); `claude --resume <that-id>` then dies with
 /// "no conversation found", leaving a black pane. This returns `Some(live_id)`
-/// pointing at the surviving transcript in the fork family, or `None` when
+/// pointing at the surviving continuation in the family, or `None` when
 /// nothing resumable is left — so the UI can say so instead of launching a
-/// doomed resume.
+/// doomed resume. A live `<id>.jsonl` resolves to itself — forking never
+/// retires the original, so a forked parent stays resumable at its own point.
 #[tauri::command]
 pub fn resolve_resumable_id(session_id: String) -> Option<String> {
     let path = resolve_live_session_file(&session_id)?;

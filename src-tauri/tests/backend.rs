@@ -259,9 +259,11 @@ fn parses_tasks_and_agents_from_transcript() {
 }
 
 #[test]
-fn collapses_forked_session_duplicates() {
-    // A forked conversation writes a new transcript sharing the original's
-    // bridgeSessionId; only the newest fork should appear in the list.
+fn keeps_both_fork_siblings() {
+    // An explicit `--fork-session` writes a new transcript sharing the
+    // original's bridgeSessionId but leaves the original intact and
+    // independently resumable. BOTH must stay listed — collapsing the family
+    // to the newest row (old behavior) hid the parent's context entirely.
     let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
     let dir = home.join(".claude/projects/-aiterm-fork-dup-test");
     std::fs::create_dir_all(&dir).unwrap();
@@ -286,11 +288,11 @@ fn collapses_forked_session_duplicates() {
     let ids: Vec<String> = ClaudeProvider.scan().into_iter().map(|s| s.id).collect();
     assert!(
         ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermforknew"),
-        "newest fork should be listed"
+        "fork should be listed"
     );
     assert!(
-        !ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermforkold"),
-        "older fork sharing the bridge id should be collapsed away"
+        ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermforkold"),
+        "forked parent must stay listed — its context is still resumable"
     );
 
     let _ = std::fs::remove_file(&older);
