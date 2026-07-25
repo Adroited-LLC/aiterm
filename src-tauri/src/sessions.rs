@@ -37,20 +37,22 @@ impl ClaudeProvider {
             let Ok(files) = std::fs::read_dir(project.path()) else {
                 continue;
             };
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().is_none_or(|e| e != "jsonl") {
-                    continue;
-                }
+            let paths: Vec<std::path::PathBuf> = files
+                .flatten()
+                .map(|f| f.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
                 // Claude Code renames superseded transcripts to
                 // <id>.orphaned-<ts>-<hash>.jsonl — not resumable sessions.
-                if path
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
-                {
-                    continue;
-                }
-                if let Some(s) = parse_session(&path) {
+                .filter(|p| {
+                    !p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
+                })
+                .collect();
+            // Every real session in a project dir records the same cwd; find it
+            // once so /fork stub files (title-only, no cwd) can borrow it.
+            let dir_cwd = paths.iter().find_map(|p| read_first_cwd(p));
+            for path in paths {
+                if let Some(s) = parse_session(&path, dir_cwd.as_deref()) {
                     sessions.push((s, path));
                 }
             }
@@ -72,6 +74,26 @@ impl ClaudeProvider {
         });
         sessions
     }
+}
+
+/// Read the first `cwd` a transcript records. Used to backfill the project for
+/// Claude Code /fork stub files, which are title-only and omit `cwd`. Only the
+/// head of the file is scanned — cwd appears on the earliest real records.
+fn read_first_cwd(path: &Path) -> Option<String> {
+    let reader = BufReader::new(File::open(path).ok()?);
+    for line in reader.lines().take(80).flatten() {
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(c) = v.get("cwd").and_then(|c| c.as_str()) {
+                if !c.is_empty() {
+                    return Some(c.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read a transcript's `bridgeSessionId` — the stable id shared across every
@@ -182,7 +204,7 @@ fn is_system_meta_prompt(text: &str) -> bool {
 
 /// Pull title/cwd/branch out of the first lines of a session jsonl without
 /// parsing the whole transcript.
-fn parse_session(path: &Path) -> Option<Session> {
+fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() == 0 {
         return None;
@@ -198,6 +220,10 @@ fn parse_session(path: &Path) -> Option<Session> {
     let reader = BufReader::new(File::open(path).ok()?);
 
     let mut title: Option<String> = None;
+    // Claude Code's auto-generated title (record type `ai-title`). Used as a
+    // last-resort title so /fork stub files — which contain ONLY an ai-title
+    // ("<project> ⑂") and an agent-name, no prompt — still appear in the list.
+    let mut ai_title: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_prompt: Option<String> = None;
     let mut cwd: Option<String> = None;
@@ -215,6 +241,13 @@ fn parse_session(path: &Path) -> Option<Session> {
         match v.get("type").and_then(|t| t.as_str()) {
             Some("custom-title") => {
                 title = v.get("customTitle").and_then(|t| t.as_str()).map(String::from)
+            }
+            Some("ai-title") if ai_title.is_none() => {
+                ai_title = v
+                    .get("aiTitle")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
             }
             Some("summary") => {
                 summary = v.get("summary").and_then(|t| t.as_str()).map(String::from)
@@ -263,13 +296,15 @@ fn parse_session(path: &Path) -> Option<Session> {
         return None;
     }
 
-    let project_path = cwd?;
+    // Fork stubs omit cwd; backfill from a sibling session's cwd in the same
+    // project dir so they still group under the right project.
+    let project_path = cwd.or_else(|| dir_cwd.map(String::from))?;
     // Noise filters: scratch sessions in /tmp, and sessions with no human
     // content at all (memory summarizer runs, local-command-only sessions).
     if project_path == "/tmp" || project_path.starts_with("/tmp/") {
         return None;
     }
-    let title = title.or(summary).or(first_prompt)?;
+    let title = title.or(summary).or(first_prompt).or(ai_title)?;
 
     Some(Session {
         id,
@@ -429,7 +464,7 @@ pub fn trash_list() -> Vec<TrashedSession> {
                 .unwrap_or(0);
             // parse_session rejects some transcripts (noise filters); trash
             // still lists those with a fallback label so nothing is invisible.
-            let (title, project_path) = match parse_session(&p) {
+            let (title, project_path) = match parse_session(&p, None) {
                 Some(s) => (s.title, s.project_path),
                 None => (format!("session {}", &id[..8.min(id.len())]), String::new()),
             };
@@ -1144,20 +1179,45 @@ mod tests {
         let tmp_session = dir.join("11111111-1111-1111-1111-111111111111.jsonl");
         std::fs::write(&tmp_session,
             r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":"real prompt"}}"#).unwrap();
-        assert!(parse_session(&tmp_session).is_none(), "/tmp session should be dropped");
+        assert!(parse_session(&tmp_session, None).is_none(), "/tmp session should be dropped");
 
         let meta_session = dir.join("22222222-2222-2222-2222-222222222222.jsonl");
         std::fs::write(&meta_session,
             r#"{"type":"user","cwd":"/home/x/proj","message":{"role":"user","content":"You are summarizing a Claude Code session for a daily memory log"}}"#).unwrap();
-        assert!(parse_session(&meta_session).is_none(), "meta-only session should be dropped");
+        assert!(parse_session(&meta_session, None).is_none(), "meta-only session should be dropped");
 
         let real_session = dir.join("33333333-3333-3333-3333-333333333333.jsonl");
         std::fs::write(&real_session, concat!(
             r#"{"type":"user","cwd":"/home/x/proj","message":{"role":"user","content":"<local-command-caveat>Caveat: The messages below were generated</local-command-caveat>"}}"#, "\n",
             r#"{"type":"user","cwd":"/home/x/proj","gitBranch":"main","message":{"role":"user","content":"hey fix the login bug"}}"#)).unwrap();
-        let s = parse_session(&real_session).expect("real session kept");
+        let s = parse_session(&real_session, None).expect("real session kept");
         assert_eq!(s.title, "hey fix the login bug");
         assert_eq!(s.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn keeps_fork_stub_via_ai_title_and_backfilled_cwd() {
+        // A Claude Code /fork stub: only an ai-title + agent-name, no cwd, no
+        // prompt, no bridge. Must still surface so forks are visible.
+        let dir = std::env::temp_dir().join("aiterm-test-fork-stub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("44444444-4444-4444-4444-444444444444.jsonl");
+        std::fs::write(
+            &stub,
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"headroom ⑂","sessionId":"x"}"#,
+                "\n",
+                r#"{"type":"agent-name","agentName":"headroom ⑂","sessionId":"x"}"#,
+            ),
+        )
+        .unwrap();
+        // No cwd anywhere → still dropped (can't place it in a project).
+        assert!(parse_session(&stub, None).is_none(), "stub w/o cwd dropped");
+        // With the project dir's cwd backfilled, it shows under its ai-title.
+        let s = parse_session(&stub, Some("/home/matt/Projects/headroom"))
+            .expect("fork stub kept");
+        assert_eq!(s.title, "headroom ⑂");
+        assert_eq!(s.project_path, "/home/matt/Projects/headroom");
     }
 }
 
