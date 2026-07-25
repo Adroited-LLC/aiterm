@@ -1060,11 +1060,58 @@ pub fn resolve_resumable_id(session_id: String) -> Option<String> {
 /// decide fork-vs-resume: a plain `claude --resume` fails on a session that's
 /// still running (leaving a black pane), so those must fork; everything else
 /// resumes in place, which avoids minting a duplicate forked transcript.
+/// Short session ids (first UUID segment) of sessions the Claude Code daemon
+/// currently has live, read from its per-session sockets under
+/// /tmp/cc-daemon-*/<hash>/{rv,pty}/<shortid>.sock. Covers background agents,
+/// which don't appear in /proc cmdlines.
+fn daemon_live_session_shortids() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(tmp) = std::fs::read_dir("/tmp") else {
+        return out;
+    };
+    for entry in tmp.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("cc-daemon-")
+        {
+            continue;
+        }
+        let Ok(hashes) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for hash in hashes.flatten() {
+            for sub in ["rv", "pty"] {
+                let Ok(socks) = std::fs::read_dir(hash.path().join(sub)) else {
+                    continue;
+                };
+                for s in socks.flatten() {
+                    let name = s.file_name();
+                    if let Some(stem) = name.to_string_lossy().strip_suffix(".sock") {
+                        if !stem.is_empty() {
+                            out.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[tauri::command]
 pub fn running_session_ids() -> Vec<String> {
     let mut ids = std::collections::HashSet::new();
+    // Background agents (Claude Code's `/fork`, `--bg`) run under a daemon and
+    // never name their session in /proc — but the daemon opens a socket per
+    // live session at /tmp/cc-daemon-*/<hash>/{rv,pty}/<shortid>.sock, where
+    // shortid is the FIRST segment of the session UUID. Collect those short
+    // ids; the resume path matches them by prefix. Without this, resuming a
+    // bg-agent fork falls through to plain `claude --resume`, which errors
+    // ("currently running as a background agent … add --fork-session").
+    ids.extend(daemon_live_session_shortids());
     let Ok(procs) = std::fs::read_dir("/proc") else {
-        return vec![];
+        return ids.into_iter().collect();
     };
     for entry in procs.flatten() {
         let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {

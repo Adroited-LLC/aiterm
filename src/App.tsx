@@ -493,7 +493,12 @@ export default function App() {
     } catch {
       running = [];
     }
-    const command = running.includes(liveId)
+    // Match a full id (from /proc) OR the first UUID segment (daemon bg-agent
+    // sockets are named by the short id). A running session — incl. a bg-agent
+    // fork — must resume with --fork-session or Claude Code errors out.
+    const isRunning =
+      running.includes(liveId) || running.includes(liveId.split("-")[0]);
+    const command = isRunning
       ? `claude --fork-session --resume ${liveId}`
       : `claude --resume ${liveId}`;
     openTab(s.title, s.project_path, command, liveId, liveId);
