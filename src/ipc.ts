@@ -123,6 +123,12 @@ export const runningSessionIds = () =>
 // the agent view (`claude agents`).
 export const bgAgentSessionIds = () =>
   invoke<string[]>("bg_agent_session_ids");
+// Every session the daemon currently holds, background AND interactive — i.e.
+// "is this session alive right now". Distinct from "aiterm has a tab open for
+// it": after a background-mode resume the tab holds the parent id while the
+// conversation runs under a new one, so the two point at different rows.
+export const liveSessionIds = () =>
+  invoke<string[]>("live_session_ids");
 // Resolve a pinned session id to one `claude --resume` can open now (follows
 // the fork family). null → the original was cleared/superseded and nothing
 // resumable survives.

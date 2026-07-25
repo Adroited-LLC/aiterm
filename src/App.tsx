@@ -19,7 +19,7 @@ import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
-  resolveResumableId, bgAgentSessionIds,
+  resolveResumableId, bgAgentSessionIds, liveSessionIds,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -152,6 +152,21 @@ export default function App() {
 
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [trashed, setTrashed] = useState<TrashedSession[]>([]);
+  // Which sessions the daemon is actually running. Polled rather than derived
+  // from tabs, because those are different questions — see SessionsPanel's
+  // hasTab/isRunning split. Costs one `claude agents --json` (~200ms) per tick,
+  // so it runs on its own slow timer instead of on every filesystem event.
+  const [liveSessions, setLiveSessions] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let stop = false;
+    const tick = () =>
+      liveSessionIds()
+        .then((ids) => { if (!stop) setLiveSessions(new Set(ids)); })
+        .catch(() => { /* keep the last known set rather than blanking dots */ });
+    tick();
+    const t = setInterval(tick, 6000);
+    return () => { stop = true; clearInterval(t); };
+  }, []);
 
   // List-only refresh: cheap, safe to run on every fs event.
   const refreshSessionList = useCallback(() => {
@@ -615,6 +630,7 @@ export default function App() {
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
+                liveSessions={liveSessions}
                 attentionSlots={new Set(
                   tabs.filter((t) => attention.has(t.key)).map((t) => t.slotId),
                 )}

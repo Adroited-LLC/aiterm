@@ -620,6 +620,30 @@ body.dragging * { pointer-events: none; }
   vertical-align: 1px;
 }
 
+/* "Open in a tab here" — same shape as .live-dot but muted, never green,
+   because it is a weaker claim: the tab exists, but the session it names may
+   not be the one running (a background-mode resume moves the conversation to
+   a new id while the tab keeps the old one). Colour only, so .badge-dot's
+   separator ring still applies. */
+.tab-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+/* Opposite corner from .live-dot so a row can carry both at once — a session
+   can be running AND have a tab, and after a background-mode resume the two
+   land on different rows, which is exactly when you need to see both. */
+.tab-dot.badge-dot {
+  right: auto;
+  bottom: auto;
+  left: -2px;
+  top: -2px;
+}
+
 .agent-icon { color: var(--text-dim); margin-top: 2px; flex-shrink: 0; }
 .agent-icon.claude { color: var(--accent); }
 

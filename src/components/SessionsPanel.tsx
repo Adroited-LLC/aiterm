@@ -94,8 +94,12 @@ interface Props {
   sessions: Session[];
   projects: ProjectInfo[];
   activeProject: string | null;
-  /** Slot ids that currently have a live terminal. */
+  /** Slot ids aiterm has a terminal tab open for. Tab ownership only — NOT
+   *  the same as the session being alive, and after a background-mode resume
+   *  the two name different rows. */
   liveSlots: Set<string>;
+  /** Session ids the Claude Code daemon is actually running right now. */
+  liveSessions: Set<string>;
   /** Slot ids whose terminal rang the bell (claude waiting on input). */
   attentionSlots: Set<string>;
   /** Slot id of the terminal currently displayed. */
@@ -142,7 +146,7 @@ function AgentIcon({ agent }: { agent: string }) {
 }
 
 export default function SessionsPanel({
-  sessions, projects, activeProject, liveSlots, attentionSlots, activeSlot, opts,
+  sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, activeSlot, opts,
   onOptsChange, onSelect, onResume, onFork, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty,
@@ -542,7 +546,15 @@ export default function SessionsPanel({
   );
 
   const renderItem = (s: Session, container?: string) => {
-    const isLive = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
+    // Two different facts, deliberately kept apart. `hasTab` is whether aiterm
+    // has a terminal open for this row; `isRunning` is whether the session is
+    // alive at all. They were one value, which put the live badge — and the
+    // fork/exit menu, and the absence of Delete — on whichever row the tab
+    // happened to name. After a background-mode resume that's the frozen
+    // parent, while the real conversation runs elsewhere wearing no badge and
+    // offering a Delete that would truncate it.
+    const hasTab = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
+    const isRunning = liveSessions.has(s.id);
     const hasAttn =
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
     const isShowing = activeSlot !== null &&
@@ -598,11 +610,17 @@ export default function SessionsPanel({
       >
         <div className={"agent-badge" + (s.agent === "claude" ? " claude" : "")}>
           <AgentIcon agent={s.agent} />
-          {(isLive || hasAttn) && (
+          {/* Green: the session is running. Hollow: aiterm has a tab for it.
+              Usually the same row — but not after a background-mode resume,
+              and when they differ you need to see both. */}
+          {(isRunning || hasAttn) && (
             <span
               className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
-              title={hasAttn ? "Waiting for your input" : "Terminal running"}
+              title={hasAttn ? "Waiting for your input" : "Session is running"}
             />
+          )}
+          {hasTab && (
+            <span className="tab-dot badge-dot" title="Open in a tab here" />
           )}
         </div>
         <div className="session-text">
@@ -657,21 +675,26 @@ export default function SessionsPanel({
             </>
           ) : (
             <>
-              {liveSlots.has(s.id) ? (
-                // Already active — resume would just refocus, so offer the two
-                // actions that make sense on a live session: branch a copy, or
-                // end it. (Delete is hidden for live sessions anyway.)
-                <>
-                  <button
-                    className="act-btn" title="Fork into a new tab (branch a copy)"
-                    onClick={() => onFork(s)}
-                  >⑂</button>
-                  <button
-                    className="act-btn" title="Exit — close this running session"
-                    onClick={() => onExit(s)}
-                  >⏻</button>
-                </>
-              ) : (
+              {/* Each action is offered only when it can actually do
+                  something. Branching needs a session; exiting needs a tab to
+                  close; resuming needs the session NOT to be running already.
+                  These used to hang off one flag, so a frozen snapshot got
+                  Fork/Exit (branching stale history, closing a tab that wasn't
+                  driving the conversation) while the running session got
+                  Resume. */}
+              {isRunning && (
+                <button
+                  className="act-btn" title="Fork into a new tab (branch a copy)"
+                  onClick={() => onFork(s)}
+                >⑂</button>
+              )}
+              {hasTab && (
+                <button
+                  className="act-btn" title="Exit — close this tab"
+                  onClick={() => onExit(s)}
+                >⏻</button>
+              )}
+              {!isRunning && !hasTab && (
                 <button
                   className="act-btn" title="Resume claude session"
                   onClick={() => onResume(s)}
@@ -681,7 +704,11 @@ export default function SessionsPanel({
                 className="act-btn" title="New shell here"
                 onClick={() => onNewShell(s)}
               >＋</button>
-              {!liveSlots.has(s.id) && (
+              {/* Never offer Delete on a running session: trashing one doesn't
+                  stick — the process recreates its transcript seconds later,
+                  rebuilt from the deletion point, losing the history before
+                  it. Stop it first. */}
+              {!isRunning && !hasTab && (
                 <button
                   className="act-btn danger" title="Delete session…"
                   onClick={() => setConfirmDel(s.id)}

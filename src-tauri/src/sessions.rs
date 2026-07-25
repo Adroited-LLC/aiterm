@@ -1277,12 +1277,36 @@ fn extract_session_id(val: &str) -> Option<String> {
     }
 }
 
-/// Full session UUIDs of live *background* agents, from `claude agents --json`
-/// (the sanctioned roster; sockets only give short ids and no kind). A session
-/// on this list is held by the daemon — a plain or `--fork-session` resume
-/// either errors (prompt-less `/fork` stub with a title-only transcript) or
-/// mints a detached copy. The real session is reachable only through the
-/// agent view (`claude agents`), so the UI routes these rows there.
+/// Every session the Claude Code daemon currently holds — background agents
+/// AND interactive ones. This is what "this session is alive right now" means,
+/// and it is not the same question as "aiterm has a tab open for it".
+///
+/// Those two were conflated, and after a background-mode resume they point at
+/// different rows: the tab runs `--resume <parent>` while the conversation
+/// moves to a new bg session id. Keying the live dot on tab ownership put the
+/// badge on a frozen snapshot and offered Delete on the session that was
+/// actually running.
+#[tauri::command]
+pub fn live_session_ids() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("claude")
+        .args(["agents", "--json"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|a| a.get("sessionId").and_then(|s| s.as_str()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Full session UUIDs of live *background* agents only. A session on this list
+/// is held by the daemon with no tab of ours, so `--resume` on it exits with
+/// "…add --fork-session to branch off a copy" — resume says so rather than
+/// launching a doomed one.
 #[tauri::command]
 pub fn bg_agent_session_ids() -> Vec<String> {
     let Ok(out) = std::process::Command::new("claude")
