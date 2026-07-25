@@ -571,6 +571,16 @@ body.dragging * { pointer-events: none; }
   align-items: baseline;
   gap: 8px;
 }
+/* Marks a row whose conversation began in another session — a /fork child, or
+   a continuation past a compaction. Sits before the title so the branch point
+   is visible without opening the session. */
+.fork-mark {
+  flex-shrink: 0;
+  margin-right: -4px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1;
+}
 .session-time {
   margin-left: auto;
   flex-shrink: 0;

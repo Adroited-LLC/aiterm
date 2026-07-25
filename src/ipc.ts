@@ -4,8 +4,20 @@ export interface Session {
   id: string;
   agent: string;
   title: string;
+  /** True cwd — what a resumed tab spawns in. */
   project_path: string;
+  /** Project this row groups under; differs from project_path only for
+   *  sessions inside a Claude Code worktree, which group under their repo. */
+  group_path: string;
   branch: string | null;
+  /** Continues a conversation held in another transcript (a /fork child or a
+   *  compact continuation) — its parent stays on disk, frozen at the fork. */
+  forked: boolean;
+  /** Ran as a background agent under the daemon (/fork or --bg). */
+  background: boolean;
+  /** Session this was forked from, from Claude Code job state — known as soon
+   *  as /fork runs, before the fork's transcript has any messages. */
+  fork_parent: string | null;
   last_active: number;
 }
 

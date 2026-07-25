@@ -232,9 +232,13 @@ export default function SessionsPanel({
     return [...(ftResults ?? []), ...filtered.filter((s) => !seen.has(s.id))];
   }, [query, ftResults, filtered]);
 
+  // Group membership keys off `group_path`, not the raw cwd: a `/fork` can run
+  // its agent in a `<repo>/.claude/worktrees/<name>` checkout, which would
+  // otherwise strand the fork in a group of its own instead of listing it
+  // beside the session it branched from. Rows still spawn in `project_path`.
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
   const ungrouped = useMemo(
-    () => applyOrder(filtered.filter((s) => !grouped.has(s.project_path)), orders["recent"]),
+    () => applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"]),
     [filtered, grouped, orders],
   );
   const groupMembers = useMemo(() => {
@@ -243,7 +247,7 @@ export default function SessionsPanel({
       m.set(
         g.id,
         applyOrder(
-          filtered.filter((s) => g.members.includes(s.project_path)),
+          filtered.filter((s) => g.members.includes(s.group_path)),
           orders[`group:${g.id}`],
         ),
       );
@@ -258,7 +262,7 @@ export default function SessionsPanel({
   ]);
 
   const sessionPaths = useMemo(
-    () => new Set(sessions.map((s) => s.project_path)),
+    () => new Set(sessions.map((s) => s.group_path)),
     [sessions],
   );
   const sessionlessProjects = useMemo(() => {
@@ -275,7 +279,7 @@ export default function SessionsPanel({
     const map = new Map<string, Session[]>();
     for (const s of filtered) {
       const key = viewMode === "project"
-        ? s.project_path
+        ? s.group_path
         : dateBucket(s.last_active);
       (map.get(key) ?? map.set(key, []).get(key)!).push(s);
     }
@@ -554,7 +558,10 @@ export default function SessionsPanel({
           if (e.button !== 0 || !container || searchList) return;
           if ((e.target as HTMLElement).closest("button")) return;
           dragArm.current = {
-            kind: "session", id: s.id, path: s.project_path,
+            // group_path, matching how membership is read below — dragging a
+            // worktree session must group the repo it belongs to, not the
+            // throwaway checkout path, or the drop silently does nothing.
+            kind: "session", id: s.id, path: s.group_path,
             container, label: s.title, x: e.clientX, y: e.clientY,
           };
         }}
@@ -600,6 +607,18 @@ export default function SessionsPanel({
         </div>
         <div className="session-text">
           <div className="session-title-row">
+            {s.forked && (
+              <span
+                className="fork-mark"
+                title={
+                  s.background
+                    ? "Forked from another session — carries its context up to the fork"
+                    : "Continues an earlier session past a compaction"
+                }
+              >
+                ⑂
+              </span>
+            )}
             <span className="session-title">{s.title}</span>
             {opts.showTime && <span className="session-time">{shortTime(s.last_active)}</span>}
           </div>

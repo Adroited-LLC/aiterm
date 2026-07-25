@@ -267,6 +267,34 @@ export default function App() {
     // Newest wins if several qualify.
     const cont = candidates.reduce((a, b) => (b.last_active > a.last_active ? b : a));
 
+    // A `/fork` looks identical to a `/clear` from here — new session, same
+    // project, newer — but means the opposite: the parent is NOT retired. The
+    // backend tells them apart on disk via `forked` (the new transcript's
+    // first chain link points at a uuid held in ANOTHER file; a /clear's
+    // resolves in its own). Two shapes hide behind that flag:
+    //
+    //  - `/fork` (forked && background): Claude Code checkpoints the current
+    //    session and spawns a *background* agent carrying its context. This
+    //    terminal never left the parent, so nothing rebinds — the fork just
+    //    earns its own row, and the parent keeps running as it was. Hiding the
+    //    parent here is what made forked-from sessions unreachable.
+    //  - compact continuation (forked && !background): the conversation really
+    //    did move to a new transcript, so the tab follows it — but the parent
+    //    still holds its pre-compaction context and stays listed.
+    //
+    // `fork_parent` is the exact test and comes from job state, which exists
+    // the instant `/fork` runs; `forked` alone is not enough here, because a
+    // newborn fork stub is two lines with no message chain to read lineage
+    // from — it reported false and the parent got hidden anyway.
+    if (cont.fork_parent === sid || cont.forked) {
+      if (!cont.background && !cont.fork_parent) {
+        setTabs((ts) =>
+          ts.map((t) => (t.key === tab.key ? { ...t, sessionId: cont.id, slotId: cont.id } : t)),
+        );
+      }
+      return;
+    }
+
     setSuperseded((prev) => {
       const next = new Set(prev);
       next.add(sid);

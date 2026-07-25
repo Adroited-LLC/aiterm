@@ -10,7 +10,25 @@ pub struct Session {
     pub agent: String,
     pub title: String,
     pub project_path: String,
+    /// Project the row groups under. Same as `project_path` except for
+    /// sessions living in a Claude Code worktree (`<repo>/.claude/worktrees/…`),
+    /// which group under `<repo>` so a `/fork` lands beside its parent instead
+    /// of in a group of its own. `project_path` stays the true cwd — it's what
+    /// a resumed tab is spawned in.
+    pub group_path: String,
     pub branch: Option<String>,
+    /// This transcript continues a conversation whose earlier messages live in
+    /// another file — a `/fork` child or a compact continuation. Its parent is
+    /// still on disk, frozen at the fork point, and must stay listed.
+    pub forked: bool,
+    /// Ran under the daemon as a background agent (`sessionKind":"bg"`), i.e.
+    /// `/fork` or `--bg`. `forked && background` is a `/fork` child: the
+    /// terminal that spawned it stayed on the parent, so no tab moves.
+    pub background: bool,
+    /// Session this one was forked from, per Claude Code's job state. Known
+    /// from the instant `/fork` runs — unlike the transcript chain, which only
+    /// reveals lineage once messages land.
+    pub fork_parent: Option<String>,
     /// Unix millis of last activity (file mtime).
     pub last_active: u64,
 }
@@ -57,6 +75,20 @@ impl ClaudeProvider {
                 }
             }
         }
+        // Attach fork lineage from Claude Code's job state. This has to come
+        // from outside the transcript: a fresh `/fork` stub is two lines
+        // (`ai-title` + `agent-name`) with no message chain at all, so the
+        // in-file heuristic reads `forked = false` at exactly the moment the
+        // UI decides whether to hide the parent — which hid it. The job state
+        // records the pair the instant the fork is created.
+        let parents = fork_parent_map(&home.join(".claude/jobs"));
+        for (s, _) in &mut sessions {
+            if let Some(parent) = parents.get(&s.id) {
+                s.fork_parent = Some(parent.clone());
+                s.forked = true;
+            }
+        }
+
         sessions.sort_by(|a, b| b.0.last_active.cmp(&a.0.last_active));
 
         // One live `<id>.jsonl` = one row, even when several share a
@@ -71,6 +103,43 @@ impl ClaudeProvider {
         // filtered above — so no collapse is needed.
         sessions
     }
+}
+
+/// Fork lineage from Claude Code's job state files: forked session UUID →
+/// parent session UUID. Each `~/.claude/jobs/<short>/state.json` of a `/fork`
+/// job carries `forkSessionId` + `forkParentSessionId`; jobs without the pair
+/// (plain bg jobs, interactive sessions) are skipped. State files are small
+/// and few, so reading them per scan is cheap.
+///
+/// (Ported from the worktree-fix-agents-sync branch, which found this source.)
+fn fork_parent_map(jobs_dir: &Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(jobs) = std::fs::read_dir(jobs_dir) else {
+        return map;
+    };
+    for job in jobs.flatten() {
+        let Ok(raw) = std::fs::read_to_string(job.path().join("state.json")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        // `forkParentSessionId` alone identifies a fork job. Key it by
+        // `sessionId` — `forkSessionId` is written only sometimes (a job forked
+        // from another fork omits it), and requiring both silently skipped
+        // exactly those, leaving their parent hidden after all.
+        let parent = v.get("forkParentSessionId").and_then(|s| s.as_str());
+        let fork = v
+            .get("forkSessionId")
+            .and_then(|s| s.as_str())
+            .or_else(|| v.get("sessionId").and_then(|s| s.as_str()));
+        if let (Some(fork), Some(parent)) = (fork, parent) {
+            if fork != parent {
+                map.insert(fork.to_string(), parent.to_string());
+            }
+        }
+    }
+    map
 }
 
 /// Read the first `cwd` a transcript records. Used to backfill the project for
@@ -230,11 +299,31 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
     // prompt the user actually typed — they'd show up as duplicate entries.
     let mut fork_marker = false;
     let mut human_prompt = false;
+    // Fork detection. Records are written parent-before-child, so a message
+    // whose `parentUuid` was never defined earlier in this same file can only
+    // be continuing another transcript — that's a `/fork` child (or a compact
+    // continuation). A `/clear` writes a self-contained file whose first chain
+    // link resolves in-file, which is how the two are told apart. Only the
+    // first linked record decides it; later dangling refs are noise.
+    let mut seen_uuids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut forked: Option<bool> = None;
+    let mut background = false;
 
     for line in reader.lines().take(400).flatten() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        if forked.is_none() {
+            if let Some(parent) = v.get("parentUuid").and_then(|p| p.as_str()) {
+                forked = Some(!seen_uuids.contains(parent));
+            }
+        }
+        if let Some(u) = v.get("uuid").and_then(|u| u.as_str()) {
+            seen_uuids.insert(u.to_string());
+        }
+        if !background {
+            background = v.get("sessionKind").and_then(|k| k.as_str()) == Some("bg");
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("custom-title") => {
                 title = v.get("customTitle").and_then(|t| t.as_str()).map(String::from)
@@ -253,6 +342,25 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
             Some("system") => {
                 if v.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") {
                     fork_marker = true;
+                }
+            }
+            // A `/fork` child records what the user typed in a `last-prompt`
+            // record, not as `user` message content — its own `user` records
+            // are all replayed tool results. Without counting this, every fork
+            // looked like promptless bookkeeping and got dropped by the
+            // `fork_marker && !human_prompt` filter below, which is why a
+            // `/fork` never earned a row in the list.
+            Some("last-prompt") if !human_prompt => {
+                let prompt = v
+                    .get("lastPrompt")
+                    .and_then(|p| p.as_str())
+                    .map(strip_system_tags)
+                    .filter(|s| !s.is_empty() && !is_system_meta_prompt(s));
+                if let Some(p) = prompt {
+                    human_prompt = true;
+                    if first_prompt.is_none() {
+                        first_prompt = Some(p.chars().take(80).collect());
+                    }
                 }
             }
             Some("user") if !human_prompt => {
@@ -282,7 +390,8 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
                 .filter(|b| !b.is_empty() && *b != "HEAD")
                 .map(String::from);
         }
-        if title.is_some() && cwd.is_some() && branch.is_some() && human_prompt {
+        if title.is_some() && cwd.is_some() && branch.is_some() && human_prompt && forked.is_some()
+        {
             break;
         }
     }
@@ -307,10 +416,27 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
         id,
         agent: "claude".into(),
         title,
+        group_path: worktree_repo_root(&project_path).unwrap_or_else(|| project_path.clone()),
         project_path,
         branch,
+        forked: forked.unwrap_or(false),
+        background,
+        fork_parent: None, // filled in from job state by the caller
         last_active: mtime,
     })
+}
+
+/// Collapse a Claude Code worktree path to the repo it was cut from:
+/// `<repo>/.claude/worktrees/<name>[/<sub>]` → `<repo>`. `/fork` can run its
+/// child agent in a fresh worktree, which lands the transcript in a project
+/// dir of its own — without this the fork row shows up under a stray
+/// `<name>`/`src-tauri` group instead of next to the session it forked from.
+fn worktree_repo_root(cwd: &str) -> Option<String> {
+    let root = cwd.split("/.claude/worktrees/").next()?;
+    if root == cwd || root.is_empty() {
+        return None;
+    }
+    Some(root.to_string())
 }
 
 
@@ -1292,6 +1418,164 @@ mod tests {
             .expect("fork stub kept");
         assert_eq!(s.title, "headroom ⑂");
         assert_eq!(s.project_path, "/home/matt/Projects/headroom");
+    }
+
+    #[test]
+    fn tells_a_fork_child_from_a_clear_child() {
+        let dir = std::env::temp_dir().join("aiterm-test-fork-vs-clear");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // /fork child: opens mid-conversation, its first record chaining to a
+        // uuid that lives in the parent's transcript (shape taken from a real
+        // `sessionKind":"bg"` fork). The parent must not be superseded.
+        let fork = dir.join("55555555-5555-5555-5555-555555555555.jsonl");
+        std::fs::write(&fork, concat!(
+            r#"{"type":"assistant","uuid":"aaaa","parentUuid":"b689eab6","sessionKind":"bg","cwd":"/home/x/proj","message":{"role":"assistant","content":"carrying on"}}"#, "\n",
+            r#"{"type":"user","uuid":"bbbb","parentUuid":"aaaa","sessionKind":"bg","cwd":"/home/x/proj","gitBranch":"main","message":{"role":"user","content":"keep going on this branch"}}"#,
+        )).unwrap();
+        let s = parse_session(&fork, None).expect("fork child kept");
+        assert!(s.forked, "dangling first parentUuid marks a fork child");
+        // forked && background => a /fork child: no tab rebinds to it.
+        assert!(s.background, "sessionKind bg marks the background fork");
+
+        // A compact continuation also chains out of its file, but runs in the
+        // foreground — the tab does follow that one.
+        let compact = dir.join("88888888-8888-8888-8888-888888888888.jsonl");
+        std::fs::write(&compact, concat!(
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"eeee","parentUuid":"prior9","cwd":"/home/x/proj"}"#, "\n",
+            r#"{"type":"user","uuid":"ffff","parentUuid":"eeee","cwd":"/home/x/proj","gitBranch":"main","message":{"role":"user","content":"picking up after compaction"}}"#,
+        )).unwrap();
+        let s = parse_session(&compact, None).expect("compact continuation kept");
+        assert!(s.forked, "compact continuation chains out of its own file");
+        assert!(!s.background, "compaction stays in the foreground session");
+
+        // /clear child: a fresh, self-contained conversation — its chain
+        // resolves inside its own file, so the old row still gets hidden.
+        let clear = dir.join("66666666-6666-6666-6666-666666666666.jsonl");
+        std::fs::write(&clear, concat!(
+            r#"{"type":"attachment","uuid":"cccc","parentUuid":null,"cwd":"/home/x/proj"}"#, "\n",
+            r#"{"type":"user","uuid":"dddd","parentUuid":"cccc","cwd":"/home/x/proj","gitBranch":"main","message":{"role":"user","content":"starting something new"}}"#,
+        )).unwrap();
+        let s = parse_session(&clear, None).expect("clear child kept");
+        assert!(!s.forked, "self-contained chain is a /clear, not a fork");
+    }
+
+    #[test]
+    fn keeps_a_fork_whose_only_prompt_is_a_last_prompt_record() {
+        // Shape of a real `/fork` child: a bridge-session marker (so the
+        // promptless-bookkeeping filter is armed) and `user` records that are
+        // nothing but replayed tool results — what the user actually typed
+        // lives in `last-prompt`. Missing that dropped every fork from the
+        // list, so no row ever appeared for a forked session.
+        let dir = std::env::temp_dir().join("aiterm-test-fork-last-prompt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fork = dir.join("99999999-9999-9999-9999-999999999999.jsonl");
+        std::fs::write(&fork, concat!(
+            r#"{"type":"bridge-session","sessionId":"x","bridgeSessionId":"cse_1"}"#, "\n",
+            r#"{"type":"assistant","uuid":"aaaa","parentUuid":"elsewhere","sessionKind":"bg","cwd":"/home/x/proj","message":{"role":"assistant","content":"working"}}"#, "\n",
+            r#"{"type":"user","uuid":"bbbb","parentUuid":"aaaa","cwd":"/home/x/proj","message":{"role":"user","content":[{"type":"tool_result","content":"cargo test: ok"}]}}"#, "\n",
+            r#"{"type":"last-prompt","lastPrompt":"take this branch and try the other approach","sessionId":"x"}"#,
+        )).unwrap();
+        let s = parse_session(&fork, None).expect("fork with only a last-prompt is kept");
+        assert_eq!(s.title, "take this branch and try the other approach");
+        assert!(s.forked && s.background, "still recognised as a /fork child");
+
+        // A last-prompt holding only injected system text is still not a human
+        // prompt — that bookkeeping stays filtered out.
+        let noise = dir.join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.jsonl");
+        std::fs::write(&noise, concat!(
+            r#"{"type":"bridge-session","sessionId":"y","bridgeSessionId":"cse_2"}"#, "\n",
+            r#"{"type":"last-prompt","lastPrompt":"<system-reminder>be nice</system-reminder>","cwd":"/home/x/proj","sessionId":"y"}"#,
+        )).unwrap();
+        assert!(parse_session(&noise, None).is_none(), "system-only prompt stays filtered");
+    }
+
+    #[test]
+    fn newborn_fork_stub_has_no_chain_but_job_state_knows() {
+        // The exact shape that leaked a "hid superseded" toast: a `/fork` stub
+        // the moment it is created is an ai-title and an agent-name, nothing
+        // else. No parentUuid exists, so the transcript heuristic cannot see
+        // the fork and the parent got hidden. Job state carries the lineage
+        // from the start, which is why the scan overrides `forked` from it.
+        let dir = std::env::temp_dir().join("aiterm-test-newborn-fork");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("1eeedeca-05a5-41f4-a2c6-dc791d1a2a61.jsonl");
+        std::fs::write(&stub, concat!(
+            r#"{"type":"ai-title","aiTitle":"aiterm ⑂","sessionId":"1eeedeca"}"#, "\n",
+            r#"{"type":"agent-name","agentName":"aiterm","sessionId":"1eeedeca"}"#,
+        )).unwrap();
+        let s = parse_session(&stub, Some("/home/x/proj")).expect("stub is listed");
+        assert!(!s.forked, "no chain in the file yet — heuristic cannot tell");
+        assert_eq!(s.fork_parent, None, "parse_session never sets lineage");
+
+        // Job state supplies what the transcript cannot.
+        let jobs = std::env::temp_dir().join("aiterm-test-newborn-fork-jobs");
+        let job = jobs.join("1eeedeca");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(job.join("state.json"), concat!(
+            r#"{"forkSessionId":"1eeedeca-05a5-41f4-a2c6-dc791d1a2a61","#,
+            r#""forkParentSessionId":"9c82d668-97de-469a-9cd4-ca25319bb145"}"#,
+        )).unwrap();
+        let map = fork_parent_map(&jobs);
+        assert_eq!(
+            map.get("1eeedeca-05a5-41f4-a2c6-dc791d1a2a61").map(String::as_str),
+            Some("9c82d668-97de-469a-9cd4-ca25319bb145"),
+            "lineage is available before the fork writes any message",
+        );
+
+        // A fork OF a fork omits `forkSessionId` and carries only `sessionId`
+        // + `forkParentSessionId` — the real shape of job 457d5d29, which was
+        // skipped entirely while the map demanded both keys.
+        let nested = jobs.join("457d5d29");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("state.json"), concat!(
+            r#"{"sessionId":"457d5d29-1111-4111-8111-111111111111","#,
+            r#""forkParentSessionId":"1eeedeca-05a5-41f4-a2c6-dc791d1a2a61","#,
+            r#""forkSourceAlive":true}"#,
+        )).unwrap();
+        let map = fork_parent_map(&jobs);
+        assert_eq!(
+            map.get("457d5d29-1111-4111-8111-111111111111").map(String::as_str),
+            Some("1eeedeca-05a5-41f4-a2c6-dc791d1a2a61"),
+            "a fork with no forkSessionId still resolves via sessionId",
+        );
+
+        // A plain (non-fork) job must still be ignored — `sessionId` alone is
+        // not lineage, or every session would claim a parent.
+        let plain = jobs.join("4c8c8287");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("state.json"),
+            r#"{"sessionId":"4c8c8287-2222-4222-8222-222222222222"}"#).unwrap();
+        let map = fork_parent_map(&jobs);
+        assert_eq!(map.len(), 2, "non-fork job must not appear");
+
+        let _ = std::fs::remove_dir_all(&jobs);
+    }
+
+    #[test]
+    fn worktree_sessions_group_under_their_repo() {
+        assert_eq!(
+            worktree_repo_root("/home/matt/Projects/aiterm/.claude/worktrees/fix-agents-sync"),
+            Some("/home/matt/Projects/aiterm".into()),
+        );
+        // /fork can land the agent in a subdir of the worktree.
+        assert_eq!(
+            worktree_repo_root(
+                "/home/matt/Projects/aiterm/.claude/worktrees/fix-agents-sync/src-tauri"
+            ),
+            Some("/home/matt/Projects/aiterm".into()),
+        );
+        assert_eq!(worktree_repo_root("/home/matt/Projects/aiterm"), None);
+
+        // The session keeps its real cwd for spawning, but groups under the repo.
+        let dir = std::env::temp_dir().join("aiterm-test-worktree-group");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wt = dir.join("77777777-7777-7777-7777-777777777777.jsonl");
+        std::fs::write(&wt,
+            r#"{"type":"user","uuid":"a","parentUuid":null,"cwd":"/home/x/proj/.claude/worktrees/wip/src-tauri","message":{"role":"user","content":"fork work"}}"#).unwrap();
+        let s = parse_session(&wt, None).expect("worktree session kept");
+        assert_eq!(s.project_path, "/home/x/proj/.claude/worktrees/wip/src-tauri");
+        assert_eq!(s.group_path, "/home/x/proj");
     }
 }
 
