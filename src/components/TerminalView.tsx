@@ -1,9 +1,27 @@
 import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
 import "@xterm/xterm/css/xterm.css";
+
+/** Attach the GPU WebGL renderer. It owns its own surface and clears+repaints
+ *  every cell each frame — which is what kills the stale-cell ghosting the
+ *  built-in DOM renderer left behind. Guarded so that if WebGL can't init (no
+ *  GPU context) the terminal is never worse than the DOM default. On GPU
+ *  context loss, dispose so xterm reverts to the DOM renderer rather than
+ *  freezing on a dead canvas. */
+function attachRenderer(term: Terminal) {
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => webgl.dispose());
+    term.loadAddon(webgl);
+  } catch {
+    /* WebGL unavailable — xterm's built-in DOM renderer remains */
+  }
+}
 
 export interface TermTab {
   key: number;
@@ -71,56 +89,37 @@ export default function TerminalView({
     termRef.current = term;
     term.loadAddon(fit);
     term.open(elRef.current);
+    attachRenderer(term);
     fit.fit();
 
-    let unlistenOut: UnlistenFn | null = null;
     let unlistenExit: UnlistenFn | null = null;
     let disposed = false;
 
-    // Startup nudge: claude's TUI paints while panels/window-state are
-    // still settling and only repaints on SIGWINCH, leaving stale lines on
-    // screen until something resizes. Once the FIRST output burst goes
-    // quiet (a fixed delay fires too early — resuming a big session can
-    // take seconds to paint), resize one column down and fit back — two
-    // SIGWINCHs force a clean full redraw, same as a manual window-drag.
-    let jiggled = false;
-    let quietTimer: number | null = null;
-    const doJiggle = () => {
-      if (term.cols > 2) {
-        term.resize(term.cols - 1, term.rows);
-        window.setTimeout(() => {
-          fit.fit();
-          term.refresh(0, term.rows - 1);
-        }, 80);
-      }
+    // Manual repaint escape hatch (Ctrl+Shift+L): a clean refit + full
+    // re-render. With an accelerated renderer this is rarely needed — no
+    // window/grid jiggle, no SIGWINCH storm.
+    const redraw = () => {
+      fit.fit();
+      term.refresh(0, term.rows - 1);
     };
-    const scheduleJiggle = () => {
-      if (jiggled) return;
-      if (quietTimer !== null) clearTimeout(quietTimer);
-      quietTimer = window.setTimeout(() => {
-        if (jiggled || disposed) return;
-        jiggled = true;
-        doJiggle();
-      }, 800);
+
+    // PTY output arrives as raw bytes over a binary Channel. Write the
+    // Uint8Array straight to xterm (it keeps a persistent UTF-8 decoder, so
+    // multibyte chars split across chunks are reassembled correctly). Set
+    // onmessage before spawning so no early output is missed.
+    const onOutput = new Channel<ArrayBuffer>();
+    onOutput.onmessage = (chunk) => {
+      term.write(new Uint8Array(chunk));
+      onActivity(tab.key);
     };
-    scheduleJiggle();
 
     (async () => {
-      const id = await ptySpawn(tab.cwd, tab.command, term.cols, term.rows);
+      const id = await ptySpawn(tab.cwd, tab.command, term.cols, term.rows, onOutput);
       if (disposed) {
         ptyKill(id);
         return;
       }
       ptyIdRef.current = id;
-      unlistenOut = await listen<string>(`pty://output/${id}`, (e) => {
-        term.write(e.payload);
-        onActivity(tab.key);
-        // NOTE: do NOT re-arm the jiggle on clear-screen sequences —
-        // claude emits them during ordinary streaming redraws, and the
-        // jiggle's own repaint contains one too, which loops the nudge
-        // forever (nonstop resizing). Startup-only + Ctrl+Shift+L.
-        scheduleJiggle();
-      });
       unlistenExit = await listen<{ id: number }>("pty://exit", (e) => {
         if (e.payload.id === id) onExit(tab.key);
       });
@@ -133,7 +132,7 @@ export default function TerminalView({
 
       onRegister(tab.key, {
         write: (data) => ptyWrite(id, data),
-        redraw: doJiggle,
+        redraw,
         paste: (text) =>
           ptyWrite(
             id,
@@ -154,28 +153,23 @@ export default function TerminalView({
       });
     })();
 
-    // Debounce resize→fit: splitter drags fire the observer continuously,
-    // and a SIGWINCH storm makes TUIs (claude's input box) redraw over
-    // half-painted frames. One fit at the end + a full repaint instead.
+    // Debounce resize→fit: splitter drags fire the observer continuously, and
+    // a SIGWINCH storm makes TUIs (claude's input box) redraw over half-painted
+    // frames. One fit at the end; the accelerated renderer repaints itself.
     let fitTimer: number | null = null;
     const ro = new ResizeObserver(() => {
       if (fitTimer !== null) clearTimeout(fitTimer);
       fitTimer = window.setTimeout(() => {
         fitTimer = null;
-        if (elRef.current && elRef.current.offsetWidth > 0) {
-          fit.fit();
-          term.refresh(0, term.rows - 1);
-        }
+        if (elRef.current && elRef.current.offsetWidth > 0) fit.fit();
       }, 120);
     });
     ro.observe(elRef.current);
 
     return () => {
       disposed = true;
-      if (quietTimer !== null) clearTimeout(quietTimer);
       if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();
-      unlistenOut?.();
       unlistenExit?.();
       onRegister(tab.key, null);
       if (ptyIdRef.current !== null) ptyKill(ptyIdRef.current);
@@ -188,8 +182,6 @@ export default function TerminalView({
   useEffect(() => {
     if (active) {
       fitRef.current?.fit();
-      const t = termRef.current;
-      t?.refresh(0, t.rows - 1);
       if (autoFocus) termRef.current?.focus();
     }
   }, [active, autoFocus]);

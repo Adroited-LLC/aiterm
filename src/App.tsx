@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
-import { PhysicalSize } from "@tauri-apps/api/dpi";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
@@ -329,25 +328,10 @@ export default function App() {
     return () => window.removeEventListener("focus", clear);
   }, [activeTab]);
 
-  // Window-level startup jiggle: after window-state restore on Wayland the
-  // compositor surface and window geometry occasionally disagree, clipping
-  // the bottom ~10px (stale content from other windows shows through).
-  // A 1px grow-and-back forces a real reconfigure — what dragging the
-  // window edge does by hand.
-  useEffect(() => {
-    const t = setTimeout(async () => {
-      try {
-        const w = getCurrentWindow();
-        if (await w.isMaximized()) return;
-        const size = await w.innerSize();
-        await w.setSize(new PhysicalSize(size.width, size.height + 1));
-        await w.setSize(size);
-      } catch {
-        // best-effort; never block startup
-      }
-    }, 1200);
-    return () => clearTimeout(t);
-  }, []);
+  // (Removed the startup OS-window ±1px "jiggle". It forced a Wayland surface
+  // reconfigure to fix bottom-edge clipping / stale content — a symptom of the
+  // WebKitGTK DMABUF renderer, now disabled at the Rust entry point. No more
+  // window growing/shrinking on launch.)
 
   // Dropping files onto the window pastes their quoted paths into the
   // active terminal (like any terminal emulator) instead of letting the

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
 
 export interface Session {
   id: string;
@@ -137,8 +137,12 @@ export const searchSessions = (query: string) =>
 export const reindexSessions = () =>
   invoke<{ indexed: number; total: number }>("reindex_sessions");
 
-export const ptySpawn =(cwd: string | null, command: string | null, cols: number, rows: number) =>
-  invoke<number>("pty_spawn", { cwd, command, cols, rows });
+// PTY output streams over a binary Channel (raw bytes → ArrayBuffer), not the
+// JSON event bus. Caller passes a Channel whose onmessage receives each chunk.
+export const ptySpawn = (
+  cwd: string | null, command: string | null, cols: number, rows: number,
+  onOutput: Channel<ArrayBuffer>,
+) => invoke<number>("pty_spawn", { cwd, command, cols, rows, onOutput });
 export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
 export const ptyResize = (id: number, cols: number, rows: number) =>
   invoke<void>("pty_resize", { id, cols, rows });

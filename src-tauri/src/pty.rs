@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
 
 pub struct PtyInstance {
@@ -31,6 +32,7 @@ pub fn pty_spawn(
     command: Option<String>,
     cols: u16,
     rows: u16,
+    on_output: Channel<InvokeResponseBody>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -81,9 +83,13 @@ pub fn pty_spawn(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    // Lossy is fine: xterm.js handles the byte stream as utf8 text.
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app_reader.emit(&format!("pty://output/{id}"), data);
+                    // Send raw bytes over a binary Channel — no JSON string
+                    // serialization, and no per-chunk `from_utf8_lossy`, which
+                    // used to corrupt any multibyte char (box-drawing borders,
+                    // emoji) straddling the 8 KB read boundary. xterm decodes
+                    // the byte stream with a persistent UTF-8 decoder, so a char
+                    // split across two chunks is reassembled correctly.
+                    let _ = on_output.send(InvokeResponseBody::Raw(buf[..n].to_vec()));
                 }
             }
         }

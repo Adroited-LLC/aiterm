@@ -8,6 +8,18 @@ pub mod watcher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK on Wayland ships a DMABUF renderer path that frequently fails
+    // to flush partial frames — the terminal shows stale cells / torn glyphs
+    // until something forces a surface reconfigure (the old resize-jiggle
+    // crutch). Disabling just that path (compositing/GPU stays on, so the
+    // WebGL terminal renderer still works) makes the webview repaint reliably.
+    // Must be set before the webview/GTK initializes.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
