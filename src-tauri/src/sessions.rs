@@ -1219,7 +1219,30 @@ pub fn resolve_resumable_id(session_id: String) -> Option<String> {
     {
         return None;
     }
+    // Existing on disk is not the same as resumable. A `/fork` stub is a real
+    // file with a title and no conversation, and `claude --resume` rejects it
+    // with the same "No conversation found" it gives for a missing file. Saying
+    // so here — before anything is stopped — is what keeps a failed resume from
+    // costing a running session.
+    if !has_conversation(&path) {
+        return None;
+    }
     Some(path.file_stem()?.to_string_lossy().into_owned())
+}
+
+/// Whether a transcript holds an actual exchange, as opposed to metadata only.
+/// Message records are what `claude --resume` looks for; titles and agent names
+/// are not enough.
+fn has_conversation(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    BufReader::new(file).lines().map_while(Result::ok).any(|l| {
+        serde_json::from_str::<serde_json::Value>(&l)
+            .ok()
+            .and_then(|v| v.get("type")?.as_str().map(|t| t == "user" || t == "assistant"))
+            .unwrap_or(false)
+    })
 }
 
 /// Session ids that currently have a live Claude Code process, read from
@@ -1575,6 +1598,113 @@ pub fn session_fork(session_id: String) -> Result<String, String> {
     Ok(new_id)
 }
 
+/// The parent id and boundary timestamp a `/fork` recorded, if this session is
+/// one. `/fork` writes only a title stub and stores the actual content as a
+/// promise in job state: "the parent's history, up to this instant". The
+/// promise is redeemed when the background agent is first prompted — and if the
+/// agent is stopped before that ever happens, the stub stays a 192-byte file
+/// that `claude --resume` refuses. This is how we find out we can redeem it
+/// ourselves.
+fn fork_promise(session_id: &str) -> Option<(String, String)> {
+    let jobs = dirs::home_dir()?.join(".claude/jobs");
+    for job in std::fs::read_dir(jobs).ok()?.flatten() {
+        let Ok(raw) = std::fs::read_to_string(job.path().join("state.json")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v.get("sessionId").and_then(|s| s.as_str()) != Some(session_id) {
+            continue;
+        }
+        let parent = v.get("forkParentSessionId")?.as_str()?.to_string();
+        let boundary = v.get("forkBoundaryAt")?.as_str()?.to_string();
+        return Some((parent, boundary));
+    }
+    None
+}
+
+/// The parent's records from before a fork boundary. Cuts at the first record
+/// stamped after it: ISO-8601 UTC timestamps compare correctly as strings, and
+/// records carrying none (titles, modes, permission changes) travel with the
+/// line order they were written in rather than being dropped.
+fn history_up_to<'a>(text: &'a str, boundary: &str) -> Vec<&'a str> {
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
+                if ts > boundary {
+                    break;
+                }
+            }
+        }
+        kept.push(line);
+    }
+    kept
+}
+
+/// Redeem a `/fork` promise: write the conversation the stub stands for, by
+/// copying the parent's history up to the fork boundary under the stub's id.
+///
+/// This makes a console `/fork` behave like aiterm's own ⑂ — a real, resumable
+/// branch — instead of a row that can only ever fail. It is the same copy and
+/// id-rewrite as `session_fork`, with a cut at the boundary timestamp, and it
+/// refuses to touch a stub that already has content.
+#[tauri::command]
+pub fn materialize_fork(session_id: String) -> Result<(), String> {
+    let stub = find_session_file(&session_id)
+        .ok_or_else(|| "no transcript for that session".to_string())?;
+    if has_conversation(&stub) {
+        return Err("that session already has a conversation".into());
+    }
+    let (parent_id, boundary) =
+        fork_promise(&session_id).ok_or_else(|| "not a /fork — nothing to rebuild from".to_string())?;
+    let parent = find_session_file(&parent_id)
+        .ok_or_else(|| format!("the session it forked from ({parent_id}) is gone"))?;
+    let parent_text =
+        std::fs::read_to_string(&parent).map_err(|e| format!("couldn't read the parent: {e}"))?;
+    let kept = history_up_to(&parent_text, &boundary);
+    if kept.is_empty() {
+        return Err("the parent has no history from before the fork".into());
+    }
+    let (history, replaced) = rewrite_session_ids(&kept.join("\n"), &parent_id, &session_id);
+    if replaced == 0 {
+        return Err("parent transcript has no session id fields to rewrite".into());
+    }
+    // Keep the stub's own two lines: they carry the "<project> ⑂" title that
+    // makes a console fork recognisable, and they are already stamped with the
+    // right id.
+    let stub_text =
+        std::fs::read_to_string(&stub).map_err(|e| format!("couldn't read the stub: {e}"))?;
+    // …but they are not enough on their own. The parent's history ends with its
+    // own `custom-title`, and a custom title outranks an `ai-title` when a row
+    // is named — so inheriting the history would make the branch shed the ⑂ and
+    // appear as a second row with the parent's name. Restate the stub's name as
+    // a custom title, last, so the branch keeps saying where it came from.
+    let stub_name = stub_text.lines().find_map(|l| {
+        let v = serde_json::from_str::<serde_json::Value>(l).ok()?;
+        v.get("aiTitle")
+            .or_else(|| v.get("agentName"))?
+            .as_str()
+            .map(String::from)
+    });
+    let mut merged = format!("{}\n{}", history, stub_text.trim_end());
+    if let Some(name) = stub_name {
+        let rename = serde_json::json!({
+            "type": "custom-title",
+            "customTitle": name,
+            "sessionId": session_id,
+        });
+        merged.push('\n');
+        merged.push_str(&rename.to_string());
+    }
+    std::fs::write(&stub, merged + "\n").map_err(|e| format!("couldn't write the branch: {e}"))?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o600));
+    record_aiterm_fork(&session_id, &parent_id);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,6 +1726,46 @@ mod tests {
         // The two content mentions survive untouched.
         assert!(out.contains(&format!("see /tmp/{old}/out and id {old}")));
         assert!(!out.contains(&format!("\"sessionId\":\"{old}\"")));
+    }
+
+    #[test]
+    fn history_cuts_at_the_fork_boundary() {
+        let text = "\
+{\"type\":\"user\",\"timestamp\":\"2026-07-25T18:00:00.000Z\"}
+{\"type\":\"mode\",\"mode\":\"default\"}
+{\"type\":\"assistant\",\"timestamp\":\"2026-07-25T18:49:00.000Z\"}
+{\"type\":\"user\",\"timestamp\":\"2026-07-25T18:50:00.000Z\"}
+{\"type\":\"assistant\",\"timestamp\":\"2026-07-25T18:51:00.000Z\"}";
+        let kept = history_up_to(text, "2026-07-25T18:49:37.666Z");
+        // Everything up to the boundary, including the untimestamped record
+        // that sits between them; nothing from after it.
+        assert_eq!(kept.len(), 3);
+        assert!(kept[1].contains("\"mode\""), "untimestamped records ride along");
+        assert!(!kept.iter().any(|l| l.contains("18:50")));
+    }
+
+    #[test]
+    fn history_keeps_everything_when_the_fork_is_newer() {
+        let text = "{\"type\":\"user\",\"timestamp\":\"2026-07-25T18:00:00.000Z\"}";
+        assert_eq!(history_up_to(text, "2027-01-01T00:00:00.000Z").len(), 1);
+    }
+
+    #[test]
+    fn a_title_only_stub_is_not_a_conversation() {
+        let dir = std::env::temp_dir().join("aiterm-test-hasconv");
+        let _ = std::fs::create_dir_all(&dir);
+        let stub = dir.join("stub.jsonl");
+        std::fs::write(
+            &stub,
+            "{\"type\":\"ai-title\",\"aiTitle\":\"aiterm ⑂\"}\n\
+             {\"type\":\"agent-name\",\"agentName\":\"aiterm ⑂\"}\n",
+        )
+        .unwrap();
+        assert!(!has_conversation(&stub), "a /fork stub has nothing to resume");
+        let real = dir.join("real.jsonl");
+        std::fs::write(&real, "{\"type\":\"ai-title\"}\n{\"type\":\"user\"}\n").unwrap();
+        assert!(has_conversation(&real), "one message record is enough");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

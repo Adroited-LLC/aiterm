@@ -18,7 +18,7 @@ import {
 import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
-  gitRepoState, listProjects, listSessions, reindexSessions, sessionFork,
+  gitRepoState, listProjects, listSessions, materializeFork, reindexSessions, sessionFork,
   resolveResumableId, liveSessionIds, stopSession,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
@@ -388,7 +388,20 @@ export default function App() {
     // NOT stale — forking leaves it intact, and it resolves to itself.)
     let liveId = s.id;
     try {
-      const resolved = await resolveResumableId(s.id);
+      let resolved = await resolveResumableId(s.id);
+      // Nothing resumable — but a `/fork` row is a special case worth rescuing.
+      // It has no conversation of its own, only a promise in job state to hold
+      // the parent's history up to the fork. Redeem it, then ask again. Every
+      // other kind of empty session fails this and falls through to the toast.
+      if (resolved === null) {
+        try {
+          await materializeFork(s.id);
+          resolved = await resolveResumableId(s.id);
+          refreshSessionList();
+        } catch {
+          /* not a redeemable fork; the toast below is the right answer */
+        }
+      }
       if (resolved === null) {
         setNotice(`"${s.title}" was cleared or superseded — no resumable transcript remains.`);
         return;

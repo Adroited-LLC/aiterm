@@ -146,6 +146,11 @@ export const resolveResumableId = (sessionId: string) =>
 // is gone or was cleared.
 export const sessionFork = (sessionId: string) =>
   invoke<string>("session_fork", { sessionId });
+// Write the conversation a `/fork` only promised: copies the parent's history
+// up to the fork boundary under this session's id. Rejects unless the session
+// really is an empty /fork stub with its parent still on disk.
+export const materializeFork = (sessionId: string) =>
+  invoke<void>("materialize_fork", { sessionId });
 export interface UsageBar {
   kind: string;
   label: string;
