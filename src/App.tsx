@@ -16,12 +16,12 @@ import {
   AppSettings, applySettings, loadSettings, saveSettings, termFontFamily, termTheme,
 } from "./settings";
 import {
-  ProjectInfo, Session, SessionStatus,
+  ProjectInfo, Session,
   TrashedSession,
-  claudePermissionMode, gitRepoState, listProjects, listSessions, materializeFork,
+  claudePermissionMode, listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork,
   resolveResumableId, liveSessionIds, stopSession,
-  sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
+  sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
 import "./App.css";
@@ -80,9 +80,6 @@ export default function App() {
 
   const handles = useRef<Map<number, TermHandle>>(new Map());
   const lastOutput = useRef<Map<number, number>>(new Map());
-  const [working, setWorking] = useState(false);
-  const [claudeStatus, setClaudeStatus] = useState<SessionStatus | null>(null);
-  const [branch, setBranch] = useState<string | null>(null);
 
   const [showSessions, setShowSessions] = useState(true);
   const [showExplorer, setShowExplorer] = useState(true);
@@ -313,46 +310,12 @@ export default function App() {
     };
   }, []);
 
-  // "working" pulse: active tab produced output within the last 2.5s.
-  useEffect(() => {
-    const iv = setInterval(() => {
-      const last = activeTab !== null ? (lastOutput.current.get(activeTab) ?? 0) : 0;
-      setWorking(Date.now() - last < 2500);
-    }, 1000);
-    return () => clearInterval(iv);
-  }, [activeTab]);
-
-  // Poll the claude session status for the active tab (if it's a resume tab).
   const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
   const activeSessionId = activeTabObj?.sessionId ?? null;
-  useEffect(() => {
-    if (!activeSessionId) {
-      setClaudeStatus(null);
-      return;
-    }
-    let stop = false;
-    const poll = () =>
-      sessionStatus(activeSessionId)
-        .then((s) => !stop && setClaudeStatus(s.exists ? s : null))
-        .catch(() => {});
-    poll();
-    const iv = setInterval(poll, 5000);
-    return () => {
-      stop = true;
-      clearInterval(iv);
-    };
-  }, [activeSessionId]);
-
-  // Branch for the status bar follows the active project.
-  useEffect(() => {
-    if (!activeProject) {
-      setBranch(null);
-      return;
-    }
-    gitRepoState(activeProject)
-      .then((s) => setBranch(s.is_repo ? s.branch : null))
-      .catch(() => setBranch(null));
-  }, [activeProject, gitRefresh]);
+  // The composer's status line is gone, and with it three pollers that existed
+  // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
+  // `git_repo_state` call per project change. Claude's own footer already says
+  // all three things. Removed rather than left running for nobody to read.
 
   const closeTab = useCallback((key: number) => {
     setTabs((t) => {
@@ -697,18 +660,7 @@ export default function App() {
               />
             )}
           </div>
-          {showComposer && <Composer
-            tabKey={activeTab}
-            tabTitle={activeTabObj?.title ?? null}
-            sessionId={activeSessionId}
-            shells={tabs.length}
-            working={working}
-            claudeStatus={claudeStatus}
-            projectLabel={activeProject ? activeProject.replace(/^\/home\/[^/]+/, "~") : null}
-            branch={branch}
-            onSend={(text) => activeTab !== null && handles.current.get(activeTab)?.sendComposed(text)}
-            onControl={(seq) => activeTab !== null && handles.current.get(activeTab)?.write(seq)}
-          />}
+          {showComposer && <Composer sessionId={activeSessionId} />}
         </div>
 
         {showRight && (
