@@ -19,7 +19,7 @@ import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
-  resolveResumableId, runningSessionIds, bgAgentSessionIds,
+  resolveResumableId, runningSessionIds,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -518,29 +518,18 @@ export default function App() {
     // duplicate. The agents panel follows either path because the backend
     // resolves a pinned id to the newest transcript in its fork family.
     let running: string[] = [];
-    let bgAgents: string[] = [];
     try {
-      [running, bgAgents] = await Promise.all([
-        runningSessionIds(),
-        bgAgentSessionIds(),
-      ]);
+      running = await runningSessionIds();
     } catch {
       /* keep whatever resolved; defaults stand */
     }
-    // A session the daemon holds as a *background agent* (a `/fork`, `--bg`)
-    // isn't resumable at all: a prompt-less fork stub has a title-only
-    // transcript (resume dies with "no conversation found"), and even a
-    // prompted one only yields a detached copy via --fork-session. The real
-    // agent lives behind the daemon, reachable through the agent view — so
-    // point the row there and leave the session itself alone.
-    if (bgAgents.includes(liveId)) {
-      openTab(
-        `⑂ agents · ${s.title}`, s.project_path,
-        `claude agents --cwd ${s.project_path}`,
-        `agents:${s.project_path}`, liveId,
-      );
-      return;
-    }
+    // NOTE: rows held by the daemon as background agents used to be routed to
+    // the agent view (`claude agents --cwd …`) instead of resumed, because the
+    // live agent is only truly reachable there. That is removed: the agent
+    // list is a wall in front of the one action this button exists to do, and
+    // it appeared on EVERY launch, since the daemon keeps a bg session alive
+    // across aiterm restarts. Resuming a live bg session branches a copy with
+    // its full history instead — which is what the ⑂ button does anyway.
     // Match a full id (from /proc) OR the first UUID segment (daemon bg-agent
     // sockets are named by the short id). A running session — incl. a bg-agent
     // fork — must resume with --fork-session or Claude Code errors out.
