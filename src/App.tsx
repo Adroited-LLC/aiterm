@@ -19,7 +19,7 @@ import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
   gitRepoState, listProjects, listSessions, reindexSessions,
-  resolveResumableId, runningSessionIds,
+  resolveResumableId, bgAgentSessionIds,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -28,16 +28,12 @@ import "./App.css";
 const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
-const SUPERSEDED_KEY = "aiterm.superseded";
 
-function loadSuperseded(): Set<string> {
-  try {
-    const raw = localStorage.getItem(SUPERSEDED_KEY);
-    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
-  } catch {
-    return new Set();
-  }
-}
+// Sessions used to be hidden when a heuristic decided a newly-appeared one
+// "superseded" them. That's gone — the list shows what is on disk, always —
+// but the hidden set was persisted, so drop it once or those rows stay
+// invisible forever in an app that no longer has a way to bring them back.
+localStorage.removeItem("aiterm.superseded");
 
 interface PanelSizes {
   left: number;
@@ -76,26 +72,10 @@ export default function App() {
   // Tabs whose terminal rang the bell while not being looked at.
   const [attention, setAttention] = useState<Set<number>>(new Set());
   const activeTabRef = useRef<number | null>(null);
-  // Latest tabs, read by the [sessions] supersession effect without putting
-  // `tabs` in its deps (which would re-run it on every tab change).
+  // Latest tabs, read without putting `tabs` in an effect's deps (which would
+  // re-run it on every tab change).
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
-
-  // Sessions hidden because a focused-tab `/clear` spawned a fresh sibling
-  // that superseded them. Persisted; purely a hide + tab-rebind (reversible).
-  const [superseded, setSuperseded] = useState<Set<string>>(loadSuperseded);
-  useEffect(() => {
-    localStorage.setItem(SUPERSEDED_KEY, JSON.stringify([...superseded]));
-  }, [superseded]);
-  // Undo affordance for the most recent supersession.
-  const [undoInfo, setUndoInfo] = useState<{ id: string; title: string } | null>(null);
-  useEffect(() => {
-    if (!undoInfo) return;
-    const t = setTimeout(() => setUndoInfo(null), 8000);
-    return () => clearTimeout(t);
-  }, [undoInfo]);
-  // Previous scan's session ids, to detect newly-appeared continuations.
-  const knownIdsRef = useRef<Set<string> | null>(null);
 
   const handles = useRef<Map<number, TermHandle>>(new Map());
   const lastOutput = useRef<Map<number, number>>(new Map());
@@ -199,122 +179,15 @@ export default function App() {
     };
   }, [refreshSessionList]);
 
-  // Detect a focused-tab `/clear`: it writes a brand-new, fully unlinked
-  // session in the same folder (new id, no bridge/fork link), so the disk-based
-  // fork-collapse can't catch it. We catch it live: when a session that *newly
-  // appeared this scan* is a strict continuation of the focused resume tab's
-  // session, hide the old row and rebind the tab to the new session. The six
-  // guards below jointly identify exactly this case — do not weaken them.
-  useEffect(() => {
-    const cur = new Set(sessions.map((s) => s.id));
-    const known = knownIdsRef.current;
-    knownIdsRef.current = cur;
-
-    // Light pruning: forget hidden ids no longer present on disk.
-    setSuperseded((prev) => {
-      let changed = false;
-      const next = new Set(prev);
-      for (const id of prev) {
-        if (!cur.has(id)) { next.delete(id); changed = true; }
-      }
-      return changed ? next : prev;
-    });
-
-    if (known === null) return; // (6) baseline on first load — never supersede
-    const fresh = sessions.filter((s) => !known.has(s.id)); // (1) newly-appeared
-    if (fresh.length === 0) return;
-
-    // (2) focused tab only.
-    const tab = tabsRef.current.find((t) => t.key === activeTabRef.current) ?? null;
-    if (!tab) return;
-    const sid = tab.sessionId;
-    // (5) never steal another open tab's session.
-    const otherSlots = new Set(
-      tabsRef.current.filter((t) => t.key !== tab.key).map((t) => t.slotId),
-    );
-
-    // A fork tab (slot `fork:<id>:<n>`, opened by forkSession) has no listed
-    // session row until `--fork-session` writes its new transcript. Adopt the
-    // newest fresh session in the tab's project that no other tab holds. The
-    // parent row can't be adopted by accident — it already existed, so it's
-    // never in `fresh` — and it stays listed: forking leaves the parent
-    // intact, frozen at its own context, independently resumable.
-    if (tab.slotId.startsWith("fork:")) {
-      const adopt = fresh
-        .filter((s) => s.project_path === tab.cwd && !otherSlots.has(s.id))
-        .reduce<Session | null>((a, b) => (!a || b.last_active > a.last_active ? b : a), null);
-      if (!adopt) return;
-      setTabs((ts) =>
-        ts.map((t) => (t.key === tab.key ? { ...t, sessionId: adopt.id, slotId: adopt.id } : t)),
-      );
-      return;
-    }
-
-    // Otherwise: a real Claude resume tab (session-id slot) whose live session
-    // was replaced by a continuation (compact/fork on resume).
-    if (!sid || sid.startsWith("shell:") || sid.startsWith("claude:")) return;
-    // (4) the tab's current session row must still exist to compare against.
-    const curRow = sessions.find((s) => s.id === sid);
-    if (!curRow) return;
-    const candidates = fresh.filter(
-      (s) =>
-        s.project_path === tab.cwd &&           // (3) same project as the tab
-        s.id !== sid &&                          // (4) strictly a different session
-        s.last_active >= curRow.last_active &&   // (4) the continuation, not older
-        !otherSlots.has(s.id),                   // (5) not another open tab
-    );
-    if (candidates.length === 0) return;
-    // Newest wins if several qualify.
-    const cont = candidates.reduce((a, b) => (b.last_active > a.last_active ? b : a));
-
-    // A `/fork` looks identical to a `/clear` from here — new session, same
-    // project, newer — but means the opposite: the parent is NOT retired. The
-    // backend tells them apart on disk via `forked` (the new transcript's
-    // first chain link points at a uuid held in ANOTHER file; a /clear's
-    // resolves in its own). Two shapes hide behind that flag:
-    //
-    //  - `/fork` (forked && background): Claude Code checkpoints the current
-    //    session and spawns a *background* agent carrying its context. This
-    //    terminal never left the parent, so nothing rebinds — the fork just
-    //    earns its own row, and the parent keeps running as it was. Hiding the
-    //    parent here is what made forked-from sessions unreachable.
-    //  - compact continuation (forked && !background): the conversation really
-    //    did move to a new transcript, so the tab follows it — but the parent
-    //    still holds its pre-compaction context and stays listed.
-    //
-    // `fork_parent` is the exact test and comes from job state, which exists
-    // the instant `/fork` runs; `forked` alone is not enough here, because a
-    // newborn fork stub is two lines with no message chain to read lineage
-    // from — it reported false and the parent got hidden anyway.
-    if (cont.fork_parent === sid || cont.forked) {
-      if (!cont.background && !cont.fork_parent) {
-        setTabs((ts) =>
-          ts.map((t) => (t.key === tab.key ? { ...t, sessionId: cont.id, slotId: cont.id } : t)),
-        );
-      }
-      return;
-    }
-
-    setSuperseded((prev) => {
-      const next = new Set(prev);
-      next.add(sid);
-      return next;
-    });
-    // Rebind both sessionId AND slotId (slotId drives the live dot + tab dedup;
-    // resumed tabs keep them equal). The Agents panel follows via sessionId.
-    setTabs((ts) =>
-      ts.map((t) => (t.key === tab.key ? { ...t, sessionId: cont.id, slotId: cont.id } : t)),
-    );
-    setUndoInfo({ id: sid, title: curRow.title });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessions]);
-
-  // Render the sessions list without hidden (superseded) rows; detection and
-  // knownIds diffing still run against the unfiltered `sessions`.
-  const visibleSessions = useMemo(
-    () => sessions.filter((s) => !superseded.has(s.id)),
-    [sessions, superseded],
-  );
+  // NOTE: there used to be a large effect here that watched for newly-appeared
+  // sessions and decided some of them "superseded" older rows — hiding those
+  // rows behind six heuristic guards, with an undo toast. It is gone. The list
+  // shows what is on disk, and nothing removes a row but you.
+  //
+  // The tab-rebind it also did (follow a conversation into a new transcript
+  // after a compaction) is not needed either: the backend resolves a pinned
+  // session id to the newest transcript in its family on read, so the Agents
+  // and Tasks panels already follow without anything rewriting the tab.
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string, sessionId?: string) => {
@@ -509,42 +382,34 @@ export default function App() {
     } catch {
       liveId = s.id; // resolver unavailable → fall back to the pinned id
     }
-    // A plain `claude --resume` on a session still running as a bg agent exits
-    // with "…add --fork-session to branch off a copy", leaving a black pane —
-    // so those MUST fork. But forking unconditionally mints a new transcript on
-    // every resume, which is what buried the sessions/agents lists in
-    // duplicates. So fork only when actually running (authoritative: a live
-    // claude process names it in /proc); otherwise resume in place, same id, no
-    // duplicate. The agents panel follows either path because the backend
-    // resolves a pinned id to the newest transcript in its fork family.
-    let running: string[] = [];
+    // Resume is `claude -r <id>`, nothing else. It does not fork, it does not
+    // substitute a copy, and it does not route anywhere. A session aiterm ran
+    // is not running once its tab is closed (TerminalView kills the pty on
+    // unmount), so this is the ordinary case and it just works.
+    //
+    // The exception is a session held by the Claude Code daemon as a
+    // *background* agent — a `/fork`, or anything started with `--bg`. Those
+    // are running with no tab of ours, and `--resume` on them exits with
+    // "…add --fork-session to branch off a copy", i.e. a black pane. Say that
+    // plainly and let the ⑂ button be the answer, rather than silently
+    // branching a copy the user didn't ask for and calling it a resume.
+    let bgAgents: string[] = [];
     try {
-      running = await runningSessionIds();
+      bgAgents = await bgAgentSessionIds();
     } catch {
-      /* keep whatever resolved; defaults stand */
+      /* roster unavailable → attempt the resume; a failure is visible anyway */
     }
-    // NOTE: rows held by the daemon as background agents used to be routed to
-    // the agent view (`claude agents --cwd …`) instead of resumed, because the
-    // live agent is only truly reachable there. That is removed: the agent
-    // list is a wall in front of the one action this button exists to do, and
-    // it appeared on EVERY launch, since the daemon keeps a bg session alive
-    // across aiterm restarts. Resuming a live bg session branches a copy with
-    // its full history instead — which is what the ⑂ button does anyway.
-    // Match a full id (from /proc) OR the first UUID segment (daemon bg-agent
-    // sockets are named by the short id). A running session — incl. a bg-agent
-    // fork — must resume with --fork-session or Claude Code errors out.
-    const isRunning =
-      running.includes(liveId) || running.includes(liveId.split("-")[0]);
-    const command = isRunning
-      ? `claude --fork-session --resume ${liveId}`
-      : `claude --resume ${liveId}`;
-    openTab(s.title, s.project_path, command, liveId, liveId);
+    if (bgAgents.includes(liveId)) {
+      setNotice(
+        `"${s.title}" is running as a background agent, so it can't be resumed in place — use ⑂ to branch a copy.`,
+      );
+      return;
+    }
+    openTab(s.title, s.project_path, `claude --resume ${liveId}`, liveId, liveId);
   };
-  // Fork an active session into its own tab — branch a copy with full history.
-  // Resume already forks a *running* session, but folds onto the existing tab
-  // (slotId dedup); an explicit fork wants a separate terminal, so give it a
-  // unique slot. The continuation tracker rebinds that slot to the real fork id
-  // once Claude Code writes it.
+  // Branch a session into its own tab, resumable later on its own row. The
+  // parent is left intact and frozen at its own context — `--fork-session`
+  // writes a new transcript and never touches the original.
   const forkSession = async (s: Session) => {
     setActiveProject(s.project_path);
     let liveId = s.id;
@@ -558,10 +423,17 @@ export default function App() {
     } catch {
       liveId = s.id;
     }
+    // Mint the branch's session id rather than letting Claude Code pick one.
+    // Otherwise the tab has no id to claim until the new transcript appears,
+    // and it would need a heuristic to guess which fresh row was its own —
+    // exactly the kind of guessing this app has too much of. With --session-id
+    // the tab is slotted with the real id from the first frame, so clicking
+    // the branch's row focuses this tab instead of opening a second one.
+    const branchId = crypto.randomUUID();
     openTab(
       s.title, s.project_path,
-      `claude --fork-session --resume ${liveId}`,
-      `fork:${liveId}:${nextKey.current}`, liveId,
+      `claude --fork-session --resume ${liveId} --session-id ${branchId}`,
+      branchId, branchId,
     );
     // The fork carries the conversation forward — exit the parent's live
     // terminal so one context isn't running twice. Its row stays listed
@@ -686,23 +558,6 @@ export default function App() {
           {notice}
         </div>
       )}
-      {undoInfo && (
-        <div className="app-toast undo-toast" role="status">
-          <span className="undo-msg">Hid superseded session “{undoInfo.title}”</span>
-          <button
-            className="undo-btn"
-            onClick={() => {
-              const id = undoInfo.id;
-              setSuperseded((prev) => {
-                const next = new Set(prev);
-                next.delete(id);
-                return next;
-              });
-              setUndoInfo(null);
-            }}
-          >Undo</button>
-        </div>
-      )}
       <div className="topbar">
         <div className="topbar-left">
           <button
@@ -756,7 +611,7 @@ export default function App() {
           <>
             <div className="panel sessions" style={{ width: sizes.left, ...zoomFor("sessions") }}>
               <SessionsPanel
-                sessions={visibleSessions}
+                sessions={sessions}
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
