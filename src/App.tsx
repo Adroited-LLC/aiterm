@@ -700,6 +700,7 @@ export default function App() {
           {showComposer && <Composer
             tabKey={activeTab}
             tabTitle={activeTabObj?.title ?? null}
+            sessionId={activeSessionId}
             shells={tabs.length}
             working={working}
             claudeStatus={claudeStatus}

@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { SessionStatus } from "../ipc";
+import ComposerPills from "./ComposerPills";
 
 interface Props {
   /** Key of the active terminal tab (composer state is kept per tab). */
   tabKey: number | null;
   tabTitle: string | null;
+  /** Claude session of the active tab, for the pill strip. */
+  sessionId: string | null;
   onSend: (text: string) => void;
   /** Forward a raw control sequence (ctrl-c, esc) to the active PTY. */
   onControl: (seq: string) => void;
@@ -29,7 +32,7 @@ function permissionLabel(mode: string): { text: string; cls: string } {
 }
 
 export default function Composer({
-  tabKey, tabTitle, onSend, onControl, shells, working, claudeStatus, projectLabel, branch,
+  tabKey, tabTitle, sessionId, onSend, onControl, shells, working, claudeStatus, projectLabel, branch,
 }: Props) {
   const [text, setText] = useState("");
   const taRef = useRef<HTMLTextAreaElement>(null);
@@ -139,6 +142,7 @@ export default function Composer({
 
   return (
     <div className="composer-wrap">
+      <ComposerPills sessionId={sessionId} />
       <div className="composer">
         {tabTitle && <span className="composer-chip">{tabTitle}</span>}
         <span className="composer-prompt">❯</span>
