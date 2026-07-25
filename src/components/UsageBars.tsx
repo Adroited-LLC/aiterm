@@ -27,9 +27,13 @@ export function UsageBars() {
 
   useEffect(() => {
     let alive = true;
+    // Keep the last good reading. `usage_limits` returns [] on any transient
+    // failure (curl hiccup, token mid-refresh); replacing bars with [] on those
+    // makes them blink out for up to a poll interval — the "flaky" behaviour.
+    // Only replace when we actually got data.
     const load = () =>
       usageLimits()
-        .then((b) => alive && setBars(b))
+        .then((b) => alive && b.length && setBars(b))
         .catch(() => {});
     load();
     const iv = setInterval(load, 60_000);

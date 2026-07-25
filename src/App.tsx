@@ -493,6 +493,36 @@ export default function App() {
       : `claude --resume ${liveId}`;
     openTab(s.title, s.project_path, command, liveId, liveId);
   };
+  // Fork an active session into its own tab — branch a copy with full history.
+  // Resume already forks a *running* session, but folds onto the existing tab
+  // (slotId dedup); an explicit fork wants a separate terminal, so give it a
+  // unique slot. The continuation tracker rebinds that slot to the real fork id
+  // once Claude Code writes it.
+  const forkSession = async (s: Session) => {
+    setActiveProject(s.project_path);
+    let liveId = s.id;
+    try {
+      const resolved = await resolveResumableId(s.id);
+      if (resolved === null) {
+        setNotice(`"${s.title}" was cleared or superseded — nothing to fork.`);
+        return;
+      }
+      liveId = resolved;
+    } catch {
+      liveId = s.id;
+    }
+    openTab(
+      s.title, s.project_path,
+      `claude --fork-session --resume ${liveId}`,
+      `fork:${liveId}:${nextKey.current}`, liveId,
+    );
+  };
+  // Exit an active session: close its live terminal tab (ends the running
+  // claude process). The transcript stays on disk, so it's resumable later.
+  const exitSession = (s: Session) => {
+    const live = tabs.find((t) => t.slotId === s.id);
+    if (live) closeTab(live.key);
+  };
   const newShell = (s: Session) => {
     setActiveProject(s.project_path);
     openTab(basename(s.project_path), s.project_path, null, `shell:${s.project_path}`);
@@ -681,6 +711,8 @@ export default function App() {
                 onOptsChange={setOpts}
                 onSelect={selectSession}
                 onResume={resumeSession}
+                onFork={forkSession}
+                onExit={exitSession}
                 onNewShell={newShell}
                 onDelete={deleteSession}
                 onSelectProject={selectProject}

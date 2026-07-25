@@ -104,6 +104,8 @@ interface Props {
   onOptsChange: (o: SessionDisplayOpts) => void;
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
+  onFork: (s: Session) => void;
+  onExit: (s: Session) => void;
   onNewShell: (s: Session) => void;
   onDelete: (s: Session) => void;
   onSelectProject: (p: ProjectInfo) => void;
@@ -141,7 +143,7 @@ function AgentIcon({ agent }: { agent: string }) {
 
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, attentionSlots, activeSlot, opts,
-  onOptsChange, onSelect, onResume, onNewShell, onDelete,
+  onOptsChange, onSelect, onResume, onFork, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty,
 }: Props) {
@@ -636,10 +638,26 @@ export default function SessionsPanel({
             </>
           ) : (
             <>
-              <button
-                className="act-btn" title="Resume claude session"
-                onClick={() => onResume(s)}
-              >▶</button>
+              {liveSlots.has(s.id) ? (
+                // Already active — resume would just refocus, so offer the two
+                // actions that make sense on a live session: branch a copy, or
+                // end it. (Delete is hidden for live sessions anyway.)
+                <>
+                  <button
+                    className="act-btn" title="Fork into a new tab (branch a copy)"
+                    onClick={() => onFork(s)}
+                  >⑂</button>
+                  <button
+                    className="act-btn" title="Exit — close this running session"
+                    onClick={() => onExit(s)}
+                  >⏻</button>
+                </>
+              ) : (
+                <button
+                  className="act-btn" title="Resume claude session"
+                  onClick={() => onResume(s)}
+                >▶</button>
+              )}
               <button
                 className="act-btn" title="New shell here"
                 onClick={() => onNewShell(s)}
