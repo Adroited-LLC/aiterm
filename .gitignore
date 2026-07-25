@@ -24,3 +24,6 @@ dist-ssr
 *.sw?
 
 .remember/
+
+# Claude Code worktrees
+.claude/worktrees/
