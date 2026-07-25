@@ -5,17 +5,60 @@ import {
   sessionAgents, sessionArtifacts, sessionModel, sessionTasks, usageLimits,
 } from "../ipc";
 
-/** `/model <name>` choices, straight from the command's own usage line. */
-const MODELS = ["default", "best", "opus", "opusplan", "sonnet", "haiku", "fable"];
-/** `/effort <level>` choices, likewise. */
-const EFFORTS = ["auto", "low", "medium", "high", "xhigh", "max", "ultracode"];
+/** `/model <name>` choices, straight from the command's own usage line. The
+ *  descriptions are ours — claude does not expose them — so they can drift. */
+const MODELS: [string, string][] = [
+  ["default", "Whatever your config selects"],
+  ["best", "Highest-capability model available to you"],
+  ["opus", "Most capable for hard, long-running work"],
+  ["opusplan", "Opus to plan, a faster model to execute"],
+  ["sonnet", "Balanced capability and speed"],
+  ["haiku", "Fastest — mechanical and simple work"],
+  ["fable", "Most capable for the hardest, longest tasks"],
+];
+/** `/effort <level>` choices. The medium and high wordings are claude's own. */
+const EFFORTS: [string, string][] = [
+  ["auto", "Let claude pick per turn"],
+  ["low", "Quick and direct — minimal deliberation"],
+  ["medium", "Balanced approach with standard implementation and testing"],
+  ["high", "Comprehensive implementation with extensive testing and documentation"],
+  ["xhigh", "Deeper reasoning for expensive-to-get-wrong work"],
+  ["max", "Maximum deliberation, slowest"],
+  ["ultracode", "Max effort plus multi-agent orchestration by default"],
+];
 
 /** "claude-opus-5" → "opus". Falls back to the raw id when unrecognised, so a
  *  new model shows *something* rather than going blank. */
 function shortModel(id: string | null): string {
   if (!id) return "—";
-  const m = MODELS.find((n) => n !== "default" && n !== "best" && id.includes(n));
+  const m = MODELS.map(([n]) => n).find(
+    (n) => n !== "default" && n !== "best" && id.includes(n),
+  );
   return m ?? id.replace(/^claude-/, "");
+}
+
+/**
+ * What was last *chosen* here, per session.
+ *
+ * The transcript records what each turn actually ran at, which is not the same
+ * question: pick `auto` and every record still names a concrete level, so
+ * reading the file can never show `auto` back to you. Nothing on disk holds the
+ * selection either — it lives in the running claude. So the chooser remembers
+ * its own choice, and falls back to the observed value when it has none.
+ *
+ * The gap this leaves is a `/model` typed straight into the terminal: we won't
+ * see it, and the pill will keep showing our older pick until a turn runs and
+ * the fallback catches up.
+ */
+const PICK_KEY = "aiterm.composerPick";
+type Picks = Record<string, { model?: string; effort?: string }>;
+
+function loadPicks(): Picks {
+  try {
+    return JSON.parse(localStorage.getItem(PICK_KEY) ?? "{}");
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -61,6 +104,8 @@ export default function ComposerPills({ sessionId, onCommand }: Props) {
   const [agents, setAgents] = useState<AgentRun[]>([]);
   const [bars, setBars] = useState<UsageBar[]>([]);
   const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null });
+  const [picks, setPicks] = useState<Picks>(loadPicks);
+  const pick = (sessionId && picks[sessionId]) || {};
 
   useEffect(() => {
     if (!sessionId) {
@@ -85,8 +130,17 @@ export default function ComposerPills({ sessionId, onCommand }: Props) {
   // Sending is fire-and-forget: claude writes the change into the transcript,
   // and the next poll reads it back. Nothing optimistic to get out of step —
   // if the command doesn't take, the pill keeps showing the truth.
-  const run = (cmd: string) => {
-    onCommand?.(cmd);
+  const run = (kind: "model" | "effort", value: string) => {
+    onCommand?.(`/${kind} ${value}`);
+    if (sessionId) {
+      setPicks((p) => {
+        const next = { ...p, [sessionId]: { ...p[sessionId], [kind]: value } };
+        try {
+          localStorage.setItem(PICK_KEY, JSON.stringify(next));
+        } catch { /* private mode / quota — the pill just won't persist */ }
+        return next;
+      });
+    }
     setOpen(null);
   };
 
@@ -208,26 +262,37 @@ export default function ComposerPills({ sessionId, onCommand }: Props) {
       )}
       {(open === "model" || open === "effort") && (
         <div className="cpill-panel cpill-choices">
-          {(open === "model" ? MODELS : EFFORTS).map((name) => {
-            const current = open === "model"
-              ? shortModel(choice.model) === name
-              : choice.effort === name;
+          {(open === "model" ? MODELS : EFFORTS).map(([name, desc]) => {
+            const selected = open === "model"
+              ? (pick.model ?? shortModel(choice.model)) === name
+              : (pick.effort ?? choice.effort) === name;
             return (
               <button
                 key={name}
-                className={"cpill-choice" + (current ? " on" : "")}
-                onClick={() => run(`/${open} ${name}`)}
+                className={"cpill-choice" + (selected ? " on" : "")}
+                onClick={() => run(open, name)}
               >
-                {name}
-                {current && <span className="cpill-choice-mark">current</span>}
+                <span className="cpill-choice-name">
+                  {name}
+                  {selected && <span className="cpill-choice-mark">selected</span>}
+                </span>
+                <span className="cpill-choice-desc">{desc}</span>
               </button>
             );
           })}
+          {/* With effort on auto every turn still records a concrete level, so
+              say what it actually resolved to rather than implying `auto` is
+              itself a setting the model ran at. */}
+          {open === "effort" && pick.effort === "auto" && choice.effort && (
+            <div className="cpill-choice-note">
+              Last turn ran at <b>{choice.effort}</b>
+            </div>
+          )}
         </div>
       )}
       <div className="cpill-row">
-        {onCommand && pill("model", "◆", "Model", shortModel(choice.model))}
-        {onCommand && pill("effort", "≡", "Effort", choice.effort ?? "—")}
+        {onCommand && pill("model", "◆", "Model", pick.model ?? shortModel(choice.model))}
+        {onCommand && pill("effort", "≡", "Effort", pick.effort ?? choice.effort ?? "—")}
         {sessionId && pill("tasks", "◑", "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
         {sessionId && pill("artifacts", "▤", "Files", artifacts.length ? `${artifacts.length}` : "")}
         {sessionId && pill(

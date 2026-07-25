@@ -1533,28 +1533,54 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* Model / effort choosers: a wrapped row of options rather than a list, since
    there are few of them and they are single words. */
+/* Vertical list: each option carries a description, so a wrapped row of
+   chips would give the text nowhere to go. */
 .cpill-choices {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px;
 }
 .cpill-choice {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  border: 1px solid transparent;
   border-radius: 6px;
-  background: var(--bg-panel);
+  background: transparent;
   color: var(--text);
   font-family: var(--font-ui);
-  font-size: 11px;
-  padding: 5px 10px;
+  text-align: left;
+  padding: 6px 9px;
   cursor: pointer;
 }
-.cpill-choice:hover { background: var(--bg-hover); border-color: var(--accent); }
+.cpill-choice:hover { background: var(--bg-hover); }
 .cpill-choice.on { border-color: var(--accent); background: var(--bg-active); }
-.cpill-choice-mark {
-  color: var(--text-faint);
-  font-size: 10px;
+.cpill-choice-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
 }
+.cpill-choice-desc {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.cpill-choice-mark {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 500;
+}
+.cpill-choice-note {
+  color: var(--text-faint);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  padding: 4px 9px 2px;
+  border-top: 1px solid var(--border);
+  margin-top: 3px;
+}
+.cpill-choice-note b { color: var(--text-dim); font-weight: 600; }
