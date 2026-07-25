@@ -31,6 +31,7 @@ const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
 const PANELS_KEY = "aiterm.panelToggles";
+const USAGE_KEY = "aiterm.usageCache";
 
 interface PanelToggles {
   sessions: boolean;
@@ -197,11 +198,30 @@ export default function App() {
   // rate limits, so a second poller is not just waste — a refused request
   // returns [] and that view blanks while the other still shows bars.
   // Keep the last good reading: [] means "couldn't ask", never "zero usage".
-  const [usage, setUsage] = useState<UsageBar[]>([]);
+  //
+  // Seeded from the last reading written to disk, so a cold start shows
+  // something immediately instead of an empty strip for up to a minute — the
+  // first call often lands on a rate limit, which made the gap longer still.
+  // Written on every success rather than on exit: an exit hook does not run
+  // when the app is killed, which is exactly when the cache would be wanted.
+  const cached = loadJSON(USAGE_KEY, { at: 0, bars: [] as UsageBar[] });
+  const [usage, setUsage] = useState<UsageBar[]>(cached.bars);
+  const [usageAt, setUsageAt] = useState<number>(cached.at);
+  const [usageFresh, setUsageFresh] = useState(false);
   useEffect(() => {
     let alive = true;
     const load = () =>
-      usageLimits().then((b) => alive && b.length && setUsage(b)).catch(() => {});
+      usageLimits()
+        .then((b) => {
+          if (!alive || !b.length) return;
+          setUsage(b);
+          setUsageAt(Date.now());
+          setUsageFresh(true);
+          try {
+            localStorage.setItem(USAGE_KEY, JSON.stringify({ at: Date.now(), bars: b }));
+          } catch { /* quota — the cache is a convenience, not a requirement */ }
+        })
+        .catch(() => {});
     load();
     const iv = setInterval(load, 60_000);
     return () => { alive = false; clearInterval(iv); };
@@ -707,6 +727,7 @@ export default function App() {
             sessionId={activeSessionId}
             projectRoot={activeProject}
             usage={usage}
+            usageAsOf={usageFresh ? null : usageAt || null}
             onCommand={activeTab === null ? undefined : (text) =>
               handles.current.get(activeTab)?.sendComposed(text)}
           />}

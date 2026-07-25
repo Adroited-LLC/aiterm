@@ -100,12 +100,18 @@ interface Props {
    *  gauges: the endpoint rate limits, so a second poller would both double
    *  the requests and let the two views disagree when one is refused. */
   usage: UsageBar[];
+  /** Set when the reading came from the on-disk cache and no live call has
+   *  succeeded yet — the numbers are real, just possibly old, and saying so is
+   *  cheaper than letting them quietly mislead. */
+  usageAsOf: number | null;
   /** Run a slash command in the live terminal (adds Enter). Absent when no
    *  terminal is focused, which is what disables the model/effort pills. */
   onCommand?: (text: string) => void;
 }
 
-export default function ComposerPills({ sessionId, projectRoot, usage, onCommand }: Props) {
+export default function ComposerPills({
+  sessionId, projectRoot, usage, usageAsOf, onCommand,
+}: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
   const [tasks, setTasks] = useState<SessionTask[]>([]);
@@ -256,6 +262,11 @@ export default function ComposerPills({ sessionId, projectRoot, usage, onCommand
                 <span className="cpill-usage-reset">{resetsIn(b.resets_at)}</span>
               </div>
             ))
+          )}
+          {usageAsOf && bars.length > 0 && (
+            <div className="cpill-choice-note">
+              Last known reading, {relTime(usageAsOf)} — refreshing
+            </div>
           )}
         </div>
       )}
