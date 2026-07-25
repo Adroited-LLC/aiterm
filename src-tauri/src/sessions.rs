@@ -579,7 +579,56 @@ pub fn session_delete(session_id: String) -> Result<(), String> {
             touch(&tasks_dest);
         }
     }
+    // Claude Code keeps a second, independent record of a session under
+    // `~/.claude/jobs/<short>/`, and nothing there follows the transcript. Left
+    // behind, it is a ghost: `claude agents` goes on listing a session you
+    // deleted, with its old state and last output, forever. A delete that
+    // leaves the session listed elsewhere has not really deleted it.
+    //
+    // It goes to the trash like everything else rather than being removed, so
+    // a restore puts it back and nothing here is one-way.
+    if let Some(job) = find_job_dir(&home.join(".claude/jobs"), &session_id) {
+        let job_dest = trash.join(format!("{session_id}.job"));
+        if std::fs::rename(&job, &job_dest).is_ok() {
+            touch(&job_dest);
+        }
+    }
     Ok(())
+}
+
+/// The job directory belonging to exactly this session, found by reading each
+/// `state.json` — never by matching the directory's name.
+///
+/// The names happen to be the session's first uuid segment today, but matching
+/// on that would mean deleting Claude Code's records on a coincidence. Reading
+/// the `sessionId` inside is the only claim we can actually stand behind.
+fn find_job_dir(jobs_root: &Path, session_id: &str) -> Option<std::path::PathBuf> {
+    for job in std::fs::read_dir(jobs_root).ok()?.flatten() {
+        let Ok(raw) = std::fs::read_to_string(job.path().join("state.json")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v.get("sessionId").and_then(|s| s.as_str()) == Some(session_id) {
+            return Some(job.path());
+        }
+    }
+    None
+}
+
+/// Where a trashed job directory belongs. Prefers the `daemonShort` recorded
+/// inside it over re-deriving the name from the id.
+fn job_dir_name(trashed: &Path, session_id: &str) -> String {
+    std::fs::read_to_string(trashed.join("state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("daemonShort")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| session_id.split('-').next().unwrap_or(session_id).to_string())
 }
 
 #[derive(Serialize)]
@@ -681,6 +730,12 @@ pub fn trash_restore(session_id: String) -> Result<(), String> {
     if tasks_src.is_dir() {
         let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(&session_id));
     }
+    let job_src = trash.join(format!("{session_id}.job"));
+    if job_src.is_dir() {
+        let jobs = home.join(".claude/jobs");
+        let _ = std::fs::create_dir_all(&jobs);
+        let _ = std::fs::rename(&job_src, jobs.join(job_dir_name(&job_src, &session_id)));
+    }
     Ok(())
 }
 
@@ -692,6 +747,10 @@ pub fn trash_delete(session_id: String) -> Result<(), String> {
     let tasks = trash.join(format!("{session_id}.tasks"));
     if tasks.is_dir() {
         let _ = std::fs::remove_dir_all(tasks);
+    }
+    let job = trash.join(format!("{session_id}.job"));
+    if job.is_dir() {
+        let _ = std::fs::remove_dir_all(job);
     }
     Ok(())
 }
@@ -1726,6 +1785,38 @@ mod tests {
         // The two content mentions survive untouched.
         assert!(out.contains(&format!("see /tmp/{old}/out and id {old}")));
         assert!(!out.contains(&format!("\"sessionId\":\"{old}\"")));
+    }
+
+    #[test]
+    fn job_dir_matches_on_recorded_id_not_directory_name() {
+        let root = std::env::temp_dir().join("aiterm-test-jobs");
+        let _ = std::fs::remove_dir_all(&root);
+        let want = "7f8edb5a-26d1-4520-900e-aff9c9b42dbf";
+        // A decoy whose *directory* is named like the session's first segment,
+        // but whose recorded session is someone else's. Matching on the name
+        // would trash Claude Code's records for an unrelated session.
+        std::fs::create_dir_all(root.join("7f8edb5a")).unwrap();
+        std::fs::write(
+            root.join("7f8edb5a/state.json"),
+            "{\"sessionId\":\"11111111-2222-3333-4444-555555555555\"}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("someotherdir")).unwrap();
+        std::fs::write(
+            root.join("someotherdir/state.json"),
+            format!("{{\"sessionId\":\"{want}\",\"daemonShort\":\"abcd1234\"}}"),
+        )
+        .unwrap();
+        // A directory with no state.json at all must not blow up the scan.
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+
+        let found = find_job_dir(&root, want).expect("matches by recorded id");
+        assert!(found.ends_with("someotherdir"), "got {found:?}");
+        assert!(find_job_dir(&root, "nobody-has-this-id").is_none());
+        // Restore prefers the recorded daemonShort over re-deriving a name.
+        assert_eq!(job_dir_name(&found, want), "abcd1234");
+        assert_eq!(job_dir_name(&root.join("empty"), want), "7f8edb5a");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

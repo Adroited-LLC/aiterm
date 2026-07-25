@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk git *)",
+      "Bash(rtk grep *)",
+      "Bash(rpm -q aiterm)",
+      "Bash(timeout 60 claude agents --json)",
+      "Bash(python3 -c ' *)",
+      "Bash(rtk ls *)",
+      "Bash(xargs -n1 basename)",
+      "Bash(git tag *)",
+      "Bash(rtk cargo *)",
+      "Bash(rtk npm *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(sudo -n dnf install -y src-tauri/target/release/bundle/rpm/aiterm-0.4.7-1.x86_64.rpm)"
+    ]
+  }
+}
