@@ -77,3 +77,49 @@ pub fn watch_project(
     });
     Ok(())
 }
+
+/// Watch `~/.claude/projects` recursively and emit `sessions://changed` after
+/// writes settle, so the sessions list refreshes promptly on /clear, forks, or
+/// new transcripts instead of waiting for the 30s poll.
+///
+/// The watcher handle is moved into the pump thread's closure so it lives for
+/// the whole app lifetime; when the thread ends (never, in practice) the
+/// watcher drops with it. This is the simplest correct way to keep it alive
+/// without adding managed state.
+pub fn watch_claude_projects(app: AppHandle) -> Result<(), String> {
+    let dir = dirs::home_dir()
+        .ok_or_else(|| "no home dir".to_string())?
+        .join(".claude/projects");
+    // Nothing to watch yet; not an error (dir appears once Claude runs).
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .map_err(|e| e.to_string())?;
+    watcher
+        .watch(&dir, RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())?;
+
+    std::thread::spawn(move || {
+        // Keep the watcher alive for the lifetime of this thread.
+        let _watcher = watcher;
+        loop {
+            // Block until the first event of a burst.
+            if rx.recv().is_err() {
+                break; // channel closed (app shutting down)
+            }
+            // Debounce: transcript appends arrive in bursts; drain until 1500ms
+            // of quiet, then emit once. Avoids firing on every append.
+            while rx
+                .recv_timeout(std::time::Duration::from_millis(1500))
+                .is_ok()
+            {}
+            let _ = app.emit("sessions://changed", ());
+        }
+    });
+    Ok(())
+}

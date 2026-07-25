@@ -47,6 +47,12 @@ pub fn run() {
             git::git_diff_file,
             git::git_commit_diff,
         ])
+        .setup(|app| {
+            // Push sessions-list refreshes when Claude's transcripts change
+            // (new/cleared/forked sessions) instead of waiting for the 30s poll.
+            let _ = watcher::watch_claude_projects(app.handle().clone());
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

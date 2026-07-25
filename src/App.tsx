@@ -143,18 +143,31 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [trashed, setTrashed] = useState<TrashedSession[]>([]);
 
-  const refreshSessions = useCallback(() => {
+  // List-only refresh: cheap, safe to run on every fs event.
+  const refreshSessionList = useCallback(() => {
     listSessions().then(setSessions).catch(console.error);
     listProjects().then(setProjects).catch(console.error);
     trashList().then(setTrashed).catch(() => setTrashed([]));
-    // Keep the full-text index warm in the background.
-    reindexSessions().catch(() => {});
   }, []);
+  const refreshSessions = useCallback(() => {
+    refreshSessionList();
+    // Keep the full-text index warm in the background (30s poll only).
+    reindexSessions().catch(() => {});
+  }, [refreshSessionList]);
   useEffect(() => {
     refreshSessions();
     const iv = setInterval(refreshSessions, 30_000);
     return () => clearInterval(iv);
   }, [refreshSessions]);
+  // Event-driven refresh: Claude's transcripts changed (backend debounces).
+  useEffect(() => {
+    const un = listen("sessions://changed", () => {
+      refreshSessionList();
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, [refreshSessionList]);
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string, sessionId?: string) => {
