@@ -18,7 +18,7 @@ import {
 import {
   ProjectInfo, Session, SessionStatus,
   TrashedSession,
-  gitRepoState, listProjects, listSessions, reindexSessions,
+  gitRepoState, listProjects, listSessions, reindexSessions, sessionFork,
   resolveResumableId, liveSessionIds, stopSession,
   sessionDelete, sessionStatus, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
@@ -424,40 +424,21 @@ export default function App() {
   // Branch a session into its own tab, resumable later on its own row. The
   // parent is left intact and frozen at its own context — `--fork-session`
   // writes a new transcript and never touches the original.
+  // Branch a session. This starts nothing and touches no tab: the backend
+  // copies the transcript under a fresh id, so the branch appears as an
+  // ordinary inactive row holding the conversation exactly as it stands now,
+  // and the session you forked from keeps running, still yours, still green.
+  //
+  // It used to launch `claude --fork-session --resume` into a new tab and
+  // close the parent's. That made forking a lifecycle event — the branch
+  // didn't exist on disk until you typed into it, and the tab you forked
+  // *from* went away, which is not what branching means. Rejections are
+  // surfaced by the caller (see `onFork` below).
   const forkSession = async (s: Session) => {
-    setActiveProject(s.project_path);
-    let liveId = s.id;
-    try {
-      const resolved = await resolveResumableId(s.id);
-      if (resolved === null) {
-        setNotice(`"${s.title}" was cleared or superseded — nothing to fork.`);
-        return;
-      }
-      liveId = resolved;
-    } catch {
-      liveId = s.id;
-    }
-    // Mint the branch's session id rather than letting Claude Code pick one.
-    // Otherwise the tab has no id to claim until the new transcript appears,
-    // and it would need a heuristic to guess which fresh row was its own —
-    // exactly the kind of guessing this app has too much of. With --session-id
-    // the tab is slotted with the real id from the first frame, so clicking
-    // the branch's row focuses this tab instead of opening a second one.
-    const branchId = crypto.randomUUID();
-    openTab(
-      s.title, s.project_path,
-      `claude --fork-session --resume ${liveId} --session-id ${branchId}`,
-      branchId, branchId,
-    );
-    // The fork carries the conversation forward — exit the parent's live
-    // terminal so one context isn't running twice. Its row stays listed
-    // (scan keeps fork siblings) and resumes later at its pre-fork context.
-    // Focus stays on the fork tab: closeTab only refocuses when closing the
-    // active tab. A parent running as a bg agent has no tab here; that's
-    // Claude Code's process to manage, not ours. (tabsRef, not tabs: the
-    // resolver await above means the render-time snapshot can be stale.)
-    const parent = tabsRef.current.find((t) => t.slotId === liveId);
-    if (parent) closeTab(parent.key);
+    const branchId = await sessionFork(s.id);
+    refreshSessionList();
+    setNotice(`Branched "${s.title}" — the copy is listed, idle, at this point.`);
+    return branchId;
   };
   // Exit an active session: close its live terminal tab (ends the running
   // claude process). The transcript stays on disk, so it's resumable later.
@@ -638,7 +619,11 @@ export default function App() {
                 onOptsChange={setOpts}
                 onSelect={selectSession}
                 onResume={resumeSession}
-                onFork={forkSession}
+                onFork={(s) =>
+                  forkSession(s).catch((e) =>
+                    setNotice(`Couldn't fork "${s.title}": ${e}`),
+                  )
+                }
                 onExit={exitSession}
                 onNewShell={newShell}
                 onDelete={deleteSession}

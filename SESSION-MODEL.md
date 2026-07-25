@@ -49,6 +49,30 @@ Last updated 2026-07-25.
 - `--session-id <uuid>` **composes** with `--fork-session`, so the caller can
   mint the child's id instead of discovering it later.
   *Verified: ran it; the child transcript appeared at the chosen uuid.*
+- `--session-id` with `--resume` but **without** `--fork-session` is rejected
+  outright: "Error: --session-id can only be used with --continue or --resume
+  if --fork-session is also specified." *Verified 2026-07-25 in `-p` mode.*
+- **`--resume <id>` resolves a conversation by the `sessionId` recorded *inside*
+  the transcript, not by the file's name.** A `cp <parent>.jsonl <new>.jsonl`
+  produces a file `--resume` cannot open — it reports "No conversation found
+  with session ID: <new>" even though `<new>.jsonl` is sitting right there. The
+  same copy with the id fields rewritten resumes perfectly, with full context.
+  *Verified 2026-07-25: plain copy of a 452-line transcript failed; a copy with
+  `sessionId`/`session_id` rewritten answered a question about the conversation
+  it inherited. This is the fact aiterm's ⑂ is built on, and the reason
+  opcode's `fs::copy` fork produces unresumable files.*
+- A transcript legitimately carries lines stamped with **other** session ids.
+  Resuming copies the prior session's records forward verbatim, keeping their
+  original `sessionId`, so a resumed transcript is genuinely mixed-id. Rewriting
+  only the lines bearing the file's own id is enough — the historical ones can
+  be left alone and resume still works.
+  *Verified 2026-07-25: a branch of session `8a576195` contained lines stamped
+  `437fecea` (the session it had been resumed from); it resumed normally.*
+- Together these mean **a session can be branched with no process at all** —
+  copy the transcript, rewrite its id fields, and a new resumable session
+  exists. `--fork-session` is not the only way to fork, and unlike it, the file
+  copy produces the branch *immediately* rather than on first prompt.
+  *Verified: this is what `sessions::session_fork` does as of aiterm 0.4.4.*
 - Prompting an already-running session does **not** mint a new session.
   **Resuming does.** *Verified: sent a bare test message, no new transcript and
   no new roster entry; only the live transcript grew.*

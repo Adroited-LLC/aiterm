@@ -81,9 +81,14 @@ impl ClaudeProvider {
         // in-file heuristic reads `forked = false` at exactly the moment the
         // UI decides whether to hide the parent — which hid it. The job state
         // records the pair the instant the fork is created.
+        // Two sources, same shape: aiterm's own record for branches made with
+        // ⑂, and Claude Code's job state for `/fork`. Ours is checked first —
+        // it was written by the code that created the file, so it is the more
+        // direct evidence. In practice the key sets are disjoint.
         let parents = fork_parent_map(&home.join(".claude/jobs"));
+        let ours = read_aiterm_fork_map();
         for (s, _) in &mut sessions {
-            if let Some(parent) = parents.get(&s.id) {
+            if let Some(parent) = ours.get(&s.id).or_else(|| parents.get(&s.id)) {
                 s.fork_parent = Some(parent.clone());
                 s.forked = true;
             }
@@ -102,6 +107,40 @@ impl ClaudeProvider {
         // and /clear/compact retire the old file via the `.orphaned-` rename
         // filtered above — so no collapse is needed.
         sessions
+    }
+}
+
+/// Where aiterm records the branches *it* creates: branch id → parent id.
+/// Claude Code's job state (below) only knows about its own `/fork`, so a
+/// branch made by the ⑂ button would otherwise wear no lineage and show up as
+/// an unexplained twin of its parent.
+fn aiterm_fork_map_path() -> Option<std::path::PathBuf> {
+    Some(dirs::data_dir()?.join("aiterm/forks.json"))
+}
+
+fn read_aiterm_fork_map() -> std::collections::HashMap<String, String> {
+    let Some(path) = aiterm_fork_map_path() else {
+        return Default::default();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Record a branch's parent. Best-effort: a fork whose lineage fails to save
+/// is still a perfectly good session, so this never fails the fork itself.
+fn record_aiterm_fork(branch: &str, parent: &str) {
+    let Some(path) = aiterm_fork_map_path() else {
+        return;
+    };
+    let mut map = read_aiterm_fork_map();
+    map.insert(branch.to_string(), parent.to_string());
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(path, text);
     }
 }
 
@@ -1449,9 +1488,137 @@ pub fn session_artifacts(session_id: String) -> Vec<Artifact> {
     artifacts
 }
 
+/// A v4 UUID from `/dev/urandom`. `claude --resume` only accepts well-formed
+/// UUIDs, and a transcript is named for its id, so the shape is load-bearing.
+fn uuid_v4() -> Result<String, String> {
+    let mut b = [0u8; 16];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| format!("no randomness available: {e}"))?;
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    ))
+}
+
+/// Rewrite only the two id *fields*, never every occurrence of the old id.
+/// A transcript quotes its own session id in ordinary places — tool output,
+/// scratchpad paths, prose — and a blind replace would rewrite that history.
+/// In this session's own file, 776 occurrences of the id are only 736 fields.
+/// Claude Code writes compact JSON (`"sessionId":"…"`, no spaces), so an exact
+/// pattern match is precise and leaves every other byte untouched.
+fn rewrite_session_ids(text: &str, old: &str, new: &str) -> (String, usize) {
+    let mut out = text.to_string();
+    let mut n = 0;
+    for key in ["sessionId", "session_id"] {
+        let from = format!("\"{key}\":\"{old}\"");
+        let to = format!("\"{key}\":\"{new}\"");
+        n += out.matches(&from).count();
+        out = out.replace(&from, &to);
+    }
+    (out, n)
+}
+
+/// Branch a session: copy its transcript to a fresh id and hand back that id.
+///
+/// This is the whole fork. No process is started and no tab is opened, so the
+/// session you forked from keeps running untouched and the branch shows up as
+/// an ordinary inactive row you can resume later, at exactly the point you
+/// forked. Doing it by launching `claude --fork-session --resume` instead
+/// meant the branch did not exist until you typed into it, and cost a tab.
+///
+/// The id rewrite is mandatory, not cosmetic: `claude --resume` resolves a
+/// conversation by the `sessionId` *inside* the file, not by its name. A plain
+/// copy is a dead file — verified: it fails with "No conversation found with
+/// session ID". (opcode's fork does exactly that, which is why its forks are
+/// unresumable.)
+#[tauri::command]
+pub fn session_fork(session_id: String) -> Result<String, String> {
+    let src = resolve_live_session_file(&session_id)
+        .ok_or_else(|| "that session has no transcript left to fork".to_string())?;
+    if src
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
+    {
+        return Err("that session was cleared or superseded — nothing to fork".into());
+    }
+    let old_id = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| "unreadable transcript name".to_string())?;
+    let text = std::fs::read_to_string(&src).map_err(|e| format!("couldn't read transcript: {e}"))?;
+    let new_id = uuid_v4()?;
+    let (out, replaced) = rewrite_session_ids(&text, &old_id, &new_id);
+    // Zero replacements means the format moved out from under us (spacing, a
+    // renamed field). Writing the copy anyway would leave an unresumable file
+    // on disk wearing a real-looking row, which is worse than failing loudly.
+    if replaced == 0 {
+        return Err("transcript has no session id fields to rewrite — not forking".into());
+    }
+    let dst = src.with_file_name(format!("{new_id}.jsonl"));
+    std::fs::write(&dst, out).map_err(|e| format!("couldn't write the branch: {e}"))?;
+    // Transcripts are private (0600); a fork must not be looser than its parent.
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
+    // Record the lineage rather than leaving the scanner to infer it. A clean
+    // copy has an intact `parentUuid` chain, so the in-file heuristic reads it
+    // as an ordinary session and the ⑂ badge never appears — the branch looks
+    // like an unexplained twin. We know the parent here; say so.
+    record_aiterm_fork(&new_id, &old_id);
+    Ok(new_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_rewrites_id_fields_only() {
+        let old = "437fecea-45a2-409f-a0a0-ed2161621425";
+        let new = "fa06996a-14c7-4e88-9502-508eb55d220d";
+        // Third line quotes the id in ordinary content — a path and prose. A
+        // blind replace would rewrite those too, silently editing history.
+        let text = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{old}\"}}\n\
+             {{\"type\":\"assistant\",\"session_id\":\"{old}\",\"requestId\":\"x\"}}\n\
+             {{\"type\":\"user\",\"sessionId\":\"{old}\",\"text\":\"see /tmp/{old}/out and id {old}\"}}\n"
+        );
+        let (out, n) = rewrite_session_ids(&text, old, new);
+        assert_eq!(n, 3, "three id fields");
+        assert_eq!(out.matches(new).count(), 3);
+        // The two content mentions survive untouched.
+        assert!(out.contains(&format!("see /tmp/{old}/out and id {old}")));
+        assert!(!out.contains(&format!("\"sessionId\":\"{old}\"")));
+    }
+
+    #[test]
+    fn fork_reports_nothing_to_rewrite() {
+        // Spaced-out JSON is not the format Claude Code writes; better to
+        // report zero than to leave an unresumable copy on disk.
+        let (_, n) = rewrite_session_ids("{\"sessionId\": \"abc\"}", "abc", "def");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn uuid_v4_is_well_formed() {
+        let u = uuid_v4().expect("urandom");
+        let parts: Vec<&str> = u.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_eq!(parts[2].as_bytes()[0], b'4', "version nibble");
+        assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
+        assert_ne!(u, uuid_v4().unwrap(), "not a constant");
+    }
 
     #[test]
     fn strips_and_detects_noise() {

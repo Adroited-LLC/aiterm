@@ -562,6 +562,11 @@ export default function SessionsPanel({
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
     const isShowing = activeSlot !== null &&
       (activeSlot === s.id || activeSlot === `shell:${s.project_path}`);
+    // Tighter than `isShowing`: the displayed terminal is *this session's own*
+    // tab, not merely a shell in the same project (which would match every row
+    // in that project). Only this row has nothing to resume — you are already
+    // looking at the conversation.
+    const isFocusedSession = activeSlot === s.id;
     const isDragging =
       dragId === s.id || (dragId !== null && dragActive.current && selected.has(dragId) && selected.has(s.id));
     return (
@@ -698,22 +703,29 @@ export default function SessionsPanel({
                   make in a shell: quit what's running, then `claude --resume`.
                   It used to be hidden whenever the roster called the session
                   live, which left ⑂ as the only door in; every attempt to
-                  reopen a conversation branched a copy of it instead. */}
-              <button
-                className="act-btn"
-                title={
-                  isRunning || hasTab
-                    ? "Resume — stops the running session first"
-                    : "Resume claude session"
-                }
-                onClick={() =>
-                  isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
-                }
-              >▶</button>
+                  reopen a conversation branched a copy of it instead.
+                  The one exception is the tab you are looking at right now:
+                  offering to stop and reopen the conversation you are typing
+                  into is never what you meant. Every *other* live row keeps ▶,
+                  so the door-in problem above does not come back. */}
+              {!isFocusedSession && (
+                <button
+                  className="act-btn"
+                  title={
+                    isRunning || hasTab
+                      ? "Resume — stops the running session first"
+                      : "Resume claude session"
+                  }
+                  onClick={() =>
+                    isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
+                  }
+                >▶</button>
+              )}
               {/* Branching is a deliberate act (two divergent lines from one
                   history), not a workaround for resume being unavailable. */}
               <button
-                className="act-btn" title="Fork into a new tab (branch a copy)"
+                className="act-btn"
+                title="Branch a copy at this point — listed idle, starts nothing"
                 onClick={() => onFork(s)}
               >⑂</button>
               {hasTab && (

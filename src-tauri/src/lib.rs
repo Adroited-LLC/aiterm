@@ -34,6 +34,7 @@ pub fn run() {
             sessions::live_session_ids,
             sessions::stop_session,
             sessions::resolve_resumable_id,
+            sessions::session_fork,
             usage::usage_limits,
             watcher::watch_project,
             fsx::list_dir,

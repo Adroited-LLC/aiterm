@@ -140,6 +140,12 @@ export const stopSession = (sessionId: string) =>
 // resumable survives.
 export const resolveResumableId = (sessionId: string) =>
   invoke<string | null>("resolve_resumable_id", { sessionId });
+// Branch a session on disk: copies its transcript under a fresh id and returns
+// that id. Starts nothing — the branch appears as an inactive row, and the
+// session you forked from keeps running untouched. Rejects if the transcript
+// is gone or was cleared.
+export const sessionFork = (sessionId: string) =>
+  invoke<string>("session_fork", { sessionId });
 export interface UsageBar {
   kind: string;
   label: string;
