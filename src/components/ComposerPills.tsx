@@ -2,21 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import GitPanel from "./GitPanel";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
-  claudeModelDefault, homeAbbrev, openPath, relTime, restoreClaudeModelDefault,
+  homeAbbrev, openPath, relTime,
   sessionAgents, sessionArtifacts, sessionModel, sessionTasks,
 } from "../ipc";
 
-/** `/model <name>` choices, straight from the command's own usage line. The
- *  descriptions are ours — claude does not expose them — so they can drift. */
-const MODELS: [string, string][] = [
-  ["default", "Whatever your config selects"],
-  ["best", "Highest-capability model available to you"],
-  ["opus", "Most capable for hard, long-running work"],
-  ["opusplan", "Opus to plan, a faster model to execute"],
-  ["sonnet", "Balanced capability and speed"],
-  ["haiku", "Fastest — mechanical and simple work"],
-  ["fable", "Most capable for the hardest, longest tasks"],
-];
+/** Aliases used only to shorten a recorded model id for the pill — "claude-
+ *  opus-5" to "opus". The picker no longer lists these: it shows claude's own
+ *  entries, read off the screen, so there are no descriptions here to drift
+ *  out of date. */
+const MODEL_ALIASES = ["opus", "opusplan", "sonnet", "haiku", "fable"];
+
 /** `/effort <level>` choices. The medium and high wordings are claude's own. */
 const EFFORTS: [string, string][] = [
   ["auto", "Let claude pick per turn"],
@@ -32,9 +27,7 @@ const EFFORTS: [string, string][] = [
  *  new model shows *something* rather than going blank. */
 function shortModel(id: string | null): string {
   if (!id) return "—";
-  const m = MODELS.map(([n]) => n).find(
-    (n) => n !== "default" && n !== "best" && id.includes(n),
-  );
+  const m = MODEL_ALIASES.find((n) => id.includes(n));
   return m ?? id.replace(/^claude-/, "");
 }
 
@@ -84,7 +77,9 @@ function loadPicks(): Picks {
  * them disagreeing whenever one request was refused.
  */
 
-type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "model" | "effort" | "git";
+// "model" is absent on purpose: choosing a model opens claude's own picker
+// with a dialog over it, rather than a list of our own invention.
+type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "effort" | "git";
 
 /** Relative "resets in 3h 55m"; "" when unknown or past. */
 function resetsIn(iso: string): string {
@@ -124,10 +119,13 @@ interface Props {
    *  command typed into a non-empty prompt is appended to it and the whole
    *  thing is submitted as one message, so we ask before doing that. */
   hasPendingInput?: () => boolean;
+  /** Ask the app to open claude's model picker and draw a dialog over it. */
+  onOpenModelPicker?: () => void;
 }
 
 export default function ComposerPills({
   sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss, hasPendingInput,
+  onOpenModelPicker,
 }: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
@@ -137,8 +135,8 @@ export default function ComposerPills({
   const [agents, setAgents] = useState<AgentRun[]>([]);
   const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null, at: null });
   const [picks, setPicks] = useState<Picks>(loadPicks);
-  /** A choice held back because the prompt was not empty. */
-  const [held, setHeld] = useState<{ kind: "model" | "effort"; value: string } | null>(null);
+  /** An action held back because the prompt was not empty. */
+  const [held, setHeld] = useState<{ label: string; send: () => void } | null>(null);
   const pick = (sessionId && picks[sessionId]) || {};
 
   /** One exit path for every way a panel closes, so the keyboard always ends
@@ -197,33 +195,30 @@ export default function ComposerPills({
   // Sending is fire-and-forget: claude writes the change into the transcript,
   // and the next poll reads it back. Nothing optimistic to get out of step —
   // if the command doesn't take, the pill keeps showing the truth.
-  const run = (kind: "model" | "effort", value: string, force = false) => {
-    // A slash command is only a command when it starts the line. Typed into a
-    // prompt you were halfway through writing, it becomes the tail of that
-    // sentence and Enter sends the whole thing to the model. We cannot clear
-    // claude's input for you — nothing we can send reliably empties it, and
-    // guessing would throw away what you wrote — so ask instead.
+  // A slash command is only a command when it starts the line. Typed into a
+  // prompt you were halfway through writing, it becomes the tail of that
+  // sentence and Enter sends the whole thing to the model. We cannot clear
+  // claude's input for you — nothing we can send reliably empties it, and
+  // guessing would throw away what you wrote — so ask instead.
+  const guard = (label: string, send: () => void, force = false) => {
     if (!force && hasPendingInput?.()) {
-      setHeld({ kind, value });
+      setHeld({ label, send });
       return;
     }
     setHeld(null);
+    send();
+  };
 
-    // `/model` does not only retarget this session: the CLI also writes the
-    // name into ~/.claude/settings.json as the default for every new session
-    // in every project. This pill is a per-session control, so read the
-    // default first and put it back once the CLI has written. `/effort` has
-    // no such behaviour — both verified against a live session.
-    const restore =
-      kind === "model"
-        ? claudeModelDefault().catch(() => null)
-        : null;
+  /** Open claude's own picker; aiterm draws a dialog over it. */
+  const openModelPicker = (force = false) =>
+    guard("/model", () => { onOpenModelPicker?.(); close(); }, force);
+
+  const run = (kind: "model" | "effort", value: string, force = false) =>
+    guard(`/${kind} ${value}`, () => doRun(kind, value), force);
+
+  const doRun = (kind: "model" | "effort", value: string) => {
 
     onCommand?.(`/${kind} ${value}`);
-
-    restore?.then((previous) =>
-      restoreClaudeModelDefault(previous).catch(() => {}),
-    );
 
     if (sessionId) {
       setPicks((p) => {
@@ -368,33 +363,31 @@ export default function ComposerPills({
           )}
         </div>
       )}
-      {(open === "model" || open === "effort") && (
+      {open === "effort" && (
         <div className="cpill-panel cpill-choices">
           {held && (
             <div className="cpill-hold">
               <div className="cpill-hold-text">
-                Your prompt has unsent text. <b>/{held.kind} {held.value}</b> would be
-                added to the end of it and the whole thing sent as a message.
+                Your prompt has unsent text. <b>{held.label}</b> would be added to
+                the end of it and the whole thing sent as a message.
                 Send or clear what you typed first.
               </div>
               <div className="cpill-hold-acts">
                 <button
                   className="cpill-hold-go"
-                  onClick={() => run(held.kind, held.value, true)}
+                  onClick={() => { held.send(); setHeld(null); }}
                 >Send it anyway</button>
                 <button className="cpill-hold-no" onClick={() => setHeld(null)}>Cancel</button>
               </div>
             </div>
           )}
-          {(open === "model" ? MODELS : EFFORTS).map(([name, desc]) => {
-            const selected = open === "model"
-              ? shownModel === name
-              : shownEffort === name;
+          {EFFORTS.map(([name, desc]) => {
+            const selected = shownEffort === name;
             return (
               <button
                 key={name}
                 className={"cpill-choice" + (selected ? " on" : "")}
-                onClick={() => run(open, name)}
+                onClick={() => run("effort", name)}
               >
                 <span className="cpill-choice-name">
                   {name}
@@ -407,7 +400,7 @@ export default function ComposerPills({
           {/* With effort on auto every turn still records a concrete level, so
               say what it actually resolved to rather than implying `auto` is
               itself a setting the model ran at. */}
-          {open === "effort" && pick.effort === "auto" && choice.effort && (
+          {pick.effort === "auto" && choice.effort && (
             <div className="cpill-choice-note">
               Last turn ran at <b>{choice.effort}</b>
             </div>
@@ -415,12 +408,10 @@ export default function ComposerPills({
           {/* Say plainly that this is a request until a turn proves it. A
               `/model` can be refused — sonnet answering "Kept model as Opus 5"
               — and the pill should not present that as settled. */}
-          {((open === "model" && pendingModel) ||
-            (open === "effort" && pendingEffort && pick.effort !== "auto")) && (
+          {pendingEffort && pick.effort !== "auto" && (
             <div className="cpill-choice-note">
-              Asked for <b>{open === "model" ? pendingModel : pendingEffort}</b> —
-              the next turn will show what actually ran
-              {open === "model" && liveModel ? `, currently ${liveModel}` : ""}.
+              Asked for <b>{pendingEffort}</b> — the next turn will show what
+              actually ran.
             </div>
           )}
         </div>
@@ -433,7 +424,17 @@ export default function ComposerPills({
         </div>
       )}
       <div className="cpill-row">
-        {onCommand && pill("model", "◆", "Model", shownModel, pendingModel ? "pending" : "")}
+        {onCommand && onOpenModelPicker && (
+          <button
+            className={"cpill" + (pendingModel ? " pending" : "")}
+            onClick={() => openModelPicker()}
+            title="Choose a model — opens claude's picker as a dialog"
+          >
+            <span className="cpill-icon">◆</span>
+            <span className="cpill-label">Model</span>
+            <span className="cpill-count">{shownModel}</span>
+          </button>
+        )}
         {onCommand && pill(
           "effort", "≡", "Effort", shownEffort,
           pendingEffort && pick.effort !== "auto" ? "pending" : "",

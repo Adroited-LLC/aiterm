@@ -125,12 +125,33 @@ export default function App() {
   // *this* appearance, and clears itself once the screen goes away.
   const [tui, setTui] = useState<ModelPicker | null>(null);
   const [tuiDismissed, setTuiDismissed] = useState(false);
+  // Only dress up a picker *we* opened. Typing /model yourself is a request for
+  // the terminal, and answering it with our own dialog would be taking the
+  // terminal away from someone who just asked for it. Holds the time the pill
+  // asked, so a picker that never appears stops arming us.
+  const pickerArmed = useRef<number | null>(null);
+  const openModelPicker = useCallback(() => {
+    if (activeTab === null) return;
+    pickerArmed.current = Date.now();
+    handles.current.get(activeTab)?.sendComposed("/model");
+  }, [activeTab]);
+
   useEffect(() => {
     const id = window.setInterval(() => {
       const handle = activeTab === null ? undefined : handles.current.get(activeTab);
       const found = handle ? detect(handle.screen()) : null;
+      if (!found) {
+        // Gone, or not painted yet. Give it a moment before disarming, so
+        // arming a beat before claude draws does not cancel itself.
+        if (pickerArmed.current && Date.now() - pickerArmed.current > 4000) {
+          pickerArmed.current = null;
+        }
+        setTui(null);
+        setTuiDismissed(false);
+        return;
+      }
+      if (!pickerArmed.current) return; // theirs, not ours — leave it alone
       setTui((prev) => {
-        if (!found) return null;
         // Only replace when something actually changed, so the dialog is not
         // rebuilt four times a second while it sits there.
         if (
@@ -141,7 +162,6 @@ export default function App() {
         ) return prev;
         return found;
       });
-      if (!found) setTuiDismissed(false);
     }, 250);
     return () => window.clearInterval(id);
   }, [activeTab]);
@@ -772,6 +792,7 @@ export default function App() {
               handles.current.get(activeTab)?.focus()}
             hasPendingInput={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.pendingInput() ?? false}
+            onOpenModelPicker={activeTab === null ? undefined : openModelPicker}
           />}
         </div>
 
