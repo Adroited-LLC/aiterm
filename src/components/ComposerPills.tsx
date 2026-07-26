@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import GitPanel from "./GitPanel";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
-  homeAbbrev, openPath, relTime,
+  claudeModelDefault, homeAbbrev, openPath, relTime, restoreClaudeModelDefault,
   sessionAgents, sessionArtifacts, sessionModel, sessionTasks,
 } from "../ipc";
 
@@ -41,18 +41,26 @@ function shortModel(id: string | null): string {
 /**
  * What was last *chosen* here, per session.
  *
- * The transcript records what each turn actually ran at, which is not the same
- * question: pick `auto` and every record still names a concrete level, so
- * reading the file can never show `auto` back to you. Nothing on disk holds the
- * selection either — it lives in the running claude. So the chooser remembers
- * its own choice, and falls back to the observed value when it has none.
+ * Clicking a model is a request, not a fact. It can be refused (`/model sonnet`
+ * answering "Kept model as Opus 5"), or swallowed by a prompt you were halfway
+ * through typing. The transcript is the fact: it records what each turn
+ * actually ran at.
  *
- * The gap this leaves is a `/model` typed straight into the terminal: we won't
- * see it, and the pill will keep showing our older pick until a turn runs and
- * the fallback catches up.
+ * Showing only the request lies once it fails. Showing only the transcript
+ * ignores you until the next turn runs, which reads as the pill being broken.
+ * So show the request immediately, marked pending, and let the transcript
+ * overrule it the moment a turn settles the question — which is what `seenAt`
+ * detects: the timestamp of the newest assistant record when the click
+ * happened. Once that moves, a turn has run and the file wins.
+ *
+ * `auto` effort is the exception that outlives settling, because every turn
+ * resolves to a concrete level and so `auto` can never appear in a transcript.
  */
 const PICK_KEY = "aiterm.composerPick";
-type Picks = Record<string, { model?: string; effort?: string }>;
+type Picks = Record<
+  string,
+  { model?: string; effort?: string; seenAt?: string | null }
+>;
 
 function loadPicks(): Picks {
   try {
@@ -112,10 +120,14 @@ interface Props {
    *  into the terminal — never when the click went to other chrome, which owns
    *  its own focus. */
   onDismiss?: () => void;
+  /** Whether the focused terminal has unsent text in its input line. A slash
+   *  command typed into a non-empty prompt is appended to it and the whole
+   *  thing is submitted as one message, so we ask before doing that. */
+  hasPendingInput?: () => boolean;
 }
 
 export default function ComposerPills({
-  sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss,
+  sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss, hasPendingInput,
 }: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
@@ -123,14 +135,17 @@ export default function ComposerPills({
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
-  const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null });
+  const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null, at: null });
   const [picks, setPicks] = useState<Picks>(loadPicks);
+  /** A choice held back because the prompt was not empty. */
+  const [held, setHeld] = useState<{ kind: "model" | "effort"; value: string } | null>(null);
   const pick = (sessionId && picks[sessionId]) || {};
 
   /** One exit path for every way a panel closes, so the keyboard always ends
    *  up in the same place. */
   const close = () => {
     setOpen(null);
+    setHeld(null);
     onDismiss?.();
   };
 
@@ -164,7 +179,7 @@ export default function ComposerPills({
       setTasks([]);
       setArtifacts([]);
       setAgents([]);
-      setChoice({ model: null, effort: null });
+      setChoice({ model: null, effort: null, at: null });
       return;
     }
     let stop = false;
@@ -182,11 +197,40 @@ export default function ComposerPills({
   // Sending is fire-and-forget: claude writes the change into the transcript,
   // and the next poll reads it back. Nothing optimistic to get out of step —
   // if the command doesn't take, the pill keeps showing the truth.
-  const run = (kind: "model" | "effort", value: string) => {
+  const run = (kind: "model" | "effort", value: string, force = false) => {
+    // A slash command is only a command when it starts the line. Typed into a
+    // prompt you were halfway through writing, it becomes the tail of that
+    // sentence and Enter sends the whole thing to the model. We cannot clear
+    // claude's input for you — nothing we can send reliably empties it, and
+    // guessing would throw away what you wrote — so ask instead.
+    if (!force && hasPendingInput?.()) {
+      setHeld({ kind, value });
+      return;
+    }
+    setHeld(null);
+
+    // `/model` does not only retarget this session: the CLI also writes the
+    // name into ~/.claude/settings.json as the default for every new session
+    // in every project. This pill is a per-session control, so read the
+    // default first and put it back once the CLI has written. `/effort` has
+    // no such behaviour — both verified against a live session.
+    const restore =
+      kind === "model"
+        ? claudeModelDefault().catch(() => null)
+        : null;
+
     onCommand?.(`/${kind} ${value}`);
+
+    restore?.then((previous) =>
+      restoreClaudeModelDefault(previous).catch(() => {}),
+    );
+
     if (sessionId) {
       setPicks((p) => {
-        const next = { ...p, [sessionId]: { ...p[sessionId], [kind]: value } };
+        const next = {
+          ...p,
+          [sessionId]: { ...p[sessionId], [kind]: value, seenAt: choice.at },
+        };
         try {
           localStorage.setItem(PICK_KEY, JSON.stringify(next));
         } catch { /* private mode / quota — the pill just won't persist */ }
@@ -195,6 +239,22 @@ export default function ComposerPills({
     }
     close();
   };
+
+  // A turn has run since the click, so the transcript has settled the question
+  // and takes over from what was asked for.
+  //
+  // A pick with no `seenAt` was written before picks recorded when they were
+  // made. There is no way to tell whether a turn has run since, so treat it as
+  // settled and let the transcript win — the alternative leaves it pending for
+  // ever, quietly overriding the truth until the pill is clicked again.
+  const settled =
+    !("seenAt" in pick) || choice.at !== pick.seenAt;
+  const liveModel = choice.model ? shortModel(choice.model) : null;
+  const pendingModel = settled ? null : pick.model ?? null;
+  const pendingEffort = settled ? null : pick.effort ?? null;
+  const shownModel = pendingModel ?? liveModel ?? "—";
+  const shownEffort =
+    pick.effort === "auto" ? "auto" : pendingEffort ?? choice.effort ?? "—";
 
   const done = tasks.filter((t) => t.status === "completed").length;
   const running = agents.filter((a) => a.status === "running").length;
@@ -310,10 +370,26 @@ export default function ComposerPills({
       )}
       {(open === "model" || open === "effort") && (
         <div className="cpill-panel cpill-choices">
+          {held && (
+            <div className="cpill-hold">
+              <div className="cpill-hold-text">
+                Your prompt has unsent text. <b>/{held.kind} {held.value}</b> would be
+                added to the end of it and the whole thing sent as a message.
+                Send or clear what you typed first.
+              </div>
+              <div className="cpill-hold-acts">
+                <button
+                  className="cpill-hold-go"
+                  onClick={() => run(held.kind, held.value, true)}
+                >Send it anyway</button>
+                <button className="cpill-hold-no" onClick={() => setHeld(null)}>Cancel</button>
+              </div>
+            </div>
+          )}
           {(open === "model" ? MODELS : EFFORTS).map(([name, desc]) => {
             const selected = open === "model"
-              ? (pick.model ?? shortModel(choice.model)) === name
-              : (pick.effort ?? choice.effort) === name;
+              ? shownModel === name
+              : shownEffort === name;
             return (
               <button
                 key={name}
@@ -336,6 +412,17 @@ export default function ComposerPills({
               Last turn ran at <b>{choice.effort}</b>
             </div>
           )}
+          {/* Say plainly that this is a request until a turn proves it. A
+              `/model` can be refused — sonnet answering "Kept model as Opus 5"
+              — and the pill should not present that as settled. */}
+          {((open === "model" && pendingModel) ||
+            (open === "effort" && pendingEffort && pick.effort !== "auto")) && (
+            <div className="cpill-choice-note">
+              Asked for <b>{open === "model" ? pendingModel : pendingEffort}</b> —
+              the next turn will show what actually ran
+              {open === "model" && liveModel ? `, currently ${liveModel}` : ""}.
+            </div>
+          )}
         </div>
       )}
       {open === "git" && (
@@ -346,8 +433,11 @@ export default function ComposerPills({
         </div>
       )}
       <div className="cpill-row">
-        {onCommand && pill("model", "◆", "Model", pick.model ?? shortModel(choice.model))}
-        {onCommand && pill("effort", "≡", "Effort", pick.effort ?? choice.effort ?? "—")}
+        {onCommand && pill("model", "◆", "Model", shownModel, pendingModel ? "pending" : "")}
+        {onCommand && pill(
+          "effort", "≡", "Effort", shownEffort,
+          pendingEffort && pick.effort !== "auto" ? "pending" : "",
+        )}
         {sessionId && pill("tasks", "◑", "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
         {sessionId && pill("artifacts", "▤", "Artifacts", artifacts.length ? `${artifacts.length}` : "")}
         {sessionId && pill(

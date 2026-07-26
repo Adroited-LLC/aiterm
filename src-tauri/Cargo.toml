@@ -1,6 +1,6 @@
 [package]
 name = "aiterm"
-version = "0.5.2"
+version = "0.5.10"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -21,7 +21,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: rewriting a settings file must not reorder the keys the user
+# put there. Without it serde_json sorts them alphabetically on the way out.
+serde_json = { version = "1", features = ["preserve_order"] }
 portable-pty = "0.9.0"
 git2 = "0.21.0"
 dirs = "6.0.0"

@@ -1312,6 +1312,39 @@ body.dragging * { pointer-events: none; }
   flex-shrink: 0;
 }
 
+/* A choice that has been asked for but not yet confirmed by a turn. Dotted
+   rather than solid: it is a request, not a fact. */
+.cpill.pending .cpill-count {
+  font-style: italic;
+  border-bottom: 1px dotted currentColor;
+}
+
+/* Shown in place of sending, when the prompt already has unsent text. */
+.cpill-hold {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px 10px;
+  margin-bottom: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--yellow);
+  border-radius: 6px;
+}
+.cpill-hold-text { font-size: 11px; line-height: 1.45; color: var(--text-dim); }
+.cpill-hold-text b { color: var(--text); font-family: var(--font-mono); }
+.cpill-hold-acts { display: flex; gap: 6px; }
+.cpill-hold-go, .cpill-hold-no {
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.cpill-hold-go:hover { border-color: var(--yellow); color: var(--yellow); }
+.cpill-hold-no:hover { border-color: var(--accent); color: var(--accent); }
+
 .set-tabs { display: flex; gap: 2px; }
 .set-tab {
   background: none;

@@ -71,8 +71,18 @@ fn fc_families(args: &[&str]) -> Vec<String> {
 }
 
 /// Every font family installed, flagged with whether it is fixed-pitch.
+///
+/// Async, like everything here that shells out. Tauri runs a plain `fn`
+/// command on the main thread, so a slow subprocess freezes the window —
+/// harmless for one fc-list, fatal for a `dnf install`.
 #[tauri::command]
-pub fn list_fonts() -> Vec<FontFamily> {
+pub async fn list_fonts() -> Vec<FontFamily> {
+    tauri::async_runtime::spawn_blocking(list_fonts_blocking)
+        .await
+        .unwrap_or_default()
+}
+
+fn list_fonts_blocking() -> Vec<FontFamily> {
     let mono = fc_families(&[":mono"]);
     fc_families(&[])
         .into_iter()
@@ -87,7 +97,13 @@ pub fn list_fonts() -> Vec<FontFamily> {
 /// checking for the family, because a package can be installed while its
 /// family name differs from what we predicted.
 #[tauri::command]
-pub fn font_packages() -> Vec<FontPackage> {
+pub async fn font_packages() -> Vec<FontPackage> {
+    tauri::async_runtime::spawn_blocking(font_packages_blocking)
+        .await
+        .unwrap_or_default()
+}
+
+fn font_packages_blocking() -> Vec<FontPackage> {
     PACKAGES
         .iter()
         .map(|(name, package, note)| FontPackage {
@@ -111,7 +127,13 @@ pub fn font_packages() -> Vec<FontPackage> {
 /// terminal-style password prompt is the one thing that cannot work here —
 /// there is no tty behind the button.
 #[tauri::command]
-pub fn install_font_package(package: String) -> Result<String, String> {
+pub async fn install_font_package(package: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || install_font_package_blocking(package))
+        .await
+        .map_err(|e| format!("installing font package: {e}"))?
+}
+
+fn install_font_package_blocking(package: String) -> Result<String, String> {
     if !PACKAGES.iter().any(|(_, p, _)| *p == package) {
         return Err(format!("{package} is not an offered font package"));
     }
@@ -155,7 +177,13 @@ fn user_font_dir() -> Option<PathBuf> {
 
 /// Copy font files into the user font directory. Returns how many landed.
 #[tauri::command]
-pub fn install_font_files(paths: Vec<String>) -> Result<usize, String> {
+pub async fn install_font_files(paths: Vec<String>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || install_font_files_blocking(paths))
+        .await
+        .map_err(|e| format!("installing font files: {e}"))?
+}
+
+fn install_font_files_blocking(paths: Vec<String>) -> Result<usize, String> {
     let dir = user_font_dir().ok_or_else(|| "no home directory".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
@@ -198,7 +226,7 @@ mod tests {
 
     #[test]
     fn rejects_packages_outside_the_curated_list() {
-        let err = install_font_package("bash".into()).unwrap_err();
+        let err = install_font_package_blocking("bash".into()).unwrap_err();
         assert!(err.contains("not an offered font package"), "{err}");
     }
 
@@ -231,7 +259,7 @@ mod tests {
 
     #[test]
     fn refuses_non_font_files() {
-        let err = install_font_files(vec!["/etc/hosts".into()]).unwrap_err();
+        let err = install_font_files_blocking(vec!["/etc/hosts".into()]).unwrap_err();
         assert!(err.contains("not a font file"), "{err}");
     }
 }
