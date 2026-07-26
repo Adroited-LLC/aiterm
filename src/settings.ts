@@ -243,39 +243,13 @@ export function termTheme(s: AppSettings) {
 
 /* ---------- installed-font detection ---------- */
 
-const MONO_CANDIDATES = [
-  "JetBrainsMono Nerd Font", "JetBrains Mono", "Fira Code", "Hack",
-  "Source Code Pro", "Cascadia Code", "IBM Plex Mono", "Iosevka",
-  "Inconsolata", "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono",
-  "Noto Sans Mono", "Adwaita Mono",
-];
-
-const UI_CANDIDATES = [
-  "Inter", "Roboto", "Ubuntu", "Cantarell", "Noto Sans", "Open Sans",
-  "Source Sans 3", "Fira Sans", "Adwaita Sans", "DejaVu Sans",
-  "Liberation Sans", "Segoe UI",
-];
-
-/** Webviews can't enumerate system fonts — probe candidates by comparing
- *  rendered widths against both generic fallbacks. */
-export function fontInstalled(name: string): boolean {
-  const ctx = document.createElement("canvas").getContext("2d");
-  if (!ctx) return false;
-  const sample = "mmmMMMwwwilli170O";
-  const width = (font: string) => {
-    ctx.font = `16px ${font}`;
-    return ctx.measureText(sample).width;
-  };
-  return (
-    width(`"${name}", monospace`) !== width("monospace") ||
-    width(`"${name}", sans-serif`) !== width("sans-serif")
-  );
-}
-
-export function installedMonoFonts(): string[] {
-  return MONO_CANDIDATES.filter(fontInstalled);
-}
-
-export function installedUiFonts(): string[] {
-  return UI_CANDIDATES.filter(fontInstalled);
-}
+/**
+ * Font discovery lives in the backend now — see `src-tauri/src/fonts.rs`.
+ *
+ * This used to be a canvas width-probe against a hardcoded candidate list:
+ * render a sample string in `"Name", monospace` and in plain `monospace`, and
+ * call the font installed when the widths differed. It worked, but it could
+ * only ever find fonts someone had thought to list, so the picker quietly
+ * offered a fraction of what was actually on the machine. fontconfig knows
+ * the real answer — `listFonts()` in ipc.ts asks it.
+ */

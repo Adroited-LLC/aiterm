@@ -1,3 +1,4 @@
+pub mod fonts;
 pub mod fsx;
 pub mod git;
 pub mod indexer;
@@ -10,6 +11,7 @@ pub mod watcher;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty::PtyManager::default())
         .manage(watcher::WatchState::default())
@@ -39,6 +41,10 @@ pub fn run() {
             sessions::claude_permission_mode,
             sessions::session_model,
             usage::usage_limits,
+            fonts::list_fonts,
+            fonts::font_packages,
+            fonts::install_font_package,
+            fonts::install_font_files,
             watcher::watch_project,
             fsx::list_dir,
             fsx::open_path,
