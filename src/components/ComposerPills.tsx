@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import GitPanel from "./GitPanel";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
@@ -107,19 +107,57 @@ interface Props {
   /** Run a slash command in the live terminal (adds Enter). Absent when no
    *  terminal is focused, which is what disables the model/effort pills. */
   onCommand?: (text: string) => void;
+  /** Put the keyboard back in the terminal. Called when a panel is dismissed
+   *  deliberately (Escape, a choice, re-clicking the pill) or by clicking back
+   *  into the terminal — never when the click went to other chrome, which owns
+   *  its own focus. */
+  onDismiss?: () => void;
 }
 
 export default function ComposerPills({
-  sessionId, projectRoot, usage, usageAsOf, onCommand,
+  sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss,
 }: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
   const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null });
   const [picks, setPicks] = useState<Picks>(loadPicks);
   const pick = (sessionId && picks[sessionId]) || {};
+
+  /** One exit path for every way a panel closes, so the keyboard always ends
+   *  up in the same place. */
+  const close = () => {
+    setOpen(null);
+    onDismiss?.();
+  };
+
+  // A panel is an overlay covering part of the terminal, so it behaves like
+  // one: Escape closes it, and so does a click anywhere outside it. Clicking
+  // back into the terminal hands the keyboard back too — clicking other chrome
+  // (sessions, git, the top bar) does not, because that click is the user
+  // saying where focus should go, and stealing it back would fight them.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    const onDown = (e: PointerEvent) => {
+      const t = e.target as Node | null;
+      if (t && wrapRef.current?.contains(t)) return;
+      setOpen(null);
+      if (t instanceof Element && t.closest(".terminal-panel")) onDismiss?.();
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("pointerdown", onDown, true);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onDown, true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -155,7 +193,7 @@ export default function ComposerPills({
         return next;
       });
     }
-    setOpen(null);
+    close();
   };
 
   const done = tasks.filter((t) => t.status === "completed").length;
@@ -165,7 +203,7 @@ export default function ComposerPills({
   const pill = (key: PanelKey, icon: string, label: string, count: string, extra = "") => (
     <button
       className={"cpill" + (open === key ? " on" : "") + (extra ? " " + extra : "")}
-      onClick={() => setOpen((o) => (o === key ? null : key))}
+      onClick={() => (open === key ? close() : setOpen(key))}
       title={open === key ? `Hide ${label.toLowerCase()}` : `Show ${label.toLowerCase()}`}
     >
       <span className="cpill-icon">{icon}</span>
@@ -175,7 +213,7 @@ export default function ComposerPills({
   );
 
   return (
-    <div className="cpill-wrap">
+    <div className="cpill-wrap" ref={wrapRef}>
       {open === "tasks" && (
         <div className="cpill-panel">
           {tasks.length === 0 ? (
