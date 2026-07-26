@@ -8,7 +8,8 @@ import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
 import TuiModelPicker from "./components/TuiModelPicker";
-import { ModelPicker, detect } from "./term/screen";
+import TuiPermission from "./components/TuiPermission";
+import { Detected, detect } from "./term/screen";
 import AgentPanel from "./components/AgentPanel";
 import SettingsModal from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
@@ -123,7 +124,7 @@ export default function App() {
   // hanging this on, and reading ~40 already-parsed lines four times a second
   // is nothing. `dismissed` remembers that you asked for the raw terminal for
   // *this* appearance, and clears itself once the screen goes away.
-  const [tui, setTui] = useState<ModelPicker | null>(null);
+  const [tui, setTui] = useState<Detected | null>(null);
   const [tuiDismissed, setTuiDismissed] = useState(false);
   // Only dress up a picker *we* opened. Typing /model yourself is a request for
   // the terminal, and answering it with our own dialog would be taking the
@@ -150,15 +151,19 @@ export default function App() {
         setTuiDismissed(false);
         return;
       }
-      if (!pickerArmed.current) return; // theirs, not ours — leave it alone
+      // A permission prompt is never something we asked for — it interrupts
+      // you, which is exactly when a real dialog earns its place. Only the
+      // model picker has to be armed, because typing /model yourself is a
+      // request for the terminal.
+      if (found.kind === "model-picker" && !pickerArmed.current) return;
       setTui((prev) => {
         // Only replace when something actually changed, so the dialog is not
         // rebuilt four times a second while it sits there.
         if (
           prev &&
+          prev.kind === found.kind &&
           prev.highlighted === found.highlighted &&
-          prev.options.length === found.options.length &&
-          prev.effort === found.effort
+          prev.options.length === found.options.length
         ) return prev;
         return found;
       });
@@ -771,12 +776,21 @@ export default function App() {
               />
             )}
             {tui && !tuiDismissed && activeTab !== null && (
-              <TuiModelPicker
-                picker={tui}
-                write={(d) => handles.current.get(activeTab)?.write(d)}
-                screen={() => handles.current.get(activeTab)?.screen() ?? []}
-                onDismiss={() => setTuiDismissed(true)}
-              />
+              tui.kind === "model-picker" ? (
+                <TuiModelPicker
+                  picker={tui}
+                  write={(d) => handles.current.get(activeTab)?.write(d)}
+                  screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                  onDismiss={() => setTuiDismissed(true)}
+                />
+              ) : (
+                <TuiPermission
+                  request={tui}
+                  write={(d) => handles.current.get(activeTab)?.write(d)}
+                  screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                  onDismiss={() => setTuiDismissed(true)}
+                />
+              )
             )}
           </div>
           {/* onCommand goes to the focused terminal, so the pills only offer

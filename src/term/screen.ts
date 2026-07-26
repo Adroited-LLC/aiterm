@@ -85,9 +85,75 @@ export function detectModelPicker(screen: Screen): ModelPicker | null {
   return { kind: "model-picker", options, highlighted, effort };
 }
 
+export interface PermissionOption {
+  number: number;
+  label: string;
+}
+
+export interface PermissionRequest {
+  kind: "permission";
+  /** "Bash command", "Edit file", … — what claude is asking about. */
+  title: string;
+  /** The command or diff lines it printed underneath. */
+  detail: string[];
+  options: PermissionOption[];
+  highlighted: number;
+}
+
+const OPTION = /^\s*(❯)?\s*(\d+)\.\s+(.+?)\s*$/;
+const RULE = /^[\s─━]{10,}$/;
+
+/**
+ * claude's tool-permission prompt, or null.
+ *
+ * Anchored on the question and the footer together. The stakes here are higher
+ * than for the model picker — mistaking another screen for this one and sending
+ * a key would approve something nobody asked to approve — so the shape has to
+ * match exactly or we show nothing.
+ */
+export function detectPermission(screen: Screen): PermissionRequest | null {
+  const q = screen.findIndex((l) => /^\s*Do you want to proceed\?\s*$/.test(l));
+  if (q < 0) return null;
+  const footerAt = screen.findIndex(
+    (l, i) => i > q && l.includes("Esc to cancel"),
+  );
+  if (footerAt < 0) return null;
+
+  const options: PermissionOption[] = [];
+  let highlighted = -1;
+  for (let i = q + 1; i < footerAt; i++) {
+    const m = OPTION.exec(screen[i]);
+    if (!m) continue;
+    if (m[1]) highlighted = options.length;
+    options.push({ number: Number(m[2]), label: m[3].trim() });
+  }
+  if (options.length < 2 || highlighted < 0) return null;
+  if (options.some((o, i) => o.number !== i + 1)) return null;
+
+  // Walk back to the rule above the question; what sits between is what claude
+  // is asking about, with the first line as its heading.
+  let top = q - 1;
+  while (top >= 0 && !RULE.test(screen[top])) top--;
+  const block = screen
+    .slice(top + 1, q)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!block.length) return null;
+
+  return {
+    kind: "permission",
+    title: block[0],
+    detail: block.slice(1),
+    options,
+    highlighted,
+  };
+}
+
+export type Detected = ModelPicker | PermissionRequest;
+
 /** Every detector we know. Order matters only for overlapping screens. */
-export function detect(screen: Screen): ModelPicker | null {
-  return detectModelPicker(screen);
+export function detect(screen: Screen): Detected | null {
+  return detectPermission(screen) ?? detectModelPicker(screen);
 }
 
 /**
