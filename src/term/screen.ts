@@ -272,6 +272,11 @@ export interface RewindPicker {
   kind: "rewind-picker";
   points: RewindPoint[];
   highlighted: number;
+  /** From claude's own "N more above" / "N below" indicators, 0 when absent.
+   *  `above === 0` is how we know the window is at the top — exact, rather
+   *  than inferring it from a read that stopped adding anything. */
+  above: number;
+  below: number;
 }
 
 export interface RewindConfirm {
@@ -310,6 +315,12 @@ export function detectRewindPicker(screen: Screen): RewindPicker | null {
   );
   if (foot < 0) return null;
 
+  // claude paginates the list and marks the remainder: "4 more above",
+  // "35 below". They are not restore points, and their text changes on every
+  // scroll — left in, they appeared as rows *and* defeated the harvest's
+  // stop condition, since every read looked like it had found something new.
+  const MORE = /^[↑↓⌃⌄\s]*(\d+)\s*(?:more\s*)?(above|below)?\s*(?:more)?\s*$/i;
+
   // A change line is a filename followed only by +N/-N counts. Anything else
   // in the region is a prompt. Matching on that shape rather than "does it
   // contain a number" keeps a prompt like "bump version to +1" from being
@@ -318,10 +329,19 @@ export function detectRewindPicker(screen: Screen): RewindPicker | null {
 
   const points: RewindPoint[] = [];
   let highlighted = -1;
+  let above = 0;
+  let below = 0;
   for (let i = intro + 1; i < foot; i++) {
     const raw = screen[i];
     const text = raw.replace(/^\s*❯\s*/, "").trim();
     if (!text) continue;
+    const more = MORE.exec(text);
+    if (more && /above|below|↑|↓/i.test(text)) {
+      const n = Number(more[1]);
+      if (/above|↑/i.test(text)) above = n;
+      else below = n;
+      continue;
+    }
     if (points.length && CHANGE.test(text) && !points[points.length - 1].changes) {
       points[points.length - 1].changes = text;
       continue;
@@ -334,7 +354,7 @@ export function detectRewindPicker(screen: Screen): RewindPicker | null {
     });
   }
   if (points.length < 2 || highlighted < 0) return null;
-  return { kind: "rewind-picker", points, highlighted };
+  return { kind: "rewind-picker", points, highlighted, above, below };
 }
 
 /**

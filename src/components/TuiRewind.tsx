@@ -41,6 +41,9 @@ export default function TuiRewind({ step, write, screen, onDismiss }: Props) {
   const [error, setError] = useState<string | null>(null);
   /** The whole list, gathered by paging claude's own. null until gathered. */
   const [allPoints, setAllPoints] = useState<RewindPoint[] | null>(null);
+  /** How many gathered so far, so a long list shows progress rather than a
+   *  frozen dialog. */
+  const [found, setFound] = useState(0);
 
   // Only the drawn slice of the picker is readable, so page up through it once
   // on open and keep the result. Harmless: nothing commits until Enter.
@@ -51,10 +54,17 @@ export default function TuiRewind({ step, write, screen, onDismiss }: Props) {
     harvestUpwards(
       () => {
         const p = detectRewindPicker(screen());
-        return p && { items: p.points, highlighted: p.highlighted };
+        return p && {
+          items: p.points,
+          highlighted: p.highlighted,
+          // claude says how many rows remain above; none means we are there.
+          atTop: p.above === 0,
+        };
       },
       write,
       pointKey,
+      200,
+      setFound,
     )
       .then((points) => !stop && setAllPoints(points))
       .catch((e) => !stop && setError(String(e)))
@@ -186,7 +196,7 @@ export default function TuiRewind({ step, write, screen, onDismiss }: Props) {
           <span className="tui-hint">
             {step.kind === "rewind-picker"
               ? busy && !allPoints
-                ? "Reading the full list from claude…"
+                ? `Reading the full list from claude… ${found} so far`
                 : `${(allPoints ?? step.points).length} points · nothing changes until you confirm`
               : "This cannot be undone from here."}
           </span>
