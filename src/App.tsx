@@ -704,7 +704,7 @@ export default function App() {
                 onRegister={registerHandle}
                 onActivity={noteActivity}
                 onAttention={noteAttention}
-                autoFocus={!showComposer}
+                autoFocus
                 fontSize={termFont}
                 fontFamily={xtermFont}
                 theme={xtermTheme}
@@ -730,6 +730,8 @@ export default function App() {
             usageAsOf={usageFresh ? null : usageAt || null}
             onCommand={activeTab === null ? undefined : (text) =>
               handles.current.get(activeTab)?.sendComposed(text)}
+            onDismiss={activeTab === null ? undefined : () =>
+              handles.current.get(activeTab)?.focus()}
           />}
         </div>
 

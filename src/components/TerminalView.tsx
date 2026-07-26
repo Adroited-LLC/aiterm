@@ -47,6 +47,9 @@ export interface TermHandle {
   /** Send composed input from the bottom input box (adds Enter, wraps
    *  multiline text in bracketed paste when the running app supports it). */
   sendComposed: (text: string) => void;
+  /** Put the keyboard back in the terminal — used when a chrome element that
+   *  took focus (a composer pill panel) is dismissed. */
+  focus: () => void;
 }
 
 interface Props {
@@ -57,7 +60,10 @@ interface Props {
   onActivity: (key: number) => void;
   /** Bell = the program wants eyes (claude prompts ring it); typing clears. */
   onAttention: (key: number, on: boolean) => void;
-  /** Focus the terminal itself when it becomes active (composer hidden). */
+  /** Focus the terminal when it becomes active. Once true only while the
+   *  composer was hidden, back when the composer held a text input that would
+   *  have been fighting for the same keystrokes. It is a pill strip now, so
+   *  the terminal is always where typing should land. */
   autoFocus: boolean;
   fontSize: number;
   fontFamily: string;
@@ -150,6 +156,7 @@ export default function TerminalView({
           }
           ptyWrite(id, payload);
         },
+        focus: () => term.focus(),
       });
     })();
 

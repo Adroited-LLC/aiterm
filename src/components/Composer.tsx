@@ -16,7 +16,7 @@ import { UsageBar } from "../ipc";
  * toggle keeps working unchanged.
  */
 export default function Composer({
-  sessionId, projectRoot, usage, usageAsOf, onCommand,
+  sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss,
 }: {
   sessionId: string | null;
   projectRoot: string | null;
@@ -25,6 +25,7 @@ export default function Composer({
    *  refreshed this run. null once a live call has succeeded. */
   usageAsOf: number | null;
   onCommand?: (text: string) => void;
+  onDismiss?: () => void;
 }) {
   return (
     <div className="composer-wrap">
@@ -34,6 +35,7 @@ export default function Composer({
         usage={usage}
         usageAsOf={usageAsOf}
         onCommand={onCommand}
+        onDismiss={onDismiss}
       />
     </div>
   );
