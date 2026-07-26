@@ -184,18 +184,28 @@ export function readModelOutcome(
 /**
  * The permission mode claude's status line is advertising.
  *
- * Four modes, cycled with shift+tab. The fourth only exists when the session
- * was launched with `--allow-dangerously-skip-permissions`, which *enables*
- * bypass without turning it on — verified by cycling a live session with and
- * without the flag:
+ * Read rather than tracked, so a shift+tab typed straight into the terminal
+ * stays in step with the pill for free — and so a mode we cannot set is still
+ * reported honestly.
+ *
+ * shift+tab cycles four of them. Bypass only joins the loop when the session
+ * was launched with `--allow-dangerously-skip-permissions`, which enables it
+ * without selecting it — verified by cycling a live session both ways:
  *
  *   without:  manual → accept edits → plan → manual
  *   with:     manual → accept edits → plan → bypass permissions → manual
  *
- * Reading it rather than tracking it means a shift+tab typed straight into the
- * terminal stays in step with the pill for free.
+ * `auto` is outside the loop entirely: it is granted at launch, and once left
+ * it cannot be returned to without a new session.
+ */
+/**
+ * Every mode the status line can show. `auto` is here but not in CYCLE_MODES:
+ * shift+tab cannot reach it, so it can be displayed and left, never chosen.
+ * Leaving it out of this list entirely was worse — the mode went unrecognised
+ * and the pill hid itself just when it had the most to say.
  */
 export const PERMISSION_MODES = [
+  "auto",
   "manual",
   "accept edits",
   "plan",
@@ -203,6 +213,19 @@ export const PERMISSION_MODES = [
 ] as const;
 
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
+
+/**
+ * What shift+tab actually cycles through, in order. The menu offers exactly
+ * this and nothing else: a control the CLI does not have is a lie, however
+ * convenient. Leaving auto means you cannot return to it without restarting
+ * the session — worth saying out loud rather than hiding.
+ */
+export const CYCLE_MODES: readonly PermissionMode[] = [
+  "manual",
+  "accept edits",
+  "plan",
+  "bypass permissions",
+];
 
 export function detectPermissionMode(screen: Screen): PermissionMode | null {
   // Search upward: the status line is the last thing drawn, and the same words
@@ -212,6 +235,7 @@ export function detectPermissionMode(screen: Screen): PermissionMode | null {
     if (/bypass permissions on/i.test(line)) return "bypass permissions";
     if (/accept edits on/i.test(line)) return "accept edits";
     if (/plan mode on/i.test(line)) return "plan";
+    if (/auto mode on/i.test(line)) return "auto";
     if (/manual mode on/i.test(line)) return "manual";
   }
   return null;

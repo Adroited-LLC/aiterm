@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import GitPanel from "./GitPanel";
-import { PERMISSION_MODES, PermissionMode } from "../term/screen";
+import { CYCLE_MODES, PermissionMode } from "../term/screen";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
   homeAbbrev, openPath, relTime,
@@ -15,6 +15,7 @@ const MODEL_ALIASES = ["opus", "opusplan", "sonnet", "haiku", "fable"];
 
 /** What each permission mode actually means, in claude's own terms. */
 const PERM_DESC: Record<PermissionMode, string> = {
+  "auto": "Claude's classifier vets each action and asks when unsure",
   "manual": "Ask before every tool call",
   "accept edits": "File edits go through, everything else asks",
   "plan": "Research and plan only — no changes until you approve",
@@ -432,7 +433,7 @@ export default function ComposerPills({
       )}
       {open === "perms" && (
         <div className="cpill-panel cpill-choices">
-          {PERMISSION_MODES.map((m) => (
+          {CYCLE_MODES.map((m) => (
             <button
               key={m}
               className={"cpill-choice" + (permMode === m ? " on" : "")}
@@ -452,6 +453,8 @@ export default function ComposerPills({
           {permErr && <div className="cpill-choice-note">{permErr}</div>}
           <div className="cpill-choice-note">
             Same as shift+tab in the terminal — this session only, nothing saved.
+            {permMode === "auto" &&
+              " Auto is not in the cycle: leaving it needs a new session to get back."}
           </div>
         </div>
       )}
