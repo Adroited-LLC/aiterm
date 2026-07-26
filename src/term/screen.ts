@@ -112,7 +112,10 @@ const RULE = /^[\s─━]{10,}$/;
  * match exactly or we show nothing.
  */
 export function detectPermission(screen: Screen): PermissionRequest | null {
-  const q = screen.findIndex((l) => /^\s*Do you want to proceed\?\s*$/.test(l));
+  // The wording is per-tool — "Do you want to proceed?" for a Bash command,
+  // "Do you want to create hello.txt?" for a Write, and so on. The shape is
+  // what is stable, so anchor on that rather than on any one tool's sentence.
+  const q = screen.findIndex((l) => /^\s*Do you want to .+\?\s*$/.test(l));
   if (q < 0) return null;
   const footerAt = screen.findIndex(
     (l, i) => i > q && l.includes("Esc to cancel"),
