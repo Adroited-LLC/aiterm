@@ -8,6 +8,8 @@ pub mod usage;
 pub mod watcher;
 pub mod winstate;
 
+use tauri::Manager;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -67,9 +69,20 @@ pub fn run() {
             // Push sessions-list refreshes when Claude's transcripts change
             // (new/cleared/forked sessions) instead of waiting for the 30s poll.
             let _ = watcher::watch_claude_projects(app.handle().clone());
-            // The window-state plugin has already restored the size by now;
-            // this takes back whatever the decorations added to it.
+
+            // Ask for the saved size less whatever this desktop's decorations
+            // add to it. Runs after the plugin's own restore, so it wins.
             winstate::correct_restored_size(app.handle());
+            // Then measure what actually landed, once the compositor has
+            // settled the surface, and remember it for next launch.
+            {
+                let h = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(2500));
+                    let inner = h.clone();
+                    let _ = h.run_on_main_thread(move || winstate::learn_drift(&inner));
+                });
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
