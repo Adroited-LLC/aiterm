@@ -242,7 +242,13 @@ export default function ComposerPills({
 
   // A turn has run since the click, so the transcript has settled the question
   // and takes over from what was asked for.
-  const settled = pick.seenAt !== undefined && choice.at !== pick.seenAt;
+  //
+  // A pick with no `seenAt` was written before picks recorded when they were
+  // made. There is no way to tell whether a turn has run since, so treat it as
+  // settled and let the transcript win — the alternative leaves it pending for
+  // ever, quietly overriding the truth until the pill is clicked again.
+  const settled =
+    !("seenAt" in pick) || choice.at !== pick.seenAt;
   const liveModel = choice.model ? shortModel(choice.model) : null;
   const pendingModel = settled ? null : pick.model ?? null;
   const pendingEffort = settled ? null : pick.effort ?? null;
