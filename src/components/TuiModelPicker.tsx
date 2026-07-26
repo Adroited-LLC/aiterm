@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ModelPicker, detectModelPicker, readModelOutcome } from "../term/screen";
+import { SETTLE_MS, moveHighlight, wait } from "../term/drive";
 
 /**
  * A real dialog in front of claude's `/model` picker.
@@ -19,15 +20,6 @@ import { ModelPicker, detectModelPicker, readModelOutcome } from "../term/screen
  * should have to know that.
  */
 
-const KEY_DOWN = "\x1b[B";
-const KEY_UP = "\x1b[A";
-/** Long enough for claude to repaint between presses on a loaded machine. */
-const SETTLE_MS = 90;
-/** More than any real list needs; stops a mis-detection spinning forever. */
-const MAX_STEPS = 24;
-
-const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 interface Props {
   picker: ModelPicker;
   /** Send raw bytes to the terminal. */
@@ -43,23 +35,11 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
   const [error, setError] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<string | null>(null);
 
-  /** Walk the highlight to `target`, checking the screen after every press. */
-  const moveTo = async (target: number) => {
-    for (let step = 0; step < MAX_STEPS; step++) {
-      const now = detectModelPicker(screen());
-      if (!now) throw new Error("the picker closed before the choice landed");
-      if (now.highlighted === target) return;
-      write(now.highlighted < target ? KEY_DOWN : KEY_UP);
-      await wait(SETTLE_MS);
-    }
-    throw new Error("could not move the selection to that model");
-  };
-
   const commit = async (target: number, key: string) => {
     setBusy(true);
     setError(null);
     try {
-      await moveTo(target);
+      await moveHighlight(() => detectModelPicker(screen()), write, target);
       // Re-read rather than trust the loop's last look: this is the moment
       // just before a keystroke that changes state.
       const confirmed = detectModelPicker(screen());

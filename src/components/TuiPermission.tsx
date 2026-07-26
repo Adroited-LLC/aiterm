@@ -1,39 +1,24 @@
 import { useState } from "react";
 import { PermissionRequest, detectPermission } from "../term/screen";
+import { SETTLE_MS, selectRow, wait } from "../term/drive";
 
 /**
  * A real dialog in front of claude's tool-permission prompt.
  *
- * This is the most safety-critical screen aiterm draws over, so it is also the
- * most conservative. Only the two answers whose keys are unambiguous in the
- * CLI's own binding table are offered as buttons:
+ * Every option claude offers is a button, labelled with claude's own words —
+ * including "Yes, allow all edits in tmp/ during this session", which is
+ * genuinely useful and which the TUI leaves as an unexplained numbered row.
  *
- *   context:"Confirmation" → y: confirm:yes, n: confirm:no, escape: confirm:no
+ * An earlier version offered only Allow/Deny and sent `y`/`n`, on the strength
+ * of the CLI's `Confirmation` bindings. Wrong context: this is the generic
+ * `Select` widget, where letters do nothing at all. It failed honestly — "sent,
+ * but the prompt is still up" — which is the only reason it was a five-minute
+ * fix rather than a silent one.
  *
- * Anything else — notably "Yes, and don't ask again for …" — is shown but not
- * clickable, because `enter` is bound to `confirm:yes` rather than "accept the
- * highlighted row", and we have not established what it does when the
- * highlight is elsewhere. Guessing would mean handing out a standing approval
- * nobody asked for. The terminal is right there and it does that job today.
- *
- * The prompt is not dismissable to a "later" state: leaving it half-answered
- * would block the session. Cancelling sends `n`, which is what Escape does in
- * the TUI anyway.
+ * The stakes here are higher than for the model picker, so nothing is sent
+ * without the screen confirming the highlight first, and the prompt has to
+ * actually disappear before we call it done.
  */
-
-const YES = "y";
-const NO = "n";
-const SETTLE_MS = 90;
-
-const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** Recognise the plain yes/no answers among claude's numbered options. */
-function classify(label: string): "yes" | "no" | "other" {
-  const l = label.toLowerCase().trim();
-  if (l === "yes") return "yes";
-  if (l === "no" || l.startsWith("no,")) return "no";
-  return "other";
-}
 
 interface Props {
   request: PermissionRequest;
@@ -42,21 +27,21 @@ interface Props {
   onDismiss: () => void;
 }
 
+/** Colour the obvious refusal differently from the approvals. */
+function isRefusal(label: string): boolean {
+  const l = label.toLowerCase().trim();
+  return l === "no" || l.startsWith("no,");
+}
+
 export default function TuiPermission({ request, write, screen, onDismiss }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const answer = async (key: string) => {
+  const answer = async (index: number) => {
     setBusy(true);
     setError(null);
     try {
-      // Re-read immediately before sending: this keystroke approves or denies
-      // a real action, so it must not be delivered to a screen that has moved
-      // on since the dialog was drawn.
-      if (!detectPermission(screen())) {
-        throw new Error("the prompt is gone — nothing was sent");
-      }
-      write(key);
+      await selectRow(() => detectPermission(screen()), write, index);
       for (let i = 0; i < 30; i++) {
         await wait(SETTLE_MS);
         if (!detectPermission(screen())) {
@@ -71,8 +56,6 @@ export default function TuiPermission({ request, write, screen, onDismiss }: Pro
       setBusy(false);
     }
   };
-
-  const extra = request.options.filter((o) => classify(o.label) === "other");
 
   return (
     <div className="tui-overlay">
@@ -92,27 +75,24 @@ export default function TuiPermission({ request, write, screen, onDismiss }: Pro
           </div>
         )}
 
-        {extra.length > 0 && (
-          <div className="tui-note">
-            Other choices are in the terminal:{" "}
-            {extra.map((o) => o.label).join(" · ")}
-          </div>
-        )}
+        <div className="perm-options">
+          {request.options.map((o, i) => (
+            <button
+              key={o.number}
+              className={"perm-option" + (isRefusal(o.label) ? " deny" : "")}
+              disabled={busy}
+              onClick={() => answer(i)}
+            >{o.label}</button>
+          ))}
+        </div>
 
         {error && <div className="tui-note bad">{error}</div>}
 
         <div className="tui-foot">
+          <span className="tui-hint">Answering here is the same as answering in the terminal.</span>
           <button className="tui-plain" disabled={busy} onClick={onDismiss}>
             Use the terminal
           </button>
-          <div className="tui-foot-acts">
-            <button className="tui-pick ghost" disabled={busy} onClick={() => answer(NO)}>
-              Deny
-            </button>
-            <button className="tui-pick" disabled={busy} onClick={() => answer(YES)}>
-              Allow once
-            </button>
-          </div>
         </div>
       </div>
     </div>
