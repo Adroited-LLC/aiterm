@@ -39,6 +39,25 @@ const FONT_KEY = "aiterm.fontScale";
 const PANELS_KEY = "aiterm.panelToggles";
 const USAGE_KEY = "aiterm.usageCache";
 
+/**
+ * How aiterm starts claude. One place, so every session it opens behaves the
+ * same way and nothing depends on a global config that can outrank a session.
+ *
+ * `--permission-mode auto` asks for the classifier mode, which the CLI calls
+ * its own default ("Auto mode is now Claude Code's default permission mode").
+ * It needs a background setup, and where that has not happened it falls back
+ * to manual — a safe direction to fail, and the pill goes on reporting
+ * whatever claude's status line actually says, so it cannot misrepresent
+ * which mode you are in.
+ *
+ * `--allow-dangerously-skip-permissions` *enables* bypass without selecting
+ * it, which is what puts the fourth mode in the shift+tab cycle and therefore
+ * one click away on the permissions pill. Verified against a live session:
+ * without the flag the cycle is manual → accept edits → plan → manual; with
+ * it, bypass joins the loop.
+ */
+const CLAUDE_CMD = "claude --permission-mode auto --allow-dangerously-skip-permissions";
+
 interface PanelToggles {
   sessions: boolean;
   explorer: boolean;
@@ -539,20 +558,10 @@ export default function App() {
       setNotice(`Couldn't stop "${s.title}" to resume it: ${e}`);
       return;
     }
-    // Resume in whatever mode the session was actually in, and make bypass
-    // *available* rather than imposed.
-    //
-    // This used to pass `--permission-mode <configured>`, which meant a
-    // session deliberately started in manual came back bypassing everything,
-    // because a flag outranks the recorded mode. Silent escalation, with
-    // nothing on screen to say so.
-    //
-    // `--allow-dangerously-skip-permissions` enables the fourth mode without
-    // selecting it, so bypass is one click away on the permissions pill and
-    // the session keeps the mode it had. Verified by cycling a live session:
-    // without the flag shift+tab goes manual → accept edits → plan → manual;
-    // with it, bypass joins the loop.
-    const cmd = `claude --allow-dangerously-skip-permissions --resume ${liveId}`;
+    // Resume the same way we start anything — see CLAUDE_CMD. This used to
+    // pass `--permission-mode <configured>`, which is what silently lifted a
+    // manual session into bypass on resume.
+    const cmd = `${CLAUDE_CMD} --resume ${liveId}`;
     openTab(s.title, s.project_path, cmd, liveId, liveId);
   };
   // Branch a session into its own tab, resumable later on its own row. The
@@ -630,7 +639,7 @@ export default function App() {
   };
   const projectClaude = (p: ProjectInfo) => {
     setActiveProject(p.path);
-    openTab(p.name, p.path, "claude", `claude:${p.path}`);
+    openTab(p.name, p.path, CLAUDE_CMD, `claude:${p.path}`);
   };
 
   // --- splitter dragging ---
