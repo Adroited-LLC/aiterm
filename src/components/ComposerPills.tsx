@@ -131,6 +131,8 @@ interface Props {
   hasPendingInput?: () => boolean;
   /** Ask the app to open claude's model picker and draw a dialog over it. */
   onOpenModelPicker?: () => void;
+  /** Ask the app to open claude's /rewind picker and draw a dialog over it. */
+  onOpenRewind?: () => void;
   /** Permission mode read off claude's status line; null when unreadable. */
   permMode: PermissionMode | null;
   /** Cycle the session to a mode with shift+tab. */
@@ -139,7 +141,7 @@ interface Props {
 
 export default function ComposerPills({
   sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss, hasPendingInput,
-  onOpenModelPicker, permMode, onSetPermMode,
+  onOpenModelPicker, onOpenRewind, permMode, onSetPermMode,
 }: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
@@ -227,6 +229,10 @@ export default function ComposerPills({
   /** Open claude's own picker; aiterm draws a dialog over it. */
   const openModelPicker = (force = false) =>
     guard("/model", () => { onOpenModelPicker?.(); close(); }, force);
+
+  /** Same, for the rewind picker. */
+  const openRewind = (force = false) =>
+    guard("/rewind", () => { onOpenRewind?.(); close(); }, force);
 
   const run = (kind: "model" | "effort", value: string, force = false) =>
     guard(`/${kind} ${value}`, () => doRun(kind, value), force);
@@ -492,6 +498,16 @@ export default function ComposerPills({
         {onSetPermMode && permMode && pill(
           "perms", "⛨", "Perms", permMode,
           permMode === "bypass permissions" ? "sev-warning" : "",
+        )}
+        {onOpenRewind && (
+          <button
+            className="cpill"
+            onClick={() => openRewind()}
+            title="Rewind — restore the code and/or conversation to an earlier point"
+          >
+            <span className="cpill-icon">⟲</span>
+            <span className="cpill-label">Rewind</span>
+          </button>
         )}
         {projectRoot && pill("git", "⎇", "Git", "")}
       </div>

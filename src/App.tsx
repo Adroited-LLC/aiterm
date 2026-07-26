@@ -150,16 +150,20 @@ export default function App() {
   const [tui, setTui] = useState<Detected | null>(null);
   const [permMode, setPermMode] = useState<PermissionMode | null>(null);
   const [tuiDismissed, setTuiDismissed] = useState(false);
-  // Only dress up a picker *we* opened. Typing /model yourself is a request for
-  // the terminal, and answering it with our own dialog would be taking the
-  // terminal away from someone who just asked for it. Holds the time the pill
-  // asked, so a picker that never appears stops arming us.
-  const pickerArmed = useRef<number | null>(null);
-  const openModelPicker = useCallback(() => {
+  // Only dress up a screen *we* opened. Typing /model or /rewind yourself is a
+  // request for the terminal, and answering it with our own dialog would be
+  // taking the terminal away from someone who just asked for it. Records what
+  // was asked for and when, so a screen that never appears stops arming us.
+  const armed = useRef<{ what: "model" | "rewind"; at: number } | null>(null);
+  const openViaPill = useCallback((what: "model" | "rewind", command: string) => {
     if (activeTab === null) return;
-    pickerArmed.current = Date.now();
-    handles.current.get(activeTab)?.sendComposed("/model");
+    armed.current = { what, at: Date.now() };
+    handles.current.get(activeTab)?.sendComposed(command);
   }, [activeTab]);
+  const openModelPicker = useCallback(
+    () => openViaPill("model", "/model"), [openViaPill]);
+  const openRewind = useCallback(
+    () => openViaPill("rewind", "/rewind"), [openViaPill]);
 
   // Closing a dialog — by answering it, cancelling, or asking for the raw
   // terminal — always ends with the keyboard back in the terminal. Whatever
@@ -191,18 +195,22 @@ export default function App() {
       if (!found) {
         // Gone, or not painted yet. Give it a moment before disarming, so
         // arming a beat before claude draws does not cancel itself.
-        if (pickerArmed.current && Date.now() - pickerArmed.current > 4000) {
-          pickerArmed.current = null;
+        if (armed.current && Date.now() - armed.current.at > 4000) {
+          armed.current = null;
         }
         setTui(null);
         setTuiDismissed(false);
         return;
       }
       // A permission prompt is never something we asked for — it interrupts
-      // you, which is exactly when a real dialog earns its place. Only the
-      // model picker has to be armed, because typing /model yourself is a
-      // request for the terminal.
-      if (found.kind === "model-picker" && !pickerArmed.current) return;
+      // you, which is exactly when a real dialog earns its place. Everything
+      // reached by a command has to be armed, because typing that command
+      // yourself is a request for the terminal.
+      const needs =
+        found.kind === "model-picker" ? "model"
+        : found.kind === "rewind-picker" || found.kind === "rewind-confirm" ? "rewind"
+        : null;
+      if (needs && armed.current?.what !== needs) return;
       setTui((prev) => {
         // Only replace when something actually changed, so the dialog is not
         // rebuilt four times a second while it sits there.
@@ -854,6 +862,7 @@ export default function App() {
             hasPendingInput={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.pendingInput() ?? false}
             onOpenModelPicker={activeTab === null ? undefined : openModelPicker}
+            onOpenRewind={activeTab === null ? undefined : openRewind}
             permMode={permMode}
             onSetPermMode={activeTab === null ? undefined : setPermissionMode}
           />}
