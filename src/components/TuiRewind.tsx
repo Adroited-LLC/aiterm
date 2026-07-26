@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
-  RewindConfirm, RewindPicker,
+  RewindConfirm, RewindPicker, RewindPoint,
   detectRewindConfirm, detectRewindPicker,
 } from "../term/screen";
-import { SETTLE_MS, moveHighlight, selectRow, wait } from "../term/drive";
+import {
+  SETTLE_MS, harvestUpwards, selectByIdentity, selectRow, wait,
+} from "../term/drive";
 
 /**
  * A real dialog over `/rewind`, in its two steps: pick a point, then choose
@@ -30,18 +32,54 @@ interface Props {
   onDismiss: () => void;
 }
 
+/** Identity of a restore point: its prompt plus its diff, which together are
+ *  unique in practice even when the same prompt was sent twice. */
+const pointKey = (p: RewindPoint) => `${p.prompt}\u0000${p.changes}`;
+
 export default function TuiRewind({ step, write, screen, onDismiss }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** The whole list, gathered by paging claude's own. null until gathered. */
+  const [allPoints, setAllPoints] = useState<RewindPoint[] | null>(null);
+
+  // Only the drawn slice of the picker is readable, so page up through it once
+  // on open and keep the result. Harmless: nothing commits until Enter.
+  useEffect(() => {
+    if (step.kind !== "rewind-picker" || allPoints) return;
+    let stop = false;
+    setBusy(true);
+    harvestUpwards(
+      () => {
+        const p = detectRewindPicker(screen());
+        return p && { items: p.points, highlighted: p.highlighted };
+      },
+      write,
+      pointKey,
+    )
+      .then((points) => !stop && setAllPoints(points))
+      .catch((e) => !stop && setError(String(e)))
+      .finally(() => !stop && setBusy(false));
+    return () => { stop = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step.kind]);
 
   /** Step one: move to a point and continue to the confirmation. */
-  const choosePoint = async (index: number) => {
+  const choosePoint = async (point: RewindPoint) => {
     setBusy(true);
     setError(null);
     try {
-      await moveHighlight(() => detectRewindPicker(screen()), write, index);
+      const target = pointKey(point);
+      await selectByIdentity(
+        () => {
+          const p = detectRewindPicker(screen());
+          return p && { items: p.points, highlighted: p.highlighted };
+        },
+        write,
+        pointKey,
+        target,
+      );
       const confirmed = detectRewindPicker(screen());
-      if (!confirmed || confirmed.highlighted !== index) {
+      if (!confirmed || pointKey(confirmed.points[confirmed.highlighted]) !== target) {
         throw new Error("the selection moved unexpectedly — nothing was sent");
       }
       write("\r");
@@ -98,7 +136,7 @@ export default function TuiRewind({ step, write, screen, onDismiss }: Props) {
 
         {step.kind === "rewind-picker" ? (
           <div className="tui-list">
-            {step.points.map((p, i) => (
+            {(allPoints ?? step.points).map((p, i) => (
               <div key={i} className={"tui-row" + (p.isCurrent ? " current" : "")}>
                 <div className="tui-row-text">
                   <span className="tui-row-name">
@@ -112,7 +150,7 @@ export default function TuiRewind({ step, write, screen, onDismiss }: Props) {
                     <button
                       className="tui-pick ghost"
                       disabled={busy}
-                      onClick={() => choosePoint(i)}
+                      onClick={() => choosePoint(p)}
                     >Rewind to before this</button>
                   </div>
                 )}
@@ -147,7 +185,9 @@ export default function TuiRewind({ step, write, screen, onDismiss }: Props) {
         <div className="tui-foot">
           <span className="tui-hint">
             {step.kind === "rewind-picker"
-              ? "Nothing changes until you confirm on the next step."
+              ? busy && !allPoints
+                ? "Reading the full list from claude…"
+                : `${(allPoints ?? step.points).length} points · nothing changes until you confirm`
               : "This cannot be undone from here."}
           </span>
           <div className="tui-foot-acts">
