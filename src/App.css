@@ -1312,6 +1312,13 @@ body.dragging * { pointer-events: none; }
   flex-shrink: 0;
 }
 
+/* A choice that has been asked for but not yet confirmed by a turn. Dotted
+   rather than solid: it is a request, not a fact. */
+.cpill.pending .cpill-count {
+  font-style: italic;
+  border-bottom: 1px dotted currentColor;
+}
+
 /* Shown in place of sending, when the prompt already has unsent text. */
 .cpill-hold {
   display: flex;

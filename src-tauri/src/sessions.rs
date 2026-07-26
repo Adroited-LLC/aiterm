@@ -1576,6 +1576,10 @@ pub struct ModelChoice {
     pub model: Option<String>,
     /// "low" | "medium" | "high" | "xhigh" | "max" | … as recorded.
     pub effort: Option<String>,
+    /// Timestamp of the record these came from. Lets the UI tell "no turn has
+    /// run since you clicked" from "a turn ran and this is what it used" —
+    /// the difference between a pending request and a settled fact.
+    pub at: Option<String>,
 }
 
 /// What model and effort the session last actually ran with.
@@ -1637,6 +1641,9 @@ pub fn session_model(session_id: String) -> ModelChoice {
         }
         if let Some(e) = v.get("effort").and_then(|e| e.as_str()) {
             out.effort = Some(e.to_string());
+        }
+        if let Some(t) = v.get("timestamp").and_then(|t| t.as_str()) {
+            out.at = Some(t.to_string());
         }
     }
     out

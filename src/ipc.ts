@@ -167,6 +167,9 @@ export interface ModelChoice {
   /** Full id as recorded, e.g. "claude-opus-5". null before the first reply. */
   model: string | null;
   effort: string | null;
+  /** Timestamp of the record these came from — tells a pending request from a
+   *  settled fact. Unchanged means no turn has run since you clicked. */
+  at: string | null;
 }
 // What the session last actually ran with, read from its transcript — so it
 // stays right whether the pill, a typed /model, or a launch flag changed it.

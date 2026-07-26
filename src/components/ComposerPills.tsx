@@ -39,20 +39,28 @@ function shortModel(id: string | null): string {
 }
 
 /**
- * What was last *chosen* here, per session — a fallback, never the headline.
+ * What was last *chosen* here, per session.
  *
- * The transcript records what each turn actually ran at, and that is the truth:
- * it is what happened, not what we asked for. Clicking a model is only a
- * request. It can be swallowed by a prompt you were mid-way through typing, or
- * refused because the model is not available to you — and then the pill would
- * sit there naming a model the session has never used.
+ * Clicking a model is a request, not a fact. It can be refused (`/model sonnet`
+ * answering "Kept model as Opus 5"), or swallowed by a prompt you were halfway
+ * through typing. The transcript is the fact: it records what each turn
+ * actually ran at.
  *
- * So a remembered pick only fills what the transcript cannot say: before the
- * first reply there is nothing recorded yet, and `auto` effort never appears
- * because every turn resolves to a concrete level.
+ * Showing only the request lies once it fails. Showing only the transcript
+ * ignores you until the next turn runs, which reads as the pill being broken.
+ * So show the request immediately, marked pending, and let the transcript
+ * overrule it the moment a turn settles the question — which is what `seenAt`
+ * detects: the timestamp of the newest assistant record when the click
+ * happened. Once that moves, a turn has run and the file wins.
+ *
+ * `auto` effort is the exception that outlives settling, because every turn
+ * resolves to a concrete level and so `auto` can never appear in a transcript.
  */
 const PICK_KEY = "aiterm.composerPick";
-type Picks = Record<string, { model?: string; effort?: string }>;
+type Picks = Record<
+  string,
+  { model?: string; effort?: string; seenAt?: string | null }
+>;
 
 function loadPicks(): Picks {
   try {
@@ -127,7 +135,7 @@ export default function ComposerPills({
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
-  const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null });
+  const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null, at: null });
   const [picks, setPicks] = useState<Picks>(loadPicks);
   /** A choice held back because the prompt was not empty. */
   const [held, setHeld] = useState<{ kind: "model" | "effort"; value: string } | null>(null);
@@ -171,7 +179,7 @@ export default function ComposerPills({
       setTasks([]);
       setArtifacts([]);
       setAgents([]);
-      setChoice({ model: null, effort: null });
+      setChoice({ model: null, effort: null, at: null });
       return;
     }
     let stop = false;
@@ -219,7 +227,10 @@ export default function ComposerPills({
 
     if (sessionId) {
       setPicks((p) => {
-        const next = { ...p, [sessionId]: { ...p[sessionId], [kind]: value } };
+        const next = {
+          ...p,
+          [sessionId]: { ...p[sessionId], [kind]: value, seenAt: choice.at },
+        };
         try {
           localStorage.setItem(PICK_KEY, JSON.stringify(next));
         } catch { /* private mode / quota — the pill just won't persist */ }
@@ -229,12 +240,15 @@ export default function ComposerPills({
     close();
   };
 
-  // What the session is really running, per its transcript. The remembered
-  // pick fills in only where the transcript has nothing to say.
+  // A turn has run since the click, so the transcript has settled the question
+  // and takes over from what was asked for.
+  const settled = pick.seenAt !== undefined && choice.at !== pick.seenAt;
   const liveModel = choice.model ? shortModel(choice.model) : null;
-  const shownModel = liveModel ?? pick.model ?? "—";
+  const pendingModel = settled ? null : pick.model ?? null;
+  const pendingEffort = settled ? null : pick.effort ?? null;
+  const shownModel = pendingModel ?? liveModel ?? "—";
   const shownEffort =
-    pick.effort === "auto" ? "auto" : choice.effort ?? pick.effort ?? "—";
+    pick.effort === "auto" ? "auto" : pendingEffort ?? choice.effort ?? "—";
 
   const done = tasks.filter((t) => t.status === "completed").length;
   const running = agents.filter((a) => a.status === "running").length;
@@ -392,6 +406,17 @@ export default function ComposerPills({
               Last turn ran at <b>{choice.effort}</b>
             </div>
           )}
+          {/* Say plainly that this is a request until a turn proves it. A
+              `/model` can be refused — sonnet answering "Kept model as Opus 5"
+              — and the pill should not present that as settled. */}
+          {((open === "model" && pendingModel) ||
+            (open === "effort" && pendingEffort && pick.effort !== "auto")) && (
+            <div className="cpill-choice-note">
+              Asked for <b>{open === "model" ? pendingModel : pendingEffort}</b> —
+              the next turn will show what actually ran
+              {open === "model" && liveModel ? `, currently ${liveModel}` : ""}.
+            </div>
+          )}
         </div>
       )}
       {open === "git" && (
@@ -402,8 +427,11 @@ export default function ComposerPills({
         </div>
       )}
       <div className="cpill-row">
-        {onCommand && pill("model", "◆", "Model", shownModel)}
-        {onCommand && pill("effort", "≡", "Effort", shownEffort)}
+        {onCommand && pill("model", "◆", "Model", shownModel, pendingModel ? "pending" : "")}
+        {onCommand && pill(
+          "effort", "≡", "Effort", shownEffort,
+          pendingEffort && pick.effort !== "auto" ? "pending" : "",
+        )}
         {sessionId && pill("tasks", "◑", "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
         {sessionId && pill("artifacts", "▤", "Artifacts", artifacts.length ? `${artifacts.length}` : "")}
         {sessionId && pill(
