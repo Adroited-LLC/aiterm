@@ -1312,6 +1312,87 @@ body.dragging * { pointer-events: none; }
   flex-shrink: 0;
 }
 
+.set-tabs { display: flex; gap: 2px; }
+.set-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 10px 5px;
+  cursor: pointer;
+}
+.set-tab:hover { color: var(--text); }
+.set-tab.on { color: var(--text); border-bottom-color: var(--accent); }
+
+/* Renders the sample at the terminal's real size and face, so comparing two
+   fonts is a like-for-like look rather than a guess. */
+.font-preview {
+  margin-top: 4px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.font-pkg-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.font-pkg-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.font-pkg-row:last-child { border-bottom: none; }
+.font-pkg-row:hover { background: var(--bg-hover); }
+.font-pkg-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.font-pkg-name { font-size: 12px; color: var(--text); }
+.font-pkg-note { font-size: 11px; color: var(--text-faint); }
+.font-pkg-done { font-size: 11px; color: var(--green); flex-shrink: 0; }
+.font-pkg-install {
+  flex-shrink: 0;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.font-pkg-install:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.font-pkg-install:disabled { opacity: 0.5; cursor: default; }
+
+.set-file-install {
+  align-self: flex-start;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.set-file-install:hover { border-color: var(--accent); color: var(--accent); }
+.set-notice {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border-left: 2px solid var(--accent);
+  border-radius: 3px;
+  padding: 6px 9px;
+  white-space: pre-wrap;
+}
+
 .set-section { display: flex; flex-direction: column; gap: 8px; }
 .set-cols { flex-direction: row; gap: 14px; }
 .set-cols > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }

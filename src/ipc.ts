@@ -172,6 +172,32 @@ export interface UsageBar {
   resets_at: string;
 }
 export const usageLimits = () => invoke<UsageBar[]>("usage_limits");
+
+export interface FontFamily {
+  name: string;
+  /** Fixed-pitch per fontconfig — the set worth offering for a terminal. */
+  mono: boolean;
+}
+export interface FontPackage {
+  name: string;
+  package: string;
+  note: string;
+  installed: boolean;
+}
+// Every installed font family, straight from fontconfig. Replaces the old
+// canvas width-probe, which could only find fonts we had thought to name.
+export const listFonts = () => invoke<FontFamily[]>("list_fonts");
+// Coding fonts installable from the distro repos, each flagged with whether
+// it is already present.
+export const fontPackages = () => invoke<FontPackage[]>("font_packages");
+// Install one of those packages. Only names from `font_packages` are accepted;
+// the backend refuses anything else rather than passing it to dnf.
+export const installFontPackage = (pkg: string) =>
+  invoke<string>("install_font_package", { package: pkg });
+// Copy font files into ~/.local/share/fonts — no privileges, no network.
+// Returns how many were installed.
+export const installFontFiles = (paths: string[]) =>
+  invoke<number>("install_font_files", { paths });
 export const sessionStatus = (sessionId: string) =>
   invoke<SessionStatus>("session_status", { sessionId });
 export interface ProjectInfo {
