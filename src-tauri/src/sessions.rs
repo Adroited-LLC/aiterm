@@ -1716,8 +1716,19 @@ pub fn claude_model_default() -> Option<String> {
 /// before restoring, otherwise we would race it and lose. Returns whether a
 /// restore was needed. Only ever touches the one key, re-reading the file first
 /// so anything else written meanwhile survives.
+/// Async, and the waiting happens on a blocking-pool thread. Tauri runs a
+/// plain `fn` command on the main thread, so the first version of this froze
+/// the whole window while it polled — worst case the full timeout, which is
+/// exactly what happens when you pick the model that is already your default
+/// and the file therefore never changes.
 #[tauri::command]
-pub fn restore_claude_model_default(previous: Option<String>) -> Result<bool, String> {
+pub async fn restore_claude_model_default(previous: Option<String>) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || restore_model_default_blocking(previous))
+        .await
+        .map_err(|e| format!("restoring the model default: {e}"))?
+}
+
+fn restore_model_default_blocking(previous: Option<String>) -> Result<bool, String> {
     let path = user_settings_path().ok_or_else(|| "no home directory".to_string())?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
