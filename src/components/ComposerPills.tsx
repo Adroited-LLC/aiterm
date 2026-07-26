@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import GitPanel from "./GitPanel";
+import { PERMISSION_MODES, PermissionMode } from "../term/screen";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
   homeAbbrev, openPath, relTime,
@@ -11,6 +12,14 @@ import {
  *  entries, read off the screen, so there are no descriptions here to drift
  *  out of date. */
 const MODEL_ALIASES = ["opus", "opusplan", "sonnet", "haiku", "fable"];
+
+/** What each permission mode actually means, in claude's own terms. */
+const PERM_DESC: Record<PermissionMode, string> = {
+  "manual": "Ask before every tool call",
+  "accept edits": "File edits go through, everything else asks",
+  "plan": "Research and plan only — no changes until you approve",
+  "bypass permissions": "Never ask. Only enabled when the session was started with it",
+};
 
 /** `/effort <level>` choices. The medium and high wordings are claude's own. */
 const EFFORTS: [string, string][] = [
@@ -79,7 +88,7 @@ function loadPicks(): Picks {
 
 // "model" is absent on purpose: choosing a model opens claude's own picker
 // with a dialog over it, rather than a list of our own invention.
-type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "effort" | "git";
+type PanelKey = "tasks" | "artifacts" | "agents" | "usage" | "effort" | "git" | "perms";
 
 /** Relative "resets in 3h 55m"; "" when unknown or past. */
 function resetsIn(iso: string): string {
@@ -121,11 +130,15 @@ interface Props {
   hasPendingInput?: () => boolean;
   /** Ask the app to open claude's model picker and draw a dialog over it. */
   onOpenModelPicker?: () => void;
+  /** Permission mode read off claude's status line; null when unreadable. */
+  permMode: PermissionMode | null;
+  /** Cycle the session to a mode with shift+tab. */
+  onSetPermMode?: (m: PermissionMode) => Promise<void>;
 }
 
 export default function ComposerPills({
   sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss, hasPendingInput,
-  onOpenModelPicker,
+  onOpenModelPicker, permMode, onSetPermMode,
 }: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
@@ -137,6 +150,7 @@ export default function ComposerPills({
   const [picks, setPicks] = useState<Picks>(loadPicks);
   /** An action held back because the prompt was not empty. */
   const [held, setHeld] = useState<{ label: string; send: () => void } | null>(null);
+  const [permErr, setPermErr] = useState<string | null>(null);
   const pick = (sessionId && picks[sessionId]) || {};
 
   /** One exit path for every way a panel closes, so the keyboard always ends
@@ -416,6 +430,31 @@ export default function ComposerPills({
           )}
         </div>
       )}
+      {open === "perms" && (
+        <div className="cpill-panel cpill-choices">
+          {PERMISSION_MODES.map((m) => (
+            <button
+              key={m}
+              className={"cpill-choice" + (permMode === m ? " on" : "")}
+              onClick={() => {
+                setPermErr(null);
+                onSetPermMode?.(m).catch((e) => setPermErr(String(e)));
+                close();
+              }}
+            >
+              <span className="cpill-choice-name">
+                {m}
+                {permMode === m && <span className="cpill-choice-mark">current</span>}
+              </span>
+              <span className="cpill-choice-desc">{PERM_DESC[m]}</span>
+            </button>
+          ))}
+          {permErr && <div className="cpill-choice-note">{permErr}</div>}
+          <div className="cpill-choice-note">
+            Same as shift+tab in the terminal — this session only, nothing saved.
+          </div>
+        </div>
+      )}
       {open === "git" && (
         <div className="cpill-panel cpill-git">
           {/* The same component the right-hand panel uses. Reusing it means the
@@ -447,6 +486,10 @@ export default function ComposerPills({
           running ? "busy" : "",
         )}
         {session && pill("usage", "▮", "Usage", `${Math.round(session.percent)}%`, "sev-" + session.severity)}
+        {onSetPermMode && permMode && pill(
+          "perms", "⛨", "Perms", permMode,
+          permMode === "bypass permissions" ? "sev-warning" : "",
+        )}
         {projectRoot && pill("git", "⎇", "Git", "")}
       </div>
     </div>

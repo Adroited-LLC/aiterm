@@ -1,4 +1,5 @@
 import ComposerPills from "./ComposerPills";
+import { PermissionMode } from "../term/screen";
 import { UsageBar } from "../ipc";
 
 /**
@@ -17,6 +18,7 @@ import { UsageBar } from "../ipc";
  */
 export default function Composer({
   sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss, hasPendingInput, onOpenModelPicker,
+  permMode, onSetPermMode,
 }: {
   sessionId: string | null;
   projectRoot: string | null;
@@ -28,6 +30,8 @@ export default function Composer({
   onDismiss?: () => void;
   hasPendingInput?: () => boolean;
   onOpenModelPicker?: () => void;
+  permMode: PermissionMode | null;
+  onSetPermMode?: (m: PermissionMode) => Promise<void>;
 }) {
   return (
     <div className="composer-wrap">
@@ -40,6 +44,8 @@ export default function Composer({
         onDismiss={onDismiss}
         hasPendingInput={hasPendingInput}
         onOpenModelPicker={onOpenModelPicker}
+        permMode={permMode}
+        onSetPermMode={onSetPermMode}
       />
     </div>
   );

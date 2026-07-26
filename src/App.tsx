@@ -9,7 +9,10 @@ import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
 import TuiModelPicker from "./components/TuiModelPicker";
 import TuiPermission from "./components/TuiPermission";
-import { Detected, detect } from "./term/screen";
+import {
+  Detected, PermissionMode, detect, detectPermissionMode,
+} from "./term/screen";
+import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
 import SettingsModal from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
@@ -22,7 +25,7 @@ import {
   ProjectInfo, Session,
   TrashedSession,
   UsageBar,
-  claudePermissionMode, listProjects, listSessions, materializeFork,
+  listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, usageLimits,
   resolveResumableId, liveSessionIds, stopSession,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
@@ -125,6 +128,7 @@ export default function App() {
   // is nothing. `dismissed` remembers that you asked for the raw terminal for
   // *this* appearance, and clears itself once the screen goes away.
   const [tui, setTui] = useState<Detected | null>(null);
+  const [permMode, setPermMode] = useState<PermissionMode | null>(null);
   const [tuiDismissed, setTuiDismissed] = useState(false);
   // Only dress up a picker *we* opened. Typing /model yourself is a request for
   // the terminal, and answering it with our own dialog would be taking the
@@ -146,10 +150,24 @@ export default function App() {
     handles.current.get(tab)?.focus();
   }, []);
 
+  const setPermissionMode = useCallback(async (target: PermissionMode) => {
+    if (activeTab === null) return;
+    const handle = handles.current.get(activeTab);
+    if (!handle) return;
+    await cycleModeTo(
+      () => detectPermissionMode(handle.screen()),
+      (d) => handle.write(d),
+      target,
+    );
+    handle.focus();
+  }, [activeTab]);
+
   useEffect(() => {
     const id = window.setInterval(() => {
       const handle = activeTab === null ? undefined : handles.current.get(activeTab);
-      const found = handle ? detect(handle.screen()) : null;
+      const lines = handle ? handle.screen() : null;
+      setPermMode(lines ? detectPermissionMode(lines) : null);
+      const found = lines ? detect(lines) : null;
       if (!found) {
         // Gone, or not painted yet. Give it a moment before disarming, so
         // arming a beat before claude draws does not cancel itself.
@@ -521,20 +539,20 @@ export default function App() {
       setNotice(`Couldn't stop "${s.title}" to resume it: ${e}`);
       return;
     }
-    // Carry the configured permission mode. A resumed session otherwise
-    // replays the mode it last recorded, so one that drifted to `acceptEdits`
-    // could never be lifted back to what the config asks for — the flag is the
-    // only thing that outranks the recording. A new session needs no help
-    // here: `claude` reads the same config itself on a cold start.
-    let mode: string | null = null;
-    try {
-      mode = await claudePermissionMode(s.project_path);
-    } catch {
-      /* no config, or unreadable — resume without the flag */
-    }
-    const cmd = mode
-      ? `claude --permission-mode ${mode} --resume ${liveId}`
-      : `claude --resume ${liveId}`;
+    // Resume in whatever mode the session was actually in, and make bypass
+    // *available* rather than imposed.
+    //
+    // This used to pass `--permission-mode <configured>`, which meant a
+    // session deliberately started in manual came back bypassing everything,
+    // because a flag outranks the recorded mode. Silent escalation, with
+    // nothing on screen to say so.
+    //
+    // `--allow-dangerously-skip-permissions` enables the fourth mode without
+    // selecting it, so bypass is one click away on the permissions pill and
+    // the session keeps the mode it had. Verified by cycling a live session:
+    // without the flag shift+tab goes manual → accept edits → plan → manual;
+    // with it, bypass joins the loop.
+    const cmd = `claude --allow-dangerously-skip-permissions --resume ${liveId}`;
     openTab(s.title, s.project_path, cmd, liveId, liveId);
   };
   // Branch a session into its own tab, resumable later on its own row. The
@@ -816,6 +834,8 @@ export default function App() {
             hasPendingInput={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.pendingInput() ?? false}
             onOpenModelPicker={activeTab === null ? undefined : openModelPicker}
+            permMode={permMode}
+            onSetPermMode={activeTab === null ? undefined : setPermissionMode}
           />}
         </div>
 

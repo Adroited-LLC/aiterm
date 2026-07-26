@@ -65,3 +65,34 @@ export async function selectRow<T extends { highlighted: number }>(
   }
   write("\r");
 }
+
+/** Shift+Tab — CSI Z, the standard back-tab. `chat:cycleMode` is bound to it. */
+const KEY_BACKTAB = "\x1b[Z";
+
+/**
+ * Cycle a session's permission mode until it reads `target`.
+ *
+ * The cycle is a loop with no way to step backwards, so this presses forward
+ * and re-reads, at most one full lap plus a little. Bounded rather than
+ * hopeful: if the mode never arrives — most likely because bypass is not
+ * enabled for this session — it says so instead of pressing for ever.
+ */
+export async function cycleModeTo(
+  read: () => string | null,
+  write: (data: string) => void,
+  target: string,
+  laps = 6,
+): Promise<void> {
+  for (let step = 0; step < laps; step++) {
+    const now = read();
+    if (now === target) return;
+    if (now === null) throw new Error("could not read the current mode");
+    write(KEY_BACKTAB);
+    await wait(SETTLE_MS * 2);
+  }
+  if (read() !== target) {
+    throw new Error(
+      `could not reach "${target}" — it may not be enabled for this session`,
+    );
+  }
+}

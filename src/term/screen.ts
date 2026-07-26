@@ -180,3 +180,39 @@ export function readModelOutcome(
   }
   return null;
 }
+
+/**
+ * The permission mode claude's status line is advertising.
+ *
+ * Four modes, cycled with shift+tab. The fourth only exists when the session
+ * was launched with `--allow-dangerously-skip-permissions`, which *enables*
+ * bypass without turning it on — verified by cycling a live session with and
+ * without the flag:
+ *
+ *   without:  manual → accept edits → plan → manual
+ *   with:     manual → accept edits → plan → bypass permissions → manual
+ *
+ * Reading it rather than tracking it means a shift+tab typed straight into the
+ * terminal stays in step with the pill for free.
+ */
+export const PERMISSION_MODES = [
+  "manual",
+  "accept edits",
+  "plan",
+  "bypass permissions",
+] as const;
+
+export type PermissionMode = (typeof PERMISSION_MODES)[number];
+
+export function detectPermissionMode(screen: Screen): PermissionMode | null {
+  // Search upward: the status line is the last thing drawn, and the same words
+  // can appear in conversation text further up.
+  for (let i = screen.length - 1; i >= 0; i--) {
+    const line = screen[i];
+    if (/bypass permissions on/i.test(line)) return "bypass permissions";
+    if (/accept edits on/i.test(line)) return "accept edits";
+    if (/plan mode on/i.test(line)) return "plan";
+    if (/manual mode on/i.test(line)) return "manual";
+  }
+  return null;
+}
