@@ -18,7 +18,7 @@ import { UsageBar } from "../ipc";
  */
 export default function Composer({
   sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss, hasPendingInput, onOpenModelPicker,
-  permMode, onSetPermMode,
+  onOpenRewind, permMode, onSetPermMode,
 }: {
   sessionId: string | null;
   projectRoot: string | null;
@@ -30,6 +30,7 @@ export default function Composer({
   onDismiss?: () => void;
   hasPendingInput?: () => boolean;
   onOpenModelPicker?: () => void;
+  onOpenRewind?: () => void;
   permMode: PermissionMode | null;
   onSetPermMode?: (m: PermissionMode) => Promise<void>;
 }) {
@@ -44,6 +45,7 @@ export default function Composer({
         onDismiss={onDismiss}
         hasPendingInput={hasPendingInput}
         onOpenModelPicker={onOpenModelPicker}
+        onOpenRewind={onOpenRewind}
         permMode={permMode}
         onSetPermMode={onSetPermMode}
       />

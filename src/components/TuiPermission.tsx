@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PermissionRequest, detectPermission } from "../term/screen";
 import { SETTLE_MS, selectRow, wait } from "../term/drive";
 
@@ -36,6 +36,38 @@ function isRefusal(label: string): boolean {
 export default function TuiPermission({ request, write, screen, onDismiss }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Which option has the keyboard. Starts on claude's own highlighted row. */
+  const [focus, setFocus] = useState(request.highlighted);
+  const optionRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  // Take the keyboard while this is up.
+  //
+  // Not only for convenience: with focus left in the terminal, an Enter typed
+  // while the dialog is showing goes straight through to the TUI underneath,
+  // where it is bound to confirm:yes. Someone answering "no" with the mouse
+  // could approve the call with a stray keystroke a moment earlier. Holding
+  // focus here means every key lands on the dialog you can see.
+  useEffect(() => {
+    optionRefs.current[focus]?.focus();
+  }, [focus]);
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (busy) return;
+    const last = request.options.length - 1;
+    if (e.key === "ArrowDown" || e.key === "j") {
+      e.preventDefault();
+      setFocus((f) => (f >= last ? 0 : f + 1));
+    } else if (e.key === "ArrowUp" || e.key === "k") {
+      e.preventDefault();
+      setFocus((f) => (f <= 0 ? last : f - 1));
+    } else if (e.key === "Escape") {
+      // Hand the prompt back rather than answering it. Escape means "no" in
+      // claude's own binding, and guessing that on the user's behalf is not
+      // ours to do — the prompt is still there to answer directly.
+      e.preventDefault();
+      onDismiss();
+    }
+  };
 
   const answer = async (index: number) => {
     setBusy(true);
@@ -59,7 +91,8 @@ export default function TuiPermission({ request, write, screen, onDismiss }: Pro
 
   return (
     <div className="tui-overlay">
-      <div className="tui-dialog perm">
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
+      <div className="tui-dialog perm" onKeyDown={onKeyDown}>
         <div className="tui-head">
           <span className="tui-title">{request.title}</span>
           <span className="tui-effort">needs your approval</span>
@@ -79,8 +112,10 @@ export default function TuiPermission({ request, write, screen, onDismiss }: Pro
           {request.options.map((o, i) => (
             <button
               key={o.number}
+              ref={(el) => { optionRefs.current[i] = el; }}
               className={"perm-option" + (isRefusal(o.label) ? " deny" : "")}
               disabled={busy}
+              onFocus={() => setFocus(i)}
               onClick={() => answer(i)}
             >{o.label}</button>
           ))}
@@ -89,7 +124,9 @@ export default function TuiPermission({ request, write, screen, onDismiss }: Pro
         {error && <div className="tui-note bad">{error}</div>}
 
         <div className="tui-foot">
-          <span className="tui-hint">Answering here is the same as answering in the terminal.</span>
+          <span className="tui-hint">
+            ↑↓ to move · Enter to choose · Esc hands it back to the terminal
+          </span>
           <button className="tui-plain" disabled={busy} onClick={onDismiss}>
             Use the terminal
           </button>

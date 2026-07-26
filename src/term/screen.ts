@@ -100,7 +100,7 @@ export interface PermissionRequest {
   highlighted: number;
 }
 
-const OPTION = /^\s*(❯)?\s*(\d+)\.\s+(.+?)\s*$/;
+const OPTION = /^\s*([❯↓↑])?\s*(\d+)\.\s+(.+?)\s*$/;
 const RULE = /^[\s─━]{10,}$/;
 
 /**
@@ -127,7 +127,7 @@ export function detectPermission(screen: Screen): PermissionRequest | null {
   for (let i = q + 1; i < footerAt; i++) {
     const m = OPTION.exec(screen[i]);
     if (!m) continue;
-    if (m[1]) highlighted = options.length;
+    if (m[1] === "❯") highlighted = options.length;
     options.push({ number: Number(m[2]), label: m[3].trim() });
   }
   if (options.length < 2 || highlighted < 0) return null;
@@ -152,11 +152,26 @@ export function detectPermission(screen: Screen): PermissionRequest | null {
   };
 }
 
-export type Detected = ModelPicker | PermissionRequest;
+export type Detected =
+  | ModelPicker
+  | PermissionRequest
+  | RewindPicker
+  | RewindConfirm;
 
-/** Every detector we know. Order matters only for overlapping screens. */
+/**
+ * Every detector we know.
+ *
+ * Order matters where screens overlap: the rewind confirmation is a numbered
+ * Select like a permission prompt, so it is checked first — otherwise the more
+ * general shape would claim it and offer the wrong buttons.
+ */
 export function detect(screen: Screen): Detected | null {
-  return detectPermission(screen) ?? detectModelPicker(screen);
+  return (
+    detectRewindConfirm(screen) ??
+    detectRewindPicker(screen) ??
+    detectPermission(screen) ??
+    detectModelPicker(screen)
+  );
 }
 
 /**
@@ -239,4 +254,154 @@ export function detectPermissionMode(screen: Screen): PermissionMode | null {
     if (/manual mode on/i.test(line)) return "manual";
   }
   return null;
+}
+
+
+/* ---------- /rewind ---------- */
+
+export interface RewindPoint {
+  /** The prompt this point sits before, as claude prints it. */
+  prompt: string;
+  /** "a.txt +2 -1" — what changed in that turn. "" when nothing did. */
+  changes: string;
+  /** The trailing "(current)" row: rewinding to it is a no-op. */
+  isCurrent: boolean;
+}
+
+export interface RewindPicker {
+  kind: "rewind-picker";
+  points: RewindPoint[];
+  highlighted: number;
+  /** From claude's own "N more above" / "N below" indicators, 0 when absent.
+   *  `above === 0` is how we know the window is at the top — exact, rather
+   *  than inferring it from a read that stopped adding anything. */
+  above: number;
+  below: number;
+}
+
+export interface RewindConfirm {
+  kind: "rewind-confirm";
+  /** The message being rewound to, and how long ago it was sent. */
+  prompt: string;
+  when: string;
+  /** "The conversation will be forked." / "The code will be restored…" */
+  effects: string[];
+  options: PermissionOption[];
+  highlighted: number;
+  /** claude's own caveat, carried through rather than paraphrased. */
+  warning: string | null;
+}
+
+const REWIND_HEAD = /^\s*Rewind\s*$/;
+
+/**
+ * Step one of `/rewind`: which point to go back to.
+ *
+ * The rows are *not* numbered, and claude renders every user message in the
+ * conversation with a leading ❯ — so an unbounded search for the highlight
+ * would happily latch onto the transcript scrolled above. The region between
+ * the "Restore the code and/or conversation…" line and the footer is the only
+ * place ❯ means "selected", and this reads nothing outside it.
+ */
+export function detectRewindPicker(screen: Screen): RewindPicker | null {
+  const head = screen.findIndex((l) => REWIND_HEAD.test(l));
+  if (head < 0) return null;
+  const intro = screen.findIndex(
+    (l, i) => i > head && /Restore the code and\/or conversation/i.test(l),
+  );
+  if (intro < 0) return null;
+  const foot = screen.findIndex(
+    (l, i) => i > intro && /Enter to continue/.test(l) && /Esc to cancel/.test(l),
+  );
+  if (foot < 0) return null;
+
+  // claude paginates the list and marks the remainder: "4 more above",
+  // "35 below". They are not restore points, and their text changes on every
+  // scroll — left in, they appeared as rows *and* defeated the harvest's
+  // stop condition, since every read looked like it had found something new.
+  const MORE = /^[↑↓⌃⌄\s]*(\d+)\s*(?:more\s*)?(above|below)?\s*(?:more)?\s*$/i;
+
+  // A change line is a filename followed only by +N/-N counts. Anything else
+  // in the region is a prompt. Matching on that shape rather than "does it
+  // contain a number" keeps a prompt like "bump version to +1" from being
+  // swallowed as the previous point's diff.
+  const CHANGE = /^\S+(\s+[+-]\d+)+$/;
+
+  const points: RewindPoint[] = [];
+  let highlighted = -1;
+  let above = 0;
+  let below = 0;
+  for (let i = intro + 1; i < foot; i++) {
+    const raw = screen[i];
+    const text = raw.replace(/^\s*❯\s*/, "").trim();
+    if (!text) continue;
+    const more = MORE.exec(text);
+    if (more && /above|below|↑|↓/i.test(text)) {
+      const n = Number(more[1]);
+      if (/above|↑/i.test(text)) above = n;
+      else below = n;
+      continue;
+    }
+    if (points.length && CHANGE.test(text) && !points[points.length - 1].changes) {
+      points[points.length - 1].changes = text;
+      continue;
+    }
+    if (/^\s*❯/.test(raw)) highlighted = points.length;
+    points.push({
+      prompt: text,
+      changes: "",
+      isCurrent: /^\(current\)$/i.test(text),
+    });
+  }
+  if (points.length < 2 || highlighted < 0) return null;
+  return { kind: "rewind-picker", points, highlighted, above, below };
+}
+
+/**
+ * Step two: what to restore. A numbered Select, so the shared driver moves it.
+ *
+ * claude states the consequences itself ("The conversation will be forked",
+ * "The code will be restored +1 -2 in a.txt") and adds a caveat about files it
+ * cannot undo. Both are carried through verbatim — this is a destructive
+ * action, and paraphrasing what it does would be the wrong place to be clever.
+ */
+export function detectRewindConfirm(screen: Screen): RewindConfirm | null {
+  const head = screen.findIndex((l) => REWIND_HEAD.test(l));
+  if (head < 0) return null;
+  const intro = screen.findIndex(
+    (l, i) => i > head && /Confirm you want to restore/i.test(l),
+  );
+  if (intro < 0) return null;
+
+  const options: PermissionOption[] = [];
+  let highlighted = -1;
+  for (let i = intro + 1; i < screen.length; i++) {
+    const m = OPTION.exec(screen[i]);
+    if (!m) continue;
+    if (m[1] === "❯") highlighted = options.length;
+    options.push({ number: Number(m[2]), label: m[3].trim() });
+  }
+  if (options.length < 2 || highlighted < 0) return null;
+  if (options.some((o, i) => o.number !== i + 1)) return null;
+
+  const quoted = screen
+    .slice(intro + 1, intro + 6)
+    .filter((l) => /^\s*│/.test(l))
+    .map((l) => l.replace(/^\s*│\s*/, "").trim());
+  const effects = screen
+    .slice(intro + 1)
+    .filter((l) => /^\s*The (conversation|code) will be/.test(l))
+    .map((l) => l.trim());
+  const warning =
+    screen.find((l) => /^\s*⚠/.test(l))?.replace(/^\s*⚠\s*/, "").trim() ?? null;
+
+  return {
+    kind: "rewind-confirm",
+    prompt: quoted[0] ?? "",
+    when: quoted.find((q) => /^\(.*ago\)$/.test(q)) ?? "",
+    effects,
+    options,
+    highlighted,
+    warning,
+  };
 }

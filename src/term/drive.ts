@@ -96,3 +96,83 @@ export async function cycleModeTo(
     );
   }
 }
+
+/**
+ * Collect a scrolling TUI list that only renders a window at a time.
+ *
+ * The rewind picker can hold far more points than fit on screen, and we read
+ * the viewport — so what is drawn is all we would otherwise know about.
+ * Walking the highlight scrolls the window, and in a picker that commits
+ * nothing until Enter, walking is free.
+ *
+ * Goes up to the top, gathering as it climbs, and stops when two consecutive
+ * reads add nothing. Returns the full list in order, with the highlight parked
+ * at the top so a later selection can walk down deterministically.
+ */
+export async function harvestUpwards<T>(
+  read: () => { items: T[]; highlighted: number; atTop?: boolean } | null,
+  write: (data: string) => void,
+  key: (item: T) => string,
+  maxSteps = 200,
+  onProgress?: (count: number) => void,
+): Promise<T[]> {
+  const seen = new Map<string, T>();
+  const order: string[] = [];
+  const absorb = (items: T[]) => {
+    let added = 0;
+    // Prepend: climbing reveals earlier entries, so new ones belong in front.
+    for (let i = items.length - 1; i >= 0; i--) {
+      const k = key(items[i]);
+      if (seen.has(k)) continue;
+      seen.set(k, items[i]);
+      order.unshift(k);
+      added++;
+    }
+    return added;
+  };
+
+  const first = read();
+  if (!first) throw new Error("the list went away");
+  absorb(first.items);
+  onProgress?.(order.length);
+
+  let quiet = 0;
+  for (let step = 0; step < maxSteps; step++) {
+    const before = read();
+    if (!before) break;
+    // Prefer the list's own "nothing above" signal; fall back to "two reads
+    // in a row told us nothing new" where a list does not offer one.
+    if (before.atTop === true) break;
+    if (before.atTop === undefined && quiet >= 2) break;
+    write(KEY_UP);
+    await wait(SETTLE_MS);
+    const after = read();
+    if (!after) break;
+    quiet = absorb(after.items) === 0 ? quiet + 1 : 0;
+    onProgress?.(order.length);
+  }
+  return order.map((k) => seen.get(k)!);
+}
+
+/**
+ * Move the highlight onto the row whose identity matches, rather than onto an
+ * index. After harvesting, our list and the rendered window no longer share a
+ * coordinate system — the visible list is a slice — so an index would point at
+ * the wrong row. Matching on what the row *says* cannot drift.
+ */
+export async function selectByIdentity<T>(
+  read: () => { items: T[]; highlighted: number } | null,
+  write: (data: string) => void,
+  key: (item: T) => string,
+  target: string,
+  maxSteps = 200,
+): Promise<void> {
+  for (let step = 0; step < maxSteps; step++) {
+    const now = read();
+    if (!now) throw new Error("the list went away before the choice landed");
+    if (key(now.items[now.highlighted]) === target) return;
+    write(KEY_DOWN);
+    await wait(SETTLE_MS);
+  }
+  throw new Error("could not find that point in the list");
+}

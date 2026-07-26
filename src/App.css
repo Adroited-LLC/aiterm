@@ -1374,6 +1374,13 @@ body.dragging * { pointer-events: none; }
   cursor: pointer;
 }
 .perm-option:hover:not(:disabled) { border-color: var(--accent); background: var(--bg-hover); }
+.perm-option:focus-visible,
+.perm-option:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--bg-hover);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+}
 .perm-option:first-child { border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
 .perm-option.deny:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
 .perm-option:disabled { opacity: 0.45; cursor: default; }
