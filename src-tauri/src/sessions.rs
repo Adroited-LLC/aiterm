@@ -1625,10 +1625,13 @@ pub fn session_model(session_id: String) -> ModelChoice {
             continue;
         }
         // Last one wins: a model change mid-session leaves both in the file.
+        // `<synthetic>` marks a record the CLI wrote itself rather than a real
+        // reply — it names no model, so taking it would blank the pill.
         if let Some(m) = v
             .get("message")
             .and_then(|m| m.get("model"))
             .and_then(|m| m.as_str())
+            .filter(|m| !m.starts_with('<'))
         {
             out.model = Some(m.to_string());
         }

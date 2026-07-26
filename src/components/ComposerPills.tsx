@@ -39,17 +39,17 @@ function shortModel(id: string | null): string {
 }
 
 /**
- * What was last *chosen* here, per session.
+ * What was last *chosen* here, per session — a fallback, never the headline.
  *
- * The transcript records what each turn actually ran at, which is not the same
- * question: pick `auto` and every record still names a concrete level, so
- * reading the file can never show `auto` back to you. Nothing on disk holds the
- * selection either — it lives in the running claude. So the chooser remembers
- * its own choice, and falls back to the observed value when it has none.
+ * The transcript records what each turn actually ran at, and that is the truth:
+ * it is what happened, not what we asked for. Clicking a model is only a
+ * request. It can be swallowed by a prompt you were mid-way through typing, or
+ * refused because the model is not available to you — and then the pill would
+ * sit there naming a model the session has never used.
  *
- * The gap this leaves is a `/model` typed straight into the terminal: we won't
- * see it, and the pill will keep showing our older pick until a turn runs and
- * the fallback catches up.
+ * So a remembered pick only fills what the transcript cannot say: before the
+ * first reply there is nothing recorded yet, and `auto` effort never appears
+ * because every turn resolves to a concrete level.
  */
 const PICK_KEY = "aiterm.composerPick";
 type Picks = Record<string, { model?: string; effort?: string }>;
@@ -229,6 +229,13 @@ export default function ComposerPills({
     close();
   };
 
+  // What the session is really running, per its transcript. The remembered
+  // pick fills in only where the transcript has nothing to say.
+  const liveModel = choice.model ? shortModel(choice.model) : null;
+  const shownModel = liveModel ?? pick.model ?? "—";
+  const shownEffort =
+    pick.effort === "auto" ? "auto" : choice.effort ?? pick.effort ?? "—";
+
   const done = tasks.filter((t) => t.status === "completed").length;
   const running = agents.filter((a) => a.status === "running").length;
   const session = bars.find((b) => b.kind === "session") ?? bars[0];
@@ -361,8 +368,8 @@ export default function ComposerPills({
           )}
           {(open === "model" ? MODELS : EFFORTS).map(([name, desc]) => {
             const selected = open === "model"
-              ? (pick.model ?? shortModel(choice.model)) === name
-              : (pick.effort ?? choice.effort) === name;
+              ? shownModel === name
+              : shownEffort === name;
             return (
               <button
                 key={name}
@@ -395,8 +402,8 @@ export default function ComposerPills({
         </div>
       )}
       <div className="cpill-row">
-        {onCommand && pill("model", "◆", "Model", pick.model ?? shortModel(choice.model))}
-        {onCommand && pill("effort", "≡", "Effort", pick.effort ?? choice.effort ?? "—")}
+        {onCommand && pill("model", "◆", "Model", shownModel)}
+        {onCommand && pill("effort", "≡", "Effort", shownEffort)}
         {sessionId && pill("tasks", "◑", "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
         {sessionId && pill("artifacts", "▤", "Artifacts", artifacts.length ? `${artifacts.length}` : "")}
         {sessionId && pill(
