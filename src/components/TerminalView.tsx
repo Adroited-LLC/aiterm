@@ -50,6 +50,10 @@ export interface TermHandle {
   /** Put the keyboard back in the terminal — used when a chrome element that
    *  took focus (a composer pill panel) is dismissed. */
   focus: () => void;
+  /** Whether unsent text appears to be sitting in the running program's input
+   *  line. Typing a slash command into a non-empty prompt concatenates onto
+   *  what is there and submits the lot, so the pills ask before doing it. */
+  pendingInput: () => boolean;
 }
 
 interface Props {
@@ -129,9 +133,24 @@ export default function TerminalView({
       unlistenExit = await listen<{ id: number }>("pty://exit", (e) => {
         if (e.payload.id === id) onExit(tab.key);
       });
+      // Roughly how much unsent text is sitting in the running program's input
+      // line. Every keystroke passes through here on its way to the PTY, which
+      // is enough to answer the only question that matters: is the prompt
+      // empty right now?
+      //
+      // Deliberately approximate. Printable keys and pastes add, backspace
+      // removes, Enter and Ctrl+C reset. Cursor keys and word-kill are not
+      // modelled, so this can report text pending when the line is actually
+      // clear. That is the safe direction to be wrong in — the cost is a
+      // confirmation you did not need, never a half-written prompt sent.
+      let pending = 0;
+
       term.onBell(() => onAttention(tab.key, true));
       term.onData((data) => {
         onAttention(tab.key, false);
+        if (data === "\r" || data === "\n" || data === "\x03") pending = 0;
+        else if (data === "\x7f" || data === "\b") pending = Math.max(0, pending - 1);
+        else if (data >= " ") pending += data.length;
         ptyWrite(id, data);
       });
       term.onResize(({ cols, rows }) => ptyResize(id, cols, rows));
@@ -139,11 +158,13 @@ export default function TerminalView({
       onRegister(tab.key, {
         write: (data) => ptyWrite(id, data),
         redraw,
-        paste: (text) =>
+        paste: (text) => {
+          pending += text.length;
           ptyWrite(
             id,
             term.modes.bracketedPasteMode ? `\x1b[200~${text}\x1b[201~` : text,
-          ),
+          );
+        },
         sendComposed: (text) => {
           const bracketed = term.modes.bracketedPasteMode;
           let payload: string;
@@ -154,9 +175,11 @@ export default function TerminalView({
           } else {
             payload = text + "\r";
           }
+          pending = 0; // this call ends in Enter, so the line is spent
           ptyWrite(id, payload);
         },
         focus: () => term.focus(),
+        pendingInput: () => pending > 0,
       });
     })();
 

@@ -1689,6 +1689,74 @@ pub fn claude_permission_mode(project_path: String) -> Option<String> {
     None
 }
 
+fn user_settings_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".claude/settings.json"))
+}
+
+/// The `model` key in ~/.claude/settings.json — Claude Code's global default
+/// for new sessions. None when unset.
+#[tauri::command]
+pub fn claude_model_default() -> Option<String> {
+    let raw = std::fs::read_to_string(user_settings_path()?).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    v.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// Put the global `model` default back to `previous` after a `/model` command
+/// has changed it.
+///
+/// Typing `/model <name>` at claude's prompt does not just retarget the running
+/// session — it writes that name into ~/.claude/settings.json as the default
+/// for every new session, in every project. Verified by driving a real PTY:
+/// the key went from `opus` to `haiku` and stayed there. `/effort` does not do
+/// this; only model.
+///
+/// aiterm's pill is a per-session control, so it undoes that half. Waits for
+/// the CLI to actually write (it does so a moment after the command lands)
+/// before restoring, otherwise we would race it and lose. Returns whether a
+/// restore was needed. Only ever touches the one key, re-reading the file first
+/// so anything else written meanwhile survives.
+#[tauri::command]
+pub fn restore_claude_model_default(previous: Option<String>) -> Result<bool, String> {
+    let path = user_settings_path().ok_or_else(|| "no home directory".to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if claude_model_default() != previous {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // The CLI never wrote — nothing was hijacked, nothing to undo.
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+
+    write_model_key(&path, previous.as_deref())?;
+    Ok(true)
+}
+
+/// Set (or with None, remove) the `model` key in a settings file, leaving every
+/// other key and its position alone. Split out from the command so the part
+/// that rewrites a real config file can be tested against a scratch one.
+fn write_model_key(path: &std::path::Path, model: Option<&str>) -> Result<(), String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| format!("{} is not a JSON object", path.display()))?;
+    match model {
+        Some(m) => {
+            obj.insert("model".into(), serde_json::Value::String(m.to_string()));
+        }
+        None => {
+            obj.remove("model");
+        }
+    }
+    let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+    std::fs::write(path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// A v4 UUID from `/dev/urandom`. `claude --resume` only accepts well-formed
 /// UUIDs, and a transcript is named for its id, so the shape is load-bearing.
 fn uuid_v4() -> Result<String, String> {
@@ -1886,6 +1954,50 @@ pub fn materialize_fork(session_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("aiterm-test-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// Restoring the model default must not disturb the rest of the file. The
+    /// user's settings.json is hand-maintained; reordering or dropping keys
+    /// would be a far worse bug than the one this fixes.
+    #[test]
+    fn write_model_key_preserves_other_keys_and_their_order() {
+        let path = scratch(
+            "order",
+            r#"{"zeta":1,"model":"haiku","permissions":{"defaultMode":"bypassPermissions"},"alpha":2}"#,
+        );
+        write_model_key(&path, Some("opus")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        assert!(text.contains("\"model\": \"opus\""), "{text}");
+        assert!(text.contains("bypassPermissions"), "{text}");
+        let zeta = text.find("zeta").unwrap();
+        let alpha = text.find("alpha").unwrap();
+        assert!(zeta < alpha, "keys were reordered:\n{text}");
+    }
+
+    /// A default that was never set must come back absent, not as null or "".
+    #[test]
+    fn write_model_key_removes_the_key_when_there_was_none() {
+        let path = scratch("remove", r#"{"model":"haiku","other":true}"#);
+        write_model_key(&path, None).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v.get("model").is_none());
+        assert_eq!(v.get("other").and_then(|o| o.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn write_model_key_refuses_a_non_object_file() {
+        let path = scratch("array", "[1,2,3]");
+        assert!(write_model_key(&path, Some("opus")).is_err());
+    }
 
     #[test]
     fn fork_rewrites_id_fields_only() {

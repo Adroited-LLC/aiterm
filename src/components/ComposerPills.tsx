@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import GitPanel from "./GitPanel";
 import {
   AgentRun, Artifact, ModelChoice, SessionTask, UsageBar,
-  homeAbbrev, openPath, relTime,
+  claudeModelDefault, homeAbbrev, openPath, relTime, restoreClaudeModelDefault,
   sessionAgents, sessionArtifacts, sessionModel, sessionTasks,
 } from "../ipc";
 
@@ -112,10 +112,14 @@ interface Props {
    *  into the terminal — never when the click went to other chrome, which owns
    *  its own focus. */
   onDismiss?: () => void;
+  /** Whether the focused terminal has unsent text in its input line. A slash
+   *  command typed into a non-empty prompt is appended to it and the whole
+   *  thing is submitted as one message, so we ask before doing that. */
+  hasPendingInput?: () => boolean;
 }
 
 export default function ComposerPills({
-  sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss,
+  sessionId, projectRoot, usage, usageAsOf, onCommand, onDismiss, hasPendingInput,
 }: Props) {
   const bars = usage;
   const [open, setOpen] = useState<PanelKey | null>(null);
@@ -125,12 +129,15 @@ export default function ComposerPills({
   const [agents, setAgents] = useState<AgentRun[]>([]);
   const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null });
   const [picks, setPicks] = useState<Picks>(loadPicks);
+  /** A choice held back because the prompt was not empty. */
+  const [held, setHeld] = useState<{ kind: "model" | "effort"; value: string } | null>(null);
   const pick = (sessionId && picks[sessionId]) || {};
 
   /** One exit path for every way a panel closes, so the keyboard always ends
    *  up in the same place. */
   const close = () => {
     setOpen(null);
+    setHeld(null);
     onDismiss?.();
   };
 
@@ -182,8 +189,34 @@ export default function ComposerPills({
   // Sending is fire-and-forget: claude writes the change into the transcript,
   // and the next poll reads it back. Nothing optimistic to get out of step —
   // if the command doesn't take, the pill keeps showing the truth.
-  const run = (kind: "model" | "effort", value: string) => {
+  const run = (kind: "model" | "effort", value: string, force = false) => {
+    // A slash command is only a command when it starts the line. Typed into a
+    // prompt you were halfway through writing, it becomes the tail of that
+    // sentence and Enter sends the whole thing to the model. We cannot clear
+    // claude's input for you — nothing we can send reliably empties it, and
+    // guessing would throw away what you wrote — so ask instead.
+    if (!force && hasPendingInput?.()) {
+      setHeld({ kind, value });
+      return;
+    }
+    setHeld(null);
+
+    // `/model` does not only retarget this session: the CLI also writes the
+    // name into ~/.claude/settings.json as the default for every new session
+    // in every project. This pill is a per-session control, so read the
+    // default first and put it back once the CLI has written. `/effort` has
+    // no such behaviour — both verified against a live session.
+    const restore =
+      kind === "model"
+        ? claudeModelDefault().catch(() => null)
+        : null;
+
     onCommand?.(`/${kind} ${value}`);
+
+    restore?.then((previous) =>
+      restoreClaudeModelDefault(previous).catch(() => {}),
+    );
+
     if (sessionId) {
       setPicks((p) => {
         const next = { ...p, [sessionId]: { ...p[sessionId], [kind]: value } };
@@ -310,6 +343,22 @@ export default function ComposerPills({
       )}
       {(open === "model" || open === "effort") && (
         <div className="cpill-panel cpill-choices">
+          {held && (
+            <div className="cpill-hold">
+              <div className="cpill-hold-text">
+                Your prompt has unsent text. <b>/{held.kind} {held.value}</b> would be
+                added to the end of it and the whole thing sent as a message.
+                Send or clear what you typed first.
+              </div>
+              <div className="cpill-hold-acts">
+                <button
+                  className="cpill-hold-go"
+                  onClick={() => run(held.kind, held.value, true)}
+                >Send it anyway</button>
+                <button className="cpill-hold-no" onClick={() => setHeld(null)}>Cancel</button>
+              </div>
+            </div>
+          )}
           {(open === "model" ? MODELS : EFFORTS).map(([name, desc]) => {
             const selected = open === "model"
               ? (pick.model ?? shortModel(choice.model)) === name

@@ -732,6 +732,8 @@ export default function App() {
               handles.current.get(activeTab)?.sendComposed(text)}
             onDismiss={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.focus()}
+            hasPendingInput={activeTab === null ? undefined : () =>
+              handles.current.get(activeTab)?.pendingInput() ?? false}
           />}
         </div>
 

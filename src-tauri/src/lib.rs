@@ -39,6 +39,8 @@ pub fn run() {
             sessions::session_fork,
             sessions::materialize_fork,
             sessions::claude_permission_mode,
+            sessions::claude_model_default,
+            sessions::restore_claude_model_default,
             sessions::session_model,
             usage::usage_limits,
             fonts::list_fonts,

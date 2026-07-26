@@ -155,6 +155,14 @@ export const materializeFork = (sessionId: string) =>
 // null when nothing is configured (or it names a mode the CLI would reject).
 export const claudePermissionMode = (projectPath: string) =>
   invoke<string | null>("claude_permission_mode", { projectPath });
+// Claude Code's global default model for new sessions (~/.claude/settings.json).
+export const claudeModelDefault = () =>
+  invoke<string | null>("claude_model_default");
+// Put that global default back after a `/model` command changed it. Typing
+// `/model <name>` retargets the running session AND rewrites the global
+// default; the pill is a per-session control, so it undoes the second half.
+export const restoreClaudeModelDefault = (previous: string | null) =>
+  invoke<boolean>("restore_claude_model_default", { previous });
 export interface ModelChoice {
   /** Full id as recorded, e.g. "claude-opus-5". null before the first reply. */
   model: string | null;
