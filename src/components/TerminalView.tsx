@@ -54,6 +54,11 @@ export interface TermHandle {
    *  line. Typing a slash command into a non-empty prompt concatenates onto
    *  what is there and submits the lot, so the pills ask before doing it. */
   pendingInput: () => boolean;
+  /** The visible screen as text, one string per row. xterm has already parsed
+   *  the escape codes, so this is rendered characters rather than a guess at a
+   *  byte stream. Used to recognise TUI screens worth replacing with a real
+   *  dialog. */
+  screen: () => string[];
 }
 
 interface Props {
@@ -180,6 +185,15 @@ export default function TerminalView({
         },
         focus: () => term.focus(),
         pendingInput: () => pending > 0,
+        screen: () => {
+          const buf = term.buffer.active;
+          const rows: string[] = [];
+          for (let i = 0; i < term.rows; i++) {
+            const line = buf.getLine(buf.viewportY + i);
+            rows.push(line ? line.translateToString(true) : "");
+          }
+          return rows;
+        },
       });
     })();
 

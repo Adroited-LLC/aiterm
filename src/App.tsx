@@ -7,6 +7,12 @@ import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
+import TuiModelPicker from "./components/TuiModelPicker";
+import TuiPermission from "./components/TuiPermission";
+import {
+  Detected, PermissionMode, detect, detectPermissionMode,
+} from "./term/screen";
+import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
 import SettingsModal from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
@@ -19,7 +25,7 @@ import {
   ProjectInfo, Session,
   TrashedSession,
   UsageBar,
-  claudePermissionMode, listProjects, listSessions, materializeFork,
+  listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, usageLimits,
   resolveResumableId, liveSessionIds, stopSession,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
@@ -32,6 +38,25 @@ const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
 const PANELS_KEY = "aiterm.panelToggles";
 const USAGE_KEY = "aiterm.usageCache";
+
+/**
+ * How aiterm starts claude. One place, so every session it opens behaves the
+ * same way and nothing depends on a global config that can outrank a session.
+ *
+ * `--permission-mode auto` asks for the classifier mode, which the CLI calls
+ * its own default ("Auto mode is now Claude Code's default permission mode").
+ * It needs a background setup, and where that has not happened it falls back
+ * to manual — a safe direction to fail, and the pill goes on reporting
+ * whatever claude's status line actually says, so it cannot misrepresent
+ * which mode you are in.
+ *
+ * `--allow-dangerously-skip-permissions` *enables* bypass without selecting
+ * it, which is what puts the fourth mode in the shift+tab cycle and therefore
+ * one click away on the permissions pill. Verified against a live session:
+ * without the flag the cycle is manual → accept edits → plan → manual; with
+ * it, bypass joins the loop.
+ */
+const CLAUDE_CMD = "claude --permission-mode auto --allow-dangerously-skip-permissions";
 
 interface PanelToggles {
   sessions: boolean;
@@ -115,6 +140,82 @@ export default function App() {
   const setShowGit = setPanel("git");
   const setShowComposer = setPanel("composer");
   const setShowAgent = setPanel("agent");
+
+  // Screens in the terminal that aiterm can present better than the TUI does.
+  // Polled rather than pushed: xterm has no "screen changed" event worth
+  // hanging this on, and reading ~40 already-parsed lines four times a second
+  // is nothing. `dismissed` remembers that you asked for the raw terminal for
+  // *this* appearance, and clears itself once the screen goes away.
+  const [tui, setTui] = useState<Detected | null>(null);
+  const [permMode, setPermMode] = useState<PermissionMode | null>(null);
+  const [tuiDismissed, setTuiDismissed] = useState(false);
+  // Only dress up a picker *we* opened. Typing /model yourself is a request for
+  // the terminal, and answering it with our own dialog would be taking the
+  // terminal away from someone who just asked for it. Holds the time the pill
+  // asked, so a picker that never appears stops arming us.
+  const pickerArmed = useRef<number | null>(null);
+  const openModelPicker = useCallback(() => {
+    if (activeTab === null) return;
+    pickerArmed.current = Date.now();
+    handles.current.get(activeTab)?.sendComposed("/model");
+  }, [activeTab]);
+
+  // Closing a dialog — by answering it, cancelling, or asking for the raw
+  // terminal — always ends with the keyboard back in the terminal. Whatever
+  // happens next is typed there, and leaving focus on a button that just
+  // disappeared makes the first keystroke go nowhere.
+  const dismissTui = useCallback((tab: number) => {
+    setTuiDismissed(true);
+    handles.current.get(tab)?.focus();
+  }, []);
+
+  const setPermissionMode = useCallback(async (target: PermissionMode) => {
+    if (activeTab === null) return;
+    const handle = handles.current.get(activeTab);
+    if (!handle) return;
+    await cycleModeTo(
+      () => detectPermissionMode(handle.screen()),
+      (d) => handle.write(d),
+      target,
+    );
+    handle.focus();
+  }, [activeTab]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const handle = activeTab === null ? undefined : handles.current.get(activeTab);
+      const lines = handle ? handle.screen() : null;
+      setPermMode(lines ? detectPermissionMode(lines) : null);
+      const found = lines ? detect(lines) : null;
+      if (!found) {
+        // Gone, or not painted yet. Give it a moment before disarming, so
+        // arming a beat before claude draws does not cancel itself.
+        if (pickerArmed.current && Date.now() - pickerArmed.current > 4000) {
+          pickerArmed.current = null;
+        }
+        setTui(null);
+        setTuiDismissed(false);
+        return;
+      }
+      // A permission prompt is never something we asked for — it interrupts
+      // you, which is exactly when a real dialog earns its place. Only the
+      // model picker has to be armed, because typing /model yourself is a
+      // request for the terminal.
+      if (found.kind === "model-picker" && !pickerArmed.current) return;
+      setTui((prev) => {
+        // Only replace when something actually changed, so the dialog is not
+        // rebuilt four times a second while it sits there.
+        if (
+          prev &&
+          prev.kind === found.kind &&
+          prev.highlighted === found.highlighted &&
+          prev.options.length === found.options.length
+        ) return prev;
+        return found;
+      });
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [activeTab]);
 
   const [opts, setOpts] = useState<SessionDisplayOpts>(() =>
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
@@ -457,20 +558,10 @@ export default function App() {
       setNotice(`Couldn't stop "${s.title}" to resume it: ${e}`);
       return;
     }
-    // Carry the configured permission mode. A resumed session otherwise
-    // replays the mode it last recorded, so one that drifted to `acceptEdits`
-    // could never be lifted back to what the config asks for — the flag is the
-    // only thing that outranks the recording. A new session needs no help
-    // here: `claude` reads the same config itself on a cold start.
-    let mode: string | null = null;
-    try {
-      mode = await claudePermissionMode(s.project_path);
-    } catch {
-      /* no config, or unreadable — resume without the flag */
-    }
-    const cmd = mode
-      ? `claude --permission-mode ${mode} --resume ${liveId}`
-      : `claude --resume ${liveId}`;
+    // Resume the same way we start anything — see CLAUDE_CMD. This used to
+    // pass `--permission-mode <configured>`, which is what silently lifted a
+    // manual session into bypass on resume.
+    const cmd = `${CLAUDE_CMD} --resume ${liveId}`;
     openTab(s.title, s.project_path, cmd, liveId, liveId);
   };
   // Branch a session into its own tab, resumable later on its own row. The
@@ -548,7 +639,7 @@ export default function App() {
   };
   const projectClaude = (p: ProjectInfo) => {
     setActiveProject(p.path);
-    openTab(p.name, p.path, "claude", `claude:${p.path}`);
+    openTab(p.name, p.path, CLAUDE_CMD, `claude:${p.path}`);
   };
 
   // --- splitter dragging ---
@@ -720,6 +811,23 @@ export default function App() {
                 onClose={() => setPreviewSession(null)}
               />
             )}
+            {tui && !tuiDismissed && activeTab !== null && (
+              tui.kind === "model-picker" ? (
+                <TuiModelPicker
+                  picker={tui}
+                  write={(d) => handles.current.get(activeTab)?.write(d)}
+                  screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                  onDismiss={() => dismissTui(activeTab)}
+                />
+              ) : (
+                <TuiPermission
+                  request={tui}
+                  write={(d) => handles.current.get(activeTab)?.write(d)}
+                  screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                  onDismiss={() => dismissTui(activeTab)}
+                />
+              )
+            )}
           </div>
           {/* onCommand goes to the focused terminal, so the pills only offer
               model/effort when there is a live session to run them in. */}
@@ -734,6 +842,9 @@ export default function App() {
               handles.current.get(activeTab)?.focus()}
             hasPendingInput={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.pendingInput() ?? false}
+            onOpenModelPicker={activeTab === null ? undefined : openModelPicker}
+            permMode={permMode}
+            onSetPermMode={activeTab === null ? undefined : setPermissionMode}
           />}
         </div>
 
