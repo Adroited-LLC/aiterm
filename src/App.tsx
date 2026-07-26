@@ -137,6 +137,15 @@ export default function App() {
     handles.current.get(activeTab)?.sendComposed("/model");
   }, [activeTab]);
 
+  // Closing a dialog — by answering it, cancelling, or asking for the raw
+  // terminal — always ends with the keyboard back in the terminal. Whatever
+  // happens next is typed there, and leaving focus on a button that just
+  // disappeared makes the first keystroke go nowhere.
+  const dismissTui = useCallback((tab: number) => {
+    setTuiDismissed(true);
+    handles.current.get(tab)?.focus();
+  }, []);
+
   useEffect(() => {
     const id = window.setInterval(() => {
       const handle = activeTab === null ? undefined : handles.current.get(activeTab);
@@ -781,14 +790,14 @@ export default function App() {
                   picker={tui}
                   write={(d) => handles.current.get(activeTab)?.write(d)}
                   screen={() => handles.current.get(activeTab)?.screen() ?? []}
-                  onDismiss={() => setTuiDismissed(true)}
+                  onDismiss={() => dismissTui(activeTab)}
                 />
               ) : (
                 <TuiPermission
                   request={tui}
                   write={(d) => handles.current.get(activeTab)?.write(d)}
                   screen={() => handles.current.get(activeTab)?.screen() ?? []}
-                  onDismiss={() => setTuiDismissed(true)}
+                  onDismiss={() => dismissTui(activeTab)}
                 />
               )
             )}
