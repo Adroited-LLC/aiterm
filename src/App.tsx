@@ -9,6 +9,7 @@ import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
 import TuiModelPicker from "./components/TuiModelPicker";
 import TuiPermission from "./components/TuiPermission";
+import TuiRewind from "./components/TuiRewind";
 import {
   Detected, PermissionMode, detect, detectPermissionMode,
 } from "./term/screen";
@@ -205,12 +206,15 @@ export default function App() {
       setTui((prev) => {
         // Only replace when something actually changed, so the dialog is not
         // rebuilt four times a second while it sits there.
-        if (
-          prev &&
-          prev.kind === found.kind &&
-          prev.highlighted === found.highlighted &&
-          prev.options.length === found.options.length
-        ) return prev;
+        if (prev && prev.kind === found.kind && prev.highlighted === found.highlighted) {
+          const sameSize =
+            "options" in prev && "options" in found
+              ? prev.options.length === found.options.length
+              : "points" in prev && "points" in found
+                ? prev.points.length === found.points.length
+                : true;
+          if (sameSize) return prev;
+        }
         return found;
       });
     }, 250);
@@ -812,7 +816,14 @@ export default function App() {
               />
             )}
             {tui && !tuiDismissed && activeTab !== null && (
-              tui.kind === "model-picker" ? (
+              tui.kind === "rewind-picker" || tui.kind === "rewind-confirm" ? (
+                <TuiRewind
+                  step={tui}
+                  write={(d) => handles.current.get(activeTab)?.write(d)}
+                  screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                  onDismiss={() => dismissTui(activeTab)}
+                />
+              ) : tui.kind === "model-picker" ? (
                 <TuiModelPicker
                   picker={tui}
                   write={(d) => handles.current.get(activeTab)?.write(d)}
