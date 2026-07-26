@@ -7,6 +7,8 @@ import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
+import TuiModelPicker from "./components/TuiModelPicker";
+import { ModelPicker, detect } from "./term/screen";
 import AgentPanel from "./components/AgentPanel";
 import SettingsModal from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
@@ -115,6 +117,34 @@ export default function App() {
   const setShowGit = setPanel("git");
   const setShowComposer = setPanel("composer");
   const setShowAgent = setPanel("agent");
+
+  // Screens in the terminal that aiterm can present better than the TUI does.
+  // Polled rather than pushed: xterm has no "screen changed" event worth
+  // hanging this on, and reading ~40 already-parsed lines four times a second
+  // is nothing. `dismissed` remembers that you asked for the raw terminal for
+  // *this* appearance, and clears itself once the screen goes away.
+  const [tui, setTui] = useState<ModelPicker | null>(null);
+  const [tuiDismissed, setTuiDismissed] = useState(false);
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const handle = activeTab === null ? undefined : handles.current.get(activeTab);
+      const found = handle ? detect(handle.screen()) : null;
+      setTui((prev) => {
+        if (!found) return null;
+        // Only replace when something actually changed, so the dialog is not
+        // rebuilt four times a second while it sits there.
+        if (
+          prev &&
+          prev.highlighted === found.highlighted &&
+          prev.options.length === found.options.length &&
+          prev.effort === found.effort
+        ) return prev;
+        return found;
+      });
+      if (!found) setTuiDismissed(false);
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [activeTab]);
 
   const [opts, setOpts] = useState<SessionDisplayOpts>(() =>
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
@@ -718,6 +748,14 @@ export default function App() {
                 session={previewSession}
                 onResume={resumeSession}
                 onClose={() => setPreviewSession(null)}
+              />
+            )}
+            {tui && !tuiDismissed && activeTab !== null && (
+              <TuiModelPicker
+                picker={tui}
+                write={(d) => handles.current.get(activeTab)?.write(d)}
+                screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                onDismiss={() => setTuiDismissed(true)}
               />
             )}
           </div>
