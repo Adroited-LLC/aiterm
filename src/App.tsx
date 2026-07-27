@@ -917,20 +917,34 @@ export default function App() {
             {activeTab !== null && ended.has(activeTab) && (
               <div className="term-ended">
                 <div className="term-ended-box">
-                  <div className="term-ended-title">This session ended on its own</div>
+                  {/* A shell tab has no conversation behind it, so it gets none
+                      of the claude wording. Promising that "the transcript is
+                      still on disk" to someone who just typed `exit 3` in a
+                      shell is a reassurance about something that never
+                      existed — and a dialog that says one false thing is not
+                      worth trusting about the true ones. */}
+                  <div className="term-ended-title">
+                    {activeTabObj?.sessionId
+                      ? "This session ended on its own"
+                      : "This shell ended on its own"}
+                  </div>
                   <div className="term-ended-sub">
                     {ended.get(activeTab) === null
                       ? "The process is gone and its exit status could not be read."
-                      : `The process exited with status ${ended.get(activeTab)}.`}{" "}
-                    Nothing was lost — the transcript is still on disk.
+                      : `The process exited with status ${ended.get(activeTab)}.`}
+                    {activeTabObj?.sessionId
+                      ? " Nothing was lost — the transcript is still on disk."
+                      : ""}
                   </div>
-                  <div className="term-ended-sub dim">
-                    A session listed by <code>claude agents</code> can be stopped from
-                    any terminal, or from your phone. That looks exactly like this.
-                  </div>
+                  {activeTabObj?.sessionId && (
+                    <div className="term-ended-sub dim">
+                      A session listed by <code>claude agents</code> can be stopped from
+                      any terminal, or from your phone. That looks exactly like this.
+                    </div>
+                  )}
                   <div className="term-ended-acts">
                     <button className="tui-pick" onClick={() => restartEnded(activeTab)}>
-                      Resume it
+                      {activeTabObj?.sessionId ? "Resume it" : "Open a new shell"}
                     </button>
                     <button className="tui-plain" onClick={() => closeTab(activeTab)}>
                       Close tab
