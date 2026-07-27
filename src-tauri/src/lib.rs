@@ -36,6 +36,7 @@ pub fn run() {
             sessions::session_artifacts,
             sessions::running_session_ids,
             sessions::bg_agent_session_ids,
+            sessions::unstoppable_session_ids,
             sessions::live_session_ids,
             sessions::stop_session,
             sessions::resolve_resumable_id,

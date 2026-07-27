@@ -123,6 +123,12 @@ export const runningSessionIds = () =>
 // the agent view (`claude agents`).
 export const bgAgentSessionIds = () =>
   invoke<string[]>("bg_agent_session_ids");
+// Sessions aiterm can't reliably stop — daemon-held with no pid, or background
+// agents whose roster pid may be a helper rather than the conversation. The
+// resume path asks before it closes anything, so a stop it can't win doesn't
+// cost a tab. See `unstoppable_session_ids`.
+export const unstoppableSessionIds = () =>
+  invoke<string[]>("unstoppable_session_ids");
 // Every session the daemon currently holds, background AND interactive — i.e.
 // "is this session alive right now". Distinct from "aiterm has a tab open for
 // it": after a background-mode resume the tab holds the parent id while the

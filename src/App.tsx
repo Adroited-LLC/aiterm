@@ -28,7 +28,7 @@ import {
   UsageBar,
   listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, usageLimits,
-  resolveResumableId, liveSessionIds, stopSession,
+  resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -114,6 +114,11 @@ export default function App() {
 
   // Tabs whose terminal rang the bell while not being looked at.
   const [attention, setAttention] = useState<Set<number>>(new Set());
+  // Tabs whose process died on its own, and the exit code it died with. These
+  // keep their row: the tab going away used to be the *only* sign anything had
+  // happened, which is no help at all when the thing that killed it was
+  // somewhere else entirely — `claude agents` in another terminal, or a phone.
+  const [ended, setEnded] = useState<Map<number, number | null>>(new Map());
   const activeTabRef = useRef<number | null>(null);
   // Latest tabs, read without putting `tabs` in an effect's deps (which would
   // re-run it on every tab change).
@@ -492,12 +497,53 @@ export default function App() {
   // all three things. Removed rather than left running for nobody to read.
 
   const closeTab = useCallback((key: number) => {
+    setEnded((m) => {
+      if (!m.has(key)) return m;
+      const next = new Map(m);
+      next.delete(key);
+      return next;
+    });
     setTabs((t) => {
       const next = t.filter((x) => x.key !== key);
       setActiveTab((cur) => (cur === key ? (next[next.length - 1]?.key ?? null) : cur));
       return next;
     });
   }, []);
+
+  /** A terminal's process ended. Whether that closes the tab depends entirely
+   *  on why.
+   *
+   *  Exit 0 is someone leaving — `exit` at a shell, `/quit` in claude — and the
+   *  tab should go, which is what it has always done. Any other status means
+   *  the process died without being asked to, and the most likely cause is now
+   *  something outside this window: a session that has moved to the daemon is
+   *  listed by `claude agents` everywhere, so it can be killed from another
+   *  terminal or from the phone. Closing the tab in that case throws away the
+   *  notice that it happened and leaves the transcript — still on disk, still
+   *  resumable — to be found by hand. So the tab stays and says so. */
+  const handleTermExit = useCallback(
+    (key: number, code: number | null) => {
+      if (code === 0) {
+        closeTab(key);
+        return;
+      }
+      setEnded((m) => new Map(m).set(key, code));
+    },
+    [closeTab],
+  );
+
+  /** Put an ended tab back, resuming its conversation where it stopped. The
+   *  slot is reused so the sidebar row it belongs to stays the same row. */
+  const restartEnded = useCallback(
+    (key: number) => {
+      const t = tabsRef.current.find((x) => x.key === key);
+      if (!t) return;
+      closeTab(key);
+      const cmd = t.sessionId ? `${CLAUDE_CMD} --resume ${t.sessionId}` : t.command;
+      openTab(t.title, t.cwd, cmd, t.slotId, t.sessionId);
+    },
+    [closeTab, openTab],
+  );
 
   const selectSession = (s: Session) => {
     setActiveProject(s.project_path);
@@ -558,6 +604,26 @@ export default function App() {
     //
     // Our own tab goes through closeTab so React state stays in step; anything
     // else is signalled through the roster.
+    //
+    // But ask the roster *first*, because closing comes before stopping and
+    // the two can disagree. A session the daemon holds has no pid to signal —
+    // a conversation moves there on its own the moment you open the agents
+    // view — so `stopSession` can only poll for five seconds and give up. It
+    // used to give up having already closed the tab it was going to reuse,
+    // which turned "resume this" into "lose this", and the resume never
+    // happened either. Nothing is touched until we know a stop can succeed.
+    try {
+      const held = await unstoppableSessionIds();
+      if (held.includes(liveId) || held.includes(s.id)) {
+        setNotice(
+          `"${s.title}" is running under the Claude Code daemon, so aiterm can't stop it. ` +
+            `Stop it from \`claude agents\`, then resume.`,
+        );
+        return;
+      }
+    } catch {
+      /* roster unavailable — fall through and let stopSession be the judge */
+    }
     // Match on both ids: a tab opened before a compaction is slotted under the
     // row's pinned id, not the continuation `liveId` resolves to.
     for (const t of tabsRef.current) {
@@ -803,7 +869,7 @@ export default function App() {
                 key={t.key}
                 tab={t}
                 active={t.key === activeTab}
-                onExit={closeTab}
+                onExit={handleTermExit}
                 onRegister={registerHandle}
                 onActivity={noteActivity}
                 onAttention={noteAttention}
@@ -813,6 +879,31 @@ export default function App() {
                 theme={xtermTheme}
               />
             ))}
+            {activeTab !== null && ended.has(activeTab) && (
+              <div className="term-ended">
+                <div className="term-ended-box">
+                  <div className="term-ended-title">This session ended on its own</div>
+                  <div className="term-ended-sub">
+                    {ended.get(activeTab) === null
+                      ? "The process is gone and its exit status could not be read."
+                      : `The process exited with status ${ended.get(activeTab)}.`}{" "}
+                    Nothing was lost — the transcript is still on disk.
+                  </div>
+                  <div className="term-ended-sub dim">
+                    A session listed by <code>claude agents</code> can be stopped from
+                    any terminal, or from your phone. That looks exactly like this.
+                  </div>
+                  <div className="term-ended-acts">
+                    <button className="tui-pick" onClick={() => restartEnded(activeTab)}>
+                      Resume it
+                    </button>
+                    <button className="tui-plain" onClick={() => closeTab(activeTab)}>
+                      Close tab
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
             {tabs.length === 0 && !previewSession && (
               <div className="empty-note big">Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
             )}

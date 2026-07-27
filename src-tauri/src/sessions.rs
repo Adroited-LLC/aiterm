@@ -1519,6 +1519,33 @@ pub fn bg_agent_session_ids() -> Vec<String> {
         .collect()
 }
 
+/// Sessions aiterm cannot reliably stop, so resume must not act as if it can.
+/// `stop_session` already reports this, but only after polling for five
+/// seconds — and by then the resume path has closed the tab it was going to
+/// reuse, so the failure costs a tab and gains nothing. Asking first costs one
+/// roster read.
+///
+/// Two ways a session lands here, and it takes both to cover the ground:
+///
+/// - **No pid.** The daemon holds it with no client process of its own, so
+///   there is nothing to signal.
+/// - **`background`.** It may well report a live pid — a `--fork-session`
+///   process really is running behind it — but per `stop_session`, the pid the
+///   roster gives for a background agent can be a `bg-spare` helper parented to
+///   the daemon rather than the conversation, and killing that is a no-op.
+///
+/// Filtering on either one alone was tried and is wrong: a roster observed on
+/// 2026-07-26 reported *every* entry with a live pid, including a background
+/// one, so a `pid.is_none()` test matched nothing at all.
+#[tauri::command]
+pub fn unstoppable_session_ids() -> Vec<String> {
+    read_roster()
+        .into_iter()
+        .filter(|e| e.background || e.pid.is_none())
+        .map(|e| e.session_id)
+        .collect()
+}
+
 /// Files this session created or modified, newest first — parsed from
 /// Write/Edit/NotebookEdit tool calls in the transcript.
 #[tauri::command]
