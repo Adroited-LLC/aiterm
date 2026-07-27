@@ -46,6 +46,59 @@ struct PtyExit {
     signal: Option<String>,
 }
 
+/// Environment variables that mean "you are already inside an agent session".
+///
+/// A CLI agent exports these so anything it launches behaves as a *nested* run
+/// rather than as a new conversation. aiterm is not a nested run. It is a
+/// terminal, and the sessions it opens are the user's own — so it has to spawn
+/// from a clean environment or it inherits someone else's session identity.
+///
+/// The damage is silent and total. With `CLAUDE_CODE_CHILD_SESSION` set, claude
+/// starts with transcript saving off; the sidebar is built entirely from
+/// transcripts on disk, so every session started this way is invisible in the
+/// list, unresumable, and gone when its tab closes. Nothing in the UI can
+/// explain it, because from aiterm's side nothing failed.
+///
+/// It bites exactly one group of people: those running aiterm from inside a
+/// Claude Code session — which is to say, anyone developing aiterm with it.
+/// Launched from a desktop entry none of these are set and the whole list is a
+/// no-op. *Observed 2026-07-27: `npm run tauri dev` from a Claude Code session
+/// produced sessions warning "Transcript saving is off — inherited
+/// CLAUDE_CODE_CHILD_SESSION marker", and no row ever appeared.*
+///
+/// Named one by one rather than matched by prefix, and that is deliberate:
+/// `CLAUDE_*` is not ours to claim. `CLAUDE_CONFIG_DIR` points the CLI at a
+/// different config root, and dropping it would silently change which account,
+/// settings and projects a session sees — trading a visible bug for an
+/// invisible one. Only markers a parent session exports about *itself* belong
+/// here.
+///
+/// As other agents are supported, add their equivalents to this list. The
+/// property to preserve is the one above: strip what identifies the parent
+/// session, never what configures the tool.
+const AGENT_SESSION_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_AGENT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_EFFORT",
+    "CLAUDE_JOB_DIR",
+    "CLAUDE_PID",
+];
+
+/// Drop the parent session's markers so the child starts as its own session.
+///
+/// Applies to shells as well as agent commands: a shell that inherits them is
+/// one `claude` away from the same problem, and a terminal that does not behave
+/// like a terminal is the harder bug to find.
+fn scrub_agent_markers(cmd: &mut CommandBuilder) {
+    for key in AGENT_SESSION_MARKERS {
+        cmd.env_remove(key);
+    }
+}
+
 #[tauri::command]
 pub fn pty_spawn(
     app: AppHandle,
@@ -77,6 +130,7 @@ pub fn pty_spawn(
         None => CommandBuilder::new(&shell),
     };
     cmd.env("TERM", "xterm-256color");
+    scrub_agent_markers(&mut cmd);
     if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
         cmd.cwd(dir);
     }
@@ -337,6 +391,60 @@ mod tests {
             status.signal().is_some(),
             "a signalled child carried no signal name, so the UI can only guess",
         );
+    }
+
+    /// Both halves of the contract, in one test on purpose: `set_var` mutates
+    /// process-wide state, and two tests doing it concurrently under cargo's
+    /// thread pool is a race waiting to be debugged by someone else.
+    ///
+    /// The marker half is the bug this exists for — a session inheriting
+    /// `CLAUDE_CODE_CHILD_SESSION` runs with transcript saving off, so it never
+    /// gets a row and cannot be resumed. `CommandBuilder::new` snapshots the
+    /// real environment, so this asserts against a genuinely inherited value
+    /// rather than one the test also set on the builder.
+    ///
+    /// The config half guards the fix against being "simplified" into a
+    /// `CLAUDE_*` prefix match later. `CLAUDE_CONFIG_DIR` points the CLI at a
+    /// different config root; dropping it would silently change which account
+    /// and projects a session sees — a quieter bug than the one being fixed.
+    #[test]
+    fn scrub_strips_session_markers_but_not_configuration() {
+        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/some-other-config");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+
+        let mut cmd = CommandBuilder::new("true");
+        assert!(
+            cmd.get_env("CLAUDE_CODE_CHILD_SESSION").is_some(),
+            "precondition: the builder should inherit the process environment",
+        );
+        scrub_agent_markers(&mut cmd);
+
+        assert!(
+            cmd.get_env("CLAUDE_CODE_CHILD_SESSION").is_none(),
+            "the marker survived the scrub, so spawned sessions save no transcript",
+        );
+        assert_eq!(
+            cmd.get_env("CLAUDE_CONFIG_DIR"),
+            Some(std::ffi::OsStr::new("/tmp/some-other-config")),
+            "config, not a session marker — stripping it silently repoints the CLI",
+        );
+        assert!(cmd.get_env("ANTHROPIC_API_KEY").is_some(), "credentials must survive");
+
+        std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    /// A shell tab is scrubbed too — it is one `claude` away from the same
+    /// problem, and PATH/HOME must still be intact for it to be a usable shell.
+    #[test]
+    fn scrub_keeps_the_ordinary_environment() {
+        let mut cmd = CommandBuilder::new("true");
+        scrub_agent_markers(&mut cmd);
+        for key in ["PATH", "HOME"] {
+            assert!(cmd.get_env(key).is_some(), "{key} was lost");
+        }
     }
 
     #[test]
