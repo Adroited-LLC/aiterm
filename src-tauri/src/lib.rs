@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod fonts;
 pub mod fsx;
 pub mod git;

@@ -244,6 +244,10 @@ pub fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
             kill_tree(pid, std::time::Duration::from_millis(1500));
         }
         let _ = pty.killer.kill();
+        // Closing a tab is one of the few things that changes the roster from
+        // inside aiterm. Say so, rather than letting the sidebar keep showing
+        // the session as running for the rest of the cache window.
+        crate::sessions::invalidate_roster();
     }
     Ok(())
 }
