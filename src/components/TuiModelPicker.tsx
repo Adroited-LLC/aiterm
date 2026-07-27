@@ -126,7 +126,18 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
 
         <div className="tui-list">
           {picker.options.map((o, i) => (
-            <div key={o.number} className={"tui-row" + (o.current ? " current" : "")}>
+            <div
+              key={o.number}
+              className={
+                "tui-row" +
+                (o.current ? " current" : "") +
+                // The selector the keyboard moves. Focus itself sits on a
+                // button inside the row; without this the only visible frame
+                // was .current's — which marks the running model and never
+                // moves, so arrowing looked like nothing was selected.
+                (i === focus[0] ? " focused" : "")
+              }
+            >
               <div className="tui-row-text">
                 <span className="tui-row-name">
                   {o.name}

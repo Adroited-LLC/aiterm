@@ -1370,7 +1370,15 @@ body.dragging * { pointer-events: none; }
   border: 1px solid transparent;
 }
 .tui-row:hover { background: var(--bg-hover); }
-.tui-row.current { border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+/* The running model wears a quiet tint (the badge does the talking); the
+   keyboard's selector is the full-strength frame, so the thing that moves is
+   the thing that reads as selected. */
+.tui-row.current { border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+.tui-row.focused {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+.tui-row.focused .tui-row-acts { opacity: 1; }
 .tui-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .tui-row-name {
   font-size: 14px;
