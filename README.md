@@ -7,6 +7,7 @@ Built with Tauri 2, React, and xterm.js. Linux-first (developed and packaged on 
 ## What it does
 
 - **Real terminals.** Each tab is a native PTY running `claude` (or a plain shell). No re-implementation of the CLI — the terminal is the terminal.
+- **New sessions.** ＋ in the sessions panel starts a fresh `claude` in any directory — filter the ones you already work in, or pick a folder. aiterm mints the session id, so the new tab gets its sidebar row immediately instead of waiting for the first prompt to write a transcript.
 - **Session browser.** Every Claude Code session on the machine, indexed with tantivy and searchable, grouped by project or date. Resume any session into a tab; preview, rename-by-drag, trash with undo, and fork lineage are all handled, including the session-id rewrites Claude does on resume and background mode.
 - **Dialogs over the TUI.** Claude's own `/model`, `/rewind`, permission prompts, and the "Switch model?" confirm are detected from the screen and presented as real dialogs — keyboard-first, closed-loop (every keystroke is verified against what the TUI actually drew), and honest about failure. The TUI underneath stays the source of truth.
 - **Composer pills.** Model, effort, tasks, artifacts, running agents, permission mode, git, and usage — read live from the session transcript and Claude's config, so they stay right no matter who changed them.

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
+import NewSessionMenu, { StartPoint } from "./NewSessionMenu";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -21,6 +22,14 @@ function dateBucket(ms: number): string {
   if (ms >= startOfDay - 6 * 86400_000) return "This week";
   if (ms >= startOfDay - 29 * 86400_000) return "This month";
   return "Older";
+}
+
+/** A started-but-not-yet-written session. `id` is both its slot id and the
+ *  session id it will have, because aiterm minted it. */
+export interface PendingSession {
+  id: string;
+  title: string;
+  cwd: string;
 }
 
 export interface SessionDisplayOpts {
@@ -115,6 +124,16 @@ interface Props {
   onSelectProject: (p: ProjectInfo) => void;
   onProjectShell: (p: ProjectInfo) => void;
   onProjectClaude: (p: ProjectInfo) => void;
+  /** Start a fresh claude session in a directory — always a new one, unlike
+   *  `onProjectClaude`, which reuses the tab already open for that project. */
+  onNewSession: (path: string) => void;
+  /** Sessions aiterm has started that have not written a transcript yet, so
+   *  they have no row of their own. Listed on the strength of the tab alone —
+   *  they are the one thing in this panel that is not read off disk, and they
+   *  stop being listed the moment the real row exists. */
+  pending: PendingSession[];
+  onSelectPending: (slotId: string) => void;
+  onExitPending: (slotId: string) => void;
   onRefresh: () => void;
   trashed: TrashedSession[];
   onRestore: (id: string) => void;
@@ -148,10 +167,12 @@ function AgentIcon({ agent }: { agent: string }) {
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, activeSlot, opts,
   onOptsChange, onSelect, onResume, onFork, onExit, onNewShell, onDelete,
-  onSelectProject, onProjectShell, onProjectClaude, onRefresh,
+  onSelectProject, onProjectShell, onProjectClaude, onNewSession,
+  pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty,
 }: Props) {
   const [query, setQuery] = useState("");
+  const [showNewSession, setShowNewSession] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   // Resuming a session that's still running stops it first, which throws away
   // whatever it was mid-way through — worth one click of confirmation.
@@ -278,6 +299,30 @@ export default function SessionsPanel({
       (p) => !sessionPaths.has(p.path) && (!q || p.name.toLowerCase().includes(q)),
     );
   }, [projects, sessionPaths, query]);
+
+  // Everywhere a session could be started: directories sessions have actually
+  // run in, then project directories that have none. Deliberately not filtered
+  // by the search box — that box filters the session list, and a menu that
+  // emptied itself because you had typed something into a field behind it
+  // would be baffling. The menu has its own filter.
+  const startPoints = useMemo<StartPoint[]>(() => {
+    const seen = new Map<string, StartPoint>();
+    for (const s of sessions) {
+      const at = seen.get(s.project_path)?.at ?? 0;
+      if (at >= s.last_active) continue;
+      seen.set(s.project_path, {
+        path: s.project_path,
+        name: s.project_path.split("/").filter(Boolean).pop() ?? s.project_path,
+        at: s.last_active,
+      });
+    }
+    const fromSessions = [...seen.values()].sort((a, b) => b.at - a.at);
+    const rest = projects
+      .filter((p) => !seen.has(p.path))
+      .map<StartPoint>((p) => ({ path: p.path, name: p.name, at: p.last_modified }))
+      .sort((a, b) => b.at - a.at);
+    return [...fromSessions, ...rest];
+  }, [sessions, projects]);
 
   // Auto sub-grouping for the Project / Date view modes. Project sections
   // drag-reorder by their header; date buckets stay chronological.
@@ -757,6 +802,45 @@ export default function SessionsPanel({
     );
   };
 
+  /** A session that exists as a running terminal and nothing else yet. Kept
+   *  visually quieter than a real row — it is a tab you can get back to, not a
+   *  conversation with any history to offer — and it carries no ▶/⑂/delete,
+   *  none of which mean anything before the transcript exists. */
+  const renderPending = (p: PendingSession) => {
+    const isShowing = activeSlot === p.id;
+    const hasAttn = attentionSlots.has(p.id);
+    return (
+      <div
+        key={p.id}
+        className={"session-item pending-item" + (isShowing ? " active showing" : "")}
+        onClick={() => onSelectPending(p.id)}
+      >
+        <div className="agent-badge claude">
+          <AgentIcon agent="claude" />
+          <span
+            className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
+            title={hasAttn ? "Waiting for your input" : "Session is starting"}
+          />
+        </div>
+        <div className="session-text">
+          <div className="session-title-row">
+            <span className="session-title">{p.title}</span>
+            <span className="session-time pending-tag">new</span>
+          </div>
+          <div className="session-meta">
+            <span className="session-sub">{p.cwd ? homeAbbrev(p.cwd) : "no directory"}</span>
+          </div>
+        </div>
+        <div className="session-actions" onClick={(e) => e.stopPropagation()}>
+          <button
+            className="act-btn" title="Exit — close this tab"
+            onClick={() => onExitPending(p.id)}
+          >⏻</button>
+        </div>
+      </div>
+    );
+  };
+
   const renderProject = (p: ProjectInfo) => {
     const isLive = liveSlots.has(`claude:${p.path}`) || liveSlots.has(`shell:${p.path}`);
     const hasAttn =
@@ -828,6 +912,17 @@ export default function SessionsPanel({
             <button className="search-clear" title="Clear" onClick={() => setQuery("")}>✕</button>
           )}
         </div>
+        {/* Starting a session used to require a row to start it *from*: ▶ on a
+            project only appears for projects with no sessions, and everything
+            else in the panel resumes, branches, or opens a shell. So there was
+            no way to begin a new conversation anywhere else — including, on a
+            machine with no `~/Projects`, no way to begin one at all. */}
+        <button
+          className={"icon-btn" + (showNewSession ? " on" : "")}
+          title="New claude session…"
+          data-new-session-trigger=""
+          onClick={() => setShowNewSession((v) => !v)}
+        >＋</button>
         <button className="icon-btn" title="Refresh" onClick={onRefresh}>⟳</button>
         <button
           className="icon-btn"
@@ -860,6 +955,16 @@ export default function SessionsPanel({
           )}
         </div>
       </div>
+      {/* Anchored to the panel rather than to the ＋, so it still fits when
+          the sidebar is dragged narrow — a fixed-width popover hung off a
+          button near the right edge spills over the terminal. */}
+      {showNewSession && (
+        <NewSessionMenu
+          places={startPoints}
+          onPick={(path) => { setShowNewSession(false); onNewSession(path); }}
+          onClose={() => setShowNewSession(false)}
+        />
+      )}
       <div className="view-tabs">
         {(["recent", "project", "date"] as ViewMode[]).map((m) => (
           <button
@@ -872,6 +977,14 @@ export default function SessionsPanel({
         ))}
       </div>
       <div className="sessions-list">
+        {/* Above every view and outside the search filter: a session you just
+            started is the one row you are certainly looking for, and it has no
+            title or text to match a query against yet. */}
+        {pending.length > 0 && (
+          <div className="session-group">
+            {pending.map(renderPending)}
+          </div>
+        )}
         {searchList ? (
           <>
             {searchList.map((s) => renderItem(s))}
