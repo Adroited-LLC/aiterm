@@ -129,6 +129,11 @@ export const bgAgentSessionIds = () =>
 // cost a tab. See `unstoppable_session_ids`.
 export const unstoppableSessionIds = () =>
   invoke<string[]>("unstoppable_session_ids");
+// The session that took over this one's conversation by migrating to the
+// daemon (opening the agents view does this), or null — the normal answer.
+// A tab pinned to the parent shows live text over dead panels until it re-keys.
+export const sessionMigratedTo = (sessionId: string) =>
+  invoke<string | null>("session_migrated_to", { sessionId });
 // Every session the daemon currently holds, background AND interactive — i.e.
 // "is this session alive right now". Distinct from "aiterm has a tab open for
 // it": after a background-mode resume the tab holds the parent id while the

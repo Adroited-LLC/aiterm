@@ -28,7 +28,7 @@ import {
   UsageBar,
   listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, usageLimits,
-  resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds,
+  resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -491,6 +491,41 @@ export default function App() {
 
   const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
   const activeSessionId = activeTabObj?.sessionId ?? null;
+
+  // A conversation that moves to the daemon — which is all that opening the
+  // agents view does — keeps running in this same pty under a NEW session id.
+  // The tab's pinned id was set once when it opened and nothing ever moved it,
+  // so from that moment the terminal renders the live child while every panel
+  // keyed to the tab reads the parent: a file nothing is writing. Live text,
+  // dead clock. Re-key the tab when it happens, and say so, because the row
+  // the sidebar shows for this conversation changes underneath the user.
+  //
+  // Only the active tab, and only every 15s: answering this means reading
+  // transcripts off disk, and the parent can be tens of megabytes.
+  useEffect(() => {
+    const key = activeTabObj?.key;
+    const pinned = activeTabObj?.sessionId;
+    const title = activeTabObj?.title ?? "This session";
+    if (key === undefined || !pinned) return;
+    let stop = false;
+    const check = async () => {
+      try {
+        const moved = await sessionMigratedTo(pinned);
+        if (stop || !moved || moved === pinned) return;
+        setTabs((ts) => ts.map((x) => (x.key === key ? { ...x, sessionId: moved } : x)));
+        setNotice(`"${title}" moved to a background session — its panels now follow the live one.`);
+        refreshSessionList();
+      } catch {
+        /* backend unavailable — the tab keeps its pinned id, as before */
+      }
+    };
+    check();
+    const id = setInterval(check, 15000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, refreshSessionList]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
   // `git_repo_state` call per project change. Claude's own footer already says
