@@ -27,3 +27,6 @@ dist-ssr
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# Internal notes, not for the public repo
+PORTING-TO-OPCODE.md
