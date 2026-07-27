@@ -152,6 +152,38 @@ export function detectPermission(screen: Screen): PermissionRequest | null {
   };
 }
 
+/* ---------- agents view ---------- */
+
+/** Header line the agents view always draws: "1 awaiting input · 0 working ·
+ *  3 completed". The separators are U+00B7, as claude prints them. Anchored at
+ *  the end only — the counts share their row with the logo art, so the line
+ *  does not start with the digit. */
+const AGENTS_COUNTS = /\d+ awaiting input · \d+ working · \d+ completed\s*$/;
+
+/**
+ * Is claude's agents view (left arrow on an empty prompt) on screen?
+ *
+ * Not a dialog we dress up — the view is claude's own full-screen UI and fine
+ * as it is. Detecting it matters because *entering* it moves the running
+ * conversation to the daemon under a new session id, and aiterm's panels need
+ * to chase that immediately rather than on the next slow poll. It also tells
+ * the pills to stand down: a `/model` sent now would be typed into the view's
+ * "describe a task" box, not run as a command.
+ *
+ * Two anchors, both required. The counts line is the view's header; the footer
+ * check ("? for shortcuts" plus an "enter to open/return/collapse" hint) is
+ * wording the conversation screen never uses — its footer says "← for agents".
+ * Either alone could be quoted in transcript text; together on one screen they
+ * mean the view itself. Verified against live captures (v2.1.220), including
+ * focus moves, which change the footer verb but not the anchor set.
+ */
+export function detectAgentsView(screen: Screen): boolean {
+  if (!screen.some((l) => AGENTS_COUNTS.test(l))) return false;
+  return screen.some(
+    (l) => l.includes("? for shortcuts") && /enter to (open|return|collapse)/.test(l),
+  );
+}
+
 export interface ModelConfirm {
   kind: "model-confirm";
   /** claude's own explanation — cache invalidation, speed — verbatim. */
