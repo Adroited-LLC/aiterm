@@ -86,6 +86,27 @@ interface PanelSizes {
   agentFrac: number;
 }
 
+/** Why a terminal's process is gone. Both halves are needed: portable-pty
+ *  reports `code: 1` for *every* signal death, so the code alone cannot tell a
+ *  SIGKILL from a plain `exit 1`. */
+interface EndedWhy {
+  code: number | null;
+  signal: string | null;
+}
+
+/** Say how a process ended without inventing a reason it didn't have.
+ *
+ *  The signal comes first when there is one, because it is the true cause and
+ *  the accompanying code is a placeholder — a SIGKILLed shell reporting
+ *  "exited with status 1" reads as a program that failed, and sends you
+ *  looking for a bug instead of for whoever killed it. */
+function describeEnd(why: EndedWhy | undefined): string {
+  if (!why) return "";
+  if (why.signal) return `The process was stopped (${why.signal}).`;
+  if (why.code === null) return "The process is gone and its exit status could not be read.";
+  return `The process exited with status ${why.code}.`;
+}
+
 function loadJSON<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -118,7 +139,7 @@ export default function App() {
   // keep their row: the tab going away used to be the *only* sign anything had
   // happened, which is no help at all when the thing that killed it was
   // somewhere else entirely — `claude agents` in another terminal, or a phone.
-  const [ended, setEnded] = useState<Map<number, number | null>>(new Map());
+  const [ended, setEnded] = useState<Map<number, EndedWhy>>(new Map());
   const activeTabRef = useRef<number | null>(null);
   // Latest tabs, read without putting `tabs` in an effect's deps (which would
   // re-run it on every tab change).
@@ -557,12 +578,12 @@ export default function App() {
    *  notice that it happened and leaves the transcript — still on disk, still
    *  resumable — to be found by hand. So the tab stays and says so. */
   const handleTermExit = useCallback(
-    (key: number, code: number | null) => {
+    (key: number, code: number | null, signal: string | null) => {
       if (code === 0) {
         closeTab(key);
         return;
       }
-      setEnded((m) => new Map(m).set(key, code));
+      setEnded((m) => new Map(m).set(key, { code, signal }));
     },
     [closeTab],
   );
@@ -929,9 +950,7 @@ export default function App() {
                       : "This shell ended on its own"}
                   </div>
                   <div className="term-ended-sub">
-                    {ended.get(activeTab) === null
-                      ? "The process is gone and its exit status could not be read."
-                      : `The process exited with status ${ended.get(activeTab)}.`}
+                    {describeEnd(ended.get(activeTab))}
                     {activeTabObj?.sessionId
                       ? " Nothing was lost — the transcript is still on disk."
                       : ""}

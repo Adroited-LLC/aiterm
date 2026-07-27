@@ -65,8 +65,10 @@ interface Props {
   tab: TermTab;
   active: boolean;
   /** `code` is the child's exit status: 0 means the user left, anything else
-   *  (or null, if it couldn't be reaped) means it died on its own. */
-  onExit: (key: number, code: number | null) => void;
+   *  (or null, if it couldn't be reaped) means it died on its own. `signal` is
+   *  set instead when it was killed — portable-pty reports code 1 for every
+   *  signal, so the code alone cannot tell a SIGKILL from `exit 1`. */
+  onExit: (key: number, code: number | null, signal: string | null) => void;
   onRegister: (key: number, handle: TermHandle | null) => void;
   onActivity: (key: number) => void;
   /** Bell = the program wants eyes (claude prompts ring it); typing clears. */
@@ -137,12 +139,15 @@ export default function TerminalView({
         return;
       }
       ptyIdRef.current = id;
-      unlistenExit = await listen<{ id: number; code: number | null }>(
-        "pty://exit",
-        (e) => {
-          if (e.payload.id === id) onExit(tab.key, e.payload.code ?? null);
-        },
-      );
+      unlistenExit = await listen<{
+        id: number;
+        code: number | null;
+        signal: string | null;
+      }>("pty://exit", (e) => {
+        if (e.payload.id === id) {
+          onExit(tab.key, e.payload.code ?? null, e.payload.signal ?? null);
+        }
+      });
       // Roughly how much unsent text is sitting in the running program's input
       // line. Every keystroke passes through here on its way to the PTY, which
       // is enough to answer the only question that matters: is the prompt

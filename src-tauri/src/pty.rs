@@ -34,6 +34,16 @@ struct PtyExit {
     /// treated every death as a deliberate close: the tab vanished with no
     /// explanation and no way back but hunting the session down in the sidebar.
     code: Option<u32>,
+    /// The signal that killed the child, named ("Killed", "Terminated"), when
+    /// it was killed rather than having exited.
+    ///
+    /// `code` cannot carry this. portable-pty reports a *fixed* `exit_code()`
+    /// of 1 for every signal death, so a SIGKILL and a plain `exit 1` are
+    /// indistinguishable there — observed 2026-07-26, when a SIGKILLed shell
+    /// told the user "exited with status 1". Reporting a made-up exit code as
+    /// though the process chose it sends you looking for a failure that never
+    /// happened.
+    signal: Option<String>,
 }
 
 #[tauri::command]
@@ -112,8 +122,10 @@ pub fn pty_spawn(
         // real status. This blocks only this pty's reader thread, and the
         // child is already gone by the time we get here in every path but a
         // detaching one, so the wait returns immediately.
-        let code = child.wait().ok().map(|s| s.exit_code());
-        let _ = app_reader.emit("pty://exit", PtyExit { id, code });
+        let status = child.wait().ok();
+        let code = status.as_ref().map(|s| s.exit_code());
+        let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
+        let _ = app_reader.emit("pty://exit", PtyExit { id, code, signal });
     });
 
     Ok(id)
@@ -318,6 +330,13 @@ mod tests {
         assert!(kill_tree(pid, Duration::from_millis(1500)), "tree survived");
         let status = child.wait().expect("wait");
         assert_ne!(status.exit_code(), 0, "a killed child looked like a clean exit");
+        // And the status must say *how* it died. exit_code() alone is 1 for
+        // every signal, which is also what `exit 1` reports — the ambiguity
+        // that had a SIGKILLed shell claiming it "exited with status 1".
+        assert!(
+            status.signal().is_some(),
+            "a signalled child carried no signal name, so the UI can only guess",
+        );
     }
 
     #[test]
