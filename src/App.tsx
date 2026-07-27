@@ -12,7 +12,7 @@ import TuiModelPicker from "./components/TuiModelPicker";
 import TuiPermission from "./components/TuiPermission";
 import TuiRewind from "./components/TuiRewind";
 import {
-  Detected, PermissionMode, detect, detectPermissionMode,
+  Detected, PermissionMode, detect, detectAgentsView, detectPermissionMode,
 } from "./term/screen";
 import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
@@ -176,6 +176,13 @@ export default function App() {
   // *this* appearance, and clears itself once the screen goes away.
   const [tui, setTui] = useState<Detected | null>(null);
   const [permMode, setPermMode] = useState<PermissionMode | null>(null);
+  // claude's agents view is on the active terminal's screen. Entering it moves
+  // the conversation to the daemon under a new id, so this both hurries the
+  // re-key below and stands the pills down — a /model sent now would be typed
+  // into the view's "describe a task" box rather than run as a command.
+  const [agentsView, setAgentsView] = useState(false);
+  /** Last effect run's view state — detects the just-closed edge. */
+  const wasAgentsView = useRef(false);
   const [tuiDismissed, setTuiDismissed] = useState(false);
   // Only dress up a screen *we* opened. Typing /model or /rewind yourself is a
   // request for the terminal, and answering it with our own dialog would be
@@ -218,6 +225,7 @@ export default function App() {
       const handle = activeTab === null ? undefined : handles.current.get(activeTab);
       const lines = handle ? handle.screen() : null;
       setPermMode(lines ? detectPermissionMode(lines) : null);
+      setAgentsView(lines ? detectAgentsView(lines) : false);
       const found = lines ? detect(lines) : null;
       if (!found) {
         // Gone, or not painted yet. Give it a moment before disarming, so
@@ -529,6 +537,12 @@ export default function App() {
   //
   // Only the active tab, and only every 15s: answering this means reading
   // transcripts off disk, and the parent can be tens of megabytes.
+  //
+  // Except while the agents view is on screen — the migration happens the
+  // moment that view opens, so seeing it is the cue to chase the new id now
+  // (and every 2s until the child's transcript lands on disk). This is what
+  // closes the stale window where the terminal showed the live conversation
+  // over panels reading a file nothing was writing.
   useEffect(() => {
     const key = activeTabObj?.key;
     const pinned = activeTabObj?.sessionId;
@@ -547,12 +561,23 @@ export default function App() {
       }
     };
     check();
-    const id = setInterval(check, 15000);
+    const id = setInterval(check, agentsView ? 2000 : 15000);
+    // Right after ← the child is a two-line stub with no history and no links
+    // into the parent — the copy lands with the *next* activity, usually just
+    // after the user escapes back and keeps talking (measured 2026-07-27). So
+    // the moment the view closes, check again a couple of times instead of
+    // leaving the last word to the slow poll.
+    const grace: number[] = [];
+    if (wasAgentsView.current && !agentsView) {
+      grace.push(window.setTimeout(check, 3000), window.setTimeout(check, 8000));
+    }
+    wasAgentsView.current = agentsView;
     return () => {
       stop = true;
       clearInterval(id);
+      grace.forEach(clearTimeout);
     };
-  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, refreshSessionList]);
+  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, refreshSessionList, agentsView]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
   // `git_repo_state` call per project change. Claude's own footer already says
@@ -1021,22 +1046,24 @@ export default function App() {
             )}
           </div>
           {/* onCommand goes to the focused terminal, so the pills only offer
-              model/effort when there is a live session to run them in. */}
+              model/effort when there is a live session to run them in — and
+              not while the agents view has the screen, where a slash command
+              would be typed into its "describe a task" box instead of run. */}
           {showComposer && <Composer
             sessionId={activeSessionId}
             projectRoot={activeProject}
             usage={usage}
             usageAsOf={usageFresh ? null : usageAt || null}
-            onCommand={activeTab === null ? undefined : (text) =>
+            onCommand={activeTab === null || agentsView ? undefined : (text) =>
               handles.current.get(activeTab)?.sendComposed(text)}
             onDismiss={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.focus()}
             hasPendingInput={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.pendingInput() ?? false}
-            onOpenModelPicker={activeTab === null ? undefined : openModelPicker}
-            onOpenRewind={activeTab === null ? undefined : openRewind}
+            onOpenModelPicker={activeTab === null || agentsView ? undefined : openModelPicker}
+            onOpenRewind={activeTab === null || agentsView ? undefined : openRewind}
             permMode={permMode}
-            onSetPermMode={activeTab === null ? undefined : setPermissionMode}
+            onSetPermMode={activeTab === null || agentsView ? undefined : setPermissionMode}
           />}
         </div>
 
