@@ -152,8 +152,51 @@ export function detectPermission(screen: Screen): PermissionRequest | null {
   };
 }
 
+export interface ModelConfirm {
+  kind: "model-confirm";
+  /** claude's own explanation — cache invalidation, speed — verbatim. */
+  detail: string[];
+  options: PermissionOption[];
+  highlighted: number;
+}
+
+/**
+ * The "Switch model?" confirmation claude sometimes puts after the picker —
+ * seen when the switch invalidates the conversation's cache. A numbered Select
+ * with no "Do you want to" question and no footer we can rely on (the heading
+ * sits mid-transcript), so it anchors on its exact heading plus the wording of
+ * its own first option. Either changing means we show nothing, not the wrong
+ * dialog.
+ */
+export function detectModelConfirm(screen: Screen): ModelConfirm | null {
+  const head = screen.findIndex((l) => l.trim() === "Switch model?");
+  if (head < 0) return null;
+
+  const options: PermissionOption[] = [];
+  let highlighted = -1;
+  let firstOption = -1;
+  for (let i = head + 1; i < screen.length; i++) {
+    const m = OPTION.exec(screen[i]);
+    if (!m) continue;
+    if (firstOption < 0) firstOption = i;
+    if (m[1] === "❯") highlighted = options.length;
+    options.push({ number: Number(m[2]), label: m[3].trim() });
+  }
+  if (options.length < 2 || highlighted < 0) return null;
+  if (options.some((o, i) => o.number !== i + 1)) return null;
+  if (!/^Yes, switch to /.test(options[0].label)) return null;
+
+  const detail = screen
+    .slice(head + 1, firstOption)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  return { kind: "model-confirm", detail, options, highlighted };
+}
+
 export type Detected =
   | ModelPicker
+  | ModelConfirm
   | PermissionRequest
   | RewindPicker
   | RewindConfirm;
@@ -169,6 +212,7 @@ export function detect(screen: Screen): Detected | null {
   return (
     detectRewindConfirm(screen) ??
     detectRewindPicker(screen) ??
+    detectModelConfirm(screen) ??
     detectPermission(screen) ??
     detectModelPicker(screen)
   );

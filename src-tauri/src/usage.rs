@@ -42,7 +42,13 @@ fn label_for(kind: &str, scope_model: Option<&str>) -> String {
 /// Fetch current plan usage limits. Returns an empty vec on any failure (no
 /// token, offline, expired token, unexpected shape) so the UI simply hides the
 /// widget rather than erroring.
-#[tauri::command]
+///
+/// `(async)` is load-bearing: a plain `#[tauri::command]` body runs on the main
+/// thread, so with no network this curl froze the whole window — every minute,
+/// for as long as the connect took — and the freeze that landed on startup read
+/// as aiterm hanging on open. Off the main thread, an offline machine just
+/// keeps the cached bars.
+#[tauri::command(async)]
 pub fn usage_limits() -> Vec<UsageBar> {
     let Some(token) = read_oauth_token() else {
         return vec![];
@@ -50,6 +56,10 @@ pub fn usage_limits() -> Vec<UsageBar> {
     let output = std::process::Command::new("curl")
         .args([
             "-sS",
+            // Give up on an unreachable host quickly rather than sitting on
+            // the full budget; the reply itself still gets the longer window.
+            "--connect-timeout",
+            "3",
             "--max-time",
             "10",
             "-H",

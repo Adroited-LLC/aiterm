@@ -1289,6 +1289,117 @@ pub fn resolve_resumable_id(session_id: String) -> Option<String> {
     Some(path.file_stem()?.to_string_lossy().into_owned())
 }
 
+/// The session that took over `session_id`'s conversation by migrating to the
+/// daemon, if one has. `None` is the normal answer.
+///
+/// Opening Claude Code's agents view — left arrow, on an empty prompt — moves
+/// the running conversation to the daemon. What lands on disk is a *new*
+/// transcript under a new session id: the original stops at that instant and
+/// never moves again, while the pty in the tab goes on rendering the child. A
+/// tab pinned to the parent then shows live text over dead panels — its clock
+/// stops and Agents/Tasks/Artifacts read a file nothing is writing.
+///
+/// Nothing in the job state links the two. A migrated job records
+/// `interactiveLineage` but no `forkParentSessionId`, so `fork_parent_map`
+/// cannot see it. The link is in the transcript, at message level: the child
+/// carries copied history whose `parentUuid`/`logicalParentUuid` values are
+/// `uuid`s of records in the parent. Measured against a specimen captured
+/// 2026-07-26 — 67 of the child's 77 `parentUuid`s resolved into the parent,
+/// and `sessionKind: "bg"` appeared throughout the child and nowhere in the
+/// parent.
+///
+/// Both halves are required, and neither is sufficient. `sessionKind: "bg"`
+/// alone matches every background agent in the project. UUID overlap alone
+/// matches an ordinary `--fork-session` branch — which must never re-key a
+/// tab, because forking leaves the parent independently resumable and still
+/// running, and that parent is what the tab actually holds.
+#[tauri::command]
+pub fn session_migrated_to(session_id: String) -> Option<String> {
+    let parent = find_session_file(&session_id)?;
+    if parent
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
+    {
+        return None; // retired transcripts are resolve_live_session_file's job
+    }
+    let parent_mtime = mtime_of(&parent).unwrap_or(0);
+    let dir = parent.parent()?;
+
+    let mut best: Option<(u64, String)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path == parent || path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        if name.contains(".orphaned-") {
+            continue;
+        }
+        // A child cannot predate the instant its parent stopped.
+        let m = mtime_of(&path).unwrap_or(0);
+        if m < parent_mtime {
+            continue;
+        }
+        if best.as_ref().is_some_and(|(bm, _)| m <= *bm) {
+            continue; // already holding a newer candidate
+        }
+        let Some((links, is_bg)) = read_lineage_links(&path) else {
+            continue;
+        };
+        if !is_bg || links.is_empty() || !file_has_any_uuid(&parent, &links) {
+            continue;
+        }
+        best = Some((m, path.file_stem()?.to_string_lossy().into_owned()));
+    }
+    best.map(|(_, id)| id)
+}
+
+/// The uuids a transcript claims as its ancestry, plus whether it runs under
+/// the daemon. Reads only the head of the file — copied history sits at the
+/// front, so scanning a multi-megabyte tail to re-learn the same answer is
+/// waste.
+fn read_lineage_links(path: &Path) -> Option<(std::collections::HashSet<String>, bool)> {
+    const MAX_RECORDS: usize = 500;
+    const MAX_LINKS: usize = 64;
+    let file = File::open(path).ok()?;
+    let mut links = std::collections::HashSet::new();
+    let mut is_bg = false;
+    for line in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .take(MAX_RECORDS)
+    {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("sessionKind").and_then(|k| k.as_str()) == Some("bg") {
+            is_bg = true;
+        }
+        for field in ["parentUuid", "logicalParentUuid"] {
+            if let Some(u) = v.get(field).and_then(|u| u.as_str()) {
+                if links.len() < MAX_LINKS {
+                    links.insert(u.to_string());
+                }
+            }
+        }
+    }
+    Some((links, is_bg))
+}
+
+/// Whether any record in `path` carries one of `uuids` as its own `uuid`.
+/// Streams and stops at the first hit — the parent can be tens of megabytes.
+fn file_has_any_uuid(path: &Path, uuids: &std::collections::HashSet<String>) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    BufReader::new(file).lines().map_while(Result::ok).any(|l| {
+        serde_json::from_str::<serde_json::Value>(&l)
+            .ok()
+            .and_then(|v| v.get("uuid")?.as_str().map(|u| uuids.contains(u)))
+            .unwrap_or(false)
+    })
+}
+
 /// Whether a transcript holds an actual exchange, as opposed to metadata only.
 /// Message records are what `claude --resume` looks for; titles and agent names
 /// are not enough.
@@ -1519,6 +1630,33 @@ pub fn bg_agent_session_ids() -> Vec<String> {
         .collect()
 }
 
+/// Sessions aiterm cannot reliably stop, so resume must not act as if it can.
+/// `stop_session` already reports this, but only after polling for five
+/// seconds — and by then the resume path has closed the tab it was going to
+/// reuse, so the failure costs a tab and gains nothing. Asking first costs one
+/// roster read.
+///
+/// Two ways a session lands here, and it takes both to cover the ground:
+///
+/// - **No pid.** The daemon holds it with no client process of its own, so
+///   there is nothing to signal.
+/// - **`background`.** It may well report a live pid — a `--fork-session`
+///   process really is running behind it — but per `stop_session`, the pid the
+///   roster gives for a background agent can be a `bg-spare` helper parented to
+///   the daemon rather than the conversation, and killing that is a no-op.
+///
+/// Filtering on either one alone was tried and is wrong: a roster observed on
+/// 2026-07-26 reported *every* entry with a live pid, including a background
+/// one, so a `pid.is_none()` test matched nothing at all.
+#[tauri::command]
+pub fn unstoppable_session_ids() -> Vec<String> {
+    read_roster()
+        .into_iter()
+        .filter(|e| e.background || e.pid.is_none())
+        .map(|e| e.session_id)
+        .collect()
+}
+
 /// Files this session created or modified, newest first — parsed from
 /// Write/Edit/NotebookEdit tool calls in the transcript.
 #[tauri::command]
@@ -1580,6 +1718,11 @@ pub struct ModelChoice {
     /// run since you clicked" from "a turn ran and this is what it used" —
     /// the difference between a pending request and a settled fact.
     pub at: Option<String>,
+    /// How full the context window is, from the last main-chain reply's
+    /// `usage`: input + cache reads + cache writes + output. Sidechain records
+    /// are skipped — a subagent has its own window, and its numbers would
+    /// randomly overwrite the conversation's. None before the first reply.
+    pub context_tokens: Option<u64>,
 }
 
 /// What model and effort the session last actually ran with.
@@ -1617,6 +1760,12 @@ pub fn session_model(session_id: String) -> ModelChoice {
     if start > 0 {
         lines.next();
     }
+    parse_model_choice(lines)
+}
+
+/// The scan behind [`session_model`], separated so the record-shape rules can
+/// be tested without a real transcript on disk.
+fn parse_model_choice<'a>(lines: impl Iterator<Item = &'a str>) -> ModelChoice {
     let mut out = ModelChoice::default();
     for line in lines {
         if !line.contains("\"assistant\"") {
@@ -1644,6 +1793,18 @@ pub fn session_model(session_id: String) -> ModelChoice {
         }
         if let Some(t) = v.get("timestamp").and_then(|t| t.as_str()) {
             out.at = Some(t.to_string());
+        }
+        if v.get("isSidechain").and_then(|s| s.as_bool()) != Some(true) {
+            if let Some(usage) = v.pointer("/message/usage") {
+                let tok = |key: &str| usage.get(key).and_then(|n| n.as_u64()).unwrap_or(0);
+                let total = tok("input_tokens")
+                    + tok("cache_read_input_tokens")
+                    + tok("cache_creation_input_tokens")
+                    + tok("output_tokens");
+                if total > 0 {
+                    out.context_tokens = Some(total);
+                }
+            }
         }
     }
     out
@@ -2001,6 +2162,30 @@ mod tests {
         let zeta = text.find("zeta").unwrap();
         let alpha = text.find("alpha").unwrap();
         assert!(zeta < alpha, "keys were reordered:\n{text}");
+    }
+
+    /// Context tokens come from the last main-chain reply; a sidechain record
+    /// after it belongs to a subagent's own window and must not overwrite it.
+    /// The model, by contrast, still takes last-wins as before.
+    #[test]
+    fn model_choice_sums_usage_and_skips_sidechains() {
+        let main = r#"{"type":"assistant","timestamp":"t1","message":{"model":"claude-opus-5","usage":{"input_tokens":2,"cache_read_input_tokens":100000,"cache_creation_input_tokens":1000,"output_tokens":500}}}"#;
+        let side = r#"{"type":"assistant","isSidechain":true,"timestamp":"t2","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1,"cache_read_input_tokens":42,"cache_creation_input_tokens":0,"output_tokens":7}}}"#;
+        let out = parse_model_choice([main, side].into_iter());
+        assert_eq!(out.context_tokens, Some(101_502));
+        assert_eq!(out.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(out.at.as_deref(), Some("t2"));
+    }
+
+    /// A synthetic record (no usage, `<synthetic>` model) must leave both the
+    /// model and the token count from the real reply before it intact.
+    #[test]
+    fn model_choice_ignores_synthetic_records() {
+        let real = r#"{"type":"assistant","timestamp":"t1","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let synth = r#"{"type":"assistant","timestamp":"t2","message":{"model":"<synthetic>"}}"#;
+        let out = parse_model_choice([real, synth].into_iter());
+        assert_eq!(out.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(out.context_tokens, Some(15));
     }
 
     /// A default that was never set must come back absent, not as null or "".
@@ -2438,4 +2623,78 @@ pub fn list_sessions() -> Vec<Session> {
     let mut all: Vec<Session> = providers.iter().flat_map(|p| p.scan()).collect();
     all.sort_by(|a, b| b.last_active.cmp(&a.last_active));
     all
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_jsonl(dir: &Path, name: &str, rows: &[&str]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let mut f = File::create(&p).unwrap();
+        for r in rows {
+            writeln!(f, "{r}").unwrap();
+        }
+        p
+    }
+
+    /// Shape taken from a real migration captured 2026-07-26: the child's
+    /// ancestry uuids resolve into the parent, and only the child is `bg`.
+    #[test]
+    fn lineage_links_need_both_bg_and_an_ancestry_uuid() {
+        let tmp = std::env::temp_dir().join(format!("aiterm-mig-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+
+        let parent = write_jsonl(
+            &tmp,
+            "parent.jsonl",
+            &[r#"{"type":"user","uuid":"AAA","sessionId":"parent"}"#],
+        );
+        let child = write_jsonl(&tmp, "child.jsonl", &[
+            r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"AAA","uuid":"BBB","sessionKind":"bg"}"#,
+        ]);
+        // A plain --fork-session branch: shares ancestry, but is not a daemon
+        // session. Re-keying a tab onto one of these would swap a running
+        // conversation for a copy of it.
+        let branch = write_jsonl(
+            &tmp,
+            "branch.jsonl",
+            &[r#"{"type":"user","parentUuid":"AAA","uuid":"CCC"}"#],
+        );
+
+        let (links, is_bg) = read_lineage_links(&child).unwrap();
+        assert!(is_bg, "child should be recognised as a daemon session");
+        assert!(links.contains("AAA"), "child should claim the parent's uuid");
+        assert!(file_has_any_uuid(&parent, &links), "AAA lives in the parent");
+
+        let (blinks, bbg) = read_lineage_links(&branch).unwrap();
+        assert!(!bbg, "a --fork-session branch is not a daemon session");
+        assert!(
+            file_has_any_uuid(&parent, &blinks),
+            "the branch does share ancestry — which is exactly why bg is required too"
+        );
+
+        let unrelated = write_jsonl(
+            &tmp,
+            "unrelated.jsonl",
+            &[r#"{"type":"user","parentUuid":"ZZZ","uuid":"DDD","sessionKind":"bg"}"#],
+        );
+        let (ulinks, _) = read_lineage_links(&unrelated).unwrap();
+        assert!(
+            !file_has_any_uuid(&parent, &ulinks),
+            "an unrelated bg session must not resolve into this parent"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Run with `cargo test -- --ignored` on a machine that still has the
+    /// 2026-07-26 specimen. Non-hermetic by design: it checks the real files
+    /// the rule was derived from, which no fixture can stand in for.
+    #[test]
+    #[ignore]
+    fn finds_the_captured_specimen() {
+        let got = session_migrated_to("2eb3a23f-e4f1-4263-beb0-e3c7b768dcba".into());
+        assert_eq!(got.as_deref(), Some("6b37ca79-7e8f-4b86-9817-eaeb1b1fe95c"));
+    }
 }

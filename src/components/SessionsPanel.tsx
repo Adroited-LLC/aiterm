@@ -618,17 +618,14 @@ export default function SessionsPanel({
       >
         <div className={"agent-badge" + (s.agent === "claude" ? " claude" : "")}>
           <AgentIcon agent={s.agent} />
-          {/* Green: the session is running. Hollow: aiterm has a tab for it.
-              Usually the same row — but not after a background-mode resume,
-              and when they differ you need to see both. */}
+          {/* Green: the session is running. Whether aiterm also has a tab for
+              it is still tracked (`hasTab`, for the row's actions) but no
+              longer drawn — the row already says so by other means. */}
           {(isRunning || hasAttn) && (
             <span
               className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
               title={hasAttn ? "Waiting for your input" : "Session is running"}
             />
-          )}
-          {hasTab && (
-            <span className="tab-dot badge-dot" title="Open in a tab here" />
           )}
         </div>
         <div className="session-text">

@@ -7,6 +7,7 @@ import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
+import TuiModelConfirm from "./components/TuiModelConfirm";
 import TuiModelPicker from "./components/TuiModelPicker";
 import TuiPermission from "./components/TuiPermission";
 import TuiRewind from "./components/TuiRewind";
@@ -28,7 +29,7 @@ import {
   UsageBar,
   listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, usageLimits,
-  resolveResumableId, liveSessionIds, stopSession,
+  resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
 } from "./ipc";
@@ -86,6 +87,27 @@ interface PanelSizes {
   agentFrac: number;
 }
 
+/** Why a terminal's process is gone. Both halves are needed: portable-pty
+ *  reports `code: 1` for *every* signal death, so the code alone cannot tell a
+ *  SIGKILL from a plain `exit 1`. */
+interface EndedWhy {
+  code: number | null;
+  signal: string | null;
+}
+
+/** Say how a process ended without inventing a reason it didn't have.
+ *
+ *  The signal comes first when there is one, because it is the true cause and
+ *  the accompanying code is a placeholder — a SIGKILLed shell reporting
+ *  "exited with status 1" reads as a program that failed, and sends you
+ *  looking for a bug instead of for whoever killed it. */
+function describeEnd(why: EndedWhy | undefined): string {
+  if (!why) return "";
+  if (why.signal) return `The process was stopped (${why.signal}).`;
+  if (why.code === null) return "The process is gone and its exit status could not be read.";
+  return `The process exited with status ${why.code}.`;
+}
+
 function loadJSON<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -114,6 +136,11 @@ export default function App() {
 
   // Tabs whose terminal rang the bell while not being looked at.
   const [attention, setAttention] = useState<Set<number>>(new Set());
+  // Tabs whose process died on its own, and the exit code it died with. These
+  // keep their row: the tab going away used to be the *only* sign anything had
+  // happened, which is no help at all when the thing that killed it was
+  // somewhere else entirely — `claude agents` in another terminal, or a phone.
+  const [ended, setEnded] = useState<Map<number, EndedWhy>>(new Map());
   const activeTabRef = useRef<number | null>(null);
   // Latest tabs, read without putting `tabs` in an effect's deps (which would
   // re-run it on every tab change).
@@ -207,10 +234,15 @@ export default function App() {
       // reached by a command has to be armed, because typing that command
       // yourself is a request for the terminal.
       const needs =
-        found.kind === "model-picker" ? "model"
+        found.kind === "model-picker" || found.kind === "model-confirm" ? "model"
         : found.kind === "rewind-picker" || found.kind === "rewind-confirm" ? "rewind"
         : null;
       if (needs && armed.current?.what !== needs) return;
+      // Showing an armed screen keeps it armed. Both flows have a second step
+      // that replaces the first on screen, and the repaint between them can
+      // land a tick on nothing — which, more than 4s after the pill click,
+      // disarmed us and left step two undressed in the terminal.
+      if (needs && armed.current) armed.current.at = Date.now();
       setTui((prev) => {
         // Only replace when something actually changed, so the dialog is not
         // rebuilt four times a second while it sits there.
@@ -486,18 +518,94 @@ export default function App() {
 
   const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
   const activeSessionId = activeTabObj?.sessionId ?? null;
+
+  // A conversation that moves to the daemon — which is all that opening the
+  // agents view does — keeps running in this same pty under a NEW session id.
+  // The tab's pinned id was set once when it opened and nothing ever moved it,
+  // so from that moment the terminal renders the live child while every panel
+  // keyed to the tab reads the parent: a file nothing is writing. Live text,
+  // dead clock. Re-key the tab when it happens, and say so, because the row
+  // the sidebar shows for this conversation changes underneath the user.
+  //
+  // Only the active tab, and only every 15s: answering this means reading
+  // transcripts off disk, and the parent can be tens of megabytes.
+  useEffect(() => {
+    const key = activeTabObj?.key;
+    const pinned = activeTabObj?.sessionId;
+    const title = activeTabObj?.title ?? "This session";
+    if (key === undefined || !pinned) return;
+    let stop = false;
+    const check = async () => {
+      try {
+        const moved = await sessionMigratedTo(pinned);
+        if (stop || !moved || moved === pinned) return;
+        setTabs((ts) => ts.map((x) => (x.key === key ? { ...x, sessionId: moved } : x)));
+        setNotice(`"${title}" moved to a background session — its panels now follow the live one.`);
+        refreshSessionList();
+      } catch {
+        /* backend unavailable — the tab keeps its pinned id, as before */
+      }
+    };
+    check();
+    const id = setInterval(check, 15000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, refreshSessionList]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
   // `git_repo_state` call per project change. Claude's own footer already says
   // all three things. Removed rather than left running for nobody to read.
 
   const closeTab = useCallback((key: number) => {
+    setEnded((m) => {
+      if (!m.has(key)) return m;
+      const next = new Map(m);
+      next.delete(key);
+      return next;
+    });
     setTabs((t) => {
       const next = t.filter((x) => x.key !== key);
       setActiveTab((cur) => (cur === key ? (next[next.length - 1]?.key ?? null) : cur));
       return next;
     });
   }, []);
+
+  /** A terminal's process ended. Whether that closes the tab depends entirely
+   *  on why.
+   *
+   *  Exit 0 is someone leaving — `exit` at a shell, `/quit` in claude — and the
+   *  tab should go, which is what it has always done. Any other status means
+   *  the process died without being asked to, and the most likely cause is now
+   *  something outside this window: a session that has moved to the daemon is
+   *  listed by `claude agents` everywhere, so it can be killed from another
+   *  terminal or from the phone. Closing the tab in that case throws away the
+   *  notice that it happened and leaves the transcript — still on disk, still
+   *  resumable — to be found by hand. So the tab stays and says so. */
+  const handleTermExit = useCallback(
+    (key: number, code: number | null, signal: string | null) => {
+      if (code === 0) {
+        closeTab(key);
+        return;
+      }
+      setEnded((m) => new Map(m).set(key, { code, signal }));
+    },
+    [closeTab],
+  );
+
+  /** Put an ended tab back, resuming its conversation where it stopped. The
+   *  slot is reused so the sidebar row it belongs to stays the same row. */
+  const restartEnded = useCallback(
+    (key: number) => {
+      const t = tabsRef.current.find((x) => x.key === key);
+      if (!t) return;
+      closeTab(key);
+      const cmd = t.sessionId ? `${CLAUDE_CMD} --resume ${t.sessionId}` : t.command;
+      openTab(t.title, t.cwd, cmd, t.slotId, t.sessionId);
+    },
+    [closeTab, openTab],
+  );
 
   const selectSession = (s: Session) => {
     setActiveProject(s.project_path);
@@ -558,6 +666,26 @@ export default function App() {
     //
     // Our own tab goes through closeTab so React state stays in step; anything
     // else is signalled through the roster.
+    //
+    // But ask the roster *first*, because closing comes before stopping and
+    // the two can disagree. A session the daemon holds has no pid to signal —
+    // a conversation moves there on its own the moment you open the agents
+    // view — so `stopSession` can only poll for five seconds and give up. It
+    // used to give up having already closed the tab it was going to reuse,
+    // which turned "resume this" into "lose this", and the resume never
+    // happened either. Nothing is touched until we know a stop can succeed.
+    try {
+      const held = await unstoppableSessionIds();
+      if (held.includes(liveId) || held.includes(s.id)) {
+        setNotice(
+          `"${s.title}" is running under the Claude Code daemon, so aiterm can't stop it. ` +
+            `Stop it from \`claude agents\`, then resume.`,
+        );
+        return;
+      }
+    } catch {
+      /* roster unavailable — fall through and let stopSession be the judge */
+    }
     // Match on both ids: a tab opened before a compaction is slotted under the
     // row's pinned id, not the continuation `liveId` resolves to.
     for (const t of tabsRef.current) {
@@ -803,7 +931,7 @@ export default function App() {
                 key={t.key}
                 tab={t}
                 active={t.key === activeTab}
-                onExit={closeTab}
+                onExit={handleTermExit}
                 onRegister={registerHandle}
                 onActivity={noteActivity}
                 onAttention={noteAttention}
@@ -813,6 +941,43 @@ export default function App() {
                 theme={xtermTheme}
               />
             ))}
+            {activeTab !== null && ended.has(activeTab) && (
+              <div className="term-ended">
+                <div className="term-ended-box">
+                  {/* A shell tab has no conversation behind it, so it gets none
+                      of the claude wording. Promising that "the transcript is
+                      still on disk" to someone who just typed `exit 3` in a
+                      shell is a reassurance about something that never
+                      existed — and a dialog that says one false thing is not
+                      worth trusting about the true ones. */}
+                  <div className="term-ended-title">
+                    {activeTabObj?.sessionId
+                      ? "This session ended on its own"
+                      : "This shell ended on its own"}
+                  </div>
+                  <div className="term-ended-sub">
+                    {describeEnd(ended.get(activeTab))}
+                    {activeTabObj?.sessionId
+                      ? " Nothing was lost — the transcript is still on disk."
+                      : ""}
+                  </div>
+                  {activeTabObj?.sessionId && (
+                    <div className="term-ended-sub dim">
+                      A session listed by <code>claude agents</code> can be stopped from
+                      any terminal, or from your phone. That looks exactly like this.
+                    </div>
+                  )}
+                  <div className="term-ended-acts">
+                    <button className="tui-pick" onClick={() => restartEnded(activeTab)}>
+                      {activeTabObj?.sessionId ? "Resume it" : "Open a new shell"}
+                    </button>
+                    <button className="tui-plain" onClick={() => closeTab(activeTab)}>
+                      Close tab
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
             {tabs.length === 0 && !previewSession && (
               <div className="empty-note big">Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
             )}
@@ -834,6 +999,13 @@ export default function App() {
               ) : tui.kind === "model-picker" ? (
                 <TuiModelPicker
                   picker={tui}
+                  write={(d) => handles.current.get(activeTab)?.write(d)}
+                  screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                  onDismiss={() => dismissTui(activeTab)}
+                />
+              ) : tui.kind === "model-confirm" ? (
+                <TuiModelConfirm
+                  confirm={tui}
                   write={(d) => handles.current.get(activeTab)?.write(d)}
                   screen={() => handles.current.get(activeTab)?.screen() ?? []}
                   onDismiss={() => dismissTui(activeTab)}

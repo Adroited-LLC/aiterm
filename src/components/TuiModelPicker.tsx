@@ -1,5 +1,7 @@
-import { useState } from "react";
-import { ModelPicker, detectModelPicker, readModelOutcome } from "../term/screen";
+import { useEffect, useRef, useState } from "react";
+import {
+  ModelPicker, detectModelConfirm, detectModelPicker, readModelOutcome,
+} from "../term/screen";
 import { SETTLE_MS, moveHighlight, wait } from "../term/drive";
 
 /**
@@ -18,6 +20,13 @@ import { SETTLE_MS, moveHighlight, wait } from "../term/drive";
  * Both endings are offered as buttons, because the TUI hides them in a footer
  * as bare keys. "This session" sends `s`; "Make default" sends Enter. Nobody
  * should have to know that.
+ *
+ * The dialog holds the keyboard while it is up, same as TuiPermission and for
+ * the same reason: with focus left in the terminal, keystrokes land on the TUI
+ * picker underneath, where Enter is bound to "make default". Rows are menu
+ * items — ↑↓ moves between models, ←→ between the two endings, Enter commits
+ * the focused one — and every way out hands focus back to the terminal via
+ * onDismiss.
  */
 
 interface Props {
@@ -34,6 +43,34 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<string | null>(null);
+  /** Which button has the keyboard: [row, 0 = this-session | 1 = default]. */
+  const [focus, setFocus] = useState<[number, number]>(() => {
+    const current = picker.options.findIndex((o) => o.current);
+    return [current >= 0 ? current : 0, 0];
+  });
+  const buttonRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  useEffect(() => {
+    buttonRefs.current[focus[0] * 2 + focus[1]]?.focus();
+  }, [focus]);
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (busy) return;
+    const last = picker.options.length - 1;
+    if (e.key === "ArrowDown" || e.key === "j") {
+      e.preventDefault();
+      setFocus(([r, c]) => [r >= last ? 0 : r + 1, c]);
+    } else if (e.key === "ArrowUp" || e.key === "k") {
+      e.preventDefault();
+      setFocus(([r, c]) => [r <= 0 ? last : r - 1, c]);
+    } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      setFocus(([r, c]) => [r, c === 0 ? 1 : 0]);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancel();
+    }
+  };
 
   const commit = async (target: number, key: string) => {
     setBusy(true);
@@ -56,6 +93,12 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
           onDismiss();
           return;
         }
+        // A switch that invalidates the cache gets a "Switch model?" screen
+        // instead of an outcome. That is the flow continuing, not failing:
+        // return quietly and the poller swaps in the confirm dialog. Not
+        // onDismiss — that marks the appearance dismissed-to-terminal, which
+        // would suppress exactly the dialog we are handing over to.
+        if (detectModelConfirm(screen())) return;
       }
       // The keystroke went in but claude never printed a result. Say so rather
       // than claim success.
@@ -74,7 +117,8 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
 
   return (
     <div className="tui-overlay" onMouseDown={(e) => e.target === e.currentTarget && cancel()}>
-      <div className="tui-dialog">
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
+      <div className="tui-dialog" onKeyDown={onKeyDown}>
         <div className="tui-head">
           <span className="tui-title">Select model</span>
           {picker.effort && <span className="tui-effort">{picker.effort}</span>}
@@ -82,7 +126,18 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
 
         <div className="tui-list">
           {picker.options.map((o, i) => (
-            <div key={o.number} className={"tui-row" + (o.current ? " current" : "")}>
+            <div
+              key={o.number}
+              className={
+                "tui-row" +
+                (o.current ? " current" : "") +
+                // The selector the keyboard moves. Focus itself sits on a
+                // button inside the row; without this the only visible frame
+                // was .current's — which marks the running model and never
+                // moves, so arrowing looked like nothing was selected.
+                (i === focus[0] ? " focused" : "")
+              }
+            >
               <div className="tui-row-text">
                 <span className="tui-row-name">
                   {o.name}
@@ -92,15 +147,19 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
               </div>
               <div className="tui-row-acts">
                 <button
+                  ref={(el) => { buttonRefs.current[i * 2] = el; }}
                   className="tui-pick"
                   disabled={busy}
                   title="Use this model for this session only — your default is untouched"
+                  onFocus={() => setFocus([i, 0])}
                   onClick={() => commit(i, "s")}
                 >This session</button>
                 <button
+                  ref={(el) => { buttonRefs.current[i * 2 + 1] = el; }}
                   className="tui-pick ghost"
                   disabled={busy}
                   title="Use this model now and for every new session, in every project"
+                  onFocus={() => setFocus([i, 1])}
                   onClick={() => commit(i, "\r")}
                 >Make default</button>
               </div>
@@ -113,7 +172,7 @@ export default function TuiModelPicker({ picker, write, screen, onDismiss }: Pro
 
         <div className="tui-foot">
           <span className="tui-hint">
-            “This session” leaves your default alone. “Make default” changes it everywhere.
+            ↑↓ model · ←→ ending · Enter to choose · “Make default” changes it everywhere
           </span>
           <div className="tui-foot-acts">
             <button className="tui-plain" onClick={onDismiss} disabled={busy}>

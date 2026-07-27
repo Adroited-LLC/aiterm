@@ -25,6 +25,25 @@ pub struct PtyManager {
 #[derive(Clone, Serialize)]
 struct PtyExit {
     id: u32,
+    /// The child's exit status, or `None` if it could not be reaped.
+    ///
+    /// This is the whole difference between "you left" and "something killed
+    /// it". A shell you typed `exit` into leaves 0; a `claude` killed from
+    /// `claude agents` — possibly from another terminal, possibly from a
+    /// phone — does not. Without this the UI cannot tell the two apart, and it
+    /// treated every death as a deliberate close: the tab vanished with no
+    /// explanation and no way back but hunting the session down in the sidebar.
+    code: Option<u32>,
+    /// The signal that killed the child, named ("Killed", "Terminated"), when
+    /// it was killed rather than having exited.
+    ///
+    /// `code` cannot carry this. portable-pty reports a *fixed* `exit_code()`
+    /// of 1 for every signal death, so a SIGKILL and a plain `exit 1` are
+    /// indistinguishable there — observed 2026-07-26, when a SIGKILLed shell
+    /// told the user "exited with status 1". Reporting a made-up exit code as
+    /// though the process chose it sends you looking for a failure that never
+    /// happened.
+    signal: Option<String>,
 }
 
 #[tauri::command]
@@ -62,7 +81,7 @@ pub fn pty_spawn(
         cmd.cwd(dir);
     }
 
-    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let child_pid = child.process_id();
     let killer = child.clone_killer();
     drop(pair.slave);
@@ -98,7 +117,15 @@ pub fn pty_spawn(
                 }
             }
         }
-        let _ = app_reader.emit("pty://exit", PtyExit { id });
+        // Reap the child before announcing the exit. The read loop ends when
+        // the pty closes, which says nothing about *why* — so wait for the
+        // real status. This blocks only this pty's reader thread, and the
+        // child is already gone by the time we get here in every path but a
+        // detaching one, so the wait returns immediately.
+        let status = child.wait().ok();
+        let code = status.as_ref().map(|s| s.exit_code());
+        let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
+        let _ = app_reader.emit("pty://exit", PtyExit { id, code, signal });
     });
 
     Ok(id)
@@ -254,6 +281,62 @@ mod tests {
             assert!(!pid_alive(kid), "grandchild {kid} outlived the kill");
         }
         let _ = sh.wait();
+    }
+
+    /// The whole "keep the tab when something killed it" behaviour rests on one
+    /// assumption: that waiting on the pty's child after the read loop ends
+    /// yields a status that tells clean exits apart from everything else. If
+    /// this ever reports 0 for a killed process, the UI silently goes back to
+    /// dropping tabs with no explanation — which is the bug it was built for.
+    #[test]
+    fn exit_status_separates_leaving_from_dying() {
+        for (script, want) in [("exit 0", 0u32), ("exit 7", 7)] {
+            let pair = native_pty_system()
+                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .expect("openpty");
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.args(["-c", script]);
+            let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+            drop(pair.slave);
+            // Drain, exactly as the reader thread does: the wait can block
+            // forever behind a pty whose output nobody is reading.
+            let mut reader = pair.master.try_clone_reader().expect("reader");
+            std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = reader.read_to_end(&mut sink);
+            });
+            let status = child.wait().expect("wait");
+            assert_eq!(status.exit_code(), want, "`{script}` reported the wrong status");
+        }
+    }
+
+    /// A process killed by a signal must not look like a clean exit — that is
+    /// the case a session stopped from `claude agents` actually takes.
+    #[test]
+    fn a_signalled_child_is_not_reported_as_clean() {
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+        drop(pair.slave);
+        let pid = child.process_id().expect("pid");
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = reader.read_to_end(&mut sink);
+        });
+        assert!(kill_tree(pid, Duration::from_millis(1500)), "tree survived");
+        let status = child.wait().expect("wait");
+        assert_ne!(status.exit_code(), 0, "a killed child looked like a clean exit");
+        // And the status must say *how* it died. exit_code() alone is 1 for
+        // every signal, which is also what `exit 1` reports — the ambiguity
+        // that had a SIGKILLed shell claiming it "exited with status 1".
+        assert!(
+            status.signal().is_some(),
+            "a signalled child carried no signal name, so the UI can only guess",
+        );
     }
 
     #[test]

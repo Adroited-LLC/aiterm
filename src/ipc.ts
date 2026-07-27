@@ -123,6 +123,17 @@ export const runningSessionIds = () =>
 // the agent view (`claude agents`).
 export const bgAgentSessionIds = () =>
   invoke<string[]>("bg_agent_session_ids");
+// Sessions aiterm can't reliably stop — daemon-held with no pid, or background
+// agents whose roster pid may be a helper rather than the conversation. The
+// resume path asks before it closes anything, so a stop it can't win doesn't
+// cost a tab. See `unstoppable_session_ids`.
+export const unstoppableSessionIds = () =>
+  invoke<string[]>("unstoppable_session_ids");
+// The session that took over this one's conversation by migrating to the
+// daemon (opening the agents view does this), or null — the normal answer.
+// A tab pinned to the parent shows live text over dead panels until it re-keys.
+export const sessionMigratedTo = (sessionId: string) =>
+  invoke<string | null>("session_migrated_to", { sessionId });
 // Every session the daemon currently holds, background AND interactive — i.e.
 // "is this session alive right now". Distinct from "aiterm has a tab open for
 // it": after a background-mode resume the tab holds the parent id while the
@@ -170,6 +181,8 @@ export interface ModelChoice {
   /** Timestamp of the record these came from — tells a pending request from a
    *  settled fact. Unchanged means no turn has run since you clicked. */
   at: string | null;
+  /** Context-window fill after the last main-chain reply, in tokens. */
+  context_tokens: number | null;
 }
 // What the session last actually ran with, read from its transcript — so it
 // stays right whether the pill, a typed /model, or a launch flag changed it.
