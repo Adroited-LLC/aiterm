@@ -1535,10 +1535,24 @@ fn extract_session_id(val: &str) -> Option<String> {
 /// moves to a new bg session id. Keying the live dot on tab ownership put the
 /// badge on a frozen snapshot and offered Delete on the session that was
 /// actually running.
+///
+/// One more distinction, learned the same way: an *interactive* roster entry
+/// whose conversation has migrated to the daemon is a renderer, not a
+/// conversation. The client process stays alive under the old id for as long
+/// as the tab is open, so the roster reports it forever — and its row wore a
+/// green dot over a transcript nothing will ever write again. If the same
+/// linkage the tab re-key trusts says the conversation moved, the old id is
+/// not "alive" in any sense the sidebar should report. Background entries are
+/// never filtered: the migrated-to session IS the live one.
+///
+/// Cost note: the migration scan is mtime-gated, so for a healthy interactive
+/// session (its own transcript newest in the dir) it rejects every candidate
+/// without reading them.
 #[tauri::command]
 pub fn live_session_ids() -> Vec<String> {
     read_roster()
         .into_iter()
+        .filter(|e| e.background || session_migrated_to_inner(&e.session_id).is_none())
         .map(|e| e.session_id)
         .collect()
 }
