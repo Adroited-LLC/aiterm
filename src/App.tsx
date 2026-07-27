@@ -7,6 +7,7 @@ import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
+import TuiModelConfirm from "./components/TuiModelConfirm";
 import TuiModelPicker from "./components/TuiModelPicker";
 import TuiPermission from "./components/TuiPermission";
 import TuiRewind from "./components/TuiRewind";
@@ -233,10 +234,15 @@ export default function App() {
       // reached by a command has to be armed, because typing that command
       // yourself is a request for the terminal.
       const needs =
-        found.kind === "model-picker" ? "model"
+        found.kind === "model-picker" || found.kind === "model-confirm" ? "model"
         : found.kind === "rewind-picker" || found.kind === "rewind-confirm" ? "rewind"
         : null;
       if (needs && armed.current?.what !== needs) return;
+      // Showing an armed screen keeps it armed. Both flows have a second step
+      // that replaces the first on screen, and the repaint between them can
+      // land a tick on nothing — which, more than 4s after the pill click,
+      // disarmed us and left step two undressed in the terminal.
+      if (needs && armed.current) armed.current.at = Date.now();
       setTui((prev) => {
         // Only replace when something actually changed, so the dialog is not
         // rebuilt four times a second while it sits there.
@@ -993,6 +999,13 @@ export default function App() {
               ) : tui.kind === "model-picker" ? (
                 <TuiModelPicker
                   picker={tui}
+                  write={(d) => handles.current.get(activeTab)?.write(d)}
+                  screen={() => handles.current.get(activeTab)?.screen() ?? []}
+                  onDismiss={() => dismissTui(activeTab)}
+                />
+              ) : tui.kind === "model-confirm" ? (
+                <TuiModelConfirm
+                  confirm={tui}
                   write={(d) => handles.current.get(activeTab)?.write(d)}
                   screen={() => handles.current.get(activeTab)?.screen() ?? []}
                   onDismiss={() => dismissTui(activeTab)}
