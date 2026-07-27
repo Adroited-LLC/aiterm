@@ -28,7 +28,7 @@ import {
   TrashedSession,
   UsageBar,
   listProjects, listSessions, materializeFork,
-  reindexSessions, sessionFork, usageLimits,
+  reindexSessions, sessionFork, uiLog, usageLimits,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
@@ -553,13 +553,17 @@ export default function App() {
       try {
         const moved = await sessionMigratedTo(pinned);
         if (stop || !moved || moved === pinned) return;
+        uiLog(`migrate: re-keying tab ${key} ${pinned} -> ${moved}`);
         setTabs((ts) => ts.map((x) => (x.key === key ? { ...x, sessionId: moved } : x)));
         setNotice(`"${title}" moved to a background session — its panels now follow the live one.`);
         refreshSessionList();
-      } catch {
-        /* backend unavailable — the tab keeps its pinned id, as before */
+      } catch (e) {
+        // Not just "backend unavailable": a rejected invoke lands here too,
+        // and silently keeping the pinned id is how a dead path looks tested.
+        uiLog(`migrate: check for ${pinned} failed: ${String(e)}`);
       }
     };
+    uiLog(`migrate: watching ${pinned} (agentsView=${agentsView})`);
     check();
     const id = setInterval(check, agentsView ? 2000 : 15000);
     // Right after ← the child is a two-line stub with no history and no links

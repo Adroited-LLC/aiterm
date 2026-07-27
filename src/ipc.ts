@@ -134,6 +134,11 @@ export const unstoppableSessionIds = () =>
 // A tab pinned to the parent shows live text over dead panels until it re-keys.
 export const sessionMigratedTo = (sessionId: string) =>
   invoke<string | null>("session_migrated_to", { sessionId });
+// Journal-visible logging from the webview. Release builds drop the console,
+// so errors the UI catches quietly would otherwise vanish — send the ones
+// worth keeping to stderr, where journalctl already collects them.
+export const uiLog = (msg: string) =>
+  invoke<void>("ui_log", { msg }).catch(() => {});
 // Every session the daemon currently holds, background AND interactive — i.e.
 // "is this session alive right now". Distinct from "aiterm has a tab open for
 // it": after a background-mode resume the tab holds the parent id while the
