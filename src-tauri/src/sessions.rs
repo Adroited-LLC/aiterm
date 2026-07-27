@@ -1718,6 +1718,11 @@ pub struct ModelChoice {
     /// run since you clicked" from "a turn ran and this is what it used" —
     /// the difference between a pending request and a settled fact.
     pub at: Option<String>,
+    /// How full the context window is, from the last main-chain reply's
+    /// `usage`: input + cache reads + cache writes + output. Sidechain records
+    /// are skipped — a subagent has its own window, and its numbers would
+    /// randomly overwrite the conversation's. None before the first reply.
+    pub context_tokens: Option<u64>,
 }
 
 /// What model and effort the session last actually ran with.
@@ -1755,6 +1760,12 @@ pub fn session_model(session_id: String) -> ModelChoice {
     if start > 0 {
         lines.next();
     }
+    parse_model_choice(lines)
+}
+
+/// The scan behind [`session_model`], separated so the record-shape rules can
+/// be tested without a real transcript on disk.
+fn parse_model_choice<'a>(lines: impl Iterator<Item = &'a str>) -> ModelChoice {
     let mut out = ModelChoice::default();
     for line in lines {
         if !line.contains("\"assistant\"") {
@@ -1782,6 +1793,18 @@ pub fn session_model(session_id: String) -> ModelChoice {
         }
         if let Some(t) = v.get("timestamp").and_then(|t| t.as_str()) {
             out.at = Some(t.to_string());
+        }
+        if v.get("isSidechain").and_then(|s| s.as_bool()) != Some(true) {
+            if let Some(usage) = v.pointer("/message/usage") {
+                let tok = |key: &str| usage.get(key).and_then(|n| n.as_u64()).unwrap_or(0);
+                let total = tok("input_tokens")
+                    + tok("cache_read_input_tokens")
+                    + tok("cache_creation_input_tokens")
+                    + tok("output_tokens");
+                if total > 0 {
+                    out.context_tokens = Some(total);
+                }
+            }
         }
     }
     out
@@ -2139,6 +2162,30 @@ mod tests {
         let zeta = text.find("zeta").unwrap();
         let alpha = text.find("alpha").unwrap();
         assert!(zeta < alpha, "keys were reordered:\n{text}");
+    }
+
+    /// Context tokens come from the last main-chain reply; a sidechain record
+    /// after it belongs to a subagent's own window and must not overwrite it.
+    /// The model, by contrast, still takes last-wins as before.
+    #[test]
+    fn model_choice_sums_usage_and_skips_sidechains() {
+        let main = r#"{"type":"assistant","timestamp":"t1","message":{"model":"claude-opus-5","usage":{"input_tokens":2,"cache_read_input_tokens":100000,"cache_creation_input_tokens":1000,"output_tokens":500}}}"#;
+        let side = r#"{"type":"assistant","isSidechain":true,"timestamp":"t2","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1,"cache_read_input_tokens":42,"cache_creation_input_tokens":0,"output_tokens":7}}}"#;
+        let out = parse_model_choice([main, side].into_iter());
+        assert_eq!(out.context_tokens, Some(101_502));
+        assert_eq!(out.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(out.at.as_deref(), Some("t2"));
+    }
+
+    /// A synthetic record (no usage, `<synthetic>` model) must leave both the
+    /// model and the token count from the real reply before it intact.
+    #[test]
+    fn model_choice_ignores_synthetic_records() {
+        let real = r#"{"type":"assistant","timestamp":"t1","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let synth = r#"{"type":"assistant","timestamp":"t2","message":{"model":"<synthetic>"}}"#;
+        let out = parse_model_choice([real, synth].into_iter());
+        assert_eq!(out.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(out.context_tokens, Some(15));
     }
 
     /// A default that was never set must come back absent, not as null or "".

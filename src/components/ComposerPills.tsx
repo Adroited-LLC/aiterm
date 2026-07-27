@@ -149,7 +149,7 @@ export default function ComposerPills({
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
-  const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null, at: null });
+  const [choice, setChoice] = useState<ModelChoice>({ model: null, effort: null, at: null, context_tokens: null });
   const [picks, setPicks] = useState<Picks>(loadPicks);
   /** An action held back because the prompt was not empty. */
   const [held, setHeld] = useState<{ label: string; send: () => void } | null>(null);
@@ -194,7 +194,7 @@ export default function ComposerPills({
       setTasks([]);
       setArtifacts([]);
       setAgents([]);
-      setChoice({ model: null, effort: null, at: null });
+      setChoice({ model: null, effort: null, at: null, context_tokens: null });
       return;
     }
     let stop = false;
@@ -275,6 +275,18 @@ export default function ComposerPills({
   const done = tasks.filter((t) => t.status === "completed").length;
   const running = agents.filter((a) => a.status === "running").length;
   const session = bars.find((b) => b.kind === "session") ?? bars[0];
+
+  // Context-window fill, from the transcript's last reply. The window size is
+  // not recorded anywhere on disk, so it is inferred: 200k until the count
+  // proves otherwise, then 1M — the only way past 200k. A 1M session below
+  // 200k therefore reads against the smaller window; the panel says which
+  // window the percent is against so the assumption is never silent.
+  const ctx = choice.context_tokens;
+  const ctxWindow = ctx !== null && ctx > 200_000 ? 1_000_000 : 200_000;
+  const ctxPct = ctx !== null ? (ctx / ctxWindow) * 100 : null;
+  const ctxSev = ctxPct === null ? "" : ctxPct >= 90 ? "critical" : ctxPct >= 70 ? "warning" : "normal";
+  const fmtTok = (n: number) =>
+    n >= 1_000_000 ? (n / 1_000_000).toFixed(2) + "M" : Math.round(n / 1000) + "k";
 
   const pill = (key: PanelKey, icon: string, label: string, count: string, extra = "") => (
     <button
@@ -358,7 +370,25 @@ export default function ComposerPills({
       )}
       {open === "usage" && (
         <div className="cpill-panel">
-          {bars.length === 0 ? (
+          {ctx !== null && ctxPct !== null && (
+            <div className="cpill-usage-row">
+              <div className="cpill-usage-head">
+                <span className="cpill-usage-label">Context window</span>
+                <span className="cpill-usage-pct">{Math.round(ctxPct)}%</span>
+              </div>
+              <div className="usage-track">
+                <div
+                  className={"usage-fill sev-" + ctxSev}
+                  style={{ width: Math.min(100, ctxPct) + "%" }}
+                />
+              </div>
+              <span className="cpill-usage-reset">
+                {fmtTok(ctx)} of {fmtTok(ctxWindow)}
+                {ctxWindow === 200_000 ? " (assumed — 1M sessions read high until they pass 200k)" : ""}
+              </span>
+            </div>
+          )}
+          {bars.length === 0 && ctx === null ? (
             <div className="empty-note">No usage data — offline, or not signed in</div>
           ) : (
             bars.map((b, i) => (
@@ -494,7 +524,19 @@ export default function ComposerPills({
           agents.length ? (running ? `${running} active` : `${agents.length}`) : "",
           running ? "busy" : "",
         )}
-        {session && pill("usage", "▮", "Usage", `${Math.round(session.percent)}%`, "sev-" + session.severity)}
+        {(session || ctx !== null) && pill(
+          "usage", "▮", "Usage",
+          [
+            session ? `${Math.round(session.percent)}%` : "",
+            ctx !== null ? `${fmtTok(ctx)} ctx` : "",
+          ].filter(Boolean).join(" · "),
+          // The plan bar's colour, unless the context window is the more
+          // urgent of the two — running out of window mid-task bites sooner
+          // than a weekly limit.
+          ctxSev === "critical" || ctxSev === "warning"
+            ? "sev-" + ctxSev
+            : session ? "sev-" + session.severity : "",
+        )}
         {onSetPermMode && permMode && pill(
           "perms", "⛨", "Perms", permMode,
           permMode === "bypass permissions" ? "sev-warning" : "",

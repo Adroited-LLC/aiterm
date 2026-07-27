@@ -181,6 +181,8 @@ export interface ModelChoice {
   /** Timestamp of the record these came from — tells a pending request from a
    *  settled fact. Unchanged means no turn has run since you clicked. */
   at: string | null;
+  /** Context-window fill after the last main-chain reply, in tokens. */
+  context_tokens: number | null;
 }
 // What the session last actually ran with, read from its transcript — so it
 // stays right whether the pill, a typed /model, or a launch flag changed it.
