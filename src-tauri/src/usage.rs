@@ -686,42 +686,18 @@ fn codex_source() -> Option<UsageSource> {
 // Configured API providers
 // ---------------------------------------------------------------------------
 
-/// The provider store, read-only.
+/// Providers come from `providers.rs`, which owns
+/// `~/.config/aiterm/providers.json` — it writes the file, redacts keys on the
+/// way to the frontend, and holds the tests for both. This module only reads.
 ///
-/// **This duplicates the fork's `providers.rs` on purpose and should not
-/// survive.** That module owns `~/.config/aiterm/providers.json` — it writes
-/// it, redacts keys on the way to the frontend, and has the tests for all of it
-/// — but its `load()` is private, and the module is not on this branch at all.
-/// The fix when the two meet is one word (`pub fn load()`) plus deleting the
-/// two items below in favour of `providers::load()`.
-///
-/// Deserialising a subset of the stored shape is deliberate: these are the
-/// fields a balance lookup needs, and serde ignoring the rest means a provider
-/// record that grows a field does not stop the balances working.
-#[derive(Deserialize)]
-struct StoredProvider {
-    id: String,
-    name: String,
-    base_url: String,
-    #[serde(default)]
-    api_key: String,
-}
+/// (An earlier revision duplicated a reader here because `providers.rs` did not
+/// exist on the branch this was written against. It does now, so the copy is
+/// gone: two readers of one credential file is exactly the arrangement where
+/// one of them quietly stops matching the format.)
+use crate::providers::Provider as StoredProvider;
 
 fn configured_providers() -> Vec<StoredProvider> {
-    let Some(home) = dirs::home_dir() else {
-        return vec![];
-    };
-    let Ok(text) = std::fs::read_to_string(home.join(".config/aiterm/providers.json")) else {
-        return vec![];
-    };
-    parse_providers(&text)
-}
-
-/// The stored file is a bare JSON array of provider records. A corrupt or
-/// hand-edited one reads as "no providers", matching what providers.rs does
-/// with the same file — the panel still opens.
-fn parse_providers(text: &str) -> Vec<StoredProvider> {
-    serde_json::from_str(text).unwrap_or_default()
+    crate::providers::load()
 }
 
 /// Turn a `GET {base}/credits` reply into a source.
@@ -1091,29 +1067,6 @@ mod tests {
             "{}",
             src.detail
         );
-    }
-
-    /// The exact file providers.rs writes, with a field it does not have yet,
-    /// because a provider record that grows one must not take the balances out.
-    #[test]
-    fn the_provider_store_is_read_the_way_it_is_written() {
-        let text = r#"[
-          {"id":"openrouter","name":"OpenRouter",
-           "base_url":"https://openrouter.ai/api/v1","api_key":"sk-or-v1-x",
-           "some_future_field":true},
-          {"id":"local","name":"llama.cpp","base_url":"http://127.0.0.1:8080/v1","api_key":""}
-        ]"#;
-        let got = parse_providers(text);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].id, "openrouter");
-        assert_eq!(got[0].base_url, "https://openrouter.ai/api/v1");
-        // A keyless provider is still listed — the panel says "no key saved"
-        // rather than pretending the provider is not configured.
-        assert_eq!(got[1].api_key, "");
-
-        // Anything unreadable is no providers, never a crash on startup.
-        assert!(parse_providers("not json").is_empty());
-        assert!(parse_providers("{}").is_empty());
     }
 
     /// Hits the real services. Ignored by default so `cargo test` stays offline

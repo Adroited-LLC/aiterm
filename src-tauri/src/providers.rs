@@ -119,16 +119,28 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(dirs::home_dir()?.join(".config/aiterm/providers.json"))
 }
 
-fn load() -> Vec<Provider> {
+/// Read the provider store.
+///
+/// `pub` for `usage.rs`, which needs base URLs and keys to look up credit
+/// balances. Still not reachable from the frontend — no command returns a
+/// `Provider`, only the redacted `ProviderView`.
+pub fn load() -> Vec<Provider> {
     let Some(path) = config_path() else {
         return vec![];
     };
     let Ok(text) = std::fs::read_to_string(path) else {
         return vec![];
     };
-    // A corrupt or hand-edited file reads as "no providers" rather than
-    // throwing: the settings panel still opens, and re-adding one rewrites it.
-    serde_json::from_str(&text).unwrap_or_default()
+    parse(&text)
+}
+
+/// The stored file is a bare JSON array of provider records.
+///
+/// Split from `load` so the shape can be tested without a fixture file. A
+/// corrupt or hand-edited file reads as "no providers" rather than throwing:
+/// the settings panel still opens, and re-adding one rewrites it.
+fn parse(text: &str) -> Vec<Provider> {
+    serde_json::from_str(text).unwrap_or_default()
 }
 
 fn save(list: &[Provider]) -> Result<(), String> {
@@ -350,6 +362,30 @@ mod tests {
         assert_eq!(key_hint("sk-123"), "");
         assert_eq!(key_hint(""), "");
         assert_eq!(key_hint("0123456789ab"), "89ab");
+    }
+
+    /// The exact file this module writes, plus a field it does not have yet,
+    /// because a provider record that grows one must not take the credit
+    /// balances in `usage.rs` out with it.
+    #[test]
+    fn the_provider_store_is_read_the_way_it_is_written() {
+        let text = r#"[
+          {"id":"openrouter","name":"OpenRouter",
+           "base_url":"https://openrouter.ai/api/v1","api_key":"sk-or-v1-x",
+           "some_future_field":true},
+          {"id":"local","name":"llama.cpp","base_url":"http://127.0.0.1:8080/v1","api_key":""}
+        ]"#;
+        let got = parse(text);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "openrouter");
+        assert_eq!(got[0].base_url, "https://openrouter.ai/api/v1");
+        // A keyless provider is still listed — the panel says "no key saved"
+        // rather than pretending it is not configured.
+        assert_eq!(got[1].api_key, "");
+
+        // Anything unreadable is no providers, never a crash on startup.
+        assert!(parse("not json").is_empty());
+        assert!(parse("{}").is_empty());
     }
 
     #[test]
