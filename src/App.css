@@ -2291,8 +2291,8 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* Per-source tinting, so the mark carries meaning at a glance rather than
    being four shapes in the same grey. */
-.agent-icon.codex, .agent-icon.openai { color: var(--green); }
-.agent-icon.api { color: var(--blue); }
+.agent-icon.codex, .agent-icon.openai { color: var(--blue); }
+.agent-icon.api { color: var(--cyan); }
 .ns-agent-tab.on .agent-icon { color: inherit; }
 .ns-note { font-size: 10.5px; color: var(--text-faint); }
 
@@ -2326,13 +2326,28 @@ input[type="range"]::-webkit-slider-thumb {
    rejected: it repaints half the list every roster poll and leaves nothing for
    the question the user actually asked. */
 
+/* Source colours are drawn from the *non-state* half of the palette, and that
+   is a rule rather than a preference.
+   
+   --green, --yellow and --red mean something in this app: running, waiting for
+   input, ended. They also mean it two millimetres away, on the very same badge
+   — the state ring is drawn around the icon whose colour is set here. Codex was
+   green, so a Codex row that was not running still read as running, and a
+   Codex row that *was* running was green inside a green ring. A colour cannot
+   carry both a stable fact and a changing one at once; the changing one wins,
+   because that is the one you are watching for.
+   
+   So: --accent for Claude, --blue for Codex (which is also OpenAI's own blue),
+   --cyan for API endpoints, --text-dim for anything unrecognised. Add a source,
+   take the next unused non-state hue — never a state one. */
+
 /* Every row resolves `--src`; the kind classes override it. Declared on the
    panel so rows that carry no kind at all — trash entries, sessionless
    projects — still resolve rather than falling back to an invalid value. */
 .sessions-panel { --src: var(--accent); }
 .session-item.kind-claude { --src: var(--accent); }
-.session-item.kind-codex { --src: var(--green); }
-.session-item.kind-api { --src: var(--blue); }
+.session-item.kind-codex { --src: var(--blue); }
+.session-item.kind-api { --src: var(--cyan); }
 .session-item.kind-generic { --src: var(--text-dim); }
 
 /* Matched on the attribute so the four kinds are not spelled out twice.
