@@ -1,14 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { AgentChoice, agentChoices, homeAbbrev } from "../ipc";
+import { homeAbbrev } from "../ipc";
+import StartControls, { StartChoice, useStartChoice } from "./StartControls";
 
-/** What to start, once a directory is chosen. */
-export interface StartChoice {
-  agentId: string;
-  model: string | null;
-  effort: string | null;
-  mintsSessionId: boolean;
-}
+export type { StartChoice };
 
 /** A directory offered as somewhere to start a session. */
 export interface StartPoint {
@@ -53,43 +48,8 @@ interface Props {
 export default function NewSessionMenu({ places, onPick, onClose }: Props) {
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
-  const [agents, setAgents] = useState<AgentChoice[]>([]);
-  const [agentId, setAgentId] = useState<string>("");
-  const [model, setModel] = useState("");
-  const [effort, setEffort] = useState("");
-
-  // Installed agents only. The first one is preselected so the menu is usable
-  // without touching the row at all.
-  useEffect(() => {
-    agentChoices()
-      .then((list) => {
-        setAgents(list);
-        setAgentId((cur) => cur || list[0]?.id || "");
-      })
-      .catch(() => setAgents([]));
-  }, []);
-
-  const agent = agents.find((a) => a.id === agentId) ?? null;
-  const models = agent?.models ?? [];
-  // Effort levels belong to the *model*, not the agent — Codex publishes a
-  // different set per model — so the list narrows once one is chosen.
-  const efforts = models.find((m) => m.id === model)?.efforts ?? [];
-
-  // Changing agent invalidates both: a Claude alias is not a Codex slug.
-  const pickAgent = (id: string) => { setAgentId(id); setModel(""); setEffort(""); };
-  // Same for effort when the model changes, unless the new model still offers it.
-  const pickModel = (id: string) => {
-    setModel(id);
-    const next = models.find((m) => m.id === id)?.efforts ?? [];
-    setEffort((cur) => (next.includes(cur) ? cur : ""));
-  };
-
-  const choice = (): StartChoice => ({
-    agentId,
-    model: model || null,
-    effort: effort || null,
-    mintsSessionId: agent?.mints_session_id ?? false,
-  });
+  const ctl = useStartChoice();
+  const choice = ctl.choice;
   const inputRef = useRef<HTMLInputElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
 
@@ -158,51 +118,7 @@ export default function NewSessionMenu({ places, onPick, onClose }: Props) {
 
   return (
     <div className="new-session-pop" ref={popRef} onKeyDown={onKeyDown}>
-      <div className="ns-agents">
-        {/* One installed agent is not a choice, so it is not drawn as one. */}
-        {agents.length > 1 && (
-          <div className="ns-agent-tabs">
-            {agents.map((a) => (
-              <button
-                key={a.id}
-                className={"ns-agent-tab" + (a.id === agentId ? " on" : "")}
-                onClick={() => pickAgent(a.id)}
-              >{a.display_name}</button>
-            ))}
-          </div>
-        )}
-        <div className="ns-selects">
-          {/* Blank is not a placeholder — it is a real choice, and the right
-              default. Letting the agent decide is different from us picking. */}
-          <select
-            className="ns-select"
-            value={model}
-            onChange={(e) => pickModel(e.target.value)}
-            disabled={models.length === 0}
-            title={models.length ? "Model" : "This agent publishes no model list"}
-          >
-            <option value="">Default model</option>
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>{m.display_name}</option>
-            ))}
-          </select>
-          <select
-            className="ns-select"
-            value={effort}
-            onChange={(e) => setEffort(e.target.value)}
-            disabled={efforts.length === 0}
-            title={efforts.length ? "Effort" : "Pick a model first"}
-          >
-            <option value="">Default effort</option>
-            {efforts.map((e) => (
-              <option key={e} value={e}>{e}</option>
-            ))}
-          </select>
-        </div>
-        {agents.length === 0 && (
-          <div className="empty-note">No agent CLI found on this machine.</div>
-        )}
-      </div>
+      <StartControls ctl={ctl} />
       <input
         ref={inputRef}
         className="new-session-input"

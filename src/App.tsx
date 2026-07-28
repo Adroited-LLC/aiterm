@@ -5,6 +5,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import { StartChoice } from "./components/NewSessionMenu";
+import StartControls, { useStartChoice } from "./components/StartControls";
 import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
@@ -34,7 +35,7 @@ import {
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  agentLaunchCommand, agentChoices,
+  agentLaunchCommand,
 } from "./ipc";
 import "./App.css";
 
@@ -947,29 +948,28 @@ export default function App() {
     }
   }, [openTab]);
 
-  /** Same, but choose the directory first. The empty pane's copy is the only
-   *  instruction a first run gets, and it used to name two buttons that live
-   *  in a panel you can close — and that on a fresh machine has nothing in it
-   *  to press them on. */
+  /** The empty pane's own source/model/effort, so its button starts the same
+   *  session the ＋ menu would. It used to take the first installed agent on
+   *  its defaults — a different session from the one the menu offers, with
+   *  nothing on the button to say so. */
+  const emptyCtl = useStartChoice();
+  /** Same as the menu, but choose the directory first. The empty pane's copy is
+   *  the only instruction a first run gets, and it used to name two buttons
+   *  that live in a panel you can close — and that on a fresh machine has
+   *  nothing in it to press them on. */
   const browseNewSession = useCallback(async () => {
+    if (!emptyCtl.ready) {
+      setNotice("No agent CLI found on this machine.");
+      return;
+    }
     try {
       const picked = await openDialog({ directory: true, title: "Start a session in…" });
       if (typeof picked !== "string") return;
-      // The empty pane has no agent picker; use the first installed agent with
-      // its own defaults, which is what the menu would preselect anyway.
-      const [first] = await agentChoices();
-      if (!first) {
-        setNotice("No agent CLI found on this machine.");
-        return;
-      }
-      newSession(picked, {
-        agentId: first.id, model: null, effort: null,
-        mintsSessionId: first.mints_session_id,
-      });
+      newSession(picked, emptyCtl.choice());
     } catch {
       /* cancelled, or no chooser available */
     }
-  }, [newSession]);
+  }, [newSession, emptyCtl]);
 
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
@@ -1173,10 +1173,13 @@ export default function App() {
             )}
             {tabs.length === 0 && !previewSession && (
               <div className="empty-note big empty-start">
-                <div>Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
-                <button className="tui-pick" onClick={browseNewSession}>
-                  Start a new session…
-                </button>
+                <div>Pick a session on the left — ▶ resumes it, ＋ opens a shell</div>
+                <div className="empty-start-controls">
+                  <StartControls ctl={emptyCtl} />
+                  <button className="tui-pick" onClick={browseNewSession}>
+                    Start a new session…
+                  </button>
+                </div>
               </div>
             )}
             {previewSession && (

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
+import AgentIcon from "./AgentIcon";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -139,29 +140,6 @@ interface Props {
   onRestore: (id: string) => void;
   onTrashDelete: (id: string) => void;
   onTrashEmpty: () => void;
-}
-
-function AgentIcon({ agent }: { agent: string }) {
-  if (agent === "claude") {
-    // Claude "starburst" mark
-    return (
-      <svg className="agent-icon claude" viewBox="0 0 24 24" width="16" height="16">
-        <g fill="currentColor">
-          {Array.from({ length: 12 }).map((_, i) => (
-            <rect key={i} x="11.1" y="2" width="1.8" height="7" rx="0.9"
-              transform={`rotate(${i * 30} 12 12)`} />
-          ))}
-        </g>
-      </svg>
-    );
-  }
-  return (
-    <svg className="agent-icon" viewBox="0 0 24 24" width="16" height="16" fill="none"
-      stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-      <rect x="3" y="4" width="18" height="16" rx="2" />
-      <path d="M7 9l3 3-3 3M13 15h4" />
-    </svg>
-  );
 }
 
 export default function SessionsPanel({
