@@ -2,7 +2,7 @@
 //! (~/Projects/claudeman/src/indexer.rs): index session titles, project dirs,
 //! and the actual user/assistant message text; search returns ranked ids.
 
-use crate::sessions::{ClaudeProvider, Session};
+use crate::sessions::Session;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -192,7 +192,7 @@ pub struct ReindexResult {
 /// new/changed transcripts get re-read).
 #[tauri::command]
 pub fn reindex_sessions() -> ReindexResult {
-    let sessions = ClaudeProvider.scan_with_paths();
+    let sessions = crate::agents::scan_all_with_paths();
     let total = sessions.len();
     let Some(idx) = global() else {
         return ReindexResult { indexed: 0, total };
@@ -220,8 +220,7 @@ pub fn reindex_sessions() -> ReindexResult {
 #[tauri::command]
 pub fn search_sessions(query: String) -> Vec<Session> {
     let Some(idx) = global() else { return vec![] };
-    let by_id: std::collections::HashMap<String, Session> = ClaudeProvider
-        .scan_with_paths()
+    let by_id: std::collections::HashMap<String, Session> = crate::agents::scan_all_with_paths()
         .into_iter()
         .map(|(s, _)| (s.id.clone(), s))
         .collect();

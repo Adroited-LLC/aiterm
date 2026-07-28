@@ -33,15 +33,39 @@ pub struct Session {
     pub last_active: u64,
 }
 
-pub trait SessionProvider {
-    fn scan(&self) -> Vec<Session>;
+/// Where one agent keeps its sessions.
+///
+/// Wide enough to be the only thing the rest of the app needs in order to list,
+/// index and open a session — that is the bar, and the previous single-method
+/// version did not meet it: the indexer reached past the trait to
+/// `ClaudeProvider` directly, so a second agent would have appeared in the
+/// sidebar and been missing from search with nothing to explain why.
+///
+/// See `agents.rs` for what is still hard-wired to Claude Code beyond this.
+pub trait SessionProvider: Send + Sync {
+    /// Sessions along with their transcript paths. The one method a backend
+    /// must write; the rest are derived from it.
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)>;
+
+    /// The transcript for `session_id`, or `None` if this provider does not
+    /// own that id. Returning `None` for another agent's session is what lets
+    /// the registry route by asking rather than by parsing ids.
+    fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf>;
+
+    fn scan(&self) -> Vec<Session> {
+        self.scan_with_paths().into_iter().map(|(s, _)| s).collect()
+    }
 }
 
 pub struct ClaudeProvider;
 
-impl ClaudeProvider {
+impl SessionProvider for ClaudeProvider {
+    fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        claude_session_file(session_id)
+    }
+
     /// Scan sessions along with their jsonl paths (needed by the indexer).
-    pub fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
         let Some(home) = dirs::home_dir() else {
             return vec![];
         };
@@ -237,11 +261,6 @@ fn read_bridge_id(path: &Path) -> Option<String> {
     found
 }
 
-impl SessionProvider for ClaudeProvider {
-    fn scan(&self) -> Vec<Session> {
-        self.scan_with_paths().into_iter().map(|(s, _)| s).collect()
-    }
-}
 
 /// System XML tags Claude Code injects into user messages (ported from
 /// claudeman's parser — keep the lists in sync).
@@ -1175,7 +1194,19 @@ fn mtime_of(path: &Path) -> Option<u64> {
 /// `<id>.orphaned-<ts>-<hash>.jsonl` (compaction/supersede), so fall back to
 /// the newest such variant rather than returning nothing (which would blank
 /// the tasks/agents/artifacts panels).
+/// The transcript for `session_id`, whichever agent owns it.
+///
+/// Asks each backend in turn rather than deciding from the id itself: a session
+/// id is opaque, and a rule for telling one agent's ids from another's would be
+/// a guess that breaks the first time an id format changes. The owner is the
+/// backend that can find the file.
 fn find_session_file(session_id: &str) -> Option<std::path::PathBuf> {
+    crate::agents::find_session_file_in(&crate::agents::backends(), session_id)
+}
+
+/// Claude Code's own lookup: `~/.claude/projects/<project>/<id>.jsonl`, falling
+/// back to the newest `<id>.orphaned-…` when the live file has been retired.
+fn claude_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     let root = dirs::home_dir()?.join(".claude/projects");
     let exact = format!("{session_id}.jsonl");
     if let Ok(projects) = std::fs::read_dir(&root) {
@@ -2697,11 +2728,11 @@ mod tests {
 
 #[tauri::command]
 pub fn list_sessions() -> Vec<Session> {
-    // Future agents (codex, gemini, ...) get added to this list.
-    let providers: Vec<Box<dyn SessionProvider>> = vec![Box::new(ClaudeProvider)];
-    let mut all: Vec<Session> = providers.iter().flat_map(|p| p.scan()).collect();
-    all.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-    all
+    // Adding an agent means adding a backend in `agents.rs` and nothing here.
+    crate::agents::scan_all_with_paths()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect()
 }
 
 #[cfg(test)]
