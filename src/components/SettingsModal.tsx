@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import ModelAccess from "./ModelAccess";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
 } from "../settings";
@@ -22,7 +23,7 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
   { key: "agent", label: "Agent" },
 ];
 
-type Tab = "appearance" | "fonts" | "agents";
+type Tab = "appearance" | "fonts" | "agents" | "models";
 
 /** Shows the characters that actually separate one coding font from another. */
 const PREVIEW = "const ok = 0O1lI|; // {} => [a-z]* 3.14";
@@ -122,6 +123,10 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
               className={"set-tab" + (tab === "agents" ? " on" : "")}
               onClick={() => setTab("agents")}
             >Agents</button>
+            <button
+              className={"set-tab" + (tab === "models" ? " on" : "")}
+              onClick={() => setTab("models")}
+            >Model access</button>
           </div>
           <button className="icon-btn" title="Close (Esc)" onClick={onClose}>✕</button>
         </div>
@@ -271,6 +276,8 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
               {notice && <div className="set-notice">{notice}</div>}
             </div>
           </>}
+
+          {tab === "models" && <ModelAccess />}
 
           {tab === "agents" && <>
             <div className="set-section">
