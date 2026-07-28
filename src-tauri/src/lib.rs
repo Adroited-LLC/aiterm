@@ -27,6 +27,8 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             agents::detect_agents,
+            agents::agent_choices,
+            agents::agent_launch_command,
             providers::providers_list,
             providers::provider_save,
             providers::provider_delete,

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
-import NewSessionMenu, { StartPoint } from "./NewSessionMenu";
+import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -126,7 +126,7 @@ interface Props {
   onProjectClaude: (p: ProjectInfo) => void;
   /** Start a fresh claude session in a directory — always a new one, unlike
    *  `onProjectClaude`, which reuses the tab already open for that project. */
-  onNewSession: (path: string) => void;
+  onNewSession: (path: string, choice: StartChoice) => void;
   /** Sessions aiterm has started that have not written a transcript yet, so
    *  they have no row of their own. Listed on the strength of the tab alone —
    *  they are the one thing in this panel that is not read off disk, and they
@@ -961,7 +961,7 @@ export default function SessionsPanel({
       {showNewSession && (
         <NewSessionMenu
           places={startPoints}
-          onPick={(path) => { setShowNewSession(false); onNewSession(path); }}
+          onPick={(path, choice) => { setShowNewSession(false); onNewSession(path, choice); }}
           onClose={() => setShowNewSession(false)}
         />
       )}
