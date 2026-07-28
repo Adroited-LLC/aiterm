@@ -149,6 +149,26 @@ fn extract_texts(path: &Path) -> (String, String) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        // Codex writes its turns as `event_msg` records with the text in
+        // `payload.message`, a plain string. Handled here rather than left out,
+        // because a backend that appears in the sidebar and not in search is
+        // the exact failure the provider registry exists to prevent — and worse
+        // than being absent from both, since a search that quietly covers half
+        // your work reads as a search that found nothing.
+        if v.get("type").and_then(|t| t.as_str()) == Some("event_msg") {
+            let bucket = match v.pointer("/payload/type").and_then(|t| t.as_str()) {
+                Some("user_message") => &mut user,
+                Some("agent_message") => &mut assistant,
+                _ => continue,
+            };
+            if bucket.len() < CAP {
+                if let Some(t) = v.pointer("/payload/message").and_then(|m| m.as_str()) {
+                    bucket.push_str(t);
+                    bucket.push('\n');
+                }
+            }
+            continue;
+        }
         let (bucket, cap_left) = match v.get("type").and_then(|t| t.as_str()) {
             Some("user") => (&mut user, CAP),
             Some("assistant") => (&mut assistant, CAP),

@@ -23,25 +23,29 @@
 //! deal does not, and a second backend will find every one of these still
 //! hard-wired to Claude Code:
 //!
-//! - **Liveness.** `read_roster` shells out to `claude agents --json`.
-//! - **Lifecycle.** Resume, fork, stop and the `--session-id` mint in the UI
-//!   all speak Claude Code's flags.
+//! - **Liveness.** `read_roster` shells out to `claude agents --json`. A
+//!   running Codex session therefore wears no live dot — a fact aiterm is
+//!   missing, not one it gets wrong.
+//! - **Fork, stop, delete.** `session_fork` copies a Claude Code transcript and
+//!   rewrites its id fields; `session_delete` moves files into
+//!   `~/.claude/trash`. Neither means anything for another agent, so the
+//!   sidebar offers neither on a row it did not produce. (**Resume** is no
+//!   longer on this list — see [`AgentBackend::resume`].)
 //! - **Panels.** Tasks, artifacts, agents and the model pills parse Claude
 //!   Code's transcript records and read `~/.claude`.
-//! - **Trash.** `session_delete` and restore know `~/.claude/projects` layout.
 //!
 //! Each of those is a real decision rather than a mechanical port — a CLI agent
 //! has to be *asked* whether a session is alive, while an API-backed one knows
 //! for free — so they are left explicit rather than hidden behind a trait that
-//! pretends to abstract them. Adding a backend today gets you rows in the list
-//! and hits in search. Everything else is still to do, and this comment is the
-//! honest list of what.
+//! pretends to abstract them. Adding a backend gets you rows in the list, hits
+//! in search, a preview and a way back in. Everything else is still to do, and
+//! this comment is the honest list of what.
 
 use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::sessions::{ClaudeProvider, Session, SessionProvider};
+use crate::sessions::{ClaudeProvider, CodexProvider, Session, SessionProvider};
 
 /// What is known about an agent on this machine right now.
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -131,6 +135,25 @@ pub trait AgentBackend: Send + Sync {
     /// that is certainly per-agent, so it belongs with the agent — otherwise
     /// adding one means editing the renderer.
     fn launch(&self, spec: &LaunchSpec) -> LaunchPlan;
+
+    /// How to reopen an existing session, or `None` where the agent has no way
+    /// to.
+    ///
+    /// Split from `launch` because it is a different command with different
+    /// syntax — `claude … --resume <id>` against `codex resume <id>` — and
+    /// because getting it from the backend fixes a real bug rather than merely
+    /// tidying: the frontend used to rebuild Claude's invocation from its own
+    /// `CLAUDE_CMD` constant, which carries no environment. Resuming a session
+    /// started against an API provider therefore quietly reopened it on your
+    /// own plan, since `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` only
+    /// ever reached the *first* launch. A [`LaunchPlan`] carries both, so
+    /// [`ApiBackend`] can hand back the same environment it started with.
+    ///
+    /// `None` is a real answer — an agent with no resume at all — and the
+    /// caller is expected to say so rather than run something else.
+    fn resume(&self, _session_id: &str) -> Option<LaunchPlan> {
+        None
+    }
 }
 
 /// A command and the environment to run it in.
@@ -207,6 +230,26 @@ impl AgentBackend for ClaudeBackend {
     fn launch(&self, spec: &LaunchSpec) -> LaunchPlan {
         LaunchPlan::cmd(claude_command(spec))
     }
+
+    fn resume(&self, session_id: &str) -> Option<LaunchPlan> {
+        Some(LaunchPlan::cmd(claude_resume_command(session_id)))
+    }
+}
+
+/// Claude Code's resume: the same flags, in the same order, as the frontend's
+/// `CLAUDE_CMD --resume <id>` — with the id shell-quoted, which that one did
+/// not bother with. Both forms are identical for a UUID, and only one of them
+/// stays correct if a session id ever contains anything else.
+///
+/// No `--model` or `--effort`: a resume continues a conversation on whatever it
+/// was already using, and passing a model here is how a resumed session used to
+/// silently change what it was running. Same reasoning as the note in
+/// `resumeSession` about `--permission-mode`.
+fn claude_resume_command(session_id: &str) -> String {
+    format!(
+        "claude --permission-mode auto --allow-dangerously-skip-permissions --resume {}",
+        q(session_id),
+    )
 }
 
 /// Claude Code's invocation, shared by the Claude backend and by every
@@ -230,33 +273,17 @@ fn claude_command(spec: &LaunchSpec) -> String {
 
 /// OpenAI Codex.
 ///
-/// **Detection only.** Whether `codex` is installed is a fact aiterm can check
-/// today, and worth showing — "Codex: not installed" tells you the difference
-/// between a tool aiterm cannot use and one you have not set up. Its sessions
-/// are another matter: the on-disk format has not been examined, so
-/// [`CodexSessions`] finds nothing rather than guessing at a layout.
+/// This used to be detection only, because the on-disk session format had not
+/// been examined and a provider that invented a plausible path would have
+/// failed by finding nothing — indistinguishable from "you have no Codex
+/// sessions", and impossible to debug without proving a negative.
 ///
-/// That split is deliberate. A provider that invented a plausible path would
-/// fail by finding nothing in a way indistinguishable from "you have no Codex
-/// sessions", and the first person to debug it would have to prove a negative.
-/// This way the registry is honestly two backends, the settings panel can say
-/// what is supported, and filling in the provider is a self-contained job with
-/// nothing to unpick first.
+/// The format has now been read, from files this machine actually wrote, in
+/// both the interactive and the `exec` mode. The evidence is recorded on
+/// [`CodexProvider`] in `sessions.rs`, dated, with what was run and what came
+/// back — that comment is the reason this line can be deleted rather than a
+/// claim that it can.
 pub struct CodexBackend;
-
-/// Placeholder until Codex's session store has actually been looked at.
-pub struct CodexSessions;
-
-impl SessionProvider for CodexSessions {
-    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
-        Vec::new()
-    }
-    fn find_session_file(&self, _session_id: &str) -> Option<std::path::PathBuf> {
-        // Never claims ownership, so lookups fall through to a backend that
-        // can actually resolve the id.
-        None
-    }
-}
 
 impl AgentBackend for CodexBackend {
     fn id(&self) -> &'static str {
@@ -269,7 +296,7 @@ impl AgentBackend for CodexBackend {
         detect_cli(self.id(), self.display_name(), "codex")
     }
     fn sessions(&self) -> &dyn SessionProvider {
-        &CodexSessions
+        &CodexProvider
     }
 
     /// Codex has no `--session-id`. `codex --help` offers `resume` and `fork`
@@ -305,6 +332,25 @@ impl AgentBackend for CodexBackend {
         }
         // spec.session_id is deliberately dropped — see mints_session_id.
         LaunchPlan::cmd(cmd)
+    }
+
+    /// `codex resume <SESSION_ID>`.
+    ///
+    /// *Verified 2026-07-27, codex-cli 0.145.0: `codex resume --help` gives
+    /// `Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT]`, with SESSION_ID
+    /// documented as "Session id (UUID) or session name".* That id is the
+    /// `session_id` in the rollout's `session_meta`, which is what
+    /// [`CodexProvider`] puts on the row — so the row's id is the argument,
+    /// with no translation step to get wrong.
+    ///
+    /// No stop-first dance, unlike Claude Code's resume: `claude --resume`
+    /// refuses a session that is running, which is where all of that machinery
+    /// comes from. Whether `codex resume` refuses one has not been tested, and
+    /// aiterm has no Codex roster to consult even if it did — so the honest
+    /// thing is to hand the command over and let Codex answer for itself,
+    /// rather than to build a guard on an untested assumption.
+    fn resume(&self, session_id: &str) -> Option<LaunchPlan> {
+        Some(LaunchPlan::cmd(format!("codex resume {}", q(session_id))))
     }
 }
 
@@ -438,16 +484,35 @@ impl AgentBackend for ApiBackend {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> LaunchPlan {
+        // Claude Code warns that a key "takes precedence over your claude.ai
+        // login" and disables connectors. That is exactly what is wanted here,
+        // and only for this child — the environment does not escape the pty.
+        LaunchPlan { command: claude_command(spec), env: self.env() }
+    }
+
+    /// The same environment as `launch`, which is the whole point of routing
+    /// resume through the registry.
+    ///
+    /// Reopening one of these sessions used to run the frontend's plain
+    /// `CLAUDE_CMD --resume <id>`, with no environment at all — so a
+    /// conversation started against OpenRouter continued, silently, on your own
+    /// plan. Nothing said so; the transcript is a Claude Code transcript either
+    /// way. Finding it took knowing the session's source, which is exactly what
+    /// `sources.json` now records.
+    fn resume(&self, session_id: &str) -> Option<LaunchPlan> {
+        Some(LaunchPlan { command: claude_resume_command(session_id), env: self.env() })
+    }
+}
+
+impl ApiBackend {
+    fn env(&self) -> std::collections::HashMap<String, String> {
         let mut env = std::collections::HashMap::new();
         env.insert(
             "ANTHROPIC_BASE_URL".to_string(),
             crate::providers::anthropic_base(&self.provider.base_url),
         );
         env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), self.provider.api_key.clone());
-        // Claude Code warns that a key "takes precedence over your claude.ai
-        // login" and disables connectors. That is exactly what is wanted here,
-        // and only for this child — the environment does not escape the pty.
-        LaunchPlan { command: claude_command(spec), env }
+        env
     }
 }
 
@@ -539,7 +604,27 @@ pub fn backends() -> Vec<Box<dyn AgentBackend>> {
 /// label would be a second place for the name to live; this way `agent` cannot
 /// disagree with the registry, which is what the UI switches on.
 pub fn scan_all_with_paths() -> Vec<(Session, std::path::PathBuf)> {
-    scan_backends(&backends())
+    let list = backends();
+    let mut all = scan_backends(&list);
+    // Then the one thing the backends cannot tell you about their own rows:
+    // which *source* started each session. An API-backed source is Claude Code
+    // with two environment variables set, so `ClaudeProvider` finds its
+    // transcripts and tags them `claude` — correctly, and uselessly for telling
+    // the rows apart. See `sessions::aiterm_source_map_path`.
+    //
+    // Read once per scan rather than per row: it is one small file, and the
+    // scan already walks the whole store.
+    let recorded = crate::sessions::read_aiterm_source_map();
+    if !recorded.is_empty() {
+        let labels: std::collections::HashMap<String, String> = list
+            .iter()
+            .map(|b| (b.id().to_string(), b.display_name().to_string()))
+            .collect();
+        for (s, _) in &mut all {
+            crate::sessions::attach_source(s, &recorded, &labels);
+        }
+    }
+    all
 }
 
 /// The body of [`scan_all_with_paths`], over an explicit list.
@@ -631,6 +716,25 @@ pub fn agent_launch_command(agent_id: String, spec: LaunchSpec) -> Result<Launch
         .find(|b| b.id() == agent_id)
         .map(|b| b.launch(&spec))
         .ok_or_else(|| format!("No agent called {agent_id}."))
+}
+
+/// How to reopen `session_id` under `agent_id`.
+///
+/// `agent_id` is the row's **source** where one was recorded and its `agent`
+/// otherwise — the frontend decides that, because only it knows which row was
+/// clicked. An unknown id is an error rather than a fallback to Claude Code:
+/// running the wrong agent against someone's session id is worse than saying
+/// the source is gone.
+#[tauri::command]
+pub fn agent_resume_command(agent_id: String, session_id: String) -> Result<LaunchPlan, String> {
+    let list = backends();
+    let backend = list
+        .iter()
+        .find(|b| b.id() == agent_id)
+        .ok_or_else(|| format!("No agent called {agent_id}."))?;
+    backend
+        .resume(&session_id)
+        .ok_or_else(|| format!("{} has no way to resume a session.", backend.display_name()))
 }
 
 /// Resolve `bin` against PATH, the way a shell would.
@@ -823,6 +927,9 @@ mod tests {
                             background: false,
                             fork_parent: None,
                             last_active: *at,
+                            source: None,
+                            source_label: None,
+                            source_model: None,
                         },
                         std::path::PathBuf::from(format!("/fake/{id}")),
                     )
@@ -933,16 +1040,39 @@ mod tests {
         );
     }
 
-    /// Codex is registered for detection but contributes no sessions yet.
-    /// If someone fills in `CodexSessions`, this fails and asks them to delete
-    /// it — better than a stale claim sitting in the docs.
+    /// Codex now contributes real sessions (see `CodexProvider`), so the only
+    /// thing left to pin is that an id it does not own falls through to another
+    /// backend rather than being claimed. Whether *this* machine has any Codex
+    /// sessions is not asserted — the test suite must pass on one that has
+    /// never run it.
     #[test]
-    fn codex_is_detected_but_contributes_no_sessions_yet() {
+    fn codex_claims_only_ids_it_owns() {
         let codex = CodexBackend;
-        assert!(codex.sessions().scan_with_paths().is_empty());
-        assert_eq!(codex.sessions().find_session_file("anything"), None);
+        assert_eq!(
+            codex.sessions().find_session_file("not-a-real-session-id"),
+            None,
+        );
         // Detection is real regardless: it reports whatever this machine has.
         assert_eq!(codex.detect().id, "codex");
+    }
+
+    /// Every row a provider yields must be self-consistent — an id that its own
+    /// `find_session_file` resolves, and a cwd it can be reopened in. Skipped
+    /// silently where the store is empty, because a machine with no Codex
+    /// sessions is the ordinary case and not a failure.
+    #[test]
+    fn codex_rows_resolve_back_to_their_own_transcripts() {
+        for (s, path) in CodexBackend.sessions().scan_with_paths() {
+            assert!(!s.id.is_empty(), "a row with no session id: {path:?}");
+            assert!(!s.title.is_empty(), "a row with no title: {path:?}");
+            assert!(s.project_path.starts_with('/'), "cwd is not absolute: {}", s.project_path);
+            assert_eq!(
+                CodexBackend.sessions().find_session_file(&s.id).as_ref(),
+                Some(&path),
+                "row {} did not resolve back to the file it came from",
+                s.id,
+            );
+        }
     }
 
     /// The registry must report agents that are absent, not omit them — the
@@ -1003,6 +1133,72 @@ mod tests {
         };
         assert_eq!(CodexBackend.launch(&spec).command, "codex");
         assert!(!ClaudeBackend.launch(&spec).command.contains("--model"));
+    }
+
+    /* ---- resume ---------------------------------------------------------- */
+
+    /// The regression guard for moving resume out of the frontend: what this
+    /// produces must be what `CLAUDE_CMD --resume <id>` produced, flags and
+    /// order unchanged, or every resume quietly starts behaving differently.
+    #[test]
+    fn claude_resume_is_the_command_the_frontend_used_to_build() {
+        let plan = ClaudeBackend.resume("abc-123").expect("claude cannot resume");
+        assert_eq!(
+            plan.command,
+            "claude --permission-mode auto --allow-dangerously-skip-permissions \
+             --resume 'abc-123'",
+        );
+        assert!(plan.env.is_empty(), "a plain claude resume needs no environment");
+    }
+
+    /// A resume must not carry a model or an effort. Passing one is how a
+    /// resumed conversation silently changes what it is running, which is the
+    /// same class of bug as the `--permission-mode` one that put manual
+    /// sessions into bypass on resume.
+    #[test]
+    fn a_resume_never_re_specifies_the_model() {
+        for cmd in [
+            ClaudeBackend.resume("abc").unwrap().command,
+            CodexBackend.resume("abc").unwrap().command,
+        ] {
+            assert!(!cmd.contains("--model"), "{cmd}");
+            assert!(!cmd.contains("effort"), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn codex_resume_names_the_session_it_was_given() {
+        let plan = CodexBackend.resume("019fa659-c884").expect("codex cannot resume");
+        assert_eq!(plan.command, "codex resume '019fa659-c884'");
+    }
+
+    /// The reason resume moved into the registry at all. An API-backed source
+    /// is Claude Code pointed elsewhere by two environment variables; a resume
+    /// that dropped them reopened the conversation on the user's own plan, and
+    /// nothing in the transcript would ever have said so.
+    #[test]
+    fn an_api_source_resumes_with_the_same_environment_it_started_with() {
+        let backend = ApiBackend {
+            id: "api:test".into(),
+            provider: crate::providers::Provider {
+                id: "test".into(),
+                name: "Test Provider".into(),
+                base_url: "https://example.test/api/v1".into(),
+                api_key: "sk-secret".into(),
+            },
+        };
+        let started = backend.launch(&LaunchSpec::default()).env;
+        let resumed = backend.resume("abc-123").expect("api source cannot resume").env;
+        assert_eq!(started, resumed, "resume dropped the provider environment");
+        assert_eq!(resumed.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("sk-secret"));
+        assert!(resumed.contains_key("ANTHROPIC_BASE_URL"));
+        // And never on the command line, where `ps` would show it.
+        assert!(!backend.resume("abc-123").unwrap().command.contains("sk-secret"));
+    }
+
+    #[test]
+    fn resuming_under_an_unknown_agent_is_an_error_not_a_fallback() {
+        assert!(agent_resume_command("no-such-agent".into(), "abc".into()).is_err());
     }
 
     /// These strings are handed to `$SHELL -ic`. The UI only sends values from

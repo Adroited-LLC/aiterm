@@ -19,6 +19,20 @@ export interface Session {
    *  as /fork runs, before the fork's transcript has any messages. */
   fork_parent: string | null;
   last_active: number;
+  /** Which source aiterm started this session as — `"claude"`, `"codex"`,
+   *  `"api:<provider>"` — or null for anything aiterm did not start.
+   *
+   *  A different question from `agent`, and the reason the sidebar rows could
+   *  not be told apart before: an API-provider session *is* Claude Code with
+   *  two environment variables set, so it writes an ordinary Claude transcript
+   *  and `agent` is (correctly) "claude". Nothing on disk records the provider,
+   *  so aiterm writes it down at launch instead. */
+  source: string | null;
+  /** Display name for `source` — "OpenRouter", "Claude Code". */
+  source_label: string | null;
+  /** Model the session runs, where aiterm knows: recorded at launch, or read
+   *  from the rollout for Codex. */
+  source_model: string | null;
 }
 
 export interface DirEntry {
@@ -391,6 +405,26 @@ export const agentLaunchCommand = (
   agentId: string,
   spec: { model?: string | null; effort?: string | null; sessionId?: string | null },
 ) => invoke<LaunchPlan>("agent_launch_command", { agentId, spec });
+
+/** The command that reopens an existing session under `agentId`.
+ *
+ *  Asked for rather than assembled here for the same reason as the launch
+ *  command — but with a bug attached to getting it wrong: an API-backed source
+ *  needs its `ANTHROPIC_*` environment on the way back in, and rebuilding
+ *  `claude --resume` in the renderer silently dropped it, so a session started
+ *  against OpenRouter resumed on the user's own plan. */
+export const agentResumeCommand = (agentId: string, sessionId: string) =>
+  invoke<LaunchPlan>("agent_resume_command", { agentId, sessionId });
+
+/** Write down which source started a session, at the one moment it is known.
+ *
+ *  Nothing on disk records it — see `Session.source`. Fire-and-forget: a
+ *  session whose provenance fails to save is still a perfectly good session. */
+export const recordSessionSource = (
+  sessionId: string,
+  agent: string,
+  model: string | null,
+) => invoke<void>("record_session_source", { sessionId, agent, model });
 
 /** Does this provider serve the Anthropic Messages API — i.e. can it drive a
  *  session, or only hold models? Resolves with a sentence either way. */

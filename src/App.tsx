@@ -34,7 +34,7 @@ import {
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  agentLaunchCommand,
+  agentLaunchCommand, agentResumeCommand, recordSessionSource,
 } from "./ipc";
 import "./App.css";
 
@@ -490,7 +490,8 @@ export default function App() {
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,
-     sessionId?: string, fresh?: boolean, env?: Record<string, string>) => {
+     sessionId?: string, fresh?: boolean, env?: Record<string, string>,
+     agent?: string) => {
       setPreviewSession(null);
       setTabs((t) => {
         const existing = t.find((x) => x.slotId === slotId);
@@ -500,7 +501,7 @@ export default function App() {
         }
         const key = nextKey.current++;
         setActiveTab(key);
-        return [...t, { key, title, cwd, command, sessionId, slotId, fresh, env }];
+        return [...t, { key, title, cwd, command, sessionId, slotId, fresh, env, agent }];
       });
     },
     [],
@@ -607,12 +608,26 @@ export default function App() {
   // to a tab. Each one retires by itself: the id was minted by `newSession`,
   // so when that transcript lands the real row is already the tab's row and
   // this list stops naming it. Nothing guesses, and nothing hides a real row.
+  //
+  // Keyed on `slotId` rather than `sessionId`, which are the same value for an
+  // agent that takes a minted id and are not both present otherwise. The filter
+  // used to require a `sessionId`, so a Codex tab — Codex has no `--session-id`
+  // and never gets one — matched nothing and appeared in the sidebar not at
+  // all: a terminal you could start and then never find again, in the panel
+  // whose whole job is being the tab list. Such a tab is listed for as long as
+  // it is open, because there is no id its transcript will ever arrive under to
+  // retire it, which is exactly what `mints_session_id: false` means.
   const knownSessionIds = useMemo(() => new Set(sessions.map((s) => s.id)), [sessions]);
   const pendingSessions = useMemo(
     () =>
       tabs
-        .filter((t) => t.fresh && t.sessionId && !knownSessionIds.has(t.sessionId))
-        .map((t) => ({ id: t.sessionId!, title: t.title, cwd: t.cwd ?? "" })),
+        .filter((t) => t.fresh && !(t.sessionId && knownSessionIds.has(t.sessionId)))
+        .map((t) => ({
+          id: t.slotId,
+          title: t.title,
+          cwd: t.cwd ?? "",
+          agent: t.agent ?? "claude",
+        })),
     [tabs, knownSessionIds],
   );
   // The migration watcher's guard, reduced to a boolean before it reaches the
@@ -742,7 +757,12 @@ export default function App() {
       if (!t) return;
       closeTab(key);
       const cmd = t.sessionId ? `${CLAUDE_CMD} --resume ${t.sessionId}` : t.command;
-      openTab(t.title, t.cwd, cmd, t.slotId, t.sessionId);
+      // Everything the tab was carrying goes back with it. `env` in particular:
+      // a session started against an API provider has its credentials only
+      // here, and restarting without them silently reopened the conversation on
+      // the user's own plan. `fresh` and `agent` keep its placeholder row —
+      // which for an agent that mints no session id is the only row it has.
+      openTab(t.title, t.cwd, cmd, t.slotId, t.sessionId, t.fresh, t.env, t.agent);
     },
     [closeTab, openTab],
   );
@@ -776,7 +796,42 @@ export default function App() {
       setPreviewSession(s);
     }
   };
+  /** Which backend should be asked how to reopen this row.
+   *
+   *  The recorded source where there is one, the engine that wrote the
+   *  transcript otherwise. The distinction is the whole point: an OpenRouter
+   *  session and a plain one are byte-identical on disk, so `agent` alone sends
+   *  both back in through Claude Code on your own plan — which is what used to
+   *  happen, silently, because the renderer rebuilt the command from a
+   *  constant that carries no environment. */
+  const resumeSourceOf = (s: Session) => s.source || s.agent;
+
+  /** Reopen a session that Claude Code did not write.
+   *
+   *  Short on purpose. Everything in `resumeSession` below — resolving a
+   *  compaction continuation, asking the roster, stopping before resuming —
+   *  exists because of facts established about Claude Code and only about
+   *  Claude Code: `--resume` refuses a live session, `/clear` retires the
+   *  original transcript, the daemon holds sessions aiterm cannot stop. None
+   *  of that has been established for Codex, and there is no Codex roster to
+   *  ask, so running the same dance here would be ceremony built on nothing.
+   *  Hand over the command and let the agent answer for itself. */
+  const resumeForeign = async (s: Session) => {
+    setActiveProject(s.project_path);
+    try {
+      const plan = await agentResumeCommand(resumeSourceOf(s), s.id);
+      // Reuse the slot, so the row you clicked is the row the tab belongs to.
+      for (const t of tabsRef.current) {
+        if (t.slotId === s.id) closeTab(t.key);
+      }
+      openTab(s.title, s.project_path, plan.command, s.id, undefined, false, plan.env);
+    } catch (e) {
+      setNotice(`Couldn't reopen "${s.title}": ${e}`);
+    }
+  };
+
   const resumeSession = async (s: Session) => {
+    if (s.agent !== "claude") return resumeForeign(s);
     setActiveProject(s.project_path);
     // The pinned id can go stale: a `/clear` or compaction retires the
     // original transcript (Claude Code deletes it or renames it to
@@ -851,11 +906,27 @@ export default function App() {
       setNotice(`Couldn't stop "${s.title}" to resume it: ${e}`);
       return;
     }
-    // Resume the same way we start anything — see CLAUDE_CMD. This used to
-    // pass `--permission-mode <configured>`, which is what silently lifted a
+    // Ask the source how to reopen itself, rather than rebuilding the command
+    // here. Identical to the old `${CLAUDE_CMD} --resume <id>` for an ordinary
+    // session (pinned by a test), and *not* identical for one started against
+    // an API provider: that plan carries the `ANTHROPIC_*` environment, without
+    // which the conversation quietly continued on the user's own plan. The
+    // command still passes no `--permission-mode`, which is what used to lift a
     // manual session into bypass on resume.
-    const cmd = `${CLAUDE_CMD} --resume ${liveId}`;
-    openTab(s.title, s.project_path, cmd, liveId, liveId);
+    //
+    // Falling back to the constant if the ask fails: a source deleted from
+    // settings must not make its old sessions unopenable, and Claude Code is
+    // what wrote this transcript either way.
+    let cmd = `${CLAUDE_CMD} --resume ${liveId}`;
+    let env: Record<string, string> | undefined;
+    try {
+      const plan = await agentResumeCommand(resumeSourceOf(s), liveId);
+      cmd = plan.command;
+      env = plan.env;
+    } catch {
+      /* keep the fallback */
+    }
+    openTab(s.title, s.project_path, cmd, liveId, liveId, false, env);
   };
   // Branch a session into its own tab, resumable later on its own row. The
   // parent is left intact and frozen at its own context — `--fork-session`
@@ -975,9 +1046,25 @@ export default function App() {
         effort: choice.effort,
         sessionId: choice.mintsSessionId ? id : null,
       });
+      // Write down what this was started as, at the only moment anyone knows.
+      //
+      // An API-backed source is Claude Code with `ANTHROPIC_BASE_URL` and
+      // `ANTHROPIC_AUTH_TOKEN` set, so what lands on disk is an ordinary Claude
+      // Code transcript with nothing in it naming the provider — not the base
+      // URL, not a marker, nothing. A minute from now this fact is gone, and
+      // every session in the sidebar looks like every other one. That is the
+      // bug. (Same reason, and the same shape, as `forks.json`.)
+      //
+      // Only where the id names a real session: for Codex it is a tab handle
+      // and Codex's own rollout will carry the answer anyway.
+      if (choice.mintsSessionId) {
+        recordSessionSource(id, choice.agentId, choice.model).catch(() => {
+          /* provenance is a display detail; never fail a launch over it */
+        });
+      }
       openTab(
         basename(cwd), cwd, plan.command, id,
-        choice.mintsSessionId ? id : undefined, true, plan.env,
+        choice.mintsSessionId ? id : undefined, true, plan.env, choice.agentId,
       );
     } catch (e) {
       setNotice(`Couldn't start ${choice.agentId}: ${e}`);
@@ -1121,6 +1208,9 @@ export default function App() {
                 liveSessions={liveSessions}
                 attentionSlots={new Set(
                   tabs.filter((t) => attention.has(t.key)).map((t) => t.slotId),
+                )}
+                endedSlots={new Set(
+                  tabs.filter((t) => ended.has(t.key)).map((t) => t.slotId),
                 )}
                 activeSlot={activeTabObj?.slotId ?? null}
                 opts={opts}

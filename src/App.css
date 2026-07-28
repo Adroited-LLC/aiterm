@@ -758,10 +758,9 @@ body.dragging * { pointer-events: none; }
   flex-shrink: 0;
 }
 .agent-badge .agent-icon { margin: 0; }
-.agent-badge.claude {
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-raised));
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
-}
+/* Tinting per source lives in the "Sidebar clarity" block at the end of this
+   file, keyed on `kind-*` rather than on one hardcoded agent — there used to be
+   a `.claude` rule here and nothing for anything else. */
 .badge-dot {
   position: absolute;
   right: -2px;
@@ -823,7 +822,8 @@ body.dragging * { pointer-events: none; }
   font-size: 12px;
   box-shadow: 0 4px 16px #000a;
 }
-.session-item.showing { box-shadow: inset 2px 0 0 var(--accent); }
+/* `.showing` is styled in the "Sidebar clarity" block at the end of the file;
+   a 2px inset bar used to be the whole of it. */
 
 .live-dot {
   display: inline-block;
@@ -2295,3 +2295,131 @@ input[type="range"]::-webkit-slider-thumb {
 .agent-icon.api { color: var(--blue); }
 .ns-agent-tab.on .agent-icon { color: inherit; }
 .ns-note { font-size: 10.5px; color: var(--text-faint); }
+
+/* ==========================================================================
+   Sidebar clarity
+   ==========================================================================
+
+   Kept in one block at the end of the file, rather than edited into the
+   sessions-panel section above, purely so it merges cleanly alongside other
+   work in flight. Everything here is a session-row selector; nothing touches
+   the top bar or the usage strip.
+
+   The complaint this answers: the rows could not be told apart. Every one drew
+   the same badge in the same grey, in the same layout, and the only two
+   differences in the whole list were a 7px dot and a 2px left border. So a
+   glance answered none of the three questions you actually ask of a tab list —
+   *what kind of session is this, is it running, and which one am I looking at* —
+   and the panel is the only tab list there is.
+
+   Three signals, one per question, deliberately on different channels so they
+   can be read together rather than competing:
+
+     colour   → source     (`--src`, set by the row's `kind-*` class)
+     ring+dot → state      (running / waiting / ended)
+     bar+fill → focus      (the tab on screen right now)
+
+   Colour is the source rather than the state because source is the *stable*
+   property: a row's colour then never changes while you watch it, which is
+   what makes a moving dot legible against it. The reverse — colour for
+   liveness — was the obvious first instinct and is why it is written down as
+   rejected: it repaints half the list every roster poll and leaves nothing for
+   the question the user actually asked. */
+
+/* Every row resolves `--src`; the kind classes override it. Declared on the
+   panel so rows that carry no kind at all — trash entries, sessionless
+   projects — still resolve rather than falling back to an invalid value. */
+.sessions-panel { --src: var(--accent); }
+.session-item.kind-claude { --src: var(--accent); }
+.session-item.kind-codex { --src: var(--green); }
+.session-item.kind-api { --src: var(--blue); }
+.session-item.kind-generic { --src: var(--text-dim); }
+
+/* Matched on the attribute so the four kinds are not spelled out twice.
+   `.trash-badge` and `.agent-badge.folder` carry no `kind-` class and are
+   deliberately left in their own grey — they are not sessions. */
+.agent-badge[class*="kind-"] {
+  background: color-mix(in srgb, var(--src) 13%, var(--bg-raised));
+  border-color: color-mix(in srgb, var(--src) 34%, var(--border));
+}
+.agent-badge[class*="kind-"] .agent-icon { color: var(--src); }
+
+/* State, on the badge's rim. On the rim rather than in the row's background
+   because the background is already spoken for twice over — `.active`,
+   `.selected` — and a third thing tinting it would just mean none of them
+   reads. Red is the state that had no signal at all before: a terminal that
+   died on its own keeps its tab, and the only way to find out was to click
+   into it, which you have no reason to do when the thing that killed it was
+   `claude agents` in another terminal. */
+.session-item.running .agent-badge {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--green) 45%, transparent);
+}
+.session-item.ended .agent-badge {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 50%, transparent);
+}
+.session-item.attn .agent-badge {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--yellow) 65%, transparent);
+}
+.badge-dot.dead { background: var(--red); }
+
+/* Weight, not colour, for "this one is alive" — the idle rows keep their own
+   contrast rather than being dimmed to make the live ones stand out, which
+   would have made most of the list harder to read to solve a problem in a
+   couple of rows of it. */
+.session-item.running .session-title,
+.session-item.attn .session-title { font-weight: 650; }
+
+/* The row you are looking at. A 2px inset border in the accent colour was the
+   entire previous answer, and against twenty rows of identical grey it is not
+   findable — which is the "which one am I on?" half of the complaint. Now: a
+   3px bar in the row's own source colour, a tint of the same, and a heavier
+   title. Three cheap signals beat one expensive one. */
+.session-item.showing {
+  background: color-mix(in srgb, var(--src) 10%, var(--bg-active));
+  box-shadow: inset 3px 0 0 var(--src);
+}
+.session-item.showing .session-title { font-weight: 650; color: var(--text); }
+/* Both marks when a row is focused *and* multi-selected, rather than whichever
+   rule happens to be later in the file. */
+.session-item.showing.selected {
+  box-shadow:
+    inset 3px 0 0 var(--src),
+    inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* Source in words, for the rows where colour alone is not enough — an API
+   endpoint is a *place*, and "OpenRouter" says which one where a blue socket
+   only says "somewhere". Never drawn on Claude Code rows: a label repeated on
+   every row is a column of noise, and the default needs no announcing.
+   It leads the meta line, before the path, because it is the coarser fact —
+   and it is the one thing on that line that never shrinks, so it goes first
+   rather than being pushed off the end by a long path. */
+.source-chip {
+  flex-shrink: 0;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  line-height: 1.55;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: var(--src);
+  background: color-mix(in srgb, var(--src) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--src) 28%, transparent);
+}
+/* The path is what gives way when the line is full: it is the longest thing
+   on it and the least identifying, and it already ellipsises. */
+.session-meta .session-sub { flex-shrink: 1; }
+
+/* Sections need to read as separate before their contents can read as grouped.
+   They were flush against each other, so a header looked like one more row. */
+.sessions-list > .session-group + .session-group { margin-top: 7px; }
+
+/* Four view tabs where there were three. They divide the panel evenly, so at a
+   narrow width the labels have to be allowed to clip rather than force the
+   strip wider than the sidebar. */
+.view-tab { padding-left: 2px; padding-right: 2px; min-width: 0; overflow: hidden; }

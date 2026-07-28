@@ -33,6 +33,11 @@ export interface TermTab {
   /** Dedupe key linking this terminal to a sidebar item: a session id for
    *  resumes, "shell:<path>" for project shells. One terminal per slot. */
   slotId: string;
+  /** Registry id of the source this tab was started as — "claude", "codex",
+   *  "api:<provider>". Carried so the placeholder row can draw the right mark
+   *  before anything exists on disk to read it off; a tab opened by a resume
+   *  or a shell leaves it unset. */
+  agent?: string;
   /** Extra environment for this terminal's process. Credentials live here
    *  rather than in `command`, which is run through a shell and would put them
    *  in `ps` for every process on the machine to read. */

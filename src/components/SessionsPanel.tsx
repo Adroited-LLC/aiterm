@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
-import AgentIcon from "./AgentIcon";
+import AgentIcon, { AgentKind, agentKind } from "./AgentIcon";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -13,7 +13,7 @@ function shortTime(ms: number): string {
   return `${Math.floor(s / (30 * 86400))}mo`;
 }
 
-type ViewMode = "recent" | "project" | "date";
+type ViewMode = "recent" | "project" | "date" | "source";
 
 function dateBucket(ms: number): string {
   const now = new Date();
@@ -25,12 +25,45 @@ function dateBucket(ms: number): string {
   return "Older";
 }
 
-/** A started-but-not-yet-written session. `id` is both its slot id and the
- *  session id it will have, because aiterm minted it. */
+const KIND_NAME: Record<AgentKind, string> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  api: "API endpoint",
+  generic: "Other",
+};
+
+/** What a row says about where it came from: the mark it draws, the words for
+ *  it, and the bucket it groups into under the Source view.
+ *
+ *  One function, because these three had better agree. The label is the
+ *  provider's own name where there is one — "OpenRouter" reads as a place you
+ *  chose, where "API endpoint" reads as a category — and the bucket key follows
+ *  it, so two configured providers get a section each rather than being piled
+ *  together under a word neither of them is called.
+ *
+ *  Rows aiterm did not start (the majority) have no `source` and fall back to
+ *  their `agent`. That is deliberately *not* labelled differently from ones it
+ *  did: "who started this" is aiterm's bookkeeping, not something the sidebar
+ *  should be sorting your work by. */
+function sourceOf(s: Session): { kind: AgentKind; label: string; key: string } {
+  const kind = agentKind(s);
+  if (kind === "api") {
+    const label = s.source_label || "API endpoint";
+    return { kind, label, key: `api:${label}` };
+  }
+  return { kind, label: KIND_NAME[kind], key: kind };
+}
+
+/** A started-but-not-yet-written session. `id` is its slot id — and, where the
+ *  agent accepts a minted one, the session id it will have. */
 export interface PendingSession {
   id: string;
   title: string;
   cwd: string;
+  /** Source it was started as, for the mark. A placeholder that drew the Claude
+   *  starburst over a Codex terminal would be the one row in the list actively
+   *  lying about what it is. */
+  agent: string;
 }
 
 export interface SessionDisplayOpts {
@@ -112,6 +145,14 @@ interface Props {
   liveSessions: Set<string>;
   /** Slot ids whose terminal rang the bell (claude waiting on input). */
   attentionSlots: Set<string>;
+  /** Slot ids whose process died on its own and whose tab is still open.
+   *
+   *  A fourth state, kept apart from the other three for the same reason they
+   *  are kept apart from each other: an ended tab is not running, still has a
+   *  tab, and is not the one being shown unless you are looking at it. Rolling
+   *  it into any of those puts the wrong mark on the wrong row the moment they
+   *  disagree — which is exactly when you need to know. */
+  endedSlots: Set<string>;
   /** Slot id of the terminal currently displayed. */
   activeSlot: string | null;
   opts: SessionDisplayOpts;
@@ -143,7 +184,8 @@ interface Props {
 }
 
 export default function SessionsPanel({
-  sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, activeSlot, opts,
+  sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, endedSlots,
+  activeSlot, opts,
   onOptsChange, onSelect, onResume, onFork, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
@@ -307,10 +349,18 @@ export default function SessionsPanel({
   const autoSections = useMemo(() => {
     if (viewMode === "recent" || searchList) return null;
     const map = new Map<string, Session[]>();
+    // Source labels are looked up rather than derived back from the key,
+    // because the key for an API section is built from the provider's own name
+    // and re-deriving it would be a second place for that rule to live.
+    const names = new Map<string, string>();
     for (const s of filtered) {
-      const key = viewMode === "project"
-        ? s.group_path
-        : dateBucket(s.last_active);
+      let key: string;
+      if (viewMode === "project") key = s.group_path;
+      else if (viewMode === "source") {
+        const src = sourceOf(s);
+        key = src.key;
+        names.set(key, src.label);
+      } else key = dateBucket(s.last_active);
       (map.get(key) ?? map.set(key, []).get(key)!).push(s);
     }
     if (viewMode === "date") {
@@ -318,6 +368,15 @@ export default function SessionsPanel({
       return order
         .filter((k) => map.has(k))
         .map((k) => ({ key: k, label: k, sessions: map.get(k)! }));
+    }
+    if (viewMode === "source") {
+      // Ordered by most recent activity, the same rule the project view uses,
+      // rather than by a hand-written source ranking. Which agent you were
+      // last working in is a fact about you; an order written into this file
+      // would be an opinion about which one matters.
+      return [...map.entries()]
+        .sort((a, b) => b[1][0].last_active - a[1][0].last_active)
+        .map(([key, ss]) => ({ key, label: names.get(key) ?? key, sessions: ss }));
     }
     const secs = [...map.entries()]
       .sort((a, b) => b[1][0].last_active - a[1][0].last_active)
@@ -583,8 +642,22 @@ export default function SessionsPanel({
     const isRunning = liveSessions.has(s.id);
     const hasAttn =
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
+    const hasEnded =
+      endedSlots.has(s.id) || endedSlots.has(`shell:${s.project_path}`);
     const isShowing = activeSlot !== null &&
       (activeSlot === s.id || activeSlot === `shell:${s.project_path}`);
+    const src = sourceOf(s);
+    // Fork and delete are Claude Code operations, not general ones:
+    // `session_fork` copies a Claude transcript and rewrites its id fields, and
+    // `session_delete` moves files into `~/.claude/trash`. Run either against a
+    // Codex rollout and it would fail, or worse, half-succeed. They are hidden
+    // on rows Claude Code did not write rather than shown and refused — an
+    // action that is always an error is not an action.
+    //
+    // Keyed on `agent`, deliberately, and not on the mark the row draws: a
+    // session started against an API provider *is* Claude Code, its transcript
+    // is an ordinary one, and both operations work on it perfectly.
+    const claudeStore = s.agent === "claude";
     // Tighter than `isShowing`: the displayed terminal is *this session's own*
     // tab, not merely a shell in the same project (which would match every row
     // in that project). Only this row has nothing to resume — you are already
@@ -616,6 +689,14 @@ export default function SessionsPanel({
           (isShowing ? " active" : "") +
           (selected.has(s.id) ? " selected" : "") +
           (isShowing ? " showing" : "") +
+          // The three states a row can be in, as classes rather than only as a
+          // dot. A 7px dot in the corner of a 28px badge is the entire signal
+          // the list used to carry, and at a glance down twenty rows it is not
+          // one — the row itself has to change.
+          (isRunning ? " running" : "") +
+          (hasAttn ? " attn" : "") +
+          (hasEnded && !isRunning ? " ended" : "") +
+          ` kind-${src.kind}` +
           (isDragging ? " dragging" : "") +
           (dragOverItem === s.id ? " drop-mark" + (dragOverAfter ? " drop-after" : "") : "")
         }
@@ -639,15 +720,35 @@ export default function SessionsPanel({
           onSelect(s);
         }}
       >
-        <div className={"agent-badge" + (s.agent === "claude" ? " claude" : "")}>
-          <AgentIcon agent={s.agent} />
-          {/* Green: the session is running. Whether aiterm also has a tab for
-              it is still tracked (`hasTab`, for the row's actions) but no
-              longer drawn — the row already says so by other means. */}
-          {(isRunning || hasAttn) && (
+        {/* The badge is where "what kind of session is this" lives: the mark
+            inside it and the colour of the whole thing both come from the
+            source, so the answer survives being read at a glance instead of
+            peered at. The tooltip is the long form — the provider by name, and
+            the model where anything recorded one. */}
+        <div
+          className={`agent-badge kind-${src.kind}`}
+          title={src.label + (s.source_model ? ` · ${s.source_model}` : "")}
+        >
+          <AgentIcon agent={s.source || s.agent} />
+          {/* Green: the session is running. Yellow, pulsing: it wants you.
+              Red: its terminal died on its own and the tab is still there —
+              the one state that used to be visible only by clicking into the
+              tab and finding the notice. Whether aiterm has a tab at all is
+              still tracked (`hasTab`, for the row's actions) and still not
+              drawn: it is not a state of the session. */}
+          {(isRunning || hasAttn || hasEnded) && (
             <span
-              className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
-              title={hasAttn ? "Waiting for your input" : "Session is running"}
+              className={
+                "live-dot badge-dot" +
+                (hasAttn ? " attn" : isRunning ? "" : " dead")
+              }
+              title={
+                hasAttn
+                  ? "Waiting for your input"
+                  : isRunning
+                    ? "Session is running"
+                    : "Its terminal ended on its own — the tab is still open"
+              }
             />
           )}
         </div>
@@ -668,8 +769,24 @@ export default function SessionsPanel({
             <span className="session-title">{s.title}</span>
             {opts.showTime && <span className="session-time">{shortTime(s.last_active)}</span>}
           </div>
-          {(opts.showPath || (opts.showBranch && s.branch)) && (
+          {/* The source named in words, and only where the answer is not the
+              default — every row saying "CLAUDE CODE" would be a column of
+              identical text, which is the complaint restated.
+              On the second line rather than beside the title, which is where it
+              started: "OPENROUTER" is ten characters that never shrink, and up
+              against a title that does, it cost half of every title in the
+              list to say something the badge colour had already said. Here it
+              sits with the path and the branch, which is what it is — a fact
+              about the session rather than its name — and the row keeps its
+              full width for the one thing that identifies it.
+              The row renders a meta line for the chip alone if the path and
+              branch are both switched off, so turning those off cannot take the
+              source with them. */}
+          {(opts.showPath || (opts.showBranch && s.branch) || src.kind !== "claude") && (
             <div className="session-meta">
+              {src.kind !== "claude" && (
+                <span className={`source-chip kind-${src.kind}`}>{src.label}</span>
+              )}
               {opts.showPath && (
                 <span className="session-sub">{homeAbbrev(s.project_path)}</span>
               )}
@@ -732,22 +849,29 @@ export default function SessionsPanel({
                 <button
                   className="act-btn"
                   title={
-                    isRunning || hasTab
+                    // The stop-first warning is a Claude Code fact —
+                    // `--resume` refuses a live session — so it is not stated
+                    // over a source where it has not been established.
+                    claudeStore && (isRunning || hasTab)
                       ? "Resume — stops the running session first"
-                      : "Resume claude session"
+                      : `Resume this ${src.label} session`
                   }
                   onClick={() =>
-                    isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
+                    claudeStore && (isRunning || hasTab)
+                      ? setConfirmStop(s.id)
+                      : onResume(s)
                   }
                 >▶</button>
               )}
               {/* Branching is a deliberate act (two divergent lines from one
                   history), not a workaround for resume being unavailable. */}
-              <button
-                className="act-btn"
-                title="Branch a copy at this point — listed idle, starts nothing"
-                onClick={() => onFork(s)}
-              >⑂</button>
+              {claudeStore && (
+                <button
+                  className="act-btn"
+                  title="Branch a copy at this point — listed idle, starts nothing"
+                  onClick={() => onFork(s)}
+                >⑂</button>
+              )}
               {hasTab && (
                 <button
                   className="act-btn" title="Exit — close this tab"
@@ -761,8 +885,15 @@ export default function SessionsPanel({
               {/* Never offer Delete on a running session: trashing one doesn't
                   stick — the process recreates its transcript seconds later,
                   rebuilt from the deletion point, losing the history before
-                  it. Stop it first. */}
-              {!isRunning && !hasTab && (
+                  it. Stop it first.
+
+                  And never on a row Claude Code did not write: delete means
+                  "move this into `~/.claude/trash`", which is not where a
+                  Codex rollout lives and not somewhere restore would find it.
+                  Codex has its own `delete`/`archive` subcommands and wiring
+                  them up is a separate job — until then the honest position is
+                  that aiterm cannot delete these, not that it can. */}
+              {claudeStore && !isRunning && !hasTab && (
                 <button
                   className="act-btn danger" title="Delete session…"
                   onClick={() => setConfirmDel(s.id)}
@@ -787,14 +918,19 @@ export default function SessionsPanel({
   const renderPending = (p: PendingSession) => {
     const isShowing = activeSlot === p.id;
     const hasAttn = attentionSlots.has(p.id);
+    const kind = agentKind({ agent: p.agent });
     return (
       <div
         key={p.id}
-        className={"session-item pending-item" + (isShowing ? " active showing" : "")}
+        className={
+          `session-item pending-item running kind-${kind}` +
+          (isShowing ? " active showing" : "") +
+          (hasAttn ? " attn" : "")
+        }
         onClick={() => onSelectPending(p.id)}
       >
-        <div className="agent-badge claude">
-          <AgentIcon agent="claude" />
+        <div className={`agent-badge kind-${kind}`} title={KIND_NAME[kind]}>
+          <AgentIcon agent={p.agent} />
           <span
             className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
             title={hasAttn ? "Waiting for your input" : "Session is starting"}
@@ -944,13 +1080,21 @@ export default function SessionsPanel({
         />
       )}
       <div className="view-tabs">
-        {(["recent", "project", "date"] as ViewMode[]).map((m) => (
+        {/* "Source" earns its place next to the other three: it is the only
+            view that answers "what am I running where" — every OpenRouter
+            session in one block, every Codex one in another — and it costs one
+            bucketing rule, because the sectioning machinery was already
+            general. */}
+        {(["recent", "project", "date", "source"] as ViewMode[]).map((m) => (
           <button
             key={m}
             className={"view-tab" + (viewMode === m ? " on" : "")}
             onClick={() => setViewMode(m)}
           >
-            {m === "recent" ? "Recent" : m === "project" ? "Project" : "Date"}
+            {m === "recent" ? "Recent"
+              : m === "project" ? "Project"
+              : m === "date" ? "Date"
+              : "Source"}
           </button>
         ))}
       </div>

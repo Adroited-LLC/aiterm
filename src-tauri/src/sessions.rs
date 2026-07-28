@@ -1,4 +1,5 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -31,6 +32,35 @@ pub struct Session {
     pub fork_parent: Option<String>,
     /// Unix millis of last activity (file mtime).
     pub last_active: u64,
+    /// **Which source started this session**, when aiterm was the one that
+    /// started it: the registry id the picker offered — `"claude"`, `"codex"`,
+    /// `"api:openrouter"`. `None` for everything else, which is most rows on a
+    /// machine that has been used for a while.
+    ///
+    /// Deliberately *not* the same question as `agent`, and the whole reason
+    /// this field exists. `agent` is the engine that owns the transcript, and
+    /// it is stamped by the registry from the backend that found the file. A
+    /// session started against an API provider **is** Claude Code — aiterm sets
+    /// `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` and runs `claude` — so its
+    /// transcript lands in `~/.claude/projects` and `ClaudeProvider` yields it
+    /// tagged `agent: "claude"`, correctly. Nothing anywhere on disk records
+    /// that OpenRouter was ever involved.
+    ///
+    /// So it cannot be derived; it has to be *recorded*, by the code that knew
+    /// it at the time. See `record_session_source` — same shape, and for the
+    /// same reason, as the fork lineage in `forks.json` below.
+    pub source: Option<String>,
+    /// Human-facing name for `source`, resolved from the registry at scan time
+    /// rather than stored: a provider renamed in settings should rename its
+    /// rows, and a stored copy would go stale the moment it was written.
+    pub source_label: Option<String>,
+    /// The model this session runs on, as far as aiterm can tell. Recorded at
+    /// launch for sessions aiterm started; read out of the rollout for Codex,
+    /// which writes it into every `turn_context`. `None` when nobody said.
+    ///
+    /// Not the same as the `session_model` command, which reads what a *Claude*
+    /// transcript last switched to. This one never parses a transcript for it.
+    pub source_model: Option<String>,
 }
 
 /// Where one agent keeps its sessions.
@@ -166,6 +196,147 @@ fn record_aiterm_fork(branch: &str, parent: &str) {
     if let Ok(text) = serde_json::to_string_pretty(&map) {
         let _ = std::fs::write(path, text);
     }
+}
+
+/* ---- which source started a session ------------------------------------- */
+
+/// What aiterm knows about how a session was started.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionSource {
+    /// Registry id of the backend the user picked: `"claude"`, `"codex"`,
+    /// `"api:<provider-slug>"`. Stored raw rather than reduced to a category,
+    /// because the category is a display decision and this file outlives it.
+    pub agent: String,
+    /// Model chosen in the picker, if one was. Blank means "whatever the agent
+    /// would do on its own", which is a real answer and not a missing one — it
+    /// is stored as absent rather than as an empty string so the two do not
+    /// have to be told apart later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Where aiterm records which source started a session: session id → source.
+///
+/// The second thing in this app that has to be written down because it cannot
+/// be read back off disk — `forks.json`, directly above, was the first, and
+/// this follows it deliberately rather than inventing a new mechanism.
+///
+/// The fact being recorded is narrow and load-bearing: **a session started
+/// against an API provider is Claude Code**, pointed at another endpoint by two
+/// environment variables. It writes an ordinary Claude Code transcript into
+/// `~/.claude/projects`, with nothing in it naming the provider — not the base
+/// URL, not the model (the model line records whatever Claude Code thinks it
+/// is asking for), not a marker of any kind. Grep the store afterwards and
+/// there is genuinely no way to tell it from a session on your own plan.
+///
+/// Which is why the sidebar could not tell them apart, and why adding icons did
+/// not help: every row was `agent: "claude"` by construction, so every row drew
+/// the same mark, correctly.
+///
+/// The one moment the answer exists is the moment before launch, in
+/// `newSession`, which has just minted the session id *and* holds the picked
+/// source. Write it there or lose it.
+///
+/// ### What this does not do
+///
+/// - It does not grow a row. Only sessions aiterm itself started are in here;
+///   an entry is looked up by id and its absence means "aiterm did not start
+///   this", which is the honest answer and the common one.
+/// - It is never pruned. An entry is ~60 bytes and outlives the session it
+///   names, exactly like `forks.json`. Pruning would mean a write on every
+///   scan to save a few kilobytes a year, and a scan that writes is a scan that
+///   can corrupt.
+/// - It is not consulted for anything but display. Nothing resumes, forks or
+///   deletes differently because of what is in here.
+fn aiterm_source_map_path() -> Option<std::path::PathBuf> {
+    Some(dirs::data_dir()?.join("aiterm/sources.json"))
+}
+
+/// Parse the file's contents. Split from the read so the tolerance below can be
+/// tested without a home directory: a half-written or hand-edited file must
+/// degrade to "aiterm started none of these", never to a failed scan.
+pub fn parse_source_map(text: &str) -> HashMap<String, SessionSource> {
+    serde_json::from_str(text).unwrap_or_default()
+}
+
+pub fn read_aiterm_source_map() -> HashMap<String, SessionSource> {
+    let Some(path) = aiterm_source_map_path() else {
+        return Default::default();
+    };
+    std::fs::read_to_string(path)
+        .map(|s| parse_source_map(&s))
+        .unwrap_or_default()
+}
+
+/// Note that `session_id` was started as `agent`. Best-effort, like the fork
+/// record: a session whose provenance fails to save is still a perfectly good
+/// session, and failing the launch over a display detail would be absurd.
+#[tauri::command]
+pub fn record_session_source(session_id: String, agent: String, model: Option<String>) {
+    write_session_source(
+        &session_id,
+        SessionSource {
+            agent,
+            model: model.filter(|m| !m.is_empty()),
+        },
+    );
+}
+
+fn write_session_source(session_id: &str, rec: SessionSource) {
+    let Some(path) = aiterm_source_map_path() else {
+        return;
+    };
+    let mut map = read_aiterm_source_map();
+    map.insert(session_id.to_string(), rec);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// A branch inherits its parent's source. Nothing in the copy says where the
+/// conversation came from, and a branch of an OpenRouter session is still an
+/// OpenRouter session — without this the ⑂ copy would appear beside its parent
+/// wearing a different mark, which is precisely the confusion this whole change
+/// is about.
+fn inherit_session_source(child: &str, parent: &str) {
+    if let Some(rec) = read_aiterm_source_map().get(parent).cloned() {
+        write_session_source(child, rec);
+    }
+}
+
+/// Fill in `source`/`source_label`/`source_model` for one row.
+///
+/// Pure, and given its inputs rather than reading them, so the resolution rules
+/// below can be tested without a data directory or a configured provider.
+///
+/// `labels` is registry id → display name. A source whose backend is gone —
+/// the provider was deleted from settings after the session ran — still gets a
+/// readable name from its own id rather than falling back to nothing: the
+/// session did run against something, and saying "openrouter" is better than
+/// silently demoting the row to look like an ordinary local one.
+pub fn attach_source(
+    s: &mut Session,
+    map: &HashMap<String, SessionSource>,
+    labels: &HashMap<String, String>,
+) {
+    let Some(rec) = map.get(&s.id) else {
+        return;
+    };
+    s.source = Some(rec.agent.clone());
+    s.source_label = Some(source_label(&rec.agent, labels));
+    if s.source_model.is_none() {
+        s.source_model = rec.model.clone();
+    }
+}
+
+fn source_label(id: &str, labels: &HashMap<String, String>) -> String {
+    if let Some(name) = labels.get(id) {
+        return name.clone();
+    }
+    id.strip_prefix("api:").unwrap_or(id).to_string()
 }
 
 /// Fork lineage from Claude Code's job state files: forked session UUID →
@@ -481,6 +652,11 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
         background,
         fork_parent: None, // filled in from job state by the caller
         last_active: mtime,
+        // All three filled in by `attach_source` — the transcript cannot know
+        // them, which is the point of recording them elsewhere.
+        source: None,
+        source_label: None,
+        source_model: None,
     })
 }
 
@@ -497,6 +673,228 @@ fn worktree_repo_root(cwd: &str) -> Option<String> {
     Some(root.to_string())
 }
 
+/* ---- Codex ---------------------------------------------------------------
+ *
+ * This replaces a deliberate placeholder. Until now `CodexSessions` in
+ * `agents.rs` returned nothing, with a comment saying the on-disk format had
+ * not been examined and that inventing a plausible path would fail in the one
+ * way nobody can debug — indistinguishably from "you have no Codex sessions".
+ *
+ * It has now been examined, both ways in, and this is written from the two
+ * files rather than from any documentation:
+ *
+ * > **2026-07-27, codex-cli 0.145.0.** `codex exec` wrote
+ * > `~/.codex/sessions/2026/07/27/rollout-2026-07-27T20-22-44-019fa61a-39f4-7923-a717-215dd3b0aa58.jsonl`,
+ * > opening with one `session_meta` record whose payload carried
+ * > `session_id`, `cwd: "/home/admin/AI-OS"`, `originator: "codex_exec"`,
+ * > `source: "exec"`, `cli_version` and `git: {commit_hash, branch: "master"}`.
+ * > What the user typed appeared as
+ * > `{"type":"event_msg","payload":{"type":"user_message","message":"…"}}`,
+ * > and the model as `{"type":"turn_context","payload":{…,"model":"gpt-5.6-sol"}}`.
+ * >
+ * > The *interactive* TUI was then driven on a real pty (there is no headless
+ * > way to ask it) and wrote
+ * > `…/rollout-2026-07-27T21-32-09-019fa659-c884-7620-94fa-606596862c11.jsonl`
+ * > in the same directory, with the same record types, differing only in
+ * > `originator: "codex-tui"`, `source: "cli"` — and with no `git` key at all,
+ * > because that session's cwd was `/tmp`. So `git` is optional and `cwd` is
+ * > not.
+ *
+ * That second file is the one that mattered. `codex exec` alone would have
+ * proved nothing about the mode aiterm actually launches, and assuming the two
+ * shared a writer is exactly the sort of plausible-but-unchecked step
+ * SESSION-MODEL.md opens by warning about. Corroborating it: `codex resume
+ * --help` documents `--include-non-interactive`, "include non-interactive
+ * sessions in the resume picker" — a flag that only needs to exist if both
+ * kinds live in one store.
+ *
+ * What is deliberately **not** claimed here:
+ *
+ * - **Lineage.** `codex fork` exists, but nothing was found that records the
+ *   pair, so every Codex row reports `forked: false` rather than a guess.
+ * - **Liveness.** The roster is `claude agents --json`; there is no equivalent
+ *   here, so a running Codex session wears no dot. That is a missing fact, not
+ *   a wrong one.
+ * - **The directory layout.** `<year>/<month>/<day>` is what this machine has,
+ *   and the walk below does not depend on it — it descends a bounded few levels
+ *   and takes whatever `.jsonl` files it finds, so a future version that flattens
+ *   or re-nests the store keeps working.
+ */
+pub struct CodexProvider;
+
+impl SessionProvider for CodexProvider {
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+        let Some(root) = codex_sessions_root() else {
+            return vec![];
+        };
+        let mut files = Vec::new();
+        collect_jsonl(&root, 4, &mut files);
+        files
+            .into_iter()
+            .filter_map(|p| parse_codex_rollout(&p).map(|s| (s, p)))
+            .collect()
+    }
+
+    /// Codex names the file `rollout-<timestamp>-<session-id>.jsonl`, so the id
+    /// is a suffix match rather than the stem. Matched against the whole
+    /// `-<id>.jsonl` tail, not merely `contains`, so a session id that happens
+    /// to be a substring of another cannot resolve to the wrong transcript.
+    fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        let root = codex_sessions_root()?;
+        let mut files = Vec::new();
+        collect_jsonl(&root, 4, &mut files);
+        let tail = format!("-{session_id}.jsonl");
+        files
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&tail)))
+    }
+}
+
+fn codex_sessions_root() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".codex/sessions"))
+}
+
+/// Every `.jsonl` under `dir`, descending at most `depth` levels.
+///
+/// Bounded rather than unbounded so a symlink loop or someone's backup folder
+/// dropped into the store cannot turn a sidebar refresh into an unbounded walk.
+/// The real store is three levels deep; four leaves room for a re-nesting
+/// without leaving the app unable to see sessions until it is rebuilt.
+fn collect_jsonl(dir: &Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if depth > 0 {
+                collect_jsonl(&p, depth - 1, out);
+            }
+        } else if p.extension().is_some_and(|x| x == "jsonl") {
+            out.push(p);
+        }
+    }
+}
+
+/// The facts a Codex rollout's head carries about its session.
+#[derive(Default, Debug, PartialEq)]
+pub struct CodexHead {
+    pub id: Option<String>,
+    pub cwd: Option<String>,
+    pub branch: Option<String>,
+    /// First thing the user actually typed. `event_msg`/`user_message` is used
+    /// rather than the `response_item` records with `role: "user"`, because
+    /// those also carry everything Codex injects — the permissions block, the
+    /// apps and skills catalogues, `<environment_context>` — and the first of
+    /// them is never a human sentence.
+    pub title: Option<String>,
+    /// `"cli"` for the interactive TUI, `"exec"` for `codex exec`.
+    pub source: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Read a rollout's head. Pure, over lines, so the two captured files can be
+/// asserted against without a `~/.codex` on the machine running the tests.
+pub fn parse_codex_head<'a>(lines: impl IntoIterator<Item = &'a str>) -> CodexHead {
+    let mut head = CodexHead::default();
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("session_meta") => {
+                let p = v.get("payload").unwrap_or(&serde_json::Value::Null);
+                head.id = p.get("session_id").and_then(|x| x.as_str()).map(String::from);
+                head.cwd = p
+                    .get("cwd")
+                    .and_then(|x| x.as_str())
+                    .filter(|c| !c.is_empty())
+                    .map(String::from);
+                head.source = p.get("source").and_then(|x| x.as_str()).map(String::from);
+                head.branch = p
+                    .pointer("/git/branch")
+                    .and_then(|x| x.as_str())
+                    .filter(|b| !b.is_empty() && *b != "HEAD")
+                    .map(String::from);
+            }
+            Some("turn_context") if head.model.is_none() => {
+                head.model = v
+                    .pointer("/payload/model")
+                    .and_then(|x| x.as_str())
+                    .filter(|m| !m.is_empty())
+                    .map(String::from);
+            }
+            Some("event_msg") if head.title.is_none() => {
+                if v.pointer("/payload/type").and_then(|t| t.as_str()) != Some("user_message") {
+                    continue;
+                }
+                head.title = v
+                    .pointer("/payload/message")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|m| !m.is_empty())
+                    .map(|m| m.chars().take(80).collect());
+            }
+            _ => {}
+        }
+    }
+    head
+}
+
+/// One rollout file as a row, or `None` if it is not one worth showing.
+///
+/// The two rejections match `parse_session`'s, on purpose — two backends whose
+/// lists obey different rules is a worse sidebar than either rule alone:
+///
+/// - **No prompt, no row.** A rollout with a `session_meta` and nothing the
+///   user typed is a session that was opened and abandoned. There is nothing to
+///   title it with and nothing in it to resume to.
+/// - **Nothing under `/tmp`.** Scratch runs, same as for Claude Code.
+fn parse_codex_rollout(path: &Path) -> Option<Session> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() == 0 {
+        return None;
+    }
+    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
+    let reader = BufReader::new(File::open(path).ok()?);
+    // 400 lines, matching parse_session. Everything wanted here is in the first
+    // dozen; the bound is what stops a long conversation being read in full on
+    // every sidebar refresh.
+    let lines: Vec<String> = reader.lines().take(400).map_while(Result::ok).collect();
+    let head = parse_codex_head(lines.iter().map(String::as_str));
+
+    let id = head.id?;
+    let title = head.title?;
+    let project_path = head.cwd?;
+    if project_path == "/tmp" || project_path.starts_with("/tmp/") {
+        return None;
+    }
+    Some(Session {
+        id,
+        // Overwritten by the registry with the id of the backend that produced
+        // this row — stated there, not here, so the two cannot disagree.
+        agent: "codex".into(),
+        title,
+        group_path: worktree_repo_root(&project_path).unwrap_or_else(|| project_path.clone()),
+        project_path,
+        branch: head.branch,
+        // Not guesses — unknowns. See the module note above: Codex lineage is
+        // not recorded anywhere that has been found, and reporting `forked`
+        // from a hunch would put a ⑂ on rows at random.
+        forked: false,
+        background: false,
+        fork_parent: None,
+        last_active: mtime,
+        // Unlike a Claude row, a Codex row knows its own source: only Codex
+        // writes these files. Set here so a Codex session started outside
+        // aiterm still wears the right mark — `sources.json` only ever covers
+        // sessions aiterm launched, and Codex will not take a minted id, so it
+        // has no entry there even when aiterm did launch it.
+        source: Some("codex".into()),
+        source_label: Some("Codex".into()),
+        source_model: head.model,
+    })
+}
 
 #[derive(Serialize, Default)]
 pub struct SessionStatus {
@@ -812,13 +1210,35 @@ pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     };
     let mut out: std::collections::VecDeque<PreviewMsg> = std::collections::VecDeque::new();
     for line in BufReader::new(file).lines().map_while(Result::ok) {
-        // Cheap substring filter before JSON parsing.
-        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\":\"assistant\"") {
+        // Cheap substring filter before JSON parsing. The Codex pair is listed
+        // separately rather than loosened to `"type":"user`, which would start
+        // matching `"type":"user_message"` in a Claude file too — the two
+        // formats now share this function and the filter has to stay exact.
+        let claude_shape =
+            line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"");
+        let codex_shape =
+            line.contains("\"user_message\"") || line.contains("\"agent_message\"");
+        if !claude_shape && !codex_shape {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        // A Codex rollout says what a turn was in `payload.type`, and puts the
+        // text in `payload.message` as a plain string — no content blocks, no
+        // sidechains, no injected tags. Handled here rather than in a second
+        // function so the trimming, truncation and KEEP window below stay one
+        // implementation: a preview pane that behaved differently per agent
+        // would be a second thing to keep in step for no gain.
+        if let Some(role) = codex_role(&v) {
+            let text = v
+                .pointer("/payload/message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            push_preview(&mut out, role, text, &v, KEEP, MAX_CHARS);
+            continue;
+        }
         let role = match v.get("type").and_then(|t| t.as_str()) {
             Some(r @ ("user" | "assistant")) => r.to_string(),
             _ => continue,
@@ -844,22 +1264,52 @@ pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
             }
             _ => {}
         }
-        let text = strip_system_tags(&text);
-        if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
-            continue;
-        }
-        let truncated = text.chars().count() > MAX_CHARS;
-        let mut text: String = text.chars().take(MAX_CHARS).collect();
-        if truncated {
-            text.push('…');
-        }
-        let at = v.get("timestamp").and_then(|t| t.as_str()).map(String::from);
-        out.push_back(PreviewMsg { role, text, at });
-        if out.len() > KEEP {
-            out.pop_front();
-        }
+        push_preview(&mut out, role, text, &v, KEEP, MAX_CHARS);
     }
     out.into()
+}
+
+/// `user` / `assistant` for a Codex `event_msg`, or `None` for anything else.
+///
+/// Codex names the assistant's turn `agent_message`, which is mapped to
+/// `assistant` here rather than passed through: the role string reaches the
+/// preview pane's CSS and its "you"/"claude" labelling, and a third value would
+/// silently render unstyled.
+fn codex_role(v: &serde_json::Value) -> Option<String> {
+    if v.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+        return None;
+    }
+    match v.pointer("/payload/type").and_then(|t| t.as_str())? {
+        "user_message" => Some("user".into()),
+        "agent_message" => Some("assistant".into()),
+        _ => None,
+    }
+}
+
+/// Trim, drop, truncate and window one preview message. Shared by both formats
+/// so the pane behaves identically whichever agent wrote the transcript.
+fn push_preview(
+    out: &mut std::collections::VecDeque<PreviewMsg>,
+    role: String,
+    text: String,
+    v: &serde_json::Value,
+    keep: usize,
+    max_chars: usize,
+) {
+    let text = strip_system_tags(&text);
+    if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
+        return;
+    }
+    let truncated = text.chars().count() > max_chars;
+    let mut text: String = text.chars().take(max_chars).collect();
+    if truncated {
+        text.push('…');
+    }
+    let at = v.get("timestamp").and_then(|t| t.as_str()).map(String::from);
+    out.push_back(PreviewMsg { role, text, at });
+    if out.len() > keep {
+        out.pop_front();
+    }
 }
 
 #[derive(Serialize)]
@@ -2133,6 +2583,7 @@ pub fn session_fork(session_id: String) -> Result<String, String> {
     // as an ordinary session and the ⑂ badge never appears — the branch looks
     // like an unexplained twin. We know the parent here; say so.
     record_aiterm_fork(&new_id, &old_id);
+    inherit_session_source(&new_id, &old_id);
     Ok(new_id)
 }
 
@@ -2240,6 +2691,7 @@ pub fn materialize_fork(session_id: String) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o600));
     record_aiterm_fork(&session_id, &parent_id);
+    inherit_session_source(&session_id, &parent_id);
     Ok(())
 }
 
@@ -2806,5 +3258,229 @@ mod migration_tests {
     fn finds_the_captured_specimen() {
         let got = session_migrated_to("2eb3a23f-e4f1-4263-beb0-e3c7b768dcba".into());
         assert_eq!(got.as_deref(), Some("6b37ca79-7e8f-4b86-9817-eaeb1b1fe95c"));
+    }
+}
+
+/* ---- source records ------------------------------------------------------ */
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    fn sess(id: &str) -> Session {
+        Session {
+            id: id.into(),
+            agent: "claude".into(),
+            title: "t".into(),
+            project_path: "/p".into(),
+            group_path: "/p".into(),
+            branch: None,
+            forked: false,
+            background: false,
+            fork_parent: None,
+            last_active: 0,
+            source: None,
+            source_label: None,
+            source_model: None,
+        }
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// The case the whole record exists for: a session that *is* Claude Code on
+    /// disk, started against someone else's endpoint. `agent` must stay honest
+    /// about the engine while `source` says where it was pointed — if the two
+    /// ever collapse into one field the rows go back to being identical.
+    #[test]
+    fn an_api_started_session_keeps_its_engine_and_gains_a_source() {
+        let map = parse_source_map(
+            r#"{"s1":{"agent":"api:openrouter","model":"anthropic/claude-sonnet-5"}}"#,
+        );
+        let mut s = sess("s1");
+        attach_source(&mut s, &map, &labels(&[("api:openrouter", "OpenRouter")]));
+        assert_eq!(s.agent, "claude", "the transcript is still Claude Code's");
+        assert_eq!(s.source.as_deref(), Some("api:openrouter"));
+        assert_eq!(s.source_label.as_deref(), Some("OpenRouter"));
+        assert_eq!(s.source_model.as_deref(), Some("anthropic/claude-sonnet-5"));
+    }
+
+    /// Most rows on a real machine predate the record, or were started from a
+    /// shell. They must come back untouched rather than defaulted to something:
+    /// "aiterm did not start this" is the answer, not a gap to fill.
+    #[test]
+    fn a_session_with_no_record_is_left_alone() {
+        let mut s = sess("unknown");
+        attach_source(&mut s, &parse_source_map("{}"), &labels(&[]));
+        assert_eq!(s.source, None);
+        assert_eq!(s.source_label, None);
+    }
+
+    /// A provider deleted from settings takes its backend with it, so there is
+    /// no display name left to look up. The row still ran against something,
+    /// and saying "openrouter" beats silently demoting it to look local.
+    #[test]
+    fn a_source_whose_backend_is_gone_still_reads_as_itself() {
+        let map = parse_source_map(r#"{"s1":{"agent":"api:openrouter"}}"#);
+        let mut s = sess("s1");
+        attach_source(&mut s, &map, &labels(&[]));
+        assert_eq!(s.source_label.as_deref(), Some("openrouter"));
+        assert_eq!(s.source_model, None, "no model was recorded, so none is claimed");
+    }
+
+    /// A row that already knows its own model — a Codex rollout states it —
+    /// must not have it overwritten by a picker choice recorded elsewhere.
+    #[test]
+    fn a_row_that_knows_its_model_keeps_it() {
+        let map = parse_source_map(r#"{"s1":{"agent":"codex","model":"from-the-picker"}}"#);
+        let mut s = sess("s1");
+        s.source_model = Some("from-the-rollout".into());
+        attach_source(&mut s, &map, &labels(&[]));
+        assert_eq!(s.source_model.as_deref(), Some("from-the-rollout"));
+    }
+
+    /// A truncated or hand-edited file must cost the scan nothing. Every row in
+    /// the sidebar is real and on disk; losing the list over a display detail
+    /// would be a far worse failure than losing the detail.
+    #[test]
+    fn an_unusable_source_file_degrades_to_no_records() {
+        for junk in ["", "not json", "[]", r#"{"s1":42}"#, r#"{"s1":{"nope":1}}"#] {
+            assert!(parse_source_map(junk).is_empty(), "accepted {junk:?}");
+        }
+    }
+
+    /// An entry with no model round-trips as absent rather than as `""`, so
+    /// "the agent's own default" and "nobody said" never have to be told apart
+    /// downstream.
+    #[test]
+    fn a_default_model_is_stored_as_absent() {
+        let rec = SessionSource { agent: "claude".into(), model: None };
+        let text = serde_json::to_string(&HashMap::from([("s1".to_string(), rec)])).unwrap();
+        assert!(!text.contains("model"), "{text}");
+        assert_eq!(parse_source_map(&text).get("s1").unwrap().model, None);
+    }
+}
+
+/* ---- Codex rollouts ------------------------------------------------------ */
+
+#[cfg(test)]
+mod codex_tests {
+    use super::*;
+
+    /// Trimmed from the real file `codex exec` wrote on 2026-07-27
+    /// (`rollout-2026-07-27T20-22-44-019fa61a-….jsonl`, codex-cli 0.145.0).
+    /// `base_instructions` — several kilobytes of system prompt — and most of
+    /// the injected `response_item` records are dropped; nothing else is edited.
+    const EXEC_ROLLOUT: &str = r#"
+{"timestamp":"2026-07-28T00:22:44.537Z","type":"session_meta","payload":{"session_id":"019fa61a-39f4-7923-a717-215dd3b0aa58","id":"019fa61a-39f4-7923-a717-215dd3b0aa58","cwd":"/home/admin/AI-OS","originator":"codex_exec","cli_version":"0.145.0","source":"exec","model_provider":"openai","git":{"commit_hash":"7cef5e66","branch":"master"}}}
+{"timestamp":"2026-07-28T00:22:44.537Z","type":"event_msg","payload":{"type":"task_started","turn_id":"019fa61a-3a33"}}
+{"timestamp":"2026-07-28T00:22:46.308Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/home/admin/AI-OS</cwd></environment_context>"}]}}
+{"timestamp":"2026-07-28T00:22:46.308Z","type":"turn_context","payload":{"turn_id":"019fa61a-3a33","cwd":"/home/admin/AI-OS","approval_policy":"never","model":"gpt-5.6-sol"}}
+{"timestamp":"2026-07-28T00:22:46.314Z","type":"event_msg","payload":{"type":"user_message","message":"Reply with exactly: CODEX OK","images":[]}}
+{"timestamp":"2026-07-28T00:22:48.337Z","type":"event_msg","payload":{"type":"agent_message","message":"CODEX OK","phase":"final_answer"}}
+{"timestamp":"2026-07-28T00:22:48.390Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019fa61a-3a33"}}
+"#;
+
+    /// The same, from the *interactive* TUI, driven on a pty the same evening
+    /// (`rollout-2026-07-27T21-32-09-019fa659-….jsonl`). This is the mode
+    /// aiterm actually launches, and the differences are why it was captured
+    /// separately rather than assumed: `originator`, `source`, and no `git` key
+    /// at all, because its cwd was not a repository.
+    const TUI_ROLLOUT: &str = r#"
+{"timestamp":"2026-07-28T01:32:09.732Z","type":"session_meta","payload":{"session_id":"019fa659-c884-7620-94fa-606596862c11","id":"019fa659-c884-7620-94fa-606596862c11","cwd":"/tmp","originator":"codex-tui","cli_version":"0.145.0","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-07-28T01:32:09.800Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}
+{"timestamp":"2026-07-28T01:32:15.000Z","type":"event_msg","payload":{"type":"user_message","message":"with exactly: TUI OK","images":[]}}
+{"timestamp":"2026-07-28T01:32:17.000Z","type":"event_msg","payload":{"type":"agent_message","message":"TUI OK","phase":"final_answer"}}
+"#;
+
+    #[test]
+    fn an_exec_rollout_yields_id_cwd_branch_and_model() {
+        let head = parse_codex_head(EXEC_ROLLOUT.lines());
+        assert_eq!(head.id.as_deref(), Some("019fa61a-39f4-7923-a717-215dd3b0aa58"));
+        assert_eq!(head.cwd.as_deref(), Some("/home/admin/AI-OS"));
+        assert_eq!(head.branch.as_deref(), Some("master"));
+        assert_eq!(head.source.as_deref(), Some("exec"));
+        assert_eq!(head.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    /// The title must be what the human typed, not the first thing with
+    /// `role: "user"` on it. Codex injects the permissions block, the skills
+    /// catalogue and `<environment_context>` as user-role `response_item`s, and
+    /// a sidebar of rows titled "<environment_context><cwd>/home/admin…" would
+    /// be worse than no rows at all.
+    #[test]
+    fn the_title_is_the_prompt_and_not_the_injected_context() {
+        let head = parse_codex_head(EXEC_ROLLOUT.lines());
+        assert_eq!(head.title.as_deref(), Some("Reply with exactly: CODEX OK"));
+    }
+
+    /// The interactive mode is the one aiterm launches, and it differs in every
+    /// field that identifies it. Pinned so a future version that changes them
+    /// fails here rather than silently emptying the sidebar.
+    #[test]
+    fn the_interactive_rollout_parses_the_same_way() {
+        let head = parse_codex_head(TUI_ROLLOUT.lines());
+        assert_eq!(head.id.as_deref(), Some("019fa659-c884-7620-94fa-606596862c11"));
+        assert_eq!(head.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(head.source.as_deref(), Some("cli"));
+        assert_eq!(head.title.as_deref(), Some("with exactly: TUI OK"));
+        // No `git` key: this one ran outside a repository. Absent, not empty.
+        assert_eq!(head.branch, None);
+        // No turn_context in this capture, so no model is claimed.
+        assert_eq!(head.model, None);
+    }
+
+    /// Nothing in a rollout is guaranteed, and a half-written file is the
+    /// normal state of a session that is running right now. Every field is
+    /// independently optional and none of them may panic.
+    #[test]
+    fn a_rollout_with_nothing_useful_yields_nothing() {
+        let head = parse_codex_head(["", "not json", "{}", r#"{"type":"session_meta"}"#]);
+        assert_eq!(head, CodexHead::default());
+    }
+
+    /// A session opened and closed without a prompt has no title and nothing to
+    /// resume to. `parse_codex_rollout` drops it, matching what `parse_session`
+    /// does with a promptless Claude transcript — one rule across both stores.
+    #[test]
+    fn a_rollout_with_no_prompt_has_no_title() {
+        let no_prompt: String = EXEC_ROLLOUT
+            .lines()
+            .filter(|l| !l.contains("user_message"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(parse_codex_head(no_prompt.lines()).title, None);
+    }
+
+    /// The preview pane reads both formats through one function. Codex writes
+    /// the assistant's turn as `agent_message`, which must arrive as
+    /// `assistant` — the pane styles and labels on that string, and a third
+    /// value renders as nothing at all.
+    #[test]
+    fn codex_turns_map_onto_the_roles_the_preview_pane_knows() {
+        let roles: Vec<Option<String>> = TUI_ROLLOUT
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| codex_role(&v))
+            .collect();
+        assert!(roles.contains(&Some("user".into())));
+        assert!(roles.contains(&Some("assistant".into())));
+        // Bookkeeping records are not conversation.
+        assert!(roles.contains(&None));
+    }
+
+    /// A Claude transcript must not be read as a Codex one. The two now share
+    /// the preview loop, and `"type":"user"` is one closing quote away from
+    /// `"type":"user_message"`.
+    #[test]
+    fn claude_records_are_not_mistaken_for_codex_ones() {
+        for line in [
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(codex_role(&v), None, "claimed a Claude record: {line}");
+        }
     }
 }
