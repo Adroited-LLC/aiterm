@@ -333,18 +333,50 @@ export default function App() {
   const [trashed, setTrashed] = useState<TrashedSession[]>([]);
   // Which sessions the daemon is actually running. Polled rather than derived
   // from tabs, because those are different questions — see SessionsPanel's
-  // hasTab/isRunning split. Costs one `claude agents --json` (~200ms) per tick,
-  // so it runs on its own slow timer instead of on every filesystem event.
+  // hasTab/isRunning split.
+  //
+  // Every tick spawns a whole `claude agents --json`: ~0.26s wall and a peak
+  // around 300 MB RSS, measured 2026-07-27. At the old unconditional 6s that
+  // was 600 process spawns an hour for the lifetime of the window, running
+  // just as hard while the app sat in the background as while it was being
+  // looked at.
+  //
+  // So it only runs while the window has focus, and it stops dead when focus
+  // leaves. Nothing is lost by that: the one thing that must reach you while
+  // you are elsewhere — a session wanting input — arrives as a terminal bell
+  // and an OS attention request, neither of which comes from here. This only
+  // feeds dots on rows nobody is looking at.
+  //
+  // Regaining focus ticks immediately rather than waiting out the interval,
+  // which is what makes the pause invisible: by the time your eyes are back on
+  // the sidebar the reading is already in flight.
   const [liveSessions, setLiveSessions] = useState<Set<string>>(new Set());
   useEffect(() => {
     let stop = false;
+    let timer: number | undefined;
     const tick = () =>
       liveSessionIds()
         .then((ids) => { if (!stop) setLiveSessions(new Set(ids)); })
         .catch(() => { /* keep the last known set rather than blanking dots */ });
-    tick();
-    const t = setInterval(tick, 6000);
-    return () => { stop = true; clearInterval(t); };
+    const start = () => {
+      if (stop || timer !== undefined) return;
+      tick();
+      timer = window.setInterval(tick, 15000);
+    };
+    const halt = () => {
+      if (timer === undefined) return;
+      window.clearInterval(timer);
+      timer = undefined;
+    };
+    if (document.hasFocus()) start();
+    window.addEventListener("focus", start);
+    window.addEventListener("blur", halt);
+    return () => {
+      stop = true;
+      halt();
+      window.removeEventListener("focus", start);
+      window.removeEventListener("blur", halt);
+    };
   }, []);
 
   // Plan usage, fetched once for everything that shows it. `/api/oauth/usage`

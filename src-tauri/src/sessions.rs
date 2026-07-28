@@ -1558,6 +1558,7 @@ pub fn live_session_ids() -> Vec<String> {
 }
 
 /// One live entry from `claude agents --json`.
+#[derive(Clone)]
 pub struct RosterEntry {
     pub session_id: String,
     /// Absent for sessions the daemon holds without a client process of their
@@ -1566,11 +1567,49 @@ pub struct RosterEntry {
     pub background: bool,
 }
 
+/// How long a roster reading may be reused.
+///
+/// Asking costs a whole `claude` process — measured at ~0.26s wall and a peak
+/// around 300 MB RSS on 2026-07-27 — and several commands ask in quick
+/// succession. Resuming a session alone calls `unstoppable_session_ids` and
+/// then `stop_session`, with the sidebar's own poll landing in between.
+///
+/// Two seconds is chosen to collapse those bursts and nothing more. It is far
+/// below any interval a human would notice a dot being stale over, and the one
+/// caller that must not tolerate staleness — the stop loop, where a cached
+/// "still running" is indistinguishable from a stop that failed — reads
+/// through `read_roster_fresh` instead.
+const ROSTER_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+static ROSTER: crate::cache::TtlCache<Vec<RosterEntry>> =
+    crate::cache::TtlCache::new(ROSTER_TTL);
+
 /// The roster, minus finished sessions. `claude agents --json` keeps reporting
 /// a session with `state: "done"`, so "appears in the roster" is not the same
 /// question as "is running" — counting those made dead sessions look alive and
 /// suppressed Resume on rows that were perfectly resumable.
+///
+/// May be up to `ROSTER_TTL` old. Use `read_roster_fresh` where the answer is
+/// being used to decide whether something you just did worked.
 pub fn read_roster() -> Vec<RosterEntry> {
+    ROSTER.get(read_roster_uncached)
+}
+
+/// Ask Claude Code again, whatever is cached, and reseed the cache with the
+/// answer so readers right behind this one get the new state rather than the
+/// old one.
+pub fn read_roster_fresh() -> Vec<RosterEntry> {
+    ROSTER.refresh(read_roster_uncached)
+}
+
+/// Forget the cached roster. Called when something is known to have changed it,
+/// so the sidebar does not spend up to `ROSTER_TTL` showing a session as
+/// running after it has been stopped.
+pub fn invalidate_roster() {
+    ROSTER.invalidate();
+}
+
+fn read_roster_uncached() -> Vec<RosterEntry> {
     let Ok(out) = std::process::Command::new("claude")
         .args(["agents", "--json"])
         .output()
@@ -1617,7 +1656,11 @@ pub async fn stop_session(session_id: String) -> Result<(), String> {
 }
 
 fn stop_session_blocking(session_id: String) -> Result<(), String> {
-    let Some(entry) = read_roster()
+    // Fresh throughout. Every read on this path is load-bearing: a stale entry
+    // would have us signal a pid that is already gone, and a stale *absence*
+    // would report a stop that never happened and launch a `--resume` doomed
+    // to be refused.
+    let Some(entry) = read_roster_fresh()
         .into_iter()
         .find(|e| e.session_id == session_id)
     else {
@@ -1636,10 +1679,15 @@ fn stop_session_blocking(session_id: String) -> Result<(), String> {
     // a stop that didn't happen and then launch a `--resume` doomed to refuse.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if !read_roster().iter().any(|e| e.session_id == session_id) {
+        if !read_roster_fresh().iter().any(|e| e.session_id == session_id) {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        // Each pass already costs a process spawn of its own (~0.26s), so the
+        // sleep is what the loop period is *on top of* that, not the period
+        // itself. 250ms made this the heaviest thing the app ever did: up to
+        // ten `claude` processes inside the five-second window, for a question
+        // whose answer changes once.
+        std::thread::sleep(std::time::Duration::from_millis(600));
     }
     Err(
         "Claude Code still lists this session as running — it's held by the daemon, \
