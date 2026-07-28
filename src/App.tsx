@@ -4,6 +4,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
+import { StartChoice } from "./components/NewSessionMenu";
 import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
@@ -33,6 +34,7 @@ import {
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
+  agentLaunchCommand, agentChoices,
 } from "./ipc";
 import "./App.css";
 
@@ -878,10 +880,26 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback((cwd: string) => {
+  const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
     setActiveProject(cwd);
+    // Mint an id only where the agent will accept one. Codex has no
+    // --session-id, so for it this is a tab handle: the placeholder row keeps
+    // the tab reachable, but nothing is keyed to it as a session, because
+    // there is no session by that name and never will be.
     const id = crypto.randomUUID();
-    openTab(basename(cwd), cwd, `${CLAUDE_CMD} --session-id ${id}`, id, id, true);
+    try {
+      const command = await agentLaunchCommand(choice.agentId, {
+        model: choice.model,
+        effort: choice.effort,
+        sessionId: choice.mintsSessionId ? id : null,
+      });
+      openTab(
+        basename(cwd), cwd, command, id,
+        choice.mintsSessionId ? id : undefined, true,
+      );
+    } catch (e) {
+      setNotice(`Couldn't start ${choice.agentId}: ${e}`);
+    }
   }, [openTab]);
 
   /** Same, but choose the directory first. The empty pane's copy is the only
@@ -891,7 +909,18 @@ export default function App() {
   const browseNewSession = useCallback(async () => {
     try {
       const picked = await openDialog({ directory: true, title: "Start a session in…" });
-      if (typeof picked === "string") newSession(picked);
+      if (typeof picked !== "string") return;
+      // The empty pane has no agent picker; use the first installed agent with
+      // its own defaults, which is what the menu would preselect anyway.
+      const [first] = await agentChoices();
+      if (!first) {
+        setNotice("No agent CLI found on this machine.");
+        return;
+      }
+      newSession(picked, {
+        agentId: first.id, model: null, effort: null,
+        mintsSessionId: first.mints_session_id,
+      });
     } catch {
       /* cancelled, or no chooser available */
     }

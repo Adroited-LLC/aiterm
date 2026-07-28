@@ -326,3 +326,30 @@ export const providerDelete = (id: string) =>
 /** Ask the provider for its model list — proves the key and URL actually work. */
 export const providerModels = (id: string) =>
   invoke<string[]>("provider_models", { id });
+
+/** A model a backend can start on, with the effort levels *that model* takes. */
+export interface ModelOption {
+  id: string;
+  display_name: string;
+  efforts: string[];
+  default_effort: string | null;
+}
+
+/** An agent that is actually installed, and what it can be started as. */
+export interface AgentChoice {
+  id: string;
+  display_name: string;
+  models: ModelOption[];
+  /** Whether aiterm can pre-mint the session id. Where false, the id it
+   *  generates is a tab handle only and no panel should be keyed to it. */
+  mints_session_id: boolean;
+}
+
+export const agentChoices = () => invoke<AgentChoice[]>("agent_choices");
+
+/** The shell command that starts a session. Built in Rust so command-line
+ *  syntax — the one thing that is certainly per-agent — stays with the agent. */
+export const agentLaunchCommand = (
+  agentId: string,
+  spec: { model?: string | null; effort?: string | null; sessionId?: string | null },
+) => invoke<string>("agent_launch_command", { agentId, spec });
