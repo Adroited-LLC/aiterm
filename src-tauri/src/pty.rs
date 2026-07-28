@@ -259,10 +259,76 @@ fn descendants(root: u32) -> Vec<u32> {
 /// Stop `root` and everything under it: SIGTERM, then SIGKILL whatever is left
 /// after `grace`. Children go first so a shell can't respawn or reparent one
 /// mid-teardown. Returns false if anything is still alive at the end.
+/// The pid of whichever process we descend from, or `None` at the top.
+fn parent_of(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+/// Our own pid and every pid we descend from.
+///
+/// The walk is bounded rather than trusting /proc to terminate: a pid that
+/// reports itself as its own parent would otherwise spin here forever, and a
+/// hang inside a kill path is worse than a short chain.
+fn self_and_ancestors() -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    let mut pid = std::process::id();
+    for _ in 0..64 {
+        if !out.insert(pid) {
+            break; // already seen — a cycle, stop rather than loop
+        }
+        match parent_of(pid) {
+            Some(p) if p > 1 => pid = p,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Remove every pid in `ours` from a kill set, returning what was taken out.
+///
+/// Split from [`kill_tree`] so the rule can be tested without signalling
+/// anything. The first version of that test called `kill_tree` on our own pid,
+/// which reaps *all* descendants of the process — and since cargo runs tests as
+/// threads in one binary, it killed a sibling test's `fc-list` child and failed
+/// that test instead. A destructive test of a guard against destruction.
+fn strip_own_chain(tree: &mut Vec<u32>, ours: &std::collections::HashSet<u32>) -> Vec<u32> {
+    let skipped: Vec<u32> = tree.iter().copied().filter(|p| ours.contains(p)).collect();
+    tree.retain(|p| !ours.contains(p));
+    skipped
+}
+
 pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
     let mut tree = descendants(root);
     tree.reverse(); // deepest first
     tree.push(root);
+    // Never signal ourselves, or anything we descend from.
+    //
+    // aiterm is normally nowhere near this tree. But launch a second instance
+    // from a shell that descends from a session, then stop that session, and
+    // the walk comes straight back around into the app doing the stopping. It
+    // dies by SIGTERM, so there is no panic, no coredump and nothing in the
+    // journal — the window simply vanishes, which is unfalsifiable from the
+    // outside. (Observed 2026-07-27: resume with two instances running, one
+    // launched from inside the other.)
+    //
+    // The offending pids are dropped rather than the whole call refused: the
+    // session still gets stopped, minus the part that would have taken us with
+    // it. When `root` itself is one of ours it cannot be killed at all, and
+    // that is fine — `stop_session` defines success by the roster, not by this
+    // return value, so it will report an honest failure instead of a stop that
+    // never happened.
+    let skipped = strip_own_chain(&mut tree, &self_and_ancestors());
+    if !skipped.is_empty() {
+        // Loud on purpose. The bug this guards against leaves no other trace.
+        eprintln!(
+            "[aiterm] kill_tree({root}): refusing to signal {skipped:?} — \
+             aiterm's own process chain is inside this tree"
+        );
+    }
     for &pid in &tree {
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     }
@@ -462,5 +528,43 @@ mod tests {
     fn descendants_excludes_the_root_itself() {
         let me = std::process::id();
         assert!(!descendants(me).contains(&me));
+    }
+
+    #[test]
+    fn our_own_chain_is_us_and_our_parent() {
+        let chain = self_and_ancestors();
+        let me = std::process::id();
+        assert!(chain.contains(&me), "our own pid is missing from the chain");
+        if let Some(parent) = parent_of(me).filter(|&p| p > 1) {
+            assert!(chain.contains(&parent), "the walk stopped before our parent");
+        }
+    }
+
+    /// The regression guard. Tested through `strip_own_chain` rather than by
+    /// calling `kill_tree` on ourselves — see that function's comment for why
+    /// the obvious version of this test was worse than no test.
+    #[test]
+    fn a_kill_set_holding_our_own_chain_is_stripped() {
+        let me = std::process::id();
+        // Above default pid_max, so these can never name a real process.
+        let (unrelated_a, unrelated_b) = (4_194_305, 4_194_306);
+        let mut tree = vec![unrelated_a, me, unrelated_b];
+        let skipped = strip_own_chain(&mut tree, &self_and_ancestors());
+
+        assert!(skipped.contains(&me), "our own pid was left in the kill set");
+        assert!(!tree.contains(&me), "our own pid survived the strip");
+        assert_eq!(
+            tree,
+            vec![unrelated_a, unrelated_b],
+            "pids that are not ours must still be signalled",
+        );
+    }
+
+    #[test]
+    fn a_kill_set_of_strangers_is_left_alone() {
+        let mut tree = vec![4_194_305, 4_194_306];
+        let skipped = strip_own_chain(&mut tree, &self_and_ancestors());
+        assert!(skipped.is_empty(), "stripped a pid that was not ours");
+        assert_eq!(tree, vec![4_194_305, 4_194_306]);
     }
 }
