@@ -269,6 +269,9 @@ body.dragging * { pointer-events: none; }
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  /* Positioning context for the new-session dropdown, which spans the panel
+     rather than hanging off the button that opens it. */
+  position: relative;
 }
 
 .panel-toolbar {
@@ -344,6 +347,96 @@ body.dragging * { pointer-events: none; }
 .settings-pop label:hover { color: var(--text); }
 .settings-pop input { accent-color: var(--accent); }
 .settings-sep { border-top: 1px solid var(--border); margin: 2px 0; }
+
+/* New-session picker. Wider than the display-settings popover because it
+   shows paths, and left-anchored so it opens into the panel rather than off
+   the window edge. */
+.new-session-pop {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 38px;
+  z-index: 20;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-shadow: 0 6px 24px #0009;
+}
+.new-session-input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 5px 7px;
+  font-size: 12px;
+  outline: none;
+}
+.new-session-input:focus { border-color: var(--accent); }
+.new-session-input::placeholder { color: var(--text-faint); }
+.new-session-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.new-session-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.new-session-row.on { background: var(--bg-hover); }
+.new-session-row.browse {
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 6px 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+  color: var(--accent);
+}
+.new-session-name {
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.new-session-row.browse .new-session-name { color: inherit; }
+.new-session-path {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+
+/* Placeholder row for a session that is running but has written nothing yet.
+   Dashed edge so it reads as provisional next to the real rows. */
+.session-item.pending-item {
+  border: 1px dashed var(--border);
+  background: var(--bg-raised);
+}
+.session-item.pending-item .session-title { font-style: italic; }
+.pending-tag {
+  color: var(--accent);
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.5px;
+}
+
+.empty-start {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
 
 .sessions-list {
   overflow-y: auto;

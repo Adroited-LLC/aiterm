@@ -33,6 +33,15 @@ export interface TermTab {
   /** Dedupe key linking this terminal to a sidebar item: a session id for
    *  resumes, "shell:<path>" for project shells. One terminal per slot. */
   slotId: string;
+  /** A session aiterm started that has not written its transcript yet.
+   *
+   *  The sidebar is the tab list, so a tab with no row in it is a tab you
+   *  cannot get back to — and claude writes nothing to disk until the first
+   *  prompt. This marks the window in between, so the panel can list the tab
+   *  on the strength of aiterm having started it. It stays set once the
+   *  transcript lands; what retires the placeholder is the real session
+   *  appearing under the same id, not this flag being cleared. */
+  fresh?: boolean;
 }
 
 /** Control surface a mounted terminal registers with the app. */
