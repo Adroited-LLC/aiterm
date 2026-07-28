@@ -1986,3 +1986,45 @@ input[type="range"]::-webkit-slider-thumb {
   gap: 8px;
   margin-top: 12px;
 }
+
+/* ---------- settings: agents ---------- */
+.set-recheck {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.set-recheck:hover { color: var(--text); border-color: var(--accent); }
+.agent-list { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 10px; }
+.agent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 9px 11px;
+}
+.agent-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+.agent-dot.on { background: var(--green); }
+.agent-text { min-width: 0; }
+.agent-name { font-size: 12.5px; color: var(--text); display: flex; gap: 8px; align-items: baseline; }
+.agent-state { font-size: 11px; color: var(--text-dim); }
+.agent-path {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

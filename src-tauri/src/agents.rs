@@ -96,6 +96,51 @@ impl AgentBackend for ClaudeBackend {
     }
 }
 
+/// OpenAI Codex.
+///
+/// **Detection only.** Whether `codex` is installed is a fact aiterm can check
+/// today, and worth showing — "Codex: not installed" tells you the difference
+/// between a tool aiterm cannot use and one you have not set up. Its sessions
+/// are another matter: the on-disk format has not been examined, so
+/// [`CodexSessions`] finds nothing rather than guessing at a layout.
+///
+/// That split is deliberate. A provider that invented a plausible path would
+/// fail by finding nothing in a way indistinguishable from "you have no Codex
+/// sessions", and the first person to debug it would have to prove a negative.
+/// This way the registry is honestly two backends, the settings panel can say
+/// what is supported, and filling in the provider is a self-contained job with
+/// nothing to unpick first.
+pub struct CodexBackend;
+
+/// Placeholder until Codex's session store has actually been looked at.
+pub struct CodexSessions;
+
+impl SessionProvider for CodexSessions {
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+        Vec::new()
+    }
+    fn find_session_file(&self, _session_id: &str) -> Option<std::path::PathBuf> {
+        // Never claims ownership, so lookups fall through to a backend that
+        // can actually resolve the id.
+        None
+    }
+}
+
+impl AgentBackend for CodexBackend {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+    fn detect(&self) -> Detection {
+        detect_cli(self.id(), self.display_name(), "codex")
+    }
+    fn sessions(&self) -> &dyn SessionProvider {
+        &CodexSessions
+    }
+}
+
 /// Every backend aiterm knows about.
 ///
 /// One registry, so a new agent is added in one place and cannot be half-added
@@ -103,7 +148,7 @@ impl AgentBackend for ClaudeBackend {
 /// the indexer named `ClaudeProvider` directly, which is exactly the shape that
 /// gets you rows you cannot search.
 pub fn backends() -> Vec<Box<dyn AgentBackend>> {
-    vec![Box::new(ClaudeBackend)]
+    vec![Box::new(ClaudeBackend), Box::new(CodexBackend)]
 }
 
 /// Every backend's sessions with their transcript paths, newest first.
@@ -414,6 +459,28 @@ mod tests {
         );
     }
 
+    /// Codex is registered for detection but contributes no sessions yet.
+    /// If someone fills in `CodexSessions`, this fails and asks them to delete
+    /// it — better than a stale claim sitting in the docs.
+    #[test]
+    fn codex_is_detected_but_contributes_no_sessions_yet() {
+        let codex = CodexBackend;
+        assert!(codex.sessions().scan_with_paths().is_empty());
+        assert_eq!(codex.sessions().find_session_file("anything"), None);
+        // Detection is real regardless: it reports whatever this machine has.
+        assert_eq!(codex.detect().id, "codex");
+    }
+
+    /// The registry must report agents that are absent, not omit them — the
+    /// settings panel exists to say "not installed".
+    #[test]
+    fn detection_covers_every_registered_backend() {
+        let found = detect_agents();
+        assert_eq!(found.len(), backends().len(), "a backend went unreported");
+        assert!(found.iter().any(|d| d.id == "claude"));
+        assert!(found.iter().any(|d| d.id == "codex"));
+    }
+
     #[test]
     fn an_empty_registry_is_not_an_error() {
         assert!(scan_backends(&[]).is_empty());
@@ -429,3 +496,4 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "two backends share an id: {ids:?}");
     }
 }
+
