@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AgentChoice, agentChoices } from "../ipc";
+import { AgentChoice, ModelOption, agentChoices, providerModels } from "../ipc";
 import AgentIcon from "./AgentIcon";
 
 /** What to start, once a directory is chosen. */
@@ -45,8 +45,35 @@ export function useStartChoice() {
       .catch(() => setAgents([]));
   }, []);
 
+  // Models fetched for API sources, keyed by source id. Those lists come from
+  // the provider over the network, so they are pulled when a source is picked
+  // rather than every time the picker opens — and cached, because reopening
+  // the menu should not re-ask someone's API.
+  const [apiModels, setApiModels] = useState<Record<string, ModelOption[] | "loading" | "error">>({});
+
   const agent = agents.find((a) => a.id === agentId) ?? null;
-  const models = agent?.models ?? [];
+  const isApi = agentId.startsWith("api:");
+  const fetched = apiModels[agentId];
+
+  useEffect(() => {
+    if (!isApi || fetched !== undefined) return;
+    const providerId = agentId.slice("api:".length);
+    setApiModels((m) => ({ ...m, [agentId]: "loading" }));
+    providerModels(providerId)
+      .then((ids) =>
+        setApiModels((m) => ({
+          ...m,
+          [agentId]: ids.map((id) => ({
+            id, display_name: id, efforts: [], default_effort: null,
+          })),
+        })),
+      )
+      .catch(() => setApiModels((m) => ({ ...m, [agentId]: "error" })));
+  }, [agentId, isApi, fetched]);
+
+  const models = isApi
+    ? (Array.isArray(fetched) ? fetched : [])
+    : (agent?.models ?? []);
   const efforts = models.find((m) => m.id === model)?.efforts ?? [];
 
   // Switching source invalidates both: a Claude alias is not a Codex slug.
@@ -66,7 +93,8 @@ export function useStartChoice() {
   });
 
   return {
-    agents, agentId, model, effort, models, efforts,
+    agents, agent, agentId, model, effort, models, efforts,
+    isApi, modelsState: fetched,
     pickAgent, pickModel, setEffort, choice,
     ready: agents.length > 0,
   };
@@ -75,7 +103,10 @@ export function useStartChoice() {
 type Ctl = ReturnType<typeof useStartChoice>;
 
 export default function StartControls({ ctl }: { ctl: Ctl }) {
-  const { agents, agentId, model, effort, models, efforts, pickAgent, pickModel, setEffort } = ctl;
+  const {
+    agents, agent, agentId, model, effort, models, efforts,
+    isApi, modelsState, pickAgent, pickModel, setEffort,
+  } = ctl;
   return (
     <div className="ns-agents">
       {agents.length > 1 && (
@@ -101,7 +132,11 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
           disabled={models.length === 0}
           title={models.length ? "Model" : "This source publishes no model list"}
         >
-          <option value="">Default model</option>
+          <option value="">
+            {isApi && modelsState === "loading" ? "Loading models…"
+              : isApi && modelsState === "error" ? "Could not load models"
+              : "Default model"}
+          </option>
           {models.map((m) => (
             <option key={m.id} value={m.id}>{m.display_name}</option>
           ))}
@@ -120,7 +155,12 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
         </select>
       </div>
       {agents.length === 0 && (
-        <div className="empty-note">No agent CLI found on this machine.</div>
+        <div className="empty-note">No agent or API source configured.</div>
+      )}
+      {isApi && (
+        // Said here because it changes what the session *is*: the terminal is
+        // still Claude Code, pointed at someone else's endpoint.
+        <div className="ns-note">Runs Claude Code against {agent?.display_name}.</div>
       )}
     </div>
   );

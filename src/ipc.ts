@@ -250,7 +250,10 @@ export const reindexSessions = () =>
 export const ptySpawn = (
   cwd: string | null, command: string | null, cols: number, rows: number,
   onOutput: Channel<ArrayBuffer>,
-) => invoke<number>("pty_spawn", { cwd, command, cols, rows, onOutput });
+  /** Extra environment for the child. Credentials go here rather than into
+   *  `command`, which is run through a shell and would expose them in `ps`. */
+  env?: Record<string, string> | null,
+) => invoke<number>("pty_spawn", { cwd, command, cols, rows, env: env ?? null, onOutput });
 export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
 export const ptyResize = (id: number, cols: number, rows: number) =>
   invoke<void>("pty_resize", { id, cols, rows });
@@ -349,7 +352,16 @@ export const agentChoices = () => invoke<AgentChoice[]>("agent_choices");
 
 /** The shell command that starts a session. Built in Rust so command-line
  *  syntax — the one thing that is certainly per-agent — stays with the agent. */
+/** A command plus the environment it needs. Two fields because a credential
+ *  must not go on a command line — see LaunchPlan in agents.rs. */
+export interface LaunchPlan { command: string; env: Record<string, string> }
+
 export const agentLaunchCommand = (
   agentId: string,
   spec: { model?: string | null; effort?: string | null; sessionId?: string | null },
-) => invoke<string>("agent_launch_command", { agentId, spec });
+) => invoke<LaunchPlan>("agent_launch_command", { agentId, spec });
+
+/** Does this provider serve the Anthropic Messages API — i.e. can it drive a
+ *  session, or only hold models? Resolves with a sentence either way. */
+export const providerSpeaksAnthropic = (id: string) =>
+  invoke<string>("provider_speaks_anthropic", { id });

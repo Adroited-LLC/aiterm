@@ -33,6 +33,10 @@ export interface TermTab {
   /** Dedupe key linking this terminal to a sidebar item: a session id for
    *  resumes, "shell:<path>" for project shells. One terminal per slot. */
   slotId: string;
+  /** Extra environment for this terminal's process. Credentials live here
+   *  rather than in `command`, which is run through a shell and would put them
+   *  in `ps` for every process on the machine to read. */
+  env?: Record<string, string>;
   /** A session aiterm started that has not written its transcript yet.
    *
    *  The sidebar is the tab list, so a tab with no row in it is a tab you
@@ -142,7 +146,7 @@ export default function TerminalView({
     };
 
     (async () => {
-      const id = await ptySpawn(tab.cwd, tab.command, term.cols, term.rows, onOutput);
+      const id = await ptySpawn(tab.cwd, tab.command, term.cols, term.rows, onOutput, tab.env ?? null);
       if (disposed) {
         ptyKill(id);
         return;

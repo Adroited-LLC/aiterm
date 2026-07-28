@@ -382,3 +382,47 @@ mod tests {
         assert!(empty.contains("empty"), "got: {empty}");
     }
 }
+
+/// The configured providers, for the agent registry.
+///
+/// Returns full records including keys — callers are in-process only. Nothing
+/// reachable from the frontend uses this; `providers_list` is still the only
+/// way out, and it strips the key.
+pub fn configured() -> Vec<Provider> {
+    load()
+}
+
+/// The base URL to hand Claude Code as `ANTHROPIC_BASE_URL`.
+///
+/// Providers are stored in their OpenAI-compatible form — the `/v1` that
+/// `/v1/models` and `/v1/chat/completions` hang off. Claude Code appends
+/// `/v1/messages` to whatever it is given, so passing the stored URL unchanged
+/// would ask for `/api/v1/v1/messages`. One trailing `/v1` comes off.
+///
+/// *Verified 2026-07-27: with the stored base `https://openrouter.ai/api/v1`,
+/// `ANTHROPIC_BASE_URL=https://openrouter.ai/api` and `ANTHROPIC_AUTH_TOKEN`
+/// set, `claude -p` answered normally.*
+pub fn anthropic_base(base_url: &str) -> String {
+    let b = base_url.trim_end_matches('/');
+    b.strip_suffix("/v1").unwrap_or(b).to_string()
+}
+
+#[cfg(test)]
+mod anthropic_base_tests {
+    use super::*;
+
+    #[test]
+    fn one_trailing_v1_comes_off() {
+        assert_eq!(anthropic_base("https://openrouter.ai/api/v1"), "https://openrouter.ai/api");
+        assert_eq!(anthropic_base("https://openrouter.ai/api/v1/"), "https://openrouter.ai/api");
+    }
+
+    /// Only the trailing one, and only one — a host whose path happens to
+    /// contain `v1` elsewhere must be left alone.
+    #[test]
+    fn nothing_else_is_stripped() {
+        assert_eq!(anthropic_base("https://x.dev/v1/proxy"), "https://x.dev/v1/proxy");
+        assert_eq!(anthropic_base("https://x.dev/v1/v1"), "https://x.dev/v1");
+        assert_eq!(anthropic_base("http://localhost:8080"), "http://localhost:8080");
+    }
+}

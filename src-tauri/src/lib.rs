@@ -29,6 +29,7 @@ pub fn run() {
             agents::detect_agents,
             agents::agent_choices,
             agents::agent_launch_command,
+            agents::provider_speaks_anthropic,
             providers::providers_list,
             providers::provider_save,
             providers::provider_delete,

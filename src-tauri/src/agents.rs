@@ -124,13 +124,31 @@ pub trait AgentBackend: Send + Sync {
         false
     }
 
-    /// The shell command that starts a session.
+    /// How to start a session: the command, plus any environment it needs.
     ///
     /// Built here rather than in the frontend, which is where it used to live
     /// as a hardcoded `CLAUDE_CMD` string. Command-line syntax is the one thing
     /// that is certainly per-agent, so it belongs with the agent — otherwise
     /// adding one means editing the renderer.
-    fn launch(&self, spec: &LaunchSpec) -> String;
+    fn launch(&self, spec: &LaunchSpec) -> LaunchPlan;
+}
+
+/// A command and the environment to run it in.
+///
+/// Two fields rather than one string because a credential must not go on a
+/// command line: the command is executed as `$SHELL -ic '<cmd>'`, so anything
+/// in it is visible in `ps` to every process on the machine. Environment
+/// reaches only the child.
+#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+pub struct LaunchPlan {
+    pub command: String,
+    pub env: std::collections::HashMap<String, String>,
+}
+
+impl LaunchPlan {
+    fn cmd(command: String) -> Self {
+        Self { command, env: Default::default() }
+    }
 }
 
 /// Shell-quote a value going onto a command line.
@@ -186,7 +204,15 @@ impl AgentBackend for ClaudeBackend {
     /// exactly as the frontend's old `CLAUDE_CMD` had it, flags and reasoning
     /// unchanged — see the comment this replaced in App.tsx. Moving it here is
     /// a relocation, not a behaviour change.
-    fn launch(&self, spec: &LaunchSpec) -> String {
+    fn launch(&self, spec: &LaunchSpec) -> LaunchPlan {
+        LaunchPlan::cmd(claude_command(spec))
+    }
+}
+
+/// Claude Code's invocation, shared by the Claude backend and by every
+/// API-backed source — those *are* Claude Code, pointed at another endpoint.
+fn claude_command(spec: &LaunchSpec) -> String {
+    {
         let mut cmd =
             String::from("claude --permission-mode auto --allow-dangerously-skip-permissions");
         if let Some(m) = spec.model.as_deref().filter(|s| !s.is_empty()) {
@@ -269,7 +295,7 @@ impl AgentBackend for CodexBackend {
     /// Effort is a config override, not a flag: `codex --help` has no effort
     /// option, and `model_reasoning_effort` is a real config key — verified
     /// 2026-07-27 in the native binary of codex-cli 0.145.0.
-    fn launch(&self, spec: &LaunchSpec) -> String {
+    fn launch(&self, spec: &LaunchSpec) -> LaunchPlan {
         let mut cmd = String::from("codex");
         if let Some(m) = spec.model.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --model {}", q(m)));
@@ -278,7 +304,7 @@ impl AgentBackend for CodexBackend {
             cmd.push_str(&format!(" -c model_reasoning_effort={}", q(e)));
         }
         // spec.session_id is deliberately dropped — see mints_session_id.
-        cmd
+        LaunchPlan::cmd(cmd)
     }
 }
 
@@ -334,6 +360,155 @@ pub fn parse_codex_models(text: &str) -> Option<Vec<ModelOption>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// A configured API endpoint, driven through Claude Code.
+///
+/// Not a new engine. Claude Code reads `ANTHROPIC_BASE_URL` and
+/// `ANTHROPIC_AUTH_TOKEN`, so pointing it at a provider that serves the
+/// Anthropic Messages API gives a real session — the same terminal, the same
+/// transcripts, the same sidebar — against someone else's models. That is a far
+/// smaller thing to build than an API client, and it inherits everything the
+/// app already does well.
+///
+/// This is only offered because it was **tested end to end**, not because the
+/// environment variables exist:
+///
+/// > 2026-07-27. `POST https://openrouter.ai/api/v1/messages` with
+/// > `anthropic-version: 2023-06-01` returned a correctly-shaped Anthropic
+/// > response. Then `ANTHROPIC_BASE_URL=https://openrouter.ai/api
+/// > ANTHROPIC_AUTH_TOKEN=<key> claude -p 'reply with exactly: OK' --model
+/// > anthropic/claude-sonnet-5` printed `OK` and exited 0.
+///
+/// Not every provider can do this. An OpenAI-compatible endpoint serves
+/// `/v1/chat/completions`, which is a different protocol from
+/// `/v1/messages` — OpenRouter happens to serve both. So availability is not
+/// assumed from having a key: [`provider_speaks_anthropic`] asks the endpoint,
+/// and the settings panel reports the answer rather than letting a session fail
+/// at the first prompt.
+pub struct ApiBackend {
+    id: String,
+    provider: crate::providers::Provider,
+}
+
+impl AgentBackend for ApiBackend {
+    fn id(&self) -> &'static str {
+        // Backend ids are `&'static str` because Claude's and Codex's are
+        // compile-time constants and are stamped onto every session row. An
+        // API source's id is only known at runtime, so it is leaked once, at
+        // registry construction. There are as many of these as the user has
+        // configured providers — a handful, once per call — and the
+        // alternative is threading a lifetime through the whole trait for the
+        // sake of two static implementors.
+        Box::leak(self.id.clone().into_boxed_str())
+    }
+
+    fn display_name(&self) -> &'static str {
+        Box::leak(self.provider.name.clone().into_boxed_str())
+    }
+
+    fn detect(&self) -> Detection {
+        // A key is what makes it *configured*. Whether the endpoint speaks the
+        // right protocol is a separate question with a network cost, asked by
+        // the settings panel rather than here — this runs whenever the picker
+        // opens, and must not make that wait on someone's API.
+        Detection {
+            id: self.id.clone(),
+            display_name: self.provider.name.clone(),
+            available: !self.provider.api_key.is_empty(),
+            version: None,
+            path: Some(self.provider.base_url.clone()),
+        }
+    }
+
+    fn sessions(&self) -> &dyn SessionProvider {
+        // Sessions run through Claude Code, so they land in Claude Code's
+        // store and are already listed by ClaudeProvider. Returning it here
+        // would list every one of them once per configured provider.
+        &NoSessions
+    }
+
+    /// Deliberately empty. The model list is per-provider and costs a network
+    /// round trip, so the UI fetches it from `provider_models` when this source
+    /// is actually selected, rather than every time the picker opens.
+    fn models(&self) -> Vec<ModelOption> {
+        Vec::new()
+    }
+
+    fn mints_session_id(&self) -> bool {
+        true // it is Claude Code underneath
+    }
+
+    fn launch(&self, spec: &LaunchSpec) -> LaunchPlan {
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "ANTHROPIC_BASE_URL".to_string(),
+            crate::providers::anthropic_base(&self.provider.base_url),
+        );
+        env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), self.provider.api_key.clone());
+        // Claude Code warns that a key "takes precedence over your claude.ai
+        // login" and disables connectors. That is exactly what is wanted here,
+        // and only for this child — the environment does not escape the pty.
+        LaunchPlan { command: claude_command(spec), env }
+    }
+}
+
+/// For a backend whose sessions are somebody else's to list.
+pub struct NoSessions;
+
+impl SessionProvider for NoSessions {
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+        Vec::new()
+    }
+    fn find_session_file(&self, _session_id: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+/// Does this provider actually serve the Anthropic Messages API?
+///
+/// The one question that decides whether a provider can be a source. Asked with
+/// the smallest possible real request — a one-token completion — because the
+/// endpoint only reveals itself by answering: a provider that serves
+/// `/v1/chat/completions` and nothing else returns 404 here, which is precisely
+/// the case that must not be offered as a startable source.
+#[tauri::command(async)]
+pub fn provider_speaks_anthropic(id: String) -> Result<String, String> {
+    let list = crate::providers::configured();
+    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    if p.api_key.is_empty() {
+        return Err("No API key saved for this provider.".into());
+    }
+    let url = format!("{}/v1/messages", crate::providers::anthropic_base(&p.base_url));
+    let body = r#"{"model":"anthropic/claude-sonnet-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS", "--connect-timeout", "5", "--max-time", "25",
+            "-o", "/dev/null", "-w", "%{http_code}",
+            "-X", "POST",
+            "-H", &format!("x-api-key: {}", p.api_key),
+            "-H", &format!("Authorization: Bearer {}", p.api_key),
+            "-H", "anthropic-version: 2023-06-01",
+            "-H", "Content-Type: application/json",
+            "-d", body,
+            &url,
+        ])
+        .output()
+        .map_err(|e| format!("Could not run curl: {e}"))?;
+    let code: u16 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    match code {
+        200 => Ok("Answers the Anthropic Messages API — usable as a source.".into()),
+        401 | 403 => Err("The provider rejected that API key.".into()),
+        404 => Err(format!(
+            "No Anthropic Messages API at {url} — this provider can hold models \
+             but cannot drive a session."
+        )),
+        0 => Err(format!("Could not reach {url}.")),
+        // A 400 means it parsed the request and disliked the body — usually an
+        // unknown model id. The endpoint is there, which is what was asked.
+        400 => Ok("Endpoint answers, but rejected the test model — pick a model it serves.".into()),
+        other => Err(format!("HTTP {other} from {url}.")),
+    }
+}
+
 /// Every backend aiterm knows about.
 ///
 /// One registry, so a new agent is added in one place and cannot be half-added
@@ -341,7 +516,16 @@ pub fn parse_codex_models(text: &str) -> Option<Vec<ModelOption>> {
 /// the indexer named `ClaudeProvider` directly, which is exactly the shape that
 /// gets you rows you cannot search.
 pub fn backends() -> Vec<Box<dyn AgentBackend>> {
-    vec![Box::new(ClaudeBackend), Box::new(CodexBackend)]
+    let mut list: Vec<Box<dyn AgentBackend>> =
+        vec![Box::new(ClaudeBackend), Box::new(CodexBackend)];
+    // Then one per configured API provider. Built from config rather than
+    // compiled in, because which endpoints exist is the user's business — and
+    // prefixed so an id can never collide with a built-in backend's.
+    for p in crate::providers::configured() {
+        let id = format!("api:{}", p.id);
+        list.push(Box::new(ApiBackend { id, provider: p }));
+    }
+    list
 }
 
 /// Every backend's sessions with their transcript paths, newest first.
@@ -441,7 +625,7 @@ pub fn agent_choices() -> Vec<AgentChoice> {
 /// hold Claude's invocation as a constant, which meant the one thing that is
 /// certainly per-agent lived in the one place that should not know about any.
 #[tauri::command]
-pub fn agent_launch_command(agent_id: String, spec: LaunchSpec) -> Result<String, String> {
+pub fn agent_launch_command(agent_id: String, spec: LaunchSpec) -> Result<LaunchPlan, String> {
     backends()
         .iter()
         .find(|b| b.id() == agent_id)
@@ -677,8 +861,8 @@ mod tests {
         fn sessions(&self) -> &dyn SessionProvider {
             &self.provider
         }
-        fn launch(&self, _spec: &LaunchSpec) -> String {
-            format!("fake-{}", self.id)
+        fn launch(&self, _spec: &LaunchSpec) -> LaunchPlan {
+            LaunchPlan::cmd(format!("fake-{}", self.id))
         }
     }
 
@@ -778,7 +962,7 @@ mod tests {
     #[test]
     fn claude_with_no_choices_is_the_command_aiterm_always_used() {
         assert_eq!(
-            ClaudeBackend.launch(&LaunchSpec::default()),
+            ClaudeBackend.launch(&LaunchSpec::default()).command,
             "claude --permission-mode auto --allow-dangerously-skip-permissions",
         );
     }
@@ -789,7 +973,7 @@ mod tests {
             model: Some("opus".into()),
             effort: Some("high".into()),
             session_id: Some("abc-123".into()),
-        });
+        }).command;
         assert!(cmd.contains("--model 'opus'"), "{cmd}");
         assert!(cmd.contains("--effort 'high'"), "{cmd}");
         assert!(cmd.contains("--session-id 'abc-123'"), "{cmd}");
@@ -803,7 +987,7 @@ mod tests {
             model: Some("gpt-5.6-sol".into()),
             effort: Some("high".into()),
             session_id: Some("abc-123".into()),
-        });
+        }).command;
         assert!(cmd.starts_with("codex "), "{cmd}");
         assert!(cmd.contains("--model 'gpt-5.6-sol'"), "{cmd}");
         assert!(cmd.contains("-c model_reasoning_effort='high'"), "{cmd}");
@@ -817,8 +1001,8 @@ mod tests {
             effort: Some(String::new()),
             session_id: None,
         };
-        assert_eq!(CodexBackend.launch(&spec), "codex");
-        assert!(!ClaudeBackend.launch(&spec).contains("--model"));
+        assert_eq!(CodexBackend.launch(&spec).command, "codex");
+        assert!(!ClaudeBackend.launch(&spec).command.contains("--model"));
     }
 
     /// These strings are handed to `$SHELL -ic`. The UI only sends values from
@@ -913,6 +1097,7 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "two backends share an id: {ids:?}");
     }
 }
+
 
 
 

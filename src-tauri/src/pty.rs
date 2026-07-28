@@ -107,6 +107,12 @@ pub fn pty_spawn(
     command: Option<String>,
     cols: u16,
     rows: u16,
+    // Extra environment for the child. This exists rather than having callers
+    // prefix `FOO=bar` onto the command because an API-backed source needs a
+    // credential in the child's environment, and a command string is run as
+    // `$SHELL -ic '<cmd>'` — a key written into it is visible in `ps` to every
+    // process on the machine. Passed here it reaches only the child.
+    env: Option<std::collections::HashMap<String, String>>,
     on_output: Channel<InvokeResponseBody>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();

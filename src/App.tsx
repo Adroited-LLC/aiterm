@@ -454,7 +454,7 @@ export default function App() {
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,
-     sessionId?: string, fresh?: boolean) => {
+     sessionId?: string, fresh?: boolean, env?: Record<string, string>) => {
       setPreviewSession(null);
       setTabs((t) => {
         const existing = t.find((x) => x.slotId === slotId);
@@ -464,7 +464,7 @@ export default function App() {
         }
         const key = nextKey.current++;
         setActiveTab(key);
-        return [...t, { key, title, cwd, command, sessionId, slotId, fresh }];
+        return [...t, { key, title, cwd, command, sessionId, slotId, fresh, env }];
       });
     },
     [],
@@ -934,14 +934,14 @@ export default function App() {
     // there is no session by that name and never will be.
     const id = crypto.randomUUID();
     try {
-      const command = await agentLaunchCommand(choice.agentId, {
+      const plan = await agentLaunchCommand(choice.agentId, {
         model: choice.model,
         effort: choice.effort,
         sessionId: choice.mintsSessionId ? id : null,
       });
       openTab(
-        basename(cwd), cwd, command, id,
-        choice.mintsSessionId ? id : undefined, true,
+        basename(cwd), cwd, plan.command, id,
+        choice.mintsSessionId ? id : undefined, true, plan.env,
       );
     } catch (e) {
       setNotice(`Couldn't start ${choice.agentId}: ${e}`);
