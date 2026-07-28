@@ -437,7 +437,11 @@ export default function App() {
   }, []);
   useEffect(() => {
     readUsage();
-    const iv = setInterval(readUsage, 60_000);
+    // Five minutes, not one. Anthropic's usage endpoint refuses anything
+    // near a per-minute cadence (see ANTHROPIC_MIN_INTERVAL in usage.rs, which
+    // enforces a floor regardless of this), and the numbers are five-hour and
+    // weekly windows — a minute's resolution on them was never worth having.
+    const iv = setInterval(readUsage, 300_000);
     return () => clearInterval(iv);
   }, [readUsage]);
   // The composer's usage pill shows plan limits for the session it is attached

@@ -56,6 +56,8 @@
 //! landed on startup read as aiterm hanging on open. Off the main thread, an
 //! offline machine just keeps the cached reading.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 /// One usage limit, as a bar: a percentage against a window that resets.
@@ -435,7 +437,35 @@ pub fn parse_anthropic(status: u16, body: &str) -> UsageSource {
     src
 }
 
+/// The narrowest rate limit of any source here, by a wide margin.
+///
+/// Measured 2026-07-27: a request succeeded, an identical one five seconds
+/// later returned 429, and it stayed refused for over a minute. With aiterm's
+/// own 60s poll running, a separate curl could not get through at all — the app
+/// was consuming its whole allowance and then reporting itself rate-limited.
+///
+/// That was true before this panel existed; the old top-bar kept its last good
+/// bars on failure, so a poll that mostly bounced looked like a poll that
+/// mostly worked. Showing the failure honestly is what surfaced it.
+///
+/// So the floor lives here rather than in the caller's interval. It holds
+/// however often the UI asks — including the manual Refresh button, which is
+/// exactly the moment someone hammers it. The numbers are five-hour and weekly
+/// windows; nothing is lost by reading them at this cadence.
+const ANTHROPIC_MIN_INTERVAL: Duration = Duration::from_secs(240);
+
+static ANTHROPIC: crate::cache::TtlCache<UsageSource> =
+    crate::cache::TtlCache::new(ANTHROPIC_MIN_INTERVAL);
+
 fn anthropic_source() -> UsageSource {
+    // Served from the last reading until the floor elapses. A cached *failure*
+    // is cached too, deliberately: re-asking a refused endpoint sooner is what
+    // keeps it refused, and `mergeUsage` on the frontend still shows the last
+    // good numbers underneath the message.
+    ANTHROPIC.get(anthropic_source_uncached)
+}
+
+fn anthropic_source_uncached() -> UsageSource {
     let Some(token) = claude_oauth_token() else {
         return UsageSource::failed(
             "anthropic",
