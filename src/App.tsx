@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
@@ -449,7 +450,8 @@ export default function App() {
   // and Tasks panels already follow without anything rewriting the tab.
 
   const openTab = useCallback(
-    (title: string, cwd: string | null, command: string | null, slotId: string, sessionId?: string) => {
+    (title: string, cwd: string | null, command: string | null, slotId: string,
+     sessionId?: string, fresh?: boolean) => {
       setPreviewSession(null);
       setTabs((t) => {
         const existing = t.find((x) => x.slotId === slotId);
@@ -459,7 +461,7 @@ export default function App() {
         }
         const key = nextKey.current++;
         setActiveTab(key);
-        return [...t, { key, title, cwd, command, sessionId, slotId }];
+        return [...t, { key, title, cwd, command, sessionId, slotId, fresh }];
       });
     },
     [],
@@ -559,6 +561,35 @@ export default function App() {
   const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
   const activeSessionId = activeTabObj?.sessionId ?? null;
 
+  // Sessions aiterm has started that are not on disk yet. The sidebar lists
+  // transcripts, and claude writes none until the first prompt, so without
+  // these a brand-new session is a terminal with no row — unreachable the
+  // moment you look at something else, since the sidebar is how you get back
+  // to a tab. Each one retires by itself: the id was minted by `newSession`,
+  // so when that transcript lands the real row is already the tab's row and
+  // this list stops naming it. Nothing guesses, and nothing hides a real row.
+  const knownSessionIds = useMemo(() => new Set(sessions.map((s) => s.id)), [sessions]);
+  const pendingSessions = useMemo(
+    () =>
+      tabs
+        .filter((t) => t.fresh && t.sessionId && !knownSessionIds.has(t.sessionId))
+        .map((t) => ({ id: t.sessionId!, title: t.title, cwd: t.cwd ?? "" })),
+    [tabs, knownSessionIds],
+  );
+  // The migration watcher's guard, reduced to a boolean before it reaches the
+  // effect's dependency list. `knownSessionIds` is a new Set on every sessions
+  // refresh — which the transcript watcher fires on every write — so depending
+  // on it directly re-armed the watcher constantly during any active
+  // conversation: a journal line and an immediate re-check per write instead of
+  // one per 15s. The boolean only changes when the answer does, and its one
+  // flip (the fresh tab's transcript landing) is exactly when re-arming is
+  // wanted.
+  const freshUnwritten = !!(
+    activeTabObj?.fresh &&
+    activeTabObj.sessionId &&
+    !knownSessionIds.has(activeTabObj.sessionId)
+  );
+
   // A conversation that moves to the daemon — which is all that opening the
   // agents view does — keeps running in this same pty under a NEW session id.
   // The tab's pinned id was set once when it opened and nothing ever moved it,
@@ -580,6 +611,14 @@ export default function App() {
     const pinned = activeTabObj?.sessionId;
     const title = activeTabObj?.title ?? "This session";
     if (key === undefined || !pinned) return;
+    // A session aiterm started that has not written its transcript yet has
+    // nothing to have migrated *from*, so this would poll a file that does not
+    // exist until the first prompt lands. Narrow on purpose: only a `fresh`
+    // tab whose id has never appeared on disk. A pinned id missing from the
+    // list is otherwise the very symptom this watcher exists for — a
+    // compaction retires the original transcript — and skipping those would
+    // disable it exactly when it is needed.
+    if (freshUnwritten) return;
     let stop = false;
     const check = async () => {
       try {
@@ -613,7 +652,8 @@ export default function App() {
       clearInterval(id);
       grace.forEach(clearTimeout);
     };
-  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, refreshSessionList, agentsView]);
+  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, freshUnwritten,
+      refreshSessionList, agentsView]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
   // `git_repo_state` call per project change. Claude's own footer already says
@@ -667,6 +707,19 @@ export default function App() {
     },
     [closeTab, openTab],
   );
+
+  /** Show the terminal a slot names. Used by the placeholder rows, which have
+   *  no session on disk to select in the ordinary way. */
+  const focusSlot = useCallback((slotId: string) => {
+    const t = tabsRef.current.find((x) => x.slotId === slotId);
+    if (!t) return;
+    setPreviewSession(null);
+    setActiveTab(t.key);
+  }, []);
+  const closeSlot = useCallback((slotId: string) => {
+    const t = tabsRef.current.find((x) => x.slotId === slotId);
+    if (t) closeTab(t.key);
+  }, [closeTab]);
 
   const selectSession = (s: Session) => {
     setActiveProject(s.project_path);
@@ -843,6 +896,52 @@ export default function App() {
     openTab(p.name, p.path, CLAUDE_CMD, `claude:${p.path}`);
   };
 
+  /**
+   * Start a fresh claude session in `cwd`.
+   *
+   * The one thing aiterm could not do: every other door into a terminal needs
+   * a row to open it from — resume a session, branch one, open a shell beside
+   * one, or ▶ a project that has no sessions yet. A conversation that has
+   * never existed has no row, so beginning one meant opening a shell and
+   * typing `claude` by hand, and on a machine with no `~/Projects` there was
+   * no project row either.
+   *
+   * **The id is minted here rather than discovered.** Letting claude choose it
+   * looks simpler and is the reason the first version of this was unusable: a
+   * session has no transcript until its first prompt, the sidebar lists what
+   * is on disk, and the sidebar is the tab list — so a new session opened a
+   * terminal that no row named. It took the pane over from whatever you were
+   * looking at and there was no way back to it. `--session-id` composes with a
+   * fresh start (unlike with `--resume`, where it is rejected without
+   * `--fork-session`), so the tab can be slotted by its session id from the
+   * first frame, exactly like a resume — which is also what lets the composer
+   * pills and the agents panel key to it before it has said anything.
+   *
+   * *Verified 2026-07-27: `claude --session-id <uuid> --permission-mode auto
+   * --allow-dangerously-skip-permissions -p …` wrote its transcript to
+   * `<uuid>.jsonl` under the launch cwd.*
+   *
+   * `fresh` covers the gap until that file exists — see `pendingSessions`.
+   */
+  const newSession = useCallback((cwd: string) => {
+    setActiveProject(cwd);
+    const id = crypto.randomUUID();
+    openTab(basename(cwd), cwd, `${CLAUDE_CMD} --session-id ${id}`, id, id, true);
+  }, [openTab]);
+
+  /** Same, but choose the directory first. The empty pane's copy is the only
+   *  instruction a first run gets, and it used to name two buttons that live
+   *  in a panel you can close — and that on a fresh machine has nothing in it
+   *  to press them on. */
+  const browseNewSession = useCallback(async () => {
+    try {
+      const picked = await openDialog({ directory: true, title: "Start a session in…" });
+      if (typeof picked === "string") newSession(picked);
+    } catch {
+      /* cancelled, or no chooser available */
+    }
+  }, [newSession]);
+
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
   const rightColRef = useRef<HTMLDivElement>(null);
@@ -974,6 +1073,10 @@ export default function App() {
                 onSelectProject={selectProject}
                 onProjectShell={projectShell}
                 onProjectClaude={projectClaude}
+                onNewSession={newSession}
+                pending={pendingSessions}
+                onSelectPending={focusSlot}
+                onExitPending={closeSlot}
                 onRefresh={refreshSessions}
                 trashed={trashed}
                 onRestore={restoreTrashed}
@@ -1040,7 +1143,12 @@ export default function App() {
               </div>
             )}
             {tabs.length === 0 && !previewSession && (
-              <div className="empty-note big">Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
+              <div className="empty-note big empty-start">
+                <div>Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
+                <button className="tui-pick" onClick={browseNewSession}>
+                  Start a new session…
+                </button>
+              </div>
             )}
             {previewSession && (
               <SessionPreview
