@@ -544,6 +544,19 @@ export default function App() {
         .map((t) => ({ id: t.sessionId!, title: t.title, cwd: t.cwd ?? "" })),
     [tabs, knownSessionIds],
   );
+  // The migration watcher's guard, reduced to a boolean before it reaches the
+  // effect's dependency list. `knownSessionIds` is a new Set on every sessions
+  // refresh — which the transcript watcher fires on every write — so depending
+  // on it directly re-armed the watcher constantly during any active
+  // conversation: a journal line and an immediate re-check per write instead of
+  // one per 15s. The boolean only changes when the answer does, and its one
+  // flip (the fresh tab's transcript landing) is exactly when re-arming is
+  // wanted.
+  const freshUnwritten = !!(
+    activeTabObj?.fresh &&
+    activeTabObj.sessionId &&
+    !knownSessionIds.has(activeTabObj.sessionId)
+  );
 
   // A conversation that moves to the daemon — which is all that opening the
   // agents view does — keeps running in this same pty under a NEW session id.
@@ -573,7 +586,7 @@ export default function App() {
     // list is otherwise the very symptom this watcher exists for — a
     // compaction retires the original transcript — and skipping those would
     // disable it exactly when it is needed.
-    if (activeTabObj?.fresh && !knownSessionIds.has(pinned)) return;
+    if (freshUnwritten) return;
     let stop = false;
     const check = async () => {
       try {
@@ -607,8 +620,8 @@ export default function App() {
       clearInterval(id);
       grace.forEach(clearTimeout);
     };
-  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, activeTabObj?.fresh,
-      knownSessionIds, refreshSessionList, agentsView]);
+  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, freshUnwritten,
+      refreshSessionList, agentsView]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
   // `git_repo_state` call per project change. Claude's own footer already says
