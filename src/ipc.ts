@@ -200,7 +200,38 @@ export interface UsageBar {
   severity: string;
   resets_at: string;
 }
-export const usageLimits = () => invoke<UsageBar[]>("usage_limits");
+export interface UsageAmount {
+  label: string;
+  amount: number;
+  /** The total `amount` counts against, when the service names one. */
+  of: number | null;
+  /** ISO code, and only when the payload actually said one — OpenRouter and
+   *  Codex name no currency, so their numbers print bare. */
+  currency: string;
+  /** "remaining" — `amount` is what is left. "used" — it is what was spent. */
+  sense: string;
+}
+/** One service's answer. Always present, even when it could not be reached:
+ *  see `usage.rs` on why an absent row is not an acceptable way to say "no". */
+export interface UsageSource {
+  /** "anthropic" | "codex" | "provider:<id>". */
+  id: string;
+  name: string;
+  /** "ok" | "signed_out" | "unreachable" | "rejected" | "no_balance". */
+  state: string;
+  /** What to do about a non-"ok" state. Empty when "ok". */
+  detail: string;
+  plan: string;
+  account: string;
+  bars: UsageBar[];
+  amounts: UsageAmount[];
+  notes: string[];
+}
+// Plan limits and credit balances for every service aiterm can see, in one
+// call. Exactly one caller polls this (App) and everything that shows usage
+// renders from its result — /api/oauth/usage rate limits, and a second poller
+// would both double the request rate and let the two views disagree.
+export const usageReport = () => invoke<UsageSource[]>("usage_report");
 
 export interface FontFamily {
   name: string;

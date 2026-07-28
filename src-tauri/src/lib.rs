@@ -59,7 +59,7 @@ pub fn run() {
             sessions::claude_model_default,
             sessions::restore_claude_model_default,
             sessions::session_model,
-            usage::usage_limits,
+            usage::usage_report,
             fonts::list_fonts,
             fonts::font_packages,
             fonts::install_font_package,

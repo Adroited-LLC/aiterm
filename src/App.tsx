@@ -21,7 +21,7 @@ import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
 import SettingsModal from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
-import { UsageBars } from "./components/UsageBars";
+import { UsagePanel, UsageSourceAt, mergeUsage } from "./components/UsagePanel";
 import { Clock } from "./components/Clock";
 import {
   AppSettings, applySettings, loadSettings, saveSettings, termFontFamily, termTheme,
@@ -29,9 +29,8 @@ import {
 import {
   ProjectInfo, Session,
   TrashedSession,
-  UsageBar,
   listProjects, listSessions, materializeFork,
-  reindexSessions, sessionFork, uiLog, usageLimits,
+  reindexSessions, sessionFork, uiLog, usageReport,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
@@ -43,7 +42,10 @@ const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
 const PANELS_KEY = "aiterm.panelToggles";
-const USAGE_KEY = "aiterm.usageCache";
+const USAGE_KEY = "aiterm.usageReport";
+// The old cache held Anthropic bars only, under a different shape. Drop it
+// rather than teach the loader to read a format nothing writes any more.
+localStorage.removeItem("aiterm.usageCache");
 
 /**
  * How aiterm starts claude. One place, so every session it opens behaves the
@@ -118,6 +120,23 @@ function loadJSON<T>(key: string, fallback: T): T {
     return raw ? { ...fallback, ...JSON.parse(raw) } : fallback;
   } catch {
     return fallback;
+  }
+}
+
+/** The usage reading from the last run, so a cold start has something to show.
+ *
+ *  Not `loadJSON`: this one is an array, and that helper's object spread would
+ *  hand back `{0: …, 1: …}`. Everything it loads comes back stale by
+ *  definition — the numbers were true when they were written, and the panel
+ *  says how long ago that was until a live read replaces them. */
+function loadUsageCache(): UsageSourceAt[] {
+  try {
+    const raw = localStorage.getItem(USAGE_KEY);
+    const v = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(v)) return [];
+    return v.map((s: UsageSourceAt) => ({ ...s, stale: true }));
+  } catch {
+    return [];
   }
 }
 
@@ -383,38 +402,51 @@ export default function App() {
     };
   }, []);
 
-  // Plan usage, fetched once for everything that shows it. `/api/oauth/usage`
-  // rate limits, so a second poller is not just waste — a refused request
-  // returns [] and that view blanks while the other still shows bars.
-  // Keep the last good reading: [] means "couldn't ask", never "zero usage".
+  // Usage across every service, fetched once for everything that shows it.
+  // `/api/oauth/usage` rate limits, so a second poller is not just waste — a
+  // refused request comes back with no numbers, and that view would blank
+  // while the other still showed bars. `mergeUsage` keeps the last good
+  // reading per source, because "couldn't ask" must never render as "you have
+  // used nothing".
   //
   // Seeded from the last reading written to disk, so a cold start shows
   // something immediately instead of an empty strip for up to a minute — the
   // first call often lands on a rate limit, which made the gap longer still.
   // Written on every success rather than on exit: an exit hook does not run
   // when the app is killed, which is exactly when the cache would be wanted.
-  const cached = loadJSON(USAGE_KEY, { at: 0, bars: [] as UsageBar[] });
-  const [usage, setUsage] = useState<UsageBar[]>(cached.bars);
-  const [usageAt, setUsageAt] = useState<number>(cached.at);
-  const [usageFresh, setUsageFresh] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    const load = () =>
-      usageLimits()
-        .then((b) => {
-          if (!alive || !b.length) return;
-          setUsage(b);
-          setUsageAt(Date.now());
-          setUsageFresh(true);
-          try {
-            localStorage.setItem(USAGE_KEY, JSON.stringify({ at: Date.now(), bars: b }));
-          } catch { /* quota — the cache is a convenience, not a requirement */ }
-        })
-        .catch(() => {});
-    load();
-    const iv = setInterval(load, 60_000);
-    return () => { alive = false; clearInterval(iv); };
+  // What comes off disk is marked stale on the way in: it was true when it was
+  // written, and the panel says how long ago that was until a live read lands.
+  const [usageSources, setUsageSources] = useState<UsageSourceAt[]>(loadUsageCache);
+  const [usageBusy, setUsageBusy] = useState(false);
+  // The merge needs the reading currently on screen, and reading it out of
+  // state inside the updater would mean writing localStorage from a render.
+  const usageRef = useRef<UsageSourceAt[]>(usageSources);
+  const readUsage = useCallback(() => {
+    setUsageBusy(true);
+    return usageReport()
+      .then((next) => {
+        const merged = mergeUsage(usageRef.current, next);
+        usageRef.current = merged;
+        setUsageSources(merged);
+        try {
+          localStorage.setItem(USAGE_KEY, JSON.stringify(merged));
+        } catch { /* quota — the cache is a convenience, not a requirement */ }
+      })
+      .catch(() => {})
+      .finally(() => setUsageBusy(false));
   }, []);
+  useEffect(() => {
+    readUsage();
+    const iv = setInterval(readUsage, 60_000);
+    return () => clearInterval(iv);
+  }, [readUsage]);
+  // The composer's usage pill shows plan limits for the session it is attached
+  // to, and those sessions are claude — so it gets Anthropic's bars, not the
+  // whole report.
+  const claudeUsage = useMemo(
+    () => usageSources.find((s) => s.id === "anthropic"),
+    [usageSources],
+  );
 
   // List-only refresh: cheap, safe to run on every fs event.
   const refreshSessionList = useCallback(() => {
@@ -1052,7 +1084,7 @@ export default function App() {
             title="Toggle input composer"
             onClick={() => setShowComposer(!showComposer)}
           >⌨</button>
-          <UsageBars bars={usage} />
+          <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
           <Clock />
         </div>
         <div className="topbar-title">
@@ -1228,8 +1260,8 @@ export default function App() {
           {showComposer && <Composer
             sessionId={activeSessionId}
             projectRoot={activeProject}
-            usage={usage}
-            usageAsOf={usageFresh ? null : usageAt || null}
+            usage={claudeUsage?.bars ?? []}
+            usageAsOf={claudeUsage?.stale ? claudeUsage.at : null}
             onCommand={activeTab === null || agentsView ? undefined : (text) =>
               handles.current.get(activeTab)?.sendComposed(text)}
             onDismiss={activeTab === null ? undefined : () =>
