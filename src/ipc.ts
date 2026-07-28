@@ -303,3 +303,26 @@ export interface AgentDetection {
  *  per installed agent, so call it when the answer is wanted (opening
  *  settings) rather than on a timer. */
 export const detectAgents = () => invoke<AgentDetection[]>("detect_agents");
+
+/** A configured API provider, as the UI sees it. The key never crosses this
+ *  boundary — there is no command that returns it. */
+export interface ProviderView {
+  id: string;
+  name: string;
+  base_url: string;
+  has_key: boolean;
+  /** Last four characters, for telling two keys apart. Empty when there is no
+   *  key or it is too short to redact meaningfully. */
+  key_hint: string;
+}
+
+export const providersList = () => invoke<ProviderView[]>("providers_list");
+/** Empty `apiKey` on an existing provider keeps the stored one. */
+export const providerSave = (
+  id: string | null, name: string, baseUrl: string, apiKey: string,
+) => invoke<ProviderView[]>("provider_save", { id, name, baseUrl, apiKey });
+export const providerDelete = (id: string) =>
+  invoke<ProviderView[]>("provider_delete", { id });
+/** Ask the provider for its model list — proves the key and URL actually work. */
+export const providerModels = (id: string) =>
+  invoke<string[]>("provider_models", { id });

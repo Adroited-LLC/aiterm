@@ -37,6 +37,8 @@
 //! and hits in search. Everything else is still to do, and this comment is the
 //! honest list of what.
 
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::sessions::{ClaudeProvider, Session, SessionProvider};
@@ -229,6 +231,59 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| is_executable_file(candidate))
 }
 
+/// Ask the user's login shell where `bin` is.
+///
+/// Necessary because aiterm's own PATH is not the one you get at a prompt. A
+/// desktop launcher starts the app from the session manager with a minimal
+/// environment, and Node version managers make it worse: fnm, nvm and asdf put
+/// their shims on PATH from a shell rc file, and fnm's live in a per-shell
+/// directory (`/run/user/…/fnm_multishells/<pid>_<ts>/bin`) that does not exist
+/// outside one.
+///
+/// That is not a corner case for this feature — Codex is a Node CLI, so an fnm
+/// user has it installed and aiterm would flatly report "not installed".
+/// *Observed 2026-07-27: `codex-cli 0.145.0` resolving only inside a shell.*
+///
+/// Interactive as well as login (`-lic`), because rc files that set these shims
+/// up are usually the interactive ones. Bounded, because an interactive shell
+/// can block on anything a user has put in their profile and this is called
+/// from the UI thread's command handler.
+fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
+    let shell = std::env::var("SHELL").ok()?;
+    // `bin` is a literal from our own backend list, never user input, but keep
+    // the quoting correct anyway rather than relying on that staying true.
+    let script = format!("command -v '{}' 2>/dev/null", bin.replace('\'', "'\\''"));
+    let out = run_bounded(&shell, &["-l", "-i", "-c", &script], Duration::from_secs(4))?;
+    // An interactive shell may print a banner or an rc-file warning first, so
+    // take the last line that is actually a path to an executable rather than
+    // assuming the output is clean.
+    String::from_utf8_lossy(&out)
+        .lines()
+        .rev()
+        .map(|l| std::path::PathBuf::from(l.trim()))
+        .find(|p| is_executable_file(p))
+}
+
+/// Run a command, giving up after `limit`. Returns stdout on success.
+///
+/// `std::process::Command` has no timeout, and a shell that hangs on someone's
+/// profile would hang the settings panel with it. On timeout the worker thread
+/// is left to finish on its own — it holds nothing but its own stdout buffer,
+/// and abandoning it is better than blocking the UI on it.
+fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let program = program.to_string();
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new(&program).args(&args).output();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(out)) if out.status.success() => Some(out.stdout),
+        _ => None,
+    }
+}
+
 #[cfg(unix)]
 fn is_executable_file(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -246,7 +301,9 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// one of these agents and not the others, and that is worth showing plainly
 /// rather than treating as a failure.
 fn detect_cli(id: &str, display_name: &str, bin: &str) -> Detection {
-    let found = which(bin);
+    // PATH first because it is free; the shell only when that fails, so the
+    // common case never spawns anything to answer "is it installed".
+    let found = which(bin).or_else(|| which_via_login_shell(bin));
     let version = found.as_ref().and_then(|p| read_version(p));
     Detection {
         id: id.to_string(),
@@ -496,4 +553,7 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "two backends share an id: {ids:?}");
     }
 }
+
+
+
 

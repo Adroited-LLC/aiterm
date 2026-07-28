@@ -3,6 +3,7 @@ pub mod fonts;
 pub mod fsx;
 pub mod git;
 pub mod indexer;
+pub mod providers;
 pub mod pty;
 pub mod sessions;
 pub mod usage;
@@ -25,6 +26,10 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             agents::detect_agents,
+            providers::providers_list,
+            providers::provider_save,
+            providers::provider_delete,
+            providers::provider_models,
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,
