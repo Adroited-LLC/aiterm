@@ -5,6 +5,7 @@ import {
 } from "../settings";
 import {
   FontFamily, FontPackage,
+  AgentDetection, detectAgents, homeAbbrev,
   fontPackages, installFontFiles, installFontPackage, listFonts,
 } from "../ipc";
 
@@ -21,7 +22,7 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
   { key: "agent", label: "Agent" },
 ];
 
-type Tab = "appearance" | "fonts";
+type Tab = "appearance" | "fonts" | "agents";
 
 /** Shows the characters that actually separate one coding font from another. */
 const PREVIEW = "const ok = 0O1lI|; // {} => [a-z]* 3.14";
@@ -52,6 +53,12 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
   /** Package currently installing, so its row can say so and not be clicked twice. */
   const [installing, setInstalling] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Detection spawns a process per installed agent, so it runs when this modal
+  // opens and when explicitly re-checked — never on a timer. `null` is "not
+  // asked yet", which is a different thing to show than an empty list.
+  const [agents, setAgents] = useState<AgentDetection[] | null>(null);
+  const refreshAgents = () => detectAgents().then(setAgents).catch(() => setAgents([]));
+  useEffect(() => { if (tab === "agents" && agents === null) refreshAgents(); }, [tab, agents]);
 
   const set = (patch: Partial<AppSettings>) => onChange({ ...settings, ...patch });
   const setScale = (key: keyof PanelScales, v: number) =>
@@ -111,6 +118,10 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
               className={"set-tab" + (tab === "fonts" ? " on" : "")}
               onClick={() => setTab("fonts")}
             >Fonts</button>
+            <button
+              className={"set-tab" + (tab === "agents" ? " on" : "")}
+              onClick={() => setTab("agents")}
+            >Agents</button>
           </div>
           <button className="icon-btn" title="Close (Esc)" onClick={onClose}>✕</button>
         </div>
@@ -258,6 +269,52 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                 Copied into ~/.local/share/fonts; no administrator rights needed.
               </div>
               {notice && <div className="set-notice">{notice}</div>}
+            </div>
+          </>}
+
+          {tab === "agents" && <>
+            <div className="set-section">
+              <div className="set-label">
+                Agents
+                <button className="set-recheck" onClick={refreshAgents}>Re-check</button>
+              </div>
+              {/* Agents aiterm does not find are listed too. "Codex — not
+                  installed" is the useful answer; an absence would leave you
+                  wondering whether aiterm supports it at all. */}
+              {agents === null ? (
+                <div className="set-hint">Looking…</div>
+              ) : (
+                <div className="agent-list">
+                  {agents.map((a) => (
+                    <div key={a.id} className="agent-row">
+                      <span className={"agent-dot" + (a.available ? " on" : "")} />
+                      <div className="agent-text">
+                        <div className="agent-name">
+                          {a.display_name}
+                          <span className="agent-state">
+                            {a.available ? (a.version ?? "installed") : "not installed"}
+                          </span>
+                        </div>
+                        {/* Which copy was found — worth showing when several
+                            are installed and the wrong one is on PATH. */}
+                        {a.path && <div className="agent-path">{homeAbbrev(a.path)}</div>}
+                        {a.id === "codex" && a.available && (
+                          <div className="agent-path">
+                            Detected, but aiterm does not read Codex sessions yet.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {agents.length === 0 && (
+                    <div className="set-hint">Nothing reported.</div>
+                  )}
+                </div>
+              )}
+              <div className="set-hint">
+                Read from PATH when this tab opens, not polled — install something
+                and press Re-check.
+              </div>
             </div>
           </>}
 

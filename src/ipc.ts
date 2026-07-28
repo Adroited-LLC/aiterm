@@ -286,3 +286,20 @@ export function relTime(ms: number): string {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
 }
+
+/** What aiterm found for one agent on this machine — see `agents.rs`. */
+export interface AgentDetection {
+  id: string;
+  display_name: string;
+  /** Usable here. For a CLI agent, its binary is on PATH. */
+  available: boolean;
+  /** First line of `--version`, when it answered. Absent does not imply
+   *  unavailable — some tools just don't report one. */
+  version: string | null;
+  path: string | null;
+}
+
+/** Every agent aiterm knows about, present or not. Spawns at most one process
+ *  per installed agent, so call it when the answer is wanted (opening
+ *  settings) rather than on a timer. */
+export const detectAgents = () => invoke<AgentDetection[]>("detect_agents");
