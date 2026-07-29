@@ -1214,6 +1214,8 @@ export default function App() {
                 autoFocus
                 fontSize={termFont}
                 fontFamily={xtermFont}
+                lineHeight={settings.termLineHeight}
+                fontWeight={settings.termFontWeight}
                 theme={xtermTheme}
               />
             ))}

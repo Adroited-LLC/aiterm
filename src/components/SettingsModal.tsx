@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
+  TERM_WEIGHTS, boldWeightFor,
 } from "../settings";
 import {
   FontFamily, FontPackage,
@@ -27,7 +28,11 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
 type Tab = "appearance" | "fonts" | "agents" | "models" | "diagnostics";
 
 /** Shows the characters that actually separate one coding font from another. */
-const PREVIEW = "const ok = 0O1lI|; // {} => [a-z]* 3.14";
+/** Several lines, because one cannot show row spacing, and the characters
+ *  coding fonts most often confuse with each other. */
+const PREVIEW = `const ok = 0O1lI|; // {} => [a-z]* 3.14
+if (rows !== cols) { resize(80, 24); }
+git commit -m "fix: don't drop the last frame"`;
 
 function ThemeCard({ id, active, onPick }: { id: string; active: boolean; onPick: () => void }) {
   const t = themeById(id);
@@ -245,15 +250,65 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                 value={settings.termFontSize}
                 onChange={(e) => set({ termFontSize: +e.target.value })}
               />
-              {/* Same string the terminal would render, at the same size and
-                  face — the only honest way to compare two coding fonts. */}
+
+              <div className="set-label">
+                Line spacing
+                <span className="set-value">
+                  {settings.termLineHeight === 1
+                    ? "none"
+                    : `+${Math.round((settings.termLineHeight - 1) * 100)}%`}
+                </span>
+              </div>
+              {/* A multiple of the font's own line height, not pixels: the gap
+                  that looks right at 13px is cramped at 20. */}
+              <input
+                type="range" min={1} max={1.6} step={0.05}
+                value={settings.termLineHeight}
+                onChange={(e) => set({ termLineHeight: +e.target.value })}
+              />
+
+              <div className="set-label">
+                Weight
+                <span className="set-value">
+                  {TERM_WEIGHTS.find((w) => w.value === settings.termFontWeight)?.label ??
+                    settings.termFontWeight}
+                </span>
+              </div>
+              <div className="weight-row">
+                {TERM_WEIGHTS.map((w) => (
+                  <button
+                    key={w.value}
+                    className={"weight-btn" + (settings.termFontWeight === w.value ? " on" : "")}
+                    style={{ fontWeight: w.value }}
+                    onClick={() => set({ termFontWeight: w.value })}
+                  >{w.label}</button>
+                ))}
+              </div>
+              <div className="set-hint">
+                Bold is drawn heavier than this, so emphasis keeps working. Most
+                monospace families stop at Bold, which is why this stops at SemiBold.
+              </div>
+
+              {/* Same text the terminal would render, at the same size, face,
+                  spacing and weight — the only honest way to judge any of them.
+                  The last line is bold, so you can see emphasis still separates
+                  from body text at whatever weight you pick. */}
               <div
                 className="font-preview"
                 style={{
                   fontFamily: settings.termFont ? `"${settings.termFont}", monospace` : "monospace",
                   fontSize: settings.termFontSize,
+                  lineHeight: settings.termLineHeight,
+                  fontWeight: settings.termFontWeight,
+                  whiteSpace: "pre",
                 }}
-              >{PREVIEW}</div>
+              >
+                {PREVIEW}
+                {"\n"}
+                <span style={{ fontWeight: boldWeightFor(settings.termFontWeight) }}>
+                  this line is bold
+                </span>
+              </div>
             </div>
 
             <div className="set-section">

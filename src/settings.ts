@@ -17,6 +17,14 @@ export interface AppSettings {
   termFont: string;
   /** Terminal base font size in px (global zoom multiplies this). */
   termFontSize: number;
+  /** Terminal line spacing as a multiple of the font's natural line height.
+   *  1 is the font's own metrics; 1.1 adds a tenth of a line between rows.
+   *  A multiplier rather than pixels so it holds at any font size — the gap
+   *  that looks right at 13px is cramped at 20. */
+  termLineHeight: number;
+  /** Weight for ordinary terminal text. Bold stays heavier than whatever this
+   *  is, so emphasis keeps working — see `termFontWeightBold`. */
+  termFontWeight: number;
   panelScale: PanelScales;
 }
 
@@ -26,8 +34,32 @@ export const DEFAULT_SETTINGS: AppSettings = {
   uiFont: "",
   termFont: "",
   termFontSize: 13,
+  // A touch of air by default. Monospace faces are drawn to sit tightly and a
+  // terminal packs every line against the next, which is what makes a wall of
+  // output hard to track a line across.
+  termLineHeight: 1.1,
+  termFontWeight: 400,
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
 };
+
+/** Weights offered for terminal text, and what to call them.
+ *
+ *  Stops at 600. Bold is drawn at one step heavier than the chosen weight, and
+ *  most monospace families stop at Bold — pick 700 for body text and emphasis
+ *  has nowhere left to go, so a TUI that uses bold to mean something loses the
+ *  distinction entirely.
+ */
+export const TERM_WEIGHTS: { value: number; label: string }[] = [
+  { value: 300, label: "Light" },
+  { value: 400, label: "Regular" },
+  { value: 500, label: "Medium" },
+  { value: 600, label: "SemiBold" },
+];
+
+/** The weight bold text is drawn at, given the weight body text uses. */
+export function boldWeightFor(weight: number): number {
+  return Math.min(900, weight + 200);
+}
 
 const SETTINGS_KEY = "aiterm.settings";
 
@@ -221,9 +253,33 @@ export function termFontFamily(s: AppSettings): string {
   return s.termFont ? `"${s.termFont}", ${MONO_FALLBACK}` : MONO_FALLBACK;
 }
 
+/**
+ * Mix a hex colour towards white by `amount` (0–1).
+ *
+ * How the bright half of the ANSI palette is produced. Hand-authoring it would
+ * mean eight more colours for each of eight themes, and every one of them a
+ * chance to pick a shade that fights the theme it belongs to; derived, a new
+ * theme gets a matching bright set for free.
+ */
+function lighten(hex: string, amount: number): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  const mix = (c: number) => Math.round(c + (255 - c) * amount);
+  const r = mix((n >> 16) & 255), g = mix((n >> 8) & 255), b = mix(n & 255);
+  return "#" + [r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("");
+}
+
 /** xterm theme derived from the app theme. */
 export function termTheme(s: AppSettings) {
   const t = themeById(s.themeId);
+  // The bright half of the palette used to be left undefined, so xterm fell
+  // back to its own built-in colours — a generic set matching none of these
+  // themes. That is not a corner case: xterm draws bold text in the bright
+  // variant by default, so most of what a TUI emphasises was being painted in
+  // colours from outside the theme entirely, which reads as the terminal
+  // looking dull and slightly wrong next to the rest of the app.
+  const BRIGHT = 0.25;
   return {
     background: t.vars.bg,
     foreground: t.vars.text,
@@ -238,6 +294,13 @@ export function termTheme(s: AppSettings) {
     cyan: t.term.cyan,
     white: t.vars.text,
     brightBlack: t.vars.textFaint,
+    brightRed: lighten(t.term.red, BRIGHT),
+    brightGreen: lighten(t.term.green, BRIGHT),
+    brightYellow: lighten(t.term.yellow, BRIGHT),
+    brightBlue: lighten(t.term.blue, BRIGHT),
+    brightMagenta: lighten(t.term.magenta, BRIGHT),
+    brightCyan: lighten(t.term.cyan, BRIGHT),
+    brightWhite: lighten(t.vars.text, BRIGHT),
   };
 }
 
