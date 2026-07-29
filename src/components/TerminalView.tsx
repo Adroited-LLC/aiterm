@@ -42,6 +42,21 @@ export interface TermTab {
    *  transcript lands; what retires the placeholder is the real session
    *  appearing under the same id, not this flag being cleared. */
   fresh?: boolean;
+  /** Set while this tab is still waiting to learn its session id.
+   *
+   *  Only agents that have no `--session-id` — Codex — get one of these. They
+   *  cannot be told what to call themselves, so the tab opens with no session
+   *  id at all and watches for the transcript that appears in the directory it
+   *  launched in. Cleared the moment that id is adopted, which is also what
+   *  retires the placeholder row and stops the conversation owning two. */
+  adopt?: {
+    agentId: string;
+    /** Unix millis at launch; nothing older than this can be ours. */
+    since: number;
+    /** Session ids the sidebar already listed, so adoption cannot take over a
+     *  conversation that was open before this tab existed. */
+    known: string[];
+  };
 }
 
 /** Control surface a mounted terminal registers with the app. */

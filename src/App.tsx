@@ -35,7 +35,7 @@ import {
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  agentLaunchCommand,
+  agentLaunchCommand, adoptAgentSession,
 } from "./ipc";
 import "./App.css";
 
@@ -150,6 +150,10 @@ export default function App() {
   // re-run it on every tab change).
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
+  // Same trick for the sessions list: `newSession` needs to snapshot what
+  // already exists, and it must not be rebuilt every time the list refreshes.
+  const sessionsRef = useRef<Session[]>(sessions);
+  sessionsRef.current = sessions;
 
   const handles = useRef<Map<number, TermHandle>>(new Map());
   const lastOutput = useRef<Map<number, number>>(new Map());
@@ -454,7 +458,7 @@ export default function App() {
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,
-     sessionId?: string, fresh?: boolean) => {
+     sessionId?: string, fresh?: boolean, adopt?: TermTab["adopt"]) => {
       setPreviewSession(null);
       setTabs((t) => {
         const existing = t.find((x) => x.slotId === slotId);
@@ -464,7 +468,7 @@ export default function App() {
         }
         const key = nextKey.current++;
         setActiveTab(key);
-        return [...t, { key, title, cwd, command, sessionId, slotId, fresh }];
+        return [...t, { key, title, cwd, command, sessionId, slotId, fresh, adopt }];
       });
     },
     [],
@@ -600,6 +604,65 @@ export default function App() {
     activeTabObj.sessionId &&
     !knownSessionIds.has(activeTabObj.sessionId)
   );
+
+  // Tabs still waiting to learn their session id, as a string that only
+  // changes when the set does. Depending on `tabs` here would re-arm the
+  // watcher below on every keystroke's worth of tab state.
+  const awaitingAdoption = tabs
+    .filter((t) => t.adopt && !t.sessionId)
+    .map((t) => t.key)
+    .join(",");
+
+  // Agents with no `--session-id` name themselves, and only once they start.
+  // Until aiterm learns that name the tab is keyed to a handle no session will
+  // ever have: the placeholder row stays at the top of the sidebar forever,
+  // and the moment the agent writes its transcript the same conversation gets
+  // a second, real row under its project. Adopting the id collapses the two.
+  //
+  // Codex writes at launch rather than at first prompt, so this usually
+  // resolves on the first tick.
+  useEffect(() => {
+    if (!awaitingAdoption) return;
+    let stop = false;
+    const tick = async () => {
+      for (const t of tabsRef.current) {
+        if (stop) return;
+        if (!t.adopt || t.sessionId || !t.cwd) continue;
+        try {
+          const id = await adoptAgentSession(
+            t.adopt.agentId, t.cwd, t.adopt.since, t.adopt.known,
+          );
+          if (stop || !id) continue;
+          setTabs((list) =>
+            list.map((x) =>
+              x.key === t.key
+                ? { ...x, sessionId: id, slotId: id, fresh: false, adopt: undefined }
+                : x,
+            ),
+          );
+          uiLog(`adopted ${t.adopt.agentId} session ${id} for tab ${t.key}`);
+          refreshSessionList();
+        } catch {
+          /* keep waiting — the agent may not have written anything yet */
+        }
+      }
+    };
+    tick();
+    const every = setInterval(tick, 2000);
+    // Give up after a minute. An agent that has written nothing by then is one
+    // that does not write transcripts at all, and polling the disk forever on
+    // its behalf is worse than leaving the placeholder row in place — which
+    // still keeps the tab reachable, which was the point.
+    const giveUp = setTimeout(() => {
+      stop = true;
+      clearInterval(every);
+    }, 60_000);
+    return () => {
+      stop = true;
+      clearInterval(every);
+      clearTimeout(giveUp);
+    };
+  }, [awaitingAdoption, refreshSessionList]);
 
   // A conversation that moves to the daemon — which is all that opening the
   // agents view does — keeps running in this same pty under a NEW session id.
@@ -950,6 +1013,18 @@ export default function App() {
       openTab(
         basename(cwd), cwd, command, id,
         choice.mintsSessionId ? id : undefined, true,
+        // An agent we could not name has to be identified after the fact.
+        // Snapshot what already exists so adoption can tell its session from
+        // one that was open before this tab did anything.
+        choice.mintsSessionId
+          ? undefined
+          : {
+              agentId: choice.agentId,
+              since: Date.now(),
+              known: sessionsRef.current
+                .filter((s) => s.project_path === cwd)
+                .map((s) => s.id),
+            },
       );
     } catch (e) {
       setNotice(`Couldn't start ${choice.agentId}: ${e}`);

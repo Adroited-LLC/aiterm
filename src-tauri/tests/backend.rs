@@ -147,6 +147,49 @@ fn deletes_session_to_trash() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+/// A Codex rollout must come back to `~/.codex/sessions/<y>/<m>/<d>/` under its
+/// original filename. Restore used to work the destination out from the
+/// transcript, which can only ever name a claude project directory — so this
+/// path silently put a rollout somewhere neither agent would find it, and in
+/// practice failed outright because a rollout keeps its cwd under `payload`
+/// where that code was not looking.
+#[test]
+fn restores_a_codex_rollout_to_its_own_store() {
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    let id = "00000000-0000-4000-8000-aitermcodex";
+    let day = home.join(".codex/sessions/1999/01/01");
+    std::fs::create_dir_all(&day).unwrap();
+    let name = format!("rollout-1999-01-01T00-00-00-{id}.jsonl");
+    let file = day.join(&name);
+    std::fs::write(
+        &file,
+        format!("{{\"payload\":{{\"session_id\":\"{id}\",\"cwd\":\"/tmp\"}}}}\n"),
+    )
+    .unwrap();
+
+    aiterm_lib::sessions::session_delete(id.into()).expect("delete should succeed");
+    assert!(!file.exists(), "rollout should leave the codex store");
+    assert!(
+        home.join(".claude/trash").join(format!("{id}.origin")).exists(),
+        "delete should record where it came from"
+    );
+
+    aiterm_lib::sessions::trash_restore(id.into()).expect("restore should succeed");
+    assert!(
+        file.exists(),
+        "rollout should return to its own store under its original filename"
+    );
+    assert!(
+        !home.join(".claude/trash").join(format!("{id}.origin")).exists(),
+        "the origin record should not outlive the restore"
+    );
+    // Nothing of it should have been left in claude's tree.
+    assert!(!home.join(".claude/projects/-tmp").join(format!("{id}.jsonl")).exists());
+
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_dir_all(home.join(".codex/sessions/1999"));
+}
+
 #[test]
 fn hides_fork_and_orphaned_transcripts() {
     // Orchestrator/compact fork files (no human prompt) and .orphaned-*

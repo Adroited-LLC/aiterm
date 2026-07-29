@@ -218,17 +218,134 @@ impl AgentBackend for ClaudeBackend {
 /// nothing to unpick first.
 pub struct CodexBackend;
 
-/// Placeholder until Codex's session store has actually been looked at.
+/// Codex's session store: `~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`.
+///
+/// Every rollout opens with a header line carrying the session id, the cwd it
+/// was started in and the git branch, written the moment the session starts
+/// rather than at the first prompt. That is the whole of what the sidebar
+/// needs, and it means a Codex session is listable from the instant it exists
+/// — unlike claude, whose transcript does not appear until you say something.
+///
+/// Only that first line is read. A rollout grows to whatever the conversation
+/// grows to, and there is nothing further down that a session list wants.
 pub struct CodexSessions;
+
+/// What the header line of a rollout says about its session.
+#[derive(Debug, PartialEq)]
+struct CodexHeader {
+    id: String,
+    cwd: String,
+    branch: Option<String>,
+}
+
+/// Read a rollout's header. `None` for anything that is not one — a partial
+/// write, a file Codex has changed the shape of, or something else entirely
+/// that happens to live under the same directory.
+fn parse_codex_header(first_line: &str) -> Option<CodexHeader> {
+    let v: serde_json::Value = serde_json::from_str(first_line).ok()?;
+    let p = v.get("payload")?;
+    Some(CodexHeader {
+        id: p.get("session_id")?.as_str()?.to_string(),
+        cwd: p.get("cwd")?.as_str()?.to_string(),
+        branch: p
+            .pointer("/git/branch")
+            .and_then(|b| b.as_str())
+            .map(String::from),
+    })
+}
+
+fn codex_root() -> Option<std::path::PathBuf> {
+    let dir = dirs::home_dir()?.join(".codex/sessions");
+    dir.is_dir().then_some(dir)
+}
+
+/// Every `*.jsonl` under `dir`, recursively.
+///
+/// Codex files them by date, so the depth is fixed at three today — but a
+/// walk costs the same as three nested reads and does not break the day that
+/// changes.
+fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            codex_rollouts(&path, out);
+        } else if path.extension().is_some_and(|x| x == "jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// The body of [`CodexSessions::scan_with_paths`], over an explicit root.
+///
+/// Split out so the parsing and skipping can be tested against a directory
+/// built for the purpose. Through the trait it would read the real
+/// `~/.codex/sessions`, which makes the test say different things on different
+/// machines — and pass vacuously on any machine that has never run Codex.
+fn scan_codex_dir(root: &std::path::Path) -> Vec<(Session, std::path::PathBuf)> {
+    let mut files = Vec::new();
+    codex_rollouts(root, &mut files);
+    files
+            .into_iter()
+            .filter_map(|path| {
+                let file = std::fs::File::open(&path).ok()?;
+                let mut first = String::new();
+                std::io::BufRead::read_line(
+                    &mut std::io::BufReader::new(file),
+                    &mut first,
+                )
+                .ok()?;
+                let h = parse_codex_header(&first)?;
+                let last_active = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                Some((
+                    Session {
+                        id: h.id,
+                        // Stamped by the registry; see `scan_backends`.
+                        agent: String::new(),
+                        // The directory, matching how claude's rows read. A
+                        // rollout has no title of its own and inventing one
+                        // from the first message would mean reading the whole
+                        // file for every row in the list.
+                        title: std::path::Path::new(&h.cwd)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| h.cwd.clone()),
+                        project_path: h.cwd.clone(),
+                        group_path: h.cwd,
+                        branch: h.branch,
+                        forked: false,
+                        background: false,
+                        fork_parent: None,
+                        last_active,
+                    },
+                    path,
+                ))
+            })
+            .collect()
+}
 
 impl SessionProvider for CodexSessions {
     fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
-        Vec::new()
+        codex_root().map(|r| scan_codex_dir(&r)).unwrap_or_default()
     }
-    fn find_session_file(&self, _session_id: &str) -> Option<std::path::PathBuf> {
-        // Never claims ownership, so lookups fall through to a backend that
-        // can actually resolve the id.
-        None
+
+    fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        // Codex puts the id in the filename, so this is a name match rather
+        // than a header read of every rollout on the machine.
+        let root = codex_root()?;
+        let mut files = Vec::new();
+        codex_rollouts(&root, &mut files);
+        files.into_iter().find(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains(session_id))
+        })
     }
 }
 
@@ -440,6 +557,56 @@ pub fn agent_choices() -> Vec<AgentChoice> {
             mints_session_id: b.mints_session_id(),
         })
         .collect()
+}
+
+/// The id of the session `agent_id` just started in `cwd`, once it exists.
+///
+/// An agent that has no `--session-id` cannot be told what to call itself, so
+/// aiterm cannot key a tab to it at launch the way it does for claude. What it
+/// can do is watch: Codex writes its transcript — session id and cwd included —
+/// the moment it starts, so the session that appears in the directory we
+/// launched in is ours. Adopting it turns the placeholder row into the real
+/// one, which is what stops a Codex conversation owning two sidebar rows: an
+/// unretirable placeholder and the scanned row for the same transcript.
+///
+/// `known` is the set of ids that already existed when the terminal opened.
+/// Identity by absence rather than by timestamp: mtime moves when an old
+/// session is merely appended to, and adopting a conversation the user is
+/// still using would be far worse than adopting nothing.
+#[tauri::command(async)]
+pub fn adopt_agent_session(
+    agent_id: String,
+    cwd: String,
+    since_ms: u64,
+    known: Vec<String>,
+) -> Option<String> {
+    let list = backends();
+    let backend = list.iter().find(|b| b.id() == agent_id)?;
+    pick_adopted(&backend.sessions().scan(), &cwd, since_ms, &known)
+}
+
+/// The body of [`adopt_agent_session`], over an explicit session list.
+///
+/// Split out because the interesting part is which row gets chosen, and that
+/// is untestable through the command: it would need a real agent to have
+/// really started. Adopting the wrong session would silently repoint a tab at
+/// somebody else's conversation, so this is worth pinning down.
+fn pick_adopted(
+    sessions: &[Session],
+    cwd: &str,
+    since_ms: u64,
+    known: &[String],
+) -> Option<String> {
+    let known: std::collections::HashSet<&str> = known.iter().map(String::as_str).collect();
+    sessions
+        .iter()
+        .filter(|s| {
+            s.project_path == cwd && s.last_active >= since_ms && !known.contains(s.id.as_str())
+        })
+        // Newest, for the case where a directory gains two sessions inside one
+        // poll interval. Ours is the one that started later.
+        .max_by_key(|s| s.last_active)
+        .map(|s| s.id.clone())
 }
 
 /// The command that starts `agent_id` with `spec`.
@@ -697,6 +864,103 @@ mod tests {
 
     /// The whole point of the registry: two agents, one list.
     #[test]
+    fn a_codex_rollout_header_yields_a_listable_session() {
+        // Shape taken from a real rollout written by codex-cli 0.145.0 on
+        // 2026-07-28, trimmed to the fields the sidebar reads.
+        let line = r#"{"timestamp":"2026-07-29T00:43:28.854Z","type":"session_meta",
+            "payload":{"session_id":"019fab53-92d3-7c10-91a5-e3bc82210418",
+            "cwd":"/home/m/Projects/opcode","originator":"codex_cli_rs",
+            "git":{"commit_hash":"abc123","branch":"main"}}}"#;
+        assert_eq!(
+            parse_codex_header(line),
+            Some(CodexHeader {
+                id: "019fab53-92d3-7c10-91a5-e3bc82210418".into(),
+                cwd: "/home/m/Projects/opcode".into(),
+                branch: Some("main".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_rollout_with_no_git_still_lists() {
+        // Codex outside a repository omits the git block entirely; a session
+        // in a plain directory is still a session.
+        let line = r#"{"payload":{"session_id":"abc","cwd":"/tmp/scratch"}}"#;
+        assert_eq!(
+            parse_codex_header(line),
+            Some(CodexHeader {
+                id: "abc".into(),
+                cwd: "/tmp/scratch".into(),
+                branch: None,
+            })
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_a_rollout_header_is_skipped() {
+        // A half-written first line, and a well-formed line of some other
+        // shape. Both must be skipped rather than panicking a scan that runs
+        // every time the sidebar refreshes.
+        assert_eq!(parse_codex_header(""), None);
+        assert_eq!(parse_codex_header("{\"payload\":{\"cwd\":\"/x\"}}"), None);
+        assert_eq!(parse_codex_header("{\"timestamp\":\"2026"), None);
+    }
+
+    /// A session row with only the fields adoption looks at.
+    fn row(id: &str, cwd: &str, at: u64) -> Session {
+        Session {
+            id: id.into(),
+            agent: "codex".into(),
+            title: id.into(),
+            project_path: cwd.into(),
+            group_path: cwd.into(),
+            branch: None,
+            forked: false,
+            background: false,
+            fork_parent: None,
+            last_active: at,
+        }
+    }
+
+    #[test]
+    fn adoption_takes_the_session_that_appeared_where_we_launched() {
+        let rows = vec![
+            row("old", "/home/m/opcode", 100),
+            row("new", "/home/m/opcode", 500),
+        ];
+        assert_eq!(
+            pick_adopted(&rows, "/home/m/opcode", 400, &["old".into()]),
+            Some("new".into())
+        );
+    }
+
+    #[test]
+    fn adoption_never_takes_a_session_that_was_already_there() {
+        // The whole hazard: an old conversation in the same directory that the
+        // user is still typing into has a fresh mtime, and stealing it would
+        // repoint the tab at their work.
+        let rows = vec![row("busy", "/home/m/opcode", 9_999)];
+        assert_eq!(
+            pick_adopted(&rows, "/home/m/opcode", 400, &["busy".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn adoption_ignores_other_directories_and_stale_rows() {
+        let rows = vec![
+            row("elsewhere", "/home/m/aiterm", 500),
+            row("stale", "/home/m/opcode", 100),
+        ];
+        assert_eq!(pick_adopted(&rows, "/home/m/opcode", 400, &[]), None);
+    }
+
+    #[test]
+    fn adoption_finds_nothing_before_the_agent_has_written_anything() {
+        assert_eq!(pick_adopted(&[], "/home/m/opcode", 400, &[]), None);
+    }
+
+    #[test]
     fn sessions_from_every_backend_appear_in_one_list() {
         let list = vec![fake("claude", vec![("c1", 10)]), fake("codex", vec![("x1", 20)])];
         let ids: Vec<String> = scan_backends(&list).into_iter().map(|(s, _)| s.id).collect();
@@ -758,16 +1022,42 @@ mod tests {
         );
     }
 
-    /// Codex is registered for detection but contributes no sessions yet.
-    /// If someone fills in `CodexSessions`, this fails and asks them to delete
-    /// it — better than a stale claim sitting in the docs.
     #[test]
-    fn codex_is_detected_but_contributes_no_sessions_yet() {
-        let codex = CodexBackend;
-        assert!(codex.sessions().scan_with_paths().is_empty());
-        assert_eq!(codex.sessions().find_session_file("anything"), None);
-        // Detection is real regardless: it reports whatever this machine has.
-        assert_eq!(codex.detect().id, "codex");
+    fn codex_rollouts_become_sessions_and_junk_is_skipped() {
+        // Codex files rollouts by date, so the scan has to walk rather than
+        // list; the nesting here is the real layout.
+        let root = std::env::temp_dir().join(format!("aiterm-codex-{}", std::process::id()));
+        let day = root.join("2026/07/28");
+        std::fs::create_dir_all(&day).expect("temp dir");
+        std::fs::write(
+            day.join("rollout-2026-07-28T20-43-28-aaa.jsonl"),
+            "{\"payload\":{\"session_id\":\"aaa\",\"cwd\":\"/home/m/opcode\",\
+             \"git\":{\"branch\":\"main\"}}}\n{\"more\":\"lines\"}\n",
+        )
+        .unwrap();
+        // Not a rollout: must be skipped, not panicked on.
+        std::fs::write(day.join("notes.jsonl"), "half a line, tru").unwrap();
+        // Not even a .jsonl.
+        std::fs::write(day.join("README"), "hello").unwrap();
+
+        let found = scan_codex_dir(&root);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(found.len(), 1, "one real rollout, two decoys");
+        let (s, path) = &found[0];
+        assert_eq!(s.id, "aaa");
+        assert_eq!(s.project_path, "/home/m/opcode");
+        // Titled by directory, the way claude's rows read.
+        assert_eq!(s.title, "opcode");
+        assert_eq!(s.branch.as_deref(), Some("main"));
+        assert!(path.ends_with("rollout-2026-07-28T20-43-28-aaa.jsonl"));
+    }
+
+    #[test]
+    fn a_missing_codex_directory_is_not_an_error() {
+        // Most machines have never run Codex. That is an empty list, not a
+        // failure that takes the whole sidebar down with it.
+        assert!(scan_codex_dir(std::path::Path::new("/nonexistent/codex")).is_empty());
     }
 
     /// The registry must report agents that are absent, not omit them — the

@@ -316,6 +316,18 @@ fn strip_system_tags(text: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether a message is entirely system-injected markup, with nothing a
+/// person wrote left once the tagged blocks come out.
+///
+/// Used by the indexer to drop boilerplate that would otherwise appear in
+/// every session of an agent and make a search for any of its words match all
+/// of them. Deliberately all-or-nothing: a message that mixes a context block
+/// with real text is indexed whole, because guessing which half to keep is how
+/// you lose the half somebody wanted to find.
+pub(crate) fn is_only_system_block(text: &str) -> bool {
+    !text.trim().is_empty() && strip_system_tags(text).trim().is_empty()
+}
+
 /// System-injected meta prompts (memory summarizers, compression runs) that
 /// should never be shown as a session title.
 fn is_system_meta_prompt(text: &str) -> bool {
@@ -591,6 +603,19 @@ pub fn session_delete(session_id: String) -> Result<(), String> {
     let dest = trash.join(format!("{session_id}.jsonl"));
     std::fs::rename(&path, &dest).map_err(|e| e.to_string())?;
     touch(&dest);
+    // Where it came from, so restore can put it back rather than deduce a
+    // destination. Deducing worked while every session was claude's and the
+    // convention was known; a Codex rollout lives at
+    // `~/.codex/sessions/<y>/<m>/<d>/rollout-<stamp>-<id>.jsonl`, which that
+    // deduction cannot produce and would silently restore into claude's tree
+    // instead — a file neither agent would ever find again.
+    //
+    // Best-effort: a missing sidecar falls back to the old behaviour, which is
+    // still right for everything trashed before this existed.
+    let origin = trash.join(format!("{session_id}.origin"));
+    if std::fs::write(&origin, path.to_string_lossy().as_bytes()).is_ok() {
+        touch(&origin);
+    }
     let tasks = home.join(".claude/tasks").join(&session_id);
     if tasks.is_dir() {
         let tasks_dest = trash.join(format!("{session_id}.tasks"));
@@ -720,6 +745,37 @@ pub fn trash_restore(session_id: String) -> Result<(), String> {
     if !src.exists() {
         return Err("session not in trash".into());
     }
+
+    // Where it was when it was deleted, if that was recorded. Exact beats
+    // deduced: it is right for any agent, including ones aiterm does not know
+    // about yet, and it survives the layout of a store changing underneath us.
+    let origin = trash.join(format!("{session_id}.origin"));
+    let home_dir = dirs::home_dir().ok_or("no home dir")?;
+    if let Some(dest) = std::fs::read_to_string(&origin)
+        .ok()
+        .as_deref()
+        .and_then(recorded_origin)
+        .filter(|p| !is_claude_transcript(p, &home_dir))
+    {
+        // Refuse rather than overwrite. Something already sitting at that path
+        // is a session with the same id that came back by another route, and
+        // clobbering it would destroy a real transcript to restore a deleted
+        // one — the one outcome worse than a failed restore.
+        if dest.exists() {
+            return Err(format!("{} already exists", dest.display()));
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&origin);
+        return restore_claude_sidecars(&trash, &session_id);
+    }
+
+    // No sidecar: trashed before this was recorded, so fall back to deducing a
+    // claude project directory from the transcript's cwd. Only ever correct
+    // for claude, which is all that could have been trashed back then.
+    //
     // The transcript's cwd decides which project dir it goes back to.
     let mut cwd: Option<String> = None;
     if let Ok(f) = File::open(&src) {
@@ -745,15 +801,50 @@ pub fn trash_restore(session_id: String) -> Result<(), String> {
     std::fs::create_dir_all(&proj_dir).map_err(|e| e.to_string())?;
     std::fs::rename(&src, proj_dir.join(format!("{session_id}.jsonl")))
         .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(trash.join(format!("{session_id}.origin")));
+    restore_claude_sidecars(&trash, &session_id)
+}
+
+/// The path a `.origin` sidecar names, if it names a usable one.
+///
+/// The sidecar is a plain path written by this app, so this is a sanity check
+/// rather than a trust boundary — but it decides where a `rename` lands, and
+/// an empty or relative one would put a transcript somewhere nobody would look
+/// for it. Anything that does not read as an absolute path falls back to the
+/// old deduction instead.
+fn recorded_origin(text: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(text.trim());
+    (p.is_absolute() && p.file_name().is_some()).then_some(p)
+}
+
+/// Whether a path is a claude transcript, i.e. lives under
+/// `~/.claude/projects`.
+///
+/// Claude's restore does not put a transcript back where it was — it works out
+/// the project directory the cwd belongs in, which quietly repairs one that
+/// was filed wrongly. That is worth keeping, so the recorded origin is used
+/// only where that reasoning cannot reach: a store whose layout aiterm has no
+/// rule for. For claude, deduction still wins.
+fn is_claude_transcript(path: &Path, home: &Path) -> bool {
+    path.starts_with(home.join(".claude/projects"))
+}
+
+/// Put back the two records Claude Code keeps beside a transcript.
+///
+/// Shared by both restore paths. Only claude has these — a Codex rollout is
+/// the whole of a Codex session — so for anything else these are simply
+/// absent, which is why nothing here treats a miss as a failure.
+fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("no home dir")?;
     let tasks_src = trash.join(format!("{session_id}.tasks"));
     if tasks_src.is_dir() {
-        let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(&session_id));
+        let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(session_id));
     }
     let job_src = trash.join(format!("{session_id}.job"));
     if job_src.is_dir() {
         let jobs = home.join(".claude/jobs");
         let _ = std::fs::create_dir_all(&jobs);
-        let _ = std::fs::rename(&job_src, jobs.join(job_dir_name(&job_src, &session_id)));
+        let _ = std::fs::rename(&job_src, jobs.join(job_dir_name(&job_src, session_id)));
     }
     Ok(())
 }
@@ -763,6 +854,7 @@ pub fn trash_delete(session_id: String) -> Result<(), String> {
     valid_id(&session_id)?;
     let trash = trash_dir().ok_or("no home dir")?;
     std::fs::remove_file(trash.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(trash.join(format!("{session_id}.origin")));
     let tasks = trash.join(format!("{session_id}.tasks"));
     if tasks.is_dir() {
         let _ = std::fs::remove_dir_all(tasks);
@@ -800,6 +892,75 @@ pub struct PreviewMsg {
 /// Tail of the human-visible conversation for a session — used by the
 /// pre-resume preview pane. Returns the last few user/assistant text
 /// messages, oldest first.
+/// Whether a line is worth parsing as JSON at all.
+///
+/// Both formats are one JSON object per line and most lines are neither a
+/// user nor an assistant message — tool calls, token counts, world state. A
+/// substring test costs a fraction of a parse, and transcripts run to
+/// megabytes.
+pub(crate) fn line_may_hold_message(line: &str) -> bool {
+    line.contains("\"type\":\"user\"")
+        || line.contains("\"type\":\"assistant\"")
+        || line.contains("\"type\":\"response_item\"")
+}
+
+/// The conversation message on one transcript line, as `(role, text)`.
+///
+/// One function for every agent rather than one per agent, because the two
+/// callers — the preview panel and the search indexer — must agree about what
+/// a session contains. They did not: both understood claude's shape only, so a
+/// Codex session previewed as blank and was indexed as having said nothing,
+/// while still appearing in the sidebar. A row you can see, cannot read and
+/// cannot find is worse than no row.
+///
+/// The shapes are distinct enough to handle in one pass, so nothing has to
+/// know which agent wrote the file:
+///
+/// - claude: `{"type":"user"|"assistant","message":{"content":…}}`, where
+///   content is a string or blocks of `{"type":"text","text":…}`.
+/// - Codex: `{"type":"response_item","payload":{"type":"message","role":…,
+///   "content":[{"type":"input_text"|"output_text","text":…}]}}`.
+///
+/// Codex's `developer` role is dropped. It carries the sandbox and permission
+/// preamble, which is not something you said and not something worth matching
+/// a search against — the same reason claude's meta-prompts are filtered.
+pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
+    let (role, content) = match v.get("type").and_then(|t| t.as_str()) {
+        Some(r @ ("user" | "assistant")) => (r.to_string(), v.pointer("/message/content")?),
+        Some("response_item") => {
+            let p = v.get("payload")?;
+            if p.get("type").and_then(|t| t.as_str()) != Some("message") {
+                return None;
+            }
+            match p.get("role").and_then(|r| r.as_str()) {
+                Some(r @ ("user" | "assistant")) => (r.to_string(), p.get("content")?),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    let mut text = String::new();
+    match content {
+        serde_json::Value::String(s) => text.push_str(s),
+        serde_json::Value::Array(blocks) => {
+            for b in blocks {
+                // `text` for claude, `input_text`/`output_text` for Codex.
+                // Matched on having text rather than on the tag, so a new tag
+                // for the same thing does not silently empty a transcript.
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+        }
+        _ => return None,
+    }
+    (!text.trim().is_empty()).then_some((role, text))
+}
+
 #[tauri::command]
 pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     const KEEP: usize = 12;
@@ -813,37 +974,19 @@ pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     let mut out: std::collections::VecDeque<PreviewMsg> = std::collections::VecDeque::new();
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         // Cheap substring filter before JSON parsing.
-        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\":\"assistant\"") {
+        if !line_may_hold_message(&line) {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let role = match v.get("type").and_then(|t| t.as_str()) {
-            Some(r @ ("user" | "assistant")) => r.to_string(),
-            _ => continue,
-        };
         // Subagent traffic isn't part of the main conversation.
         if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
             continue;
         }
-        let mut text = String::new();
-        match v.pointer("/message/content") {
-            Some(serde_json::Value::String(s)) => text = s.clone(),
-            Some(serde_json::Value::Array(blocks)) => {
-                for b in blocks {
-                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(t);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        let Some((role, text)) = line_message(&v) else {
+            continue;
+        };
         let text = strip_system_tags(&text);
         if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
             continue;
@@ -1350,15 +1493,18 @@ pub fn resolve_resumable_id(session_id: String) -> Option<String> {
 /// callers log outcomes and errors, not chatter.
 #[tauri::command]
 pub fn ui_log(msg: String) {
-    eprintln!("[aiterm-ui] {msg}");
+    crate::diag!("ui", "{msg}");
 }
 
 #[tauri::command]
 pub fn session_migrated_to(session_id: String) -> Option<String> {
     let out = session_migrated_to_inner(&session_id);
-    // TEMP diagnostics for the missed re-key (2026-07-27): journal-visible
-    // trace of every poll. Remove once the frontend path is proven.
-    eprintln!("[aiterm] session_migrated_to({session_id}) -> {out:?}");
+    // Only the answer, not the asking. This polls every 15s per active tab, and
+    // a line per poll buried the one line that mattered — which is the failure
+    // mode a log is supposed to prevent.
+    if let Some(moved) = &out {
+        crate::diag!("session", "{session_id} migrated to {moved}");
+    }
     out
 }
 
@@ -2246,6 +2392,136 @@ pub fn materialize_fork(session_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg(line: &str) -> Option<(String, String)> {
+        assert!(
+            line_may_hold_message(line),
+            "prefilter would drop this line before it was ever parsed"
+        );
+        line_message(&serde_json::from_str(line).unwrap())
+    }
+
+    #[test]
+    fn reads_a_claude_message_in_both_content_shapes() {
+        assert_eq!(
+            msg(r#"{"type":"user","message":{"content":"plain string"}}"#),
+            Some(("user".into(), "plain string".into()))
+        );
+        assert_eq!(
+            msg(
+                r#"{"type":"assistant","message":{"content":[
+                   {"type":"text","text":"first"},{"type":"text","text":"second"}]}}"#
+            ),
+            Some(("assistant".into(), "first\nsecond".into()))
+        );
+    }
+
+    #[test]
+    fn reads_a_codex_message() {
+        // Shape from a real rollout, codex-cli 0.145.0.
+        assert_eq!(
+            msg(
+                r#"{"type":"response_item","payload":{"type":"message","role":"user",
+                   "content":[{"type":"input_text","text":"what does this do"}]}}"#
+            ),
+            Some(("user".into(), "what does this do".into()))
+        );
+        assert_eq!(
+            msg(
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant",
+                   "content":[{"type":"output_text","text":"it lists sessions"}]}}"#
+            ),
+            Some(("assistant".into(), "it lists sessions".into()))
+        );
+    }
+
+    #[test]
+    fn skips_what_is_not_conversation() {
+        // Codex's `developer` role is the sandbox preamble, not something the
+        // user said — indexing it would match every session on the same words.
+        assert_eq!(
+            msg(
+                r#"{"type":"response_item","payload":{"type":"message","role":"developer",
+                   "content":[{"type":"input_text","text":"<permissions instructions>"}]}}"#
+            ),
+            None
+        );
+        // A tool call carried on a response_item, not a message.
+        assert_eq!(
+            msg(r#"{"type":"response_item","payload":{"type":"function_call","name":"shell"}}"#),
+            None
+        );
+        // Empty content is not a message worth showing or searching.
+        assert_eq!(
+            msg(r#"{"type":"user","message":{"content":[{"type":"text","text":"   "}]}}"#),
+            None
+        );
+        // And the cheap prefilter must not waste a parse on the rest.
+        assert!(!line_may_hold_message(r#"{"type":"event_msg","payload":{"type":"token_count"}}"#));
+        assert!(!line_may_hold_message(r#"{"type":"world_state","payload":{"full":true}}"#));
+    }
+
+    #[test]
+    fn boilerplate_is_kept_out_of_the_index_but_real_text_is_not() {
+        // Codex opens every rollout with this. Indexed, one query matches
+        // every Codex session there is.
+        assert!(is_only_system_block(
+            "<environment_context>cwd /home/m, sandbox on</environment_context>"
+        ));
+        // A block plus something you actually said is indexed whole.
+        assert!(!is_only_system_block(
+            "<environment_context>noise</environment_context> why is the build failing"
+        ));
+        assert!(!is_only_system_block("just a normal question"));
+        // Angle brackets that are not a block — a generic in pasted code —
+        // must not look like boilerplate.
+        assert!(!is_only_system_block("fn f(v: Vec<String>) -> Option<u8>"));
+        assert!(!is_only_system_block(""));
+    }
+
+    #[test]
+    fn a_recorded_origin_sends_a_rollout_back_where_it_came_from() {
+        // The case this whole sidecar exists for: deducing a destination from
+        // the transcript can only ever produce a claude project directory, and
+        // a Codex rollout does not live in one.
+        assert_eq!(
+            recorded_origin(
+                "/home/m/.codex/sessions/2026/07/28/rollout-2026-07-28T20-43-28-abc.jsonl\n"
+            ),
+            Some(std::path::PathBuf::from(
+                "/home/m/.codex/sessions/2026/07/28/rollout-2026-07-28T20-43-28-abc.jsonl"
+            ))
+        );
+    }
+
+    #[test]
+    fn claude_still_restores_by_deduction_and_other_agents_by_record() {
+        let home = std::path::Path::new("/home/m");
+        // Claude: keep deducing, so a misfiled transcript is still repaired.
+        assert!(is_claude_transcript(
+            std::path::Path::new("/home/m/.claude/projects/-tmp/abc.jsonl"),
+            home
+        ));
+        // Codex: nothing here knows how to derive that path, so use the record.
+        assert!(!is_claude_transcript(
+            std::path::Path::new("/home/m/.codex/sessions/2026/07/28/rollout-x-abc.jsonl"),
+            home
+        ));
+        // Not fooled by a lookalike outside the projects tree.
+        assert!(!is_claude_transcript(
+            std::path::Path::new("/home/m/.claude/trash/abc.jsonl"),
+            home
+        ));
+    }
+
+    #[test]
+    fn an_unusable_origin_falls_back_instead_of_restoring_somewhere_odd() {
+        // Each of these would otherwise decide where a `rename` lands.
+        assert_eq!(recorded_origin(""), None);
+        assert_eq!(recorded_origin("   \n"), None);
+        assert_eq!(recorded_origin("relative/path.jsonl"), None);
+        assert_eq!(recorded_origin("/"), None);
+    }
 
     fn scratch(name: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("aiterm-test-{}-{name}", std::process::id()));

@@ -353,3 +353,27 @@ export const agentLaunchCommand = (
   agentId: string,
   spec: { model?: string | null; effort?: string | null; sessionId?: string | null },
 ) => invoke<string>("agent_launch_command", { agentId, spec });
+
+/** The id of the session an agent just started in `cwd`, once it exists.
+ *
+ *  For an agent with no `--session-id` the id cannot be minted up front, so
+ *  the tab starts with none and finds out by watching: the session that turns
+ *  up in the directory we launched in, that was not there before, is ours.
+ *  `known` is what the sidebar already listed, so adoption never steals a
+ *  conversation that was already open. */
+export const adoptAgentSession = (
+  agentId: string,
+  cwd: string,
+  sinceMs: number,
+  known: string[],
+) => invoke<string | null>("adopt_agent_session", { agentId, cwd, sinceMs, known });
+
+/** Where aiterm writes its diagnostics. */
+export const diagLogPath = () => invoke<string | null>("diag_log_path");
+
+/** The tail of that log, for pasting into a bug report. */
+export const diagLogTail = (lines: number) => invoke<string>("diag_log_tail", { lines });
+
+/** Build, desktop and which agents aiterm can see — the first questions of any
+ *  "it is behaving oddly" conversation, answered without a scavenger hunt. */
+export const diagEnvironment = () => invoke<[string, string][]>("diag_environment");

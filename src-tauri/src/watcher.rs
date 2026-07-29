@@ -87,11 +87,16 @@ pub fn watch_project(
 /// watcher drops with it. This is the simplest correct way to keep it alive
 /// without adding managed state.
 pub fn watch_claude_projects(app: AppHandle) -> Result<(), String> {
-    let dir = dirs::home_dir()
-        .ok_or_else(|| "no home dir".to_string())?
-        .join(".claude/projects");
-    // Nothing to watch yet; not an error (dir appears once Claude runs).
-    if !dir.exists() {
+    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+    // Every agent's transcript directory, not just claude's. The sidebar lists
+    // all of them, so watching one meant a Codex session simply did not appear
+    // until the 30s poll came round or something else forced a refresh — which
+    // reads as aiterm having lost it.
+    let dirs = [home.join(".claude/projects"), home.join(".codex/sessions")];
+    // Nothing to watch yet; not an error (a directory appears once its agent
+    // has run at least once, and most machines will not have all of them).
+    let present: Vec<_> = dirs.iter().filter(|d| d.exists()).collect();
+    if present.is_empty() {
         return Ok(());
     }
 
@@ -100,9 +105,11 @@ pub fn watch_claude_projects(app: AppHandle) -> Result<(), String> {
         let _ = tx.send(res);
     })
     .map_err(|e| e.to_string())?;
-    watcher
-        .watch(&dir, RecursiveMode::Recursive)
-        .map_err(|e| e.to_string())?;
+    for dir in present {
+        watcher
+            .watch(dir, RecursiveMode::Recursive)
+            .map_err(|e| e.to_string())?;
+    }
 
     std::thread::spawn(move || {
         // Keep the watcher alive for the lifetime of this thread.

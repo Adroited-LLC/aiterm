@@ -320,8 +320,13 @@ pub fn provider_models(id: String) -> Result<Vec<String>, String> {
 /// containing either is not a realistic shape, but a quoting bug here fails by
 /// sending a truncated credential and reading as "the provider rejected that
 /// key", which is the worst way for this to be wrong.
-fn curl_auth_config(api_key: &str) -> String {
-    let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
+///
+/// `pub(crate)` because `usage.rs` sends a bearer token the same way. It could
+/// hold its own copy of these two lines, and that is the version of this that
+/// goes wrong: an escaping rule with two implementations is one that gets fixed
+/// in one of them.
+pub(crate) fn curl_auth_config(token: &str) -> String {
+    let escaped = token.replace('\\', "\\\\").replace('"', "\\\"");
     format!("header = \"Authorization: Bearer {escaped}\"\n")
 }
 
