@@ -1,0 +1,486 @@
+//! API model access — OpenRouter, OpenAI, or anything else speaking the same
+//! `/models` + `/chat/completions` shape.
+//!
+//! This is configuration, not an engine. Nothing in aiterm runs a session
+//! against these yet; what they give you today is somewhere to put a key, and a
+//! **Test** that proves the key works by asking the provider for its model list.
+//! That distinction is kept honest in the UI, because a settings form that
+//! silently does nothing is worse than no form.
+//!
+//! Everything here is OpenAI-compatible on purpose. OpenRouter, Together,
+//! Groq, vLLM, llama.cpp and OpenAI itself all serve `GET {base}/models` with a
+//! bearer token, so one shape covers them and a provider is just a base URL.
+//!
+//! ## Where the key lives
+//!
+//! `~/.config/aiterm/providers.json`, `0600`, directory `0700`. Written by hand
+//! rather than through the settings store because that one is a UI-preferences
+//! file the app rewrites freely, and a credential does not belong in something
+//! with those habits.
+//!
+//! It is plaintext on disk. That matches how `claude` and most CLI tools keep
+//! their own credentials (`~/.claude/.credentials.json` is the same), so it is
+//! not a new exposure on this machine — but it is not a secret store either,
+//! and `0600` is the whole of the protection. A keyring backend would be a
+//! genuine improvement and is deliberately not faked here.
+//!
+//! ## What never crosses to the frontend
+//!
+//! The key. [`ProviderView`] carries a `has_key` flag and the last four
+//! characters, which is enough to tell two keys apart in a list and useless to
+//! anyone reading a screenshot. The renderer cannot ask for the real value —
+//! there is no command that returns it.
+
+use serde::{Deserialize, Serialize};
+
+/// A configured provider, as stored.
+///
+/// `Debug` is written by hand rather than derived: a derived one prints
+/// `api_key` in full, and the whole point of [`ProviderView`] is that the key
+/// does not leave this module. One `{:?}` in a log line or an error message
+/// would undo that, and nothing about the derive would warn you.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct Provider {
+    /// Stable slug, generated from the name on first save. Used as the key for
+    /// updates and deletes so renaming a provider does not orphan it.
+    pub id: String,
+    pub name: String,
+    /// Base URL *without* a trailing slash or `/models` — e.g.
+    /// `https://openrouter.ai/api/v1`.
+    pub base_url: String,
+    pub api_key: String,
+}
+
+/// A provider as the UI sees it: everything except the key.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ProviderView {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub has_key: bool,
+    /// Last four characters, for telling two keys apart. Empty when there is
+    /// no key, or when the key is too short to redact meaningfully — showing
+    /// most of a six-character secret would defeat the point.
+    pub key_hint: String,
+}
+
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Provider")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &format_args!("<{} chars>", self.api_key.len()))
+            .finish()
+    }
+}
+
+impl Provider {
+    fn view(&self) -> ProviderView {
+        ProviderView {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            base_url: self.base_url.clone(),
+            has_key: !self.api_key.is_empty(),
+            key_hint: key_hint(&self.api_key),
+        }
+    }
+}
+
+fn key_hint(key: &str) -> String {
+    let n = key.chars().count();
+    if n < 12 {
+        return String::new();
+    }
+    key.chars().skip(n - 4).collect()
+}
+
+/// Slug for `name`, lowercased, non-alphanumerics collapsed to `-`.
+///
+/// Falls back to `provider` for a name with nothing usable in it (say, one
+/// written entirely in emoji), because an empty id would collide with the next
+/// such name and silently overwrite it.
+pub fn slug(name: &str) -> String {
+    let s: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = false;
+    for c in s.chars() {
+        if c == '-' && last_dash {
+            continue;
+        }
+        last_dash = c == '-';
+        out.push(c);
+    }
+    if out.is_empty() {
+        "provider".to_string()
+    } else {
+        out
+    }
+}
+
+/// Trim a base URL into the form the request builder expects: no trailing
+/// slash, and no `/models` if the user pasted the endpoint they were reading
+/// about rather than the base.
+pub fn normalise_base(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/');
+    u.strip_suffix("/models").unwrap_or(u).trim_end_matches('/').to_string()
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".config/aiterm/providers.json"))
+}
+
+fn load() -> Vec<Provider> {
+    let Some(path) = config_path() else {
+        return vec![];
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    // A corrupt or hand-edited file reads as "no providers" rather than
+    // throwing: the settings panel still opens, and re-adding one rewrites it.
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save(list: &[Provider]) -> Result<(), String> {
+    let path = config_path().ok_or("no home directory")?;
+    let dir = path.parent().ok_or("bad config path")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    restrict(dir, 0o700);
+    let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
+    // Created 0600 rather than created-then-chmodded. Writing first and
+    // restricting after leaves a window — however short — where a file full of
+    // API keys is readable at whatever the umask allows, and any other process
+    // on the machine only has to open it once. The mode goes on at open(2), so
+    // there is no window to lose the race in.
+    write_private(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Belt and braces for a file that already existed with looser permissions:
+    // `create(true)` reuses the old inode and its old mode.
+    restrict(&path, 0o600);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(text.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(path, text)
+}
+
+#[cfg(unix)]
+fn restrict(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &std::path::Path, _mode: u32) {}
+
+#[tauri::command]
+pub fn providers_list() -> Vec<ProviderView> {
+    load().iter().map(Provider::view).collect()
+}
+
+/// Add or update a provider.
+///
+/// An empty `api_key` on an existing provider keeps the stored one, so editing
+/// a base URL does not require re-entering the secret — the UI cannot show it
+/// back, so asking for it again to change something unrelated would mean
+/// finding it again every time.
+#[tauri::command]
+pub fn provider_save(
+    id: Option<String>,
+    name: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<ProviderView>, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Give the provider a name.".into());
+    }
+    let base_url = normalise_base(&base_url);
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err("The base URL should start with http:// or https://".into());
+    }
+
+    let mut list = load();
+    let id = id.unwrap_or_else(|| slug(&name));
+    match list.iter_mut().find(|p| p.id == id) {
+        Some(existing) => {
+            existing.name = name;
+            existing.base_url = base_url;
+            if !api_key.trim().is_empty() {
+                existing.api_key = api_key.trim().to_string();
+            }
+        }
+        None => list.push(Provider {
+            id,
+            name,
+            base_url,
+            api_key: api_key.trim().to_string(),
+        }),
+    }
+    save(&list)?;
+    Ok(list.iter().map(Provider::view).collect())
+}
+
+#[tauri::command]
+pub fn provider_delete(id: String) -> Result<Vec<ProviderView>, String> {
+    let mut list = load();
+    list.retain(|p| p.id != id);
+    save(&list)?;
+    Ok(list.iter().map(Provider::view).collect())
+}
+
+/// Ask a provider for its models — the Test button.
+///
+/// This is what makes the form worth having before there is an engine behind
+/// it: a wrong key, a typo'd base URL or a provider that is down all look
+/// identical until something actually calls it.
+///
+/// `curl` rather than an HTTP crate, matching `usage.rs` — the project
+/// deliberately pulls in no TLS stack. `async` so a slow or unreachable
+/// provider does not freeze the window, which is the mistake `usage.rs`
+/// documents having made.
+#[tauri::command(async)]
+pub fn provider_models(id: String) -> Result<Vec<String>, String> {
+    let list = load();
+    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    if p.api_key.is_empty() {
+        return Err("No API key saved for this provider.".into());
+    }
+    let url = format!("{}/models", p.base_url);
+    // The key goes in on stdin, never on the argv. `/proc/<pid>/cmdline` is
+    // world-readable on Linux, so `-H "Authorization: Bearer …"` publishes the
+    // secret to every process on the machine for as long as curl runs — and
+    // `ps` is how you would look at a hung request. `--config -` takes the same
+    // header from a config file read from stdin, which no other process sees.
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "20",
+            // Status on its own line after the body, so an HTTP error can be
+            // reported as one instead of as "could not parse the reply".
+            "-w",
+            "\n%{http_code}",
+            "-H",
+            "Content-Type: application/json",
+            "--config",
+            "-",
+            &url,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not run curl: {e}"))
+        .and_then(|mut child| {
+            use std::io::Write;
+            let config = curl_auth_config(&p.api_key);
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "curl took no stdin".to_string())?
+                .write_all(config.as_bytes())
+                .map_err(|e| format!("Could not pass the key to curl: {e}"))?;
+            child
+                .wait_with_output()
+                .map_err(|e| format!("Could not run curl: {e}"))
+        })?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("Could not reach {url} — {}", err.trim()));
+    }
+    parse_models(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// One `header` line in curl config syntax, carrying the bearer token.
+///
+/// curl's config parser reads a double-quoted value with backslash escapes, so
+/// the two characters that could end the value early are escaped. An API key
+/// containing either is not a realistic shape, but a quoting bug here fails by
+/// sending a truncated credential and reading as "the provider rejected that
+/// key", which is the worst way for this to be wrong.
+fn curl_auth_config(api_key: &str) -> String {
+    let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("header = \"Authorization: Bearer {escaped}\"\n")
+}
+
+/// Split the `-w` status off the body and pull out model ids.
+///
+/// Kept separate from the request so the parsing — which is where the shapes
+/// actually differ between providers — can be tested without a network.
+pub fn parse_models(response: &str) -> Result<Vec<String>, String> {
+    let (body, status) = response.rsplit_once('\n').unwrap_or(("", response));
+    let code: u16 = status.trim().parse().unwrap_or(0);
+    if code == 401 || code == 403 {
+        return Err("The provider rejected that API key.".into());
+    }
+    if !(200..300).contains(&code) {
+        // Providers put a useful sentence in `error.message`; prefer it over a
+        // bare status, and fall back to the status when there is nothing.
+        let detail = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            });
+        return Err(match detail {
+            Some(d) => format!("HTTP {code} — {d}"),
+            None => format!("HTTP {code} from the provider."),
+        });
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "The provider did not return JSON.".to_string())?;
+    // OpenAI-compatible: `{"data":[{"id":…}]}`. A few servers return a bare
+    // array, so accept that too rather than calling a working provider broken.
+    let items = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .or_else(|| v.as_array())
+        .ok_or("No model list in the reply.")?;
+    let mut models: Vec<String> = items
+        .iter()
+        .filter_map(|m| {
+            m.get("id")
+                .and_then(|i| i.as_str())
+                .or_else(|| m.as_str())
+                .map(String::from)
+        })
+        .collect();
+    models.sort();
+    if models.is_empty() {
+        return Err("The provider returned an empty model list.".into());
+    }
+    Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_key_goes_in_a_config_line_and_not_on_the_argv() {
+        assert_eq!(
+            curl_auth_config("sk-abc123"),
+            "header = \"Authorization: Bearer sk-abc123\"\n"
+        );
+    }
+
+    #[test]
+    fn a_key_cannot_close_the_config_value_early() {
+        // Anything that would end the quoted value early is escaped, so the
+        // whole key reaches curl instead of a truncated one that reads back as
+        // a rejected credential.
+        let line = curl_auth_config(r#"a"b\c"#);
+        assert_eq!(line, "header = \"Authorization: Bearer a\\\"b\\\\c\"\n");
+        assert_eq!(line.matches('"').count() - line.matches("\\\"").count(), 2);
+    }
+
+    #[test]
+    fn debugging_a_provider_never_prints_its_key() {
+        let p = Provider {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "sk-do-not-print-me".into(),
+        };
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("sk-do-not-print-me"), "key leaked: {shown}");
+        assert!(shown.contains("OpenRouter"));
+    }
+
+    #[test]
+    fn slugs_are_stable_and_never_empty() {
+        assert_eq!(slug("OpenRouter"), "openrouter");
+        assert_eq!(slug("My  Local  Server"), "my-local-server");
+        assert_eq!(slug("  Together.ai  "), "together-ai");
+        // Nothing usable in it: must not collapse to "" and collide with the
+        // next such name.
+        assert_eq!(slug("🙂"), "provider");
+    }
+
+    #[test]
+    fn base_urls_are_normalised() {
+        assert_eq!(normalise_base("https://openrouter.ai/api/v1/"), "https://openrouter.ai/api/v1");
+        // The endpoint people actually have in front of them when copying.
+        assert_eq!(normalise_base("https://openrouter.ai/api/v1/models"), "https://openrouter.ai/api/v1");
+        assert_eq!(normalise_base("  https://x.dev/v1  "), "https://x.dev/v1");
+    }
+
+    /// A key must never be reconstructable from what the UI receives.
+    #[test]
+    fn the_view_never_carries_the_key() {
+        let p = Provider {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "sk-or-v1-abcdefghijklmnop".into(),
+        };
+        let v = p.view();
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains("sk-or-v1-abcdefghijklmnop"), "the key reached the frontend");
+        assert!(!json.contains("abcdefghijkl"), "too much of the key reached the frontend");
+        assert!(v.has_key);
+        assert_eq!(v.key_hint, "mnop");
+    }
+
+    /// A short key is not redacted, it is withheld — four of six characters is
+    /// not a hint, it is most of the secret.
+    #[test]
+    fn a_short_key_gets_no_hint() {
+        assert_eq!(key_hint("sk-123"), "");
+        assert_eq!(key_hint(""), "");
+        assert_eq!(key_hint("0123456789ab"), "89ab");
+    }
+
+    #[test]
+    fn models_are_parsed_from_the_openai_shape() {
+        let body = r#"{"data":[{"id":"z-model"},{"id":"a-model"}]}"#;
+        let got = parse_models(&format!("{body}\n200")).unwrap();
+        assert_eq!(got, vec!["a-model", "z-model"], "not sorted");
+    }
+
+    #[test]
+    fn a_bare_array_is_accepted_too() {
+        let got = parse_models("[{\"id\":\"m1\"}]\n200").unwrap();
+        assert_eq!(got, vec!["m1"]);
+    }
+
+    /// The three failures a user will actually hit, each needing its own
+    /// sentence — "it didn't work" would send them to the wrong fix.
+    #[test]
+    fn failures_are_reported_distinctly() {
+        let bad_key = parse_models("{\"error\":{\"message\":\"no\"}}\n401").unwrap_err();
+        assert!(bad_key.contains("rejected"), "got: {bad_key}");
+
+        let server = parse_models("{\"error\":{\"message\":\"upstream is down\"}}\n502").unwrap_err();
+        assert!(server.contains("502") && server.contains("upstream is down"), "got: {server}");
+
+        let html = parse_models("<html>not json</html>\n200").unwrap_err();
+        assert!(html.contains("did not return JSON"), "got: {html}");
+
+        let empty = parse_models("{\"data\":[]}\n200").unwrap_err();
+        assert!(empty.contains("empty"), "got: {empty}");
+    }
+}

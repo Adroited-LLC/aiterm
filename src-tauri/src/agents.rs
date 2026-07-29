@@ -37,6 +37,8 @@
 //! and hits in search. Everything else is still to do, and this comment is the
 //! honest list of what.
 
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::sessions::{ClaudeProvider, Session, SessionProvider};
@@ -59,6 +61,32 @@ pub struct Detection {
     pub path: Option<String>,
 }
 
+/// A model a backend can be started on, and the effort levels it accepts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ModelOption {
+    /// What goes on the command line.
+    pub id: String,
+    pub display_name: String,
+    /// Effort levels valid *for this model*. Empty when the agent has no such
+    /// concept. Per-model rather than per-agent because they genuinely differ:
+    /// Codex publishes a different set for each model.
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+}
+
+/// What to start. Every field optional — the honest default for all of them is
+/// "whatever the agent would do on its own", which is not the same as any value
+/// we could pick for it.
+#[derive(serde::Deserialize, Default, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchSpec {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// A session id aiterm has minted. Only meaningful where the agent accepts
+    /// one — see `mints_session_id`.
+    pub session_id: Option<String>,
+}
+
 pub trait AgentBackend: Send + Sync {
     /// Stable identifier. Written onto every session this backend yields, so
     /// changing it orphans the `agent` field on rows already in the index.
@@ -77,6 +105,41 @@ pub trait AgentBackend: Send + Sync {
 
     /// Where this backend's sessions live.
     fn sessions(&self) -> &dyn SessionProvider;
+
+    /// Models this agent can be started on, best-effort. An empty list means
+    /// "we do not know" — the UI offers the agent's own default rather than
+    /// inventing names.
+    fn models(&self) -> Vec<ModelOption> {
+        Vec::new()
+    }
+
+    /// Whether `--session-id`-style pre-minting works.
+    ///
+    /// This is not a detail: aiterm mints the id before launching so a new tab
+    /// has a sidebar row from the first frame. Where an agent will not take
+    /// one, the id is a tab handle only, no panel should be keyed to it, and
+    /// its placeholder row stays until the tab closes. Saying so here is what
+    /// keeps the UI from pointing panels at a session that will never exist.
+    fn mints_session_id(&self) -> bool {
+        false
+    }
+
+    /// The shell command that starts a session.
+    ///
+    /// Built here rather than in the frontend, which is where it used to live
+    /// as a hardcoded `CLAUDE_CMD` string. Command-line syntax is the one thing
+    /// that is certainly per-agent, so it belongs with the agent — otherwise
+    /// adding one means editing the renderer.
+    fn launch(&self, spec: &LaunchSpec) -> String;
+}
+
+/// Shell-quote a value going onto a command line.
+///
+/// Model ids and effort levels come from the frontend. They are chosen from
+/// lists we produced, but "the UI only sends good values" is not a security
+/// boundary — this string is handed to `$SHELL -ic`.
+fn q(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 pub struct ClaudeBackend;
@@ -94,6 +157,181 @@ impl AgentBackend for ClaudeBackend {
     fn sessions(&self) -> &dyn SessionProvider {
         &ClaudeProvider
     }
+
+    fn mints_session_id(&self) -> bool {
+        true
+    }
+
+    /// The aliases `claude --help` documents, plus the effort levels it lists.
+    ///
+    /// Hardcoded because Claude Code publishes no machine-readable list — the
+    /// `/model` picker is drawn in the TUI and there is no cache file to read,
+    /// unlike Codex. These come from `--help` on 2.1.220 and will age; the
+    /// blank "agent default" option in the UI is the escape hatch, and picking
+    /// nothing here is always safe.
+    fn models(&self) -> Vec<ModelOption> {
+        const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+        [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+            .into_iter()
+            .map(|(id, name)| ModelOption {
+                id: id.to_string(),
+                display_name: name.to_string(),
+                efforts: EFFORTS.iter().map(|s| s.to_string()).collect(),
+                default_effort: None,
+            })
+            .collect()
+    }
+
+    /// `--permission-mode auto --allow-dangerously-skip-permissions` is kept
+    /// exactly as the frontend's old `CLAUDE_CMD` had it, flags and reasoning
+    /// unchanged — see the comment this replaced in App.tsx. Moving it here is
+    /// a relocation, not a behaviour change.
+    fn launch(&self, spec: &LaunchSpec) -> String {
+        let mut cmd =
+            String::from("claude --permission-mode auto --allow-dangerously-skip-permissions");
+        if let Some(m) = spec.model.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --model {}", q(m)));
+        }
+        if let Some(e) = spec.effort.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --effort {}", q(e)));
+        }
+        if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --session-id {}", q(id)));
+        }
+        cmd
+    }
+}
+
+/// OpenAI Codex.
+///
+/// **Detection only.** Whether `codex` is installed is a fact aiterm can check
+/// today, and worth showing — "Codex: not installed" tells you the difference
+/// between a tool aiterm cannot use and one you have not set up. Its sessions
+/// are another matter: the on-disk format has not been examined, so
+/// [`CodexSessions`] finds nothing rather than guessing at a layout.
+///
+/// That split is deliberate. A provider that invented a plausible path would
+/// fail by finding nothing in a way indistinguishable from "you have no Codex
+/// sessions", and the first person to debug it would have to prove a negative.
+/// This way the registry is honestly two backends, the settings panel can say
+/// what is supported, and filling in the provider is a self-contained job with
+/// nothing to unpick first.
+pub struct CodexBackend;
+
+/// Placeholder until Codex's session store has actually been looked at.
+pub struct CodexSessions;
+
+impl SessionProvider for CodexSessions {
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+        Vec::new()
+    }
+    fn find_session_file(&self, _session_id: &str) -> Option<std::path::PathBuf> {
+        // Never claims ownership, so lookups fall through to a backend that
+        // can actually resolve the id.
+        None
+    }
+}
+
+impl AgentBackend for CodexBackend {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+    fn detect(&self) -> Detection {
+        detect_cli(self.id(), self.display_name(), "codex")
+    }
+    fn sessions(&self) -> &dyn SessionProvider {
+        &CodexSessions
+    }
+
+    /// Codex has no `--session-id`. `codex --help` offers `resume` and `fork`
+    /// as subcommands and nothing that names a session up front, so aiterm
+    /// cannot pre-mint one — its placeholder row is a tab handle for the life
+    /// of the tab, and no panel is keyed to it.
+    fn mints_session_id(&self) -> bool {
+        false
+    }
+
+    /// Read from Codex's own cache rather than hardcoded.
+    ///
+    /// `~/.codex/models_cache.json` is written by the CLI and carries the slug,
+    /// display name, the reasoning levels *each model* supports and its
+    /// default — which is exactly this list, kept current by the tool itself.
+    /// Absent (never run, or a future version that stops writing it) the list
+    /// is empty and the UI offers only the agent default, which is correct
+    /// rather than a guess.
+    fn models(&self) -> Vec<ModelOption> {
+        codex_models().unwrap_or_default()
+    }
+
+    /// Effort is a config override, not a flag: `codex --help` has no effort
+    /// option, and `model_reasoning_effort` is a real config key — verified
+    /// 2026-07-27 in the native binary of codex-cli 0.145.0.
+    fn launch(&self, spec: &LaunchSpec) -> String {
+        let mut cmd = String::from("codex");
+        if let Some(m) = spec.model.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --model {}", q(m)));
+        }
+        if let Some(e) = spec.effort.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" -c model_reasoning_effort={}", q(e)));
+        }
+        // spec.session_id is deliberately dropped — see mints_session_id.
+        cmd
+    }
+}
+
+/// Parse `~/.codex/models_cache.json`. Split out so the shape can be tested
+/// against a captured copy without needing Codex installed.
+fn codex_models() -> Option<Vec<ModelOption>> {
+    let path = dirs::home_dir()?.join(".codex/models_cache.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_codex_models(&text)
+}
+
+pub fn parse_codex_models(text: &str) -> Option<Vec<ModelOption>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let models = v.get("models")?.as_array()?;
+    let out: Vec<ModelOption> = models
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("slug")?.as_str()?.to_string();
+            let display_name = m
+                .get("display_name")
+                .and_then(|d| d.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let efforts = m
+                .get("supported_reasoning_levels")
+                .and_then(|l| l.as_array())
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|l| {
+                            // Entries are objects with an `effort`, but accept a
+                            // bare string too rather than dropping the list if a
+                            // future version simplifies it.
+                            l.get("effort")
+                                .and_then(|e| e.as_str())
+                                .or_else(|| l.as_str())
+                                .map(String::from)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ModelOption {
+                id,
+                display_name,
+                efforts,
+                default_effort: m
+                    .get("default_reasoning_level")
+                    .and_then(|d| d.as_str())
+                    .map(String::from),
+            })
+        })
+        .collect();
+    (!out.is_empty()).then_some(out)
 }
 
 /// Every backend aiterm knows about.
@@ -103,7 +341,7 @@ impl AgentBackend for ClaudeBackend {
 /// the indexer named `ClaudeProvider` directly, which is exactly the shape that
 /// gets you rows you cannot search.
 pub fn backends() -> Vec<Box<dyn AgentBackend>> {
-    vec![Box::new(ClaudeBackend)]
+    vec![Box::new(ClaudeBackend), Box::new(CodexBackend)]
 }
 
 /// Every backend's sessions with their transcript paths, newest first.
@@ -167,9 +405,55 @@ pub fn find_session_file_in(
 /// Reports every known backend, present or not: "Codex — not installed" is
 /// more useful in a settings panel than an absence, and it is the difference
 /// between a tool aiterm does not support and one you have not installed.
-#[tauri::command]
+/// `async` because detection spawns processes. Each absent backend costs a
+/// bounded login-shell probe and each present one a `--version` run, so this
+/// can take seconds on a cold PATH; a plain `#[tauri::command]` runs on the
+/// main thread and would freeze the window for every one of them. Same reason
+/// `usage.rs` and `fonts.rs` are `async`.
+#[tauri::command(async)]
 pub fn detect_agents() -> Vec<Detection> {
     backends().iter().map(|b| b.detect()).collect()
+}
+
+/// What a new session can be started as: the agents that are actually here,
+/// with their models. Absent agents are omitted — this feeds a picker, and
+/// offering something that cannot start is worse than not offering it.
+#[derive(Serialize, Clone, Debug)]
+pub struct AgentChoice {
+    pub id: String,
+    pub display_name: String,
+    pub models: Vec<ModelOption>,
+    pub mints_session_id: bool,
+}
+
+/// `async` for the same reason as [`detect_agents`], plus `models()`, which for
+/// Codex shells out again to read its model list.
+#[tauri::command(async)]
+pub fn agent_choices() -> Vec<AgentChoice> {
+    backends()
+        .iter()
+        .filter(|b| b.detect().available)
+        .map(|b| AgentChoice {
+            id: b.id().to_string(),
+            display_name: b.display_name().to_string(),
+            models: b.models(),
+            mints_session_id: b.mints_session_id(),
+        })
+        .collect()
+}
+
+/// The command that starts `agent_id` with `spec`.
+///
+/// The renderer asks for this rather than assembling flags itself. It used to
+/// hold Claude's invocation as a constant, which meant the one thing that is
+/// certainly per-agent lived in the one place that should not know about any.
+#[tauri::command]
+pub fn agent_launch_command(agent_id: String, spec: LaunchSpec) -> Result<String, String> {
+    backends()
+        .iter()
+        .find(|b| b.id() == agent_id)
+        .map(|b| b.launch(&spec))
+        .ok_or_else(|| format!("No agent called {agent_id}."))
 }
 
 /// Resolve `bin` against PATH, the way a shell would.
@@ -182,6 +466,61 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|candidate| is_executable_file(candidate))
+}
+
+/// Ask the user's login shell where `bin` is.
+///
+/// Necessary because aiterm's own PATH is not the one you get at a prompt. A
+/// desktop launcher starts the app from the session manager with a minimal
+/// environment, and Node version managers make it worse: fnm, nvm and asdf put
+/// their shims on PATH from a shell rc file, and fnm's live in a per-shell
+/// directory (`/run/user/…/fnm_multishells/<pid>_<ts>/bin`) that does not exist
+/// outside one.
+///
+/// That is not a corner case for this feature — Codex is a Node CLI, so an fnm
+/// user has it installed and aiterm would flatly report "not installed".
+/// *Observed 2026-07-27: `codex-cli 0.145.0` resolving only inside a shell.*
+///
+/// Interactive as well as login (`-lic`), because rc files that set these shims
+/// up are usually the interactive ones. Bounded, because an interactive shell
+/// can block on anything a user has put in their profile, and a settings panel
+/// that never finishes loading is no better than one that hangs.
+fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
+    let shell = std::env::var("SHELL").ok()?;
+    // `bin` is a literal from our own backend list, never user input, but keep
+    // the quoting correct anyway rather than relying on that staying true.
+    let script = format!("command -v '{}' 2>/dev/null", bin.replace('\'', "'\\''"));
+    let out = run_bounded(&shell, &["-l", "-i", "-c", &script], Duration::from_secs(4))?;
+    // An interactive shell may print a banner or an rc-file warning first, so
+    // take the last line that is actually a path to an executable rather than
+    // assuming the output is clean. It must also be named `bin`: a banner line
+    // that happens to name some other executable is not an answer to the
+    // question, and accepting it would mean launching the wrong program.
+    String::from_utf8_lossy(&out)
+        .lines()
+        .rev()
+        .map(|l| std::path::PathBuf::from(l.trim()))
+        .find(|p| p.file_name().is_some_and(|n| n == bin) && is_executable_file(p))
+}
+
+/// Run a command, giving up after `limit`. Returns stdout on success.
+///
+/// `std::process::Command` has no timeout, and a shell that hangs on someone's
+/// profile would hang the settings panel with it. On timeout the worker thread
+/// is left to finish on its own — it holds nothing but its own stdout buffer,
+/// and abandoning it is better than blocking the UI on it.
+fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let program = program.to_string();
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new(&program).args(&args).output();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(out)) if out.status.success() => Some(out.stdout),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -201,7 +540,9 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// one of these agents and not the others, and that is worth showing plainly
 /// rather than treating as a failure.
 fn detect_cli(id: &str, display_name: &str, bin: &str) -> Detection {
-    let found = which(bin);
+    // PATH first because it is free; the shell only when that fails, so the
+    // common case never spawns anything to answer "is it installed".
+    let found = which(bin).or_else(|| which_via_login_shell(bin));
     let version = found.as_ref().and_then(|p| read_version(p));
     Detection {
         id: id.to_string(),
@@ -345,6 +686,9 @@ mod tests {
         fn sessions(&self) -> &dyn SessionProvider {
             &self.provider
         }
+        fn launch(&self, _spec: &LaunchSpec) -> String {
+            format!("fake-{}", self.id)
+        }
     }
 
     fn fake(id: &'static str, rows: Vec<(&'static str, u64)>) -> Box<dyn AgentBackend> {
@@ -414,6 +758,155 @@ mod tests {
         );
     }
 
+    /// Codex is registered for detection but contributes no sessions yet.
+    /// If someone fills in `CodexSessions`, this fails and asks them to delete
+    /// it — better than a stale claim sitting in the docs.
+    #[test]
+    fn codex_is_detected_but_contributes_no_sessions_yet() {
+        let codex = CodexBackend;
+        assert!(codex.sessions().scan_with_paths().is_empty());
+        assert_eq!(codex.sessions().find_session_file("anything"), None);
+        // Detection is real regardless: it reports whatever this machine has.
+        assert_eq!(codex.detect().id, "codex");
+    }
+
+    /// The registry must report agents that are absent, not omit them — the
+    /// settings panel exists to say "not installed".
+    #[test]
+    fn detection_covers_every_registered_backend() {
+        let found = detect_agents();
+        assert_eq!(found.len(), backends().len(), "a backend went unreported");
+        assert!(found.iter().any(|d| d.id == "claude"));
+        assert!(found.iter().any(|d| d.id == "codex"));
+    }
+
+    /* ---- launch commands ------------------------------------------------ */
+
+    /// Picking nothing must produce exactly what aiterm always ran. This is the
+    /// regression guard for moving the invocation out of the frontend.
+    #[test]
+    fn claude_with_no_choices_is_the_command_aiterm_always_used() {
+        assert_eq!(
+            ClaudeBackend.launch(&LaunchSpec::default()),
+            "claude --permission-mode auto --allow-dangerously-skip-permissions",
+        );
+    }
+
+    #[test]
+    fn claude_takes_model_effort_and_a_minted_session_id() {
+        let cmd = ClaudeBackend.launch(&LaunchSpec {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            session_id: Some("abc-123".into()),
+        });
+        assert!(cmd.contains("--model 'opus'"), "{cmd}");
+        assert!(cmd.contains("--effort 'high'"), "{cmd}");
+        assert!(cmd.contains("--session-id 'abc-123'"), "{cmd}");
+    }
+
+    /// Codex has no --session-id, so a minted one must be dropped rather than
+    /// passed as some other flag or silently appended as a prompt.
+    #[test]
+    fn codex_uses_a_config_override_for_effort_and_ignores_session_id() {
+        let cmd = CodexBackend.launch(&LaunchSpec {
+            model: Some("gpt-5.6-sol".into()),
+            effort: Some("high".into()),
+            session_id: Some("abc-123".into()),
+        });
+        assert!(cmd.starts_with("codex "), "{cmd}");
+        assert!(cmd.contains("--model 'gpt-5.6-sol'"), "{cmd}");
+        assert!(cmd.contains("-c model_reasoning_effort='high'"), "{cmd}");
+        assert!(!cmd.contains("abc-123"), "session id leaked into a codex launch: {cmd}");
+    }
+
+    #[test]
+    fn empty_choices_add_no_flags() {
+        let spec = LaunchSpec {
+            model: Some(String::new()),
+            effort: Some(String::new()),
+            session_id: None,
+        };
+        assert_eq!(CodexBackend.launch(&spec), "codex");
+        assert!(!ClaudeBackend.launch(&spec).contains("--model"));
+    }
+
+    /// These strings are handed to `$SHELL -ic`. The UI only sends values from
+    /// lists we produced, but that is not a boundary to rely on.
+    /// These strings are handed to `$SHELL -ic`. The UI only sends values from
+    /// lists we produced, but that is not a boundary to rely on.
+    ///
+    /// Asserted by asking a real shell rather than by pattern-matching the
+    /// command text: what matters is that the shell sees one literal word, and
+    /// only the shell can settle that. (An earlier version of this test looked
+    /// for the payload as a substring and failed on correctly-quoted output —
+    /// the payload is *supposed* to be in there, inside the quotes.)
+    #[test]
+    fn values_survive_the_shell_as_a_single_literal_word() {
+        for nasty in [
+            "x'; touch /tmp/aiterm-pwned; #",
+            "$(touch /tmp/aiterm-pwned)",
+            "a b\tc",
+            "back\\slash",
+        ] {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &format!("printf %s {}", q(nasty))])
+                .output()
+                .expect("run sh");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                nasty,
+                "the shell did not see {nasty:?} as one literal word",
+            );
+        }
+        assert!(
+            !std::path::Path::new("/tmp/aiterm-pwned").exists(),
+            "quoting failed: the payload executed",
+        );
+    }
+
+    /* ---- codex model cache ---------------------------------------------- */
+
+    /// Captured from a real `~/.codex/models_cache.json` (codex-cli 0.145.0).
+    const CODEX_CACHE: &str = r#"{
+      "fetched_at": "2026-07-28T00:22:46Z",
+      "models": [
+        {"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol",
+         "default_reasoning_level":"low",
+         "supported_reasoning_levels":[{"effort":"low"},{"effort":"high"},{"effort":"max"}]},
+        {"slug":"gpt-5.6-codex","display_name":"GPT-5.6-Codex",
+         "supported_reasoning_levels":["medium"]}
+      ]}"#;
+
+    #[test]
+    fn codex_models_come_from_its_own_cache() {
+        let models = parse_codex_models(CODEX_CACHE).expect("parsed nothing");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models[0].display_name, "GPT-5.6-Sol");
+        assert_eq!(models[0].efforts, vec!["low", "high", "max"]);
+        assert_eq!(models[0].default_effort.as_deref(), Some("low"));
+        // Bare strings accepted too, so a simplified future format still parses.
+        assert_eq!(models[1].efforts, vec!["medium"]);
+        assert_eq!(models[1].default_effort, None);
+    }
+
+    /// A missing or unreadable cache must yield "we do not know" rather than an
+    /// invented list — the UI then offers only the agent's own default.
+    #[test]
+    fn an_unusable_codex_cache_yields_no_models() {
+        assert_eq!(parse_codex_models("not json"), None);
+        assert_eq!(parse_codex_models(r#"{"models":[]}"#), None);
+        assert_eq!(parse_codex_models(r#"{"other":1}"#), None);
+    }
+
+    #[test]
+    fn agent_choices_only_offers_agents_that_are_here() {
+        for c in agent_choices() {
+            let backend = backends().into_iter().find(|b| b.id() == c.id).unwrap();
+            assert!(backend.detect().available, "{} offered but not installed", c.id);
+        }
+    }
+
     #[test]
     fn an_empty_registry_is_not_an_error() {
         assert!(scan_backends(&[]).is_empty());
@@ -429,3 +922,8 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "two backends share an id: {ids:?}");
     }
 }
+
+
+
+
+

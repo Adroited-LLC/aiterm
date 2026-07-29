@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { homeAbbrev } from "../ipc";
+import StartControls, { StartChoice, useStartChoice } from "./StartControls";
+
+export type { StartChoice };
 
 /** A directory offered as somewhere to start a session. */
 export interface StartPoint {
@@ -15,13 +18,13 @@ export interface StartPoint {
 interface Props {
   /** Where sessions have run before, plus known project directories. */
   places: StartPoint[];
-  /** Start claude in this directory. */
-  onPick: (path: string) => void;
+  /** Start a session in this directory, as `choice`. */
+  onPick: (path: string, choice: StartChoice) => void;
   onClose: () => void;
 }
 
 /**
- * Pick a directory to start a fresh claude session in.
+ * Pick what to start, and where.
  *
  * Two ways in, because the two cases are genuinely different. Almost always
  * you want somewhere you have worked before, and typing a path for that is
@@ -33,10 +36,20 @@ interface Props {
  * `~/Projects`, and a machine where the work lives elsewhere would get an
  * empty menu. Anywhere a session has ever run counts, which is the same set
  * the sidebar is already showing rows for.
+ *
+ * Above the list sit the agent, model and effort. Only agents actually
+ * installed are offered, and the model list comes from whatever that agent
+ * publishes — Codex's own cache, Claude's documented aliases. Both model and
+ * effort default to blank, meaning "whatever the agent would do on its own",
+ * which is the only honest default: any value we picked would be us choosing
+ * for you. The agent row is hidden entirely when only one agent is installed,
+ * since a picker with one option is furniture.
  */
 export default function NewSessionMenu({ places, onPick, onClose }: Props) {
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
+  const ctl = useStartChoice();
+  const choice = ctl.choice;
   const inputRef = useRef<HTMLInputElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
 
@@ -77,14 +90,15 @@ export default function NewSessionMenu({ places, onPick, onClose }: Props) {
     onClose();
     try {
       const picked = await open({ directory: true, title: "Start a session in…" });
-      if (typeof picked === "string") onPick(picked);
+      if (typeof picked === "string") onPick(picked, choice());
     } catch {
       /* the chooser was cancelled or unavailable — nothing to report */
     }
   };
 
   // `matches.length` is the Browse row: one past the end of the list.
-  const choose = (i: number) => (i >= matches.length ? browse() : onPick(matches[i].path));
+  const choose = (i: number) =>
+    i >= matches.length ? browse() : onPick(matches[i].path, choice());
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") {
@@ -104,6 +118,7 @@ export default function NewSessionMenu({ places, onPick, onClose }: Props) {
 
   return (
     <div className="new-session-pop" ref={popRef} onKeyDown={onKeyDown}>
+      <StartControls ctl={ctl} />
       <input
         ref={inputRef}
         className="new-session-input"
@@ -117,7 +132,7 @@ export default function NewSessionMenu({ places, onPick, onClose }: Props) {
             key={p.path}
             className={"new-session-row" + (i === cursor ? " on" : "")}
             onPointerEnter={() => setCursor(i)}
-            onClick={() => onPick(p.path)}
+            onClick={() => onPick(p.path, choice())}
           >
             <span className="new-session-name">{p.name}</span>
             <span className="new-session-path">{homeAbbrev(p.path)}</span>
