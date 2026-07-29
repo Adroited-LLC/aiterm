@@ -571,12 +571,20 @@ export default function App() {
   // to a tab. Each one retires by itself: the id was minted by `newSession`,
   // so when that transcript lands the real row is already the tab's row and
   // this list stops naming it. Nothing guesses, and nothing hides a real row.
+  //
+  // Keyed by `slotId`, not `sessionId`. For claude the two are the same value —
+  // `newSession` mints one id and passes it as both — but an agent that has no
+  // `--session-id` gets a slot and no session id at all, and filtering on the
+  // session id dropped exactly those tabs: Codex opened a terminal with no row,
+  // which is the unreachable-tab bug this list exists to prevent. `slotId` is
+  // also what the panel hands back to `onSelectPending`/`onExitPending`, so it
+  // is the id this list should have been carrying either way.
   const knownSessionIds = useMemo(() => new Set(sessions.map((s) => s.id)), [sessions]);
   const pendingSessions = useMemo(
     () =>
       tabs
-        .filter((t) => t.fresh && t.sessionId && !knownSessionIds.has(t.sessionId))
-        .map((t) => ({ id: t.sessionId!, title: t.title, cwd: t.cwd ?? "" })),
+        .filter((t) => t.fresh && !knownSessionIds.has(t.slotId))
+        .map((t) => ({ id: t.slotId, title: t.title, cwd: t.cwd ?? "" })),
     [tabs, knownSessionIds],
   );
   // The migration watcher's guard, reduced to a boolean before it reaches the

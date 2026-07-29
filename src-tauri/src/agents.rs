@@ -405,7 +405,12 @@ pub fn find_session_file_in(
 /// Reports every known backend, present or not: "Codex — not installed" is
 /// more useful in a settings panel than an absence, and it is the difference
 /// between a tool aiterm does not support and one you have not installed.
-#[tauri::command]
+/// `async` because detection spawns processes. Each absent backend costs a
+/// bounded login-shell probe and each present one a `--version` run, so this
+/// can take seconds on a cold PATH; a plain `#[tauri::command]` runs on the
+/// main thread and would freeze the window for every one of them. Same reason
+/// `usage.rs` and `fonts.rs` are `async`.
+#[tauri::command(async)]
 pub fn detect_agents() -> Vec<Detection> {
     backends().iter().map(|b| b.detect()).collect()
 }
@@ -421,7 +426,9 @@ pub struct AgentChoice {
     pub mints_session_id: bool,
 }
 
-#[tauri::command]
+/// `async` for the same reason as [`detect_agents`], plus `models()`, which for
+/// Codex shells out again to read its model list.
+#[tauri::command(async)]
 pub fn agent_choices() -> Vec<AgentChoice> {
     backends()
         .iter()
@@ -476,8 +483,8 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
 ///
 /// Interactive as well as login (`-lic`), because rc files that set these shims
 /// up are usually the interactive ones. Bounded, because an interactive shell
-/// can block on anything a user has put in their profile and this is called
-/// from the UI thread's command handler.
+/// can block on anything a user has put in their profile, and a settings panel
+/// that never finishes loading is no better than one that hangs.
 fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
     let shell = std::env::var("SHELL").ok()?;
     // `bin` is a literal from our own backend list, never user input, but keep
@@ -486,12 +493,14 @@ fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
     let out = run_bounded(&shell, &["-l", "-i", "-c", &script], Duration::from_secs(4))?;
     // An interactive shell may print a banner or an rc-file warning first, so
     // take the last line that is actually a path to an executable rather than
-    // assuming the output is clean.
+    // assuming the output is clean. It must also be named `bin`: a banner line
+    // that happens to name some other executable is not an answer to the
+    // question, and accepting it would mean launching the wrong program.
     String::from_utf8_lossy(&out)
         .lines()
         .rev()
         .map(|l| std::path::PathBuf::from(l.trim()))
-        .find(|p| is_executable_file(p))
+        .find(|p| p.file_name().is_some_and(|n| n == bin) && is_executable_file(p))
 }
 
 /// Run a command, giving up after `limit`. Returns stdout on success.
