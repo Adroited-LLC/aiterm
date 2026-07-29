@@ -286,3 +286,70 @@ export function relTime(ms: number): string {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return `${Math.floor(s / 86400)}d ago`;
 }
+
+/** What aiterm found for one agent on this machine — see `agents.rs`. */
+export interface AgentDetection {
+  id: string;
+  display_name: string;
+  /** Usable here. For a CLI agent, its binary is on PATH. */
+  available: boolean;
+  /** First line of `--version`, when it answered. Absent does not imply
+   *  unavailable — some tools just don't report one. */
+  version: string | null;
+  path: string | null;
+}
+
+/** Every agent aiterm knows about, present or not. Spawns at most one process
+ *  per installed agent, so call it when the answer is wanted (opening
+ *  settings) rather than on a timer. */
+export const detectAgents = () => invoke<AgentDetection[]>("detect_agents");
+
+/** A configured API provider, as the UI sees it. The key never crosses this
+ *  boundary — there is no command that returns it. */
+export interface ProviderView {
+  id: string;
+  name: string;
+  base_url: string;
+  has_key: boolean;
+  /** Last four characters, for telling two keys apart. Empty when there is no
+   *  key or it is too short to redact meaningfully. */
+  key_hint: string;
+}
+
+export const providersList = () => invoke<ProviderView[]>("providers_list");
+/** Empty `apiKey` on an existing provider keeps the stored one. */
+export const providerSave = (
+  id: string | null, name: string, baseUrl: string, apiKey: string,
+) => invoke<ProviderView[]>("provider_save", { id, name, baseUrl, apiKey });
+export const providerDelete = (id: string) =>
+  invoke<ProviderView[]>("provider_delete", { id });
+/** Ask the provider for its model list — proves the key and URL actually work. */
+export const providerModels = (id: string) =>
+  invoke<string[]>("provider_models", { id });
+
+/** A model a backend can start on, with the effort levels *that model* takes. */
+export interface ModelOption {
+  id: string;
+  display_name: string;
+  efforts: string[];
+  default_effort: string | null;
+}
+
+/** An agent that is actually installed, and what it can be started as. */
+export interface AgentChoice {
+  id: string;
+  display_name: string;
+  models: ModelOption[];
+  /** Whether aiterm can pre-mint the session id. Where false, the id it
+   *  generates is a tab handle only and no panel should be keyed to it. */
+  mints_session_id: boolean;
+}
+
+export const agentChoices = () => invoke<AgentChoice[]>("agent_choices");
+
+/** The shell command that starts a session. Built in Rust so command-line
+ *  syntax — the one thing that is certainly per-agent — stays with the agent. */
+export const agentLaunchCommand = (
+  agentId: string,
+  spec: { model?: string | null; effort?: string | null; sessionId?: string | null },
+) => invoke<string>("agent_launch_command", { agentId, spec });

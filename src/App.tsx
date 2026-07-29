@@ -4,6 +4,8 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
+import { StartChoice } from "./components/NewSessionMenu";
+import StartControls, { useStartChoice } from "./components/StartControls";
 import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
@@ -33,6 +35,7 @@ import {
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
+  agentLaunchCommand,
 } from "./ipc";
 import "./App.css";
 
@@ -923,24 +926,50 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback((cwd: string) => {
+  const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
     setActiveProject(cwd);
+    // Mint an id only where the agent will accept one. Codex has no
+    // --session-id, so for it this is a tab handle: the placeholder row keeps
+    // the tab reachable, but nothing is keyed to it as a session, because
+    // there is no session by that name and never will be.
     const id = crypto.randomUUID();
-    openTab(basename(cwd), cwd, `${CLAUDE_CMD} --session-id ${id}`, id, id, true);
+    try {
+      const command = await agentLaunchCommand(choice.agentId, {
+        model: choice.model,
+        effort: choice.effort,
+        sessionId: choice.mintsSessionId ? id : null,
+      });
+      openTab(
+        basename(cwd), cwd, command, id,
+        choice.mintsSessionId ? id : undefined, true,
+      );
+    } catch (e) {
+      setNotice(`Couldn't start ${choice.agentId}: ${e}`);
+    }
   }, [openTab]);
 
-  /** Same, but choose the directory first. The empty pane's copy is the only
-   *  instruction a first run gets, and it used to name two buttons that live
-   *  in a panel you can close — and that on a fresh machine has nothing in it
-   *  to press them on. */
+  /** The empty pane's own source/model/effort, so its button starts the same
+   *  session the ＋ menu would. It used to take the first installed agent on
+   *  its defaults — a different session from the one the menu offers, with
+   *  nothing on the button to say so. */
+  const emptyCtl = useStartChoice();
+  /** Same as the menu, but choose the directory first. The empty pane's copy is
+   *  the only instruction a first run gets, and it used to name two buttons
+   *  that live in a panel you can close — and that on a fresh machine has
+   *  nothing in it to press them on. */
   const browseNewSession = useCallback(async () => {
+    if (!emptyCtl.ready) {
+      setNotice("No agent CLI found on this machine.");
+      return;
+    }
     try {
       const picked = await openDialog({ directory: true, title: "Start a session in…" });
-      if (typeof picked === "string") newSession(picked);
+      if (typeof picked !== "string") return;
+      newSession(picked, emptyCtl.choice());
     } catch {
       /* cancelled, or no chooser available */
     }
-  }, [newSession]);
+  }, [newSession, emptyCtl]);
 
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
@@ -1144,10 +1173,13 @@ export default function App() {
             )}
             {tabs.length === 0 && !previewSession && (
               <div className="empty-note big empty-start">
-                <div>Pick a session on the left — ▶ resumes claude, ＋ opens a shell</div>
-                <button className="tui-pick" onClick={browseNewSession}>
-                  Start a new session…
-                </button>
+                <div>Pick a session on the left — ▶ resumes it, ＋ opens a shell</div>
+                <div className="empty-start-controls">
+                  <StartControls ctl={emptyCtl} />
+                  <button className="tui-pick" onClick={browseNewSession}>
+                    Start a new session…
+                  </button>
+                </div>
               </div>
             )}
             {previewSession && (
