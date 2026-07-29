@@ -123,6 +123,18 @@ export default function TerminalView({
     const term = new Terminal({
       fontFamily,
       fontSize,
+      // Heavier than the 400 xterm defaults to. The WebGL renderer rasterises
+      // its own glyph atlas, which means grayscale antialiasing and none of
+      // the subpixel rendering or hinting the rest of the app gets from the
+      // browser — at ~81 DPI that reads as thin and washed out beside the
+      // panels. A little more weight is what closes the gap without giving up
+      // the renderer.
+      //
+      // 500, not 700: bold stays 700, and a font whose heaviest face is Bold —
+      // IBM Plex Mono, among others — would render emphasis identically to
+      // body text if normal were already there.
+      fontWeight: 500,
+      fontWeightBold: 700,
       cursorBlink: true,
       allowProposedApi: true,
       theme,

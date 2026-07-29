@@ -1,4 +1,15 @@
 :root {
+  /* Native controls follow the theme. A `<select>` styles its closed box with
+     CSS, but the popup list is drawn by the engine, not by us — WebKitGTK
+     rendered it in its light palette, so opening the font picker on a dark
+     theme threw up a white menu with a system-blue highlight. `color-scheme`
+     is the only thing that tells the engine which palette to use, and it takes
+     scrollbars and the rest of the native furniture with it.
+
+     Unconditional because every theme aiterm ships is dark; the day a light
+     one lands, this becomes a per-theme value. */
+  color-scheme: dark;
+
   --bg: #121317;
   --bg-panel: #16171d;
   --bg-raised: #1c1e26;
