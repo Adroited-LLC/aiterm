@@ -53,25 +53,44 @@ pub fn usage_limits() -> Vec<UsageBar> {
     let Some(token) = read_oauth_token() else {
         return vec![];
     };
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            // Give up on an unreachable host quickly rather than sitting on
-            // the full budget; the reply itself still gets the longer window.
-            "--connect-timeout",
-            "3",
-            "--max-time",
-            "10",
-            "-H",
-            &format!("Authorization: Bearer {token}"),
-            "-H",
-            "anthropic-beta: oauth-2025-04-20",
-            "-H",
-            "Content-Type: application/json",
-            "https://api.anthropic.com/api/oauth/usage",
-        ])
-        .output();
-    let Ok(output) = output else {
+    // The token goes in on stdin, never on the argv. `/proc/<pid>/cmdline` is
+    // world-readable, so `-H "Authorization: Bearer …"` hands your Claude
+    // OAuth token to any process on the machine that looks — and this runs
+    // every minute, so there is nearly always a curl to look at. `--config -`
+    // takes the same header from a config file read from stdin, which nothing
+    // else can see. Escaping lives in `providers.rs` so there is one copy.
+    let output = (|| {
+        use std::io::Write;
+        let mut child = std::process::Command::new("curl")
+            .args([
+                "-sS",
+                // Give up on an unreachable host quickly rather than sitting on
+                // the full budget; the reply itself still gets the longer window.
+                "--connect-timeout",
+                "3",
+                "--max-time",
+                "10",
+                "-H",
+                "anthropic-beta: oauth-2025-04-20",
+                "-H",
+                "Content-Type: application/json",
+                "--config",
+                "-",
+                "https://api.anthropic.com/api/oauth/usage",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child
+            .stdin
+            .take()?
+            .write_all(crate::providers::curl_auth_config(&token).as_bytes())
+            .ok()?;
+        child.wait_with_output().ok()
+    })();
+    let Some(output) = output else {
         return vec![];
     };
     if !output.status.success() {
