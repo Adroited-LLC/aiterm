@@ -34,7 +34,12 @@
 use serde::{Deserialize, Serialize};
 
 /// A configured provider, as stored.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+///
+/// `Debug` is written by hand rather than derived: a derived one prints
+/// `api_key` in full, and the whole point of [`ProviderView`] is that the key
+/// does not leave this module. One `{:?}` in a log line or an error message
+/// would undo that, and nothing about the derive would warn you.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct Provider {
     /// Stable slug, generated from the name on first save. Used as the key for
     /// updates and deletes so renaming a provider does not orphan it.
@@ -57,6 +62,17 @@ pub struct ProviderView {
     /// no key, or when the key is too short to redact meaningfully — showing
     /// most of a six-character secret would defeat the point.
     pub key_hint: String,
+}
+
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Provider")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("api_key", &format_args!("<{} chars>", self.api_key.len()))
+            .finish()
+    }
 }
 
 impl Provider {
@@ -137,12 +153,34 @@ fn save(list: &[Provider]) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     restrict(dir, 0o700);
     let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
-    // Written then locked down. There is a window between create and chmod
-    // where the file exists at the umask default; it is closed below rather
-    // than left, because the content is a credential.
-    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Created 0600 rather than created-then-chmodded. Writing first and
+    // restricting after leaves a window — however short — where a file full of
+    // API keys is readable at whatever the umask allows, and any other process
+    // on the machine only has to open it once. The mode goes on at open(2), so
+    // there is no window to lose the race in.
+    write_private(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Belt and braces for a file that already existed with looser permissions:
+    // `create(true)` reuses the old inode and its old mode.
     restrict(&path, 0o600);
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(text.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    std::fs::write(path, text)
 }
 
 #[cfg(unix)]
@@ -228,6 +266,11 @@ pub fn provider_models(id: String) -> Result<Vec<String>, String> {
         return Err("No API key saved for this provider.".into());
     }
     let url = format!("{}/models", p.base_url);
+    // The key goes in on stdin, never on the argv. `/proc/<pid>/cmdline` is
+    // world-readable on Linux, so `-H "Authorization: Bearer …"` publishes the
+    // secret to every process on the machine for as long as curl runs — and
+    // `ps` is how you would look at a hung request. `--config -` takes the same
+    // header from a config file read from stdin, which no other process sees.
     let out = std::process::Command::new("curl")
         .args([
             "-sS",
@@ -240,18 +283,46 @@ pub fn provider_models(id: String) -> Result<Vec<String>, String> {
             "-w",
             "\n%{http_code}",
             "-H",
-            &format!("Authorization: Bearer {}", p.api_key),
-            "-H",
             "Content-Type: application/json",
+            "--config",
+            "-",
             &url,
         ])
-        .output()
-        .map_err(|e| format!("Could not run curl: {e}"))?;
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not run curl: {e}"))
+        .and_then(|mut child| {
+            use std::io::Write;
+            let config = curl_auth_config(&p.api_key);
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "curl took no stdin".to_string())?
+                .write_all(config.as_bytes())
+                .map_err(|e| format!("Could not pass the key to curl: {e}"))?;
+            child
+                .wait_with_output()
+                .map_err(|e| format!("Could not run curl: {e}"))
+        })?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("Could not reach {url} — {}", err.trim()));
     }
     parse_models(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// One `header` line in curl config syntax, carrying the bearer token.
+///
+/// curl's config parser reads a double-quoted value with backslash escapes, so
+/// the two characters that could end the value early are escaped. An API key
+/// containing either is not a realistic shape, but a quoting bug here fails by
+/// sending a truncated credential and reading as "the provider rejected that
+/// key", which is the worst way for this to be wrong.
+fn curl_auth_config(api_key: &str) -> String {
+    let escaped = api_key.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("header = \"Authorization: Bearer {escaped}\"\n")
 }
 
 /// Split the `-w` status off the body and pull out model ids.
@@ -307,6 +378,37 @@ pub fn parse_models(response: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_key_goes_in_a_config_line_and_not_on_the_argv() {
+        assert_eq!(
+            curl_auth_config("sk-abc123"),
+            "header = \"Authorization: Bearer sk-abc123\"\n"
+        );
+    }
+
+    #[test]
+    fn a_key_cannot_close_the_config_value_early() {
+        // Anything that would end the quoted value early is escaped, so the
+        // whole key reaches curl instead of a truncated one that reads back as
+        // a rejected credential.
+        let line = curl_auth_config(r#"a"b\c"#);
+        assert_eq!(line, "header = \"Authorization: Bearer a\\\"b\\\\c\"\n");
+        assert_eq!(line.matches('"').count() - line.matches("\\\"").count(), 2);
+    }
+
+    #[test]
+    fn debugging_a_provider_never_prints_its_key() {
+        let p = Provider {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "sk-do-not-print-me".into(),
+        };
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("sk-do-not-print-me"), "key leaked: {shown}");
+        assert!(shown.contains("OpenRouter"));
+    }
 
     #[test]
     fn slugs_are_stable_and_never_empty() {
