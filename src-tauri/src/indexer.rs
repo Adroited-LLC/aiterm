@@ -146,37 +146,38 @@ fn extract_texts(path: &Path) -> (String, String) {
         if user.len() >= CAP && assistant.len() >= CAP {
             break;
         }
+        // Same reader the preview panel uses, so what you can read in a
+        // session and what you can search it for stay the same thing. It
+        // understands every agent's transcript shape; this used to understand
+        // only claude's, which is why a Codex session was indexed as empty.
+        if !crate::sessions::line_may_hold_message(&line) {
+            continue;
+        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let (bucket, cap_left) = match v.get("type").and_then(|t| t.as_str()) {
-            Some("user") => (&mut user, CAP),
-            Some("assistant") => (&mut assistant, CAP),
-            _ => continue,
-        };
-        let Some(content) = v.pointer("/message/content") else {
+        let Some((role, text)) = crate::sessions::line_message(&v) else {
             continue;
         };
-        match content {
-            serde_json::Value::String(s) => {
-                if bucket.len() < cap_left {
-                    bucket.push_str(s);
-                    bucket.push('\n');
-                }
-            }
-            serde_json::Value::Array(blocks) => {
-                for block in blocks {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                            if bucket.len() < cap_left {
-                                bucket.push_str(t);
-                                bucket.push('\n');
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
+        // A message that is nothing but an injected system block is not
+        // something anyone typed, and every session of that agent carries the
+        // same one — Codex opens each rollout with an 851-character
+        // `<environment_context>`. Indexed, it makes one query match every
+        // session at once, which is the same as the field not working.
+        //
+        // Only whole-block messages are dropped, and the original text is what
+        // gets indexed otherwise: stripping in general would quietly lose
+        // anything angle-bracketed that somebody actually wrote.
+        if crate::sessions::is_only_system_block(&text) {
+            continue;
+        }
+        let bucket = match role.as_str() {
+            "user" => &mut user,
+            _ => &mut assistant,
+        };
+        if bucket.len() < CAP {
+            bucket.push_str(&text);
+            bucket.push('\n');
         }
     }
     (user, assistant)

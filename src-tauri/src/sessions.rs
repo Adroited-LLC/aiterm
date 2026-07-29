@@ -316,6 +316,18 @@ fn strip_system_tags(text: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether a message is entirely system-injected markup, with nothing a
+/// person wrote left once the tagged blocks come out.
+///
+/// Used by the indexer to drop boilerplate that would otherwise appear in
+/// every session of an agent and make a search for any of its words match all
+/// of them. Deliberately all-or-nothing: a message that mixes a context block
+/// with real text is indexed whole, because guessing which half to keep is how
+/// you lose the half somebody wanted to find.
+pub(crate) fn is_only_system_block(text: &str) -> bool {
+    !text.trim().is_empty() && strip_system_tags(text).trim().is_empty()
+}
+
 /// System-injected meta prompts (memory summarizers, compression runs) that
 /// should never be shown as a session title.
 fn is_system_meta_prompt(text: &str) -> bool {
@@ -880,6 +892,75 @@ pub struct PreviewMsg {
 /// Tail of the human-visible conversation for a session — used by the
 /// pre-resume preview pane. Returns the last few user/assistant text
 /// messages, oldest first.
+/// Whether a line is worth parsing as JSON at all.
+///
+/// Both formats are one JSON object per line and most lines are neither a
+/// user nor an assistant message — tool calls, token counts, world state. A
+/// substring test costs a fraction of a parse, and transcripts run to
+/// megabytes.
+pub(crate) fn line_may_hold_message(line: &str) -> bool {
+    line.contains("\"type\":\"user\"")
+        || line.contains("\"type\":\"assistant\"")
+        || line.contains("\"type\":\"response_item\"")
+}
+
+/// The conversation message on one transcript line, as `(role, text)`.
+///
+/// One function for every agent rather than one per agent, because the two
+/// callers — the preview panel and the search indexer — must agree about what
+/// a session contains. They did not: both understood claude's shape only, so a
+/// Codex session previewed as blank and was indexed as having said nothing,
+/// while still appearing in the sidebar. A row you can see, cannot read and
+/// cannot find is worse than no row.
+///
+/// The shapes are distinct enough to handle in one pass, so nothing has to
+/// know which agent wrote the file:
+///
+/// - claude: `{"type":"user"|"assistant","message":{"content":…}}`, where
+///   content is a string or blocks of `{"type":"text","text":…}`.
+/// - Codex: `{"type":"response_item","payload":{"type":"message","role":…,
+///   "content":[{"type":"input_text"|"output_text","text":…}]}}`.
+///
+/// Codex's `developer` role is dropped. It carries the sandbox and permission
+/// preamble, which is not something you said and not something worth matching
+/// a search against — the same reason claude's meta-prompts are filtered.
+pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
+    let (role, content) = match v.get("type").and_then(|t| t.as_str()) {
+        Some(r @ ("user" | "assistant")) => (r.to_string(), v.pointer("/message/content")?),
+        Some("response_item") => {
+            let p = v.get("payload")?;
+            if p.get("type").and_then(|t| t.as_str()) != Some("message") {
+                return None;
+            }
+            match p.get("role").and_then(|r| r.as_str()) {
+                Some(r @ ("user" | "assistant")) => (r.to_string(), p.get("content")?),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    let mut text = String::new();
+    match content {
+        serde_json::Value::String(s) => text.push_str(s),
+        serde_json::Value::Array(blocks) => {
+            for b in blocks {
+                // `text` for claude, `input_text`/`output_text` for Codex.
+                // Matched on having text rather than on the tag, so a new tag
+                // for the same thing does not silently empty a transcript.
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+        }
+        _ => return None,
+    }
+    (!text.trim().is_empty()).then_some((role, text))
+}
+
 #[tauri::command]
 pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     const KEEP: usize = 12;
@@ -893,37 +974,19 @@ pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     let mut out: std::collections::VecDeque<PreviewMsg> = std::collections::VecDeque::new();
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         // Cheap substring filter before JSON parsing.
-        if !line.contains("\"type\":\"user\"") && !line.contains("\"type\":\"assistant\"") {
+        if !line_may_hold_message(&line) {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let role = match v.get("type").and_then(|t| t.as_str()) {
-            Some(r @ ("user" | "assistant")) => r.to_string(),
-            _ => continue,
-        };
         // Subagent traffic isn't part of the main conversation.
         if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
             continue;
         }
-        let mut text = String::new();
-        match v.pointer("/message/content") {
-            Some(serde_json::Value::String(s)) => text = s.clone(),
-            Some(serde_json::Value::Array(blocks)) => {
-                for b in blocks {
-                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(t);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        let Some((role, text)) = line_message(&v) else {
+            continue;
+        };
         let text = strip_system_tags(&text);
         if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
             continue;
@@ -2329,6 +2392,92 @@ pub fn materialize_fork(session_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg(line: &str) -> Option<(String, String)> {
+        assert!(
+            line_may_hold_message(line),
+            "prefilter would drop this line before it was ever parsed"
+        );
+        line_message(&serde_json::from_str(line).unwrap())
+    }
+
+    #[test]
+    fn reads_a_claude_message_in_both_content_shapes() {
+        assert_eq!(
+            msg(r#"{"type":"user","message":{"content":"plain string"}}"#),
+            Some(("user".into(), "plain string".into()))
+        );
+        assert_eq!(
+            msg(
+                r#"{"type":"assistant","message":{"content":[
+                   {"type":"text","text":"first"},{"type":"text","text":"second"}]}}"#
+            ),
+            Some(("assistant".into(), "first\nsecond".into()))
+        );
+    }
+
+    #[test]
+    fn reads_a_codex_message() {
+        // Shape from a real rollout, codex-cli 0.145.0.
+        assert_eq!(
+            msg(
+                r#"{"type":"response_item","payload":{"type":"message","role":"user",
+                   "content":[{"type":"input_text","text":"what does this do"}]}}"#
+            ),
+            Some(("user".into(), "what does this do".into()))
+        );
+        assert_eq!(
+            msg(
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant",
+                   "content":[{"type":"output_text","text":"it lists sessions"}]}}"#
+            ),
+            Some(("assistant".into(), "it lists sessions".into()))
+        );
+    }
+
+    #[test]
+    fn skips_what_is_not_conversation() {
+        // Codex's `developer` role is the sandbox preamble, not something the
+        // user said — indexing it would match every session on the same words.
+        assert_eq!(
+            msg(
+                r#"{"type":"response_item","payload":{"type":"message","role":"developer",
+                   "content":[{"type":"input_text","text":"<permissions instructions>"}]}}"#
+            ),
+            None
+        );
+        // A tool call carried on a response_item, not a message.
+        assert_eq!(
+            msg(r#"{"type":"response_item","payload":{"type":"function_call","name":"shell"}}"#),
+            None
+        );
+        // Empty content is not a message worth showing or searching.
+        assert_eq!(
+            msg(r#"{"type":"user","message":{"content":[{"type":"text","text":"   "}]}}"#),
+            None
+        );
+        // And the cheap prefilter must not waste a parse on the rest.
+        assert!(!line_may_hold_message(r#"{"type":"event_msg","payload":{"type":"token_count"}}"#));
+        assert!(!line_may_hold_message(r#"{"type":"world_state","payload":{"full":true}}"#));
+    }
+
+    #[test]
+    fn boilerplate_is_kept_out_of_the_index_but_real_text_is_not() {
+        // Codex opens every rollout with this. Indexed, one query matches
+        // every Codex session there is.
+        assert!(is_only_system_block(
+            "<environment_context>cwd /home/m, sandbox on</environment_context>"
+        ));
+        // A block plus something you actually said is indexed whole.
+        assert!(!is_only_system_block(
+            "<environment_context>noise</environment_context> why is the build failing"
+        ));
+        assert!(!is_only_system_block("just a normal question"));
+        // Angle brackets that are not a block — a generic in pasted code —
+        // must not look like boilerplate.
+        assert!(!is_only_system_block("fn f(v: Vec<String>) -> Option<u8>"));
+        assert!(!is_only_system_block(""));
+    }
 
     #[test]
     fn a_recorded_origin_sends_a_rollout_back_where_it_came_from() {
