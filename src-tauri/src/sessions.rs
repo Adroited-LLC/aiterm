@@ -591,6 +591,19 @@ pub fn session_delete(session_id: String) -> Result<(), String> {
     let dest = trash.join(format!("{session_id}.jsonl"));
     std::fs::rename(&path, &dest).map_err(|e| e.to_string())?;
     touch(&dest);
+    // Where it came from, so restore can put it back rather than deduce a
+    // destination. Deducing worked while every session was claude's and the
+    // convention was known; a Codex rollout lives at
+    // `~/.codex/sessions/<y>/<m>/<d>/rollout-<stamp>-<id>.jsonl`, which that
+    // deduction cannot produce and would silently restore into claude's tree
+    // instead — a file neither agent would ever find again.
+    //
+    // Best-effort: a missing sidecar falls back to the old behaviour, which is
+    // still right for everything trashed before this existed.
+    let origin = trash.join(format!("{session_id}.origin"));
+    if std::fs::write(&origin, path.to_string_lossy().as_bytes()).is_ok() {
+        touch(&origin);
+    }
     let tasks = home.join(".claude/tasks").join(&session_id);
     if tasks.is_dir() {
         let tasks_dest = trash.join(format!("{session_id}.tasks"));
@@ -720,6 +733,37 @@ pub fn trash_restore(session_id: String) -> Result<(), String> {
     if !src.exists() {
         return Err("session not in trash".into());
     }
+
+    // Where it was when it was deleted, if that was recorded. Exact beats
+    // deduced: it is right for any agent, including ones aiterm does not know
+    // about yet, and it survives the layout of a store changing underneath us.
+    let origin = trash.join(format!("{session_id}.origin"));
+    let home_dir = dirs::home_dir().ok_or("no home dir")?;
+    if let Some(dest) = std::fs::read_to_string(&origin)
+        .ok()
+        .as_deref()
+        .and_then(recorded_origin)
+        .filter(|p| !is_claude_transcript(p, &home_dir))
+    {
+        // Refuse rather than overwrite. Something already sitting at that path
+        // is a session with the same id that came back by another route, and
+        // clobbering it would destroy a real transcript to restore a deleted
+        // one — the one outcome worse than a failed restore.
+        if dest.exists() {
+            return Err(format!("{} already exists", dest.display()));
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&origin);
+        return restore_claude_sidecars(&trash, &session_id);
+    }
+
+    // No sidecar: trashed before this was recorded, so fall back to deducing a
+    // claude project directory from the transcript's cwd. Only ever correct
+    // for claude, which is all that could have been trashed back then.
+    //
     // The transcript's cwd decides which project dir it goes back to.
     let mut cwd: Option<String> = None;
     if let Ok(f) = File::open(&src) {
@@ -745,15 +789,50 @@ pub fn trash_restore(session_id: String) -> Result<(), String> {
     std::fs::create_dir_all(&proj_dir).map_err(|e| e.to_string())?;
     std::fs::rename(&src, proj_dir.join(format!("{session_id}.jsonl")))
         .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(trash.join(format!("{session_id}.origin")));
+    restore_claude_sidecars(&trash, &session_id)
+}
+
+/// The path a `.origin` sidecar names, if it names a usable one.
+///
+/// The sidecar is a plain path written by this app, so this is a sanity check
+/// rather than a trust boundary — but it decides where a `rename` lands, and
+/// an empty or relative one would put a transcript somewhere nobody would look
+/// for it. Anything that does not read as an absolute path falls back to the
+/// old deduction instead.
+fn recorded_origin(text: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(text.trim());
+    (p.is_absolute() && p.file_name().is_some()).then_some(p)
+}
+
+/// Whether a path is a claude transcript, i.e. lives under
+/// `~/.claude/projects`.
+///
+/// Claude's restore does not put a transcript back where it was — it works out
+/// the project directory the cwd belongs in, which quietly repairs one that
+/// was filed wrongly. That is worth keeping, so the recorded origin is used
+/// only where that reasoning cannot reach: a store whose layout aiterm has no
+/// rule for. For claude, deduction still wins.
+fn is_claude_transcript(path: &Path, home: &Path) -> bool {
+    path.starts_with(home.join(".claude/projects"))
+}
+
+/// Put back the two records Claude Code keeps beside a transcript.
+///
+/// Shared by both restore paths. Only claude has these — a Codex rollout is
+/// the whole of a Codex session — so for anything else these are simply
+/// absent, which is why nothing here treats a miss as a failure.
+fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("no home dir")?;
     let tasks_src = trash.join(format!("{session_id}.tasks"));
     if tasks_src.is_dir() {
-        let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(&session_id));
+        let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(session_id));
     }
     let job_src = trash.join(format!("{session_id}.job"));
     if job_src.is_dir() {
         let jobs = home.join(".claude/jobs");
         let _ = std::fs::create_dir_all(&jobs);
-        let _ = std::fs::rename(&job_src, jobs.join(job_dir_name(&job_src, &session_id)));
+        let _ = std::fs::rename(&job_src, jobs.join(job_dir_name(&job_src, session_id)));
     }
     Ok(())
 }
@@ -763,6 +842,7 @@ pub fn trash_delete(session_id: String) -> Result<(), String> {
     valid_id(&session_id)?;
     let trash = trash_dir().ok_or("no home dir")?;
     std::fs::remove_file(trash.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(trash.join(format!("{session_id}.origin")));
     let tasks = trash.join(format!("{session_id}.tasks"));
     if tasks.is_dir() {
         let _ = std::fs::remove_dir_all(tasks);
@@ -2249,6 +2329,50 @@ pub fn materialize_fork(session_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recorded_origin_sends_a_rollout_back_where_it_came_from() {
+        // The case this whole sidecar exists for: deducing a destination from
+        // the transcript can only ever produce a claude project directory, and
+        // a Codex rollout does not live in one.
+        assert_eq!(
+            recorded_origin(
+                "/home/m/.codex/sessions/2026/07/28/rollout-2026-07-28T20-43-28-abc.jsonl\n"
+            ),
+            Some(std::path::PathBuf::from(
+                "/home/m/.codex/sessions/2026/07/28/rollout-2026-07-28T20-43-28-abc.jsonl"
+            ))
+        );
+    }
+
+    #[test]
+    fn claude_still_restores_by_deduction_and_other_agents_by_record() {
+        let home = std::path::Path::new("/home/m");
+        // Claude: keep deducing, so a misfiled transcript is still repaired.
+        assert!(is_claude_transcript(
+            std::path::Path::new("/home/m/.claude/projects/-tmp/abc.jsonl"),
+            home
+        ));
+        // Codex: nothing here knows how to derive that path, so use the record.
+        assert!(!is_claude_transcript(
+            std::path::Path::new("/home/m/.codex/sessions/2026/07/28/rollout-x-abc.jsonl"),
+            home
+        ));
+        // Not fooled by a lookalike outside the projects tree.
+        assert!(!is_claude_transcript(
+            std::path::Path::new("/home/m/.claude/trash/abc.jsonl"),
+            home
+        ));
+    }
+
+    #[test]
+    fn an_unusable_origin_falls_back_instead_of_restoring_somewhere_odd() {
+        // Each of these would otherwise decide where a `rename` lands.
+        assert_eq!(recorded_origin(""), None);
+        assert_eq!(recorded_origin("   \n"), None);
+        assert_eq!(recorded_origin("relative/path.jsonl"), None);
+        assert_eq!(recorded_origin("/"), None);
+    }
 
     fn scratch(name: &str, body: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("aiterm-test-{}-{name}", std::process::id()));
