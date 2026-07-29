@@ -1350,15 +1350,18 @@ pub fn resolve_resumable_id(session_id: String) -> Option<String> {
 /// callers log outcomes and errors, not chatter.
 #[tauri::command]
 pub fn ui_log(msg: String) {
-    eprintln!("[aiterm-ui] {msg}");
+    crate::diag!("ui", "{msg}");
 }
 
 #[tauri::command]
 pub fn session_migrated_to(session_id: String) -> Option<String> {
     let out = session_migrated_to_inner(&session_id);
-    // TEMP diagnostics for the missed re-key (2026-07-27): journal-visible
-    // trace of every poll. Remove once the frontend path is proven.
-    eprintln!("[aiterm] session_migrated_to({session_id}) -> {out:?}");
+    // Only the answer, not the asking. This polls every 15s per active tab, and
+    // a line per poll buried the one line that mattered — which is the failure
+    // mode a log is supposed to prevent.
+    if let Some(moved) = &out {
+        crate::diag!("session", "{session_id} migrated to {moved}");
+    }
     out
 }
 

@@ -8,6 +8,7 @@ import {
   FontFamily, FontPackage,
   AgentDetection, detectAgents, homeAbbrev,
   fontPackages, installFontFiles, installFontPackage, listFonts,
+  diagEnvironment, diagLogPath, diagLogTail, openPath,
 } from "../ipc";
 
 interface Props {
@@ -23,7 +24,7 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
   { key: "agent", label: "Agent" },
 ];
 
-type Tab = "appearance" | "fonts" | "agents" | "models";
+type Tab = "appearance" | "fonts" | "agents" | "models" | "diagnostics";
 
 /** Shows the characters that actually separate one coding font from another. */
 const PREVIEW = "const ok = 0O1lI|; // {} => [a-z]* 3.14";
@@ -60,6 +61,19 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
   const [agents, setAgents] = useState<AgentDetection[] | null>(null);
   const refreshAgents = () => detectAgents().then(setAgents).catch(() => setAgents([]));
   useEffect(() => { if (tab === "agents" && agents === null) refreshAgents(); }, [tab, agents]);
+
+  // Diagnostics: what aiterm is and what it has been doing. Read on demand —
+  // the log tail is a file read and the environment spawns a detect, so
+  // neither belongs on a timer.
+  const [env, setEnv] = useState<[string, string][] | null>(null);
+  const [logTail, setLogTail] = useState<string | null>(null);
+  const [logPath, setLogPath] = useState<string | null>(null);
+  const refreshDiag = () => {
+    diagEnvironment().then(setEnv).catch(() => setEnv([]));
+    diagLogTail(300).then(setLogTail).catch(() => setLogTail(""));
+    diagLogPath().then(setLogPath).catch(() => setLogPath(null));
+  };
+  useEffect(() => { if (tab === "diagnostics" && env === null) refreshDiag(); }, [tab, env]);
 
   const set = (patch: Partial<AppSettings>) => onChange({ ...settings, ...patch });
   const setScale = (key: keyof PanelScales, v: number) =>
@@ -127,6 +141,10 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
               className={"set-tab" + (tab === "models" ? " on" : "")}
               onClick={() => setTab("models")}
             >Model access</button>
+            <button
+              className={"set-tab" + (tab === "diagnostics" ? " on" : "")}
+              onClick={() => setTab("diagnostics")}
+            >Diagnostics</button>
           </div>
           <button className="icon-btn" title="Close (Esc)" onClick={onClose}>✕</button>
         </div>
@@ -279,6 +297,53 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
 
           {tab === "models" && <ModelAccess />}
 
+          {/* Everything you would otherwise have to be talked through finding:
+              which build this is, what it can see, and what it has been doing.
+              The log survives the process, so a crash leaves something to read
+              instead of nothing. */}
+          {tab === "diagnostics" && <>
+            <div className="set-section">
+              <div className="set-label">
+                This build
+                <button className="set-recheck" onClick={refreshDiag}>Refresh</button>
+              </div>
+              {env === null ? (
+                <div className="set-hint">Looking…</div>
+              ) : (
+                <div className="diag-table">
+                  {env.map(([k, v]) => (
+                    <div key={k} className="diag-row">
+                      <span className="diag-key">{k}</span>
+                      <span className="diag-val">{homeAbbrev(v)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="set-section">
+              <div className="set-label">
+                Recent activity
+                <button
+                  className="set-recheck"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(
+                      (env ?? []).map(([k, v]) => `${k}: ${v}`).join("\n") +
+                        "\n\n" + (logTail ?? ""),
+                    );
+                    setNotice("Diagnostics copied — paste them into the chat.");
+                  }}
+                >Copy all</button>
+                {logPath && (
+                  <button className="set-recheck" onClick={() => openPath(logPath)}>
+                    Open folder
+                  </button>
+                )}
+              </div>
+              <pre className="diag-log">{logTail || "Nothing logged yet this run."}</pre>
+              {logPath && <div className="set-hint">{homeAbbrev(logPath)} — previous run kept as .log.1</div>}
+            </div>
+          </>}
+
           {tab === "agents" && <>
             <div className="set-section">
               <div className="set-label">
@@ -307,7 +372,8 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                         {a.path && <div className="agent-path">{homeAbbrev(a.path)}</div>}
                         {a.id === "codex" && a.available && (
                           <div className="agent-path">
-                            Detected, but aiterm does not read Codex sessions yet.
+                            Sessions are listed and searchable. Codex names its own
+                            sessions, so aiterm adopts the id once it starts.
                           </div>
                         )}
                       </div>

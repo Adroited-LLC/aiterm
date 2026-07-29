@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod cache;
+pub mod diag;
 pub mod fonts;
 pub mod fsx;
 pub mod git;
@@ -25,6 +26,10 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             agents::detect_agents,
+            agents::adopt_agent_session,
+            diag::diag_log_path,
+            diag::diag_log_tail,
+            diag::diag_environment,
             agents::agent_choices,
             agents::agent_launch_command,
             providers::providers_list,
@@ -77,9 +82,28 @@ pub fn run() {
             git::git_commit_diff,
         ])
         .setup(|app| {
-            // Push sessions-list refreshes when Claude's transcripts change
+            // First line of every log: which build this is and what launched
+            // it. The crash that took an hour to pin down last night was an
+            // aiterm started from inside another one's process tree, and the
+            // parent pid is the whole of that story.
+            crate::diag!(
+                "start",
+                "aiterm {} pid={} ppid={}",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                std::fs::read_to_string("/proc/self/status")
+                    .ok()
+                    .and_then(|s| s
+                        .lines()
+                        .find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().to_string())))
+                    .unwrap_or_else(|| "?".into())
+            );
+
+            // Push sessions-list refreshes when an agent's transcripts change
             // (new/cleared/forked sessions) instead of waiting for the 30s poll.
-            let _ = watcher::watch_claude_projects(app.handle().clone());
+            if let Err(e) = watcher::watch_claude_projects(app.handle().clone()) {
+                crate::diag!("start", "transcript watcher not running: {e}");
+            }
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.

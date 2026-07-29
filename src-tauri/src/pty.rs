@@ -323,12 +323,16 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
     // never happened.
     let skipped = strip_own_chain(&mut tree, &self_and_ancestors());
     if !skipped.is_empty() {
-        // Loud on purpose. The bug this guards against leaves no other trace.
-        eprintln!(
-            "[aiterm] kill_tree({root}): refusing to signal {skipped:?} — \
+        // Loud on purpose, and to the log file rather than stderr: the bug this
+        // guards against kills aiterm outright, so the evidence has to already
+        // be on disk by the time anyone thinks to look for it.
+        crate::diag!(
+            "pty",
+            "kill_tree({root}): refusing to signal {skipped:?} — \
              aiterm's own process chain is inside this tree"
         );
     }
+    crate::diag!("pty", "kill_tree({root}): signalling {} pid(s)", tree.len());
     for &pid in &tree {
         unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     }
