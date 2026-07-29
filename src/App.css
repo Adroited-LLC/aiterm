@@ -2032,6 +2032,23 @@ input[type="range"]::-webkit-slider-thumb {
 .agent-text { min-width: 0; }
 .agent-name { font-size: 12.5px; color: var(--text); display: flex; gap: 8px; align-items: baseline; }
 .agent-state { font-size: 11px; color: var(--text-dim); }
+/* Weight picker: each button drawn at the weight it selects, so the choice is
+   made by looking rather than by reading a number. */
+.weight-row { display: flex; gap: 6px; margin: 6px 0 4px; }
+.weight-btn {
+  flex: 1;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 6px 4px;
+  cursor: pointer;
+}
+.weight-btn:hover { color: var(--text); border-color: var(--accent); }
+.weight-btn.on { color: var(--text); border-color: var(--accent); background: var(--bg-active); }
+
 /* Diagnostics: a fact table and a log tail. Monospace throughout — this is
    output to be read and pasted, not prose. */
 .diag-table { display: flex; flex-direction: column; gap: 2px; margin: 6px 0 10px; }

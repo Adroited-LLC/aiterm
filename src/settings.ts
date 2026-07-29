@@ -17,6 +17,14 @@ export interface AppSettings {
   termFont: string;
   /** Terminal base font size in px (global zoom multiplies this). */
   termFontSize: number;
+  /** Terminal line spacing as a multiple of the font's natural line height.
+   *  1 is the font's own metrics; 1.1 adds a tenth of a line between rows.
+   *  A multiplier rather than pixels so it holds at any font size — the gap
+   *  that looks right at 13px is cramped at 20. */
+  termLineHeight: number;
+  /** Weight for ordinary terminal text. Bold stays heavier than whatever this
+   *  is, so emphasis keeps working — see `termFontWeightBold`. */
+  termFontWeight: number;
   panelScale: PanelScales;
 }
 
@@ -26,8 +34,32 @@ export const DEFAULT_SETTINGS: AppSettings = {
   uiFont: "",
   termFont: "",
   termFontSize: 13,
+  // A touch of air by default. Monospace faces are drawn to sit tightly and a
+  // terminal packs every line against the next, which is what makes a wall of
+  // output hard to track a line across.
+  termLineHeight: 1.1,
+  termFontWeight: 400,
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
 };
+
+/** Weights offered for terminal text, and what to call them.
+ *
+ *  Stops at 600. Bold is drawn at one step heavier than the chosen weight, and
+ *  most monospace families stop at Bold — pick 700 for body text and emphasis
+ *  has nowhere left to go, so a TUI that uses bold to mean something loses the
+ *  distinction entirely.
+ */
+export const TERM_WEIGHTS: { value: number; label: string }[] = [
+  { value: 300, label: "Light" },
+  { value: 400, label: "Regular" },
+  { value: 500, label: "Medium" },
+  { value: 600, label: "SemiBold" },
+];
+
+/** The weight bold text is drawn at, given the weight body text uses. */
+export function boldWeightFor(weight: number): number {
+  return Math.min(900, weight + 200);
+}
 
 const SETTINGS_KEY = "aiterm.settings";
 

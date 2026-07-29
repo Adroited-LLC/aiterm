@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
+import { boldWeightFor } from "../settings";
 import "@xterm/xterm/css/xterm.css";
 
 /** Attach the GPU WebGL renderer. It owns its own surface and clears+repaints
@@ -104,11 +105,16 @@ interface Props {
   autoFocus: boolean;
   fontSize: number;
   fontFamily: string;
+  /** Row spacing as a multiple of the font's natural line height. */
+  lineHeight: number;
+  /** Weight for ordinary text; bold is derived from it. */
+  fontWeight: number;
   theme: Record<string, string>;
 }
 
 export default function TerminalView({
-  tab, active, onExit, onRegister, onActivity, onAttention, autoFocus, fontSize, fontFamily, theme,
+  tab, active, onExit, onRegister, onActivity, onAttention, autoFocus, fontSize, fontFamily,
+  lineHeight, fontWeight, theme,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -123,18 +129,13 @@ export default function TerminalView({
     const term = new Terminal({
       fontFamily,
       fontSize,
-      // Heavier than the 400 xterm defaults to. The WebGL renderer rasterises
-      // its own glyph atlas, which means grayscale antialiasing and none of
-      // the subpixel rendering or hinting the rest of the app gets from the
-      // browser — at ~81 DPI that reads as thin and washed out beside the
-      // panels. A little more weight is what closes the gap without giving up
-      // the renderer.
-      //
-      // 500, not 700: bold stays 700, and a font whose heaviest face is Bold —
-      // IBM Plex Mono, among others — would render emphasis identically to
-      // body text if normal were already there.
-      fontWeight: 500,
-      fontWeightBold: 700,
+      // Both settable, because the right answer depends on the font, the
+      // screen and the eyes reading it. A fixed 500 was tried to compensate
+      // for the WebGL renderer's grayscale antialiasing and read as too heavy
+      // — synthesised weight is not the same as a face drawn at that weight.
+      lineHeight,
+      fontWeight,
+      fontWeightBold: boldWeightFor(fontWeight),
       cursorBlink: true,
       allowProposedApi: true,
       theme,
@@ -290,6 +291,28 @@ export default function TerminalView({
       fitRef.current?.fit();
     }
   }, [fontFamily]);
+
+  // Refit, because row spacing changes how many rows fit — without it the
+  // terminal keeps its old row count and the child is told a size that is no
+  // longer true.
+  useEffect(() => {
+    const term = termRef.current;
+    if (term && term.options.lineHeight !== lineHeight) {
+      term.options.lineHeight = lineHeight;
+      fitRef.current?.fit();
+    }
+  }, [lineHeight]);
+
+  // Refit too: a heavier face can be wider, so the columns that fit change
+  // with it.
+  useEffect(() => {
+    const term = termRef.current;
+    if (term && term.options.fontWeight !== fontWeight) {
+      term.options.fontWeight = fontWeight;
+      term.options.fontWeightBold = boldWeightFor(fontWeight);
+      fitRef.current?.fit();
+    }
+  }, [fontWeight]);
 
   useEffect(() => {
     if (termRef.current) termRef.current.options.theme = theme;
