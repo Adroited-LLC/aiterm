@@ -8,19 +8,24 @@ pub mod indexer;
 pub mod providers;
 pub mod pty;
 pub mod sessions;
+pub mod trace;
 pub mod usage;
 pub mod watcher;
 pub mod winstate;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    trace::init();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty::PtyManager::default())
         .manage(watcher::WatchState::default())
-        .invoke_handler(tauri::generate_handler![
+        // Wrapped so a debug build logs every IPC call before it dispatches.
+        // In release `log_invokes` is the identity function and the generated
+        // handler is passed straight through — see `trace.rs`.
+        .invoke_handler(trace::log_invokes(tauri::generate_handler![
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,
@@ -80,7 +85,7 @@ pub fn run() {
             git::git_log,
             git::git_diff_file,
             git::git_commit_diff,
-        ])
+        ]))
         .setup(|app| {
             // First line of every log: which build this is and what launched
             // it. The crash that took an hour to pin down last night was an

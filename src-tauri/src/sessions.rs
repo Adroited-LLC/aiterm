@@ -1559,6 +1559,11 @@ fn session_moved_to_inner(session_id: &str) -> Option<SessionMove> {
 /// Split from `session_moved_to_inner` so the rules can be tested against a
 /// temp directory: everything above this point resolves a session id through
 /// the real `~/.claude`, and everything below is decided by the files alone.
+///
+/// Instrumented because this is where the decision gets made, and when it
+/// decides wrong the only useful question is which candidate it saw and what it
+/// believed about each one. Compiled away in release (see [`crate::trace`]).
+#[tracing::instrument(level = "debug", skip_all, fields(parent = ?parent.file_name()))]
 fn moved_to_in_dir(parent: &Path) -> Option<SessionMove> {
     let parent_mtime = mtime_of(parent).unwrap_or(0);
     let dir = parent.parent()?;
@@ -1584,6 +1589,12 @@ fn moved_to_in_dir(parent: &Path) -> Option<SessionMove> {
         }
     }
     siblings.sort_by(|a, b| a.0.cmp(&b.0));
+    tracing::debug!(
+        parent_mtime,
+        candidates = siblings.len(),
+        oldest = ?siblings.first().map(|(_, p)| p.file_name()),
+        "siblings written since the parent stopped"
+    );
 
     // Daemon migration first: it is the stronger claim of the two, checked
     // against the parent's own uuids rather than inferred from timing, so the
@@ -1616,6 +1627,12 @@ fn moved_to_in_dir(parent: &Path) -> Option<SessionMove> {
     // safe direction to be wrong in, and the reason the rule is this narrow.
     let (_, first) = siblings.first()?;
     let facts = read_head_facts(first)?;
+    tracing::debug!(
+        candidate = ?first.file_name(),
+        born_from_clear = facts.born_from_clear,
+        links = facts.links.len(),
+        "testing the first transcript written after the parent stopped"
+    );
     if facts.born_from_clear && !file_has_any_uuid(parent, &facts.links) {
         return Some(SessionMove {
             id: first.file_stem()?.to_string_lossy().into_owned(),

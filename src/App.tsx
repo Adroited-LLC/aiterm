@@ -97,6 +97,10 @@ interface PanelSizes {
 interface EndedWhy {
   code: number | null;
   signal: string | null;
+  /** Not a death at all: the conversation was cleared, and this tab is the
+   *  history it left behind. Its process is alive and well — it belongs to the
+   *  cleared session, in the tab that took this one's place. */
+  cleared?: boolean;
 }
 
 /** Say how a process ended without inventing a reason it didn't have.
@@ -107,6 +111,9 @@ interface EndedWhy {
  *  looking for a bug instead of for whoever killed it. */
 function describeEnd(why: EndedWhy | undefined): string {
   if (!why) return "";
+  if (why.cleared) {
+    return "Everything said up to the moment it was cleared is still on disk.";
+  }
   if (why.signal) return `The process was stopped (${why.signal}).`;
   if (why.code === null) return "The process is gone and its exit status could not be read.";
   return `The process exited with status ${why.code}.`;
@@ -687,6 +694,12 @@ export default function App() {
     const pinned = activeTabObj?.sessionId;
     const title = activeTabObj?.title ?? "This session";
     if (key === undefined || !pinned) return;
+    // A historical tab is the conversation that was left behind — it has no
+    // process, so nothing can move out from under it. Watching one would find
+    // the very successor that created it and re-key the history onto the live
+    // session, leaving two tabs on one conversation and no way back to the
+    // context this tab exists to hold.
+    if (activeTabObj?.historical) return;
     // A session aiterm started that has not written its transcript yet has
     // nothing to have migrated *from*, so this would poll a file that does not
     // exist until the first prompt lands. Narrow on purpose: only a `fresh`
@@ -706,12 +719,38 @@ export default function App() {
         // the click that focuses an existing terminal instead of opening
         // another. Leaving it on the old id was the second half of this bug:
         // the tab kept the frozen row and the live one looked free to open.
-        setTabs((ts) =>
-          ts.map((x) => (x.key === key ? { ...x, sessionId: moved.id, slotId: moved.id } : x)),
-        );
+        //
+        // A clear also leaves a finished conversation behind, and it gets a tab
+        // of its own — ended, resumable, sitting where the live one used to be.
+        // Matt's shape: the session the command ran in becomes history you can
+        // open, and the new conversation is the live tab. (A migration gets no
+        // such tab: there the old id is a dead end, not a conversation to go
+        // back to.)
+        const histKey = moved.kind === "cleared" ? nextKey.current++ : null;
+        setTabs((ts) => {
+          const i = ts.findIndex((x) => x.key === key);
+          if (i < 0) return ts;
+          const next = [...ts];
+          next[i] = { ...ts[i], sessionId: moved.id, slotId: moved.id };
+          if (histKey !== null) {
+            next.splice(i, 0, {
+              key: histKey,
+              title: ts[i].title,
+              cwd: ts[i].cwd,
+              command: null,
+              sessionId: pinned,
+              slotId: pinned,
+              historical: true,
+            });
+          }
+          return next;
+        });
+        if (histKey !== null) {
+          setEnded((m) => new Map(m).set(histKey, { code: 0, signal: null, cleared: true }));
+        }
         setNotice(
           moved.kind === "cleared"
-            ? `"${title}" was cleared — this tab now follows the new conversation, and the old one is still in the sidebar.`
+            ? `"${title}" was cleared — the conversation up to that point is the tab beside this one, and this tab is the new one.`
             : `"${title}" moved to a background session — its panels now follow the live one.`,
         );
         refreshSessionList();
@@ -739,7 +778,8 @@ export default function App() {
       clearInterval(id);
       grace.forEach(clearTimeout);
     };
-  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title, freshUnwritten,
+  }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title,
+      activeTabObj?.historical, freshUnwritten,
       refreshSessionList, agentsView]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
@@ -1218,7 +1258,10 @@ export default function App() {
 
         <div className="panel terminal-panel">
           <div className="term-stack">
-            {tabs.map((t) => (
+            {/* Historical tabs get no terminal — mounting one would spawn a
+                second agent on a conversation that already has one. The ended
+                overlay below is their whole pane. */}
+            {tabs.filter((t) => !t.historical).map((t) => (
               <TerminalView
                 key={t.key}
                 tab={t}
@@ -1245,20 +1288,31 @@ export default function App() {
                       existed — and a dialog that says one false thing is not
                       worth trusting about the true ones. */}
                   <div className="term-ended-title">
-                    {activeTabObj?.sessionId
-                      ? "This session ended on its own"
-                      : "This shell ended on its own"}
+                    {ended.get(activeTab)?.cleared
+                      ? "This conversation was cleared"
+                      : activeTabObj?.sessionId
+                        ? "This session ended on its own"
+                        : "This shell ended on its own"}
                   </div>
                   <div className="term-ended-sub">
                     {describeEnd(ended.get(activeTab))}
-                    {activeTabObj?.sessionId
+                    {activeTabObj?.sessionId && !ended.get(activeTab)?.cleared
                       ? " Nothing was lost — the transcript is still on disk."
                       : ""}
                   </div>
-                  {activeTabObj?.sessionId && (
+                  {/* The `claude agents` note explains an unasked-for death. A
+                      clear was asked for, so saying it here would send Matt
+                      looking for someone who killed something. */}
+                  {activeTabObj?.sessionId && !ended.get(activeTab)?.cleared && (
                     <div className="term-ended-sub dim">
                       A session listed by <code>claude agents</code> can be stopped from
                       any terminal, or from your phone. That looks exactly like this.
+                    </div>
+                  )}
+                  {ended.get(activeTab)?.cleared && (
+                    <div className="term-ended-sub dim">
+                      There is no scrollback here — the terminal it ran in belongs to
+                      the cleared conversation now. Resume to read it back.
                     </div>
                   )}
                   <div className="term-ended-acts">
