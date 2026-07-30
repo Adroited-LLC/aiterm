@@ -129,11 +129,21 @@ export const bgAgentSessionIds = () =>
 // cost a tab. See `unstoppable_session_ids`.
 export const unstoppableSessionIds = () =>
   invoke<string[]>("unstoppable_session_ids");
-// The session that took over this one's conversation by migrating to the
-// daemon (opening the agents view does this), or null — the normal answer.
-// A tab pinned to the parent shows live text over dead panels until it re-keys.
-export const sessionMigratedTo = (sessionId: string) =>
-  invoke<string | null>("session_migrated_to", { sessionId });
+/** How a conversation left the session id a tab is pinned to.
+ *  - `background`: the agents view moved it to the daemon; the old id is a dead
+ *    end that nothing will write again.
+ *  - `cleared`: `/clear` started a fresh conversation in the same terminal; the
+ *    old id is a finished conversation that stays resumable on its own. */
+export type MoveKind = "background" | "cleared";
+export interface SessionMove {
+  id: string;
+  kind: MoveKind;
+}
+// The session that took over this one's conversation, or null — the normal
+// answer. A tab pinned to the old id shows live text over dead panels until it
+// re-keys, and its live conversation sits unowned in the sidebar.
+export const sessionMovedTo = (sessionId: string) =>
+  invoke<SessionMove | null>("session_moved_to", { sessionId });
 // Journal-visible logging from the webview. Release builds drop the console,
 // so errors the UI catches quietly would otherwise vanish — send the ones
 // worth keeping to stderr, where journalctl already collects them.

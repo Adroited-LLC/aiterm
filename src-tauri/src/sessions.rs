@@ -1463,15 +1463,47 @@ pub fn resolve_resumable_id(session_id: String) -> Option<String> {
     Some(path.file_stem()?.to_string_lossy().into_owned())
 }
 
-/// The session that took over `session_id`'s conversation by migrating to the
-/// daemon, if one has. `None` is the normal answer.
+/// Frontend-to-journal logging. The webview's console goes nowhere in a
+/// release build; errors the UI swallows (a failed invoke, a rejected promise)
+/// were invisible, which is how a dead code path survives testing. Low volume:
+/// callers log outcomes and errors, not chatter.
+#[tauri::command]
+pub fn ui_log(msg: String) {
+    crate::diag!("ui", "{msg}");
+}
+
+/// Why a tab's pinned session id stopped being the live one. The two need
+/// telling apart, because they leave the old conversation in opposite states.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MoveKind {
+    /// The agents view moved the conversation to the daemon. The old id is a
+    /// dead end — it holds the history, but nothing will write it again.
+    Background,
+    /// `/clear` started a fresh conversation in the same terminal. The old id is
+    /// a complete conversation that stays independently resumable, so its row
+    /// belongs in the sidebar; what changes is which row the tab owns.
+    Cleared,
+}
+
+/// The session that took over a tab's conversation, and how.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SessionMove {
+    pub id: String,
+    pub kind: MoveKind,
+}
+
+/// The session that took over `session_id`'s conversation, if one has. `None`
+/// is the normal answer. Two things do this, and they are detected differently
+/// because they leave completely different traces.
 ///
-/// Opening Claude Code's agents view — left arrow, on an empty prompt — moves
-/// the running conversation to the daemon. What lands on disk is a *new*
-/// transcript under a new session id: the original stops at that instant and
-/// never moves again, while the pty in the tab goes on rendering the child. A
-/// tab pinned to the parent then shows live text over dead panels — its clock
-/// stops and Agents/Tasks/Artifacts read a file nothing is writing.
+/// **Migration to the daemon.** Opening Claude Code's agents view — left arrow,
+/// on an empty prompt — moves the running conversation to the daemon. What lands
+/// on disk is a *new* transcript under a new session id: the original stops at
+/// that instant and never moves again, while the pty in the tab goes on
+/// rendering the child. A tab pinned to the parent then shows live text over
+/// dead panels — its clock stops and Agents/Tasks/Artifacts read a file nothing
+/// is writing.
 ///
 /// Nothing in the job state links the two. A migrated job records
 /// `interactiveLineage` but no `forkParentSessionId`, so `fork_parent_map`
@@ -1487,28 +1519,33 @@ pub fn resolve_resumable_id(session_id: String) -> Option<String> {
 /// matches an ordinary `--fork-session` branch — which must never re-key a
 /// tab, because forking leaves the parent independently resumable and still
 /// running, and that parent is what the tab actually holds.
-/// Frontend-to-journal logging. The webview's console goes nowhere in a
-/// release build; errors the UI swallows (a failed invoke, a rejected promise)
-/// were invisible, which is how a dead code path survives testing. Low volume:
-/// callers log outcomes and errors, not chatter.
+///
+/// **`/clear`.** Same visible symptom, no shared trace at all: the child's
+/// first record has `parentUuid: null`, it is not `bg`, and not one uuid is
+/// common to the two files, so the rule above is structurally blind to it. That
+/// blindness is what left a cleared tab pinned to a frozen transcript while its
+/// live conversation sat unowned in the sidebar — click that row and a *second*
+/// claude opens on it. Detected instead from the child's own head, which carries
+/// Claude Code's echo of the command that made it (see [`CLEAR_ECHO`]), paired
+/// with being the first transcript written after the parent stopped.
 #[tauri::command]
-pub fn ui_log(msg: String) {
-    crate::diag!("ui", "{msg}");
-}
-
-#[tauri::command]
-pub fn session_migrated_to(session_id: String) -> Option<String> {
-    let out = session_migrated_to_inner(&session_id);
+pub fn session_moved_to(session_id: String) -> Option<SessionMove> {
+    let out = session_moved_to_inner(&session_id);
     // Only the answer, not the asking. This polls every 15s per active tab, and
     // a line per poll buried the one line that mattered — which is the failure
     // mode a log is supposed to prevent.
     if let Some(moved) = &out {
-        crate::diag!("session", "{session_id} migrated to {moved}");
+        crate::diag!(
+            "session",
+            "{session_id} moved to {} ({:?})",
+            moved.id,
+            moved.kind
+        );
     }
     out
 }
 
-fn session_migrated_to_inner(session_id: &str) -> Option<String> {
+fn session_moved_to_inner(session_id: &str) -> Option<SessionMove> {
     let parent = find_session_file(session_id)?;
     if parent
         .file_name()
@@ -1516,48 +1553,113 @@ fn session_migrated_to_inner(session_id: &str) -> Option<String> {
     {
         return None; // retired transcripts are resolve_live_session_file's job
     }
-    let parent_mtime = mtime_of(&parent).unwrap_or(0);
+    moved_to_in_dir(&parent)
+}
+
+/// Split from `session_moved_to_inner` so the rules can be tested against a
+/// temp directory: everything above this point resolves a session id through
+/// the real `~/.claude`, and everything below is decided by the files alone.
+fn moved_to_in_dir(parent: &Path) -> Option<SessionMove> {
+    let parent_mtime = mtime_of(parent).unwrap_or(0);
     let dir = parent.parent()?;
 
-    let mut best: Option<(u64, String)> = None;
+    // Every sibling written no earlier than the instant the parent stopped — a
+    // child cannot predate its parent's last word. Oldest first, because the
+    // `/clear` rule below turns on which one came *next*.
+    let mut siblings: Vec<(u64, std::path::PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
         if path == parent || path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
-        let name = path.file_name()?.to_string_lossy().into_owned();
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
         if name.contains(".orphaned-") {
             continue;
         }
-        // A child cannot predate the instant its parent stopped.
         let m = mtime_of(&path).unwrap_or(0);
-        if m < parent_mtime {
-            continue;
+        if m >= parent_mtime {
+            siblings.push((m, path));
         }
-        if best.as_ref().is_some_and(|(bm, _)| m <= *bm) {
-            continue; // already holding a newer candidate
-        }
-        let Some((links, is_bg)) = read_lineage_links(&path) else {
+    }
+    siblings.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Daemon migration first: it is the stronger claim of the two, checked
+    // against the parent's own uuids rather than inferred from timing, so the
+    // newest sibling that satisfies it wins.
+    for (_, path) in siblings.iter().rev() {
+        let Some(facts) = read_head_facts(path) else {
             continue;
         };
-        if !is_bg || links.is_empty() || !file_has_any_uuid(&parent, &links) {
-            continue;
+        if facts.is_bg && !facts.links.is_empty() && file_has_any_uuid(parent, &facts.links) {
+            if let Some(stem) = path.file_stem() {
+                return Some(SessionMove {
+                    id: stem.to_string_lossy().into_owned(),
+                    kind: MoveKind::Background,
+                });
+            }
         }
-        best = Some((m, path.file_stem()?.to_string_lossy().into_owned()));
     }
-    best.map(|(_, id)| id)
+
+    // `/clear`, which leaves nothing to verify against: the child shares no
+    // ancestry with the parent, so timing is the only link there is. Only the
+    // *first* transcript written after the parent stopped is eligible — that is
+    // what "what this terminal did next" means, and it is what keeps a second
+    // idle tab in the same project from being re-keyed onto someone else's
+    // cleared conversation.
+    //
+    // The honest limitation: two idle tabs in one project, and the disk cannot
+    // say which of them was cleared. This rule picks the one that spoke last,
+    // which is the one a person was just using. When it picks wrong the cost is
+    // no re-key, not a tab pointed at a stranger's conversation — which is the
+    // safe direction to be wrong in, and the reason the rule is this narrow.
+    let (_, first) = siblings.first()?;
+    let facts = read_head_facts(first)?;
+    if facts.born_from_clear && !file_has_any_uuid(parent, &facts.links) {
+        return Some(SessionMove {
+            id: first.file_stem()?.to_string_lossy().into_owned(),
+            kind: MoveKind::Cleared,
+        });
+    }
+    None
 }
 
-/// The uuids a transcript claims as its ancestry, plus whether it runs under
-/// the daemon. Reads only the head of the file — copied history sits at the
-/// front, so scanning a multi-megabyte tail to re-learn the same answer is
-/// waste.
-fn read_lineage_links(path: &Path) -> Option<(std::collections::HashSet<String>, bool)> {
+/// Claude Code's own echo of the slash command that opened a transcript.
+///
+/// `/clear` keeps the terminal and starts a brand-new session id, and this
+/// marker in the new transcript's head is the only record anywhere that says
+/// why it exists — the child shares no uuid, no `sessionKind` and no job-state
+/// link with the conversation it replaced. Measured against a specimen captured
+/// 2026-07-29 (Claude Code 2.1.220): the child's first real user record is this
+/// echo, and its first record's `parentUuid` is `null`.
+const CLEAR_ECHO: &str = "<command-name>/clear</command-name>";
+
+/// What a transcript's own head says about where it came from.
+struct HeadFacts {
+    /// uuids it claims as ancestry, via `parentUuid`/`logicalParentUuid`.
+    links: std::collections::HashSet<String>,
+    /// Runs under the daemon (`sessionKind: "bg"`).
+    is_bg: bool,
+    /// Its first real user turn is the `/clear` echo. "First" matters: it is
+    /// what separates a transcript *created by* the command from one that
+    /// merely mentions it in a later prompt.
+    born_from_clear: bool,
+}
+
+/// Read only the head of a transcript — copied history and the opening command
+/// both sit at the front, so scanning a multi-megabyte tail to re-learn the
+/// same answer is waste.
+fn read_head_facts(path: &Path) -> Option<HeadFacts> {
     const MAX_RECORDS: usize = 500;
     const MAX_LINKS: usize = 64;
     let file = File::open(path).ok()?;
     let mut links = std::collections::HashSet::new();
     let mut is_bg = false;
+    let mut born_from_clear = false;
+    // Set once the opening turn has been seen, so nothing later can change the
+    // answer about how this transcript started.
+    let mut opening_settled = false;
     for line in BufReader::new(file)
         .lines()
         .map_while(Result::ok)
@@ -1576,8 +1678,39 @@ fn read_lineage_links(path: &Path) -> Option<(std::collections::HashSet<String>,
                 }
             }
         }
+        if opening_settled {
+            continue;
+        }
+        match v.get("type").and_then(|t| t.as_str()) {
+            // A reply means the conversation was already under way, so whatever
+            // opened it was not a command echo.
+            Some("assistant") => opening_settled = true,
+            // Claude Code writes its own bookkeeping as `user` records flagged
+            // `isMeta` — the local-command caveat sits directly in front of the
+            // echo — so those are not the opening turn.
+            Some("user") if v.get("isMeta").and_then(|m| m.as_bool()) != Some(true) => {
+                opening_settled = true;
+                born_from_clear = message_text(&v).contains(CLEAR_ECHO);
+            }
+            _ => {}
+        }
     }
-    Some((links, is_bg))
+    Some(HeadFacts {
+        links,
+        is_bg,
+        born_from_clear,
+    })
+}
+
+/// A record's message content as searchable text. Content is a bare string for
+/// command echoes and an array of blocks for ordinary turns; serialising the
+/// non-string case keeps one match arm working for both.
+fn message_text(v: &serde_json::Value) -> String {
+    match v.pointer("/message/content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
 }
 
 /// Whether any record in `path` carries one of `uuids` as its own `uuid`.
@@ -1714,22 +1847,26 @@ fn extract_session_id(val: &str) -> Option<String> {
 /// actually running.
 ///
 /// One more distinction, learned the same way: an *interactive* roster entry
-/// whose conversation has migrated to the daemon is a renderer, not a
-/// conversation. The client process stays alive under the old id for as long
-/// as the tab is open, so the roster reports it forever — and its row wore a
-/// green dot over a transcript nothing will ever write again. If the same
-/// linkage the tab re-key trusts says the conversation moved, the old id is
-/// not "alive" in any sense the sidebar should report. Background entries are
-/// never filtered: the migrated-to session IS the live one.
+/// whose conversation has moved on is a renderer, not a conversation. The
+/// client process stays alive under the old id for as long as the tab is open,
+/// so the roster reports it forever — and its row wore a green dot over a
+/// transcript nothing will ever write again. If the same linkage the tab re-key
+/// trusts says the conversation moved, the old id is not "alive" in any sense
+/// the sidebar should report. Background entries are never filtered: the
+/// moved-to session IS the live one.
 ///
-/// Cost note: the migration scan is mtime-gated, so for a healthy interactive
-/// session (its own transcript newest in the dir) it rejects every candidate
-/// without reading them.
+/// Both kinds of move count here. A `/clear`ed id is as finished as a migrated
+/// one — and dropping it has a second benefit, since a session with no live
+/// process resumes in place instead of being forked.
+///
+/// Cost note: the scan is mtime-gated, so for a healthy interactive session
+/// (its own transcript newest in the dir) it rejects every candidate without
+/// reading them.
 #[tauri::command]
 pub fn live_session_ids() -> Vec<String> {
     read_roster()
         .into_iter()
-        .filter(|e| e.background || session_migrated_to_inner(&e.session_id).is_none())
+        .filter(|e| e.background || session_moved_to_inner(&e.session_id).is_none())
         .map(|e| e.session_id)
         .collect()
 }
@@ -3049,15 +3186,21 @@ mod migration_tests {
             &[r#"{"type":"user","parentUuid":"AAA","uuid":"CCC"}"#],
         );
 
-        let (links, is_bg) = read_lineage_links(&child).unwrap();
-        assert!(is_bg, "child should be recognised as a daemon session");
-        assert!(links.contains("AAA"), "child should claim the parent's uuid");
-        assert!(file_has_any_uuid(&parent, &links), "AAA lives in the parent");
-
-        let (blinks, bbg) = read_lineage_links(&branch).unwrap();
-        assert!(!bbg, "a --fork-session branch is not a daemon session");
+        let facts = read_head_facts(&child).unwrap();
+        assert!(facts.is_bg, "child should be recognised as a daemon session");
         assert!(
-            file_has_any_uuid(&parent, &blinks),
+            facts.links.contains("AAA"),
+            "child should claim the parent's uuid"
+        );
+        assert!(
+            file_has_any_uuid(&parent, &facts.links),
+            "AAA lives in the parent"
+        );
+
+        let bfacts = read_head_facts(&branch).unwrap();
+        assert!(!bfacts.is_bg, "a --fork-session branch is not a daemon session");
+        assert!(
+            file_has_any_uuid(&parent, &bfacts.links),
             "the branch does share ancestry — which is exactly why bg is required too"
         );
 
@@ -3066,21 +3209,204 @@ mod migration_tests {
             "unrelated.jsonl",
             &[r#"{"type":"user","parentUuid":"ZZZ","uuid":"DDD","sessionKind":"bg"}"#],
         );
-        let (ulinks, _) = read_lineage_links(&unrelated).unwrap();
+        let ufacts = read_head_facts(&unrelated).unwrap();
         assert!(
-            !file_has_any_uuid(&parent, &ulinks),
+            !file_has_any_uuid(&parent, &ufacts.links),
             "an unrelated bg session must not resolve into this parent"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Deterministic mtimes. The `/clear` rule turns on which sibling was
+    /// written first, and consecutive writes in a test can land in the same
+    /// millisecond — which would make the ordering, and the test, a coin flip.
+    fn touch_at(path: &Path, millis: u64) {
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis);
+        let f = File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aiterm-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The head of a real `/clear` child, captured 2026-07-29: a hook
+    /// attachment, the local-command caveat as an `isMeta` user record, then the
+    /// command echo. Nothing here names the parent — that is the whole point.
+    const CLEAR_CHILD: &[&str] = &[
+        r#"{"type":"custom-title","customTitle":"work-pc","sessionId":"child"}"#,
+        r#"{"parentUuid":null,"isSidechain":false,"attachment":{"type":"hook_success","hookName":"SessionStart:clear"}}"#,
+        r#"{"type":"user","isMeta":true,"uuid":"m1","parentUuid":null,"message":{"role":"user","content":"<local-command-caveat>Caveat: …</local-command-caveat>"}}"#,
+        r#"{"type":"user","uuid":"c1","parentUuid":"m1","message":{"role":"user","content":"<command-name>/clear</command-name>\n<command-args></command-args>"}}"#,
+    ];
+
+    #[test]
+    fn a_transcript_says_for_itself_that_clear_made_it() {
+        let tmp = temp_dir("clear-head");
+        let child = write_jsonl(&tmp, "child.jsonl", CLEAR_CHILD);
+        let facts = read_head_facts(&child).unwrap();
+        assert!(
+            facts.born_from_clear,
+            "the command echo is the child's own account of why it exists"
+        );
+        assert!(!facts.is_bg, "/clear does not move anything to the daemon");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_session_that_opened_with_a_prompt_was_not_cleared() {
+        let tmp = temp_dir("clear-negative");
+        // An ordinary session. It later *mentions* the command, which must not
+        // count: only the opening turn says how a transcript began.
+        let plain = write_jsonl(&tmp, "plain.jsonl", &[
+            r#"{"type":"user","uuid":"p1","message":{"role":"user","content":"fix the build"}}"#,
+            r#"{"type":"assistant","uuid":"p2","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"user","uuid":"p3","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
+        ]);
+        assert!(!read_head_facts(&plain).unwrap().born_from_clear);
+
+        // And a resumed session, which opens on an assistant record.
+        let resumed = write_jsonl(&tmp, "resumed.jsonl", &[
+            r#"{"type":"assistant","uuid":"r1","message":{"role":"assistant","content":[{"type":"text","text":"back"}]}}"#,
+            r#"{"type":"user","uuid":"r2","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
+        ]);
+        assert!(!read_head_facts(&resumed).unwrap().born_from_clear);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_frozen_transcript_hands_its_tab_to_the_clear_child() {
+        let tmp = temp_dir("clear-pair");
+        let parent = write_jsonl(&tmp, "parent.jsonl", &[
+            r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#,
+        ]);
+        let child = write_jsonl(&tmp, "child.jsonl", CLEAR_CHILD);
+        touch_at(&parent, 1_000);
+        touch_at(&child, 2_000);
+
+        assert_eq!(
+            moved_to_in_dir(&parent),
+            Some(SessionMove {
+                id: "child".into(),
+                kind: MoveKind::Cleared
+            }),
+        );
+        // Not symmetric: the child is the live one, and it has no successor.
+        assert_eq!(moved_to_in_dir(&child), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_clear_child_is_only_claimed_by_the_session_that_spoke_last() {
+        let tmp = temp_dir("clear-ambiguous");
+        // Two idle sessions in one project. `older` stopped long before the
+        // clear happened, so the child is not its business — something else was
+        // written in between.
+        let older = write_jsonl(&tmp, "older.jsonl", &[
+            r#"{"type":"user","uuid":"OLD","message":{"role":"user","content":"a"}}"#,
+        ]);
+        let newer = write_jsonl(&tmp, "newer.jsonl", &[
+            r#"{"type":"user","uuid":"NEW","message":{"role":"user","content":"b"}}"#,
+        ]);
+        let child = write_jsonl(&tmp, "child.jsonl", CLEAR_CHILD);
+        touch_at(&older, 1_000);
+        touch_at(&newer, 2_000);
+        touch_at(&child, 3_000);
+
+        assert_eq!(
+            moved_to_in_dir(&newer).map(|m| m.id),
+            Some("child".to_string()),
+            "the session that spoke last is the one the terminal cleared"
+        );
+        assert_eq!(
+            moved_to_in_dir(&older),
+            None,
+            "re-keying this tab would point it at another tab's conversation"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The daemon-migration half of `moved_to_in_dir`, hermetically. It used to
+    /// be covered only by `finds_the_captured_specimen`, which is `#[ignore]`d
+    /// and, since the parent transcript was deleted from this machine, no longer
+    /// runnable at all — so the path had no live test.
+    #[test]
+    fn a_migrated_child_takes_the_tab() {
+        let tmp = temp_dir("moved-bg");
+        let parent = write_jsonl(&tmp, "parent.jsonl", &[
+            r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#,
+        ]);
+        let child = write_jsonl(&tmp, "child.jsonl", &[
+            r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"AAA","uuid":"BBB","sessionKind":"bg"}"#,
+            r#"{"type":"user","uuid":"CCC","parentUuid":"BBB","sessionKind":"bg","message":{"role":"user","content":"carrying on"}}"#,
+        ]);
+        touch_at(&parent, 1_000);
+        touch_at(&child, 2_000);
+        assert_eq!(
+            moved_to_in_dir(&parent),
+            Some(SessionMove {
+                id: "child".into(),
+                kind: MoveKind::Background
+            }),
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_fork_sibling_never_takes_a_tab() {
+        let tmp = temp_dir("clear-fork");
+        let parent = write_jsonl(&tmp, "parent.jsonl", &[
+            r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#,
+        ]);
+        // A `--fork-session` branch is newer and shares ancestry, but the parent
+        // is still running and still resumable at its own point.
+        let branch = write_jsonl(&tmp, "branch.jsonl", &[
+            r#"{"type":"user","uuid":"BBB","parentUuid":"AAA","message":{"role":"user","content":"branch"}}"#,
+        ]);
+        touch_at(&parent, 1_000);
+        touch_at(&branch, 2_000);
+        assert_eq!(moved_to_in_dir(&parent), None);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Run with `cargo test -- --ignored` on a machine that still has the
     /// 2026-07-26 specimen. Non-hermetic by design: it checks the real files
     /// the rule was derived from, which no fixture can stand in for.
+    ///
+    /// Known dead as of 2026-07-29 on this machine: the parent transcript
+    /// (`2eb3a23f-…`) has been deleted, so this now fails with `None` wherever
+    /// the specimen is gone. Kept for machines that still hold it;
+    /// `a_migrated_child_takes_the_tab` is the hermetic cover for the same rule.
     #[test]
     #[ignore]
     fn finds_the_captured_specimen() {
-        let got = session_migrated_to("2eb3a23f-e4f1-4263-beb0-e3c7b768dcba".into());
-        assert_eq!(got.as_deref(), Some("6b37ca79-7e8f-4b86-9817-eaeb1b1fe95c"));
+        let got = session_moved_to("2eb3a23f-e4f1-4263-beb0-e3c7b768dcba".into());
+        assert_eq!(
+            got,
+            Some(SessionMove {
+                id: "6b37ca79-7e8f-4b86-9817-eaeb1b1fe95c".into(),
+                kind: MoveKind::Background,
+            })
+        );
+    }
+
+    /// The `/clear` counterpart, from the pair captured 2026-07-29 in
+    /// `~/.claude/projects/-home-matt-Projects-work-pc`. Same deal: run with
+    /// `cargo test -- --ignored` on a machine that still has the specimen.
+    #[test]
+    #[ignore]
+    fn finds_the_captured_clear_specimen() {
+        let got = session_moved_to("605b9dad-8aff-4422-ac85-e553739f3d2b".into());
+        assert_eq!(
+            got,
+            Some(SessionMove {
+                id: "7047782e-6b33-4757-b138-89551041d670".into(),
+                kind: MoveKind::Cleared,
+            })
+        );
     }
 }

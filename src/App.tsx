@@ -32,7 +32,7 @@ import {
   UsageBar,
   listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, uiLog, usageLimits,
-  resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMigratedTo,
+  resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
   agentLaunchCommand, adoptAgentSession,
@@ -664,13 +664,15 @@ export default function App() {
     };
   }, [awaitingAdoption, refreshSessionList]);
 
-  // A conversation that moves to the daemon — which is all that opening the
-  // agents view does — keeps running in this same pty under a NEW session id.
-  // The tab's pinned id was set once when it opened and nothing ever moved it,
-  // so from that moment the terminal renders the live child while every panel
-  // keyed to the tab reads the parent: a file nothing is writing. Live text,
-  // dead clock. Re-key the tab when it happens, and say so, because the row
-  // the sidebar shows for this conversation changes underneath the user.
+  // A conversation can change its session id while staying in this same pty.
+  // Two things do it: moving to the daemon (all that opening the agents view
+  // does) and `/clear`. Either way the tab's pinned id was set once when it
+  // opened and nothing ever moved it, so from that moment the terminal renders
+  // the live conversation while every panel keyed to the tab reads the old
+  // transcript: a file nothing is writing. Live text, dead clock — and the live
+  // conversation's own sidebar row belongs to no tab, so clicking it opens a
+  // SECOND agent on it. Re-key the tab when it happens, and say so, because the
+  // row the sidebar shows for this conversation changes underneath the user.
   //
   // Only the active tab, and only every 15s: answering this means reading
   // transcripts off disk, and the parent can be tens of megabytes.
@@ -696,11 +698,22 @@ export default function App() {
     let stop = false;
     const check = async () => {
       try {
-        const moved = await sessionMigratedTo(pinned);
-        if (stop || !moved || moved === pinned) return;
-        uiLog(`migrate: re-keying tab ${key} ${pinned} -> ${moved}`);
-        setTabs((ts) => ts.map((x) => (x.key === key ? { ...x, sessionId: moved } : x)));
-        setNotice(`"${title}" moved to a background session — its panels now follow the live one.`);
+        const moved = await sessionMovedTo(pinned);
+        if (stop || !moved || moved.id === pinned) return;
+        uiLog(`migrate: re-keying tab ${key} ${pinned} -> ${moved.id} (${moved.kind})`);
+        // `slotId` moves with `sessionId`, not just the pinned id. The slot is
+        // what links a tab to a sidebar row — the live dot, the highlight, and
+        // the click that focuses an existing terminal instead of opening
+        // another. Leaving it on the old id was the second half of this bug:
+        // the tab kept the frozen row and the live one looked free to open.
+        setTabs((ts) =>
+          ts.map((x) => (x.key === key ? { ...x, sessionId: moved.id, slotId: moved.id } : x)),
+        );
+        setNotice(
+          moved.kind === "cleared"
+            ? `"${title}" was cleared — this tab now follows the new conversation, and the old one is still in the sidebar.`
+            : `"${title}" moved to a background session — its panels now follow the live one.`,
+        );
         refreshSessionList();
       } catch (e) {
         // Not just "backend unavailable": a rejected invoke lands here too,
@@ -813,10 +826,13 @@ export default function App() {
   };
   const resumeSession = async (s: Session) => {
     setActiveProject(s.project_path);
-    // The pinned id can go stale: a `/clear` or compaction retires the
-    // original transcript (Claude Code deletes it or renames it to
-    // `<id>.orphaned-…`), so `claude --resume <original-id>` dies with "no
-    // conversation found" — a black pane, the core "broken feel" of resume.
+    // The pinned id can go stale: a compaction can retire the original
+    // transcript (Claude Code deletes it or renames it to `<id>.orphaned-…`),
+    // so `claude --resume <original-id>` dies with "no conversation found" — a
+    // black pane, the core "broken feel" of resume. (`/clear` was listed here
+    // too and does not belong: measured 2026-07-29 on Claude Code 2.1.220, it
+    // leaves the original named and resumable and simply starts a new session
+    // beside it. That is why it needed detecting rather than resolving.)
     // Resolve to the surviving continuation first; if nothing resumable is
     // left, say so instead of launching a doomed resume. (A forked parent is
     // NOT stale — forking leaves it intact, and it resolves to itself.)

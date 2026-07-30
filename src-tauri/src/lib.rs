@@ -50,7 +50,7 @@ pub fn run() {
             sessions::running_session_ids,
             sessions::bg_agent_session_ids,
             sessions::unstoppable_session_ids,
-            sessions::session_migrated_to,
+            sessions::session_moved_to,
             sessions::ui_log,
             sessions::live_session_ids,
             sessions::stop_session,
