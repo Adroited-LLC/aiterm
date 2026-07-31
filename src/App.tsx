@@ -1007,26 +1007,21 @@ export default function App() {
     const cmd = `${claudeCmdRef.current} --resume ${liveId}`;
     openTab(s.title, s.project_path, cmd, liveId, liveId);
   };
-  // Branch a session and *go there*: the backend copies the transcript under
-  // a fresh id, then a tab opens on the branch, live and focused. The session
-  // you forked from keeps running untouched, still yours, still green.
+  // Branch a session. You stay exactly where you are: the backend copies the
+  // transcript under a fresh id and the branch appears in the sidebar as a
+  // stopped row holding the conversation up to this point — the same shape as
+  // `/clear`, deliberately. One rule for both: the tab you're in never
+  // changes out from under you, and the other conversation (old context for
+  // a clear, the copy for a fork) is a normal stopped row — preview on
+  // click, ▶ to resume.
   //
-  // It went through two wrong shapes first. Launching `claude --fork-session
-  // --resume` closed the parent's tab — the branch didn't exist until you
-  // typed into it, and the tab you forked *from* went away. Then the copy was
-  // made but nothing opened: the branch was a row to hunt down and a button
-  // to press before anything ran. Matt's shape: ⑂ means "start session B and
-  // put me in it" — one gesture, nothing to answer afterwards. Rejections are
+  // (Briefly, 0.10.9 opened the branch live and switched to it. Matt: no —
+  // stay in session A; the branch is the stopped one.) Rejections are
   // surfaced by the caller (see `onFork` below).
   const forkSession = async (s: Session) => {
     const branchId = await sessionFork(s.id);
     refreshSessionList();
-    openTab(
-      s.title, s.project_path,
-      `${claudeCmdRef.current} --resume ${branchId}`,
-      branchId, branchId,
-    );
-    setNotice(`Branched "${s.title}" — this tab is the branch; the original keeps running.`);
+    setNotice(`Branched "${s.title}" — the copy is in the sidebar, stopped at this point.`);
     return branchId;
   };
   // Exit an active session: close its live terminal tab (ends the running
