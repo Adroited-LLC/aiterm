@@ -1686,6 +1686,16 @@ body.dragging * { pointer-events: none; }
   font-variant-numeric: tabular-nums;
 }
 .set-hint { font-size: 11px; color: var(--text-faint); }
+.set-check {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+.set-check input { accent-color: var(--accent); }
+.set-check code { color: var(--text-faint); }
 
 .theme-grid {
   display: grid;

@@ -4,6 +4,7 @@ pub mod diag;
 pub mod fonts;
 pub mod fsx;
 pub mod git;
+pub mod hooklink;
 pub mod indexer;
 pub mod providers;
 pub mod pty;
@@ -66,6 +67,9 @@ pub fn run() {
             sessions::claude_model_default,
             sessions::restore_claude_model_default,
             sessions::session_model,
+            hooklink::drain_session_events,
+            trace::trace_set,
+            trace::trace_status,
             usage::usage_limits,
             fonts::list_fonts,
             fonts::font_packages,
@@ -103,6 +107,10 @@ pub fn run() {
                         .find_map(|l| l.strip_prefix("PPid:").map(|v| v.trim().to_string())))
                     .unwrap_or_else(|| "?".into())
             );
+
+            // The settings file claude launches load their SessionStart hook
+            // from. Every launch, because it embeds this binary's path.
+            hooklink::install();
 
             // Push sessions-list refreshes when an agent's transcripts change
             // (new/cleared/forked sessions) instead of waiting for the 30s poll.

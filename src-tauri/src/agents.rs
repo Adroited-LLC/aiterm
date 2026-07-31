@@ -189,6 +189,13 @@ impl AgentBackend for ClaudeBackend {
     fn launch(&self, spec: &LaunchSpec) -> String {
         let mut cmd =
             String::from("claude --permission-mode auto --allow-dangerously-skip-permissions");
+        // The SessionStart hook that reports the session id and pid back to
+        // aiterm — additional settings, so the user's own config is untouched.
+        // Absent only if the settings file could not be written, in which case
+        // the launch works and the heuristics cover detection.
+        if let Some(flag) = crate::hooklink::settings_flag() {
+            cmd.push_str(&flag);
+        }
         if let Some(m) = spec.model.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --model {}", q(m)));
         }
@@ -1072,12 +1079,25 @@ mod tests {
 
     /* ---- launch commands ------------------------------------------------ */
 
-    /// Picking nothing must produce exactly what aiterm always ran. This is the
-    /// regression guard for moving the invocation out of the frontend.
+    /// Picking nothing must produce what aiterm always ran, plus at most the
+    /// hook `--settings` flag — which is environmental (it appears once the
+    /// running app has written its settings file), so the assertion is a
+    /// prefix, not an exact match.
     #[test]
     fn claude_with_no_choices_is_the_command_aiterm_always_used() {
+        let cmd = ClaudeBackend.launch(&LaunchSpec::default());
+        assert!(
+            cmd.starts_with("claude --permission-mode auto --allow-dangerously-skip-permissions"),
+            "{cmd}"
+        );
+        // Nothing else may sneak in: strip the one known optional flag and
+        // what remains must be exactly the historical invocation.
+        let stripped = match crate::hooklink::settings_flag() {
+            Some(flag) => cmd.replace(&flag, ""),
+            None => cmd,
+        };
         assert_eq!(
-            ClaudeBackend.launch(&LaunchSpec::default()),
+            stripped,
             "claude --permission-mode auto --allow-dangerously-skip-permissions",
         );
     }

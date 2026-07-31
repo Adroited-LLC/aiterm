@@ -33,6 +33,7 @@ import {
   listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, uiLog, usageLimits,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
+  drainSessionEvents,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
   agentLaunchCommand, adoptAgentSession,
@@ -61,6 +62,11 @@ const USAGE_KEY = "aiterm.usageCache";
  * one click away on the permissions pill. Verified against a live session:
  * without the flag the cycle is manual → accept edits → plan → manual; with
  * it, bypass joins the loop.
+ *
+ * This is only the fallback: the real command comes from the backend
+ * (`agent_launch_command`), which also carries the `--settings` flag wiring
+ * in the SessionStart hook — the exact session-id link. See `claudeCmd`
+ * inside App. Kept in sync by a test on `ClaudeBackend::launch`.
  */
 const CLAUDE_CMD = "claude --permission-mode auto --allow-dangerously-skip-permissions";
 
@@ -97,10 +103,6 @@ interface PanelSizes {
 interface EndedWhy {
   code: number | null;
   signal: string | null;
-  /** Not a death at all: the conversation was cleared, and this tab is the
-   *  history it left behind. Its process is alive and well — it belongs to the
-   *  cleared session, in the tab that took this one's place. */
-  cleared?: boolean;
 }
 
 /** Say how a process ended without inventing a reason it didn't have.
@@ -111,9 +113,6 @@ interface EndedWhy {
  *  looking for a bug instead of for whoever killed it. */
 function describeEnd(why: EndedWhy | undefined): string {
   if (!why) return "";
-  if (why.cleared) {
-    return "Everything said up to the moment it was cleared is still on disk.";
-  }
   if (why.signal) return `The process was stopped (${why.signal}).`;
   if (why.code === null) return "The process is gone and its exit status could not be read.";
   return `The process exited with status ${why.code}.`;
@@ -157,6 +156,20 @@ export default function App() {
   // re-run it on every tab change).
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
+
+  // The claude invocation, from the backend — which is where the SessionStart
+  // hook flag is added. The constant is only the fallback for the first
+  // frames before this resolves (or a backend that cannot answer), and a
+  // launch built from it merely lacks the hook: detection falls back to the
+  // disk heuristics, nothing else changes.
+  const claudeCmdRef = useRef(CLAUDE_CMD);
+  useEffect(() => {
+    agentLaunchCommand("claude", {})
+      .then((cmd) => {
+        claudeCmdRef.current = cmd;
+      })
+      .catch(() => {});
+  }, []);
   // Same trick for the sessions list: `newSession` needs to snapshot what
   // already exists, and it must not be rebuilt every time the list refreshes.
   const sessionsRef = useRef<Session[]>(sessions);
@@ -693,13 +706,13 @@ export default function App() {
     const key = activeTabObj?.key;
     const pinned = activeTabObj?.sessionId;
     const title = activeTabObj?.title ?? "This session";
+    const command = activeTabObj?.command;
     if (key === undefined || !pinned) return;
-    // A historical tab is the conversation that was left behind — it has no
-    // process, so nothing can move out from under it. Watching one would find
-    // the very successor that created it and re-key the history onto the live
-    // session, leaving two tabs on one conversation and no way back to the
-    // context this tab exists to hold.
-    if (activeTabObj?.historical) return;
+    // This runs even for tabs the SessionStart hook reports on (drain effect
+    // below): the hook cannot see a move to the daemon — that claude is not
+    // ours — so the Background kind is still this watcher's alone. For a
+    // clear, both mechanisms re-key to the same id, so whichever fires first
+    // settles it and the other finds nothing left to do.
     // A session aiterm started that has not written its transcript yet has
     // nothing to have migrated *from*, so this would poll a file that does not
     // exist until the first prompt lands. Narrow on purpose: only a `fresh`
@@ -713,6 +726,14 @@ export default function App() {
       try {
         const moved = await sessionMovedTo(pinned);
         if (stop || !moved || moved.id === pinned) return;
+        // A tab launched as `--resume <pinned>` is deliberately reopening that
+        // conversation. Its `/clear` child on disk is history, not news — the
+        // last version of this stole the tab the instant Resume was clicked,
+        // re-keyed it onto the old clear's successor, and left the actual
+        // resume minting a third session (observed 2026-07-29 21:36, three
+        // kill_trees of cleanup). "It moved once" is forever true on disk;
+        // "this tab wants the original" beats it.
+        if (moved.kind === "cleared" && command?.includes(`--resume ${pinned}`)) return;
         uiLog(`migrate: re-keying tab ${key} ${pinned} -> ${moved.id} (${moved.kind})`);
         // `slotId` moves with `sessionId`, not just the pinned id. The slot is
         // what links a tab to a sidebar row — the live dot, the highlight, and
@@ -720,37 +741,18 @@ export default function App() {
         // another. Leaving it on the old id was the second half of this bug:
         // the tab kept the frozen row and the live one looked free to open.
         //
-        // A clear also leaves a finished conversation behind, and it gets a tab
-        // of its own — ended, resumable, sitting where the live one used to be.
-        // Matt's shape: the session the command ran in becomes history you can
-        // open, and the new conversation is the live tab. (A migration gets no
-        // such tab: there the old id is a dead end, not a conversation to go
-        // back to.)
-        const histKey = moved.kind === "cleared" ? nextKey.current++ : null;
-        setTabs((ts) => {
-          const i = ts.findIndex((x) => x.key === key);
-          if (i < 0) return ts;
-          const next = [...ts];
-          next[i] = { ...ts[i], sessionId: moved.id, slotId: moved.id };
-          if (histKey !== null) {
-            next.splice(i, 0, {
-              key: histKey,
-              title: ts[i].title,
-              cwd: ts[i].cwd,
-              command: null,
-              sessionId: pinned,
-              slotId: pinned,
-              historical: true,
-            });
-          }
-          return next;
-        });
-        if (histKey !== null) {
-          setEnded((m) => new Map(m).set(histKey, { code: 0, signal: null, cleared: true }));
-        }
+        // Nothing else changes: for a clear, the conversation left behind
+        // becomes an ordinary stopped row in the sidebar — click for its
+        // preview, ▶ to resume — exactly like any session that ended. (An
+        // earlier version manufactured a special "historical" tab for it,
+        // blank, with its own explanatory buttons. Matt: make it look like a
+        // normal stop instead.)
+        setTabs((ts) =>
+          ts.map((x) => (x.key === key ? { ...x, sessionId: moved.id, slotId: moved.id } : x)),
+        );
         setNotice(
           moved.kind === "cleared"
-            ? `"${title}" was cleared — the conversation up to that point is the tab beside this one, and this tab is the new one.`
+            ? `"${title}" was cleared — this tab is the new conversation. The old one is in the sidebar, resumable.`
             : `"${title}" moved to a background session — its panels now follow the live one.`,
         );
         refreshSessionList();
@@ -779,8 +781,63 @@ export default function App() {
       grace.forEach(clearTimeout);
     };
   }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title,
-      activeTabObj?.historical, freshUnwritten,
+      activeTabObj?.command, freshUnwritten,
       refreshSessionList, agentsView]);
+
+  // The exact channel: every claude aiterm launches carries a SessionStart
+  // hook (see hooklink.rs) that reports its session id, its cause and its pid
+  // into a spool. Drained here, each event lands on the tab whose pty owns
+  // that pid — so a `/clear` re-keys within two seconds, on any tab, active
+  // or not, with no inference anywhere in the path. The watcher above stays:
+  // it alone sees daemon moves, and it covers claudes with no hook — one
+  // typed into a shell tab, or from before this build.
+  useEffect(() => {
+    let stop = false;
+    const drain = async () => {
+      if (tabsRef.current.length === 0) return;
+      let events;
+      try {
+        events = await drainSessionEvents();
+      } catch {
+        return; // backend unavailable; the spool keeps until it is back
+      }
+      if (stop) return;
+      for (const evt of events) {
+        const entry = [...handles.current.entries()].find(
+          ([, h]) => h.ptyId === evt.ptyId,
+        );
+        const tab = entry && tabsRef.current.find((t) => t.key === entry[0]);
+        if (!tab) continue;
+        // Only re-key tabs that are keyed. A shell tab someone ran `claude`
+        // in, or a project-▶ tab, is slotted by its path — handing it a
+        // session slot would break the "one terminal per project door" dedupe
+        // without buying anything the panels don't already do.
+        if (!tab.sessionId || tab.sessionId === evt.sessionId) continue;
+        const old = tab.sessionId;
+        uiLog(`hook: tab ${tab.key} ${old} -> ${evt.sessionId} (${evt.source})`);
+        setTabs((ts) =>
+          ts.map((x) =>
+            x.key === tab.key
+              ? { ...x, sessionId: evt.sessionId, slotId: evt.sessionId, fresh: false }
+              : x,
+          ),
+        );
+        if (evt.source === "clear") {
+          setNotice(
+            `"${tab.title}" was cleared — this tab is the new conversation. ` +
+              `The old one is in the sidebar, resumable.`,
+          );
+        }
+        refreshSessionList();
+      }
+    };
+    drain();
+    const iv = setInterval(drain, 2000);
+    return () => {
+      stop = true;
+      clearInterval(iv);
+    };
+  }, [refreshSessionList]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
   // `git_repo_state` call per project change. Claude's own footer already says
@@ -829,7 +886,9 @@ export default function App() {
       const t = tabsRef.current.find((x) => x.key === key);
       if (!t) return;
       closeTab(key);
-      const cmd = t.sessionId ? `${CLAUDE_CMD} --resume ${t.sessionId}` : t.command;
+      const cmd = t.sessionId
+        ? `${claudeCmdRef.current} --resume ${t.sessionId}`
+        : t.command;
       openTab(t.title, t.cwd, cmd, t.slotId, t.sessionId);
     },
     [closeTab, openTab],
@@ -945,26 +1004,29 @@ export default function App() {
     // Resume the same way we start anything — see CLAUDE_CMD. This used to
     // pass `--permission-mode <configured>`, which is what silently lifted a
     // manual session into bypass on resume.
-    const cmd = `${CLAUDE_CMD} --resume ${liveId}`;
+    const cmd = `${claudeCmdRef.current} --resume ${liveId}`;
     openTab(s.title, s.project_path, cmd, liveId, liveId);
   };
-  // Branch a session into its own tab, resumable later on its own row. The
-  // parent is left intact and frozen at its own context — `--fork-session`
-  // writes a new transcript and never touches the original.
-  // Branch a session. This starts nothing and touches no tab: the backend
-  // copies the transcript under a fresh id, so the branch appears as an
-  // ordinary inactive row holding the conversation exactly as it stands now,
-  // and the session you forked from keeps running, still yours, still green.
+  // Branch a session and *go there*: the backend copies the transcript under
+  // a fresh id, then a tab opens on the branch, live and focused. The session
+  // you forked from keeps running untouched, still yours, still green.
   //
-  // It used to launch `claude --fork-session --resume` into a new tab and
-  // close the parent's. That made forking a lifecycle event — the branch
-  // didn't exist on disk until you typed into it, and the tab you forked
-  // *from* went away, which is not what branching means. Rejections are
+  // It went through two wrong shapes first. Launching `claude --fork-session
+  // --resume` closed the parent's tab — the branch didn't exist until you
+  // typed into it, and the tab you forked *from* went away. Then the copy was
+  // made but nothing opened: the branch was a row to hunt down and a button
+  // to press before anything ran. Matt's shape: ⑂ means "start session B and
+  // put me in it" — one gesture, nothing to answer afterwards. Rejections are
   // surfaced by the caller (see `onFork` below).
   const forkSession = async (s: Session) => {
     const branchId = await sessionFork(s.id);
     refreshSessionList();
-    setNotice(`Branched "${s.title}" — the copy is listed, idle, at this point.`);
+    openTab(
+      s.title, s.project_path,
+      `${claudeCmdRef.current} --resume ${branchId}`,
+      branchId, branchId,
+    );
+    setNotice(`Branched "${s.title}" — this tab is the branch; the original keeps running.`);
     return branchId;
   };
   // Exit an active session: close its live terminal tab (ends the running
@@ -1023,7 +1085,7 @@ export default function App() {
   };
   const projectClaude = (p: ProjectInfo) => {
     setActiveProject(p.path);
-    openTab(p.name, p.path, CLAUDE_CMD, `claude:${p.path}`);
+    openTab(p.name, p.path, claudeCmdRef.current, `claude:${p.path}`);
   };
 
   /**
@@ -1258,10 +1320,7 @@ export default function App() {
 
         <div className="panel terminal-panel">
           <div className="term-stack">
-            {/* Historical tabs get no terminal — mounting one would spawn a
-                second agent on a conversation that already has one. The ended
-                overlay below is their whole pane. */}
-            {tabs.filter((t) => !t.historical).map((t) => (
+            {tabs.map((t) => (
               <TerminalView
                 key={t.key}
                 tab={t}
@@ -1288,31 +1347,20 @@ export default function App() {
                       existed — and a dialog that says one false thing is not
                       worth trusting about the true ones. */}
                   <div className="term-ended-title">
-                    {ended.get(activeTab)?.cleared
-                      ? "This conversation was cleared"
-                      : activeTabObj?.sessionId
-                        ? "This session ended on its own"
-                        : "This shell ended on its own"}
+                    {activeTabObj?.sessionId
+                      ? "This session ended on its own"
+                      : "This shell ended on its own"}
                   </div>
                   <div className="term-ended-sub">
                     {describeEnd(ended.get(activeTab))}
-                    {activeTabObj?.sessionId && !ended.get(activeTab)?.cleared
+                    {activeTabObj?.sessionId
                       ? " Nothing was lost — the transcript is still on disk."
                       : ""}
                   </div>
-                  {/* The `claude agents` note explains an unasked-for death. A
-                      clear was asked for, so saying it here would send Matt
-                      looking for someone who killed something. */}
-                  {activeTabObj?.sessionId && !ended.get(activeTab)?.cleared && (
+                  {activeTabObj?.sessionId && (
                     <div className="term-ended-sub dim">
                       A session listed by <code>claude agents</code> can be stopped from
                       any terminal, or from your phone. That looks exactly like this.
-                    </div>
-                  )}
-                  {ended.get(activeTab)?.cleared && (
-                    <div className="term-ended-sub dim">
-                      There is no scrollback here — the terminal it ran in belongs to
-                      the cleared conversation now. Resume to read it back.
                     </div>
                   )}
                   <div className="term-ended-acts">

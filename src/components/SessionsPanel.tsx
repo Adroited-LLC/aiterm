@@ -745,7 +745,7 @@ export default function SessionsPanel({
                   history), not a workaround for resume being unavailable. */}
               <button
                 className="act-btn"
-                title="Branch a copy at this point — listed idle, starts nothing"
+                title="Branch at this point and switch to it — the original keeps running"
                 onClick={() => onFork(s)}
               >⑂</button>
               {hasTab && (

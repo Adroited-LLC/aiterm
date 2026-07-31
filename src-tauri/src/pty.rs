@@ -268,6 +268,36 @@ fn parent_of(pid: u32) -> Option<u32> {
         .and_then(|v| v.trim().parse::<u32>().ok())
 }
 
+impl PtyManager {
+    /// The pty whose child tree contains `pid`, found by walking `pid`'s
+    /// ancestor chain up to some pty's direct child (the login shell).
+    ///
+    /// Walked upward rather than enumerating every pty's descendants because
+    /// the caller has one pid and there may be many ptys: one bounded /proc
+    /// walk answers for all of them. This is how a `SessionStart` hook's
+    /// claude pid becomes a tab — see `hooklink.rs`.
+    pub fn pty_for_descendant(&self, pid: u32) -> Option<u32> {
+        let roots: HashMap<u32, u32> = self
+            .ptys
+            .lock()
+            .ok()?
+            .iter()
+            .filter_map(|(id, p)| p.child_pid.map(|child| (child, *id)))
+            .collect();
+        let mut cur = pid;
+        for _ in 0..64 {
+            if let Some(&id) = roots.get(&cur) {
+                return Some(id);
+            }
+            match parent_of(cur) {
+                Some(p) if p > 1 => cur = p,
+                _ => return None,
+            }
+        }
+        None
+    }
+}
+
 /// Our own pid and every pid we descend from.
 ///
 /// The walk is bounded rather than trusting /proc to terminate: a pid that

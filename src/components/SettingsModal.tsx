@@ -10,6 +10,7 @@ import {
   AgentDetection, detectAgents, homeAbbrev,
   fontPackages, installFontFiles, installFontPackage, listFonts,
   diagEnvironment, diagLogPath, diagLogTail, openPath,
+  traceSet, traceStatus,
 } from "../ipc";
 
 interface Props {
@@ -79,6 +80,26 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
     diagLogPath().then(setLogPath).catch(() => setLogPath(null));
   };
   useEffect(() => { if (tab === "diagnostics" && env === null) refreshDiag(); }, [tab, env]);
+
+  // Verbose trace capture — a runtime switch, so it works in the installed
+  // release build, which is the one Matt actually runs when something is odd.
+  // Deliberately not persisted: a firehose left on across restarts is a disk
+  // full of nothing, so each run starts quiet.
+  const [tracing, setTracing] = useState(false);
+  const [tracePath, setTracePath] = useState<string | null>(null);
+  useEffect(() => {
+    if (tab === "diagnostics") traceStatus().then(setTracing).catch(() => {});
+  }, [tab]);
+  const toggleTrace = async (on: boolean) => {
+    try {
+      const path = await traceSet(on);
+      setTracing(on);
+      setTracePath(path);
+      setNotice(on && path ? `Tracing to ${homeAbbrev(path)}` : null);
+    } catch (e) {
+      setNotice(String(e));
+    }
+  };
 
   const set = (patch: Partial<AppSettings>) => onChange({ ...settings, ...patch });
   const setScale = (key: keyof PanelScales, v: number) =>
@@ -357,6 +378,25 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
               The log survives the process, so a crash leaves something to read
               instead of nothing. */}
           {tab === "diagnostics" && <>
+            <div className="set-section">
+              <div className="set-label">Verbose trace</div>
+              <label className="set-check">
+                <input
+                  type="checkbox"
+                  checked={tracing}
+                  onChange={(e) => toggleTrace(e.target.checked)}
+                />
+                <span>
+                  Log everything aiterm does — every call from the UI with its
+                  arguments, with timings — to <code>trace.log</code>
+                </span>
+              </label>
+              <div className="set-hint">
+                {tracing && tracePath
+                  ? `Capturing to ${homeAbbrev(tracePath)} — starts fresh each time it's turned on.`
+                  : "For chasing a specific problem: turn on, reproduce it, turn off, send the file. Off costs nothing."}
+              </div>
+            </div>
             <div className="set-section">
               <div className="set-label">
                 This build

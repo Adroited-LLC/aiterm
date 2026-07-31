@@ -144,6 +144,26 @@ export interface SessionMove {
 // re-keys, and its live conversation sits unowned in the sidebar.
 export const sessionMovedTo = (sessionId: string) =>
   invoke<SessionMove | null>("session_moved_to", { sessionId });
+/** A session start one of our claudes reported through its SessionStart hook,
+ *  already resolved to the pty it happened in. `source` is claude's own word
+ *  for why: "startup", "resume", "clear", "compact". */
+export interface SessionEvent {
+  ptyId: number;
+  sessionId: string;
+  source: string;
+}
+// Collect (and consume) the hook reports since last asked. The exact
+// counterpart to the sessionMovedTo heuristic: no inference, just what each
+// claude process said about itself, tied to the pty aiterm ran it in.
+export const drainSessionEvents = () =>
+  invoke<SessionEvent[]>("drain_session_events");
+/** Whether verbose trace capture is on (Settings → Diagnostics). */
+export const traceStatus = () => invoke<boolean>("trace_status");
+/** Toggle verbose trace capture. On: returns the trace.log path (truncated
+ *  fresh); off: returns null. Works in release builds — the filter is
+ *  runtime-reloadable. */
+export const traceSet = (on: boolean) =>
+  invoke<string | null>("trace_set", { on });
 // Journal-visible logging from the webview. Release builds drop the console,
 // so errors the UI catches quietly would otherwise vanish — send the ones
 // worth keeping to stderr, where journalctl already collects them.

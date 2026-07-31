@@ -43,17 +43,6 @@ export interface TermTab {
    *  transcript lands; what retires the placeholder is the real session
    *  appearing under the same id, not this flag being cleared. */
   fresh?: boolean;
-  /** A tab that is pure history: a conversation that ended without this tab
-   *  ever having run it.
-   *
-   *  `/clear` is the case. The terminal that ran it goes on rendering the
-   *  cleared conversation, so the old one has no process and no scrollback to
-   *  inherit — but it is still a complete, resumable conversation, and giving it
-   *  a tab makes it somewhere you can go instead of a row you have to hunt for.
-   *  No terminal is mounted for one of these (mounting would spawn a second
-   *  agent on the conversation, which is the bug this whole path exists to
-   *  stop); the ended overlay covers the pane, and Resume starts it for real. */
-  historical?: boolean;
   /** Set while this tab is still waiting to learn its session id.
    *
    *  Only agents that have no `--session-id` — Codex — get one of these. They
@@ -73,6 +62,10 @@ export interface TermTab {
 
 /** Control surface a mounted terminal registers with the app. */
 export interface TermHandle {
+  /** The backend pty this terminal runs on. What lets a SessionStart hook
+   *  report — "session X started in process Y" — be traced to a tab: the
+   *  backend resolves Y's ancestry to a pty, and this is the other end. */
+  ptyId: number;
   /** Send raw bytes to the PTY. */
   write: (data: string) => void;
   /** Force a clean TUI repaint (SIGWINCH jiggle) — Ctrl+Shift+L. */
@@ -219,6 +212,7 @@ export default function TerminalView({
       term.onResize(({ cols, rows }) => ptyResize(id, cols, rows));
 
       onRegister(tab.key, {
+        ptyId: id,
         write: (data) => ptyWrite(id, data),
         redraw,
         paste: (text) => {
