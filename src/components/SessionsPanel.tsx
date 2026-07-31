@@ -119,6 +119,10 @@ interface Props {
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
   onFork: (s: Session) => void;
+  /** Park this conversation and start a fresh one in its tab — aiterm's own
+   *  clear, kin to ⑂: pure process control and disk, no claude machinery.
+   *  Only offered on claude rows that have a live terminal of their own. */
+  onClear: (s: Session) => void;
   onExit: (s: Session) => void;
   onNewShell: (s: Session) => void;
   onDelete: (s: Session) => void;
@@ -144,7 +148,7 @@ interface Props {
 
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, activeSlot, opts,
-  onOptsChange, onSelect, onResume, onFork, onExit, onNewShell, onDelete,
+  onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty,
@@ -748,6 +752,17 @@ export default function SessionsPanel({
                 title="Branch a copy at this point — appears as a stopped session, resumable"
                 onClick={() => onFork(s)}
               >⑂</button>
+              {/* aiterm's own clear — same end shape as typing /clear, built
+                  like ⑂: no claude machinery, just a fresh process on a
+                  minted id. Needs this session's own live terminal to act on,
+                  and claude only (Codex can't be told a session id). */}
+              {liveSlots.has(s.id) && s.agent === "claude" && (
+                <button
+                  className="act-btn"
+                  title="Clear — fresh conversation in this tab; this one becomes a stopped row"
+                  onClick={() => onClear(s)}
+                >✦</button>
+              )}
               {hasTab && (
                 <button
                   className="act-btn" title="Exit — close this tab"

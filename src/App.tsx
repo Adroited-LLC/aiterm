@@ -1097,6 +1097,27 @@ export default function App() {
     setNotice(`Branched "${s.title}" — the copy is in the sidebar, stopped at this point.`);
     return branchId;
   };
+  // aiterm's own clear, kin to ⑂ and deliberately off claude's machinery:
+  // end the running claude and start a fresh one in the same tab on a minted
+  // id. The old conversation needs nothing done to it — its transcript is
+  // already on disk, so it simply becomes a stopped row, exactly the shape a
+  // typed /clear settles into. Costs a claude restart where /clear is warm;
+  // in exchange there is no hook, no detection and no id change to chase —
+  // aiterm mints the id, so it knows everything from the first frame.
+  const clearSession = (s: Session) => {
+    const t = tabs.find((x) => x.slotId === s.id);
+    if (!t) return;
+    closeTab(t.key);
+    // The client process is going down, but the roster reports it for a beat
+    // longer — same suppress-until-reopened rule as a hook-observed move.
+    setVacated((prev) => new Set(prev).add(s.id));
+    const id = crypto.randomUUID();
+    openTab(
+      basename(s.project_path), s.project_path,
+      `${claudeCmdRef.current} --session-id ${id}`, id, id, true,
+    );
+    setNotice(`"${s.title}" is parked in the sidebar — this tab is a fresh conversation.`);
+  };
   // Exit an active session: close its live terminal tab (ends the running
   // claude process). The transcript stays on disk, so it's resumable later.
   const exitSession = (s: Session) => {
@@ -1365,6 +1386,7 @@ export default function App() {
                     setNotice(`Couldn't fork "${s.title}": ${e}`),
                   )
                 }
+                onClear={clearSession}
                 onExit={exitSession}
                 onNewShell={newShell}
                 onDelete={deleteSession}
