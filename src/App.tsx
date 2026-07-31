@@ -379,6 +379,22 @@ export default function App() {
   // which is what makes the pause invisible: by the time your eyes are back on
   // the sidebar the reading is already in flight.
   const [liveSessions, setLiveSessions] = useState<Set<string>>(new Set());
+  // Session ids our own terminals have demonstrably moved OFF of — a /clear or
+  // an in-place /fork re-keyed the tab away. The roster goes on reporting an
+  // interactive entry under the id it *started* with for as long as the client
+  // process lives, so the finished conversation's row would wear a green dot
+  // indefinitely (Matt hit this on /fork: the marker heuristic that filters a
+  // cleared parent from live_session_ids knows nothing about fork children).
+  // This is hook evidence, not inference — the pty that owned the id told us
+  // it left. An id is taken back off the list the moment anything reopens it:
+  // a tab slotted to it, or a hook report of it starting again.
+  const [vacated, setVacated] = useState<Set<string>>(new Set());
+  const liveShown = useMemo(() => {
+    if (vacated.size === 0) return liveSessions;
+    const out = new Set(liveSessions);
+    for (const id of vacated) out.delete(id);
+    return out;
+  }, [liveSessions, vacated]);
   useEffect(() => {
     let stop = false;
     let timer: number | undefined;
@@ -480,6 +496,15 @@ export default function App() {
     (title: string, cwd: string | null, command: string | null, slotId: string,
      sessionId?: string, fresh?: boolean, adopt?: TermTab["adopt"]) => {
       setPreviewSession(null);
+      // Opening a terminal on a slot is the deliberate act of going back to
+      // it — if its id was on the vacated list (green dot suppressed), it has
+      // earned the dot again the moment the roster reports it.
+      setVacated((prev) => {
+        if (!prev.has(slotId)) return prev;
+        const next = new Set(prev);
+        next.delete(slotId);
+        return next;
+      });
       setTabs((t) => {
         const existing = t.find((x) => x.slotId === slotId);
         if (existing) {
@@ -746,10 +771,23 @@ export default function App() {
         // preview, ▶ to resume — exactly like any session that ended. (An
         // earlier version manufactured a special "historical" tab for it,
         // blank, with its own explanatory buttons. Matt: make it look like a
-        // normal stop instead.)
+        // normal stop instead.) `fresh` + retitle for the cleared kind mirror
+        // the hook path above, and for the same reasons.
+        const cleared = moved.kind === "cleared";
         setTabs((ts) =>
-          ts.map((x) => (x.key === key ? { ...x, sessionId: moved.id, slotId: moved.id } : x)),
+          ts.map((x) =>
+            x.key === key
+              ? {
+                  ...x,
+                  sessionId: moved.id,
+                  slotId: moved.id,
+                  fresh: cleared ? true : x.fresh,
+                  title: cleared ? basename(x.cwd ?? "") || x.title : x.title,
+                }
+              : x,
+          ),
         );
+        setVacated((prev) => new Set(prev).add(pinned));
         setNotice(
           moved.kind === "cleared"
             ? `"${title}" was cleared — this tab is the new conversation. The old one is in the sidebar, resumable.`
@@ -808,24 +846,59 @@ export default function App() {
         );
         const tab = entry && tabsRef.current.find((t) => t.key === entry[0]);
         if (!tab) continue;
+        // A session starting (again) under an id is the definition of "not
+        // vacated" — however it left, it's back.
+        setVacated((prev) => {
+          if (!prev.has(evt.sessionId)) return prev;
+          const next = new Set(prev);
+          next.delete(evt.sessionId);
+          return next;
+        });
         // Only re-key tabs that are keyed. A shell tab someone ran `claude`
         // in, or a project-▶ tab, is slotted by its path — handing it a
         // session slot would break the "one terminal per project door" dedupe
         // without buying anything the panels don't already do.
         if (!tab.sessionId || tab.sessionId === evt.sessionId) continue;
         const old = tab.sessionId;
+        // `clear` and `fork` both mean: this terminal now holds a NEW
+        // conversation and the old id is finished. (`fork` was discovered
+        // live 2026-07-30 — claude's own /fork switches the terminal to the
+        // branch, hook source "fork", and nothing on disk links the two.)
+        const newConversation = evt.source === "clear" || evt.source === "fork";
         uiLog(`hook: tab ${tab.key} ${old} -> ${evt.sessionId} (${evt.source})`);
         setTabs((ts) =>
           ts.map((x) =>
             x.key === tab.key
-              ? { ...x, sessionId: evt.sessionId, slotId: evt.sessionId, fresh: false }
+              ? {
+                  ...x,
+                  sessionId: evt.sessionId,
+                  slotId: evt.sessionId,
+                  // A new conversation has no sidebar row until its first real
+                  // prompt lands (meta-only transcripts aren't listed), which
+                  // left the highlight orphaned — you looked "still clicked"
+                  // on the old row. `fresh` is the existing answer: the
+                  // placeholder row names this tab, highlighted, until the
+                  // real row appears under the same id and takes over.
+                  fresh: newConversation ? true : x.fresh,
+                  // And it isn't the old conversation, so it sheds the old
+                  // title rather than impersonating it in the sidebar.
+                  title: newConversation
+                    ? basename(x.cwd ?? "") || x.title
+                    : x.title,
+                }
               : x,
           ),
         );
-        if (evt.source === "clear") {
+        if (newConversation) {
+          // The roster keeps listing the old id while the client process
+          // lives; only we know the terminal left it behind.
+          setVacated((prev) => new Set(prev).add(old));
           setNotice(
-            `"${tab.title}" was cleared — this tab is the new conversation. ` +
-              `The old one is in the sidebar, resumable.`,
+            evt.source === "clear"
+              ? `"${tab.title}" was cleared — this tab is the new conversation. ` +
+                `The old one is in the sidebar, resumable.`
+              : `"${tab.title}" forked — this tab is the branch. ` +
+                `The original conversation is in the sidebar, resumable.`,
           );
         }
         refreshSessionList();
@@ -1278,7 +1351,7 @@ export default function App() {
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
-                liveSessions={liveSessions}
+                liveSessions={liveShown}
                 attentionSlots={new Set(
                   tabs.filter((t) => attention.has(t.key)).map((t) => t.slotId),
                 )}
