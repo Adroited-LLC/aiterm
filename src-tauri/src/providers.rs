@@ -96,6 +96,17 @@ impl std::fmt::Debug for Provider {
 }
 
 impl Provider {
+    /// Is this OpenRouter?
+    ///
+    /// Asked in three places that must agree: which providers OpenCode will
+    /// run models from, which of its models are offered, and whether
+    /// `pty_spawn` puts a key in the tab's environment. Two of those are
+    /// security-shaped, so the test lives here once rather than being spelled
+    /// out wherever it is needed.
+    pub fn is_openrouter(&self) -> bool {
+        self.base_url.contains("openrouter.ai")
+    }
+
     fn view(&self) -> ProviderView {
         ProviderView {
             id: self.id.clone(),
@@ -318,34 +329,33 @@ pub fn provider_model_cards(id: String) -> Result<Vec<ModelCard>, String> {
 /// The command an API-model tab runs: this very binary in its `chat` argv
 /// mode, shell-quoted. The key is not in it — `aiterm chat` reads the
 /// provider config itself, so nothing secret crosses the PTY's command line.
+///
+/// The command itself is built by [`crate::agents::ChatBackend`], where every
+/// other engine's syntax lives. This stays only as the call the frontend still
+/// makes; `resolve_launch` is the replacement.
 #[tauri::command]
 pub fn api_launch_command(
     provider_id: String,
     model: String,
     session_id: String,
 ) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    Ok(format!(
-        "{} chat --provider {} --model {} --session-id {}",
-        q(&exe.to_string_lossy()),
-        q(&provider_id),
-        q(&model),
-        q(&session_id),
-    ))
+    use crate::agents::AgentBackend;
+    Ok(crate::agents::ChatBackend.launch(&crate::agents::LaunchSpec {
+        model: Some(model),
+        session_id: Some(session_id),
+        provider: Some(provider_id),
+        ..Default::default()
+    }))
 }
 
 /// The command that reopens a stored chat with its context — the ▶ on an
 /// `api` row. Provider and model come from the transcript itself.
 #[tauri::command]
 pub fn chat_resume_command(session_id: String) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    Ok(format!(
-        "{} chat --resume {}",
-        q(&exe.to_string_lossy()),
-        q(&session_id),
-    ))
+    use crate::agents::AgentBackend;
+    crate::agents::ChatBackend
+        .resume(&session_id)
+        .ok_or_else(|| format!("Cannot reopen chat {session_id}."))
 }
 
 /// Replace a provider's startup shortlist and persist it.

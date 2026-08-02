@@ -31,6 +31,10 @@ tantivy = "0.26"
 tauri-plugin-window-state = "2.4.1"
 notify = "8.2.0"
 libc = "0.2"
+# Session ids are minted in Rust, not the renderer: only the backend knows
+# whether an id will name a real session. Already in the tree via Tauri, so
+# this turns on a feature rather than adding a dependency.
+uuid = { version = "1", features = ["v4"] }
 tauri-plugin-dialog = "2"
 # No `release_max_level_off`: the Diagnostics panel can switch tracing on in
 # release builds, so the macros must survive into them. Off = a cached filter

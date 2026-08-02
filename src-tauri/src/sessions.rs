@@ -1381,7 +1381,6 @@ fn mtime_of(path: &Path) -> Option<u64> {
 /// backend that can find the file.
 fn find_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     crate::agents::find_session_file_in(&crate::agents::backends(), session_id)
-        .or_else(|| crate::chat::chat_file_if_exists(session_id))
 }
 
 /// Claude Code's own lookup: `~/.claude/projects/<project>/<id>.jsonl`, falling

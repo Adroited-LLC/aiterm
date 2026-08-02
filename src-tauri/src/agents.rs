@@ -43,6 +43,35 @@ use serde::Serialize;
 
 use crate::sessions::{ClaudeProvider, Session, SessionProvider};
 
+/// What an engine supports, so the UI can stop asking what it is called.
+///
+/// Every flag names one affordance the renderer used to gate on an agent id —
+/// `s.agent === "api"` and `s.agent === "claude"` scattered across the sidebar
+/// and the composer. A backend declares its own; an id with no backend at all
+/// (an index row from an engine since removed) gets all false, which shows a
+/// row with no buttons rather than a row offering claude's.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Default)]
+pub struct Caps {
+    /// ⑂ in the sidebar — branch this session into a new one.
+    pub fork: bool,
+    /// ✦ re-key — start fresh under an id aiterm already knows.
+    pub clear: bool,
+    /// ▶ — reopen this session where it left off.
+    pub resume: bool,
+    /// The 250 ms screen poll in `term/screen.ts` and the Tui* dialogs that
+    /// drive the agent's own TUI by typing into it.
+    ///
+    /// Separate from `panels` because they read different things: this one
+    /// parses what is on the screen, `panels` reads a transcript off disk. An
+    /// engine can have either without the other — today both run against every
+    /// tab regardless of what is in it — so one combined flag would force a
+    /// backend to claim capabilities it does not have to get the one it does.
+    pub tui_drive: bool,
+    /// Transcript panels — tasks, artifacts, agents — and the composer pills
+    /// that send `/model`, `/effort` and `/rewind`.
+    pub panels: bool,
+}
+
 /// What is known about an agent on this machine right now.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Detection {
@@ -59,6 +88,10 @@ pub struct Detection {
     /// Resolved binary path, so the UI can show *which* copy was found when
     /// several are installed.
     pub path: Option<String>,
+    /// What this engine supports. Rides here because the frontend already
+    /// fetches detection once on mount, and it covers absent backends too — a
+    /// session row belonging to an uninstalled engine still has to resolve.
+    pub caps: Caps,
 }
 
 /// A model a backend can be started on, and the effort levels it accepts.
@@ -85,6 +118,11 @@ pub struct LaunchSpec {
     /// A session id aiterm has minted. Only meaningful where the agent accepts
     /// one — see `mints_session_id`.
     pub session_id: Option<String>,
+    /// The id of an API provider from the provider store. Only meaningful to a
+    /// backend that runs API models; everything else ignores it. Never the key
+    /// itself — that is resolved at spawn time and never crosses a command
+    /// line.
+    pub provider: Option<String>,
 }
 
 pub trait AgentBackend: Send + Sync {
@@ -139,6 +177,56 @@ pub trait AgentBackend: Send + Sync {
     fn offered(&self) -> bool {
         true
     }
+
+    /// What this engine supports, for the UI to gate on instead of the id.
+    /// Defaulting to all-false is the safe direction: a backend that has not
+    /// said it can be forked offers no ⑂ rather than one that fails.
+    fn caps(&self) -> Caps {
+        Caps::default()
+    }
+
+    /// The command that reopens an existing session. `None` where the engine
+    /// cannot be told to resume — the caller keeps whatever fallback it had.
+    fn resume(&self, session_id: &str) -> Option<String> {
+        let _ = session_id;
+        None
+    }
+
+    /// The command that starts a fresh session under an id aiterm already
+    /// knows. `None` where the engine will not take an id up front.
+    fn clear(&self, session_id: &str) -> Option<String> {
+        let _ = session_id;
+        None
+    }
+
+    /// Whether this engine will run a model from this API provider.
+    ///
+    /// The routing question that used to be an `&&` in the renderer. Each
+    /// backend answers about itself and the resolver takes the first willing
+    /// one, so a new engine inserts itself by answering rather than by an edit
+    /// at the call site.
+    fn accepts_api(&self, provider: &crate::providers::Provider) -> bool {
+        let _ = provider;
+        false
+    }
+
+    /// How this engine spells a provider's model id on its command line.
+    /// OpenCode wants its own catalog prefix; a raw id is right for everyone
+    /// else. The engine's spelling is the engine's business — the resolver
+    /// must not learn it.
+    fn api_model_slug(&self, model_id: &str) -> String {
+        model_id.to_string()
+    }
+
+    /// Whether a provider-backed launch needs the provider's key in its
+    /// process environment.
+    ///
+    /// False by default, deliberately: an engine gets a secret only by asking
+    /// for it. `ChatBackend` reads the provider store itself and must never be
+    /// handed a key; an external CLI like OpenCode has no other way to get one.
+    fn needs_provider_key_env(&self) -> bool {
+        false
+    }
 }
 
 /// Shell-quote a value going onto a command line.
@@ -160,7 +248,7 @@ impl AgentBackend for ClaudeBackend {
         "Claude Code"
     }
     fn detect(&self) -> Detection {
-        detect_cli(self.id(), self.display_name(), "claude")
+        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "claude") }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &ClaudeProvider
@@ -168,6 +256,38 @@ impl AgentBackend for ClaudeBackend {
 
     fn mints_session_id(&self) -> bool {
         true
+    }
+
+    /// Everything. The subsystems the flags gate were all written against
+    /// Claude Code and only work today because it is the engine that runs them.
+    fn caps(&self) -> Caps {
+        Caps { fork: true, clear: true, resume: true, tui_drive: true, panels: true }
+    }
+
+    /// The ordinary launch with `--resume <id>` in place of the minted id.
+    ///
+    /// Built from `launch` rather than from a second copy of the flags: the
+    /// permission mode and the hook `--settings` must be the same on a resume
+    /// as on a start, and two spellings of that would drift.
+    ///
+    /// The id is quoted, like every other value that reaches `$SHELL -ic`.
+    /// Anything reading this command back to decide "is this tab reopening
+    /// that conversation" — the re-key guard watches for exactly that — has to
+    /// look for the quoted form.
+    fn resume(&self, session_id: &str) -> Option<String> {
+        Some(format!(
+            "{} --resume {}",
+            self.launch(&LaunchSpec::default()),
+            q(session_id)
+        ))
+    }
+
+    /// A `/clear` re-key: same command, new conversation, id aiterm chose.
+    fn clear(&self, session_id: &str) -> Option<String> {
+        Some(self.launch(&LaunchSpec {
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        }))
     }
 
     /// The aliases `claude --help` documents, plus the effort levels it lists.
@@ -372,10 +492,19 @@ impl AgentBackend for CodexBackend {
         "Codex"
     }
     fn detect(&self) -> Detection {
-        detect_cli(self.id(), self.display_name(), "codex")
+        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "codex") }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &CodexSessions
+    }
+
+    /// Nothing, resume included. `codex resume` exists, but the path through
+    /// aiterm is parked with the diagnosis already done — four Claude-shaped
+    /// assumptions sit between a Codex row and a working reopen, and shipping
+    /// a ▶ that lands in a black pane is worse than not offering one. Flipping
+    /// `resume` here is the whole of the UI work when it is picked back up.
+    fn caps(&self) -> Caps {
+        Caps::default()
     }
 
     /// Codex has no `--session-id`. `codex --help` offers `resume` and `fork`
@@ -438,10 +567,17 @@ impl AgentBackend for OpenCodeBackend {
         "OpenCode"
     }
     fn detect(&self) -> Detection {
-        detect_cli(self.id(), self.display_name(), "opencode")
+        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "opencode") }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &NoSessions
+    }
+
+    /// Nothing, because there is no session reader — its sessions live in a
+    /// SQLite `opencode.db` aiterm cannot read, so there is no row to fork,
+    /// re-key or reopen in the first place.
+    fn caps(&self) -> Caps {
+        Caps::default()
     }
 
     /// `opencode --help` names sessions only to `--continue`/`--session` back
@@ -471,6 +607,133 @@ impl AgentBackend for OpenCodeBackend {
     fn offered(&self) -> bool {
         false
     }
+
+    /// OpenRouter only. OpenCode keys its catalog by *its* provider ids, so an
+    /// arbitrary OpenAI-compatible endpoint would launch a session that fails
+    /// to resolve — the same reason `opencode_models` filters the shortlist.
+    fn accepts_api(&self, provider: &crate::providers::Provider) -> bool {
+        provider.is_openrouter()
+    }
+
+    /// Its catalog prefix, matching the shortlist `opencode_models` builds.
+    fn api_model_slug(&self, model_id: &str) -> String {
+        format!("openrouter/{model_id}")
+    }
+
+    /// It authenticates from `OPENROUTER_API_KEY` in its environment; there is
+    /// no other way to hand it a key that aiterm holds.
+    fn needs_provider_key_env(&self) -> bool {
+        true
+    }
+}
+
+/// `aiterm chat` — this binary's own console harness, as a backend.
+///
+/// The id `"api"` is load-bearing twice over: it is stamped on every chat row
+/// already in the index (changing it orphans them) and it is now this
+/// backend's key in the registry. Neither can be renamed without the other.
+///
+/// It is always available — it is this executable — and never offered in the
+/// ＋ menu: a chat starts by picking a model in Model access, and a second
+/// door to the same room would be confusing rather than convenient.
+pub struct ChatBackend;
+
+/// The chats `aiterm chat` writes: one jsonl per conversation under
+/// `~/.local/share/aiterm/chats`.
+pub struct ChatSessions;
+
+impl SessionProvider for ChatSessions {
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+        crate::chat::scan_chats()
+    }
+    fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        crate::chat::chat_file_if_exists(session_id)
+    }
+}
+
+/// This binary's path, shell-quoted, for a command that re-enters it in `chat`
+/// argv mode.
+///
+/// `current_exe` can fail — a deleted or replaced binary mid-run — and the
+/// launch string has nowhere to report that, so fall back to the bare name and
+/// let the shell's PATH lookup answer. An installed aiterm resolves; one run
+/// from a build directory gets a shell error naming the command, which is a
+/// better failure than a tab that opens on nothing.
+fn chat_exe() -> String {
+    q(&std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "aiterm".into()))
+}
+
+impl AgentBackend for ChatBackend {
+    fn id(&self) -> &'static str {
+        "api"
+    }
+    fn display_name(&self) -> &'static str {
+        "aiterm chat"
+    }
+
+    /// No PATH probe: the harness is this process. Version and path are `None`
+    /// because neither describes a separate program.
+    fn detect(&self) -> Detection {
+        Detection {
+            id: self.id().to_string(),
+            display_name: self.display_name().to_string(),
+            available: true,
+            version: None,
+            path: None,
+            caps: self.caps(),
+        }
+    }
+
+    fn sessions(&self) -> &dyn SessionProvider {
+        &ChatSessions
+    }
+
+    /// The id is aiterm's own: the transcript is named after it before the
+    /// first token arrives, so the sidebar row is real from the first frame.
+    fn mints_session_id(&self) -> bool {
+        true
+    }
+
+    /// Reached through the Model-access dropdown, not the ＋ menu.
+    fn offered(&self) -> bool {
+        false
+    }
+
+    /// Resume only. There is no fork, no re-key, no TUI to drive, and the
+    /// transcript panels read Claude Code's record types, not ours.
+    fn caps(&self) -> Caps {
+        Caps { resume: true, ..Default::default() }
+    }
+
+    /// The fallback, so it declines nothing. If it did, an API model on a
+    /// provider no engine wanted would resolve to no plan at all.
+    fn accepts_api(&self, _provider: &crate::providers::Provider) -> bool {
+        true
+    }
+
+    /// The key is deliberately absent: this process reads the provider store
+    /// itself, so nothing secret needs to cross the PTY environment.
+    fn launch(&self, spec: &LaunchSpec) -> String {
+        let mut cmd = format!("{} chat", chat_exe());
+        if let Some(p) = spec.provider.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --provider {}", q(p)));
+        }
+        if let Some(m) = spec.model.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --model {}", q(m)));
+        }
+        if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --session-id {}", q(id)));
+        }
+        cmd
+    }
+
+    /// Provider and model come from the transcript itself, so a resume names
+    /// only the chat.
+    fn resume(&self, session_id: &str) -> Option<String> {
+        Some(format!("{} chat --resume {}", chat_exe(), q(session_id)))
+    }
 }
 
 /// The startup shortlist as OpenCode model slugs (`openrouter/<vendor>/<id>`).
@@ -483,7 +746,7 @@ impl AgentBackend for OpenCodeBackend {
 pub fn opencode_models(providers: &[crate::providers::Provider]) -> Vec<ModelOption> {
     providers
         .iter()
-        .filter(|p| p.base_url.contains("openrouter.ai"))
+        .filter(|p| p.is_openrouter())
         .flat_map(|p| {
             p.startup_models.iter().map(|m| ModelOption {
                 id: format!("openrouter/{m}"),
@@ -553,11 +816,15 @@ pub fn parse_codex_models(text: &str) -> Option<Vec<ModelOption>> {
 /// — the previous arrangement built this list inline in `list_sessions` while
 /// the indexer named `ClaudeProvider` directly, which is exactly the shape that
 /// gets you rows you cannot search.
+/// Order is behaviour, not taste: it is the tie-break for session lookup and
+/// the priority for "who runs this API model". `ChatBackend` sits last because
+/// it accepts everything — anything after it would never be asked.
 pub fn backends() -> Vec<Box<dyn AgentBackend>> {
     vec![
         Box::new(ClaudeBackend),
         Box::new(CodexBackend),
         Box::new(OpenCodeBackend),
+        Box::new(ChatBackend),
     ]
 }
 
@@ -571,14 +838,12 @@ pub fn backends() -> Vec<Box<dyn AgentBackend>> {
 /// trusting the parser to label its own output. The parser is per-agent and its
 /// label would be a second place for the name to live; this way `agent` cannot
 /// disagree with the registry, which is what the UI switches on.
+///
+/// Every source comes through the registry, API chats included — they used to
+/// be appended here by hand, which is one more list to remember and the reason
+/// a chat could appear twice the moment it also became a backend.
 pub fn scan_all_with_paths() -> Vec<(Session, std::path::PathBuf)> {
-    let mut all = scan_backends(&backends());
-    // API chats are sessions without being an agent: they scan and index like
-    // everyone else but never appear in agent_choices — the new-session menu
-    // offers them through the provider dropdown instead.
-    all.extend(crate::chat::scan_chats());
-    all.sort_by(|a, b| b.0.last_active.cmp(&a.0.last_active));
-    all
+    scan_backends(&backends())
 }
 
 /// The body of [`scan_all_with_paths`], over an explicit list.
@@ -823,6 +1088,9 @@ fn detect_cli(id: &str, display_name: &str, bin: &str) -> Detection {
         available: found.is_some(),
         version,
         path: found.map(|p| p.to_string_lossy().into_owned()),
+        // Nothing to declare from a PATH probe: what an engine supports is the
+        // backend's own answer, filled in by whoever called this.
+        caps: Caps::default(),
     }
 }
 
@@ -954,6 +1222,7 @@ mod tests {
                 available: true,
                 version: None,
                 path: None,
+                caps: Caps::default(),
             }
         }
         fn sessions(&self) -> &dyn SessionProvider {
@@ -1215,8 +1484,8 @@ mod tests {
         assert_eq!(OpenCodeBackend.launch(&LaunchSpec::default()), "opencode");
         let cmd = OpenCodeBackend.launch(&LaunchSpec {
             model: Some("openrouter/anthropic/claude-sonnet-5".into()),
-            effort: None,
             session_id: Some("abc-123".into()),
+            ..Default::default()
         });
         assert_eq!(cmd, "opencode --model 'openrouter/anthropic/claude-sonnet-5'");
     }
@@ -1254,6 +1523,7 @@ mod tests {
             model: Some("opus".into()),
             effort: Some("high".into()),
             session_id: Some("abc-123".into()),
+            ..Default::default()
         });
         assert!(cmd.contains("--model 'opus'"), "{cmd}");
         assert!(cmd.contains("--effort 'high'"), "{cmd}");
@@ -1268,6 +1538,7 @@ mod tests {
             model: Some("gpt-5.6-sol".into()),
             effort: Some("high".into()),
             session_id: Some("abc-123".into()),
+            ..Default::default()
         });
         assert!(cmd.starts_with("codex "), "{cmd}");
         assert!(cmd.contains("--model 'gpt-5.6-sol'"), "{cmd}");
@@ -1280,14 +1551,200 @@ mod tests {
         let spec = LaunchSpec {
             model: Some(String::new()),
             effort: Some(String::new()),
-            session_id: None,
+            ..Default::default()
         };
         assert_eq!(CodexBackend.launch(&spec), "codex");
         assert!(!ClaudeBackend.launch(&spec).contains("--model"));
     }
 
-    /// These strings are handed to `$SHELL -ic`. The UI only sends values from
-    /// lists we produced, but that is not a boundary to rely on.
+    /// Resume must carry the same permission mode and hook settings as a start
+    /// — it is the same session continuing, and a resume that ran under
+    /// different flags would behave differently for no reason a user could see.
+    #[test]
+    fn claude_resumes_with_the_flags_it_starts_with() {
+        let start = ClaudeBackend.launch(&LaunchSpec::default());
+        let resumed = ClaudeBackend.resume("abc-123").expect("claude declined to resume");
+        assert_eq!(resumed, format!("{start} --resume 'abc-123'"));
+    }
+
+    /// A `/clear` re-key is a fresh start under an id aiterm already knows, so
+    /// it is exactly the launch command with that id in it.
+    #[test]
+    fn claude_clears_by_starting_fresh_under_the_given_id() {
+        let cleared = ClaudeBackend.clear("abc-123").expect("claude declined to clear");
+        assert_eq!(
+            cleared,
+            ClaudeBackend.launch(&LaunchSpec {
+                session_id: Some("abc-123".into()),
+                ..Default::default()
+            })
+        );
+        assert!(cleared.contains("--session-id 'abc-123'"), "{cleared}");
+    }
+
+    /// Codex and OpenCode decline rather than offering a command that lands in
+    /// a black pane — the parked resume path and the unreadable session store.
+    #[test]
+    fn engines_that_cannot_reopen_a_session_say_so() {
+        assert_eq!(CodexBackend.resume("abc-123"), None);
+        assert_eq!(CodexBackend.clear("abc-123"), None);
+        assert_eq!(OpenCodeBackend.resume("abc-123"), None);
+        assert_eq!(ChatBackend.clear("abc-123"), None);
+    }
+
+    /// The renderer sends only what it picked. A spec that names a model and
+    /// nothing else has to keep parsing — every field it leaves out is one the
+    /// agent's own default answers.
+    #[test]
+    fn a_spec_naming_only_a_model_still_parses() {
+        let spec: LaunchSpec = serde_json::from_str(r#"{"model":"opus"}"#).expect("spec");
+        assert_eq!(spec.model.as_deref(), Some("opus"));
+        assert_eq!(spec.provider, None);
+        assert_eq!(spec.session_id, None);
+    }
+
+    /* ---- aiterm chat ---------------------------------------------------- */
+
+    /// The harness runs this binary in its `chat` argv mode. The provider id
+    /// is on the line; the key never is — `aiterm chat` reads the provider
+    /// store itself, and `/proc` publishes argv to every process on the box.
+    #[test]
+    fn a_chat_launch_names_the_provider_and_never_the_key() {
+        let cmd = ChatBackend.launch(&LaunchSpec {
+            model: Some("anthropic/claude-sonnet-5".into()),
+            session_id: Some("abc-123".into()),
+            provider: Some("openrouter".into()),
+            ..Default::default()
+        });
+        assert!(cmd.contains(" chat --provider 'openrouter'"), "{cmd}");
+        assert!(cmd.contains("--model 'anthropic/claude-sonnet-5'"), "{cmd}");
+        assert!(cmd.contains("--session-id 'abc-123'"), "{cmd}");
+    }
+
+    #[test]
+    fn a_chat_resume_names_only_the_session() {
+        let cmd = ChatBackend.resume("abc-123").expect("chat declined to resume");
+        assert!(cmd.contains(" chat --resume 'abc-123'"), "{cmd}");
+        assert!(!cmd.contains("--provider"), "provider guessed on a resume: {cmd}");
+    }
+
+    /// It is this executable, so it is always here — and it is the fallback
+    /// for API models, which fails if it can ever be unavailable.
+    #[test]
+    fn the_chat_harness_is_always_available_and_never_offered() {
+        let d = ChatBackend.detect();
+        assert!(d.available);
+        assert_eq!(d.id, "api");
+        assert!(!ChatBackend.offered());
+        assert!(agent_choices().iter().all(|c| c.id != "api"));
+    }
+
+    /// Chats reach the sidebar through the registry now. They used to be
+    /// appended to the scan by hand as well, and both routes at once lists
+    /// every chat twice.
+    #[test]
+    fn chats_come_from_exactly_one_place() {
+        assert_eq!(
+            backends().iter().filter(|b| b.id() == "api").count(),
+            1,
+            "more than one backend claims the chat store",
+        );
+        // Whatever is on this machine, no transcript may be listed twice: a
+        // duplicate (id, path) pair can only come from two sources yielding the
+        // same file. Vacuous on a machine with no sessions, and that is fine —
+        // the assertion is about composition, not about content.
+        let mut seen = std::collections::HashSet::new();
+        for (s, path) in scan_all_with_paths() {
+            assert!(
+                seen.insert((s.id.clone(), path.clone())),
+                "{} was listed twice from {}",
+                s.id,
+                path.display(),
+            );
+        }
+    }
+
+    /* ---- capabilities --------------------------------------------------- */
+
+    /// The flags exist so the UI can stop comparing ids. Claude is the engine
+    /// every gated subsystem was written against; everything else declares
+    /// less rather than inheriting its buttons.
+    #[test]
+    fn capabilities_ride_on_detection_and_match_the_backend() {
+        for b in backends() {
+            assert_eq!(b.detect().caps, b.caps(), "{} detected different caps", b.id());
+        }
+        assert_eq!(
+            ClaudeBackend.caps(),
+            Caps { fork: true, clear: true, resume: true, tui_drive: true, panels: true },
+        );
+        assert_eq!(CodexBackend.caps(), Caps::default());
+        assert_eq!(OpenCodeBackend.caps(), Caps::default());
+        assert_eq!(ChatBackend.caps(), Caps { resume: true, ..Default::default() });
+    }
+
+    /// A backend that offers ▶ must have a command behind it, and one that
+    /// does not must not — a button with no command is a black pane.
+    #[test]
+    fn every_backend_that_claims_a_lifecycle_button_can_produce_one() {
+        for b in backends() {
+            assert_eq!(
+                b.caps().resume,
+                b.resume("abc-123").is_some(),
+                "{} disagrees with itself about resume",
+                b.id(),
+            );
+            assert_eq!(
+                b.caps().clear,
+                b.clear("abc-123").is_some(),
+                "{} disagrees with itself about clear",
+                b.id(),
+            );
+        }
+    }
+
+    /// OpenCode keys its catalog by its own provider ids, so it takes
+    /// OpenRouter and nothing else; the harness takes everything, which is what
+    /// makes it a usable last resort.
+    #[test]
+    fn only_the_harness_accepts_a_provider_that_is_not_openrouter() {
+        let openrouter = crate::providers::Provider {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "k".into(),
+            startup_models: vec![],
+        };
+        let local = crate::providers::Provider {
+            base_url: "http://localhost:8080/v1".into(),
+            ..openrouter.clone()
+        };
+        assert!(OpenCodeBackend.accepts_api(&openrouter));
+        assert!(!OpenCodeBackend.accepts_api(&local));
+        assert!(ChatBackend.accepts_api(&openrouter) && ChatBackend.accepts_api(&local));
+        assert!(!ClaudeBackend.accepts_api(&openrouter));
+        assert!(!CodexBackend.accepts_api(&openrouter));
+    }
+
+    /// The catalog prefix is OpenCode's spelling and nobody else's — the
+    /// harness passes the provider's own model id straight through.
+    #[test]
+    fn only_opencode_prefixes_an_api_model_id() {
+        assert_eq!(OpenCodeBackend.api_model_slug("a/b"), "openrouter/a/b");
+        assert_eq!(ChatBackend.api_model_slug("a/b"), "a/b");
+        assert_eq!(ClaudeBackend.api_model_slug("a/b"), "a/b");
+    }
+
+    /// The key goes only where it is the only way in. The harness reads the
+    /// provider store itself, so handing it one would widen exposure for
+    /// nothing.
+    #[test]
+    fn only_an_engine_with_no_other_way_in_asks_for_the_key() {
+        assert!(OpenCodeBackend.needs_provider_key_env());
+        assert!(!ChatBackend.needs_provider_key_env());
+        assert!(!ClaudeBackend.needs_provider_key_env());
+    }
+
     /// These strings are handed to `$SHELL -ic`. The UI only sends values from
     /// lists we produced, but that is not a boundary to rely on.
     ///

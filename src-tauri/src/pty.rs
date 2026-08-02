@@ -139,7 +139,7 @@ pub fn pty_spawn(
     // exposure as the tool's own credential file.
     if let Some(pid) = env_provider {
         if let Some(p) = crate::providers::load_providers().iter().find(|p| p.id == pid) {
-            if p.base_url.contains("openrouter.ai") && !p.api_key.is_empty() {
+            if p.is_openrouter() && !p.api_key.is_empty() {
                 cmd.env("OPENROUTER_API_KEY", &p.api_key);
             }
         }

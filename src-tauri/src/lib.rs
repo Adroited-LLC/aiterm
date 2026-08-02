@@ -7,6 +7,7 @@ pub mod fsx;
 pub mod git;
 pub mod hooklink;
 pub mod indexer;
+pub mod launch;
 pub mod providers;
 pub mod pty;
 pub mod sessions;
@@ -48,6 +49,7 @@ pub fn run() {
             diag::diag_environment,
             agents::agent_choices,
             agents::agent_launch_command,
+            launch::resolve_launch,
             providers::providers_list,
             providers::provider_save,
             providers::provider_delete,
