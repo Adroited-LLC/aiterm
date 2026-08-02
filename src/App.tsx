@@ -1616,6 +1616,7 @@ export default function App() {
                 fontFamily={xtermFont}
                 lineHeight={settings.termLineHeight}
                 fontWeight={settings.termFontWeight}
+                renderer={settings.termRenderer}
                 theme={xtermTheme}
               />
             ))}

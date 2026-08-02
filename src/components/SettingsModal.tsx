@@ -352,6 +352,30 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                     ))}
                   </div>
                 </Row>
+                <Row
+                  label="Rendering"
+                  desc="GPU never uses the desktop's font smoothing; DOM does, and can look sharper"
+                >
+                  <div className="seg">
+                    {([
+                      ["gpu", "GPU"],
+                      ["dom", "DOM"],
+                    ] as const).map(([value, label]) => (
+                      <button
+                        key={value}
+                        className={"seg-btn" + (settings.termRenderer === value ? " on" : "")}
+                        onClick={() => set({ termRenderer: value })}
+                      >{label}</button>
+                    ))}
+                  </div>
+                </Row>
+                {settings.termRenderer === "dom" && (
+                  <div className="sgroup-foot">
+                    Switches every open terminal as you look at it. DOM is the
+                    renderer that used to leave cells behind after a redraw — if
+                    you see text that should be gone, that's the trade.
+                  </div>
+                )}
                 {/* Same text the terminal would render, at the same size, face,
                     spacing and weight — the only honest way to judge any of them.
                     The last line is bold, so you can see emphasis still separates

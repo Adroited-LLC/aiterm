@@ -25,6 +25,17 @@ export interface AppSettings {
   /** Weight for ordinary terminal text. Bold stays heavier than whatever this
    *  is, so emphasis keeps working — see `termFontWeightBold`. */
   termFontWeight: number;
+  /** Which renderer draws the terminal.
+   *
+   *  `"gpu"` rasterises its own glyph atlas, so text is always grayscale
+   *  antialiased no matter what the desktop is set to — it never sees the
+   *  system's subpixel rendering or hinting. `"dom"` is drawn by the browser
+   *  engine and does, which some displays render noticeably sharper.
+   *
+   *  Not a free choice: the GPU renderer was adopted to fix stale cells the DOM
+   *  one left behind. This is here so the trade can be looked at rather than
+   *  argued about, and it stays on GPU unless someone changes it. */
+  termRenderer: "gpu" | "dom";
   panelScale: PanelScales;
 }
 
@@ -39,6 +50,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // output hard to track a line across.
   termLineHeight: 1.1,
   termFontWeight: 400,
+  termRenderer: "gpu",
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
 };
 

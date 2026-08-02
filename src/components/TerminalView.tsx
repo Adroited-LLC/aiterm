@@ -13,14 +13,21 @@ import "@xterm/xterm/css/xterm.css";
  *  built-in DOM renderer left behind. Guarded so that if WebGL can't init (no
  *  GPU context) the terminal is never worse than the DOM default. On GPU
  *  context loss, dispose so xterm reverts to the DOM renderer rather than
- *  freezing on a dead canvas. */
-function attachRenderer(term: Terminal) {
+ *  freezing on a dead canvas.
+ *
+ *  Returns the addon so a settings change can take it away again: disposing a
+ *  WebglAddon is how xterm is told to go back to drawing in the DOM, and there
+ *  is no other switch. `null` means the terminal is already on the DOM
+ *  renderer, whether by choice or because WebGL would not start. */
+function attachRenderer(term: Terminal): WebglAddon | null {
   try {
     const webgl = new WebglAddon();
     webgl.onContextLoss(() => webgl.dispose());
     term.loadAddon(webgl);
+    return webgl;
   } catch {
     /* WebGL unavailable — xterm's built-in DOM renderer remains */
+    return null;
   }
 }
 
@@ -131,18 +138,28 @@ interface Props {
   lineHeight: number;
   /** Weight for ordinary text; bold is derived from it. */
   fontWeight: number;
+  /** Which renderer draws this terminal — see `AppSettings.termRenderer`. */
+  renderer: "gpu" | "dom";
   theme: Record<string, string>;
 }
 
 export default function TerminalView({
   tab, active, onExit, onRegister, onActivity, onAttention, autoFocus, fontSize, fontFamily,
-  lineHeight, fontWeight, theme,
+  lineHeight, fontWeight, renderer, theme,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
   const ptyIdRef = useRef<number | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  /** The live WebGL addon, when one is attached. Held because switching back to
+   *  the DOM renderer is done by disposing it. */
+  const webglRef = useRef<WebglAddon | null>(null);
+  /** Read inside the mount effect, which must not re-run when the setting
+   *  changes — a new Terminal would mean a new PTY. The effect below switches
+   *  the renderer under the terminal that already exists. */
+  const rendererRef = useRef(renderer);
+  rendererRef.current = renderer;
 
   useEffect(() => {
     if (!elRef.current || started.current) return;
@@ -167,7 +184,9 @@ export default function TerminalView({
     termRef.current = term;
     term.loadAddon(fit);
     term.open(elRef.current);
-    attachRenderer(term);
+    if (rendererRef.current === "gpu") {
+      webglRef.current = attachRenderer(term);
+    }
     fit.fit();
 
     let unlistenExit: UnlistenFn | null = null;
@@ -321,6 +340,29 @@ export default function TerminalView({
       fitRef.current?.fit();
     }
   }, [fontSize]);
+
+  /** Swap the renderer under a running terminal.
+   *
+   *  Neither direction touches the PTY, so the session carries on through the
+   *  change — which is the point of making it a setting rather than something
+   *  that only applies to the next tab: the two can be compared on the same
+   *  screenful of output. A refit and full repaint follow because the new
+   *  renderer inherits nothing from the old one's surface. */
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    const live = webglRef.current;
+    if (renderer === "gpu" && !live) {
+      webglRef.current = attachRenderer(term);
+    } else if (renderer === "dom" && live) {
+      live.dispose();
+      webglRef.current = null;
+    } else {
+      return;
+    }
+    fitRef.current?.fit();
+    term.refresh(0, term.rows - 1);
+  }, [renderer]);
 
   useEffect(() => {
     const term = termRef.current;
