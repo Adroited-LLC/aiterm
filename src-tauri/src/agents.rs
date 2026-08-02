@@ -406,6 +406,81 @@ impl AgentBackend for CodexBackend {
     }
 }
 
+pub struct OpenCodeBackend;
+
+/// A backend whose sessions aiterm cannot read yet. OpenCode 1.18 keeps them
+/// in SQLite (`~/.local/share/opencode/opencode.db`), which is a reader we
+/// have not written — saying "none" keeps the registry honest until we have.
+struct NoSessions;
+
+impl SessionProvider for NoSessions {
+    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+        vec![]
+    }
+    fn find_session_file(&self, _session_id: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
+impl AgentBackend for OpenCodeBackend {
+    fn id(&self) -> &'static str {
+        "opencode"
+    }
+    fn display_name(&self) -> &'static str {
+        "OpenCode"
+    }
+    fn detect(&self) -> Detection {
+        detect_cli(self.id(), self.display_name(), "opencode")
+    }
+    fn sessions(&self) -> &dyn SessionProvider {
+        &NoSessions
+    }
+
+    /// `opencode --help` names sessions only to `--continue`/`--session` back
+    /// into existing ones; nothing pre-mints an id.
+    fn mints_session_id(&self) -> bool {
+        false
+    }
+
+    /// The startup shortlist, spelled the way OpenCode wants it. This is the
+    /// answer to OpenCode's own model picker being a chore: star models once
+    /// in Model access and they appear here, prefixed for its catalog.
+    fn models(&self) -> Vec<ModelOption> {
+        opencode_models(&crate::providers::load_providers())
+    }
+
+    fn launch(&self, spec: &LaunchSpec) -> String {
+        let mut cmd = String::from("opencode");
+        if let Some(m) = spec.model.as_deref().filter(|s| !s.is_empty()) {
+            cmd.push_str(&format!(" --model {}", q(m)));
+        }
+        // No effort concept, and no pre-minted id — see mints_session_id.
+        cmd
+    }
+}
+
+/// The startup shortlist as OpenCode model slugs (`openrouter/<vendor>/<id>`).
+///
+/// Only providers that actually are OpenRouter map — OpenCode's catalog keys
+/// models by *its* provider ids, and pretending an arbitrary OpenAI-compatible
+/// endpoint is one of them would launch sessions that fail to resolve. A
+/// custom endpoint needs an entry in opencode.json, which is config aiterm
+/// does not write behind anyone's back.
+pub fn opencode_models(providers: &[crate::providers::Provider]) -> Vec<ModelOption> {
+    providers
+        .iter()
+        .filter(|p| p.base_url.contains("openrouter.ai"))
+        .flat_map(|p| {
+            p.startup_models.iter().map(|m| ModelOption {
+                id: format!("openrouter/{m}"),
+                display_name: m.clone(),
+                efforts: vec![],
+                default_effort: None,
+            })
+        })
+        .collect()
+}
+
 /// Parse `~/.codex/models_cache.json`. Split out so the shape can be tested
 /// against a captured copy without needing Codex installed.
 fn codex_models() -> Option<Vec<ModelOption>> {
@@ -465,7 +540,11 @@ pub fn parse_codex_models(text: &str) -> Option<Vec<ModelOption>> {
 /// the indexer named `ClaudeProvider` directly, which is exactly the shape that
 /// gets you rows you cannot search.
 pub fn backends() -> Vec<Box<dyn AgentBackend>> {
-    vec![Box::new(ClaudeBackend), Box::new(CodexBackend)]
+    vec![
+        Box::new(ClaudeBackend),
+        Box::new(CodexBackend),
+        Box::new(OpenCodeBackend),
+    ]
 }
 
 /// Every backend's sessions with their transcript paths, newest first.
@@ -1106,6 +1185,46 @@ mod tests {
             stripped,
             "claude --permission-mode auto --allow-dangerously-skip-permissions",
         );
+    }
+
+    /// OpenCode launches bare or with a model slug; a minted session id must
+    /// be dropped (nothing pre-mints one there), never passed through.
+    #[test]
+    fn opencode_takes_a_model_and_drops_a_minted_id() {
+        assert_eq!(OpenCodeBackend.launch(&LaunchSpec::default()), "opencode");
+        let cmd = OpenCodeBackend.launch(&LaunchSpec {
+            model: Some("openrouter/anthropic/claude-sonnet-5".into()),
+            effort: None,
+            session_id: Some("abc-123".into()),
+        });
+        assert_eq!(cmd, "opencode --model 'openrouter/anthropic/claude-sonnet-5'");
+    }
+
+    /// The startup shortlist becomes OpenCode's model list — OpenRouter
+    /// providers only, prefixed for its catalog; a custom endpoint's models
+    /// must not be dressed up as slugs OpenCode cannot resolve.
+    #[test]
+    fn opencode_models_come_from_openrouter_startup_lists_only() {
+        let providers = vec![
+            crate::providers::Provider {
+                id: "openrouter".into(),
+                name: "OpenRouter".into(),
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key: "k".into(),
+                startup_models: vec!["anthropic/claude-sonnet-5".into(), "qwen/q3:free".into()],
+            },
+            crate::providers::Provider {
+                id: "local".into(),
+                name: "Local".into(),
+                base_url: "http://localhost:8080/v1".into(),
+                api_key: "k".into(),
+                startup_models: vec!["some-local-model".into()],
+            },
+        ];
+        let models = opencode_models(&providers);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "openrouter/anthropic/claude-sonnet-5");
+        assert_eq!(models[1].id, "openrouter/qwen/q3:free");
     }
 
     #[test]

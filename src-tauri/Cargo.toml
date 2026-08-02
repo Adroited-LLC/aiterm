@@ -1,6 +1,6 @@
 [package]
 name = "aiterm"
-version = "0.10.20"
+version = "0.10.21"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
