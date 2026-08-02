@@ -194,16 +194,32 @@ fn mint_for(backend: &dyn AgentBackend) -> Option<String> {
         .then(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// What the request was, for an error a person can act on.
-fn describe(request: &LaunchRequest) -> String {
+/// Why nothing could be started, in terms of what the person did.
+///
+/// This string is the toast they see, so it names the engine rather than the
+/// request: "Codex sessions can't be reopened from aiterm yet" is something to
+/// act on, where the id of a session they just clicked is not. A declining
+/// owner and a session that is simply gone are different facts and read
+/// differently.
+fn explain(list: &[Box<dyn AgentBackend>], request: &LaunchRequest) -> String {
+    let gone = "That conversation isn't on disk any more.";
     match request {
-        LaunchRequest::Agent { agent_id, .. } => format!("agent {agent_id}"),
-        LaunchRequest::ApiModel { provider_id, model_id } => {
-            format!("model {model_id} from provider {provider_id}")
+        LaunchRequest::Agent { agent_id, .. } => {
+            format!("{agent_id} isn't installed on this machine.")
         }
-        LaunchRequest::Resume { session_id } => format!("resume of session {session_id}"),
-        LaunchRequest::Restart { session_id } => format!("restart of session {session_id}"),
-        LaunchRequest::Clear { session_id } => format!("clear of session {session_id}"),
+        LaunchRequest::ApiModel { model_id, .. } => {
+            format!("No engine here can run {model_id}. Check Settings → Model access.")
+        }
+        LaunchRequest::Resume { session_id } | LaunchRequest::Restart { session_id } => {
+            match owner(list, session_id) {
+                Some(b) => format!("{} sessions can't be reopened from aiterm yet.", b.display_name()),
+                None => gone.into(),
+            }
+        }
+        LaunchRequest::Clear { session_id } => match owner(list, session_id) {
+            Some(b) => format!("{} sessions can't be cleared.", b.display_name()),
+            None => gone.into(),
+        },
     }
 }
 
@@ -213,8 +229,13 @@ fn describe(request: &LaunchRequest) -> String {
 #[tauri::command]
 pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String> {
     crate::run_blocking(move || {
-        let what = describe(&request);
-        resolve(request).ok_or_else(|| format!("Nothing here can start the {what}."))
+        let list = crate::agents::backends();
+        let providers = crate::providers::load_providers();
+        // The registry is built once and used for both the answer and, when
+        // there is none, the explanation — otherwise the two could disagree
+        // about which engines exist.
+        resolve_in(&list, &providers, request.clone())
+            .ok_or_else(|| explain(&list, &request))
     })
     .await
 }
@@ -673,6 +694,27 @@ mod tests {
         assert_ne!(fresh, "old-1");
         assert!(plan.command.contains(&fresh), "{}", plan.command);
         assert!(!plan.command.contains("old-1"), "{}", plan.command);
+    }
+
+    /// The refusal is the toast a person reads, so it has to name the engine
+    /// that refused — not the request. "resume of session <uuid>" told them
+    /// nothing they did not already know and leaked an id at them.
+    #[test]
+    fn a_refusal_names_the_engine_that_refused() {
+        let list: Vec<Box<dyn AgentBackend>> = vec![Box::new(FakeBackend {
+            id: "codex-like",
+            can_resume: false,
+            sessions: FakeSessions { ids: vec!["c-1"] },
+            ..Default::default()
+        })];
+
+        let refused = explain(&list, &LaunchRequest::Resume { session_id: "c-1".into() });
+        assert!(refused.contains("codex-like"), "{refused}");
+        assert!(!refused.contains("c-1"), "the id is not news to whoever clicked it: {refused}");
+
+        // Nobody owns it: a different fact, and it reads differently.
+        let gone = explain(&list, &LaunchRequest::Resume { session_id: "never".into() });
+        assert!(gone.contains("isn't on disk"), "{gone}");
     }
 
     /// A backend that names no session cannot clear: there would be nothing for

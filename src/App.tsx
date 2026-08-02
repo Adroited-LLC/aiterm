@@ -1084,7 +1084,7 @@ export default function App() {
     try {
       plan = await resolveLaunch({ kind: "resume", sessionId: s.id });
     } catch (e) {
-      setNotice(`Couldn't reopen ${s.title}: ${e}`);
+      setNotice(`${e}`);
       return;
     }
     // The preamble — moved-to resolution, fork redemption, roster stops — is
@@ -1185,7 +1185,7 @@ export default function App() {
       try {
         plan = await resolveLaunch({ kind: "resume", sessionId: liveId });
       } catch (e) {
-        setNotice(`Couldn't reopen ${s.title}: ${e}`);
+        setNotice(`${e}`);
         return;
       }
     }
@@ -1225,13 +1225,13 @@ export default function App() {
     try {
       plan = await resolveLaunch({ kind: "clear", sessionId: s.id });
     } catch (e) {
-      setNotice(`Couldn't clear "${s.title}": ${e}`);
+      setNotice(`${e}`);
       return;
     }
     // No id on the plan means nothing would name the new conversation, and a
     // tab keyed to nothing is the unreachable-tab bug — say so instead.
     if (!plan.session_id) {
-      setNotice(`"${s.title}" can't be cleared — its engine names no new session.`);
+      setNotice(`Clearing isn't available for "${s.title}".`);
       return;
     }
     closeTab(t.key);
@@ -1440,7 +1440,7 @@ export default function App() {
    *  nothing in it to press them on. */
   const browseNewSession = useCallback(async () => {
     if (!emptyCtl.ready) {
-      setNotice("No agent CLI found on this machine.");
+      setNotice("Nothing to start yet — add a model under Settings → Model access, or install claude or codex.");
       return;
     }
     try {

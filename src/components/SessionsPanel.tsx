@@ -716,7 +716,7 @@ export default function SessionsPanel({
               <span className="confirm-label">Stop it and resume?</span>
               <button
                 className="act-btn"
-                title="Stop the running session, then reopen it with claude --resume"
+                title="Stop the running session, then reopen it where it left off"
                 onClick={() => { setConfirmStop(null); onResume(s); }}
               >Resume</button>
               <button
@@ -945,7 +945,7 @@ export default function SessionsPanel({
             machine with no `~/Projects`, no way to begin one at all. */}
         <button
           className={"icon-btn" + (showNewSession ? " on" : "")}
-          title="New claude session…"
+          title="Start a session…"
           data-new-session-trigger=""
           onClick={() => setShowNewSession((v) => !v)}
         >＋</button>

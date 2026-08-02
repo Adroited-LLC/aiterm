@@ -71,7 +71,7 @@ export default function SessionPreview({ session, onResume, onClose, canResume }
       </div>
       <div className="preview-foot">
         Preview — showing the last {msgs?.length ?? 0} messages
-        {canResume ? " · ▶ reopens it in this window" : " · this engine cannot reopen a session"}
+        {canResume ? " · ▶ reopens it in this window" : " · reopening isn't available for this one"}
       </div>
     </div>
   );

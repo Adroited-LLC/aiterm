@@ -179,12 +179,15 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
       </div>
       {apiPicked && (
         <div className="empty-note">
-          Runs OpenCode on this model — or aiterm's chat console where
-          OpenCode can't take it.
+          Runs in OpenCode where it can, and aiterm's own chat console
+          otherwise. Either way the conversation is saved and resumable.
         </div>
       )}
       {agents.length === 0 && (
-        <div className="empty-note">No agent CLI found on this machine.</div>
+        <div className="empty-note">
+          No agent installed. Add a model under Settings → Model access, or
+          install claude or codex.
+        </div>
       )}
     </div>
   );

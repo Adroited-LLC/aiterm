@@ -44,7 +44,12 @@ export default function AgentPanel({ sessionId }: Props) {
   }, [sessionId]);
 
   if (!sessionId) {
-    return <div className="empty-note">Open a claude session to see its tasks and artifacts</div>;
+    return (
+      <div className="empty-note">
+        Tasks and artifacts appear here for engines that record them. Claude
+        Code is the only one that does today.
+      </div>
+    );
   }
 
   const done = tasks.filter((t) => t.status === "completed").length;
