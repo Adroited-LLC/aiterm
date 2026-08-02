@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "aiterm"
-version = "0.10.27"
+version = "0.10.28"
 dependencies = [
  "dirs",
  "git2",
