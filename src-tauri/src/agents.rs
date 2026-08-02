@@ -131,6 +131,14 @@ pub trait AgentBackend: Send + Sync {
     /// that is certainly per-agent, so it belongs with the agent — otherwise
     /// adding one means editing the renderer.
     fn launch(&self, spec: &LaunchSpec) -> String;
+
+    /// Whether the new-session menu offers this agent as a source of its own.
+    /// An engine that is reached some other way — OpenCode runs whatever the
+    /// Model-access dropdown picks — says no, so the menu doesn't grow a
+    /// second door to the same room.
+    fn offered(&self) -> bool {
+        true
+    }
 }
 
 /// Shell-quote a value going onto a command line.
@@ -457,6 +465,12 @@ impl AgentBackend for OpenCodeBackend {
         // No effort concept, and no pre-minted id — see mints_session_id.
         cmd
     }
+
+    /// Not a tab of its own: picking a Model-access model is how an OpenCode
+    /// session starts.
+    fn offered(&self) -> bool {
+        false
+    }
 }
 
 /// The startup shortlist as OpenCode model slugs (`openrouter/<vendor>/<id>`).
@@ -641,7 +655,7 @@ pub struct AgentChoice {
 pub fn agent_choices() -> Vec<AgentChoice> {
     backends()
         .iter()
-        .filter(|b| b.detect().available)
+        .filter(|b| b.offered() && b.detect().available)
         .map(|b| AgentChoice {
             id: b.id().to_string(),
             display_name: b.display_name().to_string(),
@@ -1185,6 +1199,13 @@ mod tests {
             stripped,
             "claude --permission-mode auto --allow-dangerously-skip-permissions",
         );
+    }
+
+    /// OpenCode is an engine, not a menu entry: the Model-access dropdown is
+    /// its door, so agent_choices must never offer it as a source.
+    #[test]
+    fn opencode_is_never_offered_as_a_source() {
+        assert!(agent_choices().iter().all(|c| c.id != "opencode"));
     }
 
     /// OpenCode launches bare or with a model slug; a minted session id must

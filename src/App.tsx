@@ -36,7 +36,7 @@ import {
   drainSessionEvents,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  agentLaunchCommand, adoptAgentSession, apiLaunchCommand, chatResumeCommand,
+  agentLaunchCommand, adoptAgentSession, apiLaunchCommand, chatResumeCommand, detectAgents,
 } from "./ipc";
 import "./App.css";
 
@@ -1216,6 +1216,9 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
+  /** Whether opencode is installed — asked once per run, on first use. */
+  const opencodeAvail = useRef<boolean | null>(null);
+
   const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
     // An API-provider model runs `aiterm chat` in the tab — our own console
     // harness, spawned through the shell exactly the way `claude` is. It has
@@ -1223,15 +1226,31 @@ export default function App() {
     // no sidebar row, nothing to resume.
     if (choice.api) {
       try {
-        // The minted id names the transcript, so the chat becomes a real
-        // sidebar row (agent "api") once its first exchange lands on disk.
+        const title = choice.api.modelId.split("/").pop() || choice.api.modelId;
+        // OpenCode is the engine wherever it can be: an agent with tools,
+        // launched on the picked model. Checked once and remembered — asking
+        // spawns a version read through the login shell.
+        if (opencodeAvail.current === null) {
+          opencodeAvail.current = await detectAgents()
+            .then((l) => l.some((a) => a.id === "opencode" && a.available))
+            .catch(() => false);
+        }
+        if (choice.api.openrouter && opencodeAvail.current) {
+          const command = await agentLaunchCommand("opencode", {
+            model: `openrouter/${choice.api.modelId}`,
+          });
+          setActiveProject(cwd);
+          openTab(title, cwd, command, crypto.randomUUID());
+          return;
+        }
+        // No OpenCode, or a provider its catalog can't resolve: aiterm's own
+        // chat console, with the minted id naming the transcript so the chat
+        // becomes a real sidebar row (agent "api") once its first exchange
+        // lands on disk.
         const id = crypto.randomUUID();
         const command = await apiLaunchCommand(choice.api.providerId, choice.api.modelId, id);
         setActiveProject(cwd);
-        openTab(
-          choice.api.modelId.split("/").pop() || choice.api.modelId,
-          cwd, command, id, id,
-        );
+        openTab(title, cwd, command, id, id);
       } catch (e) {
         setNotice(`Couldn't start ${choice.api.modelId}: ${e}`);
       }

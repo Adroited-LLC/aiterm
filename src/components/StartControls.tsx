@@ -11,9 +11,16 @@ export interface StartChoice {
    *  id aiterm generates is a tab handle only and no panel is keyed to it. */
   mintsSessionId: boolean;
   /** An API-provider model off a startup list, instead of an agent CLI's
-   *  model. Runs as `aiterm chat` in the tab's PTY — same shape as an agent,
-   *  but no session id and no transcript. */
-  api: { providerId: string; providerName: string; modelId: string } | null;
+   *  model. Runs OpenCode where it can (OpenRouter provider, opencode
+   *  installed), aiterm's own chat console otherwise. */
+  api: {
+    providerId: string;
+    providerName: string;
+    modelId: string;
+    /** OpenCode's catalog only resolves OpenRouter slugs, so only an
+     *  OpenRouter provider may route there. */
+    openrouter: boolean;
+  } | null;
 }
 
 /**
@@ -80,10 +87,12 @@ export function useStartChoice() {
     let api: StartChoice["api"] = null;
     if (apiModel) {
       const [providerId, modelId] = JSON.parse(apiModel) as [string, string];
+      const p = providers.find((x) => x.id === providerId);
       api = {
         providerId,
-        providerName: providers.find((p) => p.id === providerId)?.name ?? providerId,
+        providerName: p?.name ?? providerId,
         modelId,
+        openrouter: (p?.base_url ?? "").includes("openrouter.ai"),
       };
     }
     return {
@@ -182,8 +191,8 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
       </div>
       {apiPicked && (
         <div className="empty-note">
-          Starts a chat console on this model. No transcript is kept — the tab
-          is the conversation.
+          Runs OpenCode on this model — or aiterm's chat console where
+          OpenCode can't take it.
         </div>
       )}
       {agents.length === 0 && (
