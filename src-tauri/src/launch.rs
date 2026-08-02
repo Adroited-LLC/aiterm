@@ -128,15 +128,38 @@ pub fn resolve_in(
             reopen(list, &session_id, |b, id| b.resume(id))
         }
 
-        LaunchRequest::Clear { session_id } => reopen(list, &session_id, |b, id| b.clear(id)),
+        // Clear is not a reopen, and the difference is the whole feature: the
+        // id asked about names the conversation being *parked*, never the one
+        // being started. Handing it back would relaunch the engine onto a
+        // transcript that already exists and key the new tab to the very row
+        // the sidebar was told to keep — the old conversation would be
+        // un-parked by the thing that parked it.
+        LaunchRequest::Clear { session_id } => {
+            let backend = owner(list, &session_id)?;
+            let fresh = mint_for(backend)?;
+            Some(LaunchPlan {
+                command: backend.clear(&fresh)?,
+                env_provider: None,
+                session_id: Some(fresh),
+                agent_id: backend.id().to_string(),
+                caps: backend.caps(),
+            })
+        }
     }
 }
 
-/// A plan built by the backend that owns `session_id`.
-///
-/// Ownership is decided by asking each backend to find the transcript, never by
-/// inspecting the id: ids are opaque, and a rule for telling one engine's from
-/// another's would be a guess that breaks the first time a format changes.
+/// The backend that owns a session, decided by asking each one to find the
+/// transcript rather than by inspecting the id: ids are opaque, and a rule for
+/// telling one engine's from another's would be a guess that breaks the first
+/// time a format changes.
+fn owner<'a>(list: &'a [Box<dyn AgentBackend>], session_id: &str) -> Option<&'a dyn AgentBackend> {
+    list.iter()
+        .find(|b| b.sessions().find_session_file(session_id).is_some())
+        .map(|b| &**b)
+}
+
+/// A plan built by the backend that owns `session_id`, reopening it under that
+/// same id.
 ///
 /// `None` when nobody owns the id or the owner declines the operation. The
 /// frontend keeps its own fallback — the command the tab was opened with — for
@@ -147,11 +170,9 @@ fn reopen(
     session_id: &str,
     build: impl Fn(&dyn AgentBackend, &str) -> Option<String>,
 ) -> Option<LaunchPlan> {
-    let backend = list
-        .iter()
-        .find(|b| b.sessions().find_session_file(session_id).is_some())?;
+    let backend = owner(list, session_id)?;
     Some(LaunchPlan {
-        command: build(&**backend, session_id)?,
+        command: build(backend, session_id)?,
         env_provider: None,
         session_id: Some(session_id.to_string()),
         agent_id: backend.id().to_string(),
@@ -227,6 +248,7 @@ mod tests {
         accepts_anything: bool,
         needs_key: bool,
         can_resume: bool,
+        can_clear: bool,
         prefix_models: bool,
         sessions: FakeSessions,
     }
@@ -241,6 +263,7 @@ mod tests {
                 accepts_anything: false,
                 needs_key: false,
                 can_resume: false,
+                can_clear: false,
                 prefix_models: false,
                 sessions: FakeSessions { ids: vec![] },
             }
@@ -295,6 +318,10 @@ mod tests {
         fn resume(&self, session_id: &str) -> Option<String> {
             self.can_resume
                 .then(|| format!("{} --resume {session_id}", self.id))
+        }
+        fn clear(&self, session_id: &str) -> Option<String> {
+            self.can_clear
+                .then(|| format!("{} --session-id {session_id}", self.id))
         }
         fn accepts_api(&self, provider: &Provider) -> bool {
             self.accepts_anything || (self.accepts_openrouter_only && provider.is_openrouter())
@@ -621,6 +648,46 @@ mod tests {
         // the same command as a fresh start.
         let cmd = crate::agents::ClaudeBackend.clear("abc-123").expect("no clear command");
         assert!(cmd.contains("--session-id 'abc-123'"), "{cmd}");
+    }
+
+    /// The id asked about names the conversation being parked; the plan must
+    /// name a different one. An earlier version handed the same id back, which
+    /// would have relaunched the engine onto an existing transcript and keyed
+    /// the new tab to the row it had just parked — un-parking it.
+    #[test]
+    fn a_clear_starts_a_conversation_that_is_not_the_one_it_parked() {
+        let list: Vec<Box<dyn AgentBackend>> = vec![Box::new(FakeBackend {
+            id: "claude-like",
+            mints: true,
+            can_clear: true,
+            sessions: FakeSessions { ids: vec!["old-1"] },
+            ..Default::default()
+        })];
+
+        let plan = resolve_in(&list, &[], LaunchRequest::Clear { session_id: "old-1".into() })
+            .expect("no plan");
+
+        let fresh = plan.session_id.expect("a clear names its new conversation");
+        assert_ne!(fresh, "old-1");
+        assert!(plan.command.contains(&fresh), "{}", plan.command);
+        assert!(!plan.command.contains("old-1"), "{}", plan.command);
+    }
+
+    /// A backend that names no session cannot clear: there would be nothing for
+    /// the new tab to be keyed to.
+    #[test]
+    fn an_engine_that_mints_nothing_cannot_clear() {
+        let list: Vec<Box<dyn AgentBackend>> = vec![Box::new(FakeBackend {
+            id: "no-mint",
+            mints: false,
+            can_clear: true,
+            sessions: FakeSessions { ids: vec!["old-1"] },
+            ..Default::default()
+        })];
+
+        assert!(
+            resolve_in(&list, &[], LaunchRequest::Clear { session_id: "old-1".into() }).is_none()
+        );
     }
 
     /* ---- the wire ------------------------------------------------------- */

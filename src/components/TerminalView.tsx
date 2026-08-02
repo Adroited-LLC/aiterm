@@ -31,6 +31,14 @@ export interface TermTab {
   command: string | null;
   /** Claude session id when this tab was opened via resume. */
   sessionId?: string;
+  /** The session id this tab was deliberately opened to reopen — set by resume
+   *  and by the ended-tab restart, unset for a fresh start.
+   *
+   *  What the migration watcher checks before re-keying a tab away from its
+   *  pinned id: "this tab asked for that conversation" is a fact the tab knows,
+   *  and it used to be inferred by sniffing the command text for `--resume
+   *  <id>`. That inference broke the moment the command grew shell quoting. */
+  resumedId?: string;
   /** Provider whose key the backend injects into this tab's environment. */
   envProvider?: string;
   /** Dedupe key linking this terminal to a sidebar item: a session id for

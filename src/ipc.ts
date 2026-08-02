@@ -391,6 +391,49 @@ export const apiLaunchCommand = (providerId: string, model: string, sessionId: s
 export const chatResumeCommand = (sessionId: string) =>
   invoke<string>("chat_resume_command", { sessionId });
 
+/** What an engine supports, so the UI gates on a declaration rather than on an
+ *  agent's name. Snake_case because it arrives straight off `Caps` in Rust. */
+export interface Caps {
+  /** ⑂ in the sidebar. */
+  fork: boolean;
+  /** ✦ re-key. */
+  clear: boolean;
+  /** ▶ — reopen where it left off. */
+  resume: boolean;
+  /** The screen poll in `term/screen.ts` and the Tui* dialogs. */
+  tui_drive: boolean;
+  /** Transcript panels and the `/model` `/effort` `/rewind` pills. */
+  panels: boolean;
+}
+
+/** What the user asked for, in the terms the UI actually has. Which engine
+ *  answers is `launch.rs`'s business — nothing here names one. Sent in
+ *  camelCase, which is what `LaunchRequest` deserializes. */
+export type LaunchRequest =
+  | { kind: "agent"; agentId: string; model: string | null; effort: string | null }
+  | { kind: "apiModel"; providerId: string; modelId: string }
+  | { kind: "resume"; sessionId: string }
+  | { kind: "restart"; sessionId: string }
+  | { kind: "clear"; sessionId: string };
+
+/** Everything a tab needs to open, and nothing about who produced it. */
+export interface LaunchPlan {
+  command: string;
+  /** Provider id whose key `pty_spawn` injects into the tab environment.
+   *  `null` means no key is needed. */
+  env_provider: string | null;
+  /** Non-null = a real session id panels may key to. `null` = the tab needs a
+   *  handle of its own, and nothing should be keyed to it as a session. */
+  session_id: string | null;
+  agent_id: string;
+  caps: Caps;
+}
+
+/** Turn intent into a plan. Rejects when nothing here can start it — the
+ *  caller keeps whatever fallback it had rather than inventing a command. */
+export const resolveLaunch = (request: LaunchRequest) =>
+  invoke<LaunchPlan>("resolve_launch", { request });
+
 /** A model a backend can start on, with the effort levels *that model* takes. */
 export interface ModelOption {
   id: string;

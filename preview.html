@@ -64,6 +64,15 @@
           git_repo_state: { is_repo: false, branch: null, ahead: 0, behind: 0, dirty: 0 },
           pty_spawn: 1,
           api_launch_command: "echo 'aiterm chat (preview)'",
+          // Every tab now opens on a plan, so the harness has to answer this
+          // or the paths that start one throw.
+          resolve_launch: {
+            command: "echo 'launch plan (preview)'",
+            env_provider: null,
+            session_id: "00000000-0000-4000-8000-000000000000",
+            agent_id: "claude",
+            caps: { fork: true, clear: true, resume: true, tui_drive: true, panels: true },
+          },
           claude_model_default: null,
           claude_permission_mode: null,
           watch_project: null,

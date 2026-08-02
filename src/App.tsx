@@ -36,7 +36,7 @@ import {
   drainSessionEvents,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  agentLaunchCommand, adoptAgentSession, apiLaunchCommand, chatResumeCommand, detectAgents,
+  adoptAgentSession, resolveLaunch,
 } from "./ipc";
 import "./App.css";
 
@@ -46,29 +46,10 @@ const FONT_KEY = "aiterm.fontScale";
 const PANELS_KEY = "aiterm.panelToggles";
 const USAGE_KEY = "aiterm.usageCache";
 
-/**
- * How aiterm starts claude. One place, so every session it opens behaves the
- * same way and nothing depends on a global config that can outrank a session.
- *
- * `--permission-mode auto` asks for the classifier mode, which the CLI calls
- * its own default ("Auto mode is now Claude Code's default permission mode").
- * It needs a background setup, and where that has not happened it falls back
- * to manual — a safe direction to fail, and the pill goes on reporting
- * whatever claude's status line actually says, so it cannot misrepresent
- * which mode you are in.
- *
- * `--allow-dangerously-skip-permissions` *enables* bypass without selecting
- * it, which is what puts the fourth mode in the shift+tab cycle and therefore
- * one click away on the permissions pill. Verified against a live session:
- * without the flag the cycle is manual → accept edits → plan → manual; with
- * it, bypass joins the loop.
- *
- * This is only the fallback: the real command comes from the backend
- * (`agent_launch_command`), which also carries the `--settings` flag wiring
- * in the SessionStart hook — the exact session-id link. See `claudeCmd`
- * inside App. Kept in sync by a test on `ClaudeBackend::launch`.
- */
-const CLAUDE_CMD = "claude --permission-mode auto --allow-dangerously-skip-permissions";
+// (The constant that used to sit here — claude's own flags, spelled out in the
+// renderer as a fallback for the backend's answer — is gone. Every command a
+// tab runs now comes from `resolveLaunch`, which is the one place that knows
+// what any engine's command line looks like.)
 
 interface PanelToggles {
   sessions: boolean;
@@ -118,6 +99,20 @@ function describeEnd(why: EndedWhy | undefined): string {
   return `The process exited with status ${why.code}.`;
 }
 
+/** Everything about a tab past "what it is and what it runs".
+ *
+ *  One object rather than a tail of positional arguments: these are all
+ *  optional and mostly unrelated, so the call sites that set the last one were
+ *  spelling `undefined` three times to get to it. */
+interface OpenTabOpts {
+  sessionId?: string;
+  fresh?: boolean;
+  adopt?: TermTab["adopt"];
+  envProvider?: string;
+  /** The session this tab was opened to reopen — see `TermTab.resumedId`. */
+  resumedId?: string;
+}
+
 function loadJSON<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -157,21 +152,9 @@ export default function App() {
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
 
-  // The claude invocation, from the backend — which is where the SessionStart
-  // hook flag is added. The constant is only the fallback for the first
-  // frames before this resolves (or a backend that cannot answer), and a
-  // launch built from it merely lacks the hook: detection falls back to the
-  // disk heuristics, nothing else changes.
-  const claudeCmdRef = useRef(CLAUDE_CMD);
-  useEffect(() => {
-    agentLaunchCommand("claude", {})
-      .then((cmd) => {
-        claudeCmdRef.current = cmd;
-      })
-      .catch(() => {});
-  }, []);
-  // Same trick for the sessions list: `newSession` needs to snapshot what
-  // already exists, and it must not be rebuilt every time the list refreshes.
+  // The sessions list, read without putting it in a callback's deps:
+  // `newSession` needs to snapshot what already exists, and it must not be
+  // rebuilt every time the list refreshes.
   const sessionsRef = useRef<Session[]>(sessions);
   sessionsRef.current = sessions;
 
@@ -494,8 +477,7 @@ export default function App() {
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,
-     sessionId?: string, fresh?: boolean, adopt?: TermTab["adopt"],
-     envProvider?: string) => {
+     opts: OpenTabOpts = {}) => {
       setPreviewSession(null);
       // Opening a terminal on a slot is the deliberate act of going back to
       // it — if its id was on the vacated list (green dot suppressed), it has
@@ -514,7 +496,7 @@ export default function App() {
         }
         const key = nextKey.current++;
         setActiveTab(key);
-        return [...t, { key, title, cwd, command, sessionId, slotId, fresh, adopt, envProvider }];
+        return [...t, { key, title, cwd, command, slotId, ...opts }];
       });
     },
     [],
@@ -732,7 +714,7 @@ export default function App() {
     const key = activeTabObj?.key;
     const pinned = activeTabObj?.sessionId;
     const title = activeTabObj?.title ?? "This session";
-    const command = activeTabObj?.command;
+    const resumedId = activeTabObj?.resumedId;
     if (key === undefined || !pinned) return;
     // This runs even for tabs the SessionStart hook reports on (drain effect
     // below): the hook cannot see a move to the daemon — that claude is not
@@ -752,14 +734,19 @@ export default function App() {
       try {
         const moved = await sessionMovedTo(pinned);
         if (stop || !moved || moved.id === pinned) return;
-        // A tab launched as `--resume <pinned>` is deliberately reopening that
+        // A tab opened to reopen `pinned` is deliberately holding that
         // conversation. Its `/clear` child on disk is history, not news — the
         // last version of this stole the tab the instant Resume was clicked,
         // re-keyed it onto the old clear's successor, and left the actual
         // resume minting a third session (observed 2026-07-29 21:36, three
         // kill_trees of cleanup). "It moved once" is forever true on disk;
         // "this tab wants the original" beats it.
-        if (moved.kind === "cleared" && command?.includes(`--resume ${pinned}`)) return;
+        //
+        // Compares what the tab was opened *for*, not what its command string
+        // looks like. Sniffing the text for `--resume <id>` was always the weak
+        // version — the tab knows its own intent, and the substring stopped
+        // matching the moment the backend started shell-quoting the id.
+        if (moved.kind === "cleared" && resumedId === pinned) return;
         uiLog(`migrate: re-keying tab ${key} ${pinned} -> ${moved.id} (${moved.kind})`);
         // `slotId` moves with `sessionId`, not just the pinned id. The slot is
         // what links a tab to a sidebar row — the live dot, the highlight, and
@@ -820,7 +807,7 @@ export default function App() {
       grace.forEach(clearTimeout);
     };
   }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title,
-      activeTabObj?.command, freshUnwritten,
+      activeTabObj?.resumedId, freshUnwritten,
       refreshSessionList, agentsView]);
 
   // The exact channel: every claude aiterm launches carries a SessionStart
@@ -956,14 +943,26 @@ export default function App() {
   /** Put an ended tab back, resuming its conversation where it stopped. The
    *  slot is reused so the sidebar row it belongs to stays the same row. */
   const restartEnded = useCallback(
-    (key: number) => {
+    async (key: number) => {
       const t = tabsRef.current.find((x) => x.key === key);
       if (!t) return;
       closeTab(key);
-      const cmd = t.sessionId
-        ? `${claudeCmdRef.current} --resume ${t.sessionId}`
-        : t.command;
-      openTab(t.title, t.cwd, cmd, t.slotId, t.sessionId);
+      // A tab with no session id has no conversation to continue — a shell, or
+      // an engine that never named itself — so it reopens on the command it
+      // was launched with. So does one whose engine declines to reopen: the
+      // resolver saying no is exactly what that fallback is for.
+      let command = t.command;
+      let resumedId = t.resumedId;
+      if (t.sessionId) {
+        try {
+          const plan = await resolveLaunch({ kind: "restart", sessionId: t.sessionId });
+          command = plan.command;
+          resumedId = t.sessionId;
+        } catch {
+          /* nothing here can reopen it — keep the tab's own command */
+        }
+      }
+      openTab(t.title, t.cwd, command, t.slotId, { sessionId: t.sessionId, resumedId });
     },
     [closeTab, openTab],
   );
@@ -999,16 +998,25 @@ export default function App() {
   };
   const resumeSession = async (s: Session) => {
     setActiveProject(s.project_path);
-    // An API chat resumes through its own harness: `aiterm chat --resume`
-    // reloads the transcript and carries the context on. None of the claude
-    // machinery below (moved-to resolution, roster stops) applies to it.
-    if (s.agent === "api") {
-      try {
-        const command = await chatResumeCommand(s.id);
-        openTab(s.title, s.project_path, command, s.id, s.id);
-      } catch (e) {
-        setNotice(`Couldn't reopen ${s.title}: ${e}`);
-      }
+    // Ask the pinned id first, because the plan is also how we learn which
+    // engine this row belongs to — and everything below is claude's.
+    let plan;
+    try {
+      plan = await resolveLaunch({ kind: "resume", sessionId: s.id });
+    } catch (e) {
+      setNotice(`Couldn't reopen ${s.title}: ${e}`);
+      return;
+    }
+    // The preamble — moved-to resolution, fork redemption, roster stops — is
+    // the live-process machinery of an engine that drives a TUI and holds its
+    // sessions open. An engine without it (`aiterm chat` reloads a transcript
+    // and carries on) must not be put through any of it: the id it was given
+    // is the id it resumes. Gated on the capability rather than on the agent's
+    // name, which is the check this refactor exists to remove.
+    if (!plan.caps.tui_drive) {
+      openTab(s.title, s.project_path, plan.command, s.id, {
+        sessionId: s.id, resumedId: s.id,
+      });
       return;
     }
     // The pinned id can go stale: a compaction can retire the original
@@ -1087,11 +1095,23 @@ export default function App() {
       setNotice(`Couldn't stop "${s.title}" to resume it: ${e}`);
       return;
     }
-    // Resume the same way we start anything — see CLAUDE_CMD. This used to
-    // pass `--permission-mode <configured>`, which is what silently lifted a
-    // manual session into bypass on resume.
-    const cmd = `${claudeCmdRef.current} --resume ${liveId}`;
-    openTab(s.title, s.project_path, cmd, liveId, liveId);
+    // Resume the same way we start anything: the engine's own command, which
+    // carries the same flags a fresh start gets. (This used to pass
+    // `--permission-mode <configured>`, which is what silently lifted a manual
+    // session into bypass on resume.) Re-resolve when the id moved — the plan
+    // above names the pinned session, and the continuation is a different
+    // conversation to open.
+    if (liveId !== s.id) {
+      try {
+        plan = await resolveLaunch({ kind: "resume", sessionId: liveId });
+      } catch (e) {
+        setNotice(`Couldn't reopen ${s.title}: ${e}`);
+        return;
+      }
+    }
+    openTab(s.title, s.project_path, plan.command, liveId, {
+      sessionId: liveId, resumedId: liveId,
+    });
   };
   // Branch a session. You stay exactly where you are: the backend copies the
   // transcript under a fresh id and the branch appears in the sidebar as a
@@ -1111,23 +1131,36 @@ export default function App() {
     return branchId;
   };
   // aiterm's own clear, kin to ⑂ and deliberately off claude's machinery:
-  // end the running claude and start a fresh one in the same tab on a minted
-  // id. The old conversation needs nothing done to it — its transcript is
-  // already on disk, so it simply becomes a stopped row, exactly the shape a
-  // typed /clear settles into. Costs a claude restart where /clear is warm;
-  // in exchange there is no hook, no detection and no id change to chase —
-  // aiterm mints the id, so it knows everything from the first frame.
-  const clearSession = (s: Session) => {
+  // end the running claude and start a fresh one in the same tab on an id the
+  // plan names. The old conversation needs nothing done to it — its transcript
+  // is already on disk, so it simply becomes a stopped row, exactly the shape
+  // a typed /clear settles into. Costs a claude restart where /clear is warm;
+  // in exchange there is no hook, no detection and no id change to chase — the
+  // id in the command and the id this tab is keyed to came from the same
+  // place, so aiterm knows everything from the first frame.
+  const clearSession = async (s: Session) => {
     const t = tabs.find((x) => x.slotId === s.id);
     if (!t) return;
+    let plan;
+    try {
+      plan = await resolveLaunch({ kind: "clear", sessionId: s.id });
+    } catch (e) {
+      setNotice(`Couldn't clear "${s.title}": ${e}`);
+      return;
+    }
+    // No id on the plan means nothing would name the new conversation, and a
+    // tab keyed to nothing is the unreachable-tab bug — say so instead.
+    if (!plan.session_id) {
+      setNotice(`"${s.title}" can't be cleared — its engine names no new session.`);
+      return;
+    }
     closeTab(t.key);
     // The client process is going down, but the roster reports it for a beat
     // longer — same suppress-until-reopened rule as a hook-observed move.
     setVacated((prev) => new Set(prev).add(s.id));
-    const id = crypto.randomUUID();
     openTab(
-      basename(s.project_path), s.project_path,
-      `${claudeCmdRef.current} --session-id ${id}`, id, id, true,
+      basename(s.project_path), s.project_path, plan.command, plan.session_id,
+      { sessionId: plan.session_id, fresh: true },
     );
     setNotice(`"${s.title}" is parked in the sidebar — this tab is a fresh conversation.`);
   };
@@ -1185,9 +1218,24 @@ export default function App() {
     setActiveProject(p.path);
     openTab(p.name, p.path, null, `shell:${p.path}`);
   };
-  const projectClaude = (p: ProjectInfo) => {
+  const projectClaude = async (p: ProjectInfo) => {
     setActiveProject(p.path);
-    openTab(p.name, p.path, claudeCmdRef.current, `claude:${p.path}`);
+    try {
+      // Naming claude is honest here: this is the "start claude here" button,
+      // not a choice the user made in a picker.
+      const plan = await resolveLaunch({
+        kind: "agent", agentId: "claude", model: null, effort: null,
+      });
+      // The plan's minted session id is deliberately dropped. This tab is
+      // slotted by its project door — `claude:<path>`, one terminal per
+      // project — which is what makes clicking the row focus the terminal that
+      // is already open rather than starting a second claude in it. Keying it
+      // to the session instead would put a placeholder row in the sidebar for
+      // a door that already has one.
+      openTab(p.name, p.path, plan.command, `claude:${p.path}`);
+    } catch (e) {
+      setNotice(`Couldn't start claude in ${p.name}: ${e}`);
+    }
   };
 
   /**
@@ -1200,16 +1248,18 @@ export default function App() {
    * typing `claude` by hand, and on a machine with no `~/Projects` there was
    * no project row either.
    *
-   * **The id is minted here rather than discovered.** Letting claude choose it
-   * looks simpler and is the reason the first version of this was unusable: a
-   * session has no transcript until its first prompt, the sidebar lists what
-   * is on disk, and the sidebar is the tab list — so a new session opened a
-   * terminal that no row named. It took the pane over from whatever you were
-   * looking at and there was no way back to it. `--session-id` composes with a
-   * fresh start (unlike with `--resume`, where it is rejected without
-   * `--fork-session`), so the tab can be slotted by its session id from the
+   * **The id comes from the plan, not from here.** Letting the engine choose it
+   * silently is the reason the first version of this was unusable: a session
+   * has no transcript until its first prompt, the sidebar lists what is on
+   * disk, and the sidebar is the tab list — so a new session opened a terminal
+   * that no row named. It took the pane over from whatever you were looking at
+   * and there was no way back to it. `--session-id` composes with a fresh start
+   * (unlike with `--resume`, where it is rejected without `--fork-session`), so
+   * for an engine that takes one the tab is slotted by its session id from the
    * first frame, exactly like a resume — which is also what lets the composer
-   * pills and the agents panel key to it before it has said anything.
+   * pills and the agents panel key to it before it has said anything. The
+   * resolver mints it, because only the backend knows whether an id will mean
+   * anything.
    *
    * *Verified 2026-07-27: `claude --session-id <uuid> --permission-mode auto
    * --allow-dangerously-skip-permissions -p …` wrote its transcript to
@@ -1217,79 +1267,66 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  /** Whether opencode is installed — asked once per run, on first use. */
-  const opencodeAvail = useRef<boolean | null>(null);
-
   const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
-    // An API-provider model runs `aiterm chat` in the tab — our own console
-    // harness, spawned through the shell exactly the way `claude` is. It has
-    // no session id and writes no transcript, so the tab is its whole life:
-    // no sidebar row, nothing to resume.
+    // An API-provider model is a request for a model, not for an engine —
+    // which one runs it is the resolver's answer. The branch survives because
+    // the two are presented differently: a model tab is titled by its model
+    // and gets no placeholder row, an agent tab is titled by its directory and
+    // does.
     if (choice.api) {
       try {
         const title = choice.api.modelId.split("/").pop() || choice.api.modelId;
-        // OpenCode is the engine wherever it can be: an agent with tools,
-        // launched on the picked model. Checked once and remembered — asking
-        // spawns a version read through the login shell.
-        if (opencodeAvail.current === null) {
-          opencodeAvail.current = await detectAgents()
-            .then((l) => l.some((a) => a.id === "opencode" && a.available))
-            .catch(() => false);
-        }
-        if (choice.api.openrouter && opencodeAvail.current) {
-          const command = await agentLaunchCommand("opencode", {
-            model: `openrouter/${choice.api.modelId}`,
-          });
-          setActiveProject(cwd);
-          // The provider id rides along so the spawn can put the key in the
-          // tab's environment — opencode signs in without an auth step.
-          openTab(
-            title, cwd, command, crypto.randomUUID(),
-            undefined, undefined, undefined, choice.api.providerId,
-          );
-          return;
-        }
-        // No OpenCode, or a provider its catalog can't resolve: aiterm's own
-        // chat console, with the minted id naming the transcript so the chat
-        // becomes a real sidebar row (agent "api") once its first exchange
-        // lands on disk.
-        const id = crypto.randomUUID();
-        const command = await apiLaunchCommand(choice.api.providerId, choice.api.modelId, id);
+        const plan = await resolveLaunch({
+          kind: "apiModel",
+          providerId: choice.api.providerId,
+          modelId: choice.api.modelId,
+        });
         setActiveProject(cwd);
-        openTab(title, cwd, command, id, id);
+        // A tab handle where the plan names no session: an engine that writes
+        // no transcript we can read has nothing to key panels to, and the tab
+        // is the whole life of that conversation. Where it does name one, the
+        // chat becomes a real sidebar row once its first exchange lands.
+        //
+        // `env_provider` rides along so the spawn can put the key in the tab's
+        // environment — set only for an engine that has said it authenticates
+        // no other way.
+        openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          sessionId: plan.session_id ?? undefined,
+          envProvider: plan.env_provider ?? undefined,
+        });
       } catch (e) {
         setNotice(`Couldn't start ${choice.api.modelId}: ${e}`);
       }
       return;
     }
     setActiveProject(cwd);
-    // Mint an id only where the agent will accept one. Codex has no
-    // --session-id, so for it this is a tab handle: the placeholder row keeps
-    // the tab reachable, but nothing is keyed to it as a session, because
-    // there is no session by that name and never will be.
-    const id = crypto.randomUUID();
     try {
-      const command = await agentLaunchCommand(choice.agentId, {
+      const plan = await resolveLaunch({
+        kind: "agent",
+        agentId: choice.agentId,
         model: choice.model,
         effort: choice.effort,
-        sessionId: choice.mintsSessionId ? id : null,
       });
-      openTab(
-        basename(cwd), cwd, command, id,
-        choice.mintsSessionId ? id : undefined, true,
+      // No session id on the plan means the engine would not take one — Codex
+      // has no `--session-id` — so the slot is a tab handle: the placeholder
+      // row keeps the tab reachable, but nothing is keyed to it as a session,
+      // because there is no session by that name and never will be.
+      openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+        sessionId: plan.session_id ?? undefined,
+        fresh: true,
         // An agent we could not name has to be identified after the fact.
         // Snapshot what already exists so adoption can tell its session from
         // one that was open before this tab did anything.
-        choice.mintsSessionId
+        adopt: plan.session_id
           ? undefined
           : {
-              agentId: choice.agentId,
+              agentId: plan.agent_id,
               since: Date.now(),
               known: sessionsRef.current
                 .filter((s) => s.project_path === cwd)
                 .map((s) => s.id),
             },
-      );
+      });
     } catch (e) {
       setNotice(`Couldn't start ${choice.agentId}: ${e}`);
     }
