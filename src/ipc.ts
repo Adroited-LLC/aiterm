@@ -280,7 +280,12 @@ export const reindexSessions = () =>
 export const ptySpawn = (
   cwd: string | null, command: string | null, cols: number, rows: number,
   onOutput: Channel<ArrayBuffer>,
-) => invoke<number>("pty_spawn", { cwd, command, cols, rows, onOutput });
+  /** Provider id whose API key the backend injects as process environment
+   *  (OPENROUTER_API_KEY) — the key itself never reaches the frontend. */
+  envProvider?: string,
+) => invoke<number>("pty_spawn", {
+  cwd, command, cols, rows, onOutput, envProvider: envProvider ?? null,
+});
 export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
 export const ptyResize = (id: number, cols: number, rows: number) =>
   invoke<void>("pty_resize", { id, cols, rows });

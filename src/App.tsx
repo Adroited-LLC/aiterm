@@ -494,7 +494,8 @@ export default function App() {
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,
-     sessionId?: string, fresh?: boolean, adopt?: TermTab["adopt"]) => {
+     sessionId?: string, fresh?: boolean, adopt?: TermTab["adopt"],
+     envProvider?: string) => {
       setPreviewSession(null);
       // Opening a terminal on a slot is the deliberate act of going back to
       // it — if its id was on the vacated list (green dot suppressed), it has
@@ -513,7 +514,7 @@ export default function App() {
         }
         const key = nextKey.current++;
         setActiveTab(key);
-        return [...t, { key, title, cwd, command, sessionId, slotId, fresh, adopt }];
+        return [...t, { key, title, cwd, command, sessionId, slotId, fresh, adopt, envProvider }];
       });
     },
     [],
@@ -1240,7 +1241,12 @@ export default function App() {
             model: `openrouter/${choice.api.modelId}`,
           });
           setActiveProject(cwd);
-          openTab(title, cwd, command, crypto.randomUUID());
+          // The provider id rides along so the spawn can put the key in the
+          // tab's environment — opencode signs in without an auth step.
+          openTab(
+            title, cwd, command, crypto.randomUUID(),
+            undefined, undefined, undefined, choice.api.providerId,
+          );
           return;
         }
         // No OpenCode, or a provider its catalog can't resolve: aiterm's own

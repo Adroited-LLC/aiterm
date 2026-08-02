@@ -108,6 +108,7 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
     on_output: Channel<InvokeResponseBody>,
+    env_provider: Option<String>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -131,6 +132,18 @@ pub fn pty_spawn(
     };
     cmd.env("TERM", "xterm-256color");
     scrub_agent_markers(&mut cmd);
+    // A provider-backed tab (OpenCode on an OpenRouter model) gets the key as
+    // process environment, resolved here from the provider store. It never
+    // crosses the frontend and never touches a command line — /proc shows
+    // argv to everyone, but environ only to the same user, which is the same
+    // exposure as the tool's own credential file.
+    if let Some(pid) = env_provider {
+        if let Some(p) = crate::providers::load_providers().iter().find(|p| p.id == pid) {
+            if p.base_url.contains("openrouter.ai") && !p.api_key.is_empty() {
+                cmd.env("OPENROUTER_API_KEY", &p.api_key);
+            }
+        }
+    }
     if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
         cmd.cwd(dir);
     }

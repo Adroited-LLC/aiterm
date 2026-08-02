@@ -31,6 +31,8 @@ export interface TermTab {
   command: string | null;
   /** Claude session id when this tab was opened via resume. */
   sessionId?: string;
+  /** Provider whose key the backend injects into this tab's environment. */
+  envProvider?: string;
   /** Dedupe key linking this terminal to a sidebar item: a session id for
    *  resumes, "shell:<path>" for project shells. One terminal per slot. */
   slotId: string;
@@ -174,7 +176,9 @@ export default function TerminalView({
     };
 
     (async () => {
-      const id = await ptySpawn(tab.cwd, tab.command, term.cols, term.rows, onOutput);
+      const id = await ptySpawn(
+        tab.cwd, tab.command, term.cols, term.rows, onOutput, tab.envProvider,
+      );
       if (disposed) {
         ptyKill(id);
         return;
