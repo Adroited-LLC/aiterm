@@ -1,7 +1,13 @@
 # Engine abstraction: backends own their lifecycle, the GUI owns none of it
 
 Date: 2026-08-02
-Status: approved, unimplemented
+Status: implemented in 0.10.25, all four legs
+
+One thing below was wrong when it met the code: the `Clear` rule said "same
+ownership lookup, then `backend.clear(id)`", which hands back the id being
+parked. ✦ must start a conversation that is *not* the one it parked, so the
+resolver finds the owner by the given id and then mints a fresh one. See
+`a_clear_starts_a_conversation_that_is_not_the_one_it_parked` in `launch.rs`.
 
 ## The problem
 
