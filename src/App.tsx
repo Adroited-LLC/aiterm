@@ -36,7 +36,7 @@ import {
   drainSessionEvents,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  agentLaunchCommand, adoptAgentSession, apiLaunchCommand,
+  agentLaunchCommand, adoptAgentSession, apiLaunchCommand, chatResumeCommand,
 } from "./ipc";
 import "./App.css";
 
@@ -998,6 +998,18 @@ export default function App() {
   };
   const resumeSession = async (s: Session) => {
     setActiveProject(s.project_path);
+    // An API chat resumes through its own harness: `aiterm chat --resume`
+    // reloads the transcript and carries the context on. None of the claude
+    // machinery below (moved-to resolution, roster stops) applies to it.
+    if (s.agent === "api") {
+      try {
+        const command = await chatResumeCommand(s.id);
+        openTab(s.title, s.project_path, command, s.id, s.id);
+      } catch (e) {
+        setNotice(`Couldn't reopen ${s.title}: ${e}`);
+      }
+      return;
+    }
     // The pinned id can go stale: a compaction can retire the original
     // transcript (Claude Code deletes it or renames it to `<id>.orphaned-…`),
     // so `claude --resume <original-id>` dies with "no conversation found" — a
@@ -1211,12 +1223,14 @@ export default function App() {
     // no sidebar row, nothing to resume.
     if (choice.api) {
       try {
-        const command = await apiLaunchCommand(choice.api.providerId, choice.api.modelId);
+        // The minted id names the transcript, so the chat becomes a real
+        // sidebar row (agent "api") once its first exchange lands on disk.
+        const id = crypto.randomUUID();
+        const command = await apiLaunchCommand(choice.api.providerId, choice.api.modelId, id);
         setActiveProject(cwd);
-        // The slot id is a tab handle only — no session is ever keyed to it.
         openTab(
           choice.api.modelId.split("/").pop() || choice.api.modelId,
-          cwd, command, crypto.randomUUID(),
+          cwd, command, id, id,
         );
       } catch (e) {
         setNotice(`Couldn't start ${choice.api.modelId}: ${e}`);

@@ -20,6 +20,150 @@ pub struct Msg {
     pub content: String,
 }
 
+// ── The transcript ──────────────────────────────────────────────────────
+//
+// One jsonl per chat in ~/.local/share/aiterm/chats/<id>.jsonl. The first
+// line is aiterm's own meta record; every message after it is written in the
+// same `{"type":"user","message":{…}}` shape Claude Code uses, so the
+// sessions panel's preview and the search indexer read a chat without
+// learning anything new. Our own record types are prefixed `aiterm-chat` and
+// skipped by anything that doesn't know them.
+
+pub fn chats_dir() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".local/share/aiterm/chats"))
+}
+
+/// The transcript path for a chat id, if the file exists.
+pub fn chat_file_if_exists(id: &str) -> Option<std::path::PathBuf> {
+    if id.contains('/') || id.contains("..") {
+        return None;
+    }
+    let p = chats_dir()?.join(format!("{id}.jsonl"));
+    p.is_file().then_some(p)
+}
+
+/// What a transcript loads back to: where it points, and the conversation as
+/// the model should see it now — messages since the last `/clear`, under the
+/// most recent `/model` choice.
+pub struct Loaded {
+    pub provider_id: String,
+    pub model: String,
+    pub messages: Vec<Msg>,
+    /// Turns dropped by `/clear` markers — still on disk, no longer context.
+    pub cleared: usize,
+}
+
+pub fn parse_transcript(lines: impl Iterator<Item = String>) -> Option<Loaded> {
+    let mut provider_id = None;
+    let mut model = None;
+    let mut messages: Vec<Msg> = Vec::new();
+    let mut cleared = 0usize;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("aiterm-chat") => {
+                provider_id = v.get("provider").and_then(|p| p.as_str()).map(String::from);
+                model = model.or_else(|| v.get("model").and_then(|m| m.as_str()).map(String::from));
+            }
+            Some("aiterm-chat-model") => {
+                model = v.get("model").and_then(|m| m.as_str()).map(String::from).or(model);
+            }
+            Some("aiterm-chat-clear") => {
+                cleared += messages.len();
+                messages.clear();
+            }
+            Some(role @ ("user" | "assistant")) => {
+                if let Some(text) = v.pointer("/message/content").and_then(|c| c.as_str()) {
+                    messages.push(Msg {
+                        role: if role == "user" { "user" } else { "assistant" },
+                        content: text.to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(Loaded {
+        provider_id: provider_id?,
+        model: model?,
+        messages,
+        cleared,
+    })
+}
+
+/// A message line in the claude-compatible shape the preview already reads.
+pub fn msg_line(role: &str, text: &str, at: u64) -> String {
+    serde_json::json!({
+        "type": role,
+        "message": { "role": role, "content": text },
+        "at": at,
+    })
+    .to_string()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Sidebar rows for every stored chat — stamped `api`, the socket icon.
+/// Header-read only, like the codex scanner: one line per file, never the
+/// conversation itself.
+pub fn scan_chats() -> Vec<(crate::sessions::Session, std::path::PathBuf)> {
+    let Some(dir) = chats_dir() else {
+        return vec![];
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().is_none_or(|x| x != "jsonl") {
+                return None;
+            }
+            let file = std::fs::File::open(&path).ok()?;
+            let mut first = String::new();
+            std::io::BufReader::new(file).read_line(&mut first).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&first).ok()?;
+            if v.get("type").and_then(|t| t.as_str()) != Some("aiterm-chat") {
+                return None;
+            }
+            let id = v.get("id")?.as_str()?.to_string();
+            let model = v.get("model")?.as_str()?.to_string();
+            let cwd = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let last_active = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some((
+                crate::sessions::Session {
+                    id,
+                    agent: "api".into(),
+                    // The model IS the identity of a chat — a row named after
+                    // its directory would make ten chats indistinguishable.
+                    title: model.rsplit('/').next().unwrap_or(&model).to_string(),
+                    project_path: cwd.clone(),
+                    group_path: cwd,
+                    branch: None,
+                    forked: false,
+                    background: false,
+                    fork_parent: None,
+                    last_active,
+                },
+                path,
+            ))
+        })
+        .collect()
+}
+
 /// The request body for one exchange: full history, streaming on.
 pub fn chat_body(model: &str, messages: &[Msg]) -> String {
     serde_json::json!({
@@ -68,8 +212,43 @@ pub fn sse_delta(line: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// How a chat comes into being: fresh under a minted id, or resumed from a
+/// transcript that already knows its provider and model.
+pub enum Start {
+    Fresh { provider_id: String, model: String, session_id: Option<String> },
+    Resume { session_id: String },
+}
+
 /// Entry point for the `chat` argv mode. Never returns to Tauri.
-pub fn run(provider_id: &str, model: &str) -> i32 {
+pub fn run(start: Start) -> i32 {
+    let (provider_id, mut model, session_id, mut messages, cleared) = match start {
+        Start::Fresh { provider_id, model, session_id } => {
+            (provider_id, model, session_id, Vec::new(), 0)
+        }
+        Start::Resume { session_id } => {
+            let Some(path) = chat_file_if_exists(&session_id) else {
+                eprintln!("aiterm chat: no stored chat '{session_id}'");
+                return 1;
+            };
+            let Ok(file) = std::fs::File::open(&path) else {
+                eprintln!("aiterm chat: could not read {}", path.display());
+                return 1;
+            };
+            let lines = std::io::BufReader::new(file).lines().map_while(Result::ok);
+            let Some(loaded) = parse_transcript(lines) else {
+                eprintln!("aiterm chat: {} is not a chat transcript", path.display());
+                return 1;
+            };
+            (
+                loaded.provider_id,
+                loaded.model,
+                Some(session_id),
+                loaded.messages,
+                loaded.cleared,
+            )
+        }
+    };
+
     let providers = crate::providers::load_providers();
     let Some(p) = providers.iter().find(|p| p.id == provider_id) else {
         eprintln!("aiterm chat: no provider '{provider_id}' in ~/.config/aiterm/providers.json");
@@ -81,12 +260,20 @@ pub fn run(provider_id: &str, model: &str) -> i32 {
     }
     let url = format!("{}/chat/completions", p.base_url);
 
+    // The transcript, where there is an id to keep one under. Opened for
+    // append: a resume continues the same file it loaded.
+    let mut log = session_id.as_deref().and_then(|id| open_transcript(id, &p.id, &model));
+
     // Dim banner, plain prompt. The terminal's own line editing does the rest.
     println!("\x1b[2m── {model} · via {} · aiterm chat\x1b[0m", p.name);
-    println!("\x1b[2m   Enter sends · /clear starts over · /quit or Ctrl+D leaves\x1b[0m");
+    println!(
+        "\x1b[2m   Enter sends · /model swaps · /clear starts over · /quit or Ctrl+D leaves\x1b[0m"
+    );
+    if !messages.is_empty() || cleared > 0 {
+        replay_tail(&messages, cleared);
+    }
 
     let stdin = std::io::stdin();
-    let mut messages: Vec<Msg> = Vec::new();
     loop {
         print!("\n\x1b[36m❯\x1b[0m ");
         let _ = std::io::stdout().flush();
@@ -103,19 +290,35 @@ pub fn run(provider_id: &str, model: &str) -> i32 {
             "/quit" | "/exit" => break,
             "/clear" => {
                 messages.clear();
+                append(&mut log, &serde_json::json!({"type":"aiterm-chat-clear"}).to_string());
                 println!("\x1b[2mFresh conversation — the model remembers nothing above.\x1b[0m");
+                continue;
+            }
+            "/model" => {
+                println!("\x1b[2m{model} — `/model <id>` swaps, history kept\x1b[0m");
                 continue;
             }
             _ => {}
         }
+        if let Some(next) = text.strip_prefix("/model ") {
+            model = next.trim().to_string();
+            append(
+                &mut log,
+                &serde_json::json!({"type":"aiterm-chat-model","model":model}).to_string(),
+            );
+            println!("\x1b[2mNow talking to {model} — it sees the whole conversation.\x1b[0m");
+            continue;
+        }
         messages.push(Msg { role: "user", content: text.to_string() });
-        match stream_reply(&url, &p.api_key, model, &messages) {
+        match stream_reply(&url, &p.api_key, &model, &messages) {
             Ok(reply) if reply.is_empty() => {
                 eprintln!("\x1b[2m(the model returned nothing)\x1b[0m");
                 messages.pop();
             }
             Ok(reply) => {
                 println!();
+                append(&mut log, &msg_line("user", text, now_ms()));
+                append(&mut log, &msg_line("assistant", &reply, now_ms()));
                 messages.push(Msg { role: "assistant", content: reply });
             }
             Err(e) => {
@@ -125,6 +328,76 @@ pub fn run(provider_id: &str, model: &str) -> i32 {
         }
     }
     0
+}
+
+/// Open (creating if new) the transcript for `id`, positioned to append.
+/// A fresh file gets its meta line; failure to persist degrades to an
+/// ephemeral chat with a warning, never to a dead console.
+fn open_transcript(id: &str, provider_id: &str, model: &str) -> Option<std::fs::File> {
+    let dir = chats_dir()?;
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("\x1b[2m(transcript off — could not create {})\x1b[0m", dir.display());
+        return None;
+    }
+    let path = dir.join(format!("{id}.jsonl"));
+    let fresh = !path.is_file();
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+    match file {
+        Ok(mut f) => {
+            if fresh {
+                let cwd = std::env::current_dir()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let meta = serde_json::json!({
+                    "type": "aiterm-chat",
+                    "id": id,
+                    "provider": provider_id,
+                    "model": model,
+                    "cwd": cwd,
+                    "at": now_ms(),
+                })
+                .to_string();
+                let _ = writeln!(f, "{meta}");
+            }
+            Some(f)
+        }
+        Err(e) => {
+            eprintln!("\x1b[2m(transcript off — {e})\x1b[0m");
+            None
+        }
+    }
+}
+
+fn append(log: &mut Option<std::fs::File>, line: &str) {
+    if let Some(f) = log {
+        if writeln!(f, "{line}").is_err() {
+            eprintln!("\x1b[2m(transcript stopped — disk said no)\x1b[0m");
+            *log = None;
+        }
+    }
+}
+
+/// On resume, show where the conversation stands: the last exchange verbatim,
+/// the rest as a count. The model sees everything; the human needs bearings.
+fn replay_tail(messages: &[Msg], cleared: usize) {
+    let shown = messages.len().min(2);
+    let earlier = messages.len() - shown;
+    if earlier > 0 || cleared > 0 {
+        let mut parts = Vec::new();
+        if earlier > 0 {
+            parts.push(format!("{earlier} earlier messages in context"));
+        }
+        if cleared > 0 {
+            parts.push(format!("{cleared} cleared"));
+        }
+        println!("\x1b[2m   … {}\x1b[0m", parts.join(" · "));
+    }
+    for m in &messages[messages.len() - shown..] {
+        match m.role {
+            "user" => println!("\n\x1b[36m❯\x1b[0m {}", m.content),
+            _ => println!("{}", m.content),
+        }
+    }
 }
 
 /// Send the conversation, print the reply as it streams, return it whole.
@@ -228,6 +501,41 @@ mod tests {
         assert_eq!(sse_delta(inline).unwrap_err(), "Rate limited");
         let flat = r#"{"error":{"message":"Invalid model"}}"#;
         assert_eq!(sse_delta(flat).unwrap_err(), "Invalid model");
+    }
+
+    fn lines(v: &[&str]) -> impl Iterator<Item = String> {
+        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    /// A transcript loads back to exactly the context the model should see:
+    /// its own written lines round-trip, `/clear` markers drop what came
+    /// before (counting it), and the latest `/model` swap wins.
+    #[test]
+    fn a_transcript_reloads_to_the_context_the_model_should_see() {
+        let meta = r#"{"type":"aiterm-chat","id":"x","provider":"openrouter","model":"a/b","cwd":"/tmp","at":1}"#;
+        let loaded = parse_transcript(lines(&[
+            meta,
+            &msg_line("user", "first", 2),
+            &msg_line("assistant", "reply one", 3),
+            r#"{"type":"aiterm-chat-clear"}"#,
+            &msg_line("user", "second", 4),
+            &msg_line("assistant", "reply two", 5),
+            r#"{"type":"aiterm-chat-model","model":"c/d"}"#,
+        ]))
+        .unwrap();
+        assert_eq!(loaded.provider_id, "openrouter");
+        assert_eq!(loaded.model, "c/d", "the swap wins over the meta model");
+        assert_eq!(loaded.cleared, 2);
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0].content, "second");
+        assert_eq!(loaded.messages[1].role, "assistant");
+    }
+
+    /// A file without our meta line is not a chat — `None`, not a panic and
+    /// not an empty conversation pretending to be one.
+    #[test]
+    fn a_foreign_jsonl_is_not_a_chat() {
+        assert!(parse_transcript(lines(&[r#"{"type":"user","message":{"role":"user","content":"hi"}}"#])).is_none());
     }
 
     #[test]

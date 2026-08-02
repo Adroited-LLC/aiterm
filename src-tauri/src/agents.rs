@@ -479,7 +479,13 @@ pub fn backends() -> Vec<Box<dyn AgentBackend>> {
 /// label would be a second place for the name to live; this way `agent` cannot
 /// disagree with the registry, which is what the UI switches on.
 pub fn scan_all_with_paths() -> Vec<(Session, std::path::PathBuf)> {
-    scan_backends(&backends())
+    let mut all = scan_backends(&backends());
+    // API chats are sessions without being an agent: they scan and index like
+    // everyone else but never appear in agent_choices — the new-session menu
+    // offers them through the provider dropdown instead.
+    all.extend(crate::chat::scan_chats());
+    all.sort_by(|a, b| b.0.last_active.cmp(&a.0.last_active));
+    all
 }
 
 /// The body of [`scan_all_with_paths`], over an explicit list.

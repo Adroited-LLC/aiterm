@@ -319,14 +319,32 @@ pub fn provider_model_cards(id: String) -> Result<Vec<ModelCard>, String> {
 /// mode, shell-quoted. The key is not in it — `aiterm chat` reads the
 /// provider config itself, so nothing secret crosses the PTY's command line.
 #[tauri::command]
-pub fn api_launch_command(provider_id: String, model: String) -> Result<String, String> {
+pub fn api_launch_command(
+    provider_id: String,
+    model: String,
+    session_id: String,
+) -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     Ok(format!(
-        "{} chat --provider {} --model {}",
+        "{} chat --provider {} --model {} --session-id {}",
         q(&exe.to_string_lossy()),
         q(&provider_id),
         q(&model),
+        q(&session_id),
+    ))
+}
+
+/// The command that reopens a stored chat with its context — the ▶ on an
+/// `api` row. Provider and model come from the transcript itself.
+#[tauri::command]
+pub fn chat_resume_command(session_id: String) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    Ok(format!(
+        "{} chat --resume {}",
+        q(&exe.to_string_lossy()),
+        q(&session_id),
     ))
 }
 

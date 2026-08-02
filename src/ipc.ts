@@ -378,9 +378,13 @@ export const providerModelCards = (id: string) =>
 export const providerStartupSet = (id: string, models: string[]) =>
   invoke<ProviderView[]>("provider_startup_set", { id, models });
 /** The command an API-model tab runs: `aiterm chat`, shell-quoted. The key is
- *  not in it — the chat process reads the provider config itself. */
-export const apiLaunchCommand = (providerId: string, model: string) =>
-  invoke<string>("api_launch_command", { providerId, model });
+ *  not in it — the chat process reads the provider config itself. The minted
+ *  session id names the transcript in ~/.local/share/aiterm/chats. */
+export const apiLaunchCommand = (providerId: string, model: string, sessionId: string) =>
+  invoke<string>("api_launch_command", { providerId, model, sessionId });
+/** Reopen a stored chat with its context — ▶ on an `api` row. */
+export const chatResumeCommand = (sessionId: string) =>
+  invoke<string>("chat_resume_command", { sessionId });
 
 /** A model a backend can start on, with the effort levels *that model* takes. */
 export interface ModelOption {

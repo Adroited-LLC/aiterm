@@ -55,6 +55,7 @@ pub fn run() {
             providers::provider_model_cards,
             providers::provider_startup_set,
             providers::api_launch_command,
+            providers::chat_resume_command,
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,

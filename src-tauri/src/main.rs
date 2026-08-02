@@ -16,19 +16,31 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("chat") {
         let mut provider = None;
         let mut model = None;
+        let mut session_id = None;
+        let mut resume = None;
         let mut args = std::env::args().skip(2);
         while let Some(a) = args.next() {
             match a.as_str() {
                 "--provider" => provider = args.next(),
                 "--model" => model = args.next(),
+                "--session-id" => session_id = args.next(),
+                "--resume" => resume = args.next(),
                 _ => {}
             }
         }
-        let (Some(provider), Some(model)) = (provider, model) else {
-            eprintln!("usage: aiterm chat --provider <id> --model <model-id>");
-            std::process::exit(2);
+        let start = match (resume, provider, model) {
+            (Some(session_id), _, _) => aiterm_lib::chat::Start::Resume { session_id },
+            (None, Some(provider_id), Some(model)) => {
+                aiterm_lib::chat::Start::Fresh { provider_id, model, session_id }
+            }
+            _ => {
+                eprintln!(
+                    "usage: aiterm chat --provider <id> --model <model-id> [--session-id <uuid>]\n       aiterm chat --resume <uuid>"
+                );
+                std::process::exit(2);
+            }
         };
-        std::process::exit(aiterm_lib::chat::run(&provider, &model));
+        std::process::exit(aiterm_lib::chat::run(start));
     }
     aiterm_lib::run()
 }

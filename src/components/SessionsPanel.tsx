@@ -746,12 +746,15 @@ export default function SessionsPanel({
                 >▶</button>
               )}
               {/* Branching is a deliberate act (two divergent lines from one
-                  history), not a workaround for resume being unavailable. */}
-              <button
-                className="act-btn"
-                title="Branch a copy at this point — appears as a stopped session, resumable"
-                onClick={() => onFork(s)}
-              >⑂</button>
+                  history), not a workaround for resume being unavailable.
+                  Not for API chats — their transcript has no fork machinery. */}
+              {s.agent !== "api" && (
+                <button
+                  className="act-btn"
+                  title="Branch a copy at this point — appears as a stopped session, resumable"
+                  onClick={() => onFork(s)}
+                >⑂</button>
+              )}
               {/* aiterm's own clear — same end shape as typing /clear, built
                   like ⑂: no claude machinery, just a fresh process on a
                   minted id. Needs this session's own live terminal to act on,
