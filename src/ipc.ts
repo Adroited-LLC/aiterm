@@ -377,6 +377,10 @@ export const providerModelCards = (id: string) =>
 /** Replace a provider's startup shortlist — what the new-session menu offers. */
 export const providerStartupSet = (id: string, models: string[]) =>
   invoke<ProviderView[]>("provider_startup_set", { id, models });
+/** The command an API-model tab runs: `aiterm chat`, shell-quoted. The key is
+ *  not in it — the chat process reads the provider config itself. */
+export const apiLaunchCommand = (providerId: string, model: string) =>
+  invoke<string>("api_launch_command", { providerId, model });
 
 /** A model a backend can start on, with the effort levels *that model* takes. */
 export interface ModelOption {

@@ -1,11 +1,10 @@
 //! API model access — OpenRouter, OpenAI, or anything else speaking the same
 //! `/models` + `/chat/completions` shape.
 //!
-//! This is configuration, not an engine. Nothing in aiterm runs a session
-//! against these yet; what they give you today is somewhere to put a key, and a
-//! **Test** that proves the key works by asking the provider for its model list.
-//! That distinction is kept honest in the UI, because a settings form that
-//! silently does nothing is worse than no form.
+//! Configuration lives here; the engine is `aiterm chat` (src/chat.rs) — a
+//! console harness the new-session menu launches in a tab's PTY exactly the
+//! way it launches `claude`, loaded with a model off a provider's startup
+//! shortlist. **Test** proves a key works by asking for the model list.
 //!
 //! Everything here is OpenAI-compatible on purpose. OpenRouter, Together,
 //! Groq, vLLM, llama.cpp and OpenAI itself all serve `GET {base}/models` with a
@@ -157,6 +156,12 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(dirs::home_dir()?.join(".config/aiterm/providers.json"))
 }
 
+/// The stored providers, keys included — for in-process readers only
+/// (`aiterm chat` looks its provider up by id). Never expose over IPC.
+pub fn load_providers() -> Vec<Provider> {
+    load()
+}
+
 fn load() -> Vec<Provider> {
     let Some(path) = config_path() else {
         return vec![];
@@ -188,7 +193,7 @@ fn save(list: &[Provider]) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
@@ -201,7 +206,7 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
@@ -308,6 +313,21 @@ pub fn provider_models(id: String) -> Result<Vec<String>, String> {
 #[tauri::command(async)]
 pub fn provider_model_cards(id: String) -> Result<Vec<ModelCard>, String> {
     parse_model_cards(&fetch_models_response(&id)?)
+}
+
+/// The command an API-model tab runs: this very binary in its `chat` argv
+/// mode, shell-quoted. The key is not in it — `aiterm chat` reads the
+/// provider config itself, so nothing secret crosses the PTY's command line.
+#[tauri::command]
+pub fn api_launch_command(provider_id: String, model: String) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    Ok(format!(
+        "{} chat --provider {} --model {}",
+        q(&exe.to_string_lossy()),
+        q(&provider_id),
+        q(&model),
+    ))
 }
 
 /// Replace a provider's startup shortlist and persist it.

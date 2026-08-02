@@ -11,8 +11,8 @@ export interface StartChoice {
    *  id aiterm generates is a tab handle only and no panel is keyed to it. */
   mintsSessionId: boolean;
   /** An API-provider model off a startup list, instead of an agent CLI's
-   *  model. Nothing can run one yet — the start path says so rather than
-   *  spawning something broken. */
+   *  model. Runs as `aiterm chat` in the tab's PTY — same shape as an agent,
+   *  but no session id and no transcript. */
   api: { providerId: string; providerName: string; modelId: string } | null;
 }
 
@@ -182,8 +182,8 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
       </div>
       {apiPicked && (
         <div className="empty-note">
-          API models can't run a session yet — the pick is here for when they
-          can. Choose an agent to start now.
+          Starts a chat console on this model. No transcript is kept — the tab
+          is the conversation.
         </div>
       )}
       {agents.length === 0 && (

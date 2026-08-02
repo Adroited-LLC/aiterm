@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod cache;
+pub mod chat;
 pub mod diag;
 pub mod fonts;
 pub mod fsx;
@@ -53,6 +54,7 @@ pub fn run() {
             providers::provider_models,
             providers::provider_model_cards,
             providers::provider_startup_set,
+            providers::api_launch_command,
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,

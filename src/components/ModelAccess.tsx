@@ -362,12 +362,10 @@ export default function ModelAccess() {
         </div>
       </div>
 
-      {/* Said plainly, because the alternative is someone adding a key and
-          waiting for a model picker that is not built yet. */}
       <div className="set-hint">
-        Configuration only for now — aiterm does not yet run sessions against
-        these. Test proves the key and URL work so that when it does, this part
-        is already known good.
+        Models on a startup list appear in the new-session menu and open as a
+        chat console in a tab. Test proves the key and URL work before anything
+        depends on them.
       </div>
     </div>
   );

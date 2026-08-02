@@ -10,5 +10,25 @@ fn main() {
         aiterm_lib::hooklink::hook_report();
         return;
     }
+    // `aiterm chat --provider X --model Y` is the console harness an
+    // API-model tab runs — its own process inside the tab's PTY, exactly the
+    // way `claude` is. Same rule: dispatch before Tauri exists.
+    if std::env::args().nth(1).as_deref() == Some("chat") {
+        let mut provider = None;
+        let mut model = None;
+        let mut args = std::env::args().skip(2);
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "--provider" => provider = args.next(),
+                "--model" => model = args.next(),
+                _ => {}
+            }
+        }
+        let (Some(provider), Some(model)) = (provider, model) else {
+            eprintln!("usage: aiterm chat --provider <id> --model <model-id>");
+            std::process::exit(2);
+        };
+        std::process::exit(aiterm_lib::chat::run(&provider, &model));
+    }
     aiterm_lib::run()
 }

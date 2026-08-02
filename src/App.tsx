@@ -36,7 +36,7 @@ import {
   drainSessionEvents,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  agentLaunchCommand, adoptAgentSession,
+  agentLaunchCommand, adoptAgentSession, apiLaunchCommand,
 } from "./ipc";
 import "./App.css";
 
@@ -1205,13 +1205,22 @@ export default function App() {
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
   const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
-    // An API-provider model has no engine behind it yet. Refusing here, once,
-    // covers both the ＋ menu and the empty pane — and says why, instead of
-    // spawning an agent on a model it has never heard of.
+    // An API-provider model runs `aiterm chat` in the tab — our own console
+    // harness, spawned through the shell exactly the way `claude` is. It has
+    // no session id and writes no transcript, so the tab is its whole life:
+    // no sidebar row, nothing to resume.
     if (choice.api) {
-      setNotice(
-        `${choice.api.modelId} is a ${choice.api.providerName} model — aiterm can't run API sessions yet.`,
-      );
+      try {
+        const command = await apiLaunchCommand(choice.api.providerId, choice.api.modelId);
+        setActiveProject(cwd);
+        // The slot id is a tab handle only — no session is ever keyed to it.
+        openTab(
+          choice.api.modelId.split("/").pop() || choice.api.modelId,
+          cwd, command, crypto.randomUUID(),
+        );
+      } catch (e) {
+        setNotice(`Couldn't start ${choice.api.modelId}: ${e}`);
+      }
       return;
     }
     setActiveProject(cwd);
