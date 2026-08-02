@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   ModelCard, ProviderView, providerDelete, providerModelCards, providerModels,
-  providerSave, providersList,
+  providerSave, providerStartupSet, providersList,
 } from "../ipc";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
@@ -61,6 +61,9 @@ export default function ModelAccess() {
   const [minCtx, setMinCtx] = useState(0);
   const [picked, setPicked] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  /** Providers that have answered a real request this session — the green
+   *  dot. Either button proves it; Test and Models hit the same endpoint. */
+  const [healthy, setHealthy] = useState<Record<string, boolean>>({});
 
   const browse = async (p: ProviderView) => {
     if (browsing === p.id) {
@@ -74,9 +77,27 @@ export default function ModelAccess() {
       try {
         const list = await providerModelCards(p.id);
         setCards((c) => ({ ...c, [p.id]: list }));
+        setHealthy((h) => ({ ...h, [p.id]: true }));
       } catch (e) {
         setBrowseErr(String(e));
+        setHealthy((h) => ({ ...h, [p.id]: false }));
       }
+    }
+  };
+
+  /** The provider whose models are open, as currently saved. */
+  const browsingProv = providers?.find((x) => x.id === browsing);
+
+  const toggleStartup = async (modelId: string) => {
+    if (!browsingProv) return;
+    const cur = browsingProv.startup_models;
+    const next = cur.includes(modelId)
+      ? cur.filter((m) => m !== modelId)
+      : [...cur, modelId];
+    try {
+      setProviders(await providerStartupSet(browsingProv.id, next));
+    } catch (e) {
+      setBrowseErr(String(e));
     }
   };
 
@@ -127,8 +148,10 @@ export default function ModelAccess() {
         ...t,
         [p.id]: `${models.length} models — ${models.slice(0, 3).join(", ")}${models.length > 3 ? "…" : ""}`,
       }));
+      setHealthy((h) => ({ ...h, [p.id]: true }));
     } catch (e) {
       setTested((t) => ({ ...t, [p.id]: String(e) }));
+      setHealthy((h) => ({ ...h, [p.id]: false }));
     }
   };
 
@@ -158,6 +181,9 @@ export default function ModelAccess() {
             <div key={p.id} className="prov-row">
               <div className="prov-text">
                 <div className="prov-name">
+                  {healthy[p.id] && (
+                    <span className="prov-dot" title="Answered a model list this session" />
+                  )}
                   {p.name}
                   <span className="prov-key">
                     {p.has_key ? (p.key_hint ? `key …${p.key_hint}` : "key saved") : "no key"}
@@ -243,6 +269,9 @@ export default function ModelAccess() {
                       onClick={() => setPicked(m.id)}
                     >
                       <span className="mb-item-name">{m.name ?? m.id}</span>
+                      {browsingProv?.startup_models.includes(m.id) && (
+                        <span className="mb-star" title="On the startup list">★</span>
+                      )}
                       {isFree(m) && <span className="mb-free">free</span>}
                     </button>
                   ))}
@@ -259,6 +288,17 @@ export default function ModelAccess() {
                         {copied ? "Copied" : "Copy id"}
                       </button>
                     </div>
+                    <button
+                      className={
+                        "act-btn mb-startup" +
+                        (browsingProv?.startup_models.includes(sel.id) ? " on" : "")
+                      }
+                      onClick={() => toggleStartup(sel.id)}
+                    >
+                      {browsingProv?.startup_models.includes(sel.id)
+                        ? "★ On the startup list — remove"
+                        : "☆ Add to startup list"}
+                    </button>
                     <div className="mb-meta">
                       <span className="mb-k">Context</span>
                       <span className="mb-v">{fmtCtx(sel.context_length)}</span>

@@ -1606,6 +1606,18 @@ body.dragging * { pointer-events: none; }
   white-space: nowrap;
 }
 .mb-free { font-size: 10px; color: var(--green); flex-shrink: 0; }
+.mb-star { font-size: 10px; color: var(--accent); flex-shrink: 0; }
+.mb-startup { margin-bottom: 10px; }
+.mb-startup.on { border-color: var(--accent); color: var(--accent); }
+.prov-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+  align-self: center;
+}
 .mb-card { flex: 1; min-width: 0; overflow-y: auto; padding: 12px 14px; }
 .mb-card-name { font-size: 13px; font-weight: 600; color: var(--text); }
 .mb-card-id {

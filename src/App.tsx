@@ -1205,6 +1205,15 @@ export default function App() {
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
   const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
+    // An API-provider model has no engine behind it yet. Refusing here, once,
+    // covers both the ＋ menu and the empty pane — and says why, instead of
+    // spawning an agent on a model it has never heard of.
+    if (choice.api) {
+      setNotice(
+        `${choice.api.modelId} is a ${choice.api.providerName} model — aiterm can't run API sessions yet.`,
+      );
+      return;
+    }
     setActiveProject(cwd);
     // Mint an id only where the agent will accept one. Codex has no
     // --session-id, so for it this is a tab handle: the placeholder row keeps

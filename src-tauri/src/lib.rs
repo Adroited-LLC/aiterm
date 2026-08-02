@@ -52,6 +52,7 @@ pub fn run() {
             providers::provider_delete,
             providers::provider_models,
             providers::provider_model_cards,
+            providers::provider_startup_set,
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,

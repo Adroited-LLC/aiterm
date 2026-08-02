@@ -344,6 +344,9 @@ export interface ProviderView {
   /** Last four characters, for telling two keys apart. Empty when there is no
    *  key or it is too short to redact meaningfully. */
   key_hint: string;
+  /** Model ids picked for the new-session menu — the shortlist, not the
+   *  catalog. */
+  startup_models: string[];
 }
 
 export const providersList = () => invoke<ProviderView[]>("providers_list");
@@ -371,6 +374,9 @@ export interface ModelCard {
 }
 export const providerModelCards = (id: string) =>
   invoke<ModelCard[]>("provider_model_cards", { id });
+/** Replace a provider's startup shortlist — what the new-session menu offers. */
+export const providerStartupSet = (id: string, models: string[]) =>
+  invoke<ProviderView[]>("provider_startup_set", { id, models });
 
 /** A model a backend can start on, with the effort levels *that model* takes. */
 export interface ModelOption {

@@ -49,6 +49,26 @@ pub struct Provider {
     /// `https://openrouter.ai/api/v1`.
     pub base_url: String,
     pub api_key: String,
+    /// Model ids picked for the new-session menu — the shortlist, not the
+    /// catalog. `default` so files written before this field existed load.
+    #[serde(default)]
+    pub startup_models: Vec<String>,
+}
+
+/// Replace a provider's startup shortlist. Order is the caller's; duplicates
+/// fold to their first appearance.
+pub fn set_startup_models(
+    list: &mut [Provider],
+    id: &str,
+    models: Vec<String>,
+) -> Result<(), String> {
+    let p = list
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
+    let mut seen = std::collections::HashSet::new();
+    p.startup_models = models.into_iter().filter(|m| seen.insert(m.clone())).collect();
+    Ok(())
 }
 
 /// A provider as the UI sees it: everything except the key.
@@ -62,6 +82,7 @@ pub struct ProviderView {
     /// no key, or when the key is too short to redact meaningfully — showing
     /// most of a six-character secret would defeat the point.
     pub key_hint: String,
+    pub startup_models: Vec<String>,
 }
 
 impl std::fmt::Debug for Provider {
@@ -83,6 +104,7 @@ impl Provider {
             base_url: self.base_url.clone(),
             has_key: !self.api_key.is_empty(),
             key_hint: key_hint(&self.api_key),
+            startup_models: self.startup_models.clone(),
         }
     }
 }
@@ -247,6 +269,7 @@ fn provider_save_sync(
             name,
             base_url,
             api_key: api_key.trim().to_string(),
+            startup_models: vec![],
         }),
     }
     save(&list)?;
@@ -285,6 +308,22 @@ pub fn provider_models(id: String) -> Result<Vec<String>, String> {
 #[tauri::command(async)]
 pub fn provider_model_cards(id: String) -> Result<Vec<ModelCard>, String> {
     parse_model_cards(&fetch_models_response(&id)?)
+}
+
+/// Replace a provider's startup shortlist and persist it.
+#[tauri::command]
+pub async fn provider_startup_set(
+    id: String,
+    models: Vec<String>,
+) -> Result<Vec<ProviderView>, String> {
+    crate::run_blocking(move || provider_startup_set_sync(id, models)).await
+}
+
+fn provider_startup_set_sync(id: String, models: Vec<String>) -> Result<Vec<ProviderView>, String> {
+    let mut list = load();
+    set_startup_models(&mut list, &id, models)?;
+    save(&list)?;
+    Ok(list.iter().map(Provider::view).collect())
 }
 
 /// One `GET {base}/models` as curl sees it: body, newline, HTTP status.
@@ -484,6 +523,43 @@ pub fn parse_models(response: &str) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
+    fn provider(id: &str) -> Provider {
+        Provider {
+            id: id.into(),
+            name: id.into(),
+            base_url: "https://example.test/v1".into(),
+            api_key: "k".into(),
+            startup_models: vec![],
+        }
+    }
+
+    /// The startup list is a replace: what arrives is what is kept, minus
+    /// duplicates, and naming a provider that does not exist is an error
+    /// rather than a silent no-op.
+    #[test]
+    fn startup_models_replace_dedupe_and_require_a_real_provider() {
+        let mut list = vec![provider("openrouter")];
+        set_startup_models(
+            &mut list,
+            "openrouter",
+            vec!["a/one".into(), "b/two".into(), "a/one".into()],
+        )
+        .unwrap();
+        assert_eq!(list[0].startup_models, vec!["a/one", "b/two"]);
+        assert!(set_startup_models(&mut list, "nope", vec![]).is_err());
+    }
+
+    /// providers.json written before startup lists existed has no such key —
+    /// it must load as an empty list, not fail.
+    #[test]
+    fn a_providers_file_from_before_startup_lists_still_loads() {
+        let p: Provider = serde_json::from_str(
+            r#"{"id":"op","name":"OpenRouter","base_url":"https://x","api_key":"k"}"#,
+        )
+        .unwrap();
+        assert!(p.startup_models.is_empty());
+    }
+
     /// OpenRouter's shape, cut down to the fields the card shows. Prices come
     /// as strings of USD-per-token; context and modalities live under their
     /// own keys. One model with everything, to prove each field survives.
@@ -559,6 +635,7 @@ mod tests {
             name: "OpenRouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: "sk-do-not-print-me".into(),
+            startup_models: vec![],
         };
         let shown = format!("{p:?}");
         assert!(!shown.contains("sk-do-not-print-me"), "key leaked: {shown}");
@@ -591,6 +668,7 @@ mod tests {
             name: "OpenRouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: "sk-or-v1-abcdefghijklmnop".into(),
+            startup_models: vec![],
         };
         let v = p.view();
         let json = serde_json::to_string(&v).unwrap();
