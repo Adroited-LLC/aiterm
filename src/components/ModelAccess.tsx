@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
-  ProviderView, providerDelete, providerModels, providerSave, providersList,
+  ModelCard, ProviderView, providerDelete, providerModelCards, providerModels,
+  providerSave, providersList,
 } from "../ipc";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
@@ -12,6 +13,18 @@ const PRESETS: { name: string; base_url: string }[] = [
   { name: "Together", base_url: "https://api.together.xyz/v1" },
   { name: "Local (llama.cpp / vLLM)", base_url: "http://localhost:8080/v1" },
 ];
+
+/** 200000 → "200K", 1048576 → "1M". Dash when the provider didn't say. */
+const fmtCtx = (n: number | null) =>
+  n == null ? "—" : n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}K`;
+
+/** Per-token USD → "$3/M" (or "free"). Dash when the provider didn't say. */
+const fmtPrice = (p: number | null) =>
+  p == null ? "—" : p === 0 ? "free" : `$${+(p * 1e6).toFixed(2)}/M`;
+
+/** Free means the provider *said* zero — both directions, not just unknown. */
+const isFree = (m: ModelCard) =>
+  m.prompt_price === 0 && (m.completion_price ?? 0) === 0;
 
 /**
  * Where API model access is configured.
@@ -37,6 +50,53 @@ export default function ModelAccess() {
   /** Per-provider Test result: the models found, or why not. */
   const [tested, setTested] = useState<Record<string, string>>({});
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+
+  // The model browser: which provider it is open on, the cards each provider
+  // returned (kept per id, so reopening is instant), and the view state.
+  const [browsing, setBrowsing] = useState<string | null>(null);
+  const [cards, setCards] = useState<Record<string, ModelCard[]>>({});
+  const [browseErr, setBrowseErr] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [priceFilter, setPriceFilter] = useState<"all" | "free" | "paid">("all");
+  const [minCtx, setMinCtx] = useState(0);
+  const [picked, setPicked] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const browse = async (p: ProviderView) => {
+    if (browsing === p.id) {
+      setBrowsing(null); // second click folds it away
+      return;
+    }
+    setBrowsing(p.id);
+    setBrowseErr(null);
+    setPicked(null);
+    if (!cards[p.id]) {
+      try {
+        const list = await providerModelCards(p.id);
+        setCards((c) => ({ ...c, [p.id]: list }));
+      } catch (e) {
+        setBrowseErr(String(e));
+      }
+    }
+  };
+
+  const all = browsing ? cards[browsing] : undefined;
+  const q = query.trim().toLowerCase();
+  const shown = (all ?? []).filter(
+    (m) =>
+      (!q || m.id.toLowerCase().includes(q) || (m.name ?? "").toLowerCase().includes(q)) &&
+      (priceFilter === "all" || (priceFilter === "free") === isFree(m)) &&
+      (minCtx === 0 || (m.context_length ?? 0) >= minCtx),
+  );
+  // The card follows the pick, or the first match — so it always shows
+  // something while there is anything to show.
+  const sel = shown.find((m) => m.id === picked) ?? shown[0];
+
+  const copyId = (id: string) => {
+    navigator.clipboard?.writeText(id);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
 
   const refresh = () => providersList().then(setProviders).catch(() => setProviders([]));
   useEffect(() => { refresh(); }, []);
@@ -107,6 +167,11 @@ export default function ModelAccess() {
                 {tested[p.id] && <div className="prov-test">{tested[p.id]}</div>}
               </div>
               <div className="prov-acts">
+                <button
+                  className={"act-btn" + (browsing === p.id ? " on" : "")}
+                  title="Browse its models"
+                  onClick={() => browse(p)}
+                >Models</button>
                 <button className="act-btn" title="Ask for its model list" onClick={() => test(p)}>Test</button>
                 <button className="act-btn" onClick={() => edit(p)}>Edit</button>
                 {confirmDel === p.id ? (
@@ -128,6 +193,96 @@ export default function ModelAccess() {
           ))}
           {providers.length === 0 && (
             <div className="set-hint">Nothing configured yet.</div>
+          )}
+        </div>
+      )}
+
+      {browsing && (
+        <div className="mb">
+          <div className="mb-controls">
+            <input
+              className="set-input mb-search"
+              placeholder="Search models"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            <div className="seg">
+              {(["all", "free", "paid"] as const).map((f) => (
+                <button
+                  key={f}
+                  className={"seg-btn" + (priceFilter === f ? " on" : "")}
+                  onClick={() => setPriceFilter(f)}
+                >{f === "all" ? "All" : f === "free" ? "Free" : "Paid"}</button>
+              ))}
+            </div>
+            <select
+              className="set-select mb-ctx"
+              value={minCtx}
+              onChange={(e) => setMinCtx(+e.target.value)}
+            >
+              <option value={0}>Any context</option>
+              <option value={32000}>≥ 32K</option>
+              <option value={128000}>≥ 128K</option>
+              <option value={200000}>≥ 200K</option>
+              <option value={1000000}>≥ 1M</option>
+            </select>
+          </div>
+
+          {browseErr ? (
+            <div className="set-notice">{browseErr}</div>
+          ) : all === undefined ? (
+            <div className="set-hint mb-wait">Asking the provider…</div>
+          ) : (
+            <>
+              <div className="mb-body">
+                <div className="mb-list">
+                  {shown.map((m) => (
+                    <button
+                      key={m.id}
+                      className={"mb-item" + (sel?.id === m.id ? " on" : "")}
+                      onClick={() => setPicked(m.id)}
+                    >
+                      <span className="mb-item-name">{m.name ?? m.id}</span>
+                      {isFree(m) && <span className="mb-free">free</span>}
+                    </button>
+                  ))}
+                  {shown.length === 0 && (
+                    <div className="set-hint mb-wait">Nothing matches those filters.</div>
+                  )}
+                </div>
+                {sel && (
+                  <div className="mb-card">
+                    <div className="mb-card-name">{sel.name ?? sel.id}</div>
+                    <div className="mb-card-id">
+                      <code>{sel.id}</code>
+                      <button className="act-btn" onClick={() => copyId(sel.id)}>
+                        {copied ? "Copied" : "Copy id"}
+                      </button>
+                    </div>
+                    <div className="mb-meta">
+                      <span className="mb-k">Context</span>
+                      <span className="mb-v">{fmtCtx(sel.context_length)}</span>
+                      <span className="mb-k">Input</span>
+                      <span className="mb-v">{fmtPrice(sel.prompt_price)}</span>
+                      <span className="mb-k">Output</span>
+                      <span className="mb-v">{fmtPrice(sel.completion_price)}</span>
+                      {sel.modalities.length > 0 && (
+                        <>
+                          <span className="mb-k">Accepts</span>
+                          <span className="mb-v">{sel.modalities.join(", ")}</span>
+                        </>
+                      )}
+                    </div>
+                    {sel.description && <div className="mb-desc">{sel.description}</div>}
+                  </div>
+                )}
+              </div>
+              <div className="mb-count">
+                {shown.length === all.length
+                  ? `${all.length} models`
+                  : `${shown.length} of ${all.length} models`}
+              </div>
+            </>
           )}
         </div>
       )}

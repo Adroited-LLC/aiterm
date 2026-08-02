@@ -357,6 +357,21 @@ export const providerDelete = (id: string) =>
 export const providerModels = (id: string) =>
   invoke<string[]>("provider_models", { id });
 
+/** What a provider says about one model. Everything past the id is optional —
+ *  OpenRouter fills all of it, a bare llama.cpp fills none. Prices are USD per
+ *  token as quoted; scale by 1e6 to show $/M. */
+export interface ModelCard {
+  id: string;
+  name: string | null;
+  description: string | null;
+  context_length: number | null;
+  prompt_price: number | null;
+  completion_price: number | null;
+  modalities: string[];
+}
+export const providerModelCards = (id: string) =>
+  invoke<ModelCard[]>("provider_model_cards", { id });
+
 /** A model a backend can start on, with the effort levels *that model* takes. */
 export interface ModelOption {
   id: string;

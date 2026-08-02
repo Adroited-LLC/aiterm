@@ -277,6 +277,18 @@ fn provider_delete_sync(id: String) -> Result<Vec<ProviderView>, String> {
 /// documents having made.
 #[tauri::command(async)]
 pub fn provider_models(id: String) -> Result<Vec<String>, String> {
+    parse_models(&fetch_models_response(&id)?)
+}
+
+/// The same `/models` call, kept whole — the browser's card view wants every
+/// field the provider offered, where Test wants only the ids.
+#[tauri::command(async)]
+pub fn provider_model_cards(id: String) -> Result<Vec<ModelCard>, String> {
+    parse_model_cards(&fetch_models_response(&id)?)
+}
+
+/// One `GET {base}/models` as curl sees it: body, newline, HTTP status.
+fn fetch_models_response(id: &str) -> Result<String, String> {
     let list = load();
     let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
     if p.api_key.is_empty() {
@@ -327,7 +339,7 @@ pub fn provider_models(id: String) -> Result<Vec<String>, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("Could not reach {url} — {}", err.trim()));
     }
-    parse_models(&String::from_utf8_lossy(&out.stdout))
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// One `header` line in curl config syntax, carrying the bearer token.
@@ -347,11 +359,27 @@ pub(crate) fn curl_auth_config(token: &str) -> String {
     format!("header = \"Authorization: Bearer {escaped}\"\n")
 }
 
-/// Split the `-w` status off the body and pull out model ids.
-///
-/// Kept separate from the request so the parsing — which is where the shapes
-/// actually differ between providers — can be tested without a network.
-pub fn parse_models(response: &str) -> Result<Vec<String>, String> {
+/// What a provider is willing to say about one model. Everything past the id
+/// is optional: OpenRouter fills all of it, a bare llama.cpp fills none, and
+/// the card in the UI shows what it was given.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct ModelCard {
+    pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub context_length: Option<u64>,
+    /// USD per input token, as quoted — the UI scales to $/M.
+    pub prompt_price: Option<f64>,
+    /// USD per output token.
+    pub completion_price: Option<f64>,
+    /// What the model accepts: "text", "image", …
+    pub modalities: Vec<String>,
+}
+
+/// Split the `-w` status off the body and turn an HTTP failure into the
+/// sentence the UI should show. Shared by every reader of a `/models` reply,
+/// so a rejected key reads the same everywhere.
+fn checked_body(response: &str) -> Result<&str, String> {
     let (body, status) = response.rsplit_once('\n').unwrap_or(("", response));
     let code: u16 = status.trim().parse().unwrap_or(0);
     if code == 401 || code == 403 {
@@ -372,16 +400,71 @@ pub fn parse_models(response: &str) -> Result<Vec<String>, String> {
             None => format!("HTTP {code} from the provider."),
         });
     }
+    Ok(body)
+}
+
+/// The model entries of a `/models` reply. OpenAI-compatible is
+/// `{"data":[{"id":…}]}`; a few servers return a bare array, so accept that
+/// too rather than calling a working provider broken.
+fn model_items(body: &str) -> Result<Vec<serde_json::Value>, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|_| "The provider did not return JSON.".to_string())?;
-    // OpenAI-compatible: `{"data":[{"id":…}]}`. A few servers return a bare
-    // array, so accept that too rather than calling a working provider broken.
-    let items = v
-        .get("data")
+    v.get("data")
         .and_then(|d| d.as_array())
         .or_else(|| v.as_array())
-        .ok_or("No model list in the reply.")?;
-    let mut models: Vec<String> = items
+        .map(|a| a.to_vec())
+        .ok_or_else(|| "No model list in the reply.".to_string())
+}
+
+/// The full `/models` reply as cards, one per model, in the provider's order.
+///
+/// A price can arrive as a string ("0.000003", OpenRouter) or a number;
+/// modalities under `architecture.input_modalities`, or nothing at all.
+/// Absent is absent — the card renders what it was given and no more.
+pub fn parse_model_cards(response: &str) -> Result<Vec<ModelCard>, String> {
+    let items = model_items(checked_body(response)?)?;
+    let price = |m: &serde_json::Value, key: &str| -> Option<f64> {
+        let p = m.pointer(&format!("/pricing/{key}"))?;
+        p.as_f64().or_else(|| p.as_str()?.trim().parse().ok())
+    };
+    let cards: Vec<ModelCard> = items
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|i| i.as_str()).or_else(|| m.as_str())?;
+            Some(ModelCard {
+                id: id.to_string(),
+                name: m.get("name").and_then(|v| v.as_str()).map(String::from),
+                description: m
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                context_length: m.get("context_length").and_then(|v| v.as_u64()),
+                prompt_price: price(m, "prompt"),
+                completion_price: price(m, "completion"),
+                modalities: m
+                    .pointer("/architecture/input_modalities")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    if cards.is_empty() {
+        return Err("The provider returned an empty model list.".into());
+    }
+    Ok(cards)
+}
+
+/// Split the `-w` status off the body and pull out model ids.
+///
+/// Kept separate from the request so the parsing — which is where the shapes
+/// actually differ between providers — can be tested without a network.
+pub fn parse_models(response: &str) -> Result<Vec<String>, String> {
+    let mut models: Vec<String> = model_items(checked_body(response)?)?
         .iter()
         .filter_map(|m| {
             m.get("id")
@@ -400,6 +483,56 @@ pub fn parse_models(response: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenRouter's shape, cut down to the fields the card shows. Prices come
+    /// as strings of USD-per-token; context and modalities live under their
+    /// own keys. One model with everything, to prove each field survives.
+    #[test]
+    fn openrouter_metadata_becomes_a_full_card() {
+        let body = r#"{"data":[{
+            "id":"anthropic/claude-sonnet-5",
+            "name":"Anthropic: Claude Sonnet 5",
+            "description":"Fast frontier model.",
+            "context_length":1000000,
+            "architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},
+            "pricing":{"prompt":"0.000003","completion":"0.000015"}
+        }]}"#;
+        let cards = parse_model_cards(&format!("{body}\n200")).unwrap();
+        assert_eq!(
+            cards,
+            vec![ModelCard {
+                id: "anthropic/claude-sonnet-5".into(),
+                name: Some("Anthropic: Claude Sonnet 5".into()),
+                description: Some("Fast frontier model.".into()),
+                context_length: Some(1_000_000),
+                prompt_price: Some(0.000003),
+                completion_price: Some(0.000015),
+                modalities: vec!["text".into(), "image".into()],
+            }]
+        );
+    }
+
+    /// A plain OpenAI-compatible server says almost nothing about its models.
+    /// That must produce a usable id-only card, not an error and not invented
+    /// values.
+    #[test]
+    fn a_bare_model_list_becomes_id_only_cards() {
+        let body = r#"{"data":[{"id":"llama-3.3-70b","object":"model","created":1700000000}]}"#;
+        let cards = parse_model_cards(&format!("{body}\n200")).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, "llama-3.3-70b");
+        assert_eq!(cards[0].name, None);
+        assert_eq!(cards[0].prompt_price, None);
+        assert!(cards[0].modalities.is_empty());
+    }
+
+    /// The cards path reports HTTP failures the same way the Test button does
+    /// — a rejected key must say so, not "could not parse".
+    #[test]
+    fn cards_report_a_rejected_key_as_such() {
+        let err = parse_model_cards("{}\n401").unwrap_err();
+        assert!(err.contains("rejected"), "{err}");
+    }
 
     #[test]
     fn the_key_goes_in_a_config_line_and_not_on_the_argv() {
