@@ -82,7 +82,8 @@ export default function ModelAccess() {
 
   return (
     <div className="set-section">
-      <div className="set-label">Model access</div>
+      {/* No heading of its own — the settings pane title already says where
+          we are. */}
       <div className="set-hint">
         Any OpenAI-compatible endpoint. Keys are stored in
         {" "}<code>~/.config/aiterm/providers.json</code> with 0600 permissions, and are
