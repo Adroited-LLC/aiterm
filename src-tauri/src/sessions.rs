@@ -540,6 +540,9 @@ pub async fn session_status(session_id: String) -> SessionStatus {
 }
 
 fn session_status_sync(session_id: String) -> SessionStatus {
+    if panels_denied(&session_id) {
+        return SessionStatus::default();
+    }
     let Some(path) = find_session_file(&session_id) else {
         return SessionStatus::default();
     };
@@ -593,6 +596,23 @@ const TRASH_KEEP_DAYS: u64 = 7;
 ///
 /// Taken over an explicit backend list so the refusal can be tested with fake
 /// backends rather than by having a real engine installed.
+/// Whether the owning engine has said the transcript panels do not apply.
+///
+/// Tasks, artifacts, agents and status all parse Claude Code's record types out
+/// of a JSONL transcript. An engine that keeps its sessions some other way
+/// answers `find_session_file` with something that is not one — OpenCode's is
+/// the database itself — and reading that as a conversation is at best lines of
+/// binary. `caps.panels` already hides these in the UI; refusing here is what
+/// makes the answer not depend on that.
+///
+/// Deliberately only refuses when an owner is *found*: a live claude session
+/// whose transcript has not landed yet, or one a compaction moved, has no owner
+/// by this lookup and must keep the behaviour it has always had.
+fn panels_denied(session_id: &str) -> bool {
+    crate::agents::owner_in(&crate::agents::backends(), session_id)
+        .is_some_and(|(b, _)| !b.caps().panels)
+}
+
 fn deletable(
     list: &[Box<dyn crate::agents::AgentBackend>],
     session_id: &str,
@@ -1138,6 +1158,9 @@ pub async fn session_tasks(session_id: String) -> Vec<SessionTask> {
 }
 
 fn session_tasks_sync(session_id: String) -> Vec<SessionTask> {
+    if panels_denied(&session_id) {
+        return vec![];
+    }
     if let Some(path) = resolve_live_session_file(&session_id) {
         if let Ok(file) = File::open(&path) {
             let mut todo: Option<Vec<SessionTask>> = None;
@@ -1342,6 +1365,9 @@ pub async fn session_agents(session_id: String) -> Vec<AgentRun> {
 }
 
 fn session_agents_sync(session_id: String) -> Vec<AgentRun> {
+    if panels_denied(&session_id) {
+        return vec![];
+    }
     let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];
     };
@@ -2298,6 +2324,9 @@ pub async fn session_artifacts(session_id: String) -> Vec<Artifact> {
 }
 
 fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
+    if panels_denied(&session_id) {
+        return vec![];
+    }
     let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];
     };

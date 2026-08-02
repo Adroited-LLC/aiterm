@@ -2470,4 +2470,7 @@ input[type="range"]::-webkit-slider-thumb {
    being four shapes in the same grey. */
 .agent-icon.codex, .agent-icon.openai { color: var(--green); }
 .agent-icon.api { color: var(--blue); }
+/* OpenCode runs the same API models the socket marks, so it takes the hue next
+   to it rather than an unrelated fifth — related engines, related colour. */
+.agent-icon.opencode { color: var(--cyan); }
 .ns-agent-tab.on .agent-icon { color: inherit; }
