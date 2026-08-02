@@ -152,10 +152,12 @@ pub fn resolve_in(
 /// transcript rather than by inspecting the id: ids are opaque, and a rule for
 /// telling one engine's from another's would be a guess that breaks the first
 /// time a format changes.
+///
+/// The lookup itself lives in `agents.rs` beside the registry, so the resolver,
+/// the preview panel and `session_delete` cannot come to different answers
+/// about who owns a row.
 fn owner<'a>(list: &'a [Box<dyn AgentBackend>], session_id: &str) -> Option<&'a dyn AgentBackend> {
-    list.iter()
-        .find(|b| b.sessions().find_session_file(session_id).is_some())
-        .map(|b| &**b)
+    crate::agents::owner_in(list, session_id).map(|(b, _)| b)
 }
 
 /// A plan built by the backend that owns `session_id`, reopening it under that

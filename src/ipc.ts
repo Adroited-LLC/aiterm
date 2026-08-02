@@ -396,6 +396,11 @@ export interface Caps {
   tui_drive: boolean;
   /** Transcript panels and the `/model` `/effort` `/rewind` pills. */
   panels: boolean;
+  /** 🗑 — only where the store is one file per session and aiterm's to move.
+   *  Off for OpenCode, whose "file" is the one database holding every OpenCode
+   *  conversation. Hiding the button is the courtesy; `session_delete` refuses
+   *  on the same flag, which is the actual guard. */
+  delete: boolean;
 }
 
 /** Every registered engine's capabilities, keyed by agent id.

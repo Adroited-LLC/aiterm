@@ -8,6 +8,7 @@ pub mod git;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;
+pub mod opencode;
 pub mod providers;
 pub mod pty;
 pub mod sessions;

@@ -52,6 +52,20 @@ pub trait SessionProvider: Send + Sync {
     /// the registry route by asking rather than by parsing ids.
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf>;
 
+    /// The conversation as `(role, text)`, for a backend whose sessions are not
+    /// a file.
+    ///
+    /// `None` means "read the transcript path", which is every existing
+    /// provider and stays the default. It exists because OpenCode keeps its
+    /// sessions in a SQLite database: there is no file for the preview panel or
+    /// the search indexer to open, and both of them assumed a session *is* a
+    /// jsonl. A provider that answers here is read through this instead, and
+    /// its path is never opened.
+    fn messages(&self, session_id: &str) -> Option<Vec<(String, String)>> {
+        let _ = session_id;
+        None
+    }
+
     fn scan(&self) -> Vec<Session> {
         self.scan_with_paths().into_iter().map(|(s, _)| s).collect()
     }
@@ -563,6 +577,37 @@ fn session_status_sync(session_id: String) -> SessionStatus {
 /// How long trashed sessions are kept before the next delete purges them.
 const TRASH_KEEP_DAYS: u64 = 7;
 
+/// Where `session_id`'s transcript is, if its engine permits a delete at all.
+///
+/// The gate on the destructive path, and it lives in Rust rather than in the
+/// sidebar because hiding a button is not a boundary: `session_delete` is an
+/// IPC command, and a command that destroys data must not depend on the UI
+/// having declined to call it.
+///
+/// What it prevents is concrete. `find_session_file` returns whatever the
+/// owning provider considers the session's location, and for OpenCode that is
+/// `~/.local/share/opencode/opencode.db` — the single database holding every
+/// OpenCode conversation on the machine. The delete below is a `rename` into
+/// `~/.claude/trash/<id>.jsonl`; run against that path it would move all of
+/// them, under one session's name, on one click.
+///
+/// Taken over an explicit backend list so the refusal can be tested with fake
+/// backends rather than by having a real engine installed.
+fn deletable(
+    list: &[Box<dyn crate::agents::AgentBackend>],
+    session_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    let (backend, path) =
+        crate::agents::owner_in(list, session_id).ok_or("session not found")?;
+    if !backend.caps().delete {
+        return Err(format!(
+            "{} sessions cannot be deleted from aiterm — its store is not aiterm's to move.",
+            backend.display_name()
+        ));
+    }
+    Ok(path)
+}
+
 /// Delete a session: its transcript jsonl and task store move to
 /// ~/.claude/trash (kept for TRASH_KEEP_DAYS as an undo safety net,
 /// purged lazily on later deletes).
@@ -575,7 +620,7 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     if session_id.contains('/') || session_id.contains("..") {
         return Err("invalid session id".into());
     }
-    let path = find_session_file(&session_id).ok_or("session not found")?;
+    let path = deletable(&crate::agents::backends(), &session_id)?;
     let home = dirs::home_dir().ok_or("no home dir")?;
     let trash = home.join(".claude/trash");
     std::fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
@@ -990,12 +1035,24 @@ pub async fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     crate::run_blocking(move || session_preview_sync(session_id)).await
 }
 
+/// How many messages the preview keeps, and how much of each.
+const PREVIEW_KEEP: usize = 12;
+const PREVIEW_MAX_CHARS: usize = 700;
+
 fn session_preview_sync(session_id: String) -> Vec<PreviewMsg> {
-    const KEEP: usize = 12;
-    const MAX_CHARS: usize = 700;
-    let Some(path) = find_session_file(&session_id) else {
+    // The owning backend, not just the file: a backend may keep its sessions
+    // somewhere that is not a file at all, and OpenCode does — its
+    // `find_session_file` answers with `opencode.db`, which read as a
+    // transcript is binary noise. Ask for the conversation first; only fall
+    // back to opening the path when the owner says it has none to give, which
+    // is every other engine.
+    let list = crate::agents::backends();
+    let Some((backend, path)) = crate::agents::owner_in(&list, &session_id) else {
         return vec![];
     };
+    if let Some(msgs) = backend.sessions().messages(&session_id) {
+        return preview_from_messages(msgs);
+    }
     let Ok(file) = File::open(&path) else {
         return vec![];
     };
@@ -1019,18 +1076,47 @@ fn session_preview_sync(session_id: String) -> Vec<PreviewMsg> {
         if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
             continue;
         }
-        let truncated = text.chars().count() > MAX_CHARS;
-        let mut text: String = text.chars().take(MAX_CHARS).collect();
+        let truncated = text.chars().count() > PREVIEW_MAX_CHARS;
+        let mut text: String = text.chars().take(PREVIEW_MAX_CHARS).collect();
         if truncated {
             text.push('…');
         }
         let at = v.get("timestamp").and_then(|t| t.as_str()).map(String::from);
         out.push_back(PreviewMsg { role, text, at });
-        if out.len() > KEEP {
+        if out.len() > PREVIEW_KEEP {
             out.pop_front();
         }
     }
     out.into()
+}
+
+/// Preview rows from a conversation the owning backend handed over whole.
+///
+/// The same shaping the file path applies — system-tag stripping, the
+/// `PREVIEW_MAX_CHARS` truncation with its ellipsis, the last `PREVIEW_KEEP`
+/// messages — so a preview looks the same whether it came from a transcript or
+/// from a database. `at` is `None`: the timestamp on a claude row is an ISO
+/// string off the transcript line, and `(role, text)` carries no such thing.
+fn preview_from_messages(msgs: Vec<(String, String)>) -> Vec<PreviewMsg> {
+    let mut out: Vec<PreviewMsg> = msgs
+        .into_iter()
+        .filter_map(|(role, text)| {
+            let text = strip_system_tags(&text);
+            if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
+                return None;
+            }
+            let truncated = text.chars().count() > PREVIEW_MAX_CHARS;
+            let mut text: String = text.chars().take(PREVIEW_MAX_CHARS).collect();
+            if truncated {
+                text.push('…');
+            }
+            Some(PreviewMsg { role, text, at: None })
+        })
+        .collect();
+    if out.len() > PREVIEW_KEEP {
+        out.drain(..out.len() - PREVIEW_KEEP);
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -2714,6 +2800,116 @@ mod tests {
             "prefilter would drop this line before it was ever parsed"
         );
         line_message(&serde_json::from_str(line).unwrap())
+    }
+
+    /* ---- the delete gate ------------------------------------------------ */
+
+    /// A backend that claims a session, over a path that does not exist and is
+    /// never touched: what is under test is the refusal, which must come before
+    /// anything reaches the filesystem.
+    struct FakeOwner {
+        id: &'static str,
+        can_delete: bool,
+    }
+
+    impl SessionProvider for FakeOwner {
+        fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+            vec![]
+        }
+        fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
+            (session_id == "owned").then(|| std::path::PathBuf::from("/nonexistent/store.db"))
+        }
+    }
+
+    impl crate::agents::AgentBackend for FakeOwner {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            "Fake Engine"
+        }
+        fn detect(&self) -> crate::agents::Detection {
+            crate::agents::Detection {
+                id: self.id.into(),
+                display_name: self.display_name().into(),
+                available: true,
+                version: None,
+                path: None,
+                caps: self.caps(),
+            }
+        }
+        fn sessions(&self) -> &dyn SessionProvider {
+            self
+        }
+        fn caps(&self) -> crate::agents::Caps {
+            crate::agents::Caps { delete: self.can_delete, ..Default::default() }
+        }
+        fn launch(&self, _spec: &crate::agents::LaunchSpec) -> String {
+            String::new()
+        }
+    }
+
+    fn fake(can_delete: bool) -> Vec<Box<dyn crate::agents::AgentBackend>> {
+        vec![Box::new(FakeOwner { id: "fake", can_delete })]
+    }
+
+    /// The 🗑 is hidden for an engine that declares no delete, but hiding a
+    /// button is not a boundary — `session_delete` is an IPC command anything
+    /// can call. It refuses on the backend's own answer, before it has a path
+    /// to rename, so the destructive step is never reached.
+    #[test]
+    fn delete_refuses_for_an_engine_that_does_not_claim_it() {
+        let err = deletable(&fake(false), "owned").expect_err("must refuse");
+        assert!(err.contains("Fake Engine"), "the refusal should name the engine: {err}");
+        assert_eq!(
+            deletable(&fake(true), "owned").ok(),
+            Some(std::path::PathBuf::from("/nonexistent/store.db")),
+            "an engine that claims the delete still gets its path",
+        );
+        assert_eq!(
+            deletable(&fake(true), "someone-elses").unwrap_err(),
+            "session not found",
+        );
+    }
+
+    /* ---- preview from a backend-supplied conversation ------------------- */
+
+    /// A backend that hands over its conversation gets the same shaping as one
+    /// that hands over a file: the last `PREVIEW_KEEP` messages, each cut at
+    /// `PREVIEW_MAX_CHARS` with an ellipsis. Anything else and an OpenCode
+    /// preview would be a different thing from a claude one.
+    #[test]
+    fn a_supplied_conversation_is_shaped_like_a_transcript_one() {
+        let long = "x".repeat(PREVIEW_MAX_CHARS + 50);
+        let mut msgs: Vec<(String, String)> = (0..PREVIEW_KEEP + 5)
+            .map(|i| ("user".to_string(), format!("turn {i}")))
+            .collect();
+        msgs.push(("assistant".into(), long));
+        let out = preview_from_messages(msgs);
+        assert_eq!(out.len(), PREVIEW_KEEP, "only the tail is kept");
+        // 18 in (PREVIEW_KEEP + 5 turns, then the long one), 12 out.
+        assert_eq!(out[0].text, "turn 6", "the oldest turns fall off the front");
+        let last = out.last().unwrap();
+        assert_eq!(last.text.chars().count(), PREVIEW_MAX_CHARS + 1);
+        assert!(last.text.ends_with('…'));
+        assert!(last.at.is_none(), "(role, text) carries no timestamp to invent one from");
+    }
+
+    /// The same two filters the file path applies: a message that is nothing
+    /// but an injected system block, and a meta-prompt nobody typed.
+    #[test]
+    fn a_supplied_conversation_drops_what_nobody_said() {
+        let out = preview_from_messages(vec![
+            ("user".into(), "<system-reminder>be good</system-reminder>".into()),
+            (
+                "user".into(),
+                "You are summarizing a Claude Code session and should…".into(),
+            ),
+            ("user".into(), "   ".into()),
+            ("assistant".into(), "kept".into()),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "kept");
     }
 
     #[test]

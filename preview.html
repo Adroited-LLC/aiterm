@@ -52,10 +52,10 @@
           // UI reads it — a harness that answered nothing would draw a session
           // list with no buttons on any row.
           agent_caps: {
-            claude: { fork: true, clear: true, resume: true, tui_drive: true, panels: true },
-            codex: { fork: false, clear: false, resume: false, tui_drive: false, panels: false },
-            opencode: { fork: false, clear: false, resume: false, tui_drive: false, panels: false },
-            api: { fork: false, clear: false, resume: true, tui_drive: false, panels: false },
+            claude: { fork: true, clear: true, resume: true, tui_drive: true, panels: true, delete: true },
+            codex: { fork: false, clear: false, resume: false, tui_drive: false, panels: false, delete: false },
+            opencode: { fork: false, clear: false, resume: true, tui_drive: false, panels: false, delete: false },
+            api: { fork: false, clear: false, resume: true, tui_drive: false, panels: false, delete: true },
           },
           list_fonts: [
             { name: "Adwaita Sans", mono: false },
@@ -78,7 +78,7 @@
             env_provider: null,
             session_id: "00000000-0000-4000-8000-000000000000",
             agent_id: "claude",
-            caps: { fork: true, clear: true, resume: true, tui_drive: true, panels: true },
+            caps: { fork: true, clear: true, resume: true, tui_drive: true, panels: true, delete: true },
           },
           claude_model_default: null,
           claude_permission_mode: null,

@@ -70,6 +70,17 @@ pub struct Caps {
     /// Transcript panels — tasks, artifacts, agents — and the composer pills
     /// that send `/model`, `/effort` and `/rewind`.
     pub panels: bool,
+    /// 🗑 — move this session's transcript to `~/.claude/trash`.
+    ///
+    /// Off by default, and that direction matters more here than anywhere else
+    /// in this struct. `session_delete` renames whatever
+    /// `find_session_file` hands it, and not every provider's answer is a file
+    /// that belongs to one session: OpenCode's is `opencode.db`, the single
+    /// database holding *every* OpenCode conversation on the machine. Trashing
+    /// one row would trash all of them. A backend gets a 🗑 by claiming it,
+    /// never by omission, and `session_delete` checks this itself rather than
+    /// trusting the UI to have hidden the button.
+    pub delete: bool,
 }
 
 /// What is known about an agent on this machine right now.
@@ -261,7 +272,14 @@ impl AgentBackend for ClaudeBackend {
     /// Everything. The subsystems the flags gate were all written against
     /// Claude Code and only work today because it is the engine that runs them.
     fn caps(&self) -> Caps {
-        Caps { fork: true, clear: true, resume: true, tui_drive: true, panels: true }
+        Caps {
+            fork: true,
+            clear: true,
+            resume: true,
+            tui_drive: true,
+            panels: true,
+            delete: true,
+        }
     }
 
     /// The ordinary launch with `--resume <id>` in place of the minted id.
@@ -503,8 +521,19 @@ impl AgentBackend for CodexBackend {
     /// assumptions sit between a Codex row and a working reopen, and shipping
     /// a ▶ that lands in a black pane is worse than not offering one. Flipping
     /// `resume` here is the whole of the UI work when it is picked back up.
+    ///
+    /// `delete` stays true, unlike everything else here. A rollout is one file
+    /// per session, so trashing one is exactly as scoped as trashing a claude
+    /// transcript — which is the same tool reaching into the same kind of other
+    /// tool's data, and has always been the point of the 🗑. Restore puts a
+    /// rollout back in Codex's own store rather than claude's, which is what
+    /// makes it a move rather than a theft.
+    ///
+    /// The engine this capability guards against is OpenCode, whose sessions
+    /// share one SQLite database: there, "delete this row" would have handed
+    /// the whole store to the trash.
     fn caps(&self) -> Caps {
-        Caps::default()
+        Caps { delete: true, ..Default::default() }
     }
 
     /// Codex has no `--session-id`. `codex --help` offers `resume` and `fork`
@@ -545,20 +574,6 @@ impl AgentBackend for CodexBackend {
 
 pub struct OpenCodeBackend;
 
-/// A backend whose sessions aiterm cannot read yet. OpenCode 1.18 keeps them
-/// in SQLite (`~/.local/share/opencode/opencode.db`), which is a reader we
-/// have not written — saying "none" keeps the registry honest until we have.
-struct NoSessions;
-
-impl SessionProvider for NoSessions {
-    fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
-        vec![]
-    }
-    fn find_session_file(&self, _session_id: &str) -> Option<std::path::PathBuf> {
-        None
-    }
-}
-
 impl AgentBackend for OpenCodeBackend {
     fn id(&self) -> &'static str {
         "opencode"
@@ -570,14 +585,29 @@ impl AgentBackend for OpenCodeBackend {
         Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "opencode") }
     }
     fn sessions(&self) -> &dyn SessionProvider {
-        &NoSessions
+        &crate::opencode::OpencodeSessions
     }
 
-    /// Nothing, because there is no session reader — its sessions live in a
-    /// SQLite `opencode.db` aiterm cannot read, so there is no row to fork,
-    /// re-key or reopen in the first place.
+    /// Resume, and nothing else.
+    ///
+    /// There is a session reader now (`opencode.rs`), so a row exists to point
+    /// ▶ at. The rest stay false for the same reasons as before: OpenCode has
+    /// no fork, takes no id up front so there is nothing to re-key, renders its
+    /// own screen in a way `term/screen.ts` was never written for, and keeps no
+    /// transcript in the shape the panels parse.
+    ///
+    /// `delete` is false because `find_session_file` answers with
+    /// `opencode.db` — the one database holding every OpenCode conversation on
+    /// the machine. A 🗑 wired to that would trash all of them at once, which
+    /// is the whole reason the flag exists.
     fn caps(&self) -> Caps {
-        Caps::default()
+        Caps { resume: true, ..Default::default() }
+    }
+
+    /// `opencode --help`: `-s, --session <id>` reopens a stored session. The id
+    /// is quoted like every other value that reaches `$SHELL -ic`.
+    fn resume(&self, session_id: &str) -> Option<String> {
+        Some(format!("opencode --session {}", q(session_id)))
     }
 
     /// `opencode --help` names sessions only to `--continue`/`--session` back
@@ -701,10 +731,15 @@ impl AgentBackend for ChatBackend {
         false
     }
 
-    /// Resume only. There is no fork, no re-key, no TUI to drive, and the
+    /// Resume and delete. There is no fork, no re-key, no TUI to drive, and the
     /// transcript panels read Claude Code's record types, not ours.
+    ///
+    /// `delete` because this is the one non-claude backend whose files are
+    /// aiterm's own: one `~/.local/share/aiterm/chats/<id>.jsonl` per chat,
+    /// written by this binary, one session per file. Trashing one takes exactly
+    /// that conversation and nothing else.
     fn caps(&self) -> Caps {
-        Caps { resume: true, ..Default::default() }
+        Caps { resume: true, delete: true, ..Default::default() }
     }
 
     /// The fallback, so it declines nothing. If it did, an API model on a
@@ -884,8 +919,40 @@ pub fn find_session_file_in(
     list: &[Box<dyn AgentBackend>],
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
+    owner_in(list, session_id).map(|(_, path)| path)
+}
+
+/// The backend that owns `session_id`, and where it says the session lives.
+///
+/// The one ownership lookup: [`find_session_file_in`], `launch.rs`'s resolver,
+/// the preview panel and `session_delete` all come through here, so they cannot
+/// disagree about who owns a row. Both halves of the answer are returned
+/// because every caller wants one or the other and asking twice would run the
+/// lookup twice — for OpenCode that is a `sqlite3` spawn.
+///
+/// A path is not always a transcript. OpenCode answers with its database, so a
+/// caller that means to *read* the conversation must ask
+/// [`crate::sessions::SessionProvider::messages`] first.
+pub fn owner_in<'a>(
+    list: &'a [Box<dyn AgentBackend>],
+    session_id: &str,
+) -> Option<(&'a dyn AgentBackend, std::path::PathBuf)> {
     list.iter()
-        .find_map(|b| b.sessions().find_session_file(session_id))
+        .find_map(|b| b.sessions().find_session_file(session_id).map(|p| (&**b, p)))
+}
+
+/// The conversation `agent_id` holds for `session_id`, when that backend keeps
+/// its sessions somewhere other than a file. `None` everywhere else, meaning
+/// "read the transcript".
+///
+/// Keyed by agent id rather than by [`owner_in`] because the caller — the
+/// search indexer — is walking rows that already carry the id of the backend
+/// that produced them. Asking the registry to rediscover that per row would
+/// spawn a lookup per session for no new information.
+pub fn backend_messages(agent_id: &str, session_id: &str) -> Option<Vec<(String, String)>> {
+    let list = backends();
+    let b = list.iter().find(|b| b.id() == agent_id)?;
+    b.sessions().messages(session_id)
 }
 
 /// What aiterm can see on this machine, in registry order.
@@ -1007,7 +1074,7 @@ fn pick_adopted(
 /// Deliberately not `which`/`command -v`: spawning a shell to ask whether a
 /// program exists costs more than the answer, and would make "is Codex
 /// installed?" a process spawn per backend per call.
-fn which(bin: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
@@ -1055,7 +1122,7 @@ fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
 /// profile would hang the settings panel with it. On timeout the worker thread
 /// is left to finish on its own — it holds nothing but its own stdout buffer,
 /// and abandoning it is better than blocking the UI on it.
-fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<Vec<u8>> {
+pub(crate) fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let program = program.to_string();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -1590,14 +1657,29 @@ mod tests {
         assert!(cleared.contains("--session-id 'abc-123'"), "{cleared}");
     }
 
-    /// Codex and OpenCode decline rather than offering a command that lands in
-    /// a black pane — the parked resume path and the unreadable session store.
+    /// Codex declines rather than offering a command that lands in a black pane
+    /// — its resume path is parked. Nobody but claude re-keys, because nobody
+    /// else takes an id up front.
     #[test]
     fn engines_that_cannot_reopen_a_session_say_so() {
         assert_eq!(CodexBackend.resume("abc-123"), None);
         assert_eq!(CodexBackend.clear("abc-123"), None);
-        assert_eq!(OpenCodeBackend.resume("abc-123"), None);
+        assert_eq!(OpenCodeBackend.clear("abc-123"), None);
         assert_eq!(ChatBackend.clear("abc-123"), None);
+    }
+
+    /// `opencode --help`: `-s, --session <id>`. Quoted, like everything else
+    /// that reaches `$SHELL -ic`.
+    #[test]
+    fn opencode_reopens_a_session_by_id() {
+        assert_eq!(
+            OpenCodeBackend.resume("ses_03ee94418ffeDX6l2Xs5hpVzcN"),
+            Some("opencode --session 'ses_03ee94418ffeDX6l2Xs5hpVzcN'".into()),
+        );
+        assert_eq!(
+            OpenCodeBackend.resume("a'b"),
+            Some(r"opencode --session 'a'\''b'".into()),
+        );
     }
 
     /// The renderer sends only what it picked. A spec that names a model and
@@ -1684,11 +1766,41 @@ mod tests {
         }
         assert_eq!(
             ClaudeBackend.caps(),
-            Caps { fork: true, clear: true, resume: true, tui_drive: true, panels: true },
+            Caps {
+                fork: true,
+                clear: true,
+                resume: true,
+                tui_drive: true,
+                panels: true,
+                delete: true,
+            },
         );
-        assert_eq!(CodexBackend.caps(), Caps::default());
-        assert_eq!(OpenCodeBackend.caps(), Caps::default());
-        assert_eq!(ChatBackend.caps(), Caps { resume: true, ..Default::default() });
+        assert_eq!(CodexBackend.caps(), Caps { delete: true, ..Default::default() });
+        assert_eq!(
+            OpenCodeBackend.caps(),
+            Caps { resume: true, ..Default::default() },
+        );
+        assert_eq!(
+            ChatBackend.caps(),
+            Caps { resume: true, delete: true, ..Default::default() },
+        );
+    }
+
+    /// The 🗑 moves a file into `~/.claude/trash`, so it may only be offered
+    /// where that file is one session and aiterm's to move.
+    ///
+    /// Claude's transcripts, aiterm's own chat jsonls and Codex's rollouts all
+    /// qualify: one file per conversation, which trash and restore move as a
+    /// unit — a rollout goes back to Codex's own store, not claude's. OpenCode's
+    /// "file" is `opencode.db`, which is *every* OpenCode conversation at once —
+    /// the case this flag was added for, and the one where a 🗑 would be a
+    /// silent catastrophe rather than a mistake.
+    #[test]
+    fn only_a_store_aiterm_owns_offers_a_delete() {
+        assert!(ClaudeBackend.caps().delete);
+        assert!(ChatBackend.caps().delete);
+        assert!(CodexBackend.caps().delete, "a rollout is one session's file");
+        assert!(!OpenCodeBackend.caps().delete, "opencode.db holds every session");
     }
 
     /// The UI gates on this map, so a backend missing from it is an engine

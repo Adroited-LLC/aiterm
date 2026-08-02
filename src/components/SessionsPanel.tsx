@@ -803,8 +803,14 @@ export default function SessionsPanel({
               {/* Never offer Delete on a running session: trashing one doesn't
                   stick — the process recreates its transcript seconds later,
                   rebuilt from the deletion point, losing the history before
-                  it. Stop it first. */}
-              {!isRunning && !hasTab && (
+                  it. Stop it first.
+                  And only where the engine's store is one file per session and
+                  aiterm's to move. OpenCode keeps every conversation in one
+                  `opencode.db`, so a delete there would trash all of them at
+                  once; Codex's rollouts are its own files in its own tree.
+                  `session_delete` refuses on the same flag — this hides a
+                  button, it does not guard anything. */}
+              {!isRunning && !hasTab && caps.delete && (
                 <button
                   className="act-btn danger" title="Delete session…"
                   onClick={() => setConfirmDel(s.id)}

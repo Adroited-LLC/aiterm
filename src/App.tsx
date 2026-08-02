@@ -61,6 +61,7 @@ const USAGE_KEY = "aiterm.usageCache";
  *  black pane. */
 const NO_CAPS: Caps = {
   fork: false, clear: false, resume: false, tui_drive: false, panels: false,
+  delete: false,
 };
 
 interface PanelToggles {

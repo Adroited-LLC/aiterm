@@ -198,6 +198,36 @@ fn restores_a_codex_rollout_to_its_own_store() {
     let _ = std::fs::remove_dir_all(home.join(".codex/sessions/1999"));
 }
 
+/// The 🗑 renames whatever the owning provider calls the session's file. For
+/// OpenCode that "file" is `opencode.db` — the single database holding every
+/// OpenCode conversation on the machine — so a delete would move the whole
+/// store to the trash under one session's name.
+///
+/// The sidebar hides the button, but the command has to refuse on its own: a
+/// destructive IPC command that relies on the UI not calling it is not guarded.
+///
+/// Reads Matt's real database (never writes it) and skips where OpenCode has
+/// never run, so the suite still passes on a machine without it.
+#[test]
+fn refuses_to_delete_a_session_its_engine_does_not_own() {
+    let Some(db) = aiterm_lib::opencode::db_path() else {
+        return; // no OpenCode on this machine
+    };
+    let Some(session) = aiterm_lib::opencode::sessions().into_iter().next() else {
+        return; // installed, but nothing recorded to try deleting
+    };
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+
+    let err = call(aiterm_lib::sessions::session_delete(session.id.clone()))
+        .expect_err("an opencode session must not be deletable from aiterm");
+    assert!(err.contains("OpenCode"), "the refusal should name the engine: {err}");
+    assert!(db.exists(), "the database must still be where opencode left it");
+    assert!(
+        !home.join(".claude/trash").join(format!("{}.jsonl", session.id)).exists(),
+        "nothing should have reached the trash"
+    );
+}
+
 #[test]
 fn hides_fork_and_orphaned_transcripts() {
     // Orchestrator/compact fork files (no human prompt) and .orphaned-*
