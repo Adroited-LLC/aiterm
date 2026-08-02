@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- Temporary browser-preview harness: mocks the Tauri IPC layer so the real
+     app boots in a plain browser for visual checks. Not shipped; delete me. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>aiterm preview</title>
+    <script>
+      (function () {
+        const mocks = {
+          agent_launch_command: "claude",
+          list_projects: [],
+          list_sessions: [],
+          live_session_ids: [],
+          running_session_ids: [],
+          bg_agent_session_ids: [],
+          unstoppable_session_ids: [],
+          drain_session_events: [],
+          trash_list: [],
+          providers_list: [],
+          trace_status: false,
+          trace_set: null,
+          diag_log_path: "/home/matt/.local/share/aiterm/aiterm.log",
+          diag_log_tail: "12:00:01 preview harness — nothing real below\n12:00:02 settings modal visual check",
+          diag_environment: [
+            ["aiterm", "0.10.13 (preview)"],
+            ["webview", "WebKitGTK (browser preview)"],
+            ["config", "~/.config/aiterm"],
+          ],
+          agent_choices: [
+            { id: "claude", display_name: "Claude Code", models: [], mints_session_id: true },
+          ],
+          detect_agents: [
+            { id: "claude", display_name: "Claude Code", available: true, version: "2.1.220", path: "/home/matt/.local/bin/claude" },
+            { id: "codex", display_name: "Codex CLI", available: false, version: null, path: null },
+          ],
+          list_fonts: [
+            { name: "Adwaita Sans", mono: false },
+            { name: "Cantarell", mono: false },
+            { name: "JetBrains Mono", mono: true },
+            { name: "Fira Code", mono: true },
+            { name: "Source Code Pro", mono: true },
+          ],
+          font_packages: [
+            { package: "jetbrains-mono-fonts", name: "JetBrains Mono", note: "tall x-height, clear 0O 1lI", installed: true },
+            { package: "fira-code-fonts", name: "Fira Code", note: "ligatures for => and !==", installed: false },
+            { package: "cascadia-code-fonts", name: "Cascadia Code", note: "Windows Terminal's face", installed: false },
+          ],
+          git_repo_state: { is_repo: false, branch: null, ahead: 0, behind: 0, dirty: 0 },
+          pty_spawn: 1,
+          claude_model_default: null,
+          claude_permission_mode: null,
+          watch_project: null,
+        };
+        let cb = 1;
+        window.__TAURI_INTERNALS__ = {
+          transformCallback(callback) {
+            const id = cb++;
+            window["_" + id] = callback;
+            return id;
+          },
+          invoke(cmd) {
+            if (cmd in mocks) return Promise.resolve(mocks[cmd]);
+            if (cmd.startsWith("plugin:")) return Promise.resolve(null);
+            return Promise.resolve(null);
+          },
+          metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
+        };
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

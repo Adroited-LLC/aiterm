@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { ReactNode, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
 import {
@@ -28,6 +28,14 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
 
 type Tab = "appearance" | "fonts" | "agents" | "models" | "diagnostics";
 
+const NAV: { key: Tab; label: string }[] = [
+  { key: "appearance", label: "Appearance" },
+  { key: "fonts", label: "Fonts" },
+  { key: "agents", label: "Agents" },
+  { key: "models", label: "Model access" },
+  { key: "diagnostics", label: "Diagnostics" },
+];
+
 /** Shows the characters that actually separate one coding font from another. */
 /** Several lines, because one cannot show row spacing, and the characters
  *  coding fonts most often confuse with each other. */
@@ -54,8 +62,60 @@ function ThemeCard({ id, active, onPick }: { id: string; active: boolean; onPick
   );
 }
 
+/** One setting: name and an optional one-line description on the left, the
+ *  control on the right. Every pane is built from these, so every setting
+ *  reads the same way. */
+function Row({ label, desc, children, wide }: {
+  label: string;
+  desc?: string;
+  children?: ReactNode;
+  /** Control needs the full width (theme grid, preview) — render it under the text. */
+  wide?: boolean;
+}) {
+  return (
+    <div className={"srow" + (wide ? " wide" : "")}>
+      <div className="srow-info">
+        <div className="srow-label">{label}</div>
+        {desc && <div className="srow-desc">{desc}</div>}
+      </div>
+      {children && <div className="srow-ctl">{children}</div>}
+    </div>
+  );
+}
+
+function Group({ title, children }: { title?: string; children: ReactNode }) {
+  return (
+    <div className="sgroup">
+      {title && <div className="sgroup-title">{title}</div>}
+      <div className="sgroup-rows">{children}</div>
+    </div>
+  );
+}
+
+/** A switch, for settings that are on or off. */
+function Switch({ checked, onChange, label }: {
+  checked: boolean;
+  onChange: (on: boolean) => void;
+  label: string;
+}) {
+  return (
+    <label className="sw" aria-label={label}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="sw-track"><span className="sw-knob" /></span>
+    </label>
+  );
+}
+
 export default function SettingsModal({ settings, onChange, onClose }: Props) {
   const [tab, setTab] = useState<Tab>("appearance");
+  // Each section starts at its top — the pane is one shared scroll element,
+  // so without this a scroll in one section opens the next mid-page.
+  const paneRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { paneRef.current?.scrollTo(0, 0); }, [tab]);
   const [fonts, setFonts] = useState<FontFamily[]>([]);
   const [packages, setPackages] = useState<FontPackage[]>([]);
   /** Package currently installing, so its row can say so and not be clicked twice. */
@@ -148,351 +208,316 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
   return (
     <div className="modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal settings-modal">
-        <div className="modal-head">
-          <span className="modal-title">Settings</span>
-          <div className="set-tabs">
+
+        <nav className="sm-rail">
+          <div className="sm-rail-title">Settings</div>
+          {NAV.map((n) => (
             <button
-              className={"set-tab" + (tab === "appearance" ? " on" : "")}
-              onClick={() => setTab("appearance")}
-            >Appearance</button>
-            <button
-              className={"set-tab" + (tab === "fonts" ? " on" : "")}
-              onClick={() => setTab("fonts")}
-            >Fonts</button>
-            <button
-              className={"set-tab" + (tab === "agents" ? " on" : "")}
-              onClick={() => setTab("agents")}
-            >Agents</button>
-            <button
-              className={"set-tab" + (tab === "models" ? " on" : "")}
-              onClick={() => setTab("models")}
-            >Model access</button>
-            <button
-              className={"set-tab" + (tab === "diagnostics" ? " on" : "")}
-              onClick={() => setTab("diagnostics")}
-            >Diagnostics</button>
-          </div>
-          <button className="icon-btn" title="Close (Esc)" onClick={onClose}>✕</button>
-        </div>
-        <div className="modal-body">
-
-          {tab === "appearance" && <>
-            <div className="set-section">
-              <div className="set-label">Theme</div>
-              <div className="theme-grid">
-                {THEMES.map((t) => (
-                  <ThemeCard
-                    key={t.id}
-                    id={t.id}
-                    active={settings.themeId === t.id}
-                    onPick={() => set({ themeId: t.id })}
-                  />
-                ))}
-              </div>
-            </div>
-
-            <div className="set-section">
-              <div className="set-label">Accent color</div>
-              <div className="accent-row">
-                <button
-                  className={"accent-swatch default" + (settings.accent === null ? " on" : "")}
-                  title="Theme default"
-                  onClick={() => set({ accent: null })}
-                  style={{ background: themeById(settings.themeId).vars.accent }}
-                >A</button>
-                {ACCENT_SWATCHES.map((c) => (
-                  <button
-                    key={c}
-                    className={"accent-swatch" + (settings.accent === c ? " on" : "")}
-                    style={{ background: c }}
-                    onClick={() => set({ accent: c })}
-                  />
-                ))}
-              </div>
-            </div>
-
-            <div className="set-section">
-              <div className="set-label">Panel sizes</div>
-              {PANEL_LABELS.map(({ key, label }) => (
-                <div key={key} className="set-slider-row">
-                  <span className="set-slider-name">{label}</span>
-                  <input
-                    type="range" min={0.7} max={1.5} step={0.05}
-                    value={settings.panelScale[key]}
-                    onChange={(e) => setScale(key, +e.target.value)}
-                  />
-                  <span className="set-value">{Math.round(settings.panelScale[key] * 100)}%</span>
-                </div>
-              ))}
-              <div className="set-hint">Ctrl + / Ctrl − zooms everything at once.</div>
-            </div>
-          </>}
-
-          {tab === "fonts" && <>
-            <div className="set-section set-cols">
-              <div>
-                <div className="set-label">Panel font</div>
-                <select
-                  className="set-select"
-                  value={settings.uiFont}
-                  onChange={(e) => set({ uiFont: e.target.value })}
-                >
-                  <option value="">System default</option>
-                  {fonts.map((f) => (
-                    <option key={f.name} value={f.name}>{f.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <div className="set-label">
-                  Terminal font
-                  <span className="set-value">{monoFonts.length} monospace</span>
-                </div>
-                <select
-                  className="set-select mono"
-                  value={settings.termFont}
-                  onChange={(e) => set({ termFont: e.target.value })}
-                >
-                  <option value="">System default</option>
-                  {monoFonts.map((f) => (
-                    <option key={f.name} value={f.name}>{f.name}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div className="set-section">
-              <div className="set-label">
-                Terminal font size
-                <span className="set-value">{settings.termFontSize}px</span>
-              </div>
-              <input
-                type="range" min={9} max={22} step={1}
-                value={settings.termFontSize}
-                onChange={(e) => set({ termFontSize: +e.target.value })}
-              />
-
-              <div className="set-label">
-                Line spacing
-                <span className="set-value">
-                  {settings.termLineHeight === 1
-                    ? "none"
-                    : `+${Math.round((settings.termLineHeight - 1) * 100)}%`}
-                </span>
-              </div>
-              {/* A multiple of the font's own line height, not pixels: the gap
-                  that looks right at 13px is cramped at 20. */}
-              <input
-                type="range" min={1} max={1.6} step={0.05}
-                value={settings.termLineHeight}
-                onChange={(e) => set({ termLineHeight: +e.target.value })}
-              />
-
-              <div className="set-label">
-                Weight
-                <span className="set-value">
-                  {TERM_WEIGHTS.find((w) => w.value === settings.termFontWeight)?.label ??
-                    settings.termFontWeight}
-                </span>
-              </div>
-              <div className="weight-row">
-                {TERM_WEIGHTS.map((w) => (
-                  <button
-                    key={w.value}
-                    className={"weight-btn" + (settings.termFontWeight === w.value ? " on" : "")}
-                    style={{ fontWeight: w.value }}
-                    onClick={() => set({ termFontWeight: w.value })}
-                  >{w.label}</button>
-                ))}
-              </div>
-              <div className="set-hint">
-                Bold is drawn heavier than this, so emphasis keeps working. Most
-                monospace families stop at Bold, which is why this stops at SemiBold.
-              </div>
-
-              {/* Same text the terminal would render, at the same size, face,
-                  spacing and weight — the only honest way to judge any of them.
-                  The last line is bold, so you can see emphasis still separates
-                  from body text at whatever weight you pick. */}
-              <div
-                className="font-preview"
-                style={{
-                  fontFamily: settings.termFont ? `"${settings.termFont}", monospace` : "monospace",
-                  fontSize: settings.termFontSize,
-                  lineHeight: settings.termLineHeight,
-                  fontWeight: settings.termFontWeight,
-                  whiteSpace: "pre",
-                }}
-              >
-                {PREVIEW}
-                {"\n"}
-                <span style={{ fontWeight: boldWeightFor(settings.termFontWeight) }}>
-                  this line is bold
-                </span>
-              </div>
-            </div>
-
-            <div className="set-section">
-              <div className="set-label">Install a coding font</div>
-              <div className="set-hint">
-                From the Fedora repositories. Installing needs administrator rights —
-                you may be asked for your password.
-              </div>
-              <div className="font-pkg-list">
-                {packages.map((p) => (
-                  <div key={p.package} className="font-pkg-row">
-                    <div className="font-pkg-text">
-                      <span
-                        className="font-pkg-name"
-                        style={p.installed ? { fontFamily: `"${p.name}", monospace` } : undefined}
-                      >{p.name}</span>
-                      <span className="font-pkg-note">{p.note}</span>
-                    </div>
-                    {p.installed ? (
-                      <span className="font-pkg-done">installed</span>
-                    ) : (
-                      <button
-                        className="font-pkg-install"
-                        disabled={installing !== null}
-                        onClick={() => installPackage(p)}
-                      >{installing === p.package ? "installing…" : "Install"}</button>
-                    )}
-                  </div>
-                ))}
-              </div>
-              <button className="set-file-install" onClick={installFiles}>
-                Install from file…
-              </button>
-              <div className="set-hint">
-                For fonts that are not packaged — Nerd Fonts, anything you downloaded.
-                Copied into ~/.local/share/fonts; no administrator rights needed.
-              </div>
-              {notice && <div className="set-notice">{notice}</div>}
-            </div>
-          </>}
-
-          {tab === "models" && <ModelAccess />}
-
-          {/* Everything you would otherwise have to be talked through finding:
-              which build this is, what it can see, and what it has been doing.
-              The log survives the process, so a crash leaves something to read
-              instead of nothing. */}
-          {tab === "diagnostics" && <>
-            <div className="set-section">
-              <div className="set-label">Verbose trace</div>
-              <label className="set-check">
-                <input
-                  type="checkbox"
-                  checked={tracing}
-                  onChange={(e) => toggleTrace(e.target.checked)}
-                />
-                <span>
-                  Log everything aiterm does — every call from the UI with its
-                  arguments, with timings — to <code>trace.log</code>
-                </span>
-              </label>
-              <div className="set-hint">
-                {tracing && tracePath
-                  ? `Capturing to ${homeAbbrev(tracePath)} — starts fresh each time it's turned on.`
-                  : "For chasing a specific problem: turn on, reproduce it, turn off, send the file. Off costs nothing."}
-              </div>
-            </div>
-            <div className="set-section">
-              <div className="set-label">
-                This build
-                <button className="set-recheck" onClick={refreshDiag}>Refresh</button>
-              </div>
-              {env === null ? (
-                <div className="set-hint">Looking…</div>
-              ) : (
-                <div className="diag-table">
-                  {env.map(([k, v]) => (
-                    <div key={k} className="diag-row">
-                      <span className="diag-key">{k}</span>
-                      <span className="diag-val">{homeAbbrev(v)}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            <div className="set-section">
-              <div className="set-label">
-                Recent activity
-                <button
-                  className="set-recheck"
-                  onClick={() => {
-                    navigator.clipboard?.writeText(
-                      (env ?? []).map(([k, v]) => `${k}: ${v}`).join("\n") +
-                        "\n\n" + (logTail ?? ""),
-                    );
-                    setNotice("Diagnostics copied — paste them into the chat.");
-                  }}
-                >Copy all</button>
-                {logPath && (
-                  <button className="set-recheck" onClick={() => openPath(logPath)}>
-                    Open folder
-                  </button>
-                )}
-              </div>
-              <pre className="diag-log">{logTail || "Nothing logged yet this run."}</pre>
-              {logPath && <div className="set-hint">{homeAbbrev(logPath)} — previous run kept as .log.1</div>}
-            </div>
-          </>}
-
-          {tab === "agents" && <>
-            <div className="set-section">
-              <div className="set-label">
-                Agents
-                <button className="set-recheck" onClick={refreshAgents}>Re-check</button>
-              </div>
-              {/* Agents aiterm does not find are listed too. "Codex — not
-                  installed" is the useful answer; an absence would leave you
-                  wondering whether aiterm supports it at all. */}
-              {agents === null ? (
-                <div className="set-hint">Looking…</div>
-              ) : (
-                <div className="agent-list">
-                  {agents.map((a) => (
-                    <div key={a.id} className="agent-row">
-                      <span className={"agent-dot" + (a.available ? " on" : "")} />
-                      <div className="agent-text">
-                        <div className="agent-name">
-                          {a.display_name}
-                          <span className="agent-state">
-                            {a.available ? (a.version ?? "installed") : "not installed"}
-                          </span>
-                        </div>
-                        {/* Which copy was found — worth showing when several
-                            are installed and the wrong one is on PATH. */}
-                        {a.path && <div className="agent-path">{homeAbbrev(a.path)}</div>}
-                        {a.id === "codex" && a.available && (
-                          <div className="agent-path">
-                            Sessions are listed and searchable. Codex names its own
-                            sessions, so aiterm adopts the id once it starts.
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                  {agents.length === 0 && (
-                    <div className="set-hint">Nothing reported.</div>
-                  )}
-                </div>
-              )}
-              <div className="set-hint">
-                Read from PATH when this tab opens, not polled — install something
-                and press Re-check.
-              </div>
-            </div>
-          </>}
-
-        </div>
-        <div className="modal-foot">
+              key={n.key}
+              className={"sm-nav" + (tab === n.key ? " on" : "")}
+              onClick={() => setTab(n.key)}
+            >{n.label}</button>
+          ))}
+          <div className="sm-rail-spacer" />
           <button
-            className="set-reset"
+            className="sm-reset"
             onClick={() => onChange({ ...DEFAULT_SETTINGS })}
           >Reset to defaults</button>
-          <button className="set-done" onClick={onClose}>Done</button>
+        </nav>
+
+        <div className="sm-pane">
+          <div className="sm-pane-head">
+            <span className="sm-pane-title">{NAV.find((n) => n.key === tab)?.label}</span>
+            {tab === "agents" && (
+              <button className="set-recheck" onClick={refreshAgents}>Re-check</button>
+            )}
+            {tab === "diagnostics" && (
+              <button className="set-recheck" onClick={refreshDiag}>Refresh</button>
+            )}
+            <button className="icon-btn" title="Close (Esc)" onClick={onClose}>✕</button>
+          </div>
+          <div className="sm-pane-body" ref={paneRef}>
+
+            {tab === "appearance" && <>
+              <Group title="Theme">
+                <div className="theme-grid">
+                  {THEMES.map((t) => (
+                    <ThemeCard
+                      key={t.id}
+                      id={t.id}
+                      active={settings.themeId === t.id}
+                      onPick={() => set({ themeId: t.id })}
+                    />
+                  ))}
+                </div>
+                <Row label="Accent" desc="Used for selection, focus, and the active tab">
+                  <div className="accent-row">
+                    <button
+                      className={"accent-swatch default" + (settings.accent === null ? " on" : "")}
+                      title="Theme default"
+                      onClick={() => set({ accent: null })}
+                      style={{ background: themeById(settings.themeId).vars.accent }}
+                    >A</button>
+                    {ACCENT_SWATCHES.map((c) => (
+                      <button
+                        key={c}
+                        className={"accent-swatch" + (settings.accent === c ? " on" : "")}
+                        title={c}
+                        style={{ background: c }}
+                        onClick={() => set({ accent: c })}
+                      />
+                    ))}
+                  </div>
+                </Row>
+              </Group>
+
+              <Group title="Panel sizes">
+                {PANEL_LABELS.map(({ key, label }) => (
+                  <Row key={key} label={label}>
+                    <input
+                      type="range" min={0.7} max={1.5} step={0.05}
+                      value={settings.panelScale[key]}
+                      onChange={(e) => setScale(key, +e.target.value)}
+                    />
+                    <span className="srow-value">{Math.round(settings.panelScale[key] * 100)}%</span>
+                  </Row>
+                ))}
+                <div className="sgroup-foot">Ctrl + / Ctrl − zooms everything at once.</div>
+              </Group>
+            </>}
+
+            {tab === "fonts" && <>
+              <Group title="Faces">
+                <Row label="Panel font" desc="Lists, sidebars, and dialogs">
+                  <select
+                    className="set-select"
+                    value={settings.uiFont}
+                    onChange={(e) => set({ uiFont: e.target.value })}
+                  >
+                    <option value="">System default</option>
+                    {fonts.map((f) => (
+                      <option key={f.name} value={f.name}>{f.name}</option>
+                    ))}
+                  </select>
+                </Row>
+                <Row label="Terminal font" desc={`${monoFonts.length} monospace families found`}>
+                  <select
+                    className="set-select mono"
+                    value={settings.termFont}
+                    onChange={(e) => set({ termFont: e.target.value })}
+                  >
+                    <option value="">System default</option>
+                    {monoFonts.map((f) => (
+                      <option key={f.name} value={f.name}>{f.name}</option>
+                    ))}
+                  </select>
+                </Row>
+              </Group>
+
+              <Group title="Terminal text">
+                <Row label="Size">
+                  <input
+                    type="range" min={9} max={22} step={1}
+                    value={settings.termFontSize}
+                    onChange={(e) => set({ termFontSize: +e.target.value })}
+                  />
+                  <span className="srow-value">{settings.termFontSize}px</span>
+                </Row>
+                {/* A multiple of the font's own line height, not pixels: the gap
+                    that looks right at 13px is cramped at 20. */}
+                <Row label="Line spacing">
+                  <input
+                    type="range" min={1} max={1.6} step={0.05}
+                    value={settings.termLineHeight}
+                    onChange={(e) => set({ termLineHeight: +e.target.value })}
+                  />
+                  <span className="srow-value">
+                    {settings.termLineHeight === 1
+                      ? "none"
+                      : `+${Math.round((settings.termLineHeight - 1) * 100)}%`}
+                  </span>
+                </Row>
+                <Row
+                  label="Weight"
+                  desc="Bold is drawn heavier than this, so emphasis keeps working"
+                >
+                  <div className="seg">
+                    {TERM_WEIGHTS.map((w) => (
+                      <button
+                        key={w.value}
+                        className={"seg-btn" + (settings.termFontWeight === w.value ? " on" : "")}
+                        style={{ fontWeight: w.value }}
+                        onClick={() => set({ termFontWeight: w.value })}
+                      >{w.label}</button>
+                    ))}
+                  </div>
+                </Row>
+                {/* Same text the terminal would render, at the same size, face,
+                    spacing and weight — the only honest way to judge any of them.
+                    The last line is bold, so you can see emphasis still separates
+                    from body text at whatever weight you pick. */}
+                <div
+                  className="font-preview"
+                  style={{
+                    fontFamily: settings.termFont ? `"${settings.termFont}", monospace` : "monospace",
+                    fontSize: settings.termFontSize,
+                    lineHeight: settings.termLineHeight,
+                    fontWeight: settings.termFontWeight,
+                    whiteSpace: "pre",
+                  }}
+                >
+                  {PREVIEW}
+                  {"\n"}
+                  <span style={{ fontWeight: boldWeightFor(settings.termFontWeight) }}>
+                    this line is bold
+                  </span>
+                </div>
+              </Group>
+
+              <Group title="Add fonts">
+                <div className="font-pkg-list">
+                  {packages.map((p) => (
+                    <div key={p.package} className="font-pkg-row">
+                      <div className="font-pkg-text">
+                        <span
+                          className="font-pkg-name"
+                          style={p.installed ? { fontFamily: `"${p.name}", monospace` } : undefined}
+                        >{p.name}</span>
+                        <span className="font-pkg-note">{p.note}</span>
+                      </div>
+                      {p.installed ? (
+                        <span className="font-pkg-done">installed</span>
+                      ) : (
+                        <button
+                          className="font-pkg-install"
+                          disabled={installing !== null}
+                          onClick={() => installPackage(p)}
+                        >{installing === p.package ? "installing…" : "Install"}</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <Row
+                  label="Install from file"
+                  desc="Nerd Fonts, anything downloaded — copied to ~/.local/share/fonts"
+                >
+                  <button className="set-file-install" onClick={installFiles}>
+                    Choose files…
+                  </button>
+                </Row>
+                <div className="sgroup-foot">
+                  Packaged fonts come from the Fedora repositories and may ask for
+                  your password.
+                </div>
+                {notice && <div className="set-notice">{notice}</div>}
+              </Group>
+            </>}
+
+            {tab === "models" && <ModelAccess />}
+
+            {/* Everything you would otherwise have to be talked through finding:
+                which build this is, what it can see, and what it has been doing.
+                The log survives the process, so a crash leaves something to read
+                instead of nothing. */}
+            {tab === "diagnostics" && <>
+              <Group>
+                <Row
+                  label="Verbose trace"
+                  desc={
+                    tracing && tracePath
+                      ? `Capturing to ${homeAbbrev(tracePath)} — starts fresh each time it's turned on`
+                      : "Log every call from the UI, with arguments and timings, to trace.log. Costs nothing while off."
+                  }
+                >
+                  <Switch checked={tracing} onChange={toggleTrace} label="Verbose trace" />
+                </Row>
+              </Group>
+              <Group title="This build">
+                {env === null ? (
+                  <div className="sgroup-foot">Looking…</div>
+                ) : (
+                  <div className="diag-table">
+                    {env.map(([k, v]) => (
+                      <div key={k} className="diag-row">
+                        <span className="diag-key">{k}</span>
+                        <span className="diag-val">{homeAbbrev(v)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Group>
+              <Group title="Recent activity">
+                <div className="diag-acts">
+                  <button
+                    className="set-recheck"
+                    onClick={() => {
+                      navigator.clipboard?.writeText(
+                        (env ?? []).map(([k, v]) => `${k}: ${v}`).join("\n") +
+                          "\n\n" + (logTail ?? ""),
+                      );
+                      setNotice("Diagnostics copied — paste them into the chat.");
+                    }}
+                  >Copy all</button>
+                  {logPath && (
+                    <button className="set-recheck" onClick={() => openPath(logPath)}>
+                      Open folder
+                    </button>
+                  )}
+                </div>
+                <pre className="diag-log">{logTail || "Nothing logged yet this run."}</pre>
+                {logPath && (
+                  <div className="sgroup-foot">
+                    {homeAbbrev(logPath)} — previous run kept as .log.1
+                  </div>
+                )}
+                {notice && <div className="set-notice">{notice}</div>}
+              </Group>
+            </>}
+
+            {tab === "agents" && <>
+              <Group>
+                {/* Agents aiterm does not find are listed too. "Codex — not
+                    installed" is the useful answer; an absence would leave you
+                    wondering whether aiterm supports it at all. */}
+                {agents === null ? (
+                  <div className="sgroup-foot">Looking…</div>
+                ) : (
+                  <div className="agent-list">
+                    {agents.map((a) => (
+                      <div key={a.id} className="agent-row">
+                        <span className={"agent-dot" + (a.available ? " on" : "")} />
+                        <div className="agent-text">
+                          <div className="agent-name">
+                            {a.display_name}
+                            <span className="agent-state">
+                              {a.available ? (a.version ?? "installed") : "not installed"}
+                            </span>
+                          </div>
+                          {/* Which copy was found — worth showing when several
+                              are installed and the wrong one is on PATH. */}
+                          {a.path && <div className="agent-path">{homeAbbrev(a.path)}</div>}
+                          {a.id === "codex" && a.available && (
+                            <div className="agent-path">
+                              Sessions are listed and searchable. Codex names its own
+                              sessions, so aiterm adopts the id once it starts.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                    {agents.length === 0 && (
+                      <div className="sgroup-foot">Nothing reported.</div>
+                    )}
+                  </div>
+                )}
+                <div className="sgroup-foot">
+                  Read from PATH when this page opens, not polled — install
+                  something and press Re-check.
+                </div>
+              </Group>
+            </>}
+
+          </div>
         </div>
       </div>
     </div>
