@@ -9,7 +9,6 @@
     <script>
       (function () {
         const mocks = {
-          agent_launch_command: "claude",
           list_projects: [],
           list_sessions: [],
           live_session_ids: [],
@@ -72,7 +71,6 @@
           ],
           git_repo_state: { is_repo: false, branch: null, ahead: 0, behind: 0, dirty: 0 },
           pty_spawn: 1,
-          api_launch_command: "echo 'aiterm chat (preview)'",
           // Every tab now opens on a plan, so the harness has to answer this
           // or the paths that start one throw.
           resolve_launch: {

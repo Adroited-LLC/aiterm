@@ -326,38 +326,6 @@ pub fn provider_model_cards(id: String) -> Result<Vec<ModelCard>, String> {
     parse_model_cards(&fetch_models_response(&id)?)
 }
 
-/// The command an API-model tab runs: this very binary in its `chat` argv
-/// mode, shell-quoted. The key is not in it — `aiterm chat` reads the
-/// provider config itself, so nothing secret crosses the PTY's command line.
-///
-/// The command itself is built by [`crate::agents::ChatBackend`], where every
-/// other engine's syntax lives. This stays only as the call the frontend still
-/// makes; `resolve_launch` is the replacement.
-#[tauri::command]
-pub fn api_launch_command(
-    provider_id: String,
-    model: String,
-    session_id: String,
-) -> Result<String, String> {
-    use crate::agents::AgentBackend;
-    Ok(crate::agents::ChatBackend.launch(&crate::agents::LaunchSpec {
-        model: Some(model),
-        session_id: Some(session_id),
-        provider: Some(provider_id),
-        ..Default::default()
-    }))
-}
-
-/// The command that reopens a stored chat with its context — the ▶ on an
-/// `api` row. Provider and model come from the transcript itself.
-#[tauri::command]
-pub fn chat_resume_command(session_id: String) -> Result<String, String> {
-    use crate::agents::AgentBackend;
-    crate::agents::ChatBackend
-        .resume(&session_id)
-        .ok_or_else(|| format!("Cannot reopen chat {session_id}."))
-}
-
 /// Replace a provider's startup shortlist and persist it.
 #[tauri::command]
 pub async fn provider_startup_set(

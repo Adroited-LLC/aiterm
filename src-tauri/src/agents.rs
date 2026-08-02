@@ -1002,20 +1002,6 @@ fn pick_adopted(
         .map(|s| s.id.clone())
 }
 
-/// The command that starts `agent_id` with `spec`.
-///
-/// The renderer asks for this rather than assembling flags itself. It used to
-/// hold Claude's invocation as a constant, which meant the one thing that is
-/// certainly per-agent lived in the one place that should not know about any.
-#[tauri::command]
-pub fn agent_launch_command(agent_id: String, spec: LaunchSpec) -> Result<String, String> {
-    backends()
-        .iter()
-        .find(|b| b.id() == agent_id)
-        .map(|b| b.launch(&spec))
-        .ok_or_else(|| format!("No agent called {agent_id}."))
-}
-
 /// Resolve `bin` against PATH, the way a shell would.
 ///
 /// Deliberately not `which`/`command -v`: spawning a shell to ask whether a

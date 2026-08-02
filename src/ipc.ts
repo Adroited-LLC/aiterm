@@ -382,14 +382,6 @@ export const providerModelCards = (id: string) =>
 /** Replace a provider's startup shortlist — what the new-session menu offers. */
 export const providerStartupSet = (id: string, models: string[]) =>
   invoke<ProviderView[]>("provider_startup_set", { id, models });
-/** The command an API-model tab runs: `aiterm chat`, shell-quoted. The key is
- *  not in it — the chat process reads the provider config itself. The minted
- *  session id names the transcript in ~/.local/share/aiterm/chats. */
-export const apiLaunchCommand = (providerId: string, model: string, sessionId: string) =>
-  invoke<string>("api_launch_command", { providerId, model, sessionId });
-/** Reopen a stored chat with its context — ▶ on an `api` row. */
-export const chatResumeCommand = (sessionId: string) =>
-  invoke<string>("chat_resume_command", { sessionId });
 
 /** What an engine supports, so the UI gates on a declaration rather than on an
  *  agent's name. Snake_case because it arrives straight off `Caps` in Rust. */
@@ -463,12 +455,6 @@ export interface AgentChoice {
 
 export const agentChoices = () => invoke<AgentChoice[]>("agent_choices");
 
-/** The shell command that starts a session. Built in Rust so command-line
- *  syntax — the one thing that is certainly per-agent — stays with the agent. */
-export const agentLaunchCommand = (
-  agentId: string,
-  spec: { model?: string | null; effort?: string | null; sessionId?: string | null },
-) => invoke<string>("agent_launch_command", { agentId, spec });
 
 /** The id of the session an agent just started in `cwd`, once it exists.
  *
