@@ -206,6 +206,19 @@ export default function TerminalView({
       let pending = 0;
 
       term.onBell(() => onAttention(tab.key, true));
+      // Shift+Enter means "new line", not "send". A PTY has no key for that —
+      // Shift+Enter arrives as the same \r as Enter — but backslash-return is
+      // already the continuation gesture claude's composer understands, the
+      // shell treats as an escaped newline, and aiterm chat reads the same
+      // way. So the interception simply types it for you.
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type === "keydown" && ev.key === "Enter" && ev.shiftKey) {
+          pending += 1; // the line is definitely not empty now
+          ptyWrite(id, "\\\r");
+          return false;
+        }
+        return true;
+      });
       term.onData((data) => {
         onAttention(tab.key, false);
         if (data === "\r" || data === "\n" || data === "\x03") pending = 0;

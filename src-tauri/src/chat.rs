@@ -103,6 +103,17 @@ pub fn msg_line(role: &str, text: &str, at: u64) -> String {
     .to_string()
 }
 
+/// If `line` asks to continue (one trailing backslash), the text to keep —
+/// otherwise `None` and the message is done. A doubled backslash is an
+/// escaped literal one, not a continuation.
+pub fn continuation(line: &str) -> Option<&str> {
+    if line.ends_with('\\') && !line.ends_with("\\\\") {
+        Some(&line[..line.len() - 1])
+    } else {
+        None
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -277,12 +288,38 @@ pub fn run(start: Start) -> i32 {
     loop {
         print!("\n\x1b[36m❯\x1b[0m ");
         let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => break, // Ctrl+D or a closed pty
-            Ok(_) => {}
+        // A line ending in a single backslash continues onto the next one —
+        // the same gesture claude's composer uses, and what aiterm's terminal
+        // types on Shift+Enter. The message sends when a line ends plainly.
+        let mut buf = String::new();
+        let mut ended = false;
+        loop {
+            let mut line = String::new();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    ended = true; // Ctrl+D or a closed pty
+                    break;
+                }
+                Ok(_) => {}
+            }
+            let piece = line.trim_end_matches(['\r', '\n']);
+            match continuation(piece) {
+                Some(kept) => {
+                    buf.push_str(kept);
+                    buf.push('\n');
+                    print!("\x1b[2m…\x1b[0m ");
+                    let _ = std::io::stdout().flush();
+                }
+                None => {
+                    buf.push_str(piece);
+                    break;
+                }
+            }
         }
-        let text = line.trim();
+        if ended && buf.trim().is_empty() {
+            break;
+        }
+        let text = buf.trim();
         if text.is_empty() {
             continue;
         }
@@ -501,6 +538,16 @@ mod tests {
         assert_eq!(sse_delta(inline).unwrap_err(), "Rate limited");
         let flat = r#"{"error":{"message":"Invalid model"}}"#;
         assert_eq!(sse_delta(flat).unwrap_err(), "Invalid model");
+    }
+
+    /// One trailing backslash continues the message; a doubled one is a
+    /// literal backslash and sends. Anything else sends as typed.
+    #[test]
+    fn a_single_trailing_backslash_continues_the_line() {
+        assert_eq!(continuation("first part \\"), Some("first part "));
+        assert_eq!(continuation("plain line"), None);
+        assert_eq!(continuation("ends in literal \\\\"), None);
+        assert_eq!(continuation("\\"), Some(""));
     }
 
     fn lines(v: &[&str]) -> impl Iterator<Item = String> {
