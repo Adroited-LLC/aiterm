@@ -192,7 +192,11 @@ pub struct ReindexResult {
 /// Bring the index up to date with the session store (mtime-based, so only
 /// new/changed transcripts get re-read).
 #[tauri::command]
-pub fn reindex_sessions() -> ReindexResult {
+pub async fn reindex_sessions() -> ReindexResult {
+    crate::run_blocking(reindex_sessions_sync).await
+}
+
+fn reindex_sessions_sync() -> ReindexResult {
     let sessions = crate::agents::scan_all_with_paths();
     let total = sessions.len();
     let Some(idx) = global() else {
@@ -219,7 +223,11 @@ pub fn reindex_sessions() -> ReindexResult {
 
 /// Ranked full-text search across titles, project dirs, and message text.
 #[tauri::command]
-pub fn search_sessions(query: String) -> Vec<Session> {
+pub async fn search_sessions(query: String) -> Vec<Session> {
+    crate::run_blocking(move || search_sessions_sync(query)).await
+}
+
+fn search_sessions_sync(query: String) -> Vec<Session> {
     let Some(idx) = global() else { return vec![] };
     let by_id: std::collections::HashMap<String, Session> = crate::agents::scan_all_with_paths()
         .into_iter()

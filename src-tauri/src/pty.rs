@@ -383,25 +383,28 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
 }
 
 #[tauri::command]
-pub fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
+pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
     // Take the instance out under the lock, then release it: the kill below
     // can block for over a second, and holding the map would stall every other
     // tab's writes and resizes for that whole time.
     let taken = state.ptys.lock().unwrap().remove(&id);
     if let Some(mut pty) = taken {
-        // `killer.kill()` only reaches the pty's direct child — the login
-        // shell. zsh forks the command rather than exec'ing it, so killing the
-        // shell orphaned every `claude` aiterm ever launched: they stayed in
-        // `claude agents` forever, which made their rows permanently "running"
-        // and left fork-a-copy as the only action the UI would offer.
-        if let Some(pid) = pty.child_pid {
-            kill_tree(pid, std::time::Duration::from_millis(1500));
-        }
-        let _ = pty.killer.kill();
-        // Closing a tab is one of the few things that changes the roster from
-        // inside aiterm. Say so, rather than letting the sidebar keep showing
-        // the session as running for the rest of the cache window.
-        crate::sessions::invalidate_roster();
+        crate::run_blocking(move || {
+            // `killer.kill()` only reaches the pty's direct child — the login
+            // shell. zsh forks the command rather than exec'ing it, so killing the
+            // shell orphaned every `claude` aiterm ever launched: they stayed in
+            // `claude agents` forever, which made their rows permanently "running"
+            // and left fork-a-copy as the only action the UI would offer.
+            if let Some(pid) = pty.child_pid {
+                kill_tree(pid, std::time::Duration::from_millis(1500));
+            }
+            let _ = pty.killer.kill();
+            // Closing a tab is one of the few things that changes the roster from
+            // inside aiterm. Say so, rather than letting the sidebar keep showing
+            // the session as running for the rest of the cache window.
+            crate::sessions::invalidate_roster();
+        })
+        .await;
     }
     Ok(())
 }

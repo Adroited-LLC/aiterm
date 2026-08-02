@@ -193,7 +193,11 @@ fn restrict(path: &std::path::Path, mode: u32) {
 fn restrict(_path: &std::path::Path, _mode: u32) {}
 
 #[tauri::command]
-pub fn providers_list() -> Vec<ProviderView> {
+pub async fn providers_list() -> Vec<ProviderView> {
+    crate::run_blocking(providers_list_sync).await
+}
+
+fn providers_list_sync() -> Vec<ProviderView> {
     load().iter().map(Provider::view).collect()
 }
 
@@ -204,7 +208,16 @@ pub fn providers_list() -> Vec<ProviderView> {
 /// back, so asking for it again to change something unrelated would mean
 /// finding it again every time.
 #[tauri::command]
-pub fn provider_save(
+pub async fn provider_save(
+    id: Option<String>,
+    name: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<ProviderView>, String> {
+    crate::run_blocking(move || provider_save_sync(id, name, base_url, api_key)).await
+}
+
+fn provider_save_sync(
     id: Option<String>,
     name: String,
     base_url: String,
@@ -241,7 +254,11 @@ pub fn provider_save(
 }
 
 #[tauri::command]
-pub fn provider_delete(id: String) -> Result<Vec<ProviderView>, String> {
+pub async fn provider_delete(id: String) -> Result<Vec<ProviderView>, String> {
+    crate::run_blocking(move || provider_delete_sync(id)).await
+}
+
+fn provider_delete_sync(id: String) -> Result<Vec<ProviderView>, String> {
     let mut list = load();
     list.retain(|p| p.id != id);
     save(&list)?;

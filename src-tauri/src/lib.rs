@@ -14,6 +14,15 @@ pub mod usage;
 pub mod watcher;
 pub mod winstate;
 
+/// Run a blocking body on the async runtime's blocking pool. Tauri executes
+/// non-async commands on the GTK main thread, where every millisecond is a
+/// frame — a command routed through here costs the main loop nothing.
+pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .expect("blocking command panicked")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     trace::init();

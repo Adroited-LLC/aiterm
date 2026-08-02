@@ -521,7 +521,11 @@ pub struct SessionStatus {
 /// Read the current mode lines from a Claude session jsonl. Mode changes are
 /// appended over time, so the last occurrence in the file wins.
 #[tauri::command]
-pub fn session_status(session_id: String) -> SessionStatus {
+pub async fn session_status(session_id: String) -> SessionStatus {
+    crate::run_blocking(move || session_status_sync(session_id)).await
+}
+
+fn session_status_sync(session_id: String) -> SessionStatus {
     let Some(path) = find_session_file(&session_id) else {
         return SessionStatus::default();
     };
@@ -563,7 +567,11 @@ const TRASH_KEEP_DAYS: u64 = 7;
 /// ~/.claude/trash (kept for TRASH_KEEP_DAYS as an undo safety net,
 /// purged lazily on later deletes).
 #[tauri::command]
-pub fn session_delete(session_id: String) -> Result<(), String> {
+pub async fn session_delete(session_id: String) -> Result<(), String> {
+    crate::run_blocking(move || session_delete_sync(session_id)).await
+}
+
+fn session_delete_sync(session_id: String) -> Result<(), String> {
     if session_id.contains('/') || session_id.contains("..") {
         return Err("invalid session id".into());
     }
@@ -695,7 +703,11 @@ fn valid_id(session_id: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn trash_list() -> Vec<TrashedSession> {
+pub async fn trash_list() -> Vec<TrashedSession> {
+    crate::run_blocking(trash_list_sync).await
+}
+
+fn trash_list_sync() -> Vec<TrashedSession> {
     let Some(trash) = trash_dir() else {
         return vec![];
     };
@@ -738,7 +750,11 @@ fn flatten_project_dir(cwd: &str) -> String {
 }
 
 #[tauri::command]
-pub fn trash_restore(session_id: String) -> Result<(), String> {
+pub async fn trash_restore(session_id: String) -> Result<(), String> {
+    crate::run_blocking(move || trash_restore_sync(session_id)).await
+}
+
+fn trash_restore_sync(session_id: String) -> Result<(), String> {
     valid_id(&session_id)?;
     let trash = trash_dir().ok_or("no home dir")?;
     let src = trash.join(format!("{session_id}.jsonl"));
@@ -850,7 +866,11 @@ fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String>
 }
 
 #[tauri::command]
-pub fn trash_delete(session_id: String) -> Result<(), String> {
+pub async fn trash_delete(session_id: String) -> Result<(), String> {
+    crate::run_blocking(move || trash_delete_sync(session_id)).await
+}
+
+fn trash_delete_sync(session_id: String) -> Result<(), String> {
     valid_id(&session_id)?;
     let trash = trash_dir().ok_or("no home dir")?;
     std::fs::remove_file(trash.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
@@ -867,7 +887,11 @@ pub fn trash_delete(session_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn trash_empty() -> Result<(), String> {
+pub async fn trash_empty() -> Result<(), String> {
+    crate::run_blocking(trash_empty_sync).await
+}
+
+fn trash_empty_sync() -> Result<(), String> {
     let trash = trash_dir().ok_or("no home dir")?;
     if let Ok(rd) = std::fs::read_dir(&trash) {
         for e in rd.flatten() {
@@ -962,7 +986,11 @@ pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
 }
 
 #[tauri::command]
-pub fn session_preview(session_id: String) -> Vec<PreviewMsg> {
+pub async fn session_preview(session_id: String) -> Vec<PreviewMsg> {
+    crate::run_blocking(move || session_preview_sync(session_id)).await
+}
+
+fn session_preview_sync(session_id: String) -> Vec<PreviewMsg> {
     const KEEP: usize = 12;
     const MAX_CHARS: usize = 700;
     let Some(path) = find_session_file(&session_id) else {
@@ -1019,7 +1047,11 @@ pub struct SessionTask {
 /// the older TodoWrite snapshots (last write wins). Whichever wrote later in
 /// the file is the live one; the legacy per-task json dir is a last resort.
 #[tauri::command]
-pub fn session_tasks(session_id: String) -> Vec<SessionTask> {
+pub async fn session_tasks(session_id: String) -> Vec<SessionTask> {
+    crate::run_blocking(move || session_tasks_sync(session_id)).await
+}
+
+fn session_tasks_sync(session_id: String) -> Vec<SessionTask> {
     if let Some(path) = resolve_live_session_file(&session_id) {
         if let Ok(file) = File::open(&path) {
             let mut todo: Option<Vec<SessionTask>> = None;
@@ -1219,7 +1251,11 @@ fn snippet(text: &str, max: usize) -> String {
 /// tool_result is just "Async agent launched…" and completion arrives later
 /// as a <task-notification> carrying the original tool-use-id.
 #[tauri::command]
-pub fn session_agents(session_id: String) -> Vec<AgentRun> {
+pub async fn session_agents(session_id: String) -> Vec<AgentRun> {
+    crate::run_blocking(move || session_agents_sync(session_id)).await
+}
+
+fn session_agents_sync(session_id: String) -> Vec<AgentRun> {
     let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];
     };
@@ -1442,7 +1478,11 @@ fn resolve_live_session_file(session_id: &str) -> Option<std::path::PathBuf> {
 /// doomed resume. A live `<id>.jsonl` resolves to itself — forking never
 /// retires the original, so a forked parent stays resumable at its own point.
 #[tauri::command]
-pub fn resolve_resumable_id(session_id: String) -> Option<String> {
+pub async fn resolve_resumable_id(session_id: String) -> Option<String> {
+    crate::run_blocking(move || resolve_resumable_id_sync(session_id)).await
+}
+
+fn resolve_resumable_id_sync(session_id: String) -> Option<String> {
     let path = resolve_live_session_file(&session_id)?;
     // A resumable transcript is a plain `<id>.jsonl`. If resolution could only
     // land on an orphaned remnant, there is nothing `claude` can resume.
@@ -1529,7 +1569,11 @@ pub struct SessionMove {
 /// Claude Code's echo of the command that made it (see [`CLEAR_ECHO`]), paired
 /// with being the first transcript written after the parent stopped.
 #[tauri::command]
-pub fn session_moved_to(session_id: String) -> Option<SessionMove> {
+pub async fn session_moved_to(session_id: String) -> Option<SessionMove> {
+    crate::run_blocking(move || session_moved_to_sync(session_id)).await
+}
+
+fn session_moved_to_sync(session_id: String) -> Option<SessionMove> {
     let out = session_moved_to_inner(&session_id);
     // Only the answer, not the asking. This polls every 15s per active tab, and
     // a line per poll buried the one line that mattered — which is the failure
@@ -1805,7 +1849,11 @@ fn daemon_live_session_shortids() -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn running_session_ids() -> Vec<String> {
+pub async fn running_session_ids() -> Vec<String> {
+    crate::run_blocking(running_session_ids_sync).await
+}
+
+fn running_session_ids_sync() -> Vec<String> {
     let mut ids = std::collections::HashSet::new();
     // Background agents (Claude Code's `/fork`, `--bg`) run under a daemon and
     // never name their session in /proc — but the daemon opens a socket per
@@ -1880,7 +1928,11 @@ fn extract_session_id(val: &str) -> Option<String> {
 /// (its own transcript newest in the dir) it rejects every candidate without
 /// reading them.
 #[tauri::command]
-pub fn live_session_ids() -> Vec<String> {
+pub async fn live_session_ids() -> Vec<String> {
+    crate::run_blocking(live_session_ids_sync).await
+}
+
+fn live_session_ids_sync() -> Vec<String> {
     read_roster()
         .into_iter()
         .filter(|e| e.background || session_moved_to_inner(&e.session_id).is_none())
@@ -1940,7 +1992,84 @@ pub fn invalidate_roster() {
     ROSTER.invalidate();
 }
 
+/// Read the roster straight from Claude Code's own live-session registry:
+/// one `~/.claude/sessions/<pid>.json` per live client, written on start,
+/// deleted on clean exit, covering interactive and background sessions alike.
+/// `None` means the registry isn't there to read (old claude, moved dir) —
+/// the caller falls back to asking the CLI.
+fn roster_from_dir(dir: &Path) -> Option<Vec<RosterEntry>> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let Ok(raw) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(session_id) = v.get("sessionId").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        let Some(pid) = v.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32) else {
+            continue;
+        };
+        // A file describing a process that is gone — or a *different* process
+        // the kernel has since reissued the pid to — is a crash leftover, not
+        // a session. procStart is the incarnation check; a file without one
+        // (older claude) gets plain existence.
+        let live = match v.get("procStart").and_then(|p| p.as_str()) {
+            Some(want) => proc_starttime(pid).as_deref() == Some(want),
+            None => crate::pty::pid_alive(pid),
+        };
+        if !live {
+            continue;
+        }
+        out.push(RosterEntry {
+            session_id: session_id.to_owned(),
+            pid: Some(pid),
+            // The files say "bg"; only the CLI's output says "background".
+            background: v.get("kind").and_then(|k| k.as_str()) == Some("bg"),
+        });
+    }
+    Some(out)
+}
+
+/// The process's start time — field 22 of `/proc/<pid>/stat`, the same value
+/// the registry stores as `procStart`. Comparing them is what separates "this
+/// file describes the process that holds pid N" from a leftover of a crashed
+/// client whose pid the kernel has since reissued.
+fn proc_starttime(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) is parenthesized and may itself hold spaces or parens,
+    // so field counting is only safe after the *last* ')'. starttime is field
+    // 22 overall = 20th after state, which is the first past the comm.
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(19).map(str::to_owned)
+}
+
 fn read_roster_uncached() -> Vec<RosterEntry> {
+    // The registry files are the cheap, authoritative source — reading them
+    // costs microseconds where `claude agents --json` costs a whole Node
+    // process (~0.26s wall, ~300 MB RSS, measured 2026-07-27), and that spawn
+    // used to run on the main thread every TTL expiry. The CLI remains for
+    // two cases the files cannot answer:
+    //
+    //   - the dir is missing entirely (older claude, relocated state), and
+    //   - a background entry is present: whether a bg job has *finished* is
+    //     computed by the CLI (`state: "done"`, observed 2026-08-01 with the
+    //     client pid still alive), and a finished job must not wear a live dot.
+    if let Some(entries) = dirs::home_dir()
+        .map(|h| h.join(".claude/sessions"))
+        .and_then(|d| roster_from_dir(&d))
+    {
+        if entries.iter().all(|e| !e.background) {
+            return entries;
+        }
+    }
+    roster_from_cli()
+}
+
+fn roster_from_cli() -> Vec<RosterEntry> {
     let Ok(out) = std::process::Command::new("claude")
         .args(["agents", "--json"])
         .output()
@@ -2032,7 +2161,11 @@ fn stop_session_blocking(session_id: String) -> Result<(), String> {
 /// "…add --fork-session to branch off a copy" — resume says so rather than
 /// launching a doomed one.
 #[tauri::command]
-pub fn bg_agent_session_ids() -> Vec<String> {
+pub async fn bg_agent_session_ids() -> Vec<String> {
+    crate::run_blocking(bg_agent_session_ids_sync).await
+}
+
+fn bg_agent_session_ids_sync() -> Vec<String> {
     read_roster()
         .into_iter()
         .filter(|e| e.background)
@@ -2059,7 +2192,11 @@ pub fn bg_agent_session_ids() -> Vec<String> {
 /// 2026-07-26 reported *every* entry with a live pid, including a background
 /// one, so a `pid.is_none()` test matched nothing at all.
 #[tauri::command]
-pub fn unstoppable_session_ids() -> Vec<String> {
+pub async fn unstoppable_session_ids() -> Vec<String> {
+    crate::run_blocking(unstoppable_session_ids_sync).await
+}
+
+fn unstoppable_session_ids_sync() -> Vec<String> {
     read_roster()
         .into_iter()
         .filter(|e| e.background || e.pid.is_none())
@@ -2070,7 +2207,11 @@ pub fn unstoppable_session_ids() -> Vec<String> {
 /// Files this session created or modified, newest first — parsed from
 /// Write/Edit/NotebookEdit tool calls in the transcript.
 #[tauri::command]
-pub fn session_artifacts(session_id: String) -> Vec<Artifact> {
+pub async fn session_artifacts(session_id: String) -> Vec<Artifact> {
+    crate::run_blocking(move || session_artifacts_sync(session_id)).await
+}
+
+fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
     let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];
     };
@@ -2144,7 +2285,11 @@ pub struct ModelChoice {
 ///
 /// Only the tail is read; these files reach several MB.
 #[tauri::command]
-pub fn session_model(session_id: String) -> ModelChoice {
+pub async fn session_model(session_id: String) -> ModelChoice {
+    crate::run_blocking(move || session_model_sync(session_id)).await
+}
+
+fn session_model_sync(session_id: String) -> ModelChoice {
     let Some(path) = find_session_file(&session_id) else {
         return ModelChoice::default();
     };
@@ -2234,7 +2379,11 @@ fn parse_model_choice<'a>(lines: impl Iterator<Item = &'a str>) -> ModelChoice {
 /// isn't one the CLI accepts — passing an unknown mode makes `claude` exit, and
 /// a terminal that dies on open is worse than a permission prompt.
 #[tauri::command]
-pub fn claude_permission_mode(project_path: String) -> Option<String> {
+pub async fn claude_permission_mode(project_path: String) -> Option<String> {
+    crate::run_blocking(move || claude_permission_mode_sync(project_path)).await
+}
+
+fn claude_permission_mode_sync(project_path: String) -> Option<String> {
     const ACCEPTED: [&str; 6] = [
         "acceptEdits",
         "auto",
@@ -2277,7 +2426,11 @@ fn user_settings_path() -> Option<std::path::PathBuf> {
 /// The `model` key in ~/.claude/settings.json — Claude Code's global default
 /// for new sessions. None when unset.
 #[tauri::command]
-pub fn claude_model_default() -> Option<String> {
+pub async fn claude_model_default() -> Option<String> {
+    crate::run_blocking(claude_model_default_sync).await
+}
+
+fn claude_model_default_sync() -> Option<String> {
     let raw = std::fs::read_to_string(user_settings_path()?).ok()?;
     let v = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
     v.get("model")?.as_str().map(|s| s.to_string())
@@ -2313,7 +2466,7 @@ fn restore_model_default_blocking(previous: Option<String>) -> Result<bool, Stri
     let path = user_settings_path().ok_or_else(|| "no home directory".to_string())?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if claude_model_default() != previous {
+        if claude_model_default_sync() != previous {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -2401,7 +2554,11 @@ fn rewrite_session_ids(text: &str, old: &str, new: &str) -> (String, usize) {
 /// session ID". (opcode's fork does exactly that, which is why its forks are
 /// unresumable.)
 #[tauri::command]
-pub fn session_fork(session_id: String) -> Result<String, String> {
+pub async fn session_fork(session_id: String) -> Result<String, String> {
+    crate::run_blocking(move || session_fork_sync(session_id)).await
+}
+
+fn session_fork_sync(session_id: String) -> Result<String, String> {
     let src = resolve_live_session_file(&session_id)
         .ok_or_else(|| "that session has no transcript left to fork".to_string())?;
     if src
@@ -2489,7 +2646,11 @@ fn history_up_to<'a>(text: &'a str, boundary: &str) -> Vec<&'a str> {
 /// id-rewrite as `session_fork`, with a cut at the boundary timestamp, and it
 /// refuses to touch a stub that already has content.
 #[tauri::command]
-pub fn materialize_fork(session_id: String) -> Result<(), String> {
+pub async fn materialize_fork(session_id: String) -> Result<(), String> {
+    crate::run_blocking(move || materialize_fork_sync(session_id)).await
+}
+
+fn materialize_fork_sync(session_id: String) -> Result<(), String> {
     let stub = find_session_file(&session_id)
         .ok_or_else(|| "no transcript for that session".to_string())?;
     if has_conversation(&stub) {
@@ -3157,7 +3318,11 @@ mod tests {
 }
 
 #[tauri::command]
-pub fn list_sessions() -> Vec<Session> {
+pub async fn list_sessions() -> Vec<Session> {
+    crate::run_blocking(list_sessions_sync).await
+}
+
+fn list_sessions_sync() -> Vec<Session> {
     // Adding an agent means adding a backend in `agents.rs` and nothing here.
     crate::agents::scan_all_with_paths()
         .into_iter()
@@ -3401,7 +3566,7 @@ mod migration_tests {
     #[test]
     #[ignore]
     fn finds_the_captured_specimen() {
-        let got = session_moved_to("2eb3a23f-e4f1-4263-beb0-e3c7b768dcba".into());
+        let got = session_moved_to_sync("2eb3a23f-e4f1-4263-beb0-e3c7b768dcba".into());
         assert_eq!(
             got,
             Some(SessionMove {
@@ -3417,7 +3582,7 @@ mod migration_tests {
     #[test]
     #[ignore]
     fn finds_the_captured_clear_specimen() {
-        let got = session_moved_to("605b9dad-8aff-4422-ac85-e553739f3d2b".into());
+        let got = session_moved_to_sync("605b9dad-8aff-4422-ac85-e553739f3d2b".into());
         assert_eq!(
             got,
             Some(SessionMove {
@@ -3425,5 +3590,94 @@ mod migration_tests {
                 kind: MoveKind::Cleared,
             })
         );
+    }
+
+    /// A registry dir with one interactive entry, one background entry, one
+    /// dead-pid leftover, and one file of garbage. Only the two live entries
+    /// come back, and `kind: "bg"` — the value the files actually use, not the
+    /// `"background"` the CLI normalizes it to — sets the background flag.
+    #[test]
+    fn roster_reads_live_entries_from_registry_files() {
+        let dir = std::env::temp_dir()
+            .join(format!("aiterm-test-roster-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        std::fs::write(
+            dir.join(format!("{me}.json")),
+            format!(r#"{{"pid":{me},"sessionId":"aaaaaaaa-0000-0000-0000-000000000001","kind":"interactive"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("999999998.json"),
+            format!(r#"{{"pid":{me},"sessionId":"aaaaaaaa-0000-0000-0000-000000000002","kind":"bg"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("999999999.json"),
+            r#"{"pid":999999999,"sessionId":"aaaaaaaa-0000-0000-0000-000000000003","kind":"interactive"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("junk.json"), "not json at all").unwrap();
+
+        let mut got = roster_from_dir(&dir).unwrap();
+        got.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(got.len(), 2, "live entries only");
+        assert_eq!(got[0].session_id, "aaaaaaaa-0000-0000-0000-000000000001");
+        assert!(!got[0].background);
+        assert_eq!(got[0].pid, Some(me));
+        assert_eq!(got[1].session_id, "aaaaaaaa-0000-0000-0000-000000000002");
+        assert!(got[1].background);
+    }
+
+    /// `procStart` is the stale-file detector: a pid alone can be reissued by
+    /// the kernel to an unrelated process after a crash left the file behind.
+    /// An entry whose procStart matches the live process is kept; one whose
+    /// procStart names a different incarnation of the same pid is dropped.
+    #[test]
+    fn roster_rejects_an_entry_whose_procstart_does_not_match() {
+        let dir = std::env::temp_dir()
+            .join(format!("aiterm-test-roster-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::id();
+        let real = proc_starttime(me).expect("own starttime readable");
+        assert_ne!(real, "1", "the mismatch fixture must actually mismatch");
+        std::fs::write(
+            dir.join("a.json"),
+            format!(r#"{{"pid":{me},"sessionId":"bbbbbbbb-0000-0000-0000-000000000001","kind":"interactive","procStart":"{real}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            format!(r#"{{"pid":{me},"sessionId":"bbbbbbbb-0000-0000-0000-000000000002","kind":"interactive","procStart":"1"}}"#),
+        )
+        .unwrap();
+
+        let got = roster_from_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].session_id, "bbbbbbbb-0000-0000-0000-000000000001");
+    }
+
+    /// No registry dir means "can't answer", not "no sessions" — the caller
+    /// falls back to asking the CLI, which must not be confused with the very
+    /// different reading "the dir is there and empty, nothing is running".
+    #[test]
+    fn roster_missing_dir_is_none_but_empty_dir_is_empty() {
+        let missing = std::env::temp_dir()
+            .join(format!("aiterm-test-roster-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(roster_from_dir(&missing).is_none());
+
+        let empty = std::env::temp_dir()
+            .join(format!("aiterm-test-roster-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(roster_from_dir(&empty).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 }
