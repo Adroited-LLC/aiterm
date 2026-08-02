@@ -2,26 +2,25 @@ import { useEffect, useState } from "react";
 import { AgentChoice, ProviderView, agentChoices, providersList } from "../ipc";
 import AgentIcon from "./AgentIcon";
 
-/** What to start, once a directory is chosen. */
-export interface StartChoice {
-  agentId: string;
-  model: string | null;
-  effort: string | null;
-  /** Whether the agent will accept a pre-minted `--session-id`. Where false the
-   *  id aiterm generates is a tab handle only and no panel is keyed to it. */
-  mintsSessionId: boolean;
-  /** An API-provider model off a startup list, instead of an agent CLI's
-   *  model. Runs OpenCode where it can (OpenRouter provider, opencode
-   *  installed), aiterm's own chat console otherwise. */
-  api: {
-    providerId: string;
-    providerName: string;
-    modelId: string;
-    /** OpenCode's catalog only resolves OpenRouter slugs, so only an
-     *  OpenRouter provider may route there. */
-    openrouter: boolean;
-  } | null;
-}
+/**
+ * What to start, once a directory is chosen.
+ *
+ * One thing or the other, and the type says so. It used to be a single object
+ * with an agent id, a model, an effort and an optional `api` sub-object beside
+ * them — a shape in which "an agent AND an API model" was representable, and
+ * which of the two you meant was decided at the call site by whichever field it
+ * happened to test first.
+ *
+ * Two fields are gone rather than moved. `mintsSessionId` and the `openrouter`
+ * flag were the frontend answering questions that belong to the engine: whether
+ * an id can be pre-minted, and whether OpenCode's catalog can resolve a slug.
+ * The resolver answers both now, and its plan reports what it decided.
+ */
+export type StartChoice =
+  | { kind: "agent"; agentId: string; model: string | null; effort: string | null }
+  /** A model off a provider's startup list. Which engine runs it — OpenCode,
+   *  or aiterm's own chat console — is `launch.rs`'s answer, not this one's. */
+  | { kind: "api"; providerId: string; modelId: string };
 
 /**
  * Source, model and effort — the three decisions a new session needs.
@@ -83,25 +82,14 @@ export function useStartChoice() {
     setEffort((cur) => (next.includes(cur) ? cur : ""));
   };
 
+  // The dropdown and the agent tabs are one axis — picking a model clears the
+  // agent selection and vice versa — so the choice is whichever one is set.
   const choice = (): StartChoice => {
-    let api: StartChoice["api"] = null;
     if (apiModel) {
       const [providerId, modelId] = JSON.parse(apiModel) as [string, string];
-      const p = providers.find((x) => x.id === providerId);
-      api = {
-        providerId,
-        providerName: p?.name ?? providerId,
-        modelId,
-        openrouter: (p?.base_url ?? "").includes("openrouter.ai"),
-      };
+      return { kind: "api", providerId, modelId };
     }
-    return {
-      agentId,
-      model: model || null,
-      effort: effort || null,
-      mintsSessionId: agent?.mints_session_id ?? false,
-      api,
-    };
+    return { kind: "agent", agentId, model: model || null, effort: effort || null };
   };
 
   return {

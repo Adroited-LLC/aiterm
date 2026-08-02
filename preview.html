@@ -49,6 +49,15 @@
             { id: "claude", display_name: "Claude Code", available: true, version: "2.1.220", path: "/home/matt/.local/bin/claude" },
             { id: "codex", display_name: "Codex CLI", available: false, version: null, path: null },
           ],
+          // Cheap enough to gate a render on, so every capability check in the
+          // UI reads it — a harness that answered nothing would draw a session
+          // list with no buttons on any row.
+          agent_caps: {
+            claude: { fork: true, clear: true, resume: true, tui_drive: true, panels: true },
+            codex: { fork: false, clear: false, resume: false, tui_drive: false, panels: false },
+            opencode: { fork: false, clear: false, resume: false, tui_drive: false, panels: false },
+            api: { fork: false, clear: false, resume: true, tui_drive: false, panels: false },
+          },
           list_fonts: [
             { name: "Adwaita Sans", mono: false },
             { name: "Cantarell", mono: false },

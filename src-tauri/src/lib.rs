@@ -43,6 +43,7 @@ pub fn run() {
             pty::pty_resize,
             pty::pty_kill,
             agents::detect_agents,
+            agents::agent_caps,
             agents::adopt_agent_session,
             diag::diag_log_path,
             diag::diag_log_tail,

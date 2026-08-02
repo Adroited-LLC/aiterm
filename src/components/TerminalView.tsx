@@ -41,6 +41,14 @@ export interface TermTab {
   resumedId?: string;
   /** Provider whose key the backend injects into this tab's environment. */
   envProvider?: string;
+  /** The engine running in this tab, as `LaunchPlan.agent_id` named it.
+   *
+   *  Not decoration: it is what the app looks a tab's capabilities up by, and
+   *  so what decides whether the screen poll, the `/model` `/effort` `/rewind`
+   *  pills and the tasks panel run against it at all. Undefined for a tab with
+   *  no engine — a plain shell — which is the same answer as an engine that is
+   *  no longer registered: capable of nothing. */
+  agentId?: string;
   /** Dedupe key linking this terminal to a sidebar item: a session id for
    *  resumes, "shell:<path>" for project shells. One terminal per slot. */
   slotId: string;

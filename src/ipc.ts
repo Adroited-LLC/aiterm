@@ -406,6 +406,15 @@ export interface Caps {
   panels: boolean;
 }
 
+/** Every registered engine's capabilities, keyed by agent id.
+ *
+ *  The same flags `detectAgents` carries, but free: that one probes PATH and
+ *  runs `--version` per agent, and these gate a render — which buttons a row
+ *  offers, whether the claude-shaped subsystems run against the active tab.
+ *  Fetched once on mount. An id absent from the map is an engine that is no
+ *  longer registered, and the caller treats it as capable of nothing. */
+export const agentCaps = () => invoke<Record<string, Caps>>("agent_caps");
+
 /** What the user asked for, in the terms the UI actually has. Which engine
  *  answers is `launch.rs`'s business — nothing here names one. Sent in
  *  camelCase, which is what `LaunchRequest` deserializes. */

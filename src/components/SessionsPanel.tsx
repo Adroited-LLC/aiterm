@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
+import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 
@@ -31,6 +31,12 @@ export interface PendingSession {
   id: string;
   title: string;
   cwd: string;
+  /** The engine that was started, so the row wears its own mark. Every pending
+   *  row used to draw claude's starburst, which meant a fresh Codex or
+   *  OpenCode tab impersonated a claude session for as long as it took its
+   *  transcript to land. Empty for a tab whose engine is unknown — `AgentIcon`
+   *  has a generic glyph for exactly that. */
+  agent: string;
 }
 
 export interface SessionDisplayOpts {
@@ -116,12 +122,18 @@ interface Props {
   activeSlot: string | null;
   opts: SessionDisplayOpts;
   onOptsChange: (o: SessionDisplayOpts) => void;
+  /** What an engine supports, by agent id. Every lifecycle button in a row is
+   *  drawn from this rather than from the row's agent *name*: an id with no
+   *  backend — a row from an engine since removed — answers all-false, and a
+   *  row with no buttons is a better failure than a row offering claude's. */
+  capsOf: (agent: string) => Caps;
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
   onFork: (s: Session) => void;
   /** Park this conversation and start a fresh one in its tab — aiterm's own
    *  clear, kin to ⑂: pure process control and disk, no claude machinery.
-   *  Only offered on claude rows that have a live terminal of their own. */
+   *  Only offered on rows whose engine declares `clear` and that have a live
+   *  terminal of their own. */
   onClear: (s: Session) => void;
   onExit: (s: Session) => void;
   onNewShell: (s: Session) => void;
@@ -148,7 +160,7 @@ interface Props {
 
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, activeSlot, opts,
-  onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
+  capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty,
@@ -594,6 +606,10 @@ export default function SessionsPanel({
     // in that project). Only this row has nothing to resume — you are already
     // looking at the conversation.
     const isFocusedSession = activeSlot === s.id;
+    // What this row's engine says it can do. Asked once per row: the three
+    // lifecycle buttons below used to compare `s.agent` to a name each, which
+    // is the check this refactor exists to remove.
+    const caps = capsOf(s.agent);
     const isDragging =
       dragId === s.id || (dragId !== null && dragActive.current && selected.has(dragId) && selected.has(s.id));
     return (
@@ -731,14 +747,19 @@ export default function SessionsPanel({
                   The one exception is the tab you are looking at right now:
                   offering to stop and reopen the conversation you are typing
                   into is never what you meant. Every *other* live row keeps ▶,
-                  so the door-in problem above does not come back. */}
-              {!isFocusedSession && (
+                  so the door-in problem above does not come back.
+                  The second exception is an engine that cannot reopen anything.
+                  This button was ungated, so a Codex row's ▶ ran
+                  `claude --resume <codex-id>` against an id claude has never
+                  heard of — a black pane. The resolver declines it now; not
+                  offering it is the honest end of the same fix. */}
+              {!isFocusedSession && caps.resume && (
                 <button
                   className="act-btn"
                   title={
                     isRunning || hasTab
                       ? "Resume — stops the running session first"
-                      : "Resume claude session"
+                      : "Resume this session where it left off"
                   }
                   onClick={() =>
                     isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
@@ -747,8 +768,9 @@ export default function SessionsPanel({
               )}
               {/* Branching is a deliberate act (two divergent lines from one
                   history), not a workaround for resume being unavailable.
-                  Not for API chats — their transcript has no fork machinery. */}
-              {s.agent !== "api" && (
+                  Only where the engine has fork machinery in its transcript —
+                  an API chat has none. */}
+              {caps.fork && (
                 <button
                   className="act-btn"
                   title="Branch a copy at this point — appears as a stopped session, resumable"
@@ -758,8 +780,10 @@ export default function SessionsPanel({
               {/* aiterm's own clear — same end shape as typing /clear, built
                   like ⑂: no claude machinery, just a fresh process on a
                   minted id. Needs this session's own live terminal to act on,
-                  and claude only (Codex can't be told a session id). */}
-              {liveSlots.has(s.id) && s.agent === "claude" && (
+                  and an engine that can be told what to call the new
+                  conversation (Codex takes no session id, so it declares no
+                  clear). */}
+              {liveSlots.has(s.id) && caps.clear && (
                 <button
                   className="act-btn"
                   title="Clear — fresh conversation in this tab; this one becomes a stopped row"
@@ -811,8 +835,8 @@ export default function SessionsPanel({
         className={"session-item pending-item" + (isShowing ? " active showing" : "")}
         onClick={() => onSelectPending(p.id)}
       >
-        <div className="agent-badge claude">
-          <AgentIcon agent="claude" />
+        <div className={"agent-badge" + (p.agent === "claude" ? " claude" : "")}>
+          <AgentIcon agent={p.agent} />
           <span
             className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
             title={hasAttn ? "Waiting for your input" : "Session is starting"}

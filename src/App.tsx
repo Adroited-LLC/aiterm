@@ -27,9 +27,11 @@ import {
   AppSettings, applySettings, loadSettings, saveSettings, termFontFamily, termTheme,
 } from "./settings";
 import {
+  Caps,
   ProjectInfo, Session,
   TrashedSession,
   UsageBar,
+  agentCaps,
   listProjects, listSessions, materializeFork,
   reindexSessions, sessionFork, uiLog, usageLimits,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
@@ -50,6 +52,16 @@ const USAGE_KEY = "aiterm.usageCache";
 // renderer as a fallback for the backend's answer — is gone. Every command a
 // tab runs now comes from `resolveLaunch`, which is the one place that knows
 // what any engine's command line looks like.)
+
+/** What an engine that is not in the registry can do: nothing.
+ *
+ *  The honest answer for a session row whose engine has since been removed, and
+ *  for a tab with no engine at all (a plain shell). Both used to fall through
+ *  to claude's affordances by default, which offered a ▶ that could only open a
+ *  black pane. */
+const NO_CAPS: Caps = {
+  fork: false, clear: false, resume: false, tui_drive: false, panels: false,
+};
 
 interface PanelToggles {
   sessions: boolean;
@@ -109,6 +121,9 @@ interface OpenTabOpts {
   fresh?: boolean;
   adopt?: TermTab["adopt"];
   envProvider?: string;
+  /** Which engine this tab runs — `LaunchPlan.agent_id`. Omitted for a plain
+   *  shell, which runs none. See `TermTab.agentId`. */
+  agentId?: string;
   /** The session this tab was opened to reopen — see `TermTab.resumedId`. */
   resumedId?: string;
 }
@@ -151,6 +166,35 @@ export default function App() {
   // re-run it on every tab change).
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
+
+  // The tab on screen and the session it is keyed to. Read this high up
+  // because everything claude-shaped below gates on which engine is in it.
+  const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
+  const activeSessionId = activeTabObj?.sessionId ?? null;
+
+  // What each engine supports, fetched once on mount. `agent_caps` asks the
+  // registry and nothing else — no PATH probe, no `--version` — because these
+  // gate what is *drawn*: which buttons a row offers, and whether the screen
+  // poll and the transcript panels run at all. Until it answers everything
+  // reads as capable of nothing, which is the safe direction: a feature not
+  // running for one frame beats one misfiring against the wrong engine.
+  const [caps, setCaps] = useState<Record<string, Caps>>({});
+  useEffect(() => {
+    agentCaps().then(setCaps).catch(() => { /* keep the all-false default */ });
+  }, []);
+  /** What `agent` supports — nothing, for an id no backend claims. */
+  const capsOf = (agent: string) => caps[agent] ?? NO_CAPS;
+  /** The engine in the tab on screen. A shell has none, and answers all-false. */
+  const activeCaps = capsOf(activeTabObj?.agentId ?? "");
+  /** Whether to watch this tab's screen for a TUI.
+   *
+   *  A tab aiterm launched declares its engine and is taken at its word. A tab
+   *  that declares none is a plain shell — and a shell is exactly where someone
+   *  types `claude` by hand, which is how the dialogs were reached before there
+   *  was a ＋ menu. The poll is a detector, so the undeclared tab is the one
+   *  place it still earns its keep; an engine that told us it drives no TUI is
+   *  the case worth switching off. */
+  const activeDrivesTui = activeTabObj?.agentId ? activeCaps.tui_drive : true;
 
   // The sessions list, read without putting it in a callback's deps:
   // `newSession` needs to snapshot what already exists, and it must not be
@@ -232,6 +276,26 @@ export default function App() {
   }, [activeTab]);
 
   useEffect(() => {
+    // Everything below parses Claude Code's own screens — its `/model` picker,
+    // its permission prompts, its `/rewind` steps, its agents view. Against any
+    // other engine it is forty lines of somebody else's terminal being matched
+    // against claude's phrasing four times a second, and a false positive would
+    // draw a dialog that types into a TUI it cannot drive.
+    //
+    // So a tab that does not drive a TUI schedules no interval at all, and
+    // whatever the last tab left behind is cleared on the way out: an open
+    // Tui* dialog would otherwise stay on screen over a terminal it no longer
+    // belongs to, still sending keystrokes there when answered. The permission
+    // mode and the agents-view flag go with it — both describe the tab that has
+    // just gone off screen, and both gate other chrome.
+    if (!activeDrivesTui) {
+      setTui(null);
+      setTuiDismissed(false);
+      setPermMode(null);
+      setAgentsView(false);
+      armed.current = null;
+      return;
+    }
     const id = window.setInterval(() => {
       const handle = activeTab === null ? undefined : handles.current.get(activeTab);
       const lines = handle ? handle.screen() : null;
@@ -278,7 +342,7 @@ export default function App() {
       });
     }, 250);
     return () => window.clearInterval(id);
-  }, [activeTab]);
+  }, [activeTab, activeDrivesTui]);
 
   const [opts, setOpts] = useState<SessionDisplayOpts>(() =>
     loadJSON(OPTS_KEY, { showPath: true, showBranch: true, showTime: true }),
@@ -593,9 +657,6 @@ export default function App() {
     };
   }, []);
 
-  const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
-  const activeSessionId = activeTabObj?.sessionId ?? null;
-
   // Sessions aiterm has started that are not on disk yet. The sidebar lists
   // transcripts, and claude writes none until the first prompt, so without
   // these a brand-new session is a terminal with no row — unreachable the
@@ -616,7 +677,12 @@ export default function App() {
     () =>
       tabs
         .filter((t) => t.fresh && !knownSessionIds.has(t.slotId))
-        .map((t) => ({ id: t.slotId, title: t.title, cwd: t.cwd ?? "" })),
+        // The engine comes along so the placeholder wears its own mark. Without
+        // it every pending row drew claude's starburst, so a fresh Codex or
+        // OpenCode tab spent its first minutes claiming to be a claude session.
+        .map((t) => ({
+          id: t.slotId, title: t.title, cwd: t.cwd ?? "", agent: t.agentId ?? "",
+        })),
     [tabs, knownSessionIds],
   );
   // The migration watcher's guard, reduced to a boolean before it reaches the
@@ -716,6 +782,12 @@ export default function App() {
     const title = activeTabObj?.title ?? "This session";
     const resumedId = activeTabObj?.resumedId;
     if (key === undefined || !pinned) return;
+    // Compaction, `/clear` and the move to the daemon are all things a
+    // TUI-driving engine does to its own transcripts. `sessionMovedTo` resolves
+    // through the whole registry, so without this an `aiterm chat` tab would
+    // have claude's heuristics run over the chats directory and could be
+    // re-keyed — and told it had been cleared — on a false positive.
+    if (!activeCaps.tui_drive) return;
     // This runs even for tabs the SessionStart hook reports on (drain effect
     // below): the hook cannot see a move to the daemon — that claude is not
     // ours — so the Background kind is still this watcher's alone. For a
@@ -807,7 +879,7 @@ export default function App() {
       grace.forEach(clearTimeout);
     };
   }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title,
-      activeTabObj?.resumedId, freshUnwritten,
+      activeTabObj?.resumedId, freshUnwritten, activeCaps.tui_drive,
       refreshSessionList, agentsView]);
 
   // The exact channel: every claude aiterm launches carries a SessionStart
@@ -953,16 +1025,23 @@ export default function App() {
       // resolver saying no is exactly what that fallback is for.
       let command = t.command;
       let resumedId = t.resumedId;
+      // The engine carries over when the plan is declined, because the tab is
+      // reopening on the very command it ran before — same engine, so the same
+      // capabilities.
+      let agentId = t.agentId;
       if (t.sessionId) {
         try {
           const plan = await resolveLaunch({ kind: "restart", sessionId: t.sessionId });
           command = plan.command;
           resumedId = t.sessionId;
+          agentId = plan.agent_id;
         } catch {
           /* nothing here can reopen it — keep the tab's own command */
         }
       }
-      openTab(t.title, t.cwd, command, t.slotId, { sessionId: t.sessionId, resumedId });
+      openTab(t.title, t.cwd, command, t.slotId, {
+        sessionId: t.sessionId, resumedId, agentId,
+      });
     },
     [closeTab, openTab],
   );
@@ -1015,7 +1094,7 @@ export default function App() {
     // name, which is the check this refactor exists to remove.
     if (!plan.caps.tui_drive) {
       openTab(s.title, s.project_path, plan.command, s.id, {
-        sessionId: s.id, resumedId: s.id,
+        sessionId: s.id, resumedId: s.id, agentId: plan.agent_id,
       });
       return;
     }
@@ -1110,7 +1189,7 @@ export default function App() {
       }
     }
     openTab(s.title, s.project_path, plan.command, liveId, {
-      sessionId: liveId, resumedId: liveId,
+      sessionId: liveId, resumedId: liveId, agentId: plan.agent_id,
     });
   };
   // Branch a session. You stay exactly where you are: the backend copies the
@@ -1160,7 +1239,7 @@ export default function App() {
     setVacated((prev) => new Set(prev).add(s.id));
     openTab(
       basename(s.project_path), s.project_path, plan.command, plan.session_id,
-      { sessionId: plan.session_id, fresh: true },
+      { sessionId: plan.session_id, fresh: true, agentId: plan.agent_id },
     );
     setNotice(`"${s.title}" is parked in the sidebar — this tab is a fresh conversation.`);
   };
@@ -1232,7 +1311,9 @@ export default function App() {
       // is already open rather than starting a second claude in it. Keying it
       // to the session instead would put a placeholder row in the sidebar for
       // a door that already has one.
-      openTab(p.name, p.path, plan.command, `claude:${p.path}`);
+      openTab(p.name, p.path, plan.command, `claude:${p.path}`, {
+        agentId: plan.agent_id,
+      });
     } catch (e) {
       setNotice(`Couldn't start claude in ${p.name}: ${e}`);
     }
@@ -1273,62 +1354,77 @@ export default function App() {
     // the two are presented differently: a model tab is titled by its model
     // and gets no placeholder row, an agent tab is titled by its directory and
     // does.
-    if (choice.api) {
-      try {
-        const title = choice.api.modelId.split("/").pop() || choice.api.modelId;
-        const plan = await resolveLaunch({
-          kind: "apiModel",
-          providerId: choice.api.providerId,
-          modelId: choice.api.modelId,
-        });
-        setActiveProject(cwd);
-        // A tab handle where the plan names no session: an engine that writes
-        // no transcript we can read has nothing to key panels to, and the tab
-        // is the whole life of that conversation. Where it does name one, the
-        // chat becomes a real sidebar row once its first exchange lands.
-        //
-        // `env_provider` rides along so the spawn can put the key in the tab's
-        // environment — set only for an engine that has said it authenticates
-        // no other way.
-        openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
-          sessionId: plan.session_id ?? undefined,
-          envProvider: plan.env_provider ?? undefined,
-        });
-      } catch (e) {
-        setNotice(`Couldn't start ${choice.api.modelId}: ${e}`);
+    //
+    // A `switch` on the kind rather than a test for a field, because the choice
+    // is one thing or the other and used to be a shape that could be both: an
+    // agent id sat beside an optional `api` object, and "which of these two do
+    // I mean" was a runtime question answered by whichever field was checked
+    // first. There is nothing left to check.
+    switch (choice.kind) {
+      case "api": {
+        try {
+          const title = choice.modelId.split("/").pop() || choice.modelId;
+          const plan = await resolveLaunch({
+            kind: "apiModel",
+            providerId: choice.providerId,
+            modelId: choice.modelId,
+          });
+          setActiveProject(cwd);
+          // A tab handle where the plan names no session: an engine that writes
+          // no transcript we can read has nothing to key panels to, and the tab
+          // is the whole life of that conversation. Where it does name one, the
+          // chat becomes a real sidebar row once its first exchange lands.
+          //
+          // `env_provider` rides along so the spawn can put the key in the
+          // tab's environment — set only for an engine that has said it
+          // authenticates no other way.
+          openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+            sessionId: plan.session_id ?? undefined,
+            envProvider: plan.env_provider ?? undefined,
+            agentId: plan.agent_id,
+          });
+        } catch (e) {
+          setNotice(`Couldn't start ${choice.modelId}: ${e}`);
+        }
+        return;
       }
-      return;
-    }
-    setActiveProject(cwd);
-    try {
-      const plan = await resolveLaunch({
-        kind: "agent",
-        agentId: choice.agentId,
-        model: choice.model,
-        effort: choice.effort,
-      });
-      // No session id on the plan means the engine would not take one — Codex
-      // has no `--session-id` — so the slot is a tab handle: the placeholder
-      // row keeps the tab reachable, but nothing is keyed to it as a session,
-      // because there is no session by that name and never will be.
-      openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
-        sessionId: plan.session_id ?? undefined,
-        fresh: true,
-        // An agent we could not name has to be identified after the fact.
-        // Snapshot what already exists so adoption can tell its session from
-        // one that was open before this tab did anything.
-        adopt: plan.session_id
-          ? undefined
-          : {
-              agentId: plan.agent_id,
-              since: Date.now(),
-              known: sessionsRef.current
-                .filter((s) => s.project_path === cwd)
-                .map((s) => s.id),
-            },
-      });
-    } catch (e) {
-      setNotice(`Couldn't start ${choice.agentId}: ${e}`);
+
+      case "agent": {
+        setActiveProject(cwd);
+        try {
+          const plan = await resolveLaunch({
+            kind: "agent",
+            agentId: choice.agentId,
+            model: choice.model,
+            effort: choice.effort,
+          });
+          // No session id on the plan means the engine would not take one —
+          // Codex has no `--session-id` — so the slot is a tab handle: the
+          // placeholder row keeps the tab reachable, but nothing is keyed to it
+          // as a session, because there is no session by that name and never
+          // will be.
+          openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+            sessionId: plan.session_id ?? undefined,
+            fresh: true,
+            agentId: plan.agent_id,
+            // An agent we could not name has to be identified after the fact.
+            // Snapshot what already exists so adoption can tell its session
+            // from one that was open before this tab did anything.
+            adopt: plan.session_id
+              ? undefined
+              : {
+                  agentId: plan.agent_id,
+                  since: Date.now(),
+                  known: sessionsRef.current
+                    .filter((s) => s.project_path === cwd)
+                    .map((s) => s.id),
+                },
+          });
+        } catch (e) {
+          setNotice(`Couldn't start ${choice.agentId}: ${e}`);
+        }
+        return;
+      }
     }
   }, [openTab]);
 
@@ -1471,6 +1567,7 @@ export default function App() {
                   tabs.filter((t) => attention.has(t.key)).map((t) => t.slotId),
                 )}
                 activeSlot={activeTabObj?.slotId ?? null}
+                capsOf={capsOf}
                 opts={opts}
                 onOptsChange={setOpts}
                 onSelect={selectSession}
@@ -1573,6 +1670,7 @@ export default function App() {
               <SessionPreview
                 session={previewSession}
                 onResume={resumeSession}
+                canResume={capsOf(previewSession.agent).resume}
                 onClose={() => setPreviewSession(null)}
               />
             )}
@@ -1611,22 +1709,35 @@ export default function App() {
           {/* onCommand goes to the focused terminal, so the pills only offer
               model/effort when there is a live session to run them in — and
               not while the agents view has the screen, where a slash command
-              would be typed into its "describe a task" box instead of run. */}
+              would be typed into its "describe a task" box instead of run.
+              Every pill that speaks Claude Code's vocabulary is now gated on
+              the active tab's engine declaring `panels`: `/model`, `/effort`
+              and `/rewind` are claude's commands, and Tasks/Artifacts/Agents
+              read a claude transcript. Sent into a Codex or `aiterm chat` tab
+              they were text typed at a prompt that does not understand them.
+              The pills that are about the tab rather than the engine — plan
+              usage, the repo — stay, because they are true whatever is running.
+              `onSetPermMode` goes with the TUI: it works by reading the status
+              line and sending shift+tab. */}
           {showComposer && <Composer
-            sessionId={activeSessionId}
+            sessionId={activeCaps.panels ? activeSessionId : null}
             projectRoot={activeProject}
             usage={usage}
             usageAsOf={usageFresh ? null : usageAt || null}
-            onCommand={activeTab === null || agentsView ? undefined : (text) =>
-              handles.current.get(activeTab)?.sendComposed(text)}
+            onCommand={activeTab === null || agentsView || !activeCaps.panels
+              ? undefined
+              : (text) => handles.current.get(activeTab)?.sendComposed(text)}
             onDismiss={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.focus()}
             hasPendingInput={activeTab === null ? undefined : () =>
               handles.current.get(activeTab)?.pendingInput() ?? false}
-            onOpenModelPicker={activeTab === null || agentsView ? undefined : openModelPicker}
-            onOpenRewind={activeTab === null || agentsView ? undefined : openRewind}
+            onOpenModelPicker={activeTab === null || agentsView || !activeCaps.panels
+              ? undefined : openModelPicker}
+            onOpenRewind={activeTab === null || agentsView || !activeCaps.panels
+              ? undefined : openRewind}
             permMode={permMode}
-            onSetPermMode={activeTab === null || agentsView ? undefined : setPermissionMode}
+            onSetPermMode={activeTab === null || agentsView || !activeDrivesTui
+              ? undefined : setPermissionMode}
           />}
         </div>
 
@@ -1675,7 +1786,13 @@ export default function App() {
                       <span>AGENT{activeTabObj?.title ? ` — ${activeTabObj.title}` : ""}</span>
                       <button className="icon-btn" onClick={() => setShowAgent(false)}>✕</button>
                     </div>
-                    <AgentPanel sessionId={activeSessionId} />
+                    {/* The panel's prop doc has always said "if it's a claude
+                        tab"; this is that assumption enforced instead of
+                        assumed. It reads a claude transcript for tasks,
+                        artifacts and subagent runs, so an engine that declares
+                        no `panels` hands it no session and it says so — the
+                        same empty state as a shell tab, which is the truth. */}
+                    <AgentPanel sessionId={activeCaps.panels ? activeSessionId : null} />
                   </div>
                 </>
               )}

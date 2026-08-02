@@ -903,6 +903,28 @@ pub fn detect_agents() -> Vec<Detection> {
     backends().iter().map(|b| b.detect()).collect()
 }
 
+/// What every registered engine supports, keyed by id.
+///
+/// The same flags [`detect_agents`] already carries, without any of its cost.
+/// That one probes PATH and runs `<bin> --version` through a login shell — the
+/// reason it is `async` — and the UI gates a *render* on these: which buttons a
+/// sidebar row offers, and whether the claude-shaped subsystems run against the
+/// active tab. Waiting seconds on a cold PATH to find out whether to draw a ⑂
+/// would be absurd, so this asks the registry and nothing else.
+///
+/// Deliberately not `async`, against the rule that commands go off the main
+/// thread: `id()` and `caps()` are constant functions over a `vec!` of unit
+/// structs, so the thread hop would cost more than the work. Every backend
+/// appears, present or not — a row from an uninstalled engine still has to know
+/// what it can offer.
+#[tauri::command]
+pub fn agent_caps() -> std::collections::HashMap<String, Caps> {
+    backends()
+        .iter()
+        .map(|b| (b.id().to_string(), b.caps()))
+        .collect()
+}
+
 /// What a new session can be started as: the agents that are actually here,
 /// with their models. Absent agents are omitted — this feeds a picker, and
 /// offering something that cannot start is worse than not offering it.
@@ -1681,6 +1703,24 @@ mod tests {
         assert_eq!(CodexBackend.caps(), Caps::default());
         assert_eq!(OpenCodeBackend.caps(), Caps::default());
         assert_eq!(ChatBackend.caps(), Caps { resume: true, ..Default::default() });
+    }
+
+    /// The UI gates on this map, so a backend missing from it is an engine
+    /// whose tabs silently get no buttons and none of its subsystems. Adding
+    /// one to `backends()` without its capabilities reaching the renderer is
+    /// exactly the half-added state the registry exists to prevent.
+    #[test]
+    fn every_backend_publishes_its_capabilities_to_the_ui() {
+        let map = agent_caps();
+        for b in backends() {
+            assert_eq!(
+                map.get(b.id()),
+                Some(&b.caps()),
+                "{} is invisible to the UI's capability lookup",
+                b.id(),
+            );
+        }
+        assert_eq!(map.len(), backends().len(), "two backends share an id");
     }
 
     /// A backend that offers ▶ must have a command behind it, and one that
