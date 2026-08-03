@@ -2474,3 +2474,48 @@ input[type="range"]::-webkit-slider-thumb {
    to it rather than an unrelated fifth — related engines, related colour. */
 .agent-icon.opencode { color: var(--cyan); }
 .ns-agent-tab.on .agent-icon { color: inherit; }
+
+/* Renderer lab — a real terminal on the selected renderer, so the
+   antialiasing trade is looked at rather than described, plus the measured
+   cost of it on this machine. */
+.rlab { padding-top: 10px; }
+.rlab-term {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  padding: 8px 10px;
+  overflow: hidden;
+}
+.rlab-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 8px;
+}
+.rlab-btn {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 11px;
+  cursor: pointer;
+}
+.rlab-btn:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.rlab-btn:disabled { opacity: 0.55; cursor: default; }
+.rlab-hint { font-size: 11px; color: var(--text-faint); }
+.rlab-results { display: flex; gap: 8px; padding-top: 10px; }
+.rlab-cell {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+  background: var(--bg);
+}
+.rlab-cell.on { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
+.rlab-key { font-size: 11px; color: var(--text-faint); letter-spacing: 0.04em; }
+.rlab-val { font-size: 12px; color: var(--text); }
+.rlab-sub { font-size: 11px; color: var(--text-faint); margin-left: auto; }

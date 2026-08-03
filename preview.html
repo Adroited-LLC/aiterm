@@ -63,6 +63,22 @@
           // Cheap enough to gate a render on, so every capability check in the
           // UI reads it — a harness that answered nothing would draw a session
           // list with no buttons on any row.
+          // Counters climb per call so the lab's before/after subtraction
+          // produces a plausible number instead of a flat zero, and DOM is made
+          // dearer than GPU the way the real measurements came out.
+          renderer_probe: (() => {
+            let cpu = 1000, gpu = 100;
+            return () => {
+              let dom = false;
+              try {
+                dom = JSON.parse(localStorage.getItem("aiterm.settings") || "{}")
+                  .termRenderer === "dom";
+              } catch {}
+              cpu += dom ? 640 : 180;
+              gpu += dom ? 40 : 20;
+              return { cpuMs: cpu, gpuMs: gpu, ok: true };
+            };
+          })(),
           agent_caps: {
             claude: { fork: true, clear: true, resume: true, tui_drive: true, panels: true, delete: true },
             codex: { fork: false, clear: false, resume: false, tui_drive: false, panels: false, delete: false },
@@ -103,8 +119,13 @@
             window["_" + id] = callback;
             return id;
           },
-          invoke(cmd) {
-            if (cmd in mocks) return Promise.resolve(mocks[cmd]);
+          invoke(cmd, args) {
+            // A mock may be a function when the answer has to change between
+            // calls — counters that only mean something as a difference.
+            if (cmd in mocks) {
+              const m = mocks[cmd];
+              return Promise.resolve(typeof m === "function" ? m(args) : m);
+            }
             if (cmd.startsWith("plugin:")) return Promise.resolve(null);
             return Promise.resolve(null);
           },

@@ -1,6 +1,7 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
+import RendererLab from "./RendererLab";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
   TERM_WEIGHTS, boldWeightFor,
@@ -376,6 +377,11 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                     you see text that should be gone, that's the trade.
                   </div>
                 )}
+                {/* The trade is hardware-dependent, so it is measured here
+                    rather than asserted. The sample is a real terminal on the
+                    selected renderer: the antialiasing difference is visible
+                    directly, without switching the app you are working in. */}
+                <RendererLab settings={settings} />
                 {/* Same text the terminal would render, at the same size, face,
                     spacing and weight — the only honest way to judge any of them.
                     The last line is bold, so you can see emphasis still separates

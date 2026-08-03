@@ -10,6 +10,7 @@ pub mod indexer;
 pub mod launch;
 pub mod opencode;
 pub mod providers;
+pub mod rendercost;
 pub mod pty;
 pub mod sessions;
 pub mod trace;
@@ -45,6 +46,7 @@ pub fn run() {
             pty::pty_kill,
             agents::detect_agents,
             agents::agent_caps,
+            rendercost::renderer_probe,
             agents::adopt_agent_session,
             diag::diag_log_path,
             diag::diag_log_tail,

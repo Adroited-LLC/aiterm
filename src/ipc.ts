@@ -412,6 +412,16 @@ export interface Caps {
  *  longer registered, and the caller treats it as capable of nothing. */
 export const agentCaps = () => invoke<Record<string, Caps>>("agent_caps");
 
+/** One reading of the web process's cost counters. Cumulative since it
+ *  started, so a measurement is always the difference between two calls —
+ *  `ok: false` means no web process was found and the numbers mean nothing. */
+export type RendererProbe = { cpuMs: number; gpuMs: number | null; ok: boolean };
+
+/** Sampled either side of a known repaint burst, this is what turns the
+ *  GPU/DOM trade from a claim into a number for the machine in front of you. */
+export const rendererProbe = () => invoke<RendererProbe>("renderer_probe");
+
+
 /** What the user asked for, in the terms the UI actually has. Which engine
  *  answers is `launch.rs`'s business — nothing here names one. Sent in
  *  camelCase, which is what `LaunchRequest` deserializes. */
