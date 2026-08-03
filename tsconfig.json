@@ -21,5 +21,10 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src"],
+  /* Test files run under node --experimental-strip-types, so they import
+     node: builtins this app-facing config has no types for. Excluded here
+     rather than pulling @types/node in for two imports; `npm run test:ui`
+     is what checks them. */
+  "exclude": ["src/**/*.test.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

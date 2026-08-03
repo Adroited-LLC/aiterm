@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
@@ -30,6 +31,8 @@ function attachRenderer(term: Terminal): WebglAddon | null {
     return null;
   }
 }
+
+export type { TermProgress };
 
 export interface TermTab {
   key: number;
@@ -127,6 +130,12 @@ interface Props {
   onActivity: (key: number) => void;
   /** Bell = the program wants eyes (claude prompts ring it); typing clears. */
   onAttention: (key: number, on: boolean) => void;
+  /** What the program wants eyes *for*. A bell is one byte and carries no
+   *  payload; OSC 9 carries the sentence. It arrives on this tab's own pty, so
+   *  no pid-to-tab lookup is needed to know who is asking. */
+  onNotify: (key: number, message: string) => void;
+  /** OSC 9;4 progress. `null` means the program withdrew it. */
+  onProgress: (key: number, progress: TermProgress | null) => void;
   /** Focus the terminal when it becomes active. Once true only while the
    *  composer was hidden, back when the composer held a text input that would
    *  have been fighting for the same keystrokes. It is a pill strip now, so
@@ -144,8 +153,8 @@ interface Props {
 }
 
 export default function TerminalView({
-  tab, active, onExit, onRegister, onActivity, onAttention, autoFocus, fontSize, fontFamily,
-  lineHeight, fontWeight, renderer, theme,
+  tab, active, onExit, onRegister, onActivity, onAttention, onNotify, onProgress,
+  autoFocus, fontSize, fontFamily, lineHeight, fontWeight, renderer, theme,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -241,6 +250,20 @@ export default function TerminalView({
       let pending = 0;
 
       term.onBell(() => onAttention(tab.key, true));
+
+      // Returning true claims the sequence. Nothing else in aiterm reads OSC 9,
+      // and an unclaimed sequence is passed through to be printed, which would
+      // spray notification text into the buffer.
+      term.parser.registerOscHandler(9, (data) => {
+        const parsed = parseOsc9(data);
+        if (parsed?.kind === "progress") {
+          onProgress(tab.key, parsed.progress);
+        } else if (parsed?.kind === "message") {
+          onNotify(tab.key, parsed.message);
+          onAttention(tab.key, true);
+        }
+        return true;
+      });
       // Shift+Enter means "new line", not "send". A PTY has no key for that —
       // Shift+Enter arrives as the same \r as Enter — but backslash-return is
       // already the continuation gesture claude's composer understands, the

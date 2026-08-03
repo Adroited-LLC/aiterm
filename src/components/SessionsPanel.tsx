@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
+import { TermProgress } from "./TerminalView";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -118,6 +119,11 @@ interface Props {
   liveSessions: Set<string>;
   /** Slot ids whose terminal rang the bell (claude waiting on input). */
   attentionSlots: Set<string>;
+  /** What the waiting session actually said, when it sent words rather than a
+   *  bell (OSC 9). Keyed by slot, like `attentionSlots`. */
+  attentionText: Map<string, string>;
+  /** Long-running work a live session is reporting (OSC 9;4). */
+  progressSlots: Map<string, TermProgress>;
   /** Slot id of the terminal currently displayed. */
   activeSlot: string | null;
   opts: SessionDisplayOpts;
@@ -159,7 +165,8 @@ interface Props {
 }
 
 export default function SessionsPanel({
-  sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, activeSlot, opts,
+  sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots,
+  attentionText, progressSlots, activeSlot, opts,
   capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
@@ -599,6 +606,10 @@ export default function SessionsPanel({
     const isRunning = liveSessions.has(s.id);
     const hasAttn =
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
+    // Same two slot keys the badge is looked up under, so the sentence and the
+    // dot can never disagree about which row is asking.
+    const notice = attentionText.get(s.id) ?? attentionText.get(`shell:${s.project_path}`);
+    const prog = progressSlots.get(s.id) ?? progressSlots.get(`shell:${s.project_path}`);
     const isShowing = activeSlot !== null &&
       (activeSlot === s.id || activeSlot === `shell:${s.project_path}`);
     // Tighter than `isShowing`: the displayed terminal is *this session's own*
@@ -667,7 +678,7 @@ export default function SessionsPanel({
           {(isRunning || hasAttn) && (
             <span
               className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
-              title={hasAttn ? "Waiting for your input" : "Session is running"}
+              title={hasAttn ? notice ?? "Waiting for your input" : "Session is running"}
             />
           )}
         </div>
@@ -701,6 +712,28 @@ export default function SessionsPanel({
                   {s.branch}
                 </span>
               )}
+            </div>
+          )}
+          {/* The sentence the session sent, shown only while it is still
+              waiting — once the badge clears this is a stale answer to a
+              question nobody is asking any more. */}
+          {hasAttn && notice && <div className="session-notice">{notice}</div>}
+          {prog && (
+            <div
+              className={"session-prog s" + prog.state}
+              title={
+                prog.state === 2 ? "Reported an error"
+                  : prog.state === 4 ? "Paused"
+                  : prog.pct !== null ? `${prog.pct}% done`
+                  : "Working"
+              }
+            >
+              <span
+                className="session-prog-fill"
+                // Indeterminate has no width to give, so it is shown as a
+                // moving sliver rather than a bar pretending to know.
+                style={prog.pct !== null ? { width: `${prog.pct}%` } : undefined}
+              />
             </div>
           )}
         </div>

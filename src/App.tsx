@@ -6,7 +6,7 @@ import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import { StartChoice } from "./components/NewSessionMenu";
 import StartControls, { useStartChoice } from "./components/StartControls";
-import TerminalView, { TermHandle, TermTab } from "./components/TerminalView";
+import TerminalView, { TermHandle, TermProgress, TermTab } from "./components/TerminalView";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
@@ -157,6 +157,10 @@ export default function App() {
 
   // Tabs whose terminal rang the bell while not being looked at.
   const [attention, setAttention] = useState<Set<number>>(new Set());
+  /** The message behind a badge, when the program sent one (OSC 9). */
+  const [notices, setNotices] = useState<Map<number, string>>(new Map());
+  /** Long-running work a tab is reporting (OSC 9;4). */
+  const [progress, setProgress] = useState<Map<number, TermProgress>>(new Map());
   // Tabs whose process died on its own, and the exit code it died with. These
   // keep their row: the tab going away used to be the *only* sign anything had
   // happened, which is no help at all when the thing that killed it was
@@ -591,6 +595,38 @@ export default function App() {
         .requestUserAttention(UserAttentionType.Informational)
         .catch(() => {});
     }
+    // The badge and the sentence behind it clear together — a message left
+    // behind after the badge went is a stale answer to "what did it want?".
+    if (!on) {
+      setNotices((prev) => {
+        if (!prev.has(key)) return prev;
+        const next = new Map(prev);
+        next.delete(key);
+        return next;
+      });
+    }
+  }, []);
+
+  /** What a tab asked for, in its own words (OSC 9), keyed like `attention`. */
+  const noteNotify = useCallback((key: number, message: string) => {
+    setNotices((prev) => {
+      if (prev.get(key) === message) return prev;
+      return new Map(prev).set(key, message);
+    });
+  }, []);
+
+  const noteProgress = useCallback((key: number, p: TermProgress | null) => {
+    setProgress((prev) => {
+      if (p === null) {
+        if (!prev.has(key)) return prev;
+        const next = new Map(prev);
+        next.delete(key);
+        return next;
+      }
+      const had = prev.get(key);
+      if (had && had.state === p.state && had.pct === p.pct) return prev;
+      return new Map(prev).set(key, p);
+    });
   }, []);
 
   // Viewing a tab (with the window focused) clears its badge.
@@ -1567,6 +1603,18 @@ export default function App() {
                 attentionSlots={new Set(
                   tabs.filter((t) => attention.has(t.key)).map((t) => t.slotId),
                 )}
+                attentionText={new Map(
+                  tabs.flatMap((t) => {
+                    const m = notices.get(t.key);
+                    return m ? [[t.slotId, m] as [string, string]] : [];
+                  }),
+                )}
+                progressSlots={new Map(
+                  tabs.flatMap((t) => {
+                    const p = progress.get(t.key);
+                    return p ? [[t.slotId, p] as [string, TermProgress]] : [];
+                  }),
+                )}
                 activeSlot={activeTabObj?.slotId ?? null}
                 capsOf={capsOf}
                 opts={opts}
@@ -1611,6 +1659,8 @@ export default function App() {
                 onRegister={registerHandle}
                 onActivity={noteActivity}
                 onAttention={noteAttention}
+                onNotify={noteNotify}
+                onProgress={noteProgress}
                 autoFocus
                 fontSize={termFont}
                 fontFamily={xtermFont}

@@ -2506,3 +2506,40 @@ input[type="range"]::-webkit-slider-thumb {
 .rlab-btn:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
 .rlab-btn:disabled { opacity: 0.55; cursor: default; }
 .rlab-hint { font-size: 11px; color: var(--text-faint); }
+
+/* What a waiting session actually said (OSC 9), and what it is working on
+   (OSC 9;4). Both sit under the title, inside the row's text column. */
+.session-notice {
+  font-size: 11px;
+  color: var(--accent);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-prog {
+  position: relative;
+  height: 2px;
+  margin-top: 4px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+  overflow: hidden;
+}
+.session-prog-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 100%;
+  background: var(--accent);
+  border-radius: 1px;
+}
+.session-prog.s2 .session-prog-fill { background: var(--red); }
+.session-prog.s4 .session-prog-fill { background: var(--yellow); }
+/* Indeterminate: no percentage exists, so nothing should look like one. */
+.session-prog.s3 .session-prog-fill {
+  width: 35%;
+  animation: sess-prog-slide 1.4s ease-in-out infinite;
+}
+@keyframes sess-prog-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(285%); }
+}
