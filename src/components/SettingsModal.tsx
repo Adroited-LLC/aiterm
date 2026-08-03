@@ -346,6 +346,19 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                     ))}
                   </div>
                 </Row>
+                {/* Sample first, control under it: the buttons change what is
+                    drawn directly above them, so the effect is in view when the
+                    choice is made rather than scrolled off the top. */}
+                {/* The trade is hardware-dependent, so it is measured here
+                    rather than asserted. The sample is a real terminal on the
+                    selected renderer: the antialiasing difference is visible
+                    directly, without switching the app you are working in. */}
+                {/* Two real terminals, one pinned to each renderer. A styled
+                    <div> used to stand in for this, but HTML text always goes
+                    through the desktop's font stack — so it showed subpixel
+                    output next to a GPU terminal that can never produce it, and
+                    a font picked against it looked sharper than the real thing. */}
+                <RendererLab settings={settings} />
                 <Row
                   label="Rendering"
                   desc="GPU never uses the desktop's font smoothing; DOM does, and can look sharper"
@@ -370,16 +383,6 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                     you see text that should be gone, that's the trade.
                   </div>
                 )}
-                {/* The trade is hardware-dependent, so it is measured here
-                    rather than asserted. The sample is a real terminal on the
-                    selected renderer: the antialiasing difference is visible
-                    directly, without switching the app you are working in. */}
-                {/* Two real terminals, one pinned to each renderer. A styled
-                    <div> used to stand in for this, but HTML text always goes
-                    through the desktop's font stack — so it showed subpixel
-                    output next to a GPU terminal that can never produce it, and
-                    a font picked against it looked sharper than the real thing. */}
-                <RendererLab settings={settings} />
               </Group>
 
               <Group title="Add fonts">
