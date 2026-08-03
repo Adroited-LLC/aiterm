@@ -4,41 +4,51 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { AppSettings, boldWeightFor, termFontFamily, termTheme } from "../settings";
 import { rendererProbe } from "../ipc";
 
-/** Sample text chosen to expose the thing the renderers actually differ on:
- *  stem weight at small sizes, and how thin diagonals and box-drawing edges
- *  resolve. Prose alone hides it. */
+/** Sample text built to expose what the renderers actually differ on: stem
+ *  weight at small sizes, thin diagonals, and how box-drawing edges resolve.
+ *  The last line is bold, so emphasis can still be judged against body text at
+ *  whatever weight is chosen above. */
 const SAMPLE = [
   "\x1b[1m const \x1b[0m\x1b[36mrenderer\x1b[0m = caps.gpu ? \x1b[33m\"webgl\"\x1b[0m : \x1b[33m\"dom\"\x1b[0m;",
-  " Illegible: Il1| O0o rn/m cl/d  \x1b[2mdimmed text\x1b[0m  \x1b[1mbold text\x1b[0m",
-  " ┌─────────────┬───────────┐   \x1b[32m✔ passed\x1b[0m   \x1b[31m✘ failed\x1b[0m",
-  " │ the quick   │ 0123456789│   λ → ∀ ≈ ± ∑",
-  " └─────────────┴───────────┘",
+  " Illegible: Il1| O0o rn/m cl/d   \x1b[2mdimmed text\x1b[0m   3.14",
+  " ┌─────────────┬───────────┐    \x1b[32m✔ passed\x1b[0m   \x1b[31m✘ failed\x1b[0m",
+  " │ the quick   │ 0123456789│    λ → ∀ ≈ ±",
+  " └─────────────┴───────────┘    \x1b[1mthis line is bold\x1b[0m",
 ].join("\r\n");
 
-/** Long enough that the difference clears the noise floor, short enough that
- *  the button never feels like it hung. */
+/** Long enough to clear the noise floor, short enough that the button never
+ *  feels like it hung. */
 const BURST_LINES = 4000;
-const BURST = Array.from(
-  { length: BURST_LINES },
-  (_, i) =>
-    `\x1b[2m${String(i).padStart(6, "0")}\x1b[0m the quick brown fox jumps over the lazy dog ` +
-    `\x1b[36m0123456789\x1b[0m ++--==##`,
-).join("\r\n") + "\r\n";
+const BURST =
+  Array.from(
+    { length: BURST_LINES },
+    (_, i) =>
+      `\x1b[2m${String(i).padStart(6, "0")}\x1b[0m the quick brown fox jumps over the lazy dog ` +
+      `\x1b[36m0123456789\x1b[0m ++--==##`,
+  ).join("\r\n") + "\r\n";
 
+type Kind = "gpu" | "dom";
 type Reading = { cpuMs: number; gpuMs: number | null };
+
+const CAPTION: Record<Kind, string> = {
+  gpu: "Rendered by the GPU's own glyph atlas — grayscale antialiasing, always",
+  dom: "Rendered by the desktop's font stack — subpixel antialiasing and hinting",
+};
 
 export default function RendererLab({ settings }: { settings: AppSettings }) {
   const elRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const webglRef = useRef<WebglAddon | null>(null);
   const [busy, setBusy] = useState(false);
-  /** Kept per renderer so the two survive switching between them — the whole
-   *  point is the comparison, which needs both halves at once. */
-  const [readings, setReadings] = useState<Partial<Record<"gpu" | "dom", Reading>>>({});
-  const [failed, setFailed] = useState(false);
+  /** Kept per renderer so both halves survive switching between them — the
+   *  comparison needs the other side, which is only measurable while selected. */
+  const [readings, setReadings] = useState<Partial<Record<Kind, Reading>>>({});
+  const [note, setNote] = useState<string | null>(null);
+  /** A WebGL context that failed to attach would leave this pane quietly
+   *  rendering as DOM while captioned as GPU. Tracked so it can be said out
+   *  loud instead of shown as a silent lie. */
+  const [gpuFailed, setGpuFailed] = useState(false);
 
-  // Build once. Font and theme changes are pushed onto the live instance
-  // below, the same way the real terminal handles them.
   useEffect(() => {
     if (!elRef.current || termRef.current) return;
     const term = new Terminal({
@@ -52,7 +62,7 @@ export default function RendererLab({ settings }: { settings: AppSettings }) {
       cols: 64,
       cursorBlink: false,
       disableStdin: true,
-      scrollback: 200,
+      scrollback: 100,
       allowProposedApi: true,
     });
     termRef.current = term;
@@ -67,8 +77,8 @@ export default function RendererLab({ settings }: { settings: AppSettings }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Follow the renderer setting, exactly as the real terminals do, so what is
-  // on screen here is what is on screen there.
+  /** Follows the setting exactly as the real terminals do, so this pane is the
+   *  renderer in use and never a stand-in for it. */
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
@@ -76,11 +86,13 @@ export default function RendererLab({ settings }: { settings: AppSettings }) {
     if (settings.termRenderer === "gpu" && !live) {
       try {
         const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
+        webgl.onContextLoss(() => setGpuFailed(true));
         term.loadAddon(webgl);
         webglRef.current = webgl;
+        setGpuFailed(false);
       } catch {
         webglRef.current = null;
+        setGpuFailed(true);
       }
     } else if (settings.termRenderer === "dom" && live) {
       live.dispose();
@@ -91,6 +103,8 @@ export default function RendererLab({ settings }: { settings: AppSettings }) {
     term.refresh(0, term.rows - 1);
   }, [settings.termRenderer]);
 
+  // Font and theme changes are pushed onto the live instance, so this is always
+  // the face actually chosen above.
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
@@ -106,24 +120,20 @@ export default function RendererLab({ settings }: { settings: AppSettings }) {
     const term = termRef.current;
     if (!term || busy) return;
     setBusy(true);
-    setFailed(false);
+    setNote(null);
     try {
       const before = await rendererProbe();
       if (!before.ok) {
-        setFailed(true);
+        setNote("Couldn't read the renderer's counters on this system.");
         return;
       }
       await new Promise<void>((done) => term.write(BURST, () => done()));
-      // write()'s callback means parsed, not painted. Two frames guarantees the
-      // renderer has actually put it on the glass before the counters are read.
+      // write()'s callback means parsed, not painted. Two frames guarantees it
+      // reached the glass before the counters are read again.
       await new Promise<void>((done) =>
         requestAnimationFrame(() => requestAnimationFrame(() => done())),
       );
       const after = await rendererProbe();
-      if (!after.ok) {
-        setFailed(true);
-        return;
-      }
       setReadings((prev) => ({
         ...prev,
         [settings.termRenderer]: {
@@ -141,52 +151,46 @@ export default function RendererLab({ settings }: { settings: AppSettings }) {
     }
   };
 
+  const active = settings.termRenderer;
+  const mine = readings[active];
   const gpu = readings.gpu;
   const dom = readings.dom;
-  const other = settings.termRenderer === "gpu" ? "DOM" : "GPU";
-  const ratio =
-    gpu && dom && gpu.cpuMs > 0 ? dom.cpuMs / gpu.cpuMs : null;
+  const ratio = gpu && dom && gpu.cpuMs > 0 ? dom.cpuMs / gpu.cpuMs : null;
+  const other: Kind = active === "gpu" ? "dom" : "gpu";
 
   return (
     <div className="rlab">
       <div className="rlab-term" ref={elRef} />
+      <div className="rlab-caption">
+        {active === "gpu" && gpuFailed
+          ? "WebGL didn't start — this is falling back to the desktop's font stack"
+          : CAPTION[active]}
+      </div>
       <div className="rlab-actions">
         <button className="rlab-btn" onClick={measure} disabled={busy}>
-          {busy ? "Measuring…" : `Measure ${settings.termRenderer.toUpperCase()}`}
+          {busy ? "Measuring…" : `Measure ${active.toUpperCase()}`}
         </button>
         <span className="rlab-hint">
-          {gpu && dom
-            ? `${BURST_LINES.toLocaleString()} lines rendered`
-            : `Measure both to compare — ${other} still needs a run`}
+          {mine
+            ? `${mine.cpuMs} ms CPU for ${BURST_LINES.toLocaleString()} lines` +
+              (mine.gpuMs !== null ? ` · ${mine.gpuMs} ms GPU` : "")
+            : `${BURST_LINES.toLocaleString()} lines through this pane — your open terminals aren't touched`}
         </span>
       </div>
-      {(gpu || dom) && (
-        <div className="rlab-results">
-          {(["gpu", "dom"] as const).map((key) => {
-            const r = readings[key];
-            return (
-              <div key={key} className={"rlab-cell" + (settings.termRenderer === key ? " on" : "")}>
-                <span className="rlab-key">{key.toUpperCase()}</span>
-                <span className="rlab-val">{r ? `${r.cpuMs} ms CPU` : "—"}</span>
-                {r?.gpuMs !== null && r?.gpuMs !== undefined && (
-                  <span className="rlab-sub">{r.gpuMs} ms GPU</span>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
-      {ratio !== null && (
+      {ratio !== null ? (
         <div className="sgroup-foot">
           DOM costs <b>{ratio.toFixed(1)}×</b> the CPU of GPU on this machine for the
-          same output. It buys subpixel antialiasing, which GPU cannot do at all —
-          its glyph atlas has no background to blend against. Worth it when text
-          quality matters more than a fast-scrolling log.
+          same output. What it buys is the subpixel antialiasing above, which GPU
+          cannot do at all — a glyph atlas has no background to blend against.
         </div>
+      ) : (
+        mine && (
+          <div className="sgroup-foot">
+            Switch to {other.toUpperCase()} and measure again to compare the two.
+          </div>
+        )
       )}
-      {failed && (
-        <div className="sgroup-foot">Couldn't read the renderer's counters on this system.</div>
-      )}
+      {note && <div className="sgroup-foot">{note}</div>}
     </div>
   );
 }

@@ -2475,9 +2475,9 @@ input[type="range"]::-webkit-slider-thumb {
 .agent-icon.opencode { color: var(--cyan); }
 .ns-agent-tab.on .agent-icon { color: inherit; }
 
-/* Renderer lab — a real terminal on the selected renderer, so the
-   antialiasing trade is looked at rather than described, plus the measured
-   cost of it on this machine. */
+/* Renderer lab — a real terminal running whichever renderer the GPU/DOM
+   button selects, so the antialiasing on screen is the antialiasing you get,
+   plus the measured cost of it on this machine. */
 .rlab { padding-top: 10px; }
 .rlab-term {
   border: 1px solid var(--border);
@@ -2486,6 +2486,7 @@ input[type="range"]::-webkit-slider-thumb {
   padding: 8px 10px;
   overflow: hidden;
 }
+.rlab-caption { font-size: 11px; color: var(--text-faint); padding-top: 7px; }
 .rlab-actions {
   display: flex;
   align-items: center;
@@ -2500,22 +2501,8 @@ input[type="range"]::-webkit-slider-thumb {
   font-size: 12px;
   padding: 4px 11px;
   cursor: pointer;
+  white-space: nowrap;
 }
 .rlab-btn:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
 .rlab-btn:disabled { opacity: 0.55; cursor: default; }
 .rlab-hint { font-size: 11px; color: var(--text-faint); }
-.rlab-results { display: flex; gap: 8px; padding-top: 10px; }
-.rlab-cell {
-  flex: 1;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  padding: 7px 10px;
-  background: var(--bg);
-}
-.rlab-cell.on { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
-.rlab-key { font-size: 11px; color: var(--text-faint); letter-spacing: 0.04em; }
-.rlab-val { font-size: 12px; color: var(--text); }
-.rlab-sub { font-size: 11px; color: var(--text-faint); margin-left: auto; }

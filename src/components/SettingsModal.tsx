@@ -4,7 +4,7 @@ import ModelAccess from "./ModelAccess";
 import RendererLab from "./RendererLab";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
-  TERM_WEIGHTS, boldWeightFor,
+  TERM_WEIGHTS,
 } from "../settings";
 import {
   FontFamily, FontPackage,
@@ -36,13 +36,6 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "models", label: "Model access" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
-
-/** Shows the characters that actually separate one coding font from another. */
-/** Several lines, because one cannot show row spacing, and the characters
- *  coding fonts most often confuse with each other. */
-const PREVIEW = `const ok = 0O1lI|; // {} => [a-z]* 3.14
-if (rows !== cols) { resize(80, 24); }
-git commit -m "fix: don't drop the last frame"`;
 
 function ThemeCard({ id, active, onPick }: { id: string; active: boolean; onPick: () => void }) {
   const t = themeById(id);
@@ -381,27 +374,12 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                     rather than asserted. The sample is a real terminal on the
                     selected renderer: the antialiasing difference is visible
                     directly, without switching the app you are working in. */}
+                {/* Two real terminals, one pinned to each renderer. A styled
+                    <div> used to stand in for this, but HTML text always goes
+                    through the desktop's font stack — so it showed subpixel
+                    output next to a GPU terminal that can never produce it, and
+                    a font picked against it looked sharper than the real thing. */}
                 <RendererLab settings={settings} />
-                {/* Same text the terminal would render, at the same size, face,
-                    spacing and weight — the only honest way to judge any of them.
-                    The last line is bold, so you can see emphasis still separates
-                    from body text at whatever weight you pick. */}
-                <div
-                  className="font-preview"
-                  style={{
-                    fontFamily: settings.termFont ? `"${settings.termFont}", monospace` : "monospace",
-                    fontSize: settings.termFontSize,
-                    lineHeight: settings.termLineHeight,
-                    fontWeight: settings.termFontWeight,
-                    whiteSpace: "pre",
-                  }}
-                >
-                  {PREVIEW}
-                  {"\n"}
-                  <span style={{ fontWeight: boldWeightFor(settings.termFontWeight) }}>
-                    this line is bold
-                  </span>
-                </div>
               </Group>
 
               <Group title="Add fonts">
