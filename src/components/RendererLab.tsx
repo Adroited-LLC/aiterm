@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { AppSettings, boldWeightFor, termFontFamily, termTheme } from "../settings";
 import { rendererProbe } from "../ipc";
+import Row from "./SettingsRow";
 
 /** Sample text built to expose what the renderers actually differ on: stem
  *  weight at small sizes, thin diagonals, and how box-drawing edges resolve.
@@ -35,7 +36,12 @@ const CAPTION: Record<Kind, string> = {
   dom: "Rendered by the desktop's font stack — subpixel antialiasing and hinting",
 };
 
-export default function RendererLab({ settings }: { settings: AppSettings }) {
+export default function RendererLab({ settings, onPick }: {
+  settings: AppSettings;
+  /** The renderer buttons live inside this component because they sit between
+   *  the sample they change and the measurement of what they cost. */
+  onPick: (value: Kind) => void;
+}) {
   const elRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const webglRef = useRef<WebglAddon | null>(null);
@@ -166,6 +172,30 @@ export default function RendererLab({ settings }: { settings: AppSettings }) {
           ? "WebGL didn't start — this is falling back to the desktop's font stack"
           : CAPTION[active]}
       </div>
+      <Row
+        label="Renderer"
+        desc="GPU never uses the desktop's font smoothing; DOM does, and can look sharper"
+      >
+        <div className="seg">
+          {([
+            ["gpu", "GPU"],
+            ["dom", "DOM"],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              className={"seg-btn" + (active === value ? " on" : "")}
+              onClick={() => onPick(value)}
+            >{label}</button>
+          ))}
+        </div>
+      </Row>
+      {active === "dom" && (
+        <div className="sgroup-foot">
+          Switches every open terminal as you look at it. DOM is the renderer
+          that used to leave cells behind after a redraw — if you see text that
+          should be gone, that's the trade.
+        </div>
+      )}
       <div className="rlab-actions">
         <button className="rlab-btn" onClick={measure} disabled={busy}>
           {busy ? "Measuring…" : `Measure ${active.toUpperCase()}`}

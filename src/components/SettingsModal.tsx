@@ -2,6 +2,7 @@ import { ReactNode, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
 import RendererLab from "./RendererLab";
+import Row from "./SettingsRow";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
   TERM_WEIGHTS,
@@ -53,27 +54,6 @@ function ThemeCard({ id, active, onPick }: { id: string; active: boolean; onPick
       <div className="theme-card-name" style={{ color: t.vars.text }}>{t.name}</div>
       <div className="theme-card-sub" style={{ color: t.vars.textFaint }}>Aa ❯ _</div>
     </button>
-  );
-}
-
-/** One setting: name and an optional one-line description on the left, the
- *  control on the right. Every pane is built from these, so every setting
- *  reads the same way. */
-function Row({ label, desc, children, wide }: {
-  label: string;
-  desc?: string;
-  children?: ReactNode;
-  /** Control needs the full width (theme grid, preview) — render it under the text. */
-  wide?: boolean;
-}) {
-  return (
-    <div className={"srow" + (wide ? " wide" : "")}>
-      <div className="srow-info">
-        <div className="srow-label">{label}</div>
-        {desc && <div className="srow-desc">{desc}</div>}
-      </div>
-      {children && <div className="srow-ctl">{children}</div>}
-    </div>
   );
 }
 
@@ -346,43 +326,19 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                     ))}
                   </div>
                 </Row>
-                {/* Sample first, control under it: the buttons change what is
-                    drawn directly above them, so the effect is in view when the
-                    choice is made rather than scrolled off the top. */}
-                {/* The trade is hardware-dependent, so it is measured here
-                    rather than asserted. The sample is a real terminal on the
-                    selected renderer: the antialiasing difference is visible
-                    directly, without switching the app you are working in. */}
-                {/* Two real terminals, one pinned to each renderer. A styled
-                    <div> used to stand in for this, but HTML text always goes
-                    through the desktop's font stack — so it showed subpixel
-                    output next to a GPU terminal that can never produce it, and
-                    a font picked against it looked sharper than the real thing. */}
-                <RendererLab settings={settings} />
-                <Row
-                  label="Rendering"
-                  desc="GPU never uses the desktop's font smoothing; DOM does, and can look sharper"
-                >
-                  <div className="seg">
-                    {([
-                      ["gpu", "GPU"],
-                      ["dom", "DOM"],
-                    ] as const).map(([value, label]) => (
-                      <button
-                        key={value}
-                        className={"seg-btn" + (settings.termRenderer === value ? " on" : "")}
-                        onClick={() => set({ termRenderer: value })}
-                      >{label}</button>
-                    ))}
-                  </div>
-                </Row>
-                {settings.termRenderer === "dom" && (
-                  <div className="sgroup-foot">
-                    Switches every open terminal as you look at it. DOM is the
-                    renderer that used to leave cells behind after a redraw — if
-                    you see text that should be gone, that's the trade.
-                  </div>
-                )}
+              </Group>
+
+              {/* Its own block: a sample that has to sit above its buttons, and
+                  a measurement below them, is more than one setting's worth of
+                  surface. The sample is a real terminal on the selected
+                  renderer — a styled <div> used to stand in for it, but HTML
+                  text always goes through the desktop's font stack, so it
+                  showed subpixel output a GPU terminal can never produce. */}
+              <Group title="Rendering">
+                <RendererLab
+                  settings={settings}
+                  onPick={(value) => set({ termRenderer: value })}
+                />
               </Group>
 
               <Group title="Add fonts">
