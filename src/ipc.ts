@@ -421,6 +421,17 @@ export type RendererProbe = { cpuMs: number; gpuMs: number | null; ok: boolean }
  *  GPU/DOM trade from a claim into a number for the machine in front of you. */
 export const rendererProbe = () => invoke<RendererProbe>("renderer_probe");
 
+/** Put a number on the taskbar icon (0 clears it). Emitted as the Unity
+ *  LauncherEntry D-Bus signal, which Plasma honours — Tauri's own
+ *  `setBadgeCount` goes through libunity and does nothing outside Unity. */
+export const taskbarBadge = (count: number) => invoke<void>("taskbar_badge", { count });
+
+/** Rebuild the tray icon's menu: one row per waiting session. The taskbar icon
+ *  cannot do this — Plasma takes its menu from the .desktop file's static
+ *  Actions — so the count goes there and the list goes in the tray. */
+export const trayAlerts = (alerts: { key: number; title: string; message?: string }[]) =>
+  invoke<void>("tray_alerts", { alerts });
+
 
 /** What the user asked for, in the terms the UI actually has. Which engine
  *  answers is `launch.rs`'s business — nothing here names one. Sent in

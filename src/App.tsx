@@ -7,6 +7,7 @@ import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import { StartChoice } from "./components/NewSessionMenu";
 import StartControls, { useStartChoice } from "./components/StartControls";
 import TerminalView, { TermHandle, TermProgress, TermTab } from "./components/TerminalView";
+import AlertBell, { Alert } from "./components/AlertBell";
 import FileExplorer from "./components/FileExplorer";
 import GitPanel from "./components/GitPanel";
 import Composer from "./components/Composer";
@@ -39,6 +40,8 @@ import {
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
   adoptAgentSession, resolveLaunch,
+  taskbarBadge,
+  trayAlerts,
 } from "./ipc";
 import "./App.css";
 
@@ -161,6 +164,9 @@ export default function App() {
   const [notices, setNotices] = useState<Map<number, string>>(new Map());
   /** Long-running work a tab is reporting (OSC 9;4). */
   const [progress, setProgress] = useState<Map<number, TermProgress>>(new Map());
+  /** When each waiting tab started waiting — the bell lists oldest first, and
+   *  "waiting 20m" is the part that decides which one to open. */
+  const [alertAt, setAlertAt] = useState<Map<number, number>>(new Map());
   // Tabs whose process died on its own, and the exit code it died with. These
   // keep their row: the tab going away used to be the *only* sign anything had
   // happened, which is no help at all when the thing that killed it was
@@ -576,6 +582,45 @@ export default function App() {
     else handles.current.delete(key);
   }, []);
 
+  /** Everything waiting on you, oldest first — the bell list and the taskbar
+   *  number are two views of this one thing. */
+  const alerts: Alert[] = useMemo(
+    () =>
+      tabs
+        .filter((t) => attention.has(t.key))
+        .map((t) => ({
+          key: t.key,
+          title: t.title,
+          message: notices.get(t.key),
+          at: alertAt.get(t.key) ?? Date.now(),
+        }))
+        .sort((a, b) => a.at - b.at),
+    [tabs, attention, notices, alertAt],
+  );
+
+  // The count on the icon, for when aiterm is behind another window — which is
+  // the only time it matters, and the only time the in-app bell cannot be seen.
+  useEffect(() => {
+    taskbarBadge(alerts.length).catch(() => {});
+  }, [alerts.length]);
+
+  // The tray menu carries the list itself, so a waiting session can be picked
+  // without bringing aiterm forward first to read the bell.
+  useEffect(() => {
+    trayAlerts(
+      alerts.map((a) => ({ key: a.key, title: a.title, message: a.message })),
+    ).catch(() => {});
+  }, [alerts]);
+
+  // Picking one there means going to it; the window was already raised by the
+  // backend before this fires.
+  useEffect(() => {
+    const un = listen<number>("tray-alert", (e) => setActiveTab(e.payload));
+    return () => {
+      un.then((f) => f()).catch(() => {});
+    };
+  }, []);
+
   const noteActivity = useCallback((key: number) => {
     lastOutput.current.set(key, Date.now());
   }, []);
@@ -587,6 +632,13 @@ export default function App() {
       if (on === prev.has(key)) return prev;
       const next = new Set(prev);
       if (on) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+    setAlertAt((prev) => {
+      if (on === prev.has(key)) return prev;
+      const next = new Map(prev);
+      if (on) next.set(key, Date.now());
       else next.delete(key);
       return next;
     });
@@ -1583,6 +1635,7 @@ export default function App() {
             onClick={() => bumpFont(0)}
           >{Math.round(fontScale * 100)}%</button>
           <button className="icon-btn" title="Larger fonts (Ctrl+=)" onClick={() => bumpFont(1)}>A+</button>
+          <AlertBell alerts={alerts} onGo={(key) => setActiveTab(key)} />
           <button
             className={"icon-btn" + (showSettingsModal ? " on" : "")}
             title="Settings"

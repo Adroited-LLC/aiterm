@@ -13,7 +13,9 @@ pub mod providers;
 pub mod rendercost;
 pub mod pty;
 pub mod sessions;
+pub mod taskbar;
 pub mod trace;
+pub mod tray;
 pub mod usage;
 pub mod watcher;
 pub mod winstate;
@@ -47,6 +49,8 @@ pub fn run() {
             agents::detect_agents,
             agents::agent_caps,
             rendercost::renderer_probe,
+            taskbar::taskbar_badge,
+            tray::tray_alerts,
             agents::adopt_agent_session,
             diag::diag_log_path,
             diag::diag_log_tail,
@@ -137,6 +141,12 @@ pub fn run() {
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.
+            // The tray is where a waiting session can be reached from while
+            // aiterm is behind something. Failing to create one is not worth
+            // refusing to start over.
+            if let Err(e) = tray::init(app.handle()) {
+                crate::diag!("tray", "could not create tray icon: {e}");
+            }
             winstate::correct_restored_size(app.handle());
             // Then measure what actually landed, once the compositor has
             // settled the surface, and remember it for next launch.
