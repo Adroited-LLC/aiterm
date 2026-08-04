@@ -88,6 +88,18 @@ const AGENT_SESSION_MARKERS: &[&str] = &[
     "CLAUDE_PID",
 ];
 
+/// What the terminal on the other end can do.
+///
+/// xterm.js draws 24-bit colour in both its renderers, but nothing in `TERM`
+/// can say so — there is no truecolor terminfo entry to name, which is why
+/// `TERM` stays the 256-colour one programs actually look up. `COLORTERM` is
+/// the out-of-band signal they test for, and without it claude, delta and bat
+/// all quantise to 256 and say so in a startup tip.
+fn describe_terminal(cmd: &mut CommandBuilder) {
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+}
+
 /// Drop the parent session's markers so the child starts as its own session.
 ///
 /// Applies to shells as well as agent commands: a shell that inherits them is
@@ -130,7 +142,7 @@ pub fn pty_spawn(
         }
         None => CommandBuilder::new(&shell),
     };
-    cmd.env("TERM", "xterm-256color");
+    describe_terminal(&mut cmd);
     scrub_agent_markers(&mut cmd);
     // A provider-backed tab (OpenCode on an OpenRouter model) gets the key as
     // process environment, resolved here from the provider store. It never
@@ -554,6 +566,28 @@ mod tests {
         std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    /// TERM names a terminfo entry programs look up; COLORTERM is the separate
+    /// signal for 24-bit colour, which no TERM value can carry. Both are
+    /// needed, and dropping either quietly costs colour depth rather than
+    /// failing.
+    #[test]
+    fn a_spawned_terminal_advertises_truecolour_as_well_as_256() {
+        let mut cmd = CommandBuilder::new("true");
+        describe_terminal(&mut cmd);
+        assert_eq!(cmd.get_env("TERM"), Some("xterm-256color".as_ref()));
+        assert_eq!(cmd.get_env("COLORTERM"), Some("truecolor".as_ref()));
+    }
+
+    /// A scrub after the description must not take the terminal's own
+    /// capabilities with it — they are not a parent session's markers.
+    #[test]
+    fn scrubbing_agent_markers_leaves_the_colour_signal_alone() {
+        let mut cmd = CommandBuilder::new("true");
+        describe_terminal(&mut cmd);
+        scrub_agent_markers(&mut cmd);
+        assert_eq!(cmd.get_env("COLORTERM"), Some("truecolor".as_ref()));
     }
 
     /// A shell tab is scrubbed too — it is one `claude` away from the same
