@@ -3,6 +3,7 @@ import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions 
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import { TermProgress } from "./TerminalView";
+import { followRekey } from "../selection";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -126,6 +127,11 @@ interface Props {
   progressSlots: Map<string, TermProgress>;
   /** Slot id of the terminal currently displayed. */
   activeSlot: string | null;
+  /** Set when a tab swapped the conversation it holds (/clear, /fork, or
+   *  picking another agent from claude's own agents screen). The click
+   *  selection follows it, so the highlight does not stay on the conversation
+   *  that was left behind. */
+  rekey: { from: string; to: string; seq: number } | null;
   opts: SessionDisplayOpts;
   onOptsChange: (o: SessionDisplayOpts) => void;
   /** What an engine supports, by agent id. Every lifecycle button in a row is
@@ -166,7 +172,7 @@ interface Props {
 
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots,
-  attentionText, progressSlots, activeSlot, opts,
+  attentionText, progressSlots, activeSlot, rekey, opts,
   capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
@@ -236,6 +242,13 @@ export default function SessionsPanel({
   const suppressClick = useRef(false);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
+
+  // Only a selection that held the old id moves; one built by ctrl-clicking
+  // rows for a drag belongs to the user and is left alone.
+  useEffect(() => {
+    if (!rekey) return;
+    setSelected((prev) => followRekey(prev, rekey.from, rekey.to));
+  }, [rekey]);
   // Displayed id sequence per container, read by the drop handler.
   const containerSeq = useRef<Map<string, string[]>>(new Map());
 

@@ -583,6 +583,18 @@ export default function App() {
     else handles.current.delete(key);
   }, []);
 
+  /** The last time a tab changed which conversation it holds. The sidebar's
+   *  click-selection follows this: without it the selection keeps pointing at
+   *  the conversation you left, wearing the loudest highlight of the three
+   *  while the live row wears the faintest. Carries a sequence so two
+   *  identical moves still read as two events. */
+  const [rekey, setRekey] = useState<{ from: string; to: string; seq: number } | null>(null);
+  const rekeySeq = useRef(0);
+  const noteRekey = useCallback((from: string, to: string) => {
+    rekeySeq.current += 1;
+    setRekey({ from, to, seq: rekeySeq.current });
+  }, []);
+
   /** Everything waiting on you, oldest first — the bell list and the taskbar
    *  number are two views of this one thing. */
   const alerts: Alert[] = useMemo(
@@ -966,6 +978,7 @@ export default function App() {
               : x,
           ),
         );
+        noteRekey(pinned, moved.id);
         setVacated((prev) => new Set(prev).add(pinned));
         setNotice(
           moved.kind === "cleared"
@@ -1068,6 +1081,7 @@ export default function App() {
               : x,
           ),
         );
+        noteRekey(old, evt.sessionId);
         if (newConversation) {
           // The roster keeps listing the old id while the client process
           // lives; only we know the terminal left it behind.
@@ -1699,6 +1713,7 @@ export default function App() {
                   }),
                 )}
                 activeSlot={activeTabObj?.slotId ?? null}
+                rekey={rekey}
                 capsOf={capsOf}
                 opts={opts}
                 onOptsChange={setOpts}
