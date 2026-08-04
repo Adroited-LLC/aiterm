@@ -429,6 +429,16 @@ export const taskbarBadge = (count: number) => invoke<void>("taskbar_badge", { c
 /** Rebuild the tray icon's menu: one row per waiting session. The taskbar icon
  *  cannot do this — Plasma takes its menu from the .desktop file's static
  *  Actions — so the count goes there and the list goes in the tray. */
+/** Raise a desktop popup, or update one already on screen by passing its id.
+ *  Returns the daemon's id. Unlike the taskbar count and the tray menu, this
+ *  needs nothing from the desktop — GNOME and Plasma both implement it. */
+export const desktopNotify = (summary: string, body: string, replaces: number) =>
+  invoke<number | null>("desktop_notify", { summary, body, replaces });
+
+/** Take a popup down once the session it was about stops waiting. */
+export const desktopNotifyClose = (id: number) =>
+  invoke<void>("desktop_notify_close", { id });
+
 export const trayAlerts = (alerts: { key: number; title: string; message?: string }[]) =>
   invoke<void>("tray_alerts", { alerts });
 

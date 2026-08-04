@@ -42,6 +42,7 @@ import {
   adoptAgentSession, resolveLaunch,
   taskbarBadge,
   trayAlerts,
+  desktopNotify, desktopNotifyClose,
 } from "./ipc";
 import "./App.css";
 
@@ -610,6 +611,35 @@ export default function App() {
     trayAlerts(
       alerts.map((a) => ({ key: a.key, title: a.title, message: a.message })),
     ).catch(() => {});
+  }, [alerts]);
+
+  /** Daemon ids of popups currently on screen, by tab. A ref, not state: these
+   *  are the desktop's business, and re-rendering over them would be noise. */
+  const popups = useRef<Map<number, number>>(new Map());
+
+  // A popup only when aiterm is not the window you are looking at — if it is,
+  // the bell is right there and a notification would be telling you something
+  // you can already see.
+  useEffect(() => {
+    const waiting = new Set(alerts.map((a) => a.key));
+    for (const [key, id] of popups.current) {
+      if (!waiting.has(key)) {
+        popups.current.delete(key);
+        desktopNotifyClose(id).catch(() => {});
+      }
+    }
+    if (document.hasFocus()) return;
+    for (const a of alerts) {
+      if (popups.current.has(a.key)) continue;
+      // Claimed before the await so a second pass cannot post a duplicate
+      // while the first is still in flight.
+      popups.current.set(a.key, 0);
+      desktopNotify(a.title, a.message ?? "Waiting for your input", 0)
+        .then((id) => {
+          if (id && popups.current.get(a.key) === 0) popups.current.set(a.key, id);
+        })
+        .catch(() => popups.current.delete(a.key));
+    }
   }, [alerts]);
 
   // Picking one there means going to it; the window was already raised by the

@@ -8,6 +8,7 @@ pub mod git;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;
+pub mod notify;
 pub mod opencode;
 pub mod providers;
 pub mod rendercost;
@@ -50,6 +51,8 @@ pub fn run() {
             agents::agent_caps,
             rendercost::renderer_probe,
             taskbar::taskbar_badge,
+            notify::desktop_notify,
+            notify::desktop_notify_close,
             tray::tray_alerts,
             agents::adopt_agent_session,
             diag::diag_log_path,
