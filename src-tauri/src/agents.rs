@@ -81,6 +81,11 @@ pub struct Caps {
     /// never by omission, and `session_delete` checks this itself rather than
     /// trusting the UI to have hidden the button.
     pub delete: bool,
+    /// The engine has configuration aiterm can read and show — the Settings
+    /// button on its row in the Agents pane. Off by default: an engine whose
+    /// config aiterm cannot read is better with no button than with an empty
+    /// panel.
+    pub config: bool,
 }
 
 /// What is known about an agent on this machine right now.
@@ -249,6 +254,18 @@ fn q(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// The flags every claude aiterm launches carries.
+///
+/// Public and used by the launcher below, so the configuration panel can show
+/// what a session actually starts with instead of a hand-copied list that will
+/// eventually disagree with it.
+///
+/// `--allow-dangerously-skip-permissions` is the consequential one: it disables
+/// the permission prompt outright. Kept from the frontend's old `CLAUDE_CMD`,
+/// reasoning unchanged.
+pub const CLAUDE_LAUNCH_FLAGS: &[&str] =
+    &["--permission-mode auto", "--allow-dangerously-skip-permissions"];
+
 pub struct ClaudeBackend;
 
 impl AgentBackend for ClaudeBackend {
@@ -279,6 +296,7 @@ impl AgentBackend for ClaudeBackend {
             tui_drive: true,
             panels: true,
             delete: true,
+            config: true,
         }
     }
 
@@ -333,8 +351,7 @@ impl AgentBackend for ClaudeBackend {
     /// unchanged — see the comment this replaced in App.tsx. Moving it here is
     /// a relocation, not a behaviour change.
     fn launch(&self, spec: &LaunchSpec) -> String {
-        let mut cmd =
-            String::from("claude --permission-mode auto --allow-dangerously-skip-permissions");
+        let mut cmd = format!("claude {}", CLAUDE_LAUNCH_FLAGS.join(" "));
         // The SessionStart hook that reports the session id and pid back to
         // aiterm — additional settings, so the user's own config is untouched.
         // Absent only if the settings file could not be written, in which case
@@ -1190,6 +1207,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_launcher_uses_the_flag_list_the_panel_will_show() {
+        // A panel that re-typed these would drift from what is actually run, and
+        // this is the surface where being wrong is worst.
+        let cmd = ClaudeBackend.launch(&LaunchSpec::default());
+        for flag in CLAUDE_LAUNCH_FLAGS {
+            assert!(cmd.contains(flag), "{flag} missing from {cmd}");
+        }
+    }
+
+    #[test]
+    fn only_an_engine_with_a_config_surface_offers_one() {
+        assert!(ClaudeBackend.caps().config, "claude has settings.json to show");
+        assert!(!CodexBackend.caps().config, "nothing is read for codex yet");
+    }
+
+    #[test]
     fn which_finds_a_program_that_exists_and_misses_one_that_does_not() {
         assert!(which("sh").is_some(), "sh should be on PATH");
         assert!(
@@ -1773,6 +1806,7 @@ mod tests {
                 tui_drive: true,
                 panels: true,
                 delete: true,
+                config: true,
             },
         );
         assert_eq!(CodexBackend.caps(), Caps { delete: true, ..Default::default() });

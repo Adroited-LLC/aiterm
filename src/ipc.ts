@@ -401,6 +401,8 @@ export interface Caps {
    *  conversation. Hiding the button is the courtesy; `session_delete` refuses
    *  on the same flag, which is the actual guard. */
   delete: boolean;
+  /** The engine has configuration aiterm can read — its Settings button. */
+  config: boolean;
 }
 
 /** Every registered engine's capabilities, keyed by agent id.
