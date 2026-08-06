@@ -62,29 +62,50 @@ fn attach_errors(layers: &mut [Layer], errors: &[String]) {
     }
 }
 
-#[tauri::command]
-pub fn claude_settings(project: Option<String>) -> SettingsView {
-    let h = home();
+/// A layer we could not read at all.
+///
+/// Absence is not an error — the spec is explicit that a missing file reads as
+/// "not present". Anything else is: a settings file that exists and governs
+/// every session in this project, but is unreadable, must not look identical to
+/// one that was never written.
+fn unreadable(id: LayerId, path: &str, e: &std::io::Error) -> Layer {
+    let error = match e.kind() {
+        std::io::ErrorKind::NotFound => None,
+        _ => Some(e.to_string()),
+    };
+    Layer { id, path: path.to_string(), present: false, error }
+}
+
+/// Read every settings layer once: a row per file for display, plus the text of
+/// the ones that were readable.
+///
+/// Shared with `claude_skills`, which needs `enabledPlugins` out of the same
+/// layers — a plugin can be switched off in a project file, not only in
+/// `~/.claude/settings.json`.
+fn read_layers(home: &str, project: Option<&str>) -> (Vec<Layer>, Vec<(LayerId, String)>) {
     // The real path the hook writer uses — falling back to the historical
     // default only when dirs::data_dir() can't resolve at all (no HOME),
     // where the whole panel is already guesswork.
     let injected = crate::hooklink::settings_path()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("{h}/.local/share/aiterm/claude-hook-settings.json"));
-    let paths = layer_paths(&h, project.as_deref(), &injected);
+        .unwrap_or_else(|| format!("{home}/.local/share/aiterm/claude-hook-settings.json"));
     let mut layers = Vec::new();
     let mut texts: Vec<(LayerId, String)> = Vec::new();
-    for (id, path) in &paths {
-        match std::fs::read_to_string(path) {
+    for (id, path) in layer_paths(home, project, &injected) {
+        match std::fs::read_to_string(&path) {
             Ok(t) => {
-                layers.push(Layer { id: *id, path: path.clone(), present: true, error: None });
-                texts.push((*id, t));
+                layers.push(Layer { id, path, present: true, error: None });
+                texts.push((id, t));
             }
-            Err(_) => {
-                layers.push(Layer { id: *id, path: path.clone(), present: false, error: None })
-            }
+            Err(e) => layers.push(unreadable(id, &path, &e)),
         }
     }
+    (layers, texts)
+}
+
+#[tauri::command]
+pub fn claude_settings(project: Option<String>) -> SettingsView {
+    let (mut layers, texts) = read_layers(&home(), project.as_deref());
     let borrowed: Vec<(LayerId, &str)> = texts.iter().map(|(i, t)| (*i, t.as_str())).collect();
     let (settings, errors) = settings::resolve(&borrowed);
     attach_errors(&mut layers, &errors);
@@ -115,6 +136,8 @@ pub struct McpView {
     /// False when no local config could be read at all, which is a different
     /// answer from "none configured".
     pub local_config_read: bool,
+    /// Parse failures, one per source that exists but is malformed.
+    pub errors: Vec<String>,
 }
 
 #[tauri::command]
@@ -124,24 +147,53 @@ pub fn claude_mcp(project: Option<String>) -> McpView {
     let mcp_json = project
         .as_ref()
         .and_then(|p| std::fs::read_to_string(format!("{p}/.mcp.json")).ok());
-    let (servers, local_config_read) = mcp::read(
+    let (servers, local_config_read, errors) = mcp::read(
         claude_json.as_deref(),
         mcp_json.as_deref(),
         project.as_deref().unwrap_or(""),
     );
-    McpView { servers, local_config_read }
+    McpView { servers, local_config_read, errors }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillsView {
+    pub skills: Vec<skills::Skill>,
+    /// Installed plugins that settings switch off. Their skills are on disk but
+    /// out of a session's reach, so the panel says how many it left out rather
+    /// than presenting a short list as the whole truth.
+    pub disabled_plugins: usize,
+    /// Why a source could not be used — a malformed plugin record otherwise
+    /// reads as "no skills found".
+    pub errors: Vec<String>,
 }
 
 #[tauri::command]
-pub fn claude_skills(project: Option<String>) -> Vec<skills::Skill> {
+pub fn claude_skills(project: Option<String>) -> SkillsView {
     let h = home();
     let mut roots = vec![("user".to_string(), format!("{h}/.claude/skills"))];
     if let Some(p) = &project {
         roots.push(("project".to_string(), format!("{p}/.claude/skills")));
     }
-    let installed = std::fs::read_to_string(format!("{h}/.claude/plugins/installed_plugins.json"))
-        .unwrap_or_default();
-    roots.extend(skills::plugin_roots(&installed));
+
+    let (_, texts) = read_layers(&h, project.as_deref());
+    let layer_texts: Vec<&str> = texts.iter().map(|(_, t)| t.as_str()).collect();
+    let enabled = skills::enabled_plugins(&layer_texts);
+
+    let mut errors = Vec::new();
+    let record = format!("{h}/.claude/plugins/installed_plugins.json");
+    let plugins = match std::fs::read_to_string(&record) {
+        Ok(t) => skills::plugin_roots(&t, &enabled),
+        // No plugin record is the ordinary state of an install with no plugins,
+        // not a failure. Any other read error is one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => skills::PluginRoots::default(),
+        Err(e) => skills::PluginRoots {
+            errors: vec![format!("installed_plugins.json: {e}")],
+            ..Default::default()
+        },
+    };
+    errors.extend(plugins.errors);
+    roots.extend(plugins.roots);
 
     let mut out = Vec::new();
     for (source, dir) in roots {
@@ -160,7 +212,7 @@ pub fn claude_skills(project: Option<String>) -> Vec<skills::Skill> {
         }
     }
     out.sort_by(|a, b| (a.source.clone(), a.name.clone()).cmp(&(b.source.clone(), b.name.clone())));
-    out
+    SkillsView { skills: out, disabled_plugins: plugins.disabled, errors }
 }
 
 #[cfg(test)]
@@ -229,6 +281,23 @@ mod tests {
         }];
         attach_errors(&mut layers, &["user: bad thing: at line 3 column 5".to_string()]);
         assert_eq!(layers[0].error.as_deref(), Some("bad thing: at line 3 column 5"));
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_is_not_an_error() {
+        let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let l = unreadable(LayerId::User, "/h/.claude/settings.json", &e);
+        assert!(!l.present);
+        assert!(l.error.is_none(), "{:?}", l.error);
+    }
+
+    #[test]
+    fn a_file_that_exists_but_cannot_be_read_says_so_instead_of_reading_as_absent() {
+        // It still governs every session; "not present" would be a wrong answer
+        // to the only question this panel is asked.
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let l = unreadable(LayerId::ProjectLocal, "/p/.claude/settings.local.json", &e);
+        assert!(l.error.is_some(), "an unreadable layer must explain itself");
     }
 
     /// Reads the real home directory, so it is skipped where there is none.

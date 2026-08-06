@@ -458,6 +458,8 @@ export interface ClaudeMcpView {
   servers: { name: string; scope: string; command: string | null; enabled: boolean | null }[];
   /** False means nothing local was readable — not the same as none configured. */
   localConfigRead: boolean;
+  /** One per source that exists but is malformed. */
+  errors: string[];
 }
 
 export interface ClaudeSkill {
@@ -467,6 +469,14 @@ export interface ClaudeSkill {
   path: string;
 }
 
+export interface ClaudeSkillsView {
+  skills: ClaudeSkill[];
+  /** Installed plugins switched off in settings, whose skills are therefore
+   *  absent from `skills` — a short list needs that number to be readable. */
+  disabledPlugins: number;
+  errors: string[];
+}
+
 export const claudeSettings = (project: string | null) =>
   invoke<ClaudeSettingsView>("claude_settings", { project });
 export const claudeInstructions = (project: string | null) =>
@@ -474,7 +484,7 @@ export const claudeInstructions = (project: string | null) =>
 export const claudeMcp = (project: string | null) =>
   invoke<ClaudeMcpView>("claude_mcp", { project });
 export const claudeSkills = (project: string | null) =>
-  invoke<ClaudeSkill[]>("claude_skills", { project });
+  invoke<ClaudeSkillsView>("claude_skills", { project });
 
 /** One reading of the web process's cost counters. Cumulative since it
  *  started, so a measurement is always the difference between two calls —

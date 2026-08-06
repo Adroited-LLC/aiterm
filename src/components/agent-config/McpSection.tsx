@@ -18,6 +18,11 @@ export default function McpSection({ project }: { project: string | null }) {
   return (
     <div className="acfg-body">
       <div className="acfg-grp">Registered locally</div>
+      {/* A file that is there but unparseable would otherwise be reported as a
+          file that could not be read, which is what an absent one says too. */}
+      {view.errors.map((e) => (
+        <div key={e} className="acfg-err">{e}</div>
+      ))}
       {view.servers.length === 0 ? (
         <div className="acfg-empty">
           {view.localConfigRead
