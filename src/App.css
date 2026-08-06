@@ -2661,3 +2661,26 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .acfg-empty { font-size: 11px; color: var(--text-faint); padding: 8px 0; }
 .acfg-err { font-size: 11px; color: var(--red); padding: 4px 0; }
+.acfg-grp {
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-faint); padding: 12px 0 6px;
+}
+.acfg-file, .acfg-set { display: flex; align-items: baseline; gap: 8px; padding: 4px 0; flex-wrap: wrap; }
+.acfg-file-tag, .acfg-src {
+  font-size: 10px; color: var(--text-faint); min-width: 74px;
+}
+.acfg-file-path { font-size: 11px; color: var(--text-dim); overflow-wrap: anywhere; }
+.acfg-file-path.gone { opacity: 0.55; }
+.acfg-file-state { font-size: 10px; color: var(--text-faint); }
+.acfg-open {
+  margin-left: auto; background: none; border: 1px solid var(--border);
+  border-radius: 5px; color: var(--text-dim); font-size: 10px;
+  padding: 2px 7px; cursor: pointer;
+}
+.acfg-open:hover { color: var(--text); }
+.acfg-key { font-size: 12px; min-width: 190px; overflow-wrap: anywhere; }
+.acfg-val { font-size: 12px; color: var(--accent); overflow-wrap: anywhere; }
+.acfg-src { margin-left: auto; text-align: right; }
+.acfg-over { flex-basis: 100%; font-size: 10px; color: var(--text-faint); }
+.acfg-flags { display: flex; flex-direction: column; gap: 3px; }
+.acfg-flag { font-size: 11px; color: var(--text-dim); }
