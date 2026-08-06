@@ -423,6 +423,9 @@ export interface ClaudeLayer {
   present: boolean;
   /** Why an existing file could not be used. */
   error: string | null;
+  /** Both the raw editor's starting content and the token a save is compared
+   *  against to detect collisions (file moved under us). */
+  text: string;
 }
 
 export interface ClaudeSetting {
@@ -485,6 +488,28 @@ export const claudeMcp = (project: string | null) =>
   invoke<ClaudeMcpView>("claude_mcp", { project });
 export const claudeSkills = (project: string | null) =>
   invoke<ClaudeSkillsView>("claude_skills", { project });
+
+/** Why a save was refused. `collision` is the one the UI must treat specially —
+ *  it means the file moved under us and the answer is to reload, not to fix
+ *  anything. */
+export type ClaudeSaveError =
+  | { kind: "collision" }
+  | { kind: "notAnObject" }
+  | { kind: "invalid"; detail: string }
+  | { kind: "io"; detail: string };
+
+/** Replace one layer's whole file. `loadedText` must be the bytes last read. */
+export const claudeSaveLayer = (path: string, newText: string, loadedText: string) =>
+  invoke<void>("claude_save_layer", { path, newText, loadedText });
+
+/** Change a single key in one layer, applied onto the file as it stands so keys
+ *  the panel does not understand are not dropped. */
+export const claudeSetKey = (
+  path: string,
+  dottedKey: string,
+  value: unknown,
+  loadedText: string,
+) => invoke<void>("claude_set_key", { path, dottedKey, value, loadedText });
 
 /** One reading of the web process's cost counters. Cumulative since it
  *  started, so a measurement is always the difference between two calls —
