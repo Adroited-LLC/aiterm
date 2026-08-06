@@ -175,4 +175,13 @@ mod tests {
             "temp file was left behind"
         );
     }
+
+    #[test]
+    fn the_command_surfaces_a_collision_as_a_typed_error_not_a_string() {
+        // The UI has to tell a collision apart from a syntax error to offer
+        // "reload" rather than "fix your JSON".
+        let e = SaveError::Collision;
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("collision"), "{json}");
+    }
 }

@@ -52,6 +52,7 @@ pub fn run() {
             agents::agent_caps,
             rendercost::renderer_probe,
             claudecfg::claude_settings,
+            claudecfg::claude_save_layer,
             claudecfg::claude_instructions,
             claudecfg::claude_mcp,
             claudecfg::claude_skills,

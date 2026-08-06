@@ -74,7 +74,7 @@ fn unreadable(id: LayerId, path: &str, e: &std::io::Error) -> Layer {
         std::io::ErrorKind::NotFound => None,
         _ => Some(e.to_string()),
     };
-    Layer { id, path: path.to_string(), present: false, error }
+    Layer { id, path: path.to_string(), present: false, error, text: String::new() }
 }
 
 /// Read every settings layer once: a row per file for display, plus the text of
@@ -95,7 +95,9 @@ fn read_layers(home: &str, project: Option<&str>) -> (Vec<Layer>, Vec<(LayerId, 
     for (id, path) in layer_paths(home, project, &injected) {
         match std::fs::read_to_string(&path) {
             Ok(t) => {
-                layers.push(Layer { id, path, present: true, error: None });
+                // Clone into the layer; avoid a second read by using the same text
+                // as the collision token.
+                layers.push(Layer { id, path, present: true, error: None, text: t.clone() });
                 texts.push((id, t));
             }
             Err(e) => layers.push(unreadable(id, &path, &e)),
@@ -117,6 +119,17 @@ pub fn claude_settings(project: Option<String>) -> SettingsView {
         order: concern::ORDER.iter().map(|s| s.to_string()).collect(),
         injected_flags: injected_flags().iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// Replace one settings layer's contents. `loaded_text` must be the bytes the
+/// panel last read, or the save is refused — see `write::save_layer`.
+#[tauri::command]
+pub fn claude_save_layer(
+    path: String,
+    new_text: String,
+    loaded_text: String,
+) -> Result<(), write::SaveError> {
+    write::save_layer(&path, &new_text, &loaded_text)
 }
 
 #[tauri::command]
@@ -254,8 +267,8 @@ mod tests {
     #[test]
     fn a_layer_that_failed_to_parse_wears_its_own_error() {
         let mut layers = vec![
-            Layer { id: LayerId::User, path: "/h/s.json".into(), present: true, error: None },
-            Layer { id: LayerId::Project, path: "/p/s.json".into(), present: true, error: None },
+            Layer { id: LayerId::User, path: "/h/s.json".into(), present: true, error: None, text: String::new() },
+            Layer { id: LayerId::Project, path: "/p/s.json".into(), present: true, error: None, text: String::new() },
         ];
         attach_errors(&mut layers, &["project: expected value at line 1".to_string()]);
         assert_eq!(layers[1].error.as_deref(), Some("expected value at line 1"));
@@ -267,7 +280,7 @@ mod tests {
         // "project local" contains a space; a split on the wrong separator, or a
         // match on the first word, would silently attach nothing.
         let mut layers = vec![Layer {
-            id: LayerId::ProjectLocal, path: "/p/l.json".into(), present: true, error: None,
+            id: LayerId::ProjectLocal, path: "/p/l.json".into(), present: true, error: None, text: String::new(),
         }];
         attach_errors(&mut layers, &["project local: trailing comma".to_string()]);
         assert_eq!(layers[0].error.as_deref(), Some("trailing comma"));
@@ -278,7 +291,7 @@ mod tests {
         // split_once, not split — otherwise the message is truncated at its own
         // punctuation and the row explains less than it could.
         let mut layers = vec![Layer {
-            id: LayerId::User, path: "/h/s.json".into(), present: true, error: None,
+            id: LayerId::User, path: "/h/s.json".into(), present: true, error: None, text: String::new(),
         }];
         attach_errors(&mut layers, &["user: bad thing: at line 3 column 5".to_string()]);
         assert_eq!(layers[0].error.as_deref(), Some("bad thing: at line 3 column 5"));
@@ -310,5 +323,21 @@ mod tests {
         let s = claude_settings(None);
         // Whatever is on this machine, the shape must be answerable.
         assert!(s.layers.iter().any(|l| l.id == settings::LayerId::User));
+    }
+
+    #[test]
+    fn a_layer_carries_the_bytes_it_was_read_from() {
+        // The raw editor needs the text, and the same bytes are the collision
+        // token — one read, one source of truth for both.
+        if std::env::var("HOME").is_err() {
+            return;
+        }
+        let v = claude_settings(None);
+        let user = v.layers.iter().find(|l| l.id == settings::LayerId::User).unwrap();
+        if user.present {
+            assert!(!user.text.is_empty(), "a present layer must carry its text");
+        } else {
+            assert!(user.text.is_empty(), "an absent layer carries no text");
+        }
     }
 }

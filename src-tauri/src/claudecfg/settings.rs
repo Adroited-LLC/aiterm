@@ -43,6 +43,12 @@ pub struct Layer {
     pub present: bool,
     /// Why this layer could not be used, when it exists but did not parse.
     pub error: Option<String>,
+    /// The exact bytes read, empty when the file is absent.
+    ///
+    /// Serves two jobs at once on purpose: the raw editor's initial content,
+    /// and the token a save is checked against. Reading the file twice would
+    /// invite the two to disagree.
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
