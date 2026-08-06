@@ -7,6 +7,7 @@ pub mod concern;
 pub mod instructions;
 pub mod mcp;
 pub mod skills;
+pub mod write;
 
 use serde::Serialize;
 use settings::{Layer, LayerId, Setting};
