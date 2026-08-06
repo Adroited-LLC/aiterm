@@ -2684,3 +2684,4 @@ input[type="range"]::-webkit-slider-thumb {
 .acfg-over { flex-basis: 100%; font-size: 10px; color: var(--text-faint); }
 .acfg-flags { display: flex; flex-direction: column; gap: 3px; }
 .acfg-flag { font-size: 11px; color: var(--text-dim); }
+.acfg-desc { color: var(--text-dim); }
