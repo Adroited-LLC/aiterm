@@ -414,6 +414,65 @@ export interface Caps {
  *  longer registered, and the caller treats it as capable of nothing. */
 export const agentCaps = () => invoke<Record<string, Caps>>("agent_caps");
 
+/** Which file set a value. `injected` is aiterm's own --settings file. */
+export type ClaudeLayerId = "user" | "project" | "projectLocal" | "injected";
+
+export interface ClaudeLayer {
+  id: ClaudeLayerId;
+  path: string;
+  present: boolean;
+  /** Why an existing file could not be used. */
+  error: string | null;
+}
+
+export interface ClaudeSetting {
+  key: string;
+  concern: string;
+  effective: unknown;
+  winner: ClaudeLayerId;
+  /** Lowest precedence first, so the last entry is the winner. */
+  setIn: { layer: ClaudeLayerId; value: unknown }[];
+}
+
+export interface ClaudeSettingsView {
+  layers: ClaudeLayer[];
+  settings: ClaudeSetting[];
+  errors: string[];
+  order: string[];
+  /** Flags aiterm adds to every claude launch, from the launcher's own list. */
+  injectedFlags: string[];
+}
+
+export interface ClaudeDoc {
+  source: string;
+  path: string;
+  present: boolean;
+  lines: number;
+  imports: ClaudeDoc[];
+}
+
+export interface ClaudeMcpView {
+  servers: { name: string; scope: string; command: string | null; enabled: boolean | null }[];
+  /** False means nothing local was readable — not the same as none configured. */
+  localConfigRead: boolean;
+}
+
+export interface ClaudeSkill {
+  name: string;
+  description: string;
+  source: string;
+  path: string;
+}
+
+export const claudeSettings = (project: string | null) =>
+  invoke<ClaudeSettingsView>("claude_settings", { project });
+export const claudeInstructions = (project: string | null) =>
+  invoke<ClaudeDoc[]>("claude_instructions", { project });
+export const claudeMcp = (project: string | null) =>
+  invoke<ClaudeMcpView>("claude_mcp", { project });
+export const claudeSkills = (project: string | null) =>
+  invoke<ClaudeSkill[]>("claude_skills", { project });
+
 /** One reading of the web process's cost counters. Cumulative since it
  *  started, so a measurement is always the difference between two calls —
  *  `ok: false` means no web process was found and the numbers mean nothing. */
