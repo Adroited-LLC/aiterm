@@ -75,10 +75,22 @@ function describeSaveError(e: unknown): { collision: boolean; text: string } {
 function SettingRow({
   s,
   layer,
+  busy,
+  setBusy,
   onSaved,
 }: {
   s: ClaudeSetting;
   layer: ClaudeLayer | undefined;
+  /** True while *any* row in the section has a save in flight — not just
+   *  this one. Two rows can resolve to the same layer, and a save reads
+   *  `layer.text` at click time; if a second row saves before the first
+   *  row's post-save reload lands, both sent the same now-stale text and
+   *  the second write collides against its own section's first write. That
+   *  looks to the user like "the file changed on disk," which is only true
+   *  of the first save, not the second — so this has to block section-wide,
+   *  not per row. */
+  busy: boolean;
+  setBusy: (b: boolean) => void;
   onSaved: () => Promise<void>;
 }) {
   const editable = classify(s.effective);
@@ -134,7 +146,8 @@ function SettingRow({
           : JSON.stringify(items) !== JSON.stringify(editable.value);
 
   const numValid = editable.kind !== "number" || (text.trim() !== "" && !Number.isNaN(Number(text)));
-  const canSave = dirty && numValid && !saving;
+  const canSave = dirty && numValid && !saving && !busy;
+  const disabled = saving || busy;
 
   function cancel() {
     const d = draftFrom(editable);
@@ -156,6 +169,10 @@ function SettingRow({
             ? bool
             : items;
     setSaving(true);
+    // Set section-wide, not just this row's own flag: a second row's save
+    // must not start until this one's reload has landed, or it captures the
+    // same `layer.text` this call is about to make stale.
+    setBusy(true);
     setErr(null);
     try {
       await claudeSetKey(layer.path, s.key, value, layer.text);
@@ -167,6 +184,7 @@ function SettingRow({
       setErr(describeSaveError(e));
     } finally {
       setSaving(false);
+      setBusy(false);
     }
   }
 
@@ -186,7 +204,7 @@ function SettingRow({
           className="acfg-edit"
           type="text"
           value={text}
-          disabled={saving}
+          disabled={disabled}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && canSave && save()}
         />
@@ -196,7 +214,7 @@ function SettingRow({
           className="acfg-edit"
           type="number"
           value={text}
-          disabled={saving}
+          disabled={disabled}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && canSave && save()}
         />
@@ -206,7 +224,7 @@ function SettingRow({
           <input
             type="checkbox"
             checked={bool}
-            disabled={saving}
+            disabled={disabled}
             onChange={(e) => setBool(e.target.checked)}
           />
         </label>
@@ -218,7 +236,7 @@ function SettingRow({
               {it}
               <button
                 type="button"
-                disabled={saving}
+                disabled={disabled}
                 onClick={() => setItems(items.filter((_, j) => j !== i))}
               >
                 ×
@@ -229,7 +247,7 @@ function SettingRow({
             type="text"
             placeholder="add…"
             value={newItem}
-            disabled={saving}
+            disabled={disabled}
             onChange={(e) => setNewItem(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && addItem()}
           />
@@ -243,7 +261,7 @@ function SettingRow({
           <button className="acfg-save" disabled={!canSave} onClick={save}>
             {saving ? "Saving…" : "Save"}
           </button>
-          <button className="acfg-cancel" disabled={saving} onClick={cancel}>
+          <button className="acfg-cancel" disabled={disabled} onClick={cancel}>
             Cancel
           </button>
         </>
@@ -291,6 +309,14 @@ function SettingRow({
 export default function SettingsSection({ project }: { project: string | null }) {
   const [view, setView] = useState<ClaudeSettingsView | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // One flag for the whole section, not one per row: two rows can share a
+  // winning layer, and a save reads that layer's `text` at click time. If a
+  // second row's save fires before the first row's reload has replaced
+  // `view`, both saves used the same now-stale text and the second is
+  // refused as a collision — which is really the section racing itself, not
+  // the file changing externally. Gating every row on one flag is what
+  // makes "save starts" and "reload finishes" atomic from the user's side.
+  const [busy, setBusy] = useState(false);
 
   // Shared by the mount fetch and every row's post-save refresh: a save
   // invalidates every layer's `text`, so the only safe follow-up is asking
@@ -375,6 +401,8 @@ export default function SettingsSection({ project }: { project: string | null })
               key={s.key}
               s={s}
               layer={view.layers.find((l) => l.id === s.winner)}
+              busy={busy}
+              setBusy={setBusy}
               onSaved={reload}
             />
           ))}
