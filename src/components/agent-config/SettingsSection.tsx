@@ -28,7 +28,16 @@ export default function SettingsSection({ project }: { project: string | null })
   if (error) return <div className="acfg-err">{error}</div>;
   if (!view) return <div className="acfg-empty">Reading…</div>;
 
-  const groups = view.order.filter((g) => view.settings.some((s) => s.concern === g));
+  // Groups in the order the backend asked for, then any concern it did not
+  // mention. `concern::of` falls everything unrecognised into "Other", which is
+  // always in `order` — but this panel's promise is that a setting in effect is
+  // always visible, so it does not rely on that holding. A concern that appears
+  // out of nowhere gets shown, not dropped.
+  const named = view.order.filter((g) => view.settings.some((s) => s.concern === g));
+  const extra = [...new Set(view.settings.map((s) => s.concern))].filter(
+    (g) => !view.order.includes(g),
+  );
+  const groups = [...named, ...extra];
 
   return (
     <div className="acfg-body">
