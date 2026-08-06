@@ -66,9 +66,21 @@ export default function SettingsSection({ project }: { project: string | null })
           <code key={f} className="acfg-flag">{f}</code>
         ))}
         <div className="acfg-empty">
-          Added by aiterm to every claude it launches.
+          These two are on every claude aiterm launches.
           {view.injectedFlags.some((f) => f.includes("skip-permissions")) &&
             " Permission prompts are off in these sessions."}
+        </div>
+        {/* The constants above are not the whole injected surface, and reading
+            them as if they were answers "does aiterm set the model?" with a
+            wrong no. These others depend on the launch, so they are described
+            rather than listed — the panel cannot know one tab's argv. */}
+        <div className="acfg-empty">
+          Also added: <code className="acfg-flag">--settings</code> always, carrying aiterm's
+          SessionStart hook (the aiterm layer above); and{" "}
+          <code className="acfg-flag">--model</code>, <code className="acfg-flag">--effort</code>,{" "}
+          <code className="acfg-flag">--session-id</code> when chosen in aiterm's start controls.
+          A model chosen there beats <code className="acfg-flag">model</code> in settings.json,
+          because command-line arguments outrank settings files.
         </div>
       </div>
 
