@@ -41,7 +41,7 @@ export default function SettingsSection({ project }: { project: string | null })
   const groups = [...named, ...extra];
 
   return (
-    <div className="acfg-body">
+    <div>
       <div className="acfg-grp">Files</div>
       {view.layers.map((l) => (
         <div key={l.id} className="acfg-file">

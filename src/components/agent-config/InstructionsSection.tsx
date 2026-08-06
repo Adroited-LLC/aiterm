@@ -43,7 +43,7 @@ export default function InstructionsSection({ project }: { project: string | nul
   if (!docs) return <div className="acfg-empty">Reading…</div>;
 
   return (
-    <div className="acfg-body">
+    <div>
       <div className="acfg-grp">Instructions loaded, in order</div>
       {docs.map((d) => <DocRow key={d.path} doc={d} depth={0} />)}
       <div className="acfg-empty">

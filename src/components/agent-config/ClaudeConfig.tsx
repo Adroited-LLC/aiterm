@@ -34,7 +34,7 @@ export default function ClaudeConfig({ agent, project, onBack }: {
   // The header stays, because the back link is the only way out of this panel.
   const claude = agent.id === "claude";
   return (
-    <div className="acfg">
+    <div>
       <div className="acfg-head">
         <button className="acfg-back" onClick={onBack}>← Agents</button>
         <span className="acfg-title">{agent.display_name}</span>

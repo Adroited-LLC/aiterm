@@ -16,7 +16,7 @@ export default function McpSection({ project }: { project: string | null }) {
   if (!view) return <div className="acfg-empty">Reading…</div>;
 
   return (
-    <div className="acfg-body">
+    <div>
       <div className="acfg-grp">Registered locally</div>
       {/* A file that is there but unparseable would otherwise be reported as a
           file that could not be read, which is what an absent one says too. */}
