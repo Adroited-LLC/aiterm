@@ -228,7 +228,10 @@ export default function HooksSection({ project }: { project: string | null }) {
           className="acfg-edit"
           value={event}
           disabled={busy || !userLayer}
-          onChange={(e) => setEvent(e.target.value)}
+          onChange={(e) => {
+            setEvent(e.target.value);
+            setConfirmAdd(false);
+          }}
         >
           {EVENTS.map((e) => (
             <option key={e} value={e}>{e}</option>
@@ -259,7 +262,10 @@ export default function HooksSection({ project }: { project: string | null }) {
         {confirmAdd ? (
           <span className="acfg-hook-confirm">
             <span className="acfg-note">
-              Will run on every {event}: <code>{command}</code>
+              {matcher.trim()
+                ? <>Will run on {event} matching {matcher.trim()}: </>
+                : <>Will run on every {event}: </>}
+              <code>{command}</code>
             </span>
             <button className="acfg-save" disabled={busy} onClick={addHook}>
               Confirm add
