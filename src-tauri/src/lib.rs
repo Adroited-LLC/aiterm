@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod cache;
 pub mod chat;
+pub mod claudecfg;
 pub mod diag;
 pub mod fonts;
 pub mod fsx;
