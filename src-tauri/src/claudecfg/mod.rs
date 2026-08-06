@@ -46,6 +46,22 @@ pub struct SettingsView {
     pub injected_flags: Vec<String>,
 }
 
+/// Attach each layer's parse error to its own row.
+///
+/// `resolve` reports failures as "<label>: <serde message>", which is the only
+/// link back to the file that failed — the settings list itself has already
+/// dropped that layer. Kept separate from the command so the join is testable
+/// without a filesystem.
+fn attach_errors(layers: &mut [Layer], errors: &[String]) {
+    for e in errors {
+        if let Some((label, msg)) = e.split_once(": ") {
+            if let Some(l) = layers.iter_mut().find(|l| l.id.label() == label) {
+                l.error = Some(msg.to_string());
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub fn claude_settings(project: Option<String>) -> SettingsView {
     let h = home();
@@ -71,14 +87,7 @@ pub fn claude_settings(project: Option<String>) -> SettingsView {
     }
     let borrowed: Vec<(LayerId, &str)> = texts.iter().map(|(i, t)| (*i, t.as_str())).collect();
     let (settings, errors) = settings::resolve(&borrowed);
-    // A layer that existed but did not parse carries its reason on the row.
-    for e in &errors {
-        if let Some((label, msg)) = e.split_once(": ") {
-            if let Some(l) = layers.iter_mut().find(|l| l.id.label() == label) {
-                l.error = Some(msg.to_string());
-            }
-        }
-    }
+    attach_errors(&mut layers, &errors);
     SettingsView {
         layers,
         settings,
@@ -187,6 +196,39 @@ mod tests {
     fn the_flags_reported_are_the_launchers_own() {
         // Not a second copy that can drift from what is run.
         assert_eq!(injected_flags(), crate::agents::CLAUDE_LAUNCH_FLAGS);
+    }
+
+    #[test]
+    fn a_layer_that_failed_to_parse_wears_its_own_error() {
+        let mut layers = vec![
+            Layer { id: LayerId::User, path: "/h/s.json".into(), present: true, error: None },
+            Layer { id: LayerId::Project, path: "/p/s.json".into(), present: true, error: None },
+        ];
+        attach_errors(&mut layers, &["project: expected value at line 1".to_string()]);
+        assert_eq!(layers[1].error.as_deref(), Some("expected value at line 1"));
+        assert!(layers[0].error.is_none(), "a healthy layer must not inherit a sibling's error");
+    }
+
+    #[test]
+    fn a_two_word_layer_label_is_still_matched() {
+        // "project local" contains a space; a split on the wrong separator, or a
+        // match on the first word, would silently attach nothing.
+        let mut layers = vec![Layer {
+            id: LayerId::ProjectLocal, path: "/p/l.json".into(), present: true, error: None,
+        }];
+        attach_errors(&mut layers, &["project local: trailing comma".to_string()]);
+        assert_eq!(layers[0].error.as_deref(), Some("trailing comma"));
+    }
+
+    #[test]
+    fn a_serde_message_containing_a_colon_keeps_all_of_itself() {
+        // split_once, not split — otherwise the message is truncated at its own
+        // punctuation and the row explains less than it could.
+        let mut layers = vec![Layer {
+            id: LayerId::User, path: "/h/s.json".into(), present: true, error: None,
+        }];
+        attach_errors(&mut layers, &["user: bad thing: at line 3 column 5".to_string()]);
+        assert_eq!(layers[0].error.as_deref(), Some("bad thing: at line 3 column 5"));
     }
 
     /// Reads the real home directory, so it is skipped where there is none.
