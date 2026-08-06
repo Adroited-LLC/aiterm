@@ -30,6 +30,13 @@ export default function RawLayerEditor({
   const initial = layer.present ? layer.text : "{}";
 
   const [text, setText] = useState(initial);
+  // The bytes `text` was seeded from — captured at the same moment, from the
+  // same read, so the two can never disagree about what "loaded" meant. Sent
+  // to the backend as the collision token instead of the live `layer.text`
+  // prop: that prop moves the instant a sibling row saves, and comparing a
+  // stale draft against a fresh prop would let a genuine collision pass the
+  // byte-exact check that exists specifically to catch it.
+  const [loadedAt, setLoadedAt] = useState(initial);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<{ collision: boolean; text: string } | null>(null);
   // In-place confirm for Cancel, not `window.confirm`: that call is a native
@@ -50,7 +57,12 @@ export default function RawLayerEditor({
   }
 
   const dirty = text !== initial;
-  const canSave = dirty && !parseError && !saving && !busy;
+  // `initial` is recomputed from the live `layer` prop on every render, while
+  // `loadedAt` was frozen at the moment the draft was seeded — so this is
+  // true exactly when the file has moved under the draft, and it is true
+  // before the user ever clicks Save, not just after a collision comes back.
+  const stale = initial !== loadedAt;
+  const canSave = dirty && !parseError && !saving && !busy && !stale;
   const disabled = saving || busy;
 
   async function save() {
@@ -59,10 +71,13 @@ export default function RawLayerEditor({
     setBusy(true);
     setErr(null);
     try {
-      // `layer.text` (not `text`) is the comparison token — the backend
-      // checks it against the file's current bytes to detect a change since
-      // this panel read it, which is exactly the collision Task 5 guards.
-      await claudeSaveLayer(layer.path, text, layer.text);
+      // `loadedAt` (not the live `layer.text` prop) is the comparison token:
+      // it is the exact read `text` was drafted from, captured in the same
+      // state update. Comparing the draft against the live prop instead would
+      // let a stale draft's save pass the backend's byte-exact collision
+      // check whenever nothing *else* changed the file after this draft went
+      // stale — silently overwriting whatever did change it (Fix 1).
+      await claudeSaveLayer(layer.path, text, loadedAt);
       // The save just replaced this layer's bytes, so every layer's `text`
       // in the parent's view is now stale — a fresh read is the only
       // trustworthy next state, same as a row save.
@@ -104,6 +119,12 @@ export default function RawLayerEditor({
         }}
       />
       {parseError && <div className="acfg-err">{parseError}</div>}
+      {stale && (
+        <div className="acfg-err">
+          This file changed while you were editing. Saving will refuse; reload to get the current
+          contents.
+        </div>
+      )}
       <div className="acfg-raw-actions">
         {confirmDiscard ? (
           <>
@@ -144,6 +165,13 @@ export default function RawLayerEditor({
                 // already has, nothing downstream changes to naturally
                 // dismiss the message.
                 setErr(null);
+                // Reseed both the draft and the token it is checked against
+                // from what is currently loaded — otherwise the draft would
+                // still read as `stale` (or a future save would still be
+                // checked against bytes this reload just moved past) even
+                // though the user asked to start over from the current file.
+                setText(initial);
+                setLoadedAt(initial);
                 onSaved();
               }}
             >
