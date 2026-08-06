@@ -57,6 +57,7 @@ pub fn run() {
             claudecfg::claude_instructions,
             claudecfg::claude_mcp,
             claudecfg::claude_skills,
+            claudecfg::claude_hooks,
             taskbar::taskbar_badge,
             notify::desktop_notify,
             notify::desktop_notify_close,

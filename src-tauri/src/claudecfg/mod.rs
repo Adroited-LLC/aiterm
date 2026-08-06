@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod skills;
 pub mod write;
 pub mod edit;
+pub mod hooks;
 
 use serde::Serialize;
 use settings::{Layer, LayerId, Setting};
@@ -197,6 +198,14 @@ pub struct SkillsView {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HooksView {
+    pub hooks: Vec<hooks::Hook>,
+    /// Parse failures from each layer's hooks blob, one per unusable layer.
+    pub errors: Vec<String>,
+}
+
 #[tauri::command]
 pub fn claude_skills(project: Option<String>) -> SkillsView {
     let h = home();
@@ -242,6 +251,33 @@ pub fn claude_skills(project: Option<String>) -> SkillsView {
     }
     out.sort_by(|a, b| (a.source.clone(), a.name.clone()).cmp(&(b.source.clone(), b.name.clone())));
     SkillsView { skills: out, disabled_plugins: plugins.disabled, errors }
+}
+
+#[tauri::command]
+pub fn claude_hooks(project: Option<String>) -> HooksView {
+    let h = home();
+    let (_layers, texts) = read_layers(&h, project.as_deref());
+
+    let mut all_hooks = Vec::new();
+    let mut all_errors = Vec::new();
+
+    for (id, text) in texts {
+        // Parse the entire settings JSON to extract the hooks key.
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => {
+                if let Some(hooks_value) = v.get("hooks") {
+                    let (layer_hooks, layer_errors) = hooks::parse(id.label(), hooks_value, "--hook-report");
+                    all_hooks.extend(layer_hooks);
+                    all_errors.extend(layer_errors.into_iter().map(|e| format!("{}: {}", id.label(), e)));
+                }
+            }
+            Err(e) => {
+                all_errors.push(format!("{}: {}", id.label(), e));
+            }
+        }
+    }
+
+    HooksView { hooks: all_hooks, errors: all_errors }
 }
 
 #[cfg(test)]
