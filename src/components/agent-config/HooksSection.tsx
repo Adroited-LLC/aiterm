@@ -38,12 +38,21 @@ type RawHooks = Record<string, RawHookEntry[]>;
 
 /** The `hooks` key out of a layer's raw text, defaulting to `{}` for a layer
  *  that has none — a write always sends a whole object back, and a layer with
- *  no hooks yet is something to build on, not an error. */
-function currentHooks(text: string): RawHooks {
+ *  no hooks yet is something to build on, not an error.
+ *
+ *  Returns `null` when a `hooks` key is present but is not a plain object —
+ *  `typeof [] === "object"` in JS, so an array (a malformed but pre-existing
+ *  `"hooks": []`, say) would otherwise pass the old check and then get spread
+ *  into `{ ...hooks, [event]: [...] }` by `withAdded`/`withRemoved`, turning
+ *  it into an object with numeric keys on the next add or remove. `null`
+ *  means "do not touch this", not "empty" — the caller must refuse to write
+ *  rather than silently starting over from `{}`. */
+function currentHooks(text: string): RawHooks | null {
   try {
     const v = JSON.parse(text || "{}");
     const h = v && typeof v === "object" ? v.hooks : undefined;
-    return h && typeof h === "object" ? (h as RawHooks) : {};
+    if (h === undefined) return {};
+    return h && typeof h === "object" && !Array.isArray(h) ? (h as RawHooks) : null;
   } catch {
     return {};
   }
@@ -148,7 +157,12 @@ export default function HooksSection({ project }: { project: string | null }) {
 
   async function addHook() {
     if (!userLayer || !command.trim()) return;
-    const next = withAdded(currentHooks(userLayer.text), event, matcher.trim(), command.trim());
+    const current = currentHooks(userLayer.text);
+    if (current === null) {
+      setSaveErr({ collision: false, text: "The hooks block in this file could not be read as an object; edit it in the raw editor." });
+      return;
+    }
+    const next = withAdded(current, event, matcher.trim(), command.trim());
     await writeHooks("user", next);
     setConfirmAdd(false);
     setMatcher("");
@@ -159,7 +173,12 @@ export default function HooksSection({ project }: { project: string | null }) {
     const layerId = LABEL_TO_LAYER_ID[h.layer];
     const layer = settings!.layers.find((l) => l.id === layerId);
     if (!layer) return;
-    const next = withRemoved(currentHooks(layer.text), h.event, h.matcher, h.command);
+    const current = currentHooks(layer.text);
+    if (current === null) {
+      setSaveErr({ collision: false, text: "The hooks block in this file could not be read as an object; edit it in the raw editor." });
+      return;
+    }
+    const next = withRemoved(current, h.event, h.matcher, h.command);
     await writeHooks(layerId, next);
     setConfirmRemove(null);
   }
