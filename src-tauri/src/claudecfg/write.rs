@@ -62,7 +62,12 @@ pub fn save_layer(path: &str, new_text: &str, loaded_text: &str) -> Result<(), S
     // Same directory, so the rename is on one filesystem and therefore atomic.
     let tmp = format!("{path}.tmp-aiterm");
     std::fs::write(&tmp, new_text).map_err(|e| SaveError::Io(e.to_string()))?;
-    std::fs::rename(&tmp, path).map_err(|e| SaveError::Io(e.to_string()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Leaving this behind would put a stray settings.json.tmp-aiterm next
+        // to the real file, which reads as aiterm having half-broken something.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SaveError::Io(e.to_string()));
+    }
     Ok(())
 }
 
@@ -152,5 +157,22 @@ mod tests {
     #[test]
     fn the_backup_name_sits_beside_the_file_it_copies() {
         assert_eq!(backup_path("/h/.claude/settings.json"), "/h/.claude/settings.json.bak-aiterm");
+    }
+
+    #[test]
+    fn a_failed_replace_does_not_leave_a_temp_file_behind() {
+        // The rename cannot succeed when the target's parent is a file, which
+        // is a real enough failure to pin the cleanup without fault injection.
+        let dir = std::env::temp_dir().join("aiterm-write-test-norename");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        std::fs::write(&dir, "i am a file, not a directory").unwrap();
+        let path = dir.join("settings.json").to_string_lossy().to_string();
+        let err = save_layer(&path, r#"{"a":1}"#, "").unwrap_err();
+        assert!(matches!(err, SaveError::Io(_)), "{err:?}");
+        assert!(
+            !std::path::Path::new(&format!("{path}.tmp-aiterm")).exists(),
+            "temp file was left behind"
+        );
     }
 }
