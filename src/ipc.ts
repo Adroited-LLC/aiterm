@@ -489,6 +489,29 @@ export const claudeMcp = (project: string | null) =>
 export const claudeSkills = (project: string | null) =>
   invoke<ClaudeSkillsView>("claude_skills", { project });
 
+/** A hook fires a shell command on its own, unattended, so the row it shows
+ *  up in has to carry enough to judge it: which event, which layer put it
+ *  there, and the command in full. */
+export interface ClaudeHook {
+  event: string;
+  matcher: string | null;
+  command: string;
+  layer: string;
+  isAiterm: boolean;
+}
+
+export interface ClaudeHooksView {
+  hooks: ClaudeHook[];
+  errors: string[];
+}
+
+/** Hooks are additive across every layer that sets them — none of them
+ *  "overrides" another — so this exists to show each one with the layer it
+ *  actually came from rather than collapsing them into one winner the way
+ *  `claudeSettings` does for ordinary keys. */
+export const claudeHooks = (project: string | null) =>
+  invoke<ClaudeHooksView>("claude_hooks", { project });
+
 /** Why a save was refused. `collision` is the one the UI must treat specially —
  *  it means the file moved under us and the answer is to reload, not to fix
  *  anything. */

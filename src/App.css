@@ -2757,3 +2757,18 @@ input[type="range"]::-webkit-slider-thumb {
    with `--red` in place of `--accent`. */
 .acfg-danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
 .acfg-danger:hover:not(:disabled) { color: var(--text); }
+
+/* Hooks (Task 7). `.acfg-hook-cmd` is full-width on purpose: a hook's command
+   is a shell command that fires unattended, and truncating it in the row that
+   is supposed to let someone judge it would be a trap, not a summary. */
+.acfg-hook { display: flex; align-items: baseline; gap: 8px; padding: 4px 0; flex-wrap: wrap; }
+.acfg-hook-matcher { font-size: 10px; color: var(--text-faint); min-width: 74px; }
+.acfg-hook-cmd {
+  flex-basis: 100%; font-family: monospace; font-size: 11px; color: var(--text);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.acfg-hook-form { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 4px 0 12px; }
+/* Same inline swap-the-buttons shape as `.acfg-raw-actions`' discard confirm
+   and `SessionsPanel`'s delete confirm — never `window.confirm`, which is a
+   native dialog that would block the whole window, terminal tabs included. */
+.acfg-hook-confirm { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }

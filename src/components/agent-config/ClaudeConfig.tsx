@@ -4,12 +4,14 @@ import SettingsSection from "./SettingsSection";
 import InstructionsSection from "./InstructionsSection";
 import McpSection from "./McpSection";
 import SkillsSection from "./SkillsSection";
+import HooksSection from "./HooksSection";
 
-type Section = "settings" | "instructions" | "mcp" | "skills";
+type Section = "settings" | "instructions" | "hooks" | "mcp" | "skills";
 
 const TABS: [Section, string][] = [
   ["settings", "Settings"],
   ["instructions", "Instructions"],
+  ["hooks", "Hooks"],
   ["mcp", "MCP"],
   ["skills", "Skills"],
 ];
@@ -56,6 +58,7 @@ export default function ClaudeConfig({ agent, project, onBack }: {
           </div>
           {section === "settings" && <SettingsSection project={project} />}
           {section === "instructions" && <InstructionsSection project={project} />}
+          {section === "hooks" && <HooksSection project={project} />}
           {section === "mcp" && <McpSection project={project} />}
           {section === "skills" && <SkillsSection project={project} />}
         </>
