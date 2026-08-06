@@ -6,3 +6,4 @@ pub mod settings;
 pub mod concern;
 pub mod instructions;
 pub mod mcp;
+pub mod skills;
