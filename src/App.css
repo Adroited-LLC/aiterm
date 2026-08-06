@@ -2661,6 +2661,10 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .acfg-empty { font-size: 11px; color: var(--text-faint); padding: 8px 0; }
 .acfg-err { font-size: 11px; color: var(--red); padding: 4px 0; }
+/* A layer's parse error is a child of the flex row that describes the file, so
+   it needs a full line of its own — squeezing the one message that explains a
+   broken file into the gap after the path is the wrong place to save room. */
+.acfg-file > .acfg-err { flex-basis: 100%; }
 .acfg-grp {
   font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
   color: var(--text-faint); padding: 12px 0 6px;
