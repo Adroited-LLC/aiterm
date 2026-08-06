@@ -31,6 +31,16 @@
 use std::io::Read;
 use std::path::PathBuf;
 
+/// The argv flag that identifies aiterm's own hook.
+///
+/// Public and used everywhere the marker matters, so a rename here cannot
+/// silently drift from what `main.rs` dispatches on or what `claudecfg`
+/// matches against to recognise aiterm's own hook — the config panel must
+/// never offer that hook for editing, since it lives in aiterm's own
+/// `--settings` file and an edit through the panel would either fail or
+/// fight this module's own writer.
+pub const HOOK_REPORT_FLAG: &str = "--hook-report";
+
 fn data_dir() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("aiterm"))
 }
@@ -67,7 +77,7 @@ pub fn install() {
     // The hook command line is run by a shell, so the exe path is quoted the
     // same way agents.rs quotes everything headed for one.
     let cmd = format!(
-        "'{}' --hook-report",
+        "'{}' {HOOK_REPORT_FLAG}",
         exe.to_string_lossy().replace('\'', "'\\''")
     );
     let settings = serde_json::json!({

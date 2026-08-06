@@ -266,7 +266,8 @@ pub fn claude_hooks(project: Option<String>) -> HooksView {
         match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => {
                 if let Some(hooks_value) = v.get("hooks") {
-                    let (layer_hooks, layer_errors) = hooks::parse(id.label(), hooks_value, "--hook-report");
+                    let (layer_hooks, layer_errors) =
+                        hooks::parse(id.label(), hooks_value, crate::hooklink::HOOK_REPORT_FLAG);
                     all_hooks.extend(layer_hooks);
                     all_errors.extend(layer_errors.into_iter().map(|e| format!("{}: {}", id.label(), e)));
                 }
@@ -313,6 +314,20 @@ mod tests {
     fn the_flags_reported_are_the_launchers_own() {
         // Not a second copy that can drift from what is run.
         assert_eq!(injected_flags(), crate::agents::CLAUDE_LAUNCH_FLAGS);
+    }
+
+    #[test]
+    fn claude_hooks_recognises_aiterms_own_hook_by_hooklinks_marker() {
+        // `claude_hooks` passes `crate::hooklink::HOOK_REPORT_FLAG` into
+        // `hooks::parse` — the same identifier `hooklink::install` builds the
+        // real hook command from, not a hardcoded copy that could drift from
+        // it. This exercises that identifier the same way the call site does:
+        // a command built with it must be recognised as aiterm's own.
+        let cmd = format!("'/usr/bin/aiterm' {}", crate::hooklink::HOOK_REPORT_FLAG);
+        let v = serde_json::json!({"SessionStart":[{"hooks":[
+            {"type":"command","command":cmd}]}]});
+        let (h, _) = hooks::parse("aiterm", &v, crate::hooklink::HOOK_REPORT_FLAG);
+        assert!(h[0].is_aiterm);
     }
 
     #[test]

@@ -6,7 +6,7 @@ fn main() {
     // Claude Code SessionStart hook runs to tell the running aiterm which
     // session just started in which process. Dispatch before Tauri exists —
     // it must cost milliseconds and never touch a display.
-    if std::env::args().nth(1).as_deref() == Some("--hook-report") {
+    if std::env::args().nth(1).as_deref() == Some(aiterm_lib::hooklink::HOOK_REPORT_FLAG) {
         aiterm_lib::hooklink::hook_report();
         return;
     }
