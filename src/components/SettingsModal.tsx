@@ -3,12 +3,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
+import ClaudeConfig from "./agent-config/ClaudeConfig";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
   TERM_WEIGHTS,
 } from "../settings";
 import {
-  FontFamily, FontPackage,
+  Caps, FontFamily, FontPackage,
   AgentDetection, detectAgents, homeAbbrev,
   fontPackages, installFontFiles, installFontPackage, listFonts,
   diagEnvironment, diagLogPath, diagLogTail, openPath,
@@ -19,6 +20,8 @@ interface Props {
   settings: AppSettings;
   onChange: (s: AppSettings) => void;
   onClose: () => void;
+  capsOf: (agent: string) => Caps;
+  activeProject: string | null;
 }
 
 const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
@@ -84,8 +87,10 @@ function Switch({ checked, onChange, label }: {
   );
 }
 
-export default function SettingsModal({ settings, onChange, onClose }: Props) {
+export default function SettingsModal({ settings, onChange, onClose, capsOf, activeProject }: Props) {
   const [tab, setTab] = useState<Tab>("appearance");
+  /** Engine whose configuration panel is open, drilled into from Agents. */
+  const [configFor, setConfigFor] = useState<AgentDetection | null>(null);
   // Each section starts at its top — the pane is one shared scroll element,
   // so without this a scroll in one section opens the next mid-page.
   const paneRef = useRef<HTMLDivElement>(null);
@@ -441,7 +446,10 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
               </Group>
             </>}
 
-            {tab === "agents" && <>
+            {tab === "agents" && configFor && (
+              <ClaudeConfig agent={configFor} project={activeProject} onBack={() => setConfigFor(null)} />
+            )}
+            {tab === "agents" && !configFor && <>
               <Group>
                 {/* Agents aiterm does not find are listed too. "Codex — not
                     installed" is the useful answer; an absence would leave you
@@ -470,6 +478,11 @@ export default function SettingsModal({ settings, onChange, onClose }: Props) {
                             </div>
                           )}
                         </div>
+                        {capsOf(a.id).config && a.available && (
+                          <button className="agent-config-btn" onClick={() => setConfigFor(a)}>
+                            Settings
+                          </button>
+                        )}
                       </div>
                     ))}
                     {agents.length === 0 && (

@@ -80,11 +80,42 @@
             };
           })(),
           agent_caps: {
-            claude: { fork: true, clear: true, resume: true, tui_drive: true, panels: true, delete: true },
-            codex: { fork: false, clear: false, resume: false, tui_drive: false, panels: false, delete: false },
-            opencode: { fork: false, clear: false, resume: true, tui_drive: false, panels: false, delete: false },
-            api: { fork: false, clear: false, resume: true, tui_drive: false, panels: false, delete: true },
+            claude: { fork: true, clear: true, resume: true, tui_drive: true, panels: true, delete: true, config: true },
+            codex: { fork: false, clear: false, resume: false, tui_drive: false, panels: false, delete: false, config: false },
+            opencode: { fork: false, clear: false, resume: true, tui_drive: false, panels: false, delete: false, config: false },
+            api: { fork: false, clear: false, resume: true, tui_drive: false, panels: false, delete: true, config: false },
           },
+          claude_settings: {
+            layers: [
+              { id: "user", path: "/home/matt/.claude/settings.json", present: true, error: null },
+              { id: "project", path: "/p/.claude/settings.json", present: true, error: null },
+              { id: "projectLocal", path: "/p/.claude/settings.local.json", present: false, error: null },
+              { id: "injected", path: "/home/matt/.local/share/aiterm/claude-hook-settings.json", present: true, error: null },
+            ],
+            settings: [
+              { key: "model", concern: "Model", effective: "claude-opus-5", winner: "user",
+                setIn: [{ layer: "user", value: "claude-opus-5" }] },
+              { key: "permissions.deny", concern: "Permissions", effective: ["Bash(rm)"], winner: "project",
+                setIn: [{ layer: "user", value: [] }, { layer: "project", value: ["Bash(rm)"] }] },
+              { key: "worktree.bgIsolation", concern: "Other", effective: "none", winner: "project",
+                setIn: [{ layer: "project", value: "none" }] },
+            ],
+            errors: [],
+            order: ["Model", "Permissions", "Hooks", "Environment", "MCP", "Notifications & UI", "Housekeeping", "Other"],
+            injectedFlags: ["--permission-mode auto", "--allow-dangerously-skip-permissions"],
+          },
+          claude_instructions: [
+            { source: "user", path: "/home/matt/.claude/CLAUDE.md", present: true, lines: 412,
+              imports: [{ source: "import", path: "/home/matt/.claude/RTK.md", present: true, lines: 28, imports: [] }] },
+            { source: "project", path: "/p/CLAUDE.md", present: false, lines: 0, imports: [] },
+          ],
+          claude_mcp: { servers: [], localConfigRead: true },
+          claude_skills: [
+            { name: "deploy-rpm", description: "Install an RPM on Matt's machines", source: "user",
+              path: "/home/matt/.claude/skills/deploy-rpm/SKILL.md" },
+            { name: "brainstorming", description: "Turn an idea into a design", source: "superpowers",
+              path: "/home/matt/.claude/plugins/cache/.../skills/brainstorming/SKILL.md" },
+          ],
           list_fonts: [
             { name: "Adwaita Sans", mono: false },
             { name: "Cantarell", mono: false },

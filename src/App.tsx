@@ -1955,6 +1955,8 @@ export default function App() {
           settings={settings}
           onChange={setSettings}
           onClose={() => setShowSettingsModal(false)}
+          capsOf={capsOf}
+          activeProject={activeProject}
         />
       )}
     </div>
