@@ -2689,3 +2689,49 @@ input[type="range"]::-webkit-slider-thumb {
 .acfg-flags { display: flex; flex-direction: column; gap: 3px; }
 .acfg-flag { font-size: 11px; color: var(--text-dim); }
 .acfg-desc { color: var(--text-dim); }
+
+/* Inline row editing (Task 5). A row's value slot becomes one of these in
+   place of `.acfg-val` when the setting's shape is simple enough to edit
+   without a bespoke widget. */
+.acfg-note { font-size: 10px; color: var(--text-faint); }
+.acfg-edit {
+  font: inherit; font-size: 12px; color: var(--text);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 5px;
+  padding: 2px 6px; min-width: 140px;
+}
+.acfg-edit:focus { outline: none; border-color: var(--accent); }
+.acfg-edit:disabled { opacity: 0.55; }
+.acfg-bool { display: inline-flex; align-items: center; min-width: 0; padding: 0; border: none; background: none; }
+.acfg-chips {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  min-width: 160px; border: none; background: none; padding: 0;
+}
+.acfg-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px;
+  font-size: 11px; color: var(--text-dim); padding: 1px 4px 1px 8px;
+}
+.acfg-chip button {
+  background: none; border: none; color: var(--text-faint); cursor: pointer;
+  font-size: 11px; line-height: 1; padding: 0 2px;
+}
+.acfg-chip button:hover:not(:disabled) { color: var(--red); }
+.acfg-chips input {
+  font: inherit; font-size: 11px; color: var(--text); background: none;
+  border: 1px dashed var(--border); border-radius: 8px; padding: 1px 6px; min-width: 70px;
+}
+.acfg-save, .acfg-cancel {
+  background: none; border: 1px solid var(--border); border-radius: 5px;
+  font-size: 10px; padding: 2px 8px; cursor: pointer; color: var(--text-dim);
+}
+.acfg-save { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.acfg-save:hover:not(:disabled) { color: var(--text); }
+.acfg-cancel:hover:not(:disabled) { color: var(--text); }
+.acfg-save:disabled, .acfg-cancel:disabled { opacity: 0.5; cursor: default; }
+/* Full-width like `.acfg-over` — a refusal explanation does not fit the gap
+   after the source tag, and the Reload button needs its own line to be
+   reachable without hunting for it. */
+.acfg-collision {
+  flex-basis: 100%; display: flex; align-items: center; gap: 8px;
+  font-size: 11px; color: var(--red);
+}
