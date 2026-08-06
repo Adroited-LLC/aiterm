@@ -2750,4 +2750,10 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .acfg-raw-area:focus { outline: none; border-color: var(--accent); }
 .acfg-raw-area:disabled { opacity: 0.55; }
-.acfg-raw-actions { display: flex; gap: 6px; }
+.acfg-raw-actions { display: flex; align-items: center; gap: 6px; }
+/* The inline discard confirm, in `.acfg-raw-actions` in place of Save/Cancel
+   — same shape as `SessionsPanel`'s delete confirm, no `.acfg-*` danger
+   color already existed to reuse, so this follows `.acfg-save`'s formula
+   with `--red` in place of `--accent`. */
+.acfg-danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
+.acfg-danger:hover:not(:disabled) { color: var(--text); }

@@ -32,6 +32,12 @@ export default function RawLayerEditor({
   const [text, setText] = useState(initial);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<{ collision: boolean; text: string } | null>(null);
+  // In-place confirm for Cancel, not `window.confirm`: that call is a native
+  // dialog, and in the Tauri webview a native dialog blocks the whole
+  // window — including the terminal tabs running behind this panel — until
+  // it is dismissed. `SessionsPanel`'s delete confirm uses the same
+  // swap-the-buttons shape for the same reason.
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
 
   // Checked on every keystroke, not just on save — the point is to tell the
   // user their JSON is broken while they can still see what they typed, not
@@ -73,7 +79,10 @@ export default function RawLayerEditor({
     // Silent discard is fine when there is nothing to lose; once the user
     // has typed something different, a stray click should not be able to
     // throw it away without asking.
-    if (dirty && !window.confirm("Discard changes to this file?")) return;
+    if (dirty) {
+      setConfirmDiscard(true);
+      return;
+    }
     onClose();
   }
 
@@ -87,16 +96,41 @@ export default function RawLayerEditor({
         value={text}
         disabled={disabled}
         spellCheck={false}
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => {
+          setText(e.target.value);
+          // A stale "discard?" prompt sitting over text the user has gone
+          // back to editing is confusing — resuming the edit withdraws it.
+          setConfirmDiscard(false);
+        }}
       />
       {parseError && <div className="acfg-err">{parseError}</div>}
       <div className="acfg-raw-actions">
-        <button className="acfg-save" disabled={!canSave} onClick={save}>
-          {saving ? "Saving…" : "Save"}
-        </button>
-        <button className="acfg-cancel" disabled={disabled} onClick={cancel}>
-          Cancel
-        </button>
+        {confirmDiscard ? (
+          <>
+            <span className="acfg-note">Discard changes to this file?</span>
+            <button
+              className="acfg-cancel acfg-danger"
+              onClick={() => {
+                setConfirmDiscard(false);
+                onClose();
+              }}
+            >
+              Discard
+            </button>
+            <button className="acfg-cancel" onClick={() => setConfirmDiscard(false)}>
+              Cancel
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="acfg-save" disabled={!canSave} onClick={save}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button className="acfg-cancel" disabled={disabled} onClick={cancel}>
+              Cancel
+            </button>
+          </>
+        )}
       </div>
       {err &&
         (err.collision ? (
