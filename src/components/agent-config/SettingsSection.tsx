@@ -16,8 +16,9 @@ function show(v: unknown): string {
 /** The layers, then every setting grouped by concern.
  *
  *  A setting shows the value in force and the file that set it; when more than
- *  one file sets it, the losers are listed too — "project overrides user" is
- *  the sentence this section exists to make sayable. */
+ *  one file sets it, the other setters are listed too — "project overrides
+ *  user" is the sentence this section exists to make sayable, and for the keys
+ *  Claude collects additively the sentence is "both apply" instead. */
 export default function SettingsSection({ project }: { project: string | null }) {
   const [view, setView] = useState<ClaudeSettingsView | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -83,7 +84,7 @@ export default function SettingsSection({ project }: { project: string | null })
                 <div className="acfg-over">
                   also set in{" "}
                   {s.setIn.slice(0, -1).map((x) => LAYER_LABEL[x.layer] ?? x.layer).join(", ")}
-                  {" — overridden"}
+                  {s.merged ? " — merged, all apply" : " — overridden"}
                 </div>
               )}
             </div>

@@ -432,6 +432,9 @@ export interface ClaudeSetting {
   winner: ClaudeLayerId;
   /** Lowest precedence first, so the last entry is the winner. */
   setIn: { layer: ClaudeLayerId; value: unknown }[];
+  /** Claude collects this key from every layer that sets it, so the earlier
+   *  entries in `setIn` are also in force — not overridden. */
+  merged: boolean;
 }
 
 export interface ClaudeSettingsView {

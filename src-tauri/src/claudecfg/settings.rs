@@ -7,8 +7,10 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-/// Ordered lowest-precedence first. `resolve` relies on that order rather than
-/// on a comparison, so adding a layer means putting it in the right place here.
+/// Precedence is not encoded here. `resolve` takes the layers as a slice and
+/// trusts *the caller's* order — lowest precedence first — so the invariant
+/// lives in `layer_paths`, not in how this enum is declared. Reordering these
+/// variants changes nothing; reordering that slice changes everything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LayerId {
@@ -60,6 +62,33 @@ pub struct Setting {
     pub winner: LayerId,
     /// Lowest-precedence first, so the last entry is always the winner.
     pub set_in: Vec<SetIn>,
+    /// The lower layers are not losers: Claude collects this key from all of
+    /// them. Calling that "overridden" would be a misreport.
+    pub merged: bool,
+}
+
+/// Key roots Claude collects from *every* source instead of letting the most
+/// local one win: the `permissions` rule lists and the `hooks` tree.
+///
+/// aiterm's own feature depends on that additivity — `hooklink` injects a
+/// `SessionStart` hook through `--settings` precisely because it is added to
+/// the user's hooks rather than replacing them (see the module docs there). So
+/// the day a user writes their own `SessionStart` hook, both run, and a panel
+/// that said "overridden" would be describing behaviour that does not happen.
+const ADDITIVE_ROOTS: &[&str] = &["permissions", "hooks"];
+
+/// Whether Claude will apply every layer's value for this key rather than only
+/// the winner's.
+///
+/// Root membership alone is not enough: `permissions.defaultMode` lives under
+/// an additive root but is a single mode, and the most local one really does
+/// win. Only the collections merge, so the values must be collections — which
+/// after `flatten` means arrays.
+fn is_merged(key: &str, set_in: &[SetIn]) -> bool {
+    let root = key.split('.').next().unwrap_or(key);
+    ADDITIVE_ROOTS.contains(&root)
+        && set_in.len() > 1
+        && set_in.iter().all(|s| s.value.is_array())
 }
 
 /// Walk an object into dotted leaves. Arrays are leaves: `permissions.deny` is
@@ -112,6 +141,7 @@ pub fn resolve(layers: &[(LayerId, &str)]) -> (Vec<Setting>, Vec<String>) {
                 concern: super::concern::of(&key).to_string(),
                 effective: last.value.clone(),
                 winner: last.layer,
+                merged: is_merged(&key, &set_in),
                 key,
                 set_in,
             }
@@ -182,6 +212,41 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(errors[0].contains("project"), "{errors:?}");
         assert_eq!(find(&s, "model").winner, LayerId::User);
+    }
+
+    #[test]
+    fn a_key_claude_collects_from_every_layer_is_reported_as_merged_not_overridden() {
+        // permissions.deny is concatenated across sources, so both lists are in
+        // force. aiterm relies on the same additivity for its SessionStart hook.
+        let (s, _) = resolve(&[
+            (LayerId::User, r#"{"permissions": {"deny": ["Bash(rm:*)"]}}"#),
+            (LayerId::Project, r#"{"permissions": {"deny": ["Read(.env)"]}}"#),
+        ]);
+        assert!(find(&s, "permissions.deny").merged);
+    }
+
+    #[test]
+    fn a_key_the_most_local_layer_simply_wins_is_not_reported_as_merged() {
+        let (s, _) = resolve(&layered());
+        assert!(!find(&s, "model").merged);
+    }
+
+    #[test]
+    fn a_single_setter_under_an_additive_root_is_not_called_merged() {
+        // Nothing to merge with; "merged, all apply" would be noise.
+        let (s, _) = resolve(&[(LayerId::User, r#"{"hooks": {"SessionStart": [{"x": 1}]}}"#)]);
+        assert!(!find(&s, "hooks.SessionStart").merged);
+    }
+
+    #[test]
+    fn a_scalar_under_an_additive_root_still_reports_as_overridden() {
+        // permissions.defaultMode is one mode, not a list Claude concatenates —
+        // the most local layer really does win, root membership notwithstanding.
+        let (s, _) = resolve(&[
+            (LayerId::User, r#"{"permissions": {"defaultMode": "ask"}}"#),
+            (LayerId::Project, r#"{"permissions": {"defaultMode": "auto"}}"#),
+        ]);
+        assert!(!find(&s, "permissions.defaultMode").merged);
     }
 
     #[test]
