@@ -118,9 +118,12 @@ function SettingRow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.key, JSON.stringify(s.effective)]);
 
-  if (!editable || !layer) {
-    // Unsupported shape, or the winning layer is somehow missing from
-    // `view.layers` — either way this row does not get a guess at a control.
+  if (!editable || !layer || s.ambiguous) {
+    // Unsupported shape, the winning layer is somehow missing from
+    // `view.layers`, or the key itself contains a literal `.` (s.ambiguous)
+    // — routing that through `claudeSetKey`'s dotted-path split would edit
+    // the wrong thing, so it gets the same fallback as a shape this panel
+    // cannot build a control for.
     return (
       <div className="acfg-set">
         <span className="acfg-key">{s.key}</span>

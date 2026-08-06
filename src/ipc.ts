@@ -438,6 +438,10 @@ export interface ClaudeSetting {
   /** Claude collects this key from every layer that sets it, so the earlier
    *  entries in `setIn` are also in force — not overridden. */
   merged: boolean;
+  /** True when a segment of this key's own path contained a literal `.` —
+   *  the dotted `key` string cannot be split back into the path it came
+   *  from, so an inline edit must not be routed through it. */
+  ambiguous: boolean;
 }
 
 export interface ClaudeSettingsView {

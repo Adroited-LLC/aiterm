@@ -71,6 +71,16 @@ pub struct Setting {
     /// The lower layers are not losers: Claude collects this key from all of
     /// them. Calling that "overridden" would be a misreport.
     pub merged: bool,
+    /// True when some segment on this key's own path contained a literal `.`
+    /// — a JSON key that is itself dotted, e.g. an MCP server named
+    /// `docs.search`. `key` joins path segments with `.` and nothing escapes
+    /// one that was already there, so the joined string cannot be split back
+    /// into the path it came from: `mcpServers.docs.search.command` reads as
+    /// four levels when it is really two. Editing such a key through
+    /// `edit::set_key` (which does exactly that split) would build a bogus
+    /// branch instead of touching the real key, so the panel must refuse to
+    /// offer it inline rather than invent an escaping scheme.
+    pub ambiguous: bool,
 }
 
 /// Key roots Claude collects from *every* source instead of letting the most
@@ -99,12 +109,20 @@ fn is_merged(key: &str, set_in: &[SetIn]) -> bool {
 
 /// Walk an object into dotted leaves. Arrays are leaves: `permissions.deny` is
 /// a list of rules the user recognises, and `permissions.deny.0` is not.
-fn flatten(prefix: &str, map: &Map<String, Value>, out: &mut Vec<(String, Value)>) {
+///
+/// `prefix_ambiguous` carries whether an ancestor segment already contained a
+/// literal `.`; a leaf is ambiguous if that is true or its own key `k` is. The
+/// check happens here, while `k` is still the real un-joined segment name —
+/// once it is folded into the joined `key` string there is no way to tell a
+/// key that legitimately contains a dot from a path that merely has several
+/// segments.
+fn flatten(prefix: &str, prefix_ambiguous: bool, map: &Map<String, Value>, out: &mut Vec<(String, Value, bool)>) {
     for (k, v) in map {
         let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        let ambiguous = prefix_ambiguous || k.contains('.');
         match v {
-            Value::Object(inner) if !inner.is_empty() => flatten(&key, inner, out),
-            _ => out.push((key, v.clone())),
+            Value::Object(inner) if !inner.is_empty() => flatten(&key, ambiguous, inner, out),
+            _ => out.push((key, v.clone(), ambiguous)),
         }
     }
 }
@@ -115,6 +133,10 @@ pub fn resolve(layers: &[(LayerId, &str)]) -> (Vec<Setting>, Vec<String>) {
     let mut errors = Vec::new();
     let mut order: Vec<String> = Vec::new();
     let mut found: std::collections::HashMap<String, Vec<SetIn>> = std::collections::HashMap::new();
+    // A key's ambiguity comes from its own path shape, not from which layer
+    // set it or what value it holds — so one map, keyed the same as `found`,
+    // is enough even though a key can be set in several layers.
+    let mut ambiguous: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
     for (id, text) in layers {
         let parsed: Value = match serde_json::from_str(text) {
@@ -129,12 +151,13 @@ pub fn resolve(layers: &[(LayerId, &str)]) -> (Vec<Setting>, Vec<String>) {
             continue;
         };
         let mut leaves = Vec::new();
-        flatten("", map, &mut leaves);
-        for (key, value) in leaves {
+        flatten("", false, map, &mut leaves);
+        for (key, value, is_ambiguous) in leaves {
             if !found.contains_key(&key) {
                 order.push(key.clone());
             }
-            found.entry(key).or_default().push(SetIn { layer: *id, value });
+            found.entry(key.clone()).or_default().push(SetIn { layer: *id, value });
+            ambiguous.insert(key, is_ambiguous);
         }
     }
 
@@ -148,6 +171,7 @@ pub fn resolve(layers: &[(LayerId, &str)]) -> (Vec<Setting>, Vec<String>) {
                 effective: last.value.clone(),
                 winner: last.layer,
                 merged: is_merged(&key, &set_in),
+                ambiguous: ambiguous.get(&key).copied().unwrap_or(false),
                 key,
                 set_in,
             }
@@ -267,5 +291,25 @@ mod tests {
         // permissions.deny.0 and lose the shape the user recognises.
         let (s, _) = resolve(&[(LayerId::User, r#"{"a": {"b": [1, 2]}}"#)]);
         assert!(s.iter().all(|x| x.key != "a.b.0"), "{:?}", s.iter().map(|x| &x.key).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_literal_dot_in_a_key_name_marks_the_setting_ambiguous() {
+        // "docs.search" is one MCP server name, not two path segments — but
+        // the dotted key this produces, mcpServers.docs.search.command, reads
+        // as four. `edit::set_key` would split it back into four and build a
+        // bogus branch, so the panel must know not to route this key through
+        // it.
+        let (s, _) = resolve(&[(
+            LayerId::User,
+            r#"{"mcpServers": {"docs.search": {"command": "x"}}}"#,
+        )]);
+        assert!(find(&s, "mcpServers.docs.search.command").ambiguous);
+    }
+
+    #[test]
+    fn an_ordinary_nested_key_is_not_ambiguous() {
+        let (s, _) = resolve(&[(LayerId::User, r#"{"permissions": {"deny": ["Bash"]}}"#)]);
+        assert!(!find(&s, "permissions.deny").ambiguous);
     }
 }
