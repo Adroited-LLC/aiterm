@@ -2735,3 +2735,19 @@ input[type="range"]::-webkit-slider-thumb {
   flex-basis: 100%; display: flex; align-items: center; gap: 8px;
   font-size: 11px; color: var(--red);
 }
+
+/* The raw per-layer editor (Task 6). `flex-basis: 100%` so it sits on its
+   own line beneath the file row, the way `.acfg-err` and `.acfg-over` do,
+   rather than fighting the row's other cells for the leftover width. */
+.acfg-raw {
+  flex-basis: 100%; display: flex; flex-direction: column; gap: 6px;
+  padding: 6px 0 10px;
+}
+.acfg-raw-area {
+  font-family: monospace; font-size: 11px; color: var(--text);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px; min-height: 180px; resize: vertical;
+}
+.acfg-raw-area:focus { outline: none; border-color: var(--accent); }
+.acfg-raw-area:disabled { opacity: 0.55; }
+.acfg-raw-actions { display: flex; gap: 6px; }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   ClaudeLayer,
+  ClaudeLayerId,
   ClaudeSaveError,
   ClaudeSetting,
   ClaudeSettingsView,
@@ -9,6 +10,7 @@ import {
   homeAbbrev,
   openPath,
 } from "../../ipc";
+import RawLayerEditor from "./RawLayerEditor";
 
 const LAYER_LABEL: Record<string, string> = {
   user: "user",
@@ -62,7 +64,7 @@ function draftFrom(e: Editable | null): { text: string; bool: boolean; items: st
 /** `claudeSetKey` rejects with the backend's `SaveError`, serialised as
  *  `{ kind, detail }` — but a rejection can in principle be anything JS can
  *  throw, so this stays defensive rather than assuming the shape. */
-function describeSaveError(e: unknown): { collision: boolean; text: string } {
+export function describeSaveError(e: unknown): { collision: boolean; text: string } {
   const se = e as Partial<ClaudeSaveError> & { detail?: string } | null;
   if (se && typeof se === "object") {
     if (se.kind === "collision") return { collision: true, text: "" };
@@ -317,6 +319,10 @@ export default function SettingsSection({ project }: { project: string | null })
   // the file changing externally. Gating every row on one flag is what
   // makes "save starts" and "reload finishes" atomic from the user's side.
   const [busy, setBusy] = useState(false);
+  // At most one raw editor open at a time — two open editors on the same
+  // section would both be racing the same `busy` flag, and there is nowhere
+  // on screen for a second inline panel to go that reads as "beneath its row."
+  const [openRaw, setOpenRaw] = useState<ClaudeLayerId | null>(null);
 
   // Shared by the mount fetch and every row's post-save refresh: a save
   // invalidates every layer's `text`, so the only safe follow-up is asking
@@ -365,7 +371,29 @@ export default function SettingsSection({ project }: { project: string | null })
           ) : (
             <span className="acfg-file-state">not present</span>
           )}
+          {/* Absent layers get Edit too — a project settings file that does
+              not exist yet is created by editing and saving it, same as any
+              other layer. */}
+          <button
+            className="acfg-open"
+            disabled={busy}
+            onClick={() => setOpenRaw(openRaw === l.id ? null : l.id)}
+          >
+            {openRaw === l.id ? "Close" : "Edit"}
+          </button>
           {l.error && <div className="acfg-err">{l.error}</div>}
+          {openRaw === l.id && (
+            <RawLayerEditor
+              layer={l}
+              busy={busy}
+              setBusy={setBusy}
+              onClose={() => setOpenRaw(null)}
+              onSaved={async () => {
+                await reload();
+                setOpenRaw(null);
+              }}
+            />
+          )}
         </div>
       ))}
 
