@@ -39,7 +39,11 @@ fn spool_dir() -> Option<PathBuf> {
     Some(data_dir()?.join("session-events"))
 }
 
-fn settings_path() -> Option<PathBuf> {
+/// The one definition of where the hook settings file lives. Public because
+/// the config panel (`claudecfg`) reads it too — it must show the path the
+/// hook writer actually uses, not a guess that can drift under a non-default
+/// `XDG_DATA_HOME`.
+pub fn settings_path() -> Option<PathBuf> {
     Some(data_dir()?.join("claude-hook-settings.json"))
 }
 

@@ -16,17 +16,16 @@ fn home() -> String {
 }
 
 /// Every settings file, lowest precedence first. Paths only — reading happens
-/// in the command, so this is testable without a filesystem.
-fn layer_paths(home: &str, project: Option<&str>) -> Vec<(LayerId, String)> {
+/// in the command, so this is testable without a filesystem. The injected
+/// path is passed in rather than built here, so this stays pure while still
+/// reporting the path `hooklink::settings_path` actually uses.
+fn layer_paths(home: &str, project: Option<&str>, injected: &str) -> Vec<(LayerId, String)> {
     let mut out = vec![(LayerId::User, format!("{home}/.claude/settings.json"))];
     if let Some(p) = project {
         out.push((LayerId::Project, format!("{p}/.claude/settings.json")));
         out.push((LayerId::ProjectLocal, format!("{p}/.claude/settings.local.json")));
     }
-    out.push((
-        LayerId::Injected,
-        format!("{home}/.local/share/aiterm/claude-hook-settings.json"),
-    ));
+    out.push((LayerId::Injected, injected.to_string()));
     out
 }
 
@@ -50,7 +49,13 @@ pub struct SettingsView {
 #[tauri::command]
 pub fn claude_settings(project: Option<String>) -> SettingsView {
     let h = home();
-    let paths = layer_paths(&h, project.as_deref());
+    // The real path the hook writer uses — falling back to the historical
+    // default only when dirs::data_dir() can't resolve at all (no HOME),
+    // where the whole panel is already guesswork.
+    let injected = crate::hooklink::settings_path()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{h}/.local/share/aiterm/claude-hook-settings.json"));
+    let paths = layer_paths(&h, project.as_deref(), &injected);
     let mut layers = Vec::new();
     let mut texts: Vec<(LayerId, String)> = Vec::new();
     for (id, path) in &paths {
@@ -155,7 +160,7 @@ mod tests {
 
     #[test]
     fn layer_paths_are_built_from_home_and_project() {
-        let l = layer_paths("/h", Some("/p"));
+        let l = layer_paths("/h", Some("/p"), "/h/.local/share/aiterm/claude-hook-settings.json");
         assert_eq!(l[0].1, "/h/.claude/settings.json");
         assert_eq!(l[1].1, "/p/.claude/settings.json");
         assert_eq!(l[2].1, "/p/.claude/settings.local.json");
@@ -164,9 +169,18 @@ mod tests {
 
     #[test]
     fn with_no_project_open_only_the_user_and_injected_layers_are_looked_for() {
-        let l = layer_paths("/h", None);
+        let l = layer_paths("/h", None, "/h/.local/share/aiterm/claude-hook-settings.json");
         assert!(l.iter().all(|(id, _)| *id != settings::LayerId::Project));
         assert_eq!(l.len(), 2);
+    }
+
+    #[test]
+    fn the_injected_layer_is_the_path_the_hook_writer_uses_not_a_guess() {
+        // Hardcoding ~/.local/share here would report aiterm's own settings
+        // file as absent under a non-default XDG_DATA_HOME, while sessions
+        // were still being launched with it.
+        let l = layer_paths("/h", None, "/custom/aiterm/claude-hook-settings.json");
+        assert_eq!(l.last().unwrap().1, "/custom/aiterm/claude-hook-settings.json");
     }
 
     #[test]
