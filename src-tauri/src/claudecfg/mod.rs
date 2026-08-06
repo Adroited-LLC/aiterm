@@ -8,6 +8,7 @@ pub mod instructions;
 pub mod mcp;
 pub mod skills;
 pub mod write;
+pub mod edit;
 
 use serde::Serialize;
 use settings::{Layer, LayerId, Setting};
@@ -130,6 +131,20 @@ pub fn claude_save_layer(
     loaded_text: String,
 ) -> Result<(), write::SaveError> {
     write::save_layer(&path, &new_text, &loaded_text)
+}
+
+/// Change one key in one layer. The panel's inline row editors use this; the
+/// raw editor sends whole files through `claude_save_layer` instead.
+#[tauri::command]
+pub fn claude_set_key(
+    path: String,
+    dotted_key: String,
+    value: serde_json::Value,
+    loaded_text: String,
+) -> Result<(), write::SaveError> {
+    let next = edit::set_key(&loaded_text, &dotted_key, value)
+        .map_err(write::SaveError::Invalid)?;
+    write::save_layer(&path, &next, &loaded_text)
 }
 
 #[tauri::command]
