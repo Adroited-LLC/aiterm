@@ -112,6 +112,21 @@ pub struct Provider {
     pub routes: std::collections::BTreeMap<String, Route>,
 }
 
+/// The ceiling that applies to one model: its own if it sets one, otherwise
+/// the account default. A per-model ceiling *replaces* the account one rather
+/// than merging field by field, so a model priced with one number does not
+/// quietly inherit the other.
+///
+/// Shared by the request builder and the endpoint reader. Two copies of this
+/// choice would be two answers the day one of them is edited — and the panel
+/// would then mark rows "over cap" that the request happily routes to.
+fn effective_cap<'a>(p: &'a Provider, model: &str) -> &'a MaxPrice {
+    match p.routes.get(model) {
+        Some(r) if !r.max_price.is_empty() => &r.max_price,
+        _ => &p.policy.max_price,
+    }
+}
+
 /// The `provider` object for one request: the account policy, plus whatever
 /// this model asks for on top.
 ///
@@ -124,10 +139,7 @@ pub struct Provider {
 /// point; the caller is responsible for saying so when it reports the error.
 pub fn routing_block(p: &Provider, model: &str) -> Option<serde_json::Value> {
     let route = p.routes.get(model);
-    let cap = match route {
-        Some(r) if !r.max_price.is_empty() => &r.max_price,
-        _ => &p.policy.max_price,
-    };
+    let cap = effective_cap(p, model);
     let pinned = route.map(|r| !r.order.is_empty()).unwrap_or(false);
     if p.policy.resolved_ignore.is_empty() && !pinned && cap.is_empty() {
         return None;
@@ -448,7 +460,11 @@ fn fetch_models_response(id: &str) -> Result<String, String> {
     if p.api_key.is_empty() {
         return Err("No API key saved for this provider.".into());
     }
-    let url = format!("{}/models", p.base_url);
+    fetch(p, &format!("{}/models", p.base_url))
+}
+
+/// One authenticated GET as curl sees it: body, newline, HTTP status.
+pub fn fetch(p: &Provider, url: &str) -> Result<String, String> {
     // The key goes in on stdin, never on the argv. `/proc/<pid>/cmdline` is
     // world-readable on Linux, so `-H "Authorization: Bearer …"` publishes the
     // secret to every process on the machine for as long as curl runs — and
@@ -469,7 +485,7 @@ fn fetch_models_response(id: &str) -> Result<String, String> {
             "Content-Type: application/json",
             "--config",
             "-",
-            &url,
+            url,
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -611,6 +627,109 @@ pub fn parse_model_cards(response: &str) -> Result<Vec<ModelCard>, String> {
         return Err("The provider returned an empty model list.".into());
     }
     Ok(cards)
+}
+
+/// One host's offer of one model.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct EndpointCard {
+    pub provider_name: String,
+    /// The routing slug — `novita`. What `order` and `ignore` take.
+    pub slug: String,
+    /// The full tag — `novita/fp8`. Shown, never sent: OpenRouter filters
+    /// quantization through a separate field, so a pin cannot name one.
+    pub tag: String,
+    pub quantization: Option<String>,
+    pub context_length: Option<u64>,
+    /// USD per token, as quoted — the UI scales to $/M.
+    pub prompt_price: Option<f64>,
+    pub completion_price: Option<f64>,
+    pub max_completion_tokens: Option<u64>,
+    pub uptime_30m: Option<f64>,
+    /// Why the stored policy rules this row out, or `None`.
+    pub excluded: Option<String>,
+}
+
+/// The `/endpoints` reply as rows, annotated against the stored policy.
+///
+/// The annotation happens here, in the one place that already knows the
+/// policy, rather than in the panel. Two implementations of "is this row
+/// allowed" would be two answers the day one of them is edited.
+pub fn parse_endpoints(
+    response: &str,
+    p: &Provider,
+    model: &str,
+) -> Result<Vec<EndpointCard>, String> {
+    let body = checked_body(response)?;
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "The provider did not return JSON.".to_string())?;
+    let items = v
+        .pointer("/data/endpoints")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| "No endpoint list in the reply.".to_string())?;
+
+    let cap = effective_cap(p, model);
+    let price = |m: &serde_json::Value, key: &str| -> Option<f64> {
+        let x = m.pointer(&format!("/pricing/{key}"))?;
+        x.as_f64().or_else(|| x.as_str()?.trim().parse().ok())
+    };
+
+    Ok(items
+        .iter()
+        .filter_map(|e| {
+            let tag = e
+                .get("tag")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let slug = tag.split('/').next().unwrap_or("").to_string();
+            let prompt_price = price(e, "prompt");
+            let completion_price = price(e, "completion");
+            // Per token here, per million in the ceiling.
+            let over = |p_tok: Option<f64>, cap_m: Option<f64>| {
+                matches!((p_tok, cap_m), (Some(t), Some(c)) if t * 1e6 > c)
+            };
+            let excluded = p
+                .policy
+                .resolved_ignore
+                .get(&slug)
+                .cloned()
+                .or_else(|| {
+                    (over(prompt_price, cap.prompt) || over(completion_price, cap.completion))
+                        .then(|| "over cap".to_string())
+                });
+            Some(EndpointCard {
+                provider_name: e.get("provider_name").and_then(|n| n.as_str())?.to_string(),
+                slug,
+                tag,
+                quantization: e
+                    .get("quantization")
+                    .and_then(|q| q.as_str())
+                    .map(String::from),
+                context_length: e.get("context_length").and_then(|c| c.as_u64()),
+                prompt_price,
+                completion_price,
+                max_completion_tokens: e.get("max_completion_tokens").and_then(|c| c.as_u64()),
+                uptime_30m: e.get("uptime_last_30m").and_then(|u| u.as_f64()),
+                excluded,
+            })
+        })
+        .collect())
+}
+
+/// The endpoint list for one model. OpenRouter only — the path is theirs, and
+/// a `/endpoints` call to a bare llama.cpp is a 404 nobody can act on.
+#[tauri::command(async)]
+pub fn provider_model_endpoints(id: String, model: String) -> Result<Vec<EndpointCard>, String> {
+    let list = load();
+    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    if !p.is_openrouter() {
+        return Err("Provider routing is an OpenRouter feature.".into());
+    }
+    if p.api_key.is_empty() {
+        return Err("No API key saved for this provider.".into());
+    }
+    let url = format!("{}/models/{model}/endpoints", p.base_url);
+    parse_endpoints(&fetch(p, &url)?, p, &model)
 }
 
 /// Split the `-w` status off the body and pull out model ids.
@@ -864,6 +983,62 @@ mod tests {
     fn cards_report_a_rejected_key_as_such() {
         let err = parse_model_cards("{}\n401").unwrap_err();
         assert!(err.contains("rejected"), "{err}");
+    }
+
+    /// Trimmed from a real `/models/z-ai/glm-5.2/endpoints` reply, 2026-08-10.
+    const ENDPOINTS: &str = r#"{"data":{"id":"z-ai/glm-5.2","endpoints":[
+      {"name":"Sail Research | z-ai/glm-5.2","provider_name":"Sail Research",
+       "tag":"sail-research/fp8","quantization":"fp8","context_length":1048576,
+       "max_completion_tokens":131072,"uptime_last_30m":99.34,
+       "pricing":{"prompt":"0.0000005","completion":"0.00000315"}},
+      {"name":"Novita | z-ai/glm-5.2","provider_name":"Novita",
+       "tag":"novita/fp8","quantization":"fp8","context_length":1048576,
+       "max_completion_tokens":131072,"uptime_last_30m":98.71,
+       "pricing":{"prompt":"0.0000005026","completion":"0.00000158"}},
+      {"name":"Baidu | z-ai/glm-5.2","provider_name":"Baidu",
+       "tag":"baidu/fp8","quantization":"fp8","context_length":1048576,
+       "max_completion_tokens":131072,"uptime_last_30m":97.0,
+       "pricing":{"prompt":"0.000000504","completion":"0.000001584"}}]}}
+200"#;
+
+    #[test]
+    fn an_endpoint_reply_becomes_rows_with_routing_slugs() {
+        let p = provider("openrouter");
+        let rows = parse_endpoints(ENDPOINTS, &p, "z-ai/glm-5.2").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].provider_name, "Novita");
+        // The tag is shown; the slug before the slash is what a pin sends.
+        assert_eq!(rows[1].tag, "novita/fp8");
+        assert_eq!(rows[1].slug, "novita");
+        assert_eq!(rows[1].completion_price, Some(0.00000158));
+        assert_eq!(rows[1].max_completion_tokens, Some(131072));
+        assert!(rows.iter().all(|r| r.excluded.is_none()));
+    }
+
+    #[test]
+    fn rows_carry_the_reason_the_policy_excludes_them() {
+        let mut p = provider("openrouter");
+        p.policy.resolved_ignore.insert("baidu".into(), "CN".into());
+        // $2/M completion: Sail Research at $3.15/M is over, Novita at $1.58/M is not.
+        p.policy.max_price.completion = Some(2.0);
+        let rows = parse_endpoints(ENDPOINTS, &p, "z-ai/glm-5.2").unwrap();
+        assert_eq!(rows[0].excluded.as_deref(), Some("over cap"));
+        assert_eq!(rows[1].excluded, None);
+        assert_eq!(rows[2].excluded.as_deref(), Some("CN"));
+    }
+
+    #[test]
+    fn a_models_own_ceiling_decides_which_rows_are_over_cap() {
+        let mut p = provider("openrouter");
+        p.policy.max_price.completion = Some(5.0);
+        p.routes.insert("z-ai/glm-5.2".into(), Route {
+            max_price: MaxPrice { prompt: None, completion: Some(1.6) },
+            ..Default::default()
+        });
+        let rows = parse_endpoints(ENDPOINTS, &p, "z-ai/glm-5.2").unwrap();
+        assert_eq!(rows[0].excluded.as_deref(), Some("over cap"));  // $3.15/M
+        assert_eq!(rows[1].excluded, None);                         // $1.58/M
+        assert_eq!(rows[2].excluded, None);                         // $1.584/M... under 1.6
     }
 
     #[test]
