@@ -357,6 +357,41 @@ export interface ProviderView {
   /** Model ids picked for the new-session menu — the shortlist, not the
    *  catalog. */
   startup_models: string[];
+  /** Account-wide routing rules. Present on every provider; only OpenRouter
+   *  does anything with it. */
+  policy: Policy;
+  /** Per-model routing, keyed by model id. A route outlives its star, so
+   *  re-adding a model to the shortlist restores its pin. */
+  routes: Record<string, Route>;
+}
+
+/** A ceiling in USD per *million* tokens — OpenRouter's unit for `max_price`,
+ *  which is not the per-token unit `/models` and `/endpoints` quote. Either
+ *  field absent means no ceiling on that side; Rust omits an unset one rather
+ *  than sending null. */
+export interface MaxPrice {
+  prompt?: number;
+  completion?: number;
+}
+
+/** Which hosts this account will not use. `resolved_ignore` maps a provider
+ *  slug to why it is out — compiled when the policy is saved, sent verbatim as
+ *  OpenRouter's `ignore`. */
+export interface Policy {
+  blocked_countries: string[];
+  block_unknown_country: boolean;
+  blocked_providers: string[];
+  max_price: MaxPrice;
+  resolved_ignore: Record<string, string>;
+  /** Epoch seconds. 0 means never compiled. */
+  resolved_at: number;
+}
+
+/** What one model prefers. An empty `order` is "no pin". */
+export interface Route {
+  order: string[];
+  allow_fallbacks: boolean;
+  max_price: MaxPrice;
 }
 
 export const providersList = () => invoke<ProviderView[]>("providers_list");
@@ -387,6 +422,65 @@ export const providerModelCards = (id: string) =>
 /** Replace a provider's startup shortlist — what the new-session menu offers. */
 export const providerStartupSet = (id: string, models: string[]) =>
   invoke<ProviderView[]>("provider_startup_set", { id, models });
+
+/** One host's offer of one model. Prices are USD per token as quoted; scale by
+ *  1e6 to show $/M. `excluded` is why the stored policy rules the row out. */
+export interface EndpointCard {
+  provider_name: string;
+  /** The routing slug — `novita`. What `order` and `ignore` take. */
+  slug: string;
+  /** The full tag — `novita/fp8`. Shown, never sent: a pin cannot name a
+   *  quantization. */
+  tag: string;
+  quantization: string | null;
+  context_length: number | null;
+  prompt_price: number | null;
+  completion_price: number | null;
+  max_completion_tokens: number | null;
+  uptime_30m: number | null;
+  excluded: string | null;
+}
+
+/** One provider in OpenRouter's directory. `headquarters` is often missing,
+ *  which is why `block_unknown_country` is its own decision. */
+export interface DirectoryEntry {
+  slug: string;
+  name: string;
+  headquarters: string | null;
+  datacenters: string[];
+}
+
+/** One day of one model on one host. Account-wide, not app-wide: it includes
+ *  traffic aiterm never launched. */
+export interface ActivityRow {
+  date: string;
+  model: string;
+  provider_name: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** USD. */
+  usage: number;
+}
+
+/** Who hosts this model, annotated against the stored policy. OpenRouter
+ *  only — `/endpoints` on a bare llama.cpp is a 404 nobody can act on. */
+export const providerModelEndpoints = (id: string, model: string) =>
+  invoke<EndpointCard[]>("provider_model_endpoints", { id, model });
+/** Every host OpenRouter knows, with the countries the policy filters on. */
+export const providerDirectory = (id: string) =>
+  invoke<DirectoryEntry[]>("provider_directory", { id });
+/** Compiles the policy against the live directory before saving — a directory
+ *  that will not load fails the save rather than storing an empty rule. */
+export const providerPolicySet = (id: string, policy: Policy) =>
+  invoke<ProviderView[]>("provider_policy_set", { id, policy });
+/** Replace one model's route. An empty `order` clears the pin. */
+export const providerRouteSet = (id: string, model: string, route: Route) =>
+  invoke<ProviderView[]>("provider_route_set", { id, model, route });
+/** Daily spend per model per host. Needs a management key — an inference key
+ *  comes back with OpenRouter's own sentence saying so. */
+export const providerActivity = (id: string) =>
+  invoke<ActivityRow[]>("provider_activity", { id });
 
 /** What an engine supports, so the UI gates on a declaration rather than on an
  *  agent's name. Snake_case because it arrives straight off `Caps` in Rust. */
