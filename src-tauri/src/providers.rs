@@ -112,6 +112,41 @@ pub struct Provider {
     pub routes: std::collections::BTreeMap<String, Route>,
 }
 
+/// The `provider` object for one request: the account policy, plus whatever
+/// this model asks for on top.
+///
+/// `None` when there is nothing to send, so an unrouted model's request is
+/// byte-for-byte what it was before this feature existed.
+///
+/// A pin sets `allow_fallbacks: false` — "only that host", per the decision
+/// recorded in the spec. A pinned host that is down, or priced above the
+/// ceiling, fails the request rather than routing elsewhere. That is the
+/// point; the caller is responsible for saying so when it reports the error.
+pub fn routing_block(p: &Provider, model: &str) -> Option<serde_json::Value> {
+    let route = p.routes.get(model);
+    let cap = match route {
+        Some(r) if !r.max_price.is_empty() => &r.max_price,
+        _ => &p.policy.max_price,
+    };
+    let pinned = route.map(|r| !r.order.is_empty()).unwrap_or(false);
+    if p.policy.resolved_ignore.is_empty() && !pinned && cap.is_empty() {
+        return None;
+    }
+    let mut b = serde_json::Map::new();
+    if !p.policy.resolved_ignore.is_empty() {
+        let slugs: Vec<&String> = p.policy.resolved_ignore.keys().collect();
+        b.insert("ignore".into(), serde_json::json!(slugs));
+    }
+    if let Some(r) = route.filter(|_| pinned) {
+        b.insert("order".into(), serde_json::json!(r.order));
+        b.insert("allow_fallbacks".into(), serde_json::json!(false));
+    }
+    if !cap.is_empty() {
+        b.insert("max_price".into(), serde_json::to_value(cap).ok()?);
+    }
+    Some(serde_json::Value::Object(b))
+}
+
 /// Replace a provider's startup shortlist. Order is the caller's; duplicates
 /// fold to their first appearance.
 pub fn set_startup_models(
@@ -613,6 +648,82 @@ mod tests {
             policy: Default::default(),
             routes: Default::default(),
         }
+    }
+
+    /// An unconfigured provider must send the request it sent before this
+    /// feature existed — not an empty `provider` object.
+    #[test]
+    fn nothing_configured_sends_no_routing_block() {
+        let p = provider("openrouter");
+        assert_eq!(routing_block(&p, "z-ai/glm-5.2"), None);
+    }
+
+    /// The compiled ignore list is account-wide, so it applies to a model with
+    /// no route of its own — and on its own it is the whole block.
+    #[test]
+    fn a_policy_alone_sends_only_the_ignore_list() {
+        let mut p = provider("openrouter");
+        p.policy.resolved_ignore.insert("baidu".into(), "CN".into());
+        p.policy.resolved_ignore.insert("streamlake".into(), "CN".into());
+        assert_eq!(
+            routing_block(&p, "z-ai/glm-5.2").unwrap(),
+            serde_json::json!({"ignore": ["baidu", "streamlake"]}),
+        );
+    }
+
+    /// A pin is "only that host": the order goes out with fallbacks explicitly
+    /// off, so a pinned host that is down fails rather than silently routing
+    /// somewhere the user did not choose.
+    #[test]
+    fn a_pin_means_only_that_host() {
+        let mut p = provider("openrouter");
+        p.routes.insert("z-ai/glm-5.2".into(), Route {
+            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
+        });
+        let b = routing_block(&p, "z-ai/glm-5.2").unwrap();
+        assert_eq!(b["order"], serde_json::json!(["novita"]));
+        assert_eq!(b["allow_fallbacks"], serde_json::json!(false));
+    }
+
+    /// Rust defaults `allow_fallbacks` to false and OpenRouter defaults it to
+    /// true, so neither default can be leaned on. With no pin the key is left
+    /// out entirely rather than sent as either value.
+    #[test]
+    fn an_unpinned_model_omits_allow_fallbacks_rather_than_sending_true() {
+        let mut p = provider("openrouter");
+        p.policy.max_price.completion = Some(2.5);
+        let b = routing_block(&p, "z-ai/glm-5.2").unwrap();
+        assert!(b.get("allow_fallbacks").is_none());
+        assert!(b.get("order").is_none());
+    }
+
+    /// A per-model ceiling is the whole ceiling for that model. Merging it
+    /// field-by-field with the account default would mean a model priced with
+    /// one number quietly inherits the other.
+    #[test]
+    fn a_models_ceiling_replaces_the_policy_ceiling_rather_than_merging() {
+        let mut p = provider("openrouter");
+        p.policy.max_price = MaxPrice { prompt: Some(1.0), completion: Some(2.5) };
+        p.routes.insert("z-ai/glm-5.2".into(), Route {
+            max_price: MaxPrice { prompt: None, completion: Some(1.8) },
+            ..Default::default()
+        });
+        let b = routing_block(&p, "z-ai/glm-5.2").unwrap();
+        assert_eq!(b["max_price"], serde_json::json!({"completion": 1.8}));
+        // The other model still gets the account default.
+        let b2 = routing_block(&p, "z-ai/glm-5.1").unwrap();
+        assert_eq!(b2["max_price"], serde_json::json!({"prompt": 1.0, "completion": 2.5}));
+    }
+
+    /// Routes are keyed by model and stay that way — pinning one model must
+    /// not quietly pin every other model on the account.
+    #[test]
+    fn a_route_for_another_model_does_not_leak_into_this_one() {
+        let mut p = provider("openrouter");
+        p.routes.insert("z-ai/glm-5.1".into(), Route {
+            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
+        });
+        assert_eq!(routing_block(&p, "z-ai/glm-5.2"), None);
     }
 
     /// The startup list is a replace: what arrives is what is kept, minus
