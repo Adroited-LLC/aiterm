@@ -172,8 +172,10 @@ export default function ModelAccess() {
     // would otherwise be shown the first one's rows.
     setEndpoints({}); setEpOpen(null); setEpErr(null); setCap(null);
     // Likewise the policy: the draft, the directory and the section's own
-    // open/closed state all belong to the provider being left.
-    setPolOpen(false); setDir(null); setDraft(null); setPolErr(null);
+    // open/closed state all belong to the provider being left. `polBusy` is
+    // among them — a save still settling on the provider we are leaving must
+    // not leave this one's Save button reading "Saving…".
+    setPolOpen(false); setDir(null); setDraft(null); setPolErr(null); setPolBusy(false);
     if (!cards[p.id]) {
       try {
         const list = await providerModelCards(p.id);
@@ -388,6 +390,9 @@ export default function ModelAccess() {
         resolved_ignore: {},
         resolved_at: 0,
       });
+      // The provider list is whole-account state, not the browser's view of
+      // one provider, so it is stored whichever provider is on screen — the
+      // same as `applyRoute`. Everything below it is view state, and guarded.
       provsRef.current = list;
       setProviders(list);
       // Every endpoint row carries `excluded`, computed from the stored
@@ -395,19 +400,35 @@ export default function ModelAccess() {
       // replaced. Drop them, and re-fetch the one set that is on screen,
       // because nothing else would.
       const open = epOpen;
+      // The map is keyed by model id alone, so once the browser has moved on
+      // it holds the *other* provider's rows — which this policy did not
+      // touch. Wiping them there would blank a list that is on screen.
+      if (browsingRef.current !== provId) return;
       setEndpoints({});
       if (open) {
         try {
           const rows = await providerModelEndpoints(provId, open);
-          if (browsingRef.current === provId) setEndpoints({ [open]: rows });
+          // Merged, not assigned: another section opened while this was in
+          // flight has already written its rows, and replacing the map would
+          // strand it on "Asking the provider…" with no request left to land.
+          if (browsingRef.current === provId) setEndpoints((e) => ({ ...e, [open]: rows }));
         } catch (e) {
           if (browsingRef.current === provId) setEpErr({ model: open, msg: String(e) });
         }
       }
     } catch (e) {
-      setPolErr(String(e));
+      // Errors are shown inside the policy section, which now belongs to
+      // another provider — a failed save on the one we left must not print
+      // there.
+      if (browsingRef.current === provId) setPolErr(String(e));
     } finally {
-      setPolBusy(false);
+      // Guarded like the rest: `browse` already cleared this flag for the
+      // provider now on screen, and clearing it again would free that
+      // provider's Save button while its own save is still in flight. Folding
+      // the browser away instead of switching leaves the flag set, which is
+      // harmless — the section is not rendered, and reopening the provider
+      // runs the same reset in `browse`.
+      if (browsingRef.current === provId) setPolBusy(false);
     }
   };
 
