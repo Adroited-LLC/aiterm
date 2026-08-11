@@ -175,42 +175,67 @@ pub fn scan_chats() -> Vec<(crate::sessions::Session, std::path::PathBuf)> {
         .collect()
 }
 
-/// The request body for one exchange: full history, streaming on.
-pub fn chat_body(model: &str, messages: &[Msg]) -> String {
-    serde_json::json!({
+/// The request body for one exchange: full history, streaming on, routing when
+/// the model has any, and usage accounting so a reply can report its cost.
+pub fn chat_body(model: &str, messages: &[Msg], routing: Option<&serde_json::Value>) -> String {
+    let mut v = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
-    })
-    .to_string()
+        "stream_options": {"include_usage": true},
+    });
+    if let (Some(r), Some(map)) = (routing, v.as_object_mut()) {
+        map.insert("provider".into(), r.clone());
+    }
+    v.to_string()
 }
 
-/// One line of a streaming reply → the text it carries, if any.
+/// What one `data:` line carries. Any field may be absent; absent is absent.
+#[derive(Debug, Default, PartialEq)]
+pub struct Frame {
+    pub text: Option<String>,
+    /// The host that served this reply — a top-level `provider` on every
+    /// chunk. Undeclared in OpenRouter's OpenAPI document, present on the
+    /// wire, so it is read where offered and never required.
+    pub provider: Option<String>,
+    /// USD for the exchange, on the final chunk when `include_usage` is set.
+    pub cost: Option<f64>,
+}
+
+/// One line of a streaming reply → what it carries.
 ///
 /// The stream is server-sent events: `data: {json}` lines with token deltas,
 /// `data: [DONE]` at the end, and bare `: comment` keep-alives (OpenRouter
 /// sends `: OPENROUTER PROCESSING` while a model spins up) that carry
 /// nothing. A line that is plain JSON with an `error` object is the provider
 /// failing the request — returned as `Err` so the loop can say so.
-pub fn sse_delta(line: &str) -> Result<Option<String>, String> {
+pub fn frame(line: &str) -> Result<Frame, String> {
     let line = line.trim();
     if let Some(data) = line.strip_prefix("data:") {
         let data = data.trim();
         if data == "[DONE]" {
-            return Ok(None);
+            return Ok(Frame::default());
         }
         let v: serde_json::Value = match serde_json::from_str(data) {
             Ok(v) => v,
-            Err(_) => return Ok(None), // half a frame; nothing to print
+            Err(_) => return Ok(Frame::default()), // half a frame; nothing to print
         };
         if let Some(msg) = v.pointer("/error/message").and_then(|m| m.as_str()) {
             return Err(msg.to_string());
         }
-        return Ok(v
-            .pointer("/choices/0/delta/content")
-            .and_then(|c| c.as_str())
-            .filter(|c| !c.is_empty())
-            .map(String::from));
+        return Ok(Frame {
+            text: v
+                .pointer("/choices/0/delta/content")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+                .map(String::from),
+            provider: v
+                .get("provider")
+                .and_then(|p| p.as_str())
+                .filter(|p| !p.is_empty())
+                .map(String::from),
+            cost: v.pointer("/usage/cost").and_then(|c| c.as_f64()),
+        });
     }
     // A non-SSE JSON line is how a request that failed outright comes back.
     if line.starts_with('{') {
@@ -220,7 +245,34 @@ pub fn sse_delta(line: &str) -> Result<Option<String>, String> {
             }
         }
     }
-    Ok(None)
+    Ok(Frame::default())
+}
+
+/// What a reply cost and who served it, as one line — or `None` when the
+/// stream said neither, which is every provider that is not OpenRouter.
+fn attribution(host: Option<&str>, cost: Option<f64>) -> Option<String> {
+    let mut bits = Vec::new();
+    if let Some(h) = host {
+        bits.push(format!("via {h}"));
+    }
+    if let Some(c) = cost {
+        bits.push(format!("${c:.4}"));
+    }
+    (!bits.is_empty()).then(|| bits.join(" · "))
+}
+
+/// The note under a failed request for a pinned model. A pin sends
+/// `allow_fallbacks: false`, so OpenRouter having nothing to route to is the
+/// pin working, not the session breaking — but only if we say which pin.
+/// `None` for an unpinned model, whose failure is an ordinary failure.
+fn pinned_note(model: &str, order: &[String]) -> Option<String> {
+    if order.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{model} is pinned to {} with no fallback — OpenRouter had nothing to route to.",
+        order.join(", ")
+    ))
 }
 
 /// How a chat comes into being: fresh under a minted id, or resumed from a
@@ -347,19 +399,31 @@ pub fn run(start: Start) -> i32 {
             continue;
         }
         messages.push(Msg { role: "user", content: text.to_string() });
-        match stream_reply(&url, &p.api_key, &model, &messages) {
-            Ok(reply) if reply.is_empty() => {
+        // Rebuilt per send: `/model` swaps the model mid-chat, and the route
+        // has to swap with it.
+        let routing = crate::providers::routing_block(p, &model);
+        match stream_reply(&url, &p.api_key, &model, &messages, routing.as_ref()) {
+            Ok(reply) if reply.text.is_empty() => {
                 eprintln!("\x1b[2m(the model returned nothing)\x1b[0m");
                 messages.pop();
             }
             Ok(reply) => {
                 println!();
+                if let Some(line) = attribution(reply.host.as_deref(), reply.cost) {
+                    println!("\x1b[2m· {line}\x1b[0m");
+                }
                 append(&mut log, &msg_line("user", text, now_ms()));
-                append(&mut log, &msg_line("assistant", &reply, now_ms()));
-                messages.push(Msg { role: "assistant", content: reply });
+                append(&mut log, &msg_line("assistant", &reply.text, now_ms()));
+                messages.push(Msg { role: "assistant", content: reply.text });
             }
             Err(e) => {
                 eprintln!("\x1b[31m{e}\x1b[0m");
+                // A pin is "only that host": say so, or a refusal from a
+                // constraint the user set reads as a broken session.
+                let order = p.routes.get(&model).map(|r| r.order.as_slice()).unwrap_or(&[]);
+                if let Some(note) = pinned_note(&model, order) {
+                    eprintln!("\x1b[2m  {note}\x1b[0m");
+                }
                 messages.pop(); // the turn didn't happen; let it be retyped
             }
         }
@@ -437,12 +501,27 @@ fn replay_tail(messages: &[Msg], cleared: usize) {
     }
 }
 
-/// Send the conversation, print the reply as it streams, return it whole.
-fn stream_reply(url: &str, key: &str, model: &str, messages: &[Msg]) -> Result<String, String> {
+/// One finished exchange: the reply, and what the stream said about serving
+/// it. `host` and `cost` are absent unless the provider volunteers them.
+struct Reply {
+    text: String,
+    host: Option<String>,
+    cost: Option<f64>,
+}
+
+/// Send the conversation, print the reply as it streams, return it whole —
+/// with whatever the stream said about who served it and what it cost.
+fn stream_reply(
+    url: &str,
+    key: &str,
+    model: &str,
+    messages: &[Msg],
+    routing: Option<&serde_json::Value>,
+) -> Result<Reply, String> {
     // The body goes through a 0600 file rather than the argv: prompts are the
     // user's own text and `/proc/<pid>/cmdline` is world-readable.
     let body_path = std::env::temp_dir().join(format!("aiterm-chat-{}.json", std::process::id()));
-    crate::providers::write_private(&body_path, &chat_body(model, messages))
+    crate::providers::write_private(&body_path, &chat_body(model, messages, routing))
         .map_err(|e| format!("could not stage the request: {e}"))?;
 
     let mut child = std::process::Command::new("curl")
@@ -475,17 +554,26 @@ fn stream_reply(url: &str, key: &str, model: &str, messages: &[Msg]) -> Result<S
         .map_err(|e| format!("could not pass the key to curl: {e}"))?;
 
     let mut reply = String::new();
+    // The host names itself on every chunk and the cost arrives on the last
+    // one: keep the first host offered, and the newest cost seen.
+    let mut host: Option<String> = None;
+    let mut cost: Option<f64> = None;
     let mut failed: Option<String> = None;
     if let Some(out) = child.stdout.take() {
         for line in std::io::BufReader::new(out).lines() {
             let Ok(line) = line else { break };
-            match sse_delta(&line) {
-                Ok(Some(chunk)) => {
-                    print!("{chunk}");
-                    let _ = std::io::stdout().flush();
-                    reply.push_str(&chunk);
+            match frame(&line) {
+                Ok(f) => {
+                    if let Some(chunk) = f.text {
+                        print!("{chunk}");
+                        let _ = std::io::stdout().flush();
+                        reply.push_str(&chunk);
+                    }
+                    if host.is_none() {
+                        host = f.provider;
+                    }
+                    cost = f.cost.or(cost);
                 }
-                Ok(None) => {}
                 Err(e) => failed = Some(e),
             }
         }
@@ -496,13 +584,13 @@ fn stream_reply(url: &str, key: &str, model: &str, messages: &[Msg]) -> Result<S
         return Err(format!("The provider refused: {e}"));
     }
     match status {
-        Ok(s) if s.success() => Ok(reply),
+        Ok(s) if s.success() => Ok(Reply { text: reply, host, cost }),
         _ => {
             if reply.is_empty() {
                 Err("curl could not reach the provider.".into())
             } else {
                 // The stream broke mid-reply; what printed is what there is.
-                Ok(reply)
+                Ok(Reply { text: reply, host, cost })
             }
         }
     }
@@ -515,18 +603,18 @@ mod tests {
     #[test]
     fn a_token_delta_yields_its_text() {
         let line = r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#;
-        assert_eq!(sse_delta(line).unwrap(), Some("Hel".into()));
+        assert_eq!(frame(line).unwrap().text.as_deref(), Some("Hel"));
     }
 
     #[test]
     fn done_markers_keepalives_and_role_frames_yield_nothing() {
-        assert_eq!(sse_delta("data: [DONE]").unwrap(), None);
-        assert_eq!(sse_delta(": OPENROUTER PROCESSING").unwrap(), None);
+        assert_eq!(frame("data: [DONE]").unwrap(), Frame::default());
+        assert_eq!(frame(": OPENROUTER PROCESSING").unwrap(), Frame::default());
         assert_eq!(
-            sse_delta(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#).unwrap(),
-            None
+            frame(r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#).unwrap(),
+            Frame::default()
         );
-        assert_eq!(sse_delta("").unwrap(), None);
+        assert_eq!(frame("").unwrap(), Frame::default());
     }
 
     /// Providers fail two ways: an error object inside the stream, or a plain
@@ -535,9 +623,78 @@ mod tests {
     #[test]
     fn provider_errors_surface_from_both_shapes() {
         let inline = r#"data: {"error":{"message":"Rate limited"}}"#;
-        assert_eq!(sse_delta(inline).unwrap_err(), "Rate limited");
+        assert_eq!(frame(inline).unwrap_err(), "Rate limited");
         let flat = r#"{"error":{"message":"Invalid model"}}"#;
-        assert_eq!(sse_delta(flat).unwrap_err(), "Invalid model");
+        assert_eq!(frame(flat).unwrap_err(), "Invalid model");
+    }
+
+    #[test]
+    fn a_chunk_names_the_host_that_served_it() {
+        // Verified live 2026-08-10: `provider` rides every chunk, and is absent
+        // from OpenRouter's own OpenAPI schema. Read it where present, never
+        // require it.
+        let line = r#"data: {"id":"x","provider":"Novita","choices":[{"delta":{"content":"hi"}}]}"#;
+        let f = frame(line).unwrap();
+        assert_eq!(f.text.as_deref(), Some("hi"));
+        assert_eq!(f.provider.as_deref(), Some("Novita"));
+    }
+
+    #[test]
+    fn a_chunk_without_a_provider_is_not_an_error() {
+        let line = r#"data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}"#;
+        let f = frame(line).unwrap();
+        assert_eq!(f.text.as_deref(), Some("hi"));
+        assert_eq!(f.provider, None);
+    }
+
+    #[test]
+    fn the_final_usage_chunk_carries_the_cost() {
+        let line = r#"data: {"id":"x","provider":"Novita","choices":[],
+                      "usage":{"prompt_tokens":14,"completion_tokens":5,"cost":0.0021}}"#;
+        let f = frame(line).unwrap();
+        assert_eq!(f.text, None);
+        assert_eq!(f.cost, Some(0.0021));
+    }
+
+    #[test]
+    fn the_body_carries_the_routing_block_when_there_is_one() {
+        let routing = serde_json::json!({"ignore": ["baidu"], "order": ["novita"],
+                                         "allow_fallbacks": false});
+        let body = chat_body("z-ai/glm-5.2", &[], Some(&routing));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["provider"]["order"], serde_json::json!(["novita"]));
+        assert_eq!(v["stream"], serde_json::json!(true));
+        // Cost per reply, which is why include_usage goes on unconditionally.
+        assert_eq!(v["stream_options"]["include_usage"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn an_unrouted_model_sends_no_provider_key_at_all() {
+        let body = chat_body("z-ai/glm-5.2", &[], None);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v.get("provider").is_none());
+    }
+
+    /// The line under a reply says only what the stream actually reported —
+    /// and with nothing reported there is no line to print.
+    #[test]
+    fn the_attribution_names_only_the_parts_that_arrived() {
+        let both = attribution(Some("Novita"), Some(0.0021));
+        assert_eq!(both.as_deref(), Some("via Novita · $0.0021"));
+        assert_eq!(attribution(Some("Novita"), None).as_deref(), Some("via Novita"));
+        assert_eq!(attribution(None, Some(0.0021)).as_deref(), Some("$0.0021"));
+        assert_eq!(attribution(None, None), None);
+    }
+
+    /// A pinned model has one host and no fallback, so a refusal is the pin
+    /// doing its job. Say which pin, or "only that host" reads as a break.
+    #[test]
+    fn a_refused_pin_names_the_hosts_it_was_held_to() {
+        let order = vec!["novita".to_string(), "deepinfra".to_string()];
+        let note = pinned_note("z-ai/glm-5.2", &order).unwrap();
+        assert!(note.contains("z-ai/glm-5.2"), "{note}");
+        assert!(note.contains("novita, deepinfra"), "{note}");
+        assert_eq!(pinned_note("z-ai/glm-5.2", &[]), None);
     }
 
     /// One trailing backslash continues the message; a doubled one is a
@@ -591,7 +748,7 @@ mod tests {
             Msg { role: "user", content: "hi".into() },
             Msg { role: "assistant", content: "hello".into() },
         ];
-        let v: serde_json::Value = serde_json::from_str(&chat_body("a/b", &msgs)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&chat_body("a/b", &msgs, None)).unwrap();
         assert_eq!(v["model"], "a/b");
         assert_eq!(v["stream"], true);
         assert_eq!(v["messages"][1]["role"], "assistant");
