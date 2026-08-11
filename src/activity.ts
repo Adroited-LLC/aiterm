@@ -43,12 +43,18 @@ export interface HostUse {
  * Activity reports hosts by name; the policy holds slugs. They are usually the
  * same word in different clothes, and assuming they are the same *string*
  * would silently fail to flag exactly the hosts this view exists to flag.
- * Leading and trailing dashes are trimmed, matching Rust's `slug()` — no
- * OpenRouter slug has one, so a name that produced one could only ever fail to
- * match.
+ *
+ * The activity record names hosts in endpoint-tag form — `deepinfra/fp4`,
+ * `google-vertex/global` — where everything after the slash is a variant of
+ * the same company. The policy blocks the company, so the variant is cut
+ * before slugifying: `deepinfra/fp4` must match a block on `deepinfra`, and
+ * keeping the suffix would flag none of the tagged rows (seen in real data
+ * 2026-08-10). Leading and trailing dashes are trimmed, matching Rust's
+ * `slug()` — no OpenRouter slug has one, so a name that produced one could
+ * only ever fail to match.
  */
 export const slugOf = (name: string) =>
-  name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  name.split("/")[0].toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 
 /**
  * The daily rows folded to hosts, and to models within each host.

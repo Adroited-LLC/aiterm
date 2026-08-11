@@ -62,6 +62,17 @@ test("a display name normalises to the slug a policy is keyed by", () => {
   assert.equal(slugOf("!!"), "");
 });
 
+// The activity record's real shape, seen 2026-08-10: hosts arrive as endpoint
+// tags, and the part after the slash is a variant of the same company. A block
+// on the company must catch every variant.
+test("an endpoint tag matches the company slug its policy entry uses", () => {
+  assert.equal(slugOf("deepinfra/fp4"), "deepinfra");
+  assert.equal(slugOf("google-vertex/global"), "google-vertex");
+  assert.equal(slugOf("anthropic/2"), "anthropic");
+  // A bare name is unchanged by the cut.
+  assert.equal(slugOf("novita"), "novita");
+});
+
 test("the window's total is every host added up", () => {
   const t = totalOf(groupActivity([
     row({ provider_name: "A", requests: 2, prompt_tokens: 10, usage: 1.5 }),
