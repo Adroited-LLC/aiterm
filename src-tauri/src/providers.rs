@@ -74,7 +74,9 @@ pub struct Policy {
 /// What one model prefers. An empty `order` is "no pin".
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Route {
+    #[serde(default)]
     pub order: Vec<String>,
+    #[serde(default)]
     pub allow_fallbacks: bool,
     #[serde(default)]
     pub max_price: MaxPrice,
@@ -672,6 +674,24 @@ mod tests {
         let text = serde_json::to_string(&[p.clone()]).unwrap();
         let back: Vec<Provider> = serde_json::from_str(&text).unwrap();
         assert_eq!(back[0], p);
+    }
+
+    /// providers.json is plain text and people edit it. A route typed by hand
+    /// is unlikely to carry every key, and one missing key must not fail the
+    /// parse of the whole file — `load()` turns any parse error into "no
+    /// providers at all", so a half-written route would silently cost the user
+    /// their keys until they noticed.
+    #[test]
+    fn a_hand_edited_route_missing_fields_still_loads() {
+        let hand_edited = r#"[{"id":"openrouter","name":"OpenRouter",
+            "base_url":"https://openrouter.ai/api/v1","api_key":"k",
+            "routes":{"z-ai/glm-5.2":{"max_price":{"completion":1.8}}}}]"#;
+        let list: Vec<Provider> =
+            serde_json::from_str(hand_edited).expect("a partial route must not fail the file");
+        let route = &list[0].routes["z-ai/glm-5.2"];
+        assert!(route.order.is_empty());
+        assert!(!route.allow_fallbacks);
+        assert_eq!(route.max_price.completion, Some(1.8));
     }
 
     /// providers.json written before startup lists existed has no such key —
