@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  EndpointCard, MaxPrice, ModelCard, ProviderView, providerDelete,
-  providerModelCards, providerModelEndpoints, providerModels, providerRouteSet,
-  providerSave, providerStartupSet, providersList, Route,
+  DirectoryEntry, EndpointCard, MaxPrice, ModelCard, Policy, ProviderView,
+  providerDelete, providerDirectory, providerModelCards, providerModelEndpoints,
+  providerModels, providerPolicySet, providerRouteSet, providerSave,
+  providerStartupSet, providersList, Route,
 } from "../ipc";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
@@ -26,6 +27,62 @@ const fmtPrice = (p: number | null) =>
 /** Free means the provider *said* zero — both directions, not just unknown. */
 const isFree = (m: ModelCard) =>
   m.prompt_price === 0 && (m.completion_price ?? 0) === 0;
+
+const DAY = 86_400;
+
+/** Epoch seconds → "today" or "N days ago". Days is the only unit worth
+ *  showing here: what it dates is a directory read, and the thing it warns
+ *  about — hosts added since — happens on that scale. */
+const ago = (secs: number) => {
+  const d = Math.floor((Date.now() / 1000 - secs) / DAY);
+  return d <= 0 ? "today" : d === 1 ? "1 day ago" : `${d} days ago`;
+};
+
+/** A compiled ignore list stops describing the directory it was built from. 30
+ *  days is where we say so out loud rather than let the rule look stronger
+ *  than it is. */
+const STALE_AFTER = 30 * DAY;
+
+/** One ceiling field of the policy draft. Text, not a number, because it is
+ *  being typed in; `bad` is the number field's own verdict on input it could
+ *  not parse, which reaches us as `""` and would otherwise read as "no cap". */
+type CapField = { text: string; bad: boolean };
+
+/** The policy being edited. Saving compiles it against the live directory, so
+ *  it is held here until the button is pressed rather than written per
+ *  keystroke. Countries are held uppercase; the backend matches
+ *  case-insensitively, so this only keeps the toggles from doubling up. */
+type PolDraft = {
+  countries: string[];
+  unknown: boolean;
+  /** Slugs blocked by name. Removable here; nothing adds to it yet. */
+  providers: string[];
+  prompt: CapField;
+  completion: CapField;
+};
+
+const draftOf = (pol: Policy): PolDraft => ({
+  // Both lists are de-duplicated on the way in: they are keys in the render,
+  // and a hand-edited providers.json is under no obligation to be tidy.
+  countries: [...new Set(pol.blocked_countries.map((c) => c.toUpperCase()))],
+  unknown: pol.block_unknown_country,
+  providers: [...new Set(pol.blocked_providers)],
+  prompt: { text: pol.max_price.prompt == null ? "" : String(pol.max_price.prompt), bad: false },
+  completion: {
+    text: pol.max_price.completion == null ? "" : String(pol.max_price.completion),
+    bad: false,
+  },
+});
+
+/** A draft ceiling as a number, `undefined` for "no cap", or `"bad"` for text
+ *  that is not either — which fails the save rather than silently clearing. */
+const capValue = (f: CapField): number | undefined | "bad" => {
+  if (f.bad) return "bad";
+  const t = f.text.trim();
+  if (t === "") return undefined;
+  const n = Number(t);
+  return Number.isFinite(n) && n >= 0 ? n : "bad";
+};
 
 /**
  * Where API model access is configured.
@@ -80,6 +137,16 @@ export default function ModelAccess() {
    *  verdict on the text it could not parse, which reaches us as `""` and
    *  would otherwise read as a deliberate clear. */
   const [cap, setCap] = useState<{ key: string; text: string; bad: boolean } | null>(null);
+
+  // The account-wide policy. It is one section per provider, so all of this is
+  // cleared when the browser moves — see `browse`.
+  const [polOpen, setPolOpen] = useState(false);
+  /** Every host OpenRouter knows, fetched when the section is opened. It is
+   *  where the country toggles and the unknown-country count come from. */
+  const [dir, setDir] = useState<DirectoryEntry[] | null>(null);
+  const [draft, setDraft] = useState<PolDraft | null>(null);
+  const [polErr, setPolErr] = useState<string | null>(null);
+  const [polBusy, setPolBusy] = useState(false);
   /** The newest provider list, including one a route write has just returned
    *  but React has not re-rendered from yet. */
   const provsRef = useRef<ProviderView[] | null>(null);
@@ -104,6 +171,9 @@ export default function ModelAccess() {
     // Endpoints are keyed by model id alone, so a second OpenRouter account
     // would otherwise be shown the first one's rows.
     setEndpoints({}); setEpOpen(null); setEpErr(null); setCap(null);
+    // Likewise the policy: the draft, the directory and the section's own
+    // open/closed state all belong to the provider being left.
+    setPolOpen(false); setDir(null); setDraft(null); setPolErr(null);
     if (!cards[p.id]) {
       try {
         const list = await providerModelCards(p.id);
@@ -250,6 +320,131 @@ export default function ModelAccess() {
     });
   };
 
+  /**
+   * Open the policy section, seeding the draft and fetching the directory.
+   *
+   * The draft survives a fold — collapsing the section is not a decision to
+   * throw away what was typed into it — so it is seeded only when there is
+   * none. Switching provider clears it, which is a different thing.
+   */
+  const openPolicy = async () => {
+    if (polOpen) { setPolOpen(false); return; }
+    const p = browsingProv;
+    if (!p) return;
+    setPolOpen(true);
+    setPolErr(null);
+    if (!draft) setDraft(draftOf(p.policy));
+    if (!dir) {
+      const provId = p.id;
+      try {
+        const rows = await providerDirectory(provId);
+        if (browsingRef.current !== provId) return;   // switched away mid-flight
+        setDir(rows);
+      } catch (e) {
+        if (browsingRef.current !== provId) return;
+        setPolErr(String(e));
+      }
+    }
+  };
+
+  const editDraft = (f: (d: PolDraft) => PolDraft) => setDraft((d) => (d ? f(d) : d));
+
+  const toggleCountry = (c: string) =>
+    editDraft((d) => ({
+      ...d,
+      countries: d.countries.includes(c)
+        ? d.countries.filter((x) => x !== c)
+        : [...d.countries, c],
+    }));
+
+  /**
+   * Compile and store the policy.
+   *
+   * `resolved_ignore` and `resolved_at` are sent empty: the backend recomputes
+   * both against the directory it reads at save time, and a directory that
+   * will not load fails the save rather than storing a rule that blocks
+   * nothing.
+   */
+  const savePolicy = async () => {
+    const p = browsingProv;
+    if (!p || !draft || polBusy) return;
+    const prompt = capValue(draft.prompt);
+    const completion = capValue(draft.completion);
+    if (prompt === "bad" || completion === "bad") {
+      setPolErr("A ceiling must be a number of dollars per million tokens, or blank for none.");
+      return;
+    }
+    const max_price: MaxPrice = {};
+    if (prompt !== undefined) max_price.prompt = prompt;
+    if (completion !== undefined) max_price.completion = completion;
+    setPolBusy(true); setPolErr(null);
+    const provId = p.id;
+    try {
+      const list = await providerPolicySet(provId, {
+        blocked_countries: draft.countries,
+        block_unknown_country: draft.unknown,
+        blocked_providers: draft.providers,
+        max_price,
+        resolved_ignore: {},
+        resolved_at: 0,
+      });
+      provsRef.current = list;
+      setProviders(list);
+      // Every endpoint row carries `excluded`, computed from the stored
+      // policy — so the cached rows now describe the rule that was just
+      // replaced. Drop them, and re-fetch the one set that is on screen,
+      // because nothing else would.
+      const open = epOpen;
+      setEndpoints({});
+      if (open) {
+        try {
+          const rows = await providerModelEndpoints(provId, open);
+          if (browsingRef.current === provId) setEndpoints({ [open]: rows });
+        } catch (e) {
+          if (browsingRef.current === provId) setEpErr({ model: open, msg: String(e) });
+        }
+      }
+    } catch (e) {
+      setPolErr(String(e));
+    } finally {
+      setPolBusy(false);
+    }
+  };
+
+  const pol = browsingProv?.policy;
+  const ignored = pol ? Object.keys(pol.resolved_ignore).length : 0;
+  const stale = !!pol && pol.resolved_at > 0
+    && Date.now() / 1000 - pol.resolved_at > STALE_AFTER;
+
+  /** The countries a rule can name: every one the directory mentions, plus any
+   *  already blocked — a host leaving the directory must not quietly take the
+   *  toggle for its country with it. CN leads because it is the one this was
+   *  built for, and it is offered even if the directory somehow omits it. */
+  const countries = (() => {
+    const set = new Set<string>(["CN"]);
+    for (const e of dir ?? []) {
+      if (e.headquarters) set.add(e.headquarters.toUpperCase());
+      for (const c of e.datacenters) set.add(c.toUpperCase());
+    }
+    for (const c of draft?.countries ?? []) set.add(c);
+    return ["CN", ...[...set].filter((c) => c !== "CN").sort()];
+  })();
+
+  /** How many hosts name this country at all — headquarters or a datacenter,
+   *  which is exactly what the compile matches on. */
+  const countryCount = (c: string) =>
+    (dir ?? []).filter(
+      (e) => e.headquarters?.toUpperCase() === c
+        || e.datacenters.some((d) => d.toUpperCase() === c),
+    ).length;
+
+  /** Hosts that report no country at all — neither headquarters nor a single
+   *  datacenter. Too large a share to decide silently in either direction,
+   *  hence its own checkbox with the count beside it. */
+  const unknownCount = (dir ?? []).filter(
+    (e) => !e.headquarters && e.datacenters.length === 0,
+  ).length;
+
   const all = browsing ? cards[browsing] : undefined;
   const q = query.trim().toLowerCase();
   const starred = browsingProv?.startup_models ?? [];
@@ -378,6 +573,113 @@ export default function ModelAccess() {
 
       {browsing && (
         <div className="mb">
+          {/* Account-wide, so it sits above the model list rather than in a
+              model's card: one rule, applied to every request this provider
+              serves. */}
+          {isOpenRouter && pol && (
+            <div className="pol">
+              <div className="pol-head">
+                <button
+                  className={"act-btn" + (polOpen ? " on" : "")}
+                  onClick={openPolicy}
+                >{polOpen ? "Hide routing policy" : "Routing policy"}</button>
+                {/* Shown open or closed: whether a rule is in force, and
+                    whether it still describes the directory, is the answer
+                    someone came here for. */}
+                <div className="set-hint">
+                  {ignored === 0
+                    ? "Nothing excluded."
+                    : `Excluding ${ignored} provider${ignored === 1 ? "" : "s"}`}
+                  {pol.resolved_at > 0 && ` · directory read ${ago(pol.resolved_at)}`}
+                  {stale && " · out of date — new hosts are not covered"}
+                </div>
+              </div>
+              {polOpen && draft && (
+                <div className="pol-body">
+                  {dir === null && !polErr && (
+                    <div className="set-hint">Asking OpenRouter which hosts it knows…</div>
+                  )}
+                  <div className="set-label">Refuse these countries</div>
+                  <div className="pol-chips">
+                    {countries.map((c) => (
+                      <button
+                        key={c}
+                        className={"pol-chip" + (draft.countries.includes(c) ? " on" : "")}
+                        title={dir === null ? c : `${countryCount(c)} hosts name ${c}`}
+                        onClick={() => toggleCountry(c)}
+                      >{c}</button>
+                    ))}
+                  </div>
+                  <label className="pol-check">
+                    <input
+                      type="checkbox"
+                      checked={draft.unknown}
+                      onChange={(e) => editDraft((d) => ({ ...d, unknown: e.target.checked }))}
+                    />
+                    Also block providers that report no country
+                    {dir !== null && (
+                      <span className="pol-count">({unknownCount} providers)</span>
+                    )}
+                  </label>
+                  <div className="set-hint">
+                    A country matches a host's headquarters or any of its datacenters,
+                    so a company registered elsewhere is still caught by where it runs.
+                  </div>
+                  {draft.providers.length > 0 && (
+                    <>
+                      <div className="set-label">Blocked by name</div>
+                      <div className="pol-chips">
+                        {draft.providers.map((s) => (
+                          <button
+                            key={s}
+                            className="pol-chip on"
+                            title={`Stop blocking ${s}`}
+                            onClick={() => editDraft((d) => ({
+                              ...d,
+                              providers: d.providers.filter((x) => x !== s),
+                            }))}
+                          >{s} ✕</button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                  <div className="pol-caps">
+                    {(["prompt", "completion"] as const).map((side) => (
+                      <label key={side} className="pol-cap">
+                        {side === "prompt" ? "Default max $/M in" : "Default max $/M out"}
+                        <input
+                          className="set-input" type="number" step="0.01" min="0"
+                          placeholder="no cap"
+                          value={draft[side].text}
+                          onChange={(ev) => {
+                            const text = ev.target.value;
+                            const bad = ev.target.validity.badInput;
+                            editDraft((d) => ({ ...d, [side]: { text, bad } }));
+                          }}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <div className="set-hint">
+                    The default applies to every model that does not set its own ceiling.
+                    A model that sets one replaces this rather than merging with it.
+                  </div>
+                  {polErr && <div className="set-notice">{polErr}</div>}
+                  <div className="pol-acts">
+                    <button className="set-done" disabled={polBusy} onClick={savePolicy}>
+                      {polBusy ? "Saving…" : "Save policy"}
+                    </button>
+                  </div>
+                  <div className="set-hint">
+                    Saving reads the directory and compiles the list of hosts to refuse,
+                    which is also how an out-of-date list is brought current. A directory
+                    that will not load fails the save rather than storing a rule that
+                    blocks nothing.
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           <div className="mb-controls">
             <input
               className="set-input mb-search"

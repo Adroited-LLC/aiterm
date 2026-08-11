@@ -1708,8 +1708,10 @@ body.dragging * { pointer-events: none; }
 .ep-ctx { min-width: 34px; }
 .ep-up { min-width: 44px; }
 .ep-off { font-size: 10px; color: var(--text-faint); flex-shrink: 0; }
-.ep-caps { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 6px; }
-.ep-cap {
+/* The same control in two places: a model's own ceiling, and the account
+   default in the policy section. */
+.ep-caps, .pol-caps { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 6px; }
+.ep-cap, .pol-cap {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -1718,8 +1720,53 @@ body.dragging * { pointer-events: none; }
 }
 /* Scoped harder than the base rule: .set-input says width:100% and a bottom
    margin later on, and both would knock the field out of line with its label. */
-.ep-cap .set-input { width: 88px; margin-bottom: 0; }
+.ep-cap .set-input, .pol-cap .set-input { width: 88px; margin-bottom: 0; }
 .act-btn.on { border-color: var(--accent); color: var(--accent); }
+
+/* ── The account-wide routing policy, above the model list ────────────── */
+.pol { border-bottom: 1px solid var(--border); }
+.pol-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  flex-wrap: wrap;
+}
+.pol-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 10px 10px;
+}
+.pol-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+/* A country the rule names, or a host blocked by name. Toggled, not typed. */
+.pol-chip {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.pol-chip:hover { background: var(--bg-hover); color: var(--text); }
+.pol-chip.on {
+  border-color: var(--red);
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+.pol-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.pol-check input { margin: 0; }
+.pol-count { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.pol-acts { display: flex; margin: 4px 0 2px; }
 
 /* Primary action inside a settings form (ModelAccess "Save"). */
 .set-done {
