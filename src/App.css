@@ -1654,6 +1654,71 @@ body.dragging * { pointer-events: none; }
   padding: 5px 10px;
   border-top: 1px solid var(--border);
 }
+
+/* ── Provider routing, inside the model card (OpenRouter only) ────────── */
+.ep {
+  border-top: 1px solid var(--border);
+  margin: 0 0 10px;
+  padding-top: 10px;
+}
+.mb-pin {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+.ep-list { display: flex; flex-direction: column; margin-top: 8px; }
+/* One host's offer of this model: name, quantization, price, context, uptime. */
+.ep-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  text-align: left;
+  background: none;
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 5px 6px;
+  cursor: pointer;
+}
+.ep-row:hover:not(:disabled) { background: var(--bg-hover); }
+.ep-row.on { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.ep-row.on .ep-name { color: var(--accent); }
+/* Excluded by the policy or a ceiling: still listed, because seeing which
+   hosts a rule removes is most of the value of the rule. */
+.ep-row.off { opacity: 0.45; cursor: default; }
+.ep-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.ep-tag { font-size: 10px; color: var(--text-faint); flex-shrink: 0; }
+.ep-price, .ep-ctx, .ep-up {
+  flex-shrink: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.ep-price { min-width: 112px; }
+.ep-ctx { min-width: 34px; }
+.ep-up { min-width: 44px; }
+.ep-off { font-size: 10px; color: var(--text-faint); flex-shrink: 0; }
+.ep-caps { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 6px; }
+.ep-cap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+/* Scoped harder than the base rule: .set-input says width:100% and a bottom
+   margin later on, and both would knock the field out of line with its label. */
+.ep-cap .set-input { width: 88px; margin-bottom: 0; }
 .act-btn.on { border-color: var(--accent); color: var(--accent); }
 
 /* Primary action inside a settings form (ModelAccess "Save"). */

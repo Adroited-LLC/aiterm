@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  ModelCard, ProviderView, providerDelete, providerModelCards, providerModels,
-  providerSave, providerStartupSet, providersList,
+  EndpointCard, MaxPrice, ModelCard, ProviderView, providerDelete,
+  providerModelCards, providerModelEndpoints, providerModels, providerRouteSet,
+  providerSave, providerStartupSet, providersList, Route,
 } from "../ipc";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
@@ -65,6 +66,24 @@ export default function ModelAccess() {
    *  dot. Either button proves it; Test and Models hit the same endpoint. */
   const [healthy, setHealthy] = useState<Record<string, boolean>>({});
 
+  // Who hosts each model, kept per model id: the card follows arrow-key
+  // selection through 400 rows, and fetching on selection would be one request
+  // per keystroke. So it is fetched when the section is opened, and cached.
+  const [endpoints, setEndpoints] = useState<Record<string, EndpointCard[]>>({});
+  const [epOpen, setEpOpen] = useState<string | null>(null);
+  /** Scoped to a model, so an error on one card does not follow the selection
+   *  onto the next one. */
+  const [epErr, setEpErr] = useState<{ model: string; msg: string } | null>(null);
+  /** The ceiling field being typed in, as text. One at a time, keyed
+   *  `<model>:<side>`, so the stored value shows everywhere else and a
+   *  half-typed number is never sent. */
+  const [cap, setCap] = useState<{ key: string; text: string } | null>(null);
+  /** The newest provider list, including one a route write has just returned
+   *  but React has not re-rendered from yet. */
+  const provsRef = useRef<ProviderView[] | null>(null);
+  /** Route writes run one at a time — see `applyRoute`. */
+  const routeQ = useRef<Promise<void>>(Promise.resolve());
+
   const browse = async (p: ProviderView) => {
     if (browsing === p.id) {
       setBrowsing(null); // second click folds it away
@@ -73,6 +92,9 @@ export default function ModelAccess() {
     setBrowsing(p.id);
     setBrowseErr(null);
     setPicked(null);
+    // Endpoints are keyed by model id alone, so a second OpenRouter account
+    // would otherwise be shown the first one's rows.
+    setEndpoints({}); setEpOpen(null); setEpErr(null); setCap(null);
     if (!cards[p.id]) {
       try {
         const list = await providerModelCards(p.id);
@@ -101,6 +123,100 @@ export default function ModelAccess() {
     }
   };
 
+  /** Routing is an OpenRouter feature, and the backend refuses it on anything
+   *  else — the same test, so the section is not offered where it would fail. */
+  const isOpenRouter = !!browsingProv?.base_url.includes("openrouter.ai");
+
+  const openEndpoints = async (modelId: string) => {
+    if (epOpen === modelId) { setEpOpen(null); return; }
+    setEpOpen(modelId); setEpErr(null);
+    if (!endpoints[modelId] && browsingProv) {
+      try {
+        const rows = await providerModelEndpoints(browsingProv.id, modelId);
+        setEndpoints((e) => ({ ...e, [modelId]: rows }));
+      } catch (e) { setEpErr({ model: modelId, msg: String(e) }); }
+    }
+  };
+
+  /**
+   * Store one model's route, built from the freshest copy of it.
+   *
+   * Every write carries the fields it is not changing forward, so a pin and a
+   * ceiling committed inside one round trip would have the second undo the
+   * first. Two guards: the writes run one at a time, and each one reads the
+   * route it is amending from the list the previous write returned rather than
+   * from the render that scheduled it.
+   */
+  const applyRoute = (modelId: string, build: (cur: Route | undefined) => Route) => {
+    const provId = browsing;
+    if (!provId) return routeQ.current;
+    setEpErr(null);
+    // Whether the rows are on screen is the caller's question, not the
+    // queue's: it is what the user is looking at as they act.
+    const showing = !!endpoints[modelId];
+    routeQ.current = routeQ.current.then(async () => {
+      const prov = provsRef.current?.find((x) => x.id === provId);
+      if (!prov) return;
+      try {
+        const list = await providerRouteSet(provId, modelId, build(prov.routes[modelId]));
+        provsRef.current = list;
+        setProviders(list);
+        // The rows carry `excluded`, which the new pin or ceiling may change.
+        if (showing) {
+          const rows = await providerModelEndpoints(provId, modelId);
+          setEndpoints((e) => ({ ...e, [modelId]: rows }));
+        }
+      } catch (e) { setEpErr({ model: modelId, msg: String(e) }); }
+    });
+    return routeQ.current;
+  };
+
+  const pin = (modelId: string, slug: string | null) =>
+    applyRoute(modelId, (cur) => ({
+      order: slug ? [slug] : [],
+      allow_fallbacks: false,      // a pin means only that host
+      max_price: cur?.max_price ?? {},
+    }));
+
+  const capKey = (modelId: string, side: keyof MaxPrice) => `${modelId}:${side}`;
+
+  /** What the field shows: the draft while it is being typed in, the stored
+   *  ceiling otherwise. */
+  const capText = (modelId: string, side: keyof MaxPrice) => {
+    const k = capKey(modelId, side);
+    if (cap?.key === k) return cap.text;
+    const v = browsingProv?.routes[modelId]?.max_price[side];
+    return v == null ? "" : String(v);
+  };
+
+  /** What an empty field would fall back to. A per-model ceiling *replaces*
+   *  the account one rather than merging, so once this model sets either side
+   *  the other side inherits nothing. */
+  const capHint = (modelId: string, side: keyof MaxPrice) => {
+    const own = browsingProv?.routes[modelId]?.max_price;
+    if (own && (own.prompt != null || own.completion != null)) return "no cap";
+    const acct = browsingProv?.policy.max_price[side];
+    return acct == null ? "no cap" : String(acct);
+  };
+
+  /** Blur or Enter, never per keystroke: each commit is a write to disk. */
+  const commitCap = async (modelId: string, side: keyof MaxPrice) => {
+    const k = capKey(modelId, side);
+    if (cap?.key !== k) return;             // nothing was typed here
+    const text = cap.text.trim();
+    setCap(null);
+    if (!browsingProv) return;
+    const n = text === "" ? undefined : Number(text);
+    // Garbage reverts to what is stored rather than clearing it.
+    if (n !== undefined && (!Number.isFinite(n) || n < 0)) return;
+    if (browsingProv.routes[modelId]?.max_price[side] === n) return; // no change
+    await applyRoute(modelId, (cur) => {
+      const max_price: MaxPrice = { ...(cur?.max_price ?? {}) };
+      if (n === undefined) delete max_price[side]; else max_price[side] = n;
+      return { order: cur?.order ?? [], allow_fallbacks: false, max_price };
+    });
+  };
+
   const all = browsing ? cards[browsing] : undefined;
   const q = query.trim().toLowerCase();
   const starred = browsingProv?.startup_models ?? [];
@@ -123,6 +239,7 @@ export default function ModelAccess() {
 
   const refresh = () => providersList().then(setProviders).catch(() => setProviders([]));
   useEffect(() => { refresh(); }, []);
+  useEffect(() => { provsRef.current = providers; }, [providers]);
 
   const reset = () => {
     setEditing(null); setName(""); setBaseUrl(""); setApiKey(""); setError(null);
@@ -302,6 +419,84 @@ export default function ModelAccess() {
                         ? "★ On the startup list — remove"
                         : "☆ Add to startup list"}
                     </button>
+                    {isOpenRouter && (
+                      <div className="ep">
+                        {browsingProv?.routes[sel.id]?.order[0] && (
+                          <div className="mb-pin">
+                            Pinned to {browsingProv.routes[sel.id].order[0]} — no fallback
+                            <button className="act-btn" onClick={() => pin(sel.id, null)}>
+                              Unpin
+                            </button>
+                          </div>
+                        )}
+                        <button className="act-btn" onClick={() => openEndpoints(sel.id)}>
+                          {epOpen === sel.id ? "Hide providers"
+                            : `Providers${endpoints[sel.id] ? ` (${endpoints[sel.id].length})` : ""}`}
+                        </button>
+                        {epErr?.model === sel.id && (
+                          <div className="set-notice">{epErr.msg}</div>
+                        )}
+                        {epOpen === sel.id && (
+                          <div className="ep-list">
+                            {endpoints[sel.id] === undefined ? (
+                              epErr?.model !== sel.id
+                                && <div className="set-hint mb-wait">Asking the provider…</div>
+                            ) : (
+                              <>
+                                {endpoints[sel.id].map((e) => (
+                                  <button
+                                    key={e.tag}
+                                    className={"ep-row"
+                                      + (e.excluded ? " off" : "")
+                                      + (browsingProv?.routes[sel.id]?.order[0] === e.slug ? " on" : "")}
+                                    disabled={!!e.excluded}
+                                    title={e.excluded ? `Excluded: ${e.excluded}` : `Pin ${e.provider_name}`}
+                                    onClick={() => pin(sel.id, e.slug)}
+                                  >
+                                    <span className="ep-name">{e.provider_name}</span>
+                                    <span className="ep-tag">{e.quantization ?? ""}</span>
+                                    <span className="ep-price">
+                                      {fmtPrice(e.prompt_price)} / {fmtPrice(e.completion_price)}
+                                    </span>
+                                    <span className="ep-ctx">{fmtCtx(e.context_length)}</span>
+                                    <span className="ep-up">
+                                      {e.uptime_30m == null ? "—" : `${e.uptime_30m.toFixed(1)}%`}
+                                    </span>
+                                    {e.excluded && <span className="ep-off">{e.excluded}</span>}
+                                  </button>
+                                ))}
+                                <div className="set-hint">
+                                  A pin names a provider, not a quantization — <code>wafer</code> and
+                                  {" "}<code>wafer/fast</code> are two rows and one slug.
+                                </div>
+                              </>
+                            )}
+                            <div className="ep-caps">
+                              {(["prompt", "completion"] as const).map((side) => (
+                                <label key={side} className="ep-cap">
+                                  {side === "prompt" ? "Max $/M in" : "Max $/M out"}
+                                  <input
+                                    className="set-input" type="number" step="0.01" min="0"
+                                    placeholder={capHint(sel.id, side)}
+                                    value={capText(sel.id, side)}
+                                    onChange={(ev) =>
+                                      setCap({ key: capKey(sel.id, side), text: ev.target.value })}
+                                    onBlur={() => commitCap(sel.id, side)}
+                                    onKeyDown={(ev) => {
+                                      if (ev.key === "Enter") commitCap(sel.id, side);
+                                    }}
+                                  />
+                                </label>
+                              ))}
+                            </div>
+                            <div className="set-hint">
+                              A ceiling here replaces the account default for this model rather
+                              than merging with it, and applies whether or not a host is pinned.
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <div className="mb-meta">
                       <span className="mb-k">Context</span>
                       <span className="mb-v">{fmtCtx(sel.context_length)}</span>
