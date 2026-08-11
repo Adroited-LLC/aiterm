@@ -1173,8 +1173,12 @@ export default function App() {
           /* nothing here can reopen it — keep the tab's own command */
         }
       }
+      // The provider environment carries over too: it is what gives the tab
+      // its key and its routing, and a restart that dropped it would reopen
+      // the same command against no provider at all.
       openTab(t.title, t.cwd, command, t.slotId, {
         sessionId: t.sessionId, resumedId, agentId,
+        envProvider: t.envProvider, envModel: t.envModel,
       });
     },
     [closeTab, openTab],

@@ -146,6 +146,9 @@ export default function ModelAccess() {
    *  where the country toggles and the unknown-country count come from. */
   const [dir, setDir] = useState<DirectoryEntry[] | null>(null);
   const [draft, setDraft] = useState<PolDraft | null>(null);
+  /** The slug being typed into the block field. Held apart from the draft: it
+   *  is not part of the policy until Block puts it there. */
+  const [blockSlug, setBlockSlug] = useState("");
   const [polErr, setPolErr] = useState<string | null>(null);
   const [polBusy, setPolBusy] = useState(false);
 
@@ -197,6 +200,7 @@ export default function ModelAccess() {
     // not leave this one's Save button reading "Saving…", and the tick above
     // stops that save from clearing the flag a later save has set.
     setPolOpen(false); setDir(null); setDraft(null); setPolErr(null); setPolBusy(false);
+    setBlockSlug("");
     // And the activity section: the record is per account, and a half-typed
     // management key belongs to the provider it was being typed for.
     setActOpen(false); setMgmtKey(""); setMgmtErr(null); setMgmtBusy(false);
@@ -285,12 +289,18 @@ export default function ModelAccess() {
     return routeQ.current;
   };
 
-  const pin = (modelId: string, slug: string | null) =>
-    applyRoute(modelId, (cur) => ({
+  /** `null` unpins. An empty slug is neither: a row whose tag named no
+   *  provider parses to `slug: ""`, and storing that would write an order of
+   *  one nameless host — a pin that can only fail. Clicking such a row does
+   *  nothing rather than something wrong. */
+  const pin = (modelId: string, slug: string | null) => {
+    if (slug !== null && !slug) return routeQ.current;
+    return applyRoute(modelId, (cur) => ({
       order: slug ? [slug] : [],
       allow_fallbacks: false,      // a pin means only that host
       max_price: cur?.max_price ?? {},
     }));
+  };
 
   const capKey = (modelId: string, side: keyof MaxPrice) => `${modelId}:${side}`;
 
@@ -374,6 +384,18 @@ export default function ModelAccess() {
   };
 
   const editDraft = (f: (d: PolDraft) => PolDraft) => setDraft((d) => (d ? f(d) : d));
+
+  /** Block one host by name. Slugs are lowercase in the directory and a
+   *  repeat would be a second chip removing the first, so the field is
+   *  trimmed, lowercased and checked against what is already listed. */
+  const addBlocked = () => {
+    const s = blockSlug.trim().toLowerCase();
+    if (!s) return;
+    editDraft((d) => (d.providers.includes(s)
+      ? d
+      : { ...d, providers: [...d.providers, s] }));
+    setBlockSlug("");
+  };
 
   const toggleCountry = (c: string) =>
     editDraft((d) => ({
@@ -703,24 +725,44 @@ export default function ModelAccess() {
                     A country matches a host's headquarters or any of its datacenters,
                     so a company registered elsewhere is still caught by where it runs.
                   </div>
+                  <div className="set-label">Blocked by name</div>
                   {draft.providers.length > 0 && (
-                    <>
-                      <div className="set-label">Blocked by name</div>
-                      <div className="pol-chips">
-                        {draft.providers.map((s) => (
-                          <button
-                            key={s}
-                            className="pol-chip on"
-                            title={`Stop blocking ${s}`}
-                            onClick={() => editDraft((d) => ({
-                              ...d,
-                              providers: d.providers.filter((x) => x !== s),
-                            }))}
-                          >{s} ✕</button>
-                        ))}
-                      </div>
-                    </>
+                    <div className="pol-chips">
+                      {draft.providers.map((s) => (
+                        <button
+                          key={s}
+                          className="pol-chip on"
+                          title={`Stop blocking ${s}`}
+                          onClick={() => editDraft((d) => ({
+                            ...d,
+                            providers: d.providers.filter((x) => x !== s),
+                          }))}
+                        >{s} ✕</button>
+                      ))}
+                    </div>
                   )}
+                  {/* The chips remove; this adds. Without it the list could
+                      only ever shrink, which is what a hand-edited
+                      providers.json would leave behind. */}
+                  <div className="pol-block">
+                    <input
+                      className="set-input"
+                      placeholder="provider slug — e.g. baidu"
+                      value={blockSlug}
+                      onChange={(e) => setBlockSlug(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") addBlocked(); }}
+                    />
+                    <button
+                      className="act-btn"
+                      disabled={!blockSlug.trim()}
+                      onClick={addBlocked}
+                    >Block</button>
+                  </div>
+                  <div className="set-hint">
+                    A name blocks that host for every model, whatever country it
+                    reports. The slug is the one a pin uses — <code>deepinfra</code>,
+                    not "DeepInfra".
+                  </div>
                   <div className="pol-caps">
                     {(["prompt", "completion"] as const).map((side) => (
                       <label key={side} className="pol-cap">
@@ -893,6 +935,15 @@ export default function ModelAccess() {
                         {browsingProv?.routes[sel.id]?.order[0] && (
                           <div className="mb-pin">
                             Pinned to {browsingProv.routes[sel.id].order[0]} — no fallback
+                            {/* A pin is "only this host" and the policy is
+                                "not this host" — together they leave nowhere
+                                to route, so the contradiction is said here
+                                rather than discovered as a failed request. */}
+                            {pol?.resolved_ignore[browsingProv.routes[sel.id].order[0]] && (
+                              <span className="mb-pin-warn">
+                                — your policy now blocks this host; every request will fail
+                              </span>
+                            )}
                             <button className="act-btn" onClick={() => pin(sel.id, null)}>
                               Unpin
                             </button>

@@ -1669,6 +1669,9 @@ body.dragging * { pointer-events: none; }
   color: var(--accent);
   margin-bottom: 8px;
 }
+/* The pin names a host the policy refuses — the one state where this line is
+   describing a route that cannot run. */
+.mb-pin-warn { color: var(--red); }
 .ep-list { display: flex; flex-direction: column; margin-top: 8px; }
 /* One host's offer of this model: name, quantization, price, context, uptime. */
 .ep-row {
@@ -1765,6 +1768,10 @@ body.dragging * { pointer-events: none; }
   margin-top: 4px;
 }
 .pol-check input { margin: 0; }
+/* The one field in this section that is typed rather than toggled: a host
+   blocked by name. Laid out like the management-key row it sits above. */
+.pol-block { display: flex; align-items: center; gap: 6px; }
+.pol-block .set-input { margin-bottom: 0; }
 .pol-count { color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .pol-acts { display: flex; margin: 4px 0 2px; }
 

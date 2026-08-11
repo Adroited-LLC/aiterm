@@ -27,9 +27,9 @@ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
  * slugs, so the two are matched on a normalised name (see `activity.ts`);
  * comparing the strings as given would flag nothing and look like good news.
  *
- * The numbers are OpenRouter's, for the whole account — see the note under the
- * table. Nothing here is aiterm's own accounting, and it must not read as if
- * it were.
+ * The numbers are OpenRouter's, for the whole account and for the window
+ * `/activity` covers — the last 30 days — see the note under the table.
+ * Nothing here is aiterm's own accounting, and it must not read as if it were.
  */
 export default function RoutingActivity({ prov }: { prov: ProviderView }) {
   const [rows, setRows] = useState<ActivityRow[] | null>(null);
@@ -72,7 +72,9 @@ export default function RoutingActivity({ prov }: { prov: ProviderView }) {
         <div className="set-hint mb-wait">Asking OpenRouter what ran…</div>
       )}
       {rows !== null && hosts.length === 0 && (
-        <div className="set-hint mb-wait">Nothing in OpenRouter's record for this key.</div>
+        <div className="set-hint mb-wait">
+          Nothing in OpenRouter's record for this key in the last 30 days.
+        </div>
       )}
 
       {hosts.map((h) => {
@@ -121,10 +123,12 @@ export default function RoutingActivity({ prov }: { prov: ProviderView }) {
         <button className="act-btn" onClick={() => setReload((n) => n + 1)}>Refresh</button>
       </div>
 
-      {/* Account-wide, not app-wide. Letting it read as aiterm's own spend
-          would be a lie the panel tells by omission. */}
+      {/* Account-wide, not app-wide, and a window rather than all time —
+          `/activity` returns the last 30 days. Letting either read as aiterm's
+          own lifetime spend would be a lie the panel tells by omission. */}
       <div className="set-hint">
-        OpenRouter's record for this key — including requests aiterm did not make.
+        OpenRouter's record for this key over the last 30 days — including
+        requests aiterm did not make.
       </div>
     </div>
   );
