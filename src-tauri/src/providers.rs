@@ -923,12 +923,37 @@ pub struct ActivityRow {
     pub usage: f64,
 }
 
+/// `checked_body` with one activity-only exception.
+///
+/// OpenRouter answers `/activity` with `403` and a real sentence — "Only
+/// management keys can fetch activity for an account" — when the key is good
+/// but is an inference key. The canned "rejected that API key" would send the
+/// user to replace a key that works, so the server's own sentence wins on this
+/// path, and only on this path. A `403` with no `error.message`, and every
+/// `401`, still read as a rejected key.
+fn activity_body(response: &str) -> Result<&str, String> {
+    let (body, status) = response.rsplit_once('\n').unwrap_or(("", response));
+    if status.trim().parse::<u16>() == Ok(403) {
+        let detail = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            });
+        if let Some(d) = detail {
+            return Err(d);
+        }
+    }
+    checked_body(response)
+}
+
 /// The `/activity` reply as rows, exactly as OpenRouter gives them. Grouping
 /// is the panel's job — one day of one model on one host is the finest grain
 /// the record has, and summing it here would throw away the host column the
 /// whole feature exists to show.
 pub fn parse_activity(response: &str) -> Result<Vec<ActivityRow>, String> {
-    let body = checked_body(response)?;
+    let body = activity_body(response)?;
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|_| "The provider did not return JSON.".to_string())?;
     let items = v
@@ -1410,6 +1435,27 @@ mod tests {
         let rows = parse_activity(body).unwrap();
         assert_eq!(rows[0].requests, 0);
         assert_eq!(rows[0].usage, 0.0);
+    }
+
+    /// The 403 a working inference key gets from `/activity` — verified live,
+    /// 2026-08-10. The key is fine; it is the wrong class of key. Saying
+    /// "rejected that API key" would send the user to replace it.
+    #[test]
+    fn an_activity_403_says_what_the_server_said() {
+        let body = r#"{"error":{"message":"Only management keys can fetch activity for an account"}}
+403"#;
+        let err = parse_activity(body).unwrap_err();
+        assert_eq!(
+            err, "Only management keys can fetch activity for an account",
+            "got: {err}"
+        );
+    }
+
+    /// A genuinely bad key still reads as a bad key here, like everywhere else.
+    #[test]
+    fn an_activity_401_is_still_a_rejected_key() {
+        let err = parse_activity("{\"error\":{\"message\":\"no\"}}\n401").unwrap_err();
+        assert_eq!(err, "The provider rejected that API key.", "got: {err}");
     }
 
     #[test]
