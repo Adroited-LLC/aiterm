@@ -57,7 +57,7 @@ export default function ModelAccess() {
   const [cards, setCards] = useState<Record<string, ModelCard[]>>({});
   const [browseErr, setBrowseErr] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [priceFilter, setPriceFilter] = useState<"all" | "free" | "paid">("all");
+  const [filter, setFilter] = useState<"all" | "free" | "paid" | "starred">("all");
   const [minCtx, setMinCtx] = useState(0);
   const [picked, setPicked] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -103,10 +103,12 @@ export default function ModelAccess() {
 
   const all = browsing ? cards[browsing] : undefined;
   const q = query.trim().toLowerCase();
+  const starred = browsingProv?.startup_models ?? [];
   const shown = (all ?? []).filter(
     (m) =>
       (!q || m.id.toLowerCase().includes(q) || (m.name ?? "").toLowerCase().includes(q)) &&
-      (priceFilter === "all" || (priceFilter === "free") === isFree(m)) &&
+      (filter === "all" ||
+        (filter === "starred" ? starred.includes(m.id) : (filter === "free") === isFree(m))) &&
       (minCtx === 0 || (m.context_length ?? 0) >= minCtx),
   );
   // The card follows the pick, or the first match — so it always shows
@@ -233,12 +235,13 @@ export default function ModelAccess() {
               onChange={(e) => setQuery(e.target.value)}
             />
             <div className="seg">
-              {(["all", "free", "paid"] as const).map((f) => (
+              {(["all", "free", "paid", "starred"] as const).map((f) => (
                 <button
                   key={f}
-                  className={"seg-btn" + (priceFilter === f ? " on" : "")}
-                  onClick={() => setPriceFilter(f)}
-                >{f === "all" ? "All" : f === "free" ? "Free" : "Paid"}</button>
+                  className={"seg-btn" + (filter === f ? " on" : "")}
+                  onClick={() => setFilter(f)}
+                >{f === "all" ? "All" : f === "free" ? "Free"
+                  : f === "paid" ? "Paid" : "Starred"}</button>
               ))}
             </div>
             <select
