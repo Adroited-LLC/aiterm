@@ -401,6 +401,8 @@ mod tests {
             base_url: base_url.into(),
             api_key: "k".into(),
             startup_models: vec![],
+            policy: Default::default(),
+            routes: Default::default(),
         }
     }
 

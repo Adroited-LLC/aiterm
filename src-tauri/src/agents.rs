@@ -1610,6 +1610,8 @@ mod tests {
                 base_url: "https://openrouter.ai/api/v1".into(),
                 api_key: "k".into(),
                 startup_models: vec!["anthropic/claude-sonnet-5".into(), "qwen/q3:free".into()],
+                policy: Default::default(),
+                routes: Default::default(),
             },
             crate::providers::Provider {
                 id: "local".into(),
@@ -1617,6 +1619,8 @@ mod tests {
                 base_url: "http://localhost:8080/v1".into(),
                 api_key: "k".into(),
                 startup_models: vec!["some-local-model".into()],
+                policy: Default::default(),
+                routes: Default::default(),
             },
         ];
         let models = opencode_models(&providers);
@@ -1886,6 +1890,8 @@ mod tests {
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: "k".into(),
             startup_models: vec![],
+            policy: Default::default(),
+            routes: Default::default(),
         };
         let local = crate::providers::Provider {
             base_url: "http://localhost:8080/v1".into(),

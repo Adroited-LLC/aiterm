@@ -32,6 +32,54 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A ceiling in USD per *million* tokens — OpenRouter's unit for `max_price`,
+/// which is not the per-token unit `/models` quotes. Convert at the boundary.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct MaxPrice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<f64>,
+}
+
+impl MaxPrice {
+    pub fn is_empty(&self) -> bool {
+        self.prompt.is_none() && self.completion.is_none()
+    }
+}
+
+/// Which hosts this account will not use, and the most it will pay.
+///
+/// `resolved_ignore` is the policy *compiled* against the provider directory:
+/// slug → the reason it is out. It is stored rather than computed per request
+/// because both places that build a request — a CLI process in a pty, and a
+/// launch one keystroke from a running terminal — are the wrong places for a
+/// network call.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Policy {
+    #[serde(default)]
+    pub blocked_countries: Vec<String>,
+    #[serde(default)]
+    pub block_unknown_country: bool,
+    #[serde(default)]
+    pub blocked_providers: Vec<String>,
+    #[serde(default)]
+    pub max_price: MaxPrice,
+    #[serde(default)]
+    pub resolved_ignore: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub resolved_at: u64,
+}
+
+/// What one model prefers. An empty `order` is "no pin".
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Route {
+    pub order: Vec<String>,
+    pub allow_fallbacks: bool,
+    #[serde(default)]
+    pub max_price: MaxPrice,
+}
+
 /// A configured provider, as stored.
 ///
 /// `Debug` is written by hand rather than derived: a derived one prints
@@ -52,6 +100,14 @@ pub struct Provider {
     /// catalog. `default` so files written before this field existed load.
     #[serde(default)]
     pub startup_models: Vec<String>,
+    /// Routing policy for this provider. `default` so files written before
+    /// this field existed load.
+    #[serde(default)]
+    pub policy: Policy,
+    /// Per-model routing, keyed by model id. A route outlives its star, so
+    /// re-adding a model to the startup list restores its pin.
+    #[serde(default)]
+    pub routes: std::collections::BTreeMap<String, Route>,
 }
 
 /// Replace a provider's startup shortlist. Order is the caller's; duplicates
@@ -82,6 +138,8 @@ pub struct ProviderView {
     /// most of a six-character secret would defeat the point.
     pub key_hint: String,
     pub startup_models: Vec<String>,
+    pub policy: Policy,
+    pub routes: std::collections::BTreeMap<String, Route>,
 }
 
 impl std::fmt::Debug for Provider {
@@ -115,6 +173,8 @@ impl Provider {
             has_key: !self.api_key.is_empty(),
             key_hint: key_hint(&self.api_key),
             startup_models: self.startup_models.clone(),
+            policy: self.policy.clone(),
+            routes: self.routes.clone(),
         }
     }
 }
@@ -286,6 +346,8 @@ fn provider_save_sync(
             base_url,
             api_key: api_key.trim().to_string(),
             startup_models: vec![],
+            policy: Default::default(),
+            routes: Default::default(),
         }),
     }
     save(&list)?;
@@ -546,6 +608,8 @@ mod tests {
             base_url: "https://example.test/v1".into(),
             api_key: "k".into(),
             startup_models: vec![],
+            policy: Default::default(),
+            routes: Default::default(),
         }
     }
 
@@ -563,6 +627,51 @@ mod tests {
         .unwrap();
         assert_eq!(list[0].startup_models, vec!["a/one", "b/two"]);
         assert!(set_startup_models(&mut list, "nope", vec![]).is_err());
+    }
+
+    /// A 0.10.40 file predates routing entirely: no `policy`, no `routes`. It
+    /// must load with the shortlist intact and routing simply switched off,
+    /// because the alternative is an upgrade that reads as "no providers".
+    #[test]
+    fn a_providers_file_without_policy_or_routes_still_loads() {
+        let old = r#"[{"id":"openrouter","name":"OpenRouter",
+            "base_url":"https://openrouter.ai/api/v1","api_key":"k",
+            "startup_models":["z-ai/glm-5.2"]}]"#;
+        let list: Vec<Provider> = serde_json::from_str(old).expect("0.10.40 file must load");
+        assert_eq!(list[0].startup_models, vec!["z-ai/glm-5.2"]);
+        assert!(list[0].routes.is_empty());
+        assert!(list[0].policy.blocked_countries.is_empty());
+        assert!(!list[0].policy.block_unknown_country);
+        // No stored ceiling means no ceiling — an upgrade must not start
+        // refusing hosts on a price the user never set.
+        assert!(list[0].policy.max_price.is_empty());
+    }
+
+    /// Everything routing stores has to survive a save and a load — the
+    /// compiled ignore list included, since that is what goes on the wire and
+    /// nothing recomputes it at request time.
+    #[test]
+    fn a_policy_and_a_route_round_trip_through_json() {
+        let mut p = provider("openrouter");
+        p.policy.blocked_countries = vec!["CN".into()];
+        p.policy.block_unknown_country = true;
+        p.policy.max_price.completion = Some(2.5);
+        p.policy.resolved_ignore.insert("baidu".into(), "CN".into());
+        p.policy.resolved_at = 1786000000;
+        p.routes.insert(
+            "z-ai/glm-5.2".into(),
+            Route {
+                order: vec!["novita".into()],
+                allow_fallbacks: false,
+                max_price: MaxPrice {
+                    prompt: None,
+                    completion: Some(1.8),
+                },
+            },
+        );
+        let text = serde_json::to_string(&[p.clone()]).unwrap();
+        let back: Vec<Provider> = serde_json::from_str(&text).unwrap();
+        assert_eq!(back[0], p);
     }
 
     /// providers.json written before startup lists existed has no such key —
@@ -652,6 +761,8 @@ mod tests {
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: "sk-do-not-print-me".into(),
             startup_models: vec![],
+            policy: Default::default(),
+            routes: Default::default(),
         };
         let shown = format!("{p:?}");
         assert!(!shown.contains("sk-do-not-print-me"), "key leaked: {shown}");
@@ -685,6 +796,8 @@ mod tests {
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: "sk-or-v1-abcdefghijklmnop".into(),
             startup_models: vec![],
+            policy: Default::default(),
+            routes: Default::default(),
         };
         let v = p.view();
         let json = serde_json::to_string(&v).unwrap();
