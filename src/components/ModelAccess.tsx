@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   DirectoryEntry, EndpointCard, MaxPrice, ModelCard, Policy, ProviderView,
-  providerDelete, providerDirectory, providerModelCards, providerModelEndpoints,
-  providerModels, providerPolicySet, providerRouteSet, providerSave,
-  providerStartupSet, providersList, Route,
+  providerDelete, providerDirectory, providerManagementKeySet, providerModelCards,
+  providerModelEndpoints, providerModels, providerPolicySet, providerRouteSet,
+  providerSave, providerStartupSet, providersList, Route,
 } from "../ipc";
+import RoutingActivity from "./RoutingActivity";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
  *  these are just the ones most people are reaching for. */
@@ -147,6 +148,15 @@ export default function ModelAccess() {
   const [draft, setDraft] = useState<PolDraft | null>(null);
   const [polErr, setPolErr] = useState<string | null>(null);
   const [polBusy, setPolBusy] = useState(false);
+
+  // What actually ran. Its own section, next to the policy it reports against:
+  // one says what will happen, the other what already did.
+  const [actOpen, setActOpen] = useState(false);
+  /** The management key being typed in. `/activity` is the only endpoint that
+   *  refuses an inference key, so this is the only place that asks for one. */
+  const [mgmtKey, setMgmtKey] = useState("");
+  const [mgmtBusy, setMgmtBusy] = useState(false);
+  const [mgmtErr, setMgmtErr] = useState<string | null>(null);
   /** The newest provider list, including one a route write has just returned
    *  but React has not re-rendered from yet. */
   const provsRef = useRef<ProviderView[] | null>(null);
@@ -187,6 +197,9 @@ export default function ModelAccess() {
     // not leave this one's Save button reading "Saving…", and the tick above
     // stops that save from clearing the flag a later save has set.
     setPolOpen(false); setDir(null); setDraft(null); setPolErr(null); setPolBusy(false);
+    // And the activity section: the record is per account, and a half-typed
+    // management key belongs to the provider it was being typed for.
+    setActOpen(false); setMgmtKey(""); setMgmtErr(null); setMgmtBusy(false);
     if (!cards[p.id]) {
       try {
         const list = await providerModelCards(p.id);
@@ -444,6 +457,35 @@ export default function ModelAccess() {
       // away leaves the flag set, which is harmless — the section is not
       // rendered, and reopening the provider runs the reset in `browse`.
       if (polGen.current === myGen) setPolBusy(false);
+    }
+  };
+
+  /**
+   * Store or clear the management key `/activity` wants.
+   *
+   * Blank is not "keep the stored one" here, unlike the provider form: Save is
+   * disabled on an empty field and Forget sends the empty string on purpose,
+   * so neither action can happen by way of the other.
+   *
+   * Guarded on the provider it was sent for, like every other write in this
+   * panel — the field and its error line belong to one provider's section.
+   */
+  const saveMgmtKey = async (key: string) => {
+    const p = browsingProv;
+    if (!p || mgmtBusy) return;
+    const provId = p.id;
+    setMgmtBusy(true); setMgmtErr(null);
+    try {
+      // Whole-account state, so it is stored whichever provider is on screen —
+      // the same as `applyRoute` and `savePolicy`.
+      const list = await providerManagementKeySet(provId, key);
+      provsRef.current = list;
+      setProviders(list);
+      if (browsingRef.current === provId) setMgmtKey("");
+    } catch (e) {
+      if (browsingRef.current === provId) setMgmtErr(String(e));
+    } finally {
+      if (browsingRef.current === provId) setMgmtBusy(false);
     }
   };
 
@@ -711,6 +753,61 @@ export default function ModelAccess() {
                     which is also how an out-of-date list is brought current. A directory
                     that will not load fails the save rather than storing a rule that
                     blocks nothing.
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          {/* The other half of the policy above: that one says what will
+              happen, this one says what already did. */}
+          {isOpenRouter && browsingProv && (
+            <div className="acty">
+              <div className="acty-head">
+                <button
+                  className={"act-btn" + (actOpen ? " on" : "")}
+                  onClick={() => setActOpen(!actOpen)}
+                >{actOpen ? "Hide activity" : "What actually ran"}</button>
+                <div className="set-hint">
+                  {browsingProv.has_management_key
+                    ? `Management key ${browsingProv.management_key_hint
+                      ? `…${browsingProv.management_key_hint}` : "saved"}`
+                    : "Needs a management key"}
+                </div>
+              </div>
+              {actOpen && (
+                <div className="acty-panel">
+                  <RoutingActivity prov={browsingProv} />
+                  <div className="acty-key">
+                    <input
+                      className="set-input" type="password" autoComplete="off"
+                      placeholder={browsingProv.has_management_key
+                        ? "Replace the management key" : "OpenRouter management key"}
+                      value={mgmtKey}
+                      onChange={(e) => setMgmtKey(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && mgmtKey.trim()) saveMgmtKey(mgmtKey.trim());
+                      }}
+                    />
+                    <button
+                      className="act-btn"
+                      disabled={mgmtBusy || !mgmtKey.trim()}
+                      onClick={() => saveMgmtKey(mgmtKey.trim())}
+                    >{mgmtBusy ? "Saving…" : "Save key"}</button>
+                    {browsingProv.has_management_key && (
+                      <button
+                        className="act-btn danger"
+                        disabled={mgmtBusy}
+                        title="Clear the stored management key"
+                        onClick={() => saveMgmtKey("")}
+                      >Forget</button>
+                    )}
+                  </div>
+                  {mgmtErr && <div className="set-notice">{mgmtErr}</div>}
+                  <div className="set-hint">
+                    Activity needs an OpenRouter management key — create one at
+                    {" "}<code>openrouter.ai/settings/keys</code>. An inference key is
+                    refused for this one call and works everywhere else. It is stored
+                    beside the API key and never shown again.
                   </div>
                 </div>
               )}

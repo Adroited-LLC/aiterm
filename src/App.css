@@ -1768,6 +1768,84 @@ body.dragging * { pointer-events: none; }
 .pol-count { color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .pol-acts { display: flex; margin: 4px 0 2px; }
 
+/* ── What actually ran: OpenRouter's activity record, below the policy ──── */
+.acty { border-bottom: 1px solid var(--border); }
+.acty-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  flex-wrap: wrap;
+}
+.acty-panel, .acty-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.acty-panel { padding: 2px 10px 10px; }
+/* The table itself is tight — the rows carry their own separators — so the
+   notes around it space themselves rather than the whole column. */
+.acty-body { gap: 0; }
+.acty-body > .set-hint, .acty-body > .set-notice { margin: 6px 0; }
+/* One host's whole share of the window, or one model within it. The host row
+   is a button (it unfolds its models); the model row is not. */
+.acty-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent);
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 5px 6px;
+  cursor: pointer;
+}
+button.acty-row:hover { background: var(--bg-hover); }
+.acty-row.on { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.acty-model { cursor: default; padding-left: 20px; color: var(--text-faint); }
+.acty-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.acty-model .acty-name { color: var(--text-dim); font-family: var(--font-mono); font-size: 10.5px; }
+.acty-n, .acty-tok, .acty-usd {
+  flex-shrink: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.acty-n { min-width: 78px; }
+.acty-tok { min-width: 66px; }
+.acty-usd { min-width: 56px; color: var(--text); }
+.acty-model .acty-usd { color: var(--text-faint); }
+/* A host that served this account and would be refused now — the answer to
+   "have I been using anyone I did not want to". */
+.acty-blocked {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--red);
+  border: 1px solid var(--red);
+  border-radius: 5px;
+  padding: 0 5px;
+}
+.acty-total {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding: 6px 6px 0;
+}
+.acty-acts { display: flex; margin: 4px 0 2px; }
+.acty-key { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+/* Same reason as .ep-cap .set-input: the base rule is full width with a bottom
+   margin, and both would knock the field out of line with its buttons. */
+.acty-key .set-input { margin-bottom: 0; }
+
 /* Primary action inside a settings form (ModelAccess "Save"). */
 .set-done {
   align-self: flex-start;
