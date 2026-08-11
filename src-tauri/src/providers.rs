@@ -907,6 +907,79 @@ fn provider_route_set_sync(
     Ok(list.iter().map(Provider::view).collect())
 }
 
+/// One day of one model on one host, from OpenRouter's activity record.
+///
+/// Account-wide, not app-wide: this includes traffic aiterm never launched.
+/// The panel says so — see Task 12.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct ActivityRow {
+    pub date: String,
+    pub model: String,
+    pub provider_name: String,
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// USD.
+    pub usage: f64,
+}
+
+/// The `/activity` reply as rows, exactly as OpenRouter gives them. Grouping
+/// is the panel's job — one day of one model on one host is the finest grain
+/// the record has, and summing it here would throw away the host column the
+/// whole feature exists to show.
+pub fn parse_activity(response: &str) -> Result<Vec<ActivityRow>, String> {
+    let body = checked_body(response)?;
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "The provider did not return JSON.".to_string())?;
+    let items = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "No activity in the reply.".to_string())?;
+    Ok(items
+        .iter()
+        // A row with no `date` is dropped: every reading of this record is per
+        // day, so a dateless row could only ever be counted under the wrong one.
+        .filter_map(|r| {
+            Some(ActivityRow {
+                date: r.get("date")?.as_str()?.to_string(),
+                model: r
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                provider_name: r
+                    .get("provider_name")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                requests: r.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
+                prompt_tokens: r.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                completion_tokens: r
+                    .get("completion_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                usage: r.get("usage").and_then(|x| x.as_f64()).unwrap_or(0.0),
+            })
+        })
+        .collect())
+}
+
+/// The account's recent activity. OpenRouter only, for the same reason
+/// `/endpoints` and `/providers` are: the path is theirs, and no other provider
+/// keeps a per-host record to read.
+#[tauri::command(async)]
+pub fn provider_activity(id: String) -> Result<Vec<ActivityRow>, String> {
+    let list = load();
+    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    if !p.is_openrouter() {
+        return Err("Activity is an OpenRouter feature.".into());
+    }
+    if p.api_key.is_empty() {
+        return Err("No API key saved for this provider.".into());
+    }
+    parse_activity(&fetch(p, &format!("{}/activity", p.base_url))?)
+}
+
 /// Split the `-w` status off the body and pull out model ids.
 ///
 /// Kept separate from the request so the parsing — which is where the shapes
@@ -1313,6 +1386,30 @@ mod tests {
         assert_eq!(dir[0].datacenters, Vec::<String>::new());
         assert_eq!(dir[1].datacenters, vec!["SG", "CN"]);
         assert_eq!(dir[1].headquarters.as_deref(), Some("SG"));
+    }
+
+    #[test]
+    fn an_activity_reply_becomes_rows_with_dollars_and_hosts() {
+        let body = r#"{"data":[
+          {"date":"2026-08-09","model":"z-ai/glm-5.2","provider_name":"Novita",
+           "requests":5,"prompt_tokens":50,"completion_tokens":125,"usage":0.015},
+          {"date":"2026-08-09","model":"z-ai/glm-5.2","provider_name":"Baidu",
+           "requests":2,"prompt_tokens":20,"completion_tokens":40,"usage":0.004}]}
+200"#;
+        let rows = parse_activity(body).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].provider_name, "Baidu");
+        assert_eq!(rows[0].usage, 0.015);
+        assert_eq!(rows[0].requests, 5);
+    }
+
+    #[test]
+    fn an_activity_row_missing_optional_counts_still_parses() {
+        let body = r#"{"data":[{"date":"2026-08-09","model":"m","provider_name":"X"}]}
+200"#;
+        let rows = parse_activity(body).unwrap();
+        assert_eq!(rows[0].requests, 0);
+        assert_eq!(rows[0].usage, 0.0);
     }
 
     #[test]

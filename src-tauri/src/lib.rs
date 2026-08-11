@@ -78,6 +78,7 @@ pub fn run() {
             providers::provider_directory,
             providers::provider_policy_set,
             providers::provider_route_set,
+            providers::provider_activity,
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,
