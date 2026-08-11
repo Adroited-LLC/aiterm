@@ -51,6 +51,10 @@ export interface TermTab {
   resumedId?: string;
   /** Provider whose key the backend injects into this tab's environment. */
   envProvider?: string;
+  /** Model whose routing the backend compiles into this tab's environment.
+   *  The id only — the routing itself is read from the provider store in
+   *  Rust and never passes through here. */
+  envModel?: string;
   /** The engine running in this tab, as `LaunchPlan.agent_id` named it.
    *
    *  Not decoration: it is what the app looks a tab's capabilities up by, and
@@ -221,7 +225,8 @@ export default function TerminalView({
 
     (async () => {
       const id = await ptySpawn(
-        tab.cwd, tab.command, term.cols, term.rows, onOutput, tab.envProvider,
+        tab.cwd, tab.command, term.cols, term.rows, onOutput,
+        tab.envProvider, tab.envModel,
       );
       if (disposed) {
         ptyKill(id);

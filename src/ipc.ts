@@ -283,8 +283,13 @@ export const ptySpawn = (
   /** Provider id whose API key the backend injects as process environment
    *  (OPENROUTER_API_KEY) — the key itself never reaches the frontend. */
   envProvider?: string,
+  /** Model id whose routing the backend compiles into the same environment
+   *  (OPENCODE_CONFIG_CONTENT). The id only: the routing is read from the
+   *  provider store in Rust, so no routing decision crosses IPC. */
+  envModel?: string,
 ) => invoke<number>("pty_spawn", {
-  cwd, command, cols, rows, onOutput, envProvider: envProvider ?? null,
+  cwd, command, cols, rows, onOutput,
+  envProvider: envProvider ?? null, envModel: envModel ?? null,
 });
 export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
 export const ptyResize = (id: number, cols: number, rows: number) =>
@@ -585,6 +590,9 @@ export interface LaunchPlan {
   /** Provider id whose key `pty_spawn` injects into the tab environment.
    *  `null` means no key is needed. */
   env_provider: string | null;
+  /** Model id whose routing `pty_spawn` compiles into the tab environment,
+   *  in the provider catalog's spelling. Set only alongside `env_provider`. */
+  env_model: string | null;
   /** Non-null = a real session id panels may key to. `null` = the tab needs a
    *  handle of its own, and nothing should be keyed to it as a session. */
   session_id: string | null;

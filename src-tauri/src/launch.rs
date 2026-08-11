@@ -50,6 +50,11 @@ pub struct LaunchPlan {
     /// `None` means no key is needed — an engine that reads the provider store
     /// itself must never be handed one.
     pub env_provider: Option<String>,
+    /// The model whose routing `pty_spawn` compiles into the tab environment,
+    /// in the provider catalog's spelling — the key routes are stored under,
+    /// not the engine's prefixed one. Set only alongside `env_provider`: it is
+    /// read from the same store, in the same place, for the same engine.
+    pub env_model: Option<String>,
     /// `Some` = a real session id panels may key to. `None` = tab handle only.
     pub session_id: Option<String>,
     pub agent_id: String,
@@ -88,6 +93,7 @@ pub fn resolve_in(
             Some(LaunchPlan {
                 command: backend.launch(&spec),
                 env_provider: None,
+                env_model: None,
                 session_id: spec.session_id.clone(),
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
@@ -116,6 +122,10 @@ pub fn resolve_in(
                 // reaches a tab's environment only for an engine that has said
                 // it has no other way to authenticate.
                 env_provider: backend.needs_provider_key_env().then_some(provider_id),
+                // Same engine, same condition: an engine that reads the store
+                // itself already knows the model's routing, and one that never
+                // sees the store has no use for a model id it cannot look up.
+                env_model: backend.needs_provider_key_env().then_some(model_id),
                 session_id: spec.session_id.clone(),
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
@@ -140,6 +150,7 @@ pub fn resolve_in(
             Some(LaunchPlan {
                 command: backend.clear(&fresh)?,
                 env_provider: None,
+                env_model: None,
                 session_id: Some(fresh),
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
@@ -176,6 +187,7 @@ fn reopen(
     Some(LaunchPlan {
         command: build(backend, session_id)?,
         env_provider: None,
+        env_model: None,
         session_id: Some(session_id.to_string()),
         agent_id: backend.id().to_string(),
         caps: backend.caps(),
@@ -432,6 +444,7 @@ mod tests {
         assert_eq!(plan.agent_id, "claude");
         assert!(plan.command.starts_with("claude --model opus --effort high"), "{}", plan.command);
         assert_eq!(plan.env_provider, None, "a plain agent must never be handed a key");
+        assert_eq!(plan.env_model, None);
     }
 
     #[test]
@@ -545,6 +558,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.env_provider, None, "the chat harness was handed a key");
+    }
+
+    /// The model rides along with the provider, and in the catalog's spelling
+    /// rather than the engine's: it is the key routing is stored under, so a
+    /// plan carrying `openrouter/m` would look up nothing at spawn time.
+    #[test]
+    fn the_engine_given_the_key_is_told_which_model_to_route() {
+        let with_opencode = vec![opencode_like(true), chat_like(vec![])];
+        let plan = resolve_in(
+            &with_opencode,
+            &[openrouter()],
+            LaunchRequest::ApiModel {
+                provider_id: "openrouter".into(),
+                model_id: "z-ai/glm-5.2".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.env_model.as_deref(), Some("z-ai/glm-5.2"));
+
+        // The harness routes from the store itself, so it is told neither.
+        let without = vec![opencode_like(false), chat_like(vec![])];
+        let plan = resolve_in(
+            &without,
+            &[openrouter()],
+            LaunchRequest::ApiModel {
+                provider_id: "openrouter".into(),
+                model_id: "z-ai/glm-5.2".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.env_model, None);
     }
 
     /* ---- minting -------------------------------------------------------- */
@@ -798,6 +842,7 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::to_value(&plan).unwrap();
         assert!(v.get("command").is_some() && v.get("env_provider").is_some());
+        assert!(v.get("env_model").is_some());
         assert_eq!(v.pointer("/caps/tui_drive"), Some(&serde_json::Value::Bool(false)));
         assert_eq!(v.pointer("/caps/resume"), Some(&serde_json::Value::Bool(true)));
     }
@@ -826,6 +871,7 @@ mod tests {
         .expect("no engine would run an API model");
         assert_eq!(plan.agent_id, "api");
         assert_eq!(plan.env_provider, None);
+        assert_eq!(plan.env_model, None);
         assert!(plan.session_id.is_some(), "a chat's id is real from the first frame");
     }
 }

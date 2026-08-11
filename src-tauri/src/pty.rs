@@ -121,6 +121,7 @@ pub fn pty_spawn(
     rows: u16,
     on_output: Channel<InvokeResponseBody>,
     env_provider: Option<String>,
+    env_model: Option<String>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -149,10 +150,22 @@ pub fn pty_spawn(
     // crosses the frontend and never touches a command line — /proc shows
     // argv to everyone, but environ only to the same user, which is the same
     // exposure as the tool's own credential file.
+    //
+    // That tab's routing rides in the same environment, for the same reason:
+    // the block is compiled here from stored state, so no routing decision
+    // crosses the frontend and none of it appears in argv.
+    // `OPENCODE_CONFIG_CONTENT` merges over the user's own config rather than
+    // replacing it, which is how a model's routing reaches OpenCode without
+    // aiterm ever writing their config file.
     if let Some(pid) = env_provider {
         if let Some(p) = crate::providers::load_providers().iter().find(|p| p.id == pid) {
             if p.is_openrouter() && !p.api_key.is_empty() {
                 cmd.env("OPENROUTER_API_KEY", &p.api_key);
+            }
+            if let Some(model) = env_model.as_deref() {
+                if let Some(cfg) = crate::providers::opencode_config_content(p, model) {
+                    cmd.env("OPENCODE_CONFIG_CONTENT", cfg);
+                }
             }
         }
     }

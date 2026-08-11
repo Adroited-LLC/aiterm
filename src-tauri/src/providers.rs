@@ -159,6 +159,30 @@ pub fn routing_block(p: &Provider, model: &str) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(b))
 }
 
+/// The inline OpenCode config that carries this model's routing.
+///
+/// `OPENCODE_CONFIG_CONTENT` *merges* over the user's own config — verified
+/// 2026-08-10 by running `opencode models` with this set and finding their
+/// `local/local` provider still listed. aiterm therefore never writes
+/// `~/.config/opencode/opencode.json`.
+///
+/// The block goes under the model's `options`, which OpenCode copies onto the
+/// request body as-is. Not `extraBody`: that key is passed through literally,
+/// so OpenRouter would receive — and ignore — an `extraBody` object instead of
+/// the routing it names.
+///
+/// Built with `serde_json`, never by formatting: the model id is user data
+/// that lands inside a JSON key.
+pub fn opencode_config_content(p: &Provider, model: &str) -> Option<String> {
+    let block = routing_block(p, model)?;
+    Some(
+        serde_json::json!({
+            "provider": {"openrouter": {"models": {model: {"options": {"provider": block}}}}}
+        })
+        .to_string(),
+    )
+}
+
 /// Replace a provider's startup shortlist. Order is the caller's; duplicates
 /// fold to their first appearance.
 pub fn set_startup_models(
@@ -1116,6 +1140,49 @@ mod tests {
             order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
         });
         assert_eq!(routing_block(&p, "z-ai/glm-5.2"), None);
+    }
+
+    /* ---- the OpenCode environment ---------------------------------------- */
+
+    /// OpenCode reads routing from a model's `options`, which it copies onto
+    /// the request body as-is.
+    #[test]
+    fn opencode_gets_the_routing_block_under_the_models_options() {
+        let mut p = provider("openrouter");
+        p.policy.resolved_ignore.insert("baidu".into(), "CN".into());
+        p.routes.insert("z-ai/glm-5.2".into(), Route {
+            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
+        });
+        let text = opencode_config_content(&p, "z-ai/glm-5.2").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let opts = &v["provider"]["openrouter"]["models"]["z-ai/glm-5.2"]["options"];
+        assert_eq!(opts["provider"]["order"], serde_json::json!(["novita"]));
+        assert_eq!(opts["provider"]["allow_fallbacks"], serde_json::json!(false));
+        // Verified 2026-08-10: OpenCode passes `options` straight onto the body,
+        // and does NOT unwrap `extraBody`. An extraBody key here would be silently
+        // ignored by OpenRouter.
+        assert!(opts.get("extraBody").is_none());
+    }
+
+    /// Nothing to route, nothing in the environment: the tab starts with the
+    /// environment it had before this feature existed.
+    #[test]
+    fn an_unrouted_model_sets_no_environment_variable() {
+        let p = provider("openrouter");
+        assert_eq!(opencode_config_content(&p, "z-ai/glm-5.2"), None);
+    }
+
+    /// The model id is user data and it lands inside a JSON *key*, so the
+    /// content is built by serde_json and never by formatting.
+    #[test]
+    fn a_model_id_with_awkward_characters_stays_valid_json() {
+        let mut p = provider("openrouter");
+        p.routes.insert("weird/\"quote\"".into(), Route {
+            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
+        });
+        let text = opencode_config_content(&p, "weird/\"quote\"").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).expect("must be valid JSON");
+        assert!(v["provider"]["openrouter"]["models"]["weird/\"quote\""].is_object());
     }
 
     /// The startup list is a replace: what arrives is what is kept, minus

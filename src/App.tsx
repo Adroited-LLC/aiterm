@@ -126,6 +126,7 @@ interface OpenTabOpts {
   fresh?: boolean;
   adopt?: TermTab["adopt"];
   envProvider?: string;
+  envModel?: string;
   /** Which engine this tab runs — `LaunchPlan.agent_id`. Omitted for a plain
    *  shell, which runs none. See `TermTab.agentId`. */
   agentId?: string;
@@ -1510,10 +1511,12 @@ export default function App() {
           //
           // `env_provider` rides along so the spawn can put the key in the
           // tab's environment — set only for an engine that has said it
-          // authenticates no other way.
+          // authenticates no other way. `env_model` names the model whose
+          // routing goes in beside it; the routing is compiled in Rust.
           openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             envProvider: plan.env_provider ?? undefined,
+            envModel: plan.env_model ?? undefined,
             agentId: plan.agent_id,
           });
         } catch (e) {
