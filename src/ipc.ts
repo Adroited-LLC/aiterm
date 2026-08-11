@@ -354,6 +354,11 @@ export interface ProviderView {
   /** Last four characters, for telling two keys apart. Empty when there is no
    *  key or it is too short to redact meaningfully. */
   key_hint: string;
+  /** Whether an OpenRouter management key is stored, and its last four. The
+   *  activity endpoint refuses an inference key, so this is the second
+   *  credential a provider can hold — never returned, same as the first. */
+  has_management_key: boolean;
+  management_key_hint: string;
   /** Model ids picked for the new-session menu — the shortlist, not the
    *  catalog. */
   startup_models: string[];
@@ -481,6 +486,11 @@ export const providerRouteSet = (id: string, model: string, route: Route) =>
  *  comes back with OpenRouter's own sentence saying so. */
 export const providerActivity = (id: string) =>
   invoke<ActivityRow[]>("provider_activity", { id });
+/** Store the management key `/activity` wants, or clear it with `""`. Blank
+ *  does *not* keep the stored one here — unlike `providerSave`, this field has
+ *  a Forget button instead of a rule to remember. */
+export const providerManagementKeySet = (id: string, key: string) =>
+  invoke<ProviderView[]>("provider_management_key_set", { id, key });
 
 /** What an engine supports, so the UI gates on a declaration rather than on an
  *  agent's name. Snake_case because it arrives straight off `Caps` in Rust. */

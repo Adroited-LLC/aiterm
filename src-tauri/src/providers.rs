@@ -25,10 +25,11 @@
 //!
 //! ## What never crosses to the frontend
 //!
-//! The key. [`ProviderView`] carries a `has_key` flag and the last four
+//! Either key. [`ProviderView`] carries a `has_key` flag and the last four
 //! characters, which is enough to tell two keys apart in a list and useless to
 //! anyone reading a screenshot. The renderer cannot ask for the real value —
-//! there is no command that returns it.
+//! there is no command that returns it. The management key added for
+//! `/activity` is held to the same rule.
 
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +99,14 @@ pub struct Provider {
     /// `https://openrouter.ai/api/v1`.
     pub base_url: String,
     pub api_key: String,
+    /// An OpenRouter *management* key, for the one endpoint an inference key
+    /// cannot read: `/activity` answers a good inference key with `403 Only
+    /// management keys can fetch activity for an account` — verified live on
+    /// 2026-08-10. Optional, and only OpenRouter has the distinction; every
+    /// other call uses `api_key`. `default` so files written before this field
+    /// existed load.
+    #[serde(default)]
+    pub management_key: String,
     /// Model ids picked for the new-session menu — the shortlist, not the
     /// catalog. `default` so files written before this field existed load.
     #[serde(default)]
@@ -210,6 +219,10 @@ pub struct ProviderView {
     /// no key, or when the key is too short to redact meaningfully — showing
     /// most of a six-character secret would defeat the point.
     pub key_hint: String,
+    /// Whether a management key is stored, and its last four — same treatment
+    /// as `api_key`, for the same reason. Only the activity view reads these.
+    pub has_management_key: bool,
+    pub management_key_hint: String,
     pub startup_models: Vec<String>,
     pub policy: Policy,
     pub routes: std::collections::BTreeMap<String, Route>,
@@ -222,6 +235,10 @@ impl std::fmt::Debug for Provider {
             .field("name", &self.name)
             .field("base_url", &self.base_url)
             .field("api_key", &format_args!("<{} chars>", self.api_key.len()))
+            .field(
+                "management_key",
+                &format_args!("<{} chars>", self.management_key.len()),
+            )
             .finish()
     }
 }
@@ -245,6 +262,8 @@ impl Provider {
             base_url: self.base_url.clone(),
             has_key: !self.api_key.is_empty(),
             key_hint: key_hint(&self.api_key),
+            has_management_key: !self.management_key.is_empty(),
+            management_key_hint: key_hint(&self.management_key),
             startup_models: self.startup_models.clone(),
             policy: self.policy.clone(),
             routes: self.routes.clone(),
@@ -418,6 +437,7 @@ fn provider_save_sync(
             name,
             base_url,
             api_key: api_key.trim().to_string(),
+            management_key: String::new(),
             startup_models: vec![],
             policy: Default::default(),
             routes: Default::default(),
@@ -487,8 +507,18 @@ fn fetch_models_response(id: &str) -> Result<String, String> {
     fetch(p, &format!("{}/models", p.base_url))
 }
 
-/// One authenticated GET as curl sees it: body, newline, HTTP status.
+/// One authenticated GET as curl sees it: body, newline, HTTP status. Uses the
+/// provider's ordinary key — the one every endpoint but `/activity` wants.
 pub fn fetch(p: &Provider, url: &str) -> Result<String, String> {
+    fetch_with_key(url, &p.api_key)
+}
+
+/// The same GET, with the caller naming the credential.
+///
+/// One curl block, not two: `/activity` needs a different key from every other
+/// call, and a second copy of the stdin handling below is a second place for
+/// the rule that keeps a secret off the argv to be got wrong.
+fn fetch_with_key(url: &str, key: &str) -> Result<String, String> {
     // The key goes in on stdin, never on the argv. `/proc/<pid>/cmdline` is
     // world-readable on Linux, so `-H "Authorization: Bearer …"` publishes the
     // secret to every process on the machine for as long as curl runs — and
@@ -518,7 +548,7 @@ pub fn fetch(p: &Provider, url: &str) -> Result<String, String> {
         .map_err(|e| format!("Could not run curl: {e}"))
         .and_then(|mut child| {
             use std::io::Write;
-            let config = curl_auth_config(&p.api_key);
+            let config = curl_auth_config(key);
             child
                 .stdin
                 .take()
@@ -1013,6 +1043,57 @@ pub fn parse_activity(response: &str) -> Result<Vec<ActivityRow>, String> {
         .collect())
 }
 
+/// Which key `/activity` is asked with: the management key when there is one,
+/// the ordinary key otherwise.
+///
+/// Falling back rather than refusing is deliberate. The ordinary key gets a
+/// `403` carrying OpenRouter's own sentence — "Only management keys can fetch
+/// activity for an account" — which `activity_body` passes through, and that
+/// sentence tells the user what to do. A guess of our own about which key they
+/// hold would replace it with something less true.
+fn activity_key(p: &Provider) -> &str {
+    if p.management_key.is_empty() {
+        &p.api_key
+    } else {
+        &p.management_key
+    }
+}
+
+/// Store or clear the management key. An empty string clears it — the only
+/// other thing "empty" could mean is "keep what is there", and this field has a
+/// visible Forget button rather than a blank-means-keep rule to remember.
+///
+/// Its own command rather than a fifth argument to `provider_save`: it is set
+/// from the activity view, not the add-a-provider form, and threading it
+/// through that form would mean every save of a name or URL also carries a
+/// credential it has no business holding.
+#[tauri::command]
+pub async fn provider_management_key_set(
+    id: String,
+    key: String,
+) -> Result<Vec<ProviderView>, String> {
+    crate::run_blocking(move || provider_management_key_set_sync(id, key)).await
+}
+
+fn provider_management_key_set_sync(id: String, key: String) -> Result<Vec<ProviderView>, String> {
+    let mut list = load();
+    let p = list
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
+    let key = key.trim().to_string();
+    // OpenRouter only, like every other routing command — a management key is
+    // their distinction, and nothing would ever read one stored elsewhere.
+    // Clearing is always allowed: a provider whose base URL was edited away
+    // from OpenRouter must not be left holding a credential it cannot drop.
+    if !p.is_openrouter() && !key.is_empty() {
+        return Err("A management key is an OpenRouter feature.".into());
+    }
+    p.management_key = key;
+    save(&list)?;
+    Ok(list.iter().map(Provider::view).collect())
+}
+
 /// The account's recent activity. OpenRouter only, for the same reason
 /// `/endpoints` and `/providers` are: the path is theirs, and no other provider
 /// keeps a per-host record to read.
@@ -1023,10 +1104,11 @@ pub fn provider_activity(id: String) -> Result<Vec<ActivityRow>, String> {
     if !p.is_openrouter() {
         return Err("Activity is an OpenRouter feature.".into());
     }
-    if p.api_key.is_empty() {
+    let key = activity_key(p);
+    if key.is_empty() {
         return Err("No API key saved for this provider.".into());
     }
-    parse_activity(&fetch(p, &format!("{}/activity", p.base_url))?)
+    parse_activity(&fetch_with_key(&format!("{}/activity", p.base_url), key)?)
 }
 
 /// Split the `-w` status off the body and pull out model ids.
@@ -1060,6 +1142,7 @@ mod tests {
             name: id.into(),
             base_url: "https://example.test/v1".into(),
             api_key: "k".into(),
+            management_key: String::new(),
             startup_models: vec![],
             policy: Default::default(),
             routes: Default::default(),
@@ -1550,6 +1633,7 @@ mod tests {
             name: "OpenRouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: "sk-do-not-print-me".into(),
+            management_key: "sk-or-mgmt-do-not-print-me".into(),
             startup_models: vec![],
             policy: Default::default(),
             routes: Default::default(),
@@ -1557,6 +1641,20 @@ mod tests {
         let shown = format!("{p:?}");
         assert!(!shown.contains("sk-do-not-print-me"), "key leaked: {shown}");
         assert!(shown.contains("OpenRouter"));
+    }
+
+    /// The second secret on this struct is redacted by the same hand-written
+    /// `Debug`. A field added to `Provider` and forgotten here would print in
+    /// full the first time anything logs `{:?}`.
+    #[test]
+    fn debugging_a_provider_never_prints_its_management_key() {
+        let p = Provider {
+            management_key: "sk-or-mgmt-do-not-print-me".into(),
+            ..provider("openrouter")
+        };
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("mgmt-do-not-print-me"), "key leaked: {shown}");
+        assert!(shown.contains("<26 chars>"), "not redacted as a length: {shown}");
     }
 
     #[test]
@@ -1585,6 +1683,7 @@ mod tests {
             name: "OpenRouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key: "sk-or-v1-abcdefghijklmnop".into(),
+            management_key: String::new(),
             startup_models: vec![],
             policy: Default::default(),
             routes: Default::default(),
@@ -1595,6 +1694,42 @@ mod tests {
         assert!(!json.contains("abcdefghijkl"), "too much of the key reached the frontend");
         assert!(v.has_key);
         assert_eq!(v.key_hint, "mnop");
+    }
+
+    /// The management key is a second credential on the same struct, and the
+    /// view is serialised straight to the renderer — so it gets the same test
+    /// rather than the assumption that it inherited the first one's handling.
+    #[test]
+    fn the_view_never_carries_the_management_key() {
+        let p = Provider {
+            management_key: "sk-or-mgmt-abcdefghijklwxyz".into(),
+            ..provider("openrouter")
+        };
+        let v = p.view();
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(!json.contains("sk-or-mgmt-abcdefghijklwxyz"), "the key reached the frontend");
+        assert!(!json.contains("abcdefghijkl"), "too much of the key reached the frontend");
+        assert!(v.has_management_key);
+        assert_eq!(v.management_key_hint, "wxyz");
+        // A provider with no management key says so, rather than looking like
+        // one whose key is simply too short to hint at.
+        let bare = provider("openrouter").view();
+        assert!(!bare.has_management_key);
+        assert_eq!(bare.management_key_hint, "");
+    }
+
+    /// `/activity` refuses an inference key — verified live on 2026-08-10 — so
+    /// the management key wins that one call when there is one, and only that
+    /// one call.
+    #[test]
+    fn activity_asks_with_the_management_key_when_there_is_one() {
+        let mut p = provider("openrouter");
+        p.api_key = "sk-or-v1-inference".into();
+        assert_eq!(activity_key(&p), "sk-or-v1-inference");
+        p.management_key = "sk-or-mgmt-real".into();
+        assert_eq!(activity_key(&p), "sk-or-mgmt-real");
+        // Every other endpoint keeps the ordinary key.
+        assert_eq!(p.api_key, "sk-or-v1-inference");
     }
 
     /// A short key is not redacted, it is withheld — four of six characters is

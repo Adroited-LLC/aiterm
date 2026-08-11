@@ -412,6 +412,7 @@ mod tests {
             name: id.into(),
             base_url: base_url.into(),
             api_key: "k".into(),
+            management_key: String::new(),
             startup_models: vec![],
             policy: Default::default(),
             routes: Default::default(),
