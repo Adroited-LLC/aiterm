@@ -262,15 +262,20 @@ fn attribution(host: Option<&str>, cost: Option<f64>) -> Option<String> {
 }
 
 /// The note under a failed request for a pinned model. A pin sends
-/// `allow_fallbacks: false`, so OpenRouter having nothing to route to is the
-/// pin working, not the session breaking — but only if we say which pin.
-/// `None` for an unpinned model, whose failure is an ordinary failure.
-fn pinned_note(model: &str, order: &[String]) -> Option<String> {
-    if order.is_empty() {
+/// `allow_fallbacks: false`, so a refusal from the pinned host is the pin
+/// working, not the session breaking — but only if we say which pin.
+///
+/// `None` unless a provider actually answered: a request that never reached a
+/// host says nothing about routing, and naming the pin there would assert a
+/// cause we do not know. `None` too for an unpinned model, whose failure is an
+/// ordinary failure.
+fn pinned_note(model: &str, order: &[String], provider_answered: bool) -> Option<String> {
+    if order.is_empty() || !provider_answered {
         return None;
     }
     Some(format!(
-        "{model} is pinned to {} with no fallback — OpenRouter had nothing to route to.",
+        "{model} is pinned to {} with no fallback — a pinned host that cannot \
+         serve the request fails rather than rerouting.",
         order.join(", ")
     ))
 }
@@ -405,6 +410,10 @@ pub fn run(start: Start) -> i32 {
         match stream_reply(&url, &p.api_key, &model, &messages, routing.as_ref()) {
             Ok(reply) if reply.text.is_empty() => {
                 eprintln!("\x1b[2m(the model returned nothing)\x1b[0m");
+                // An empty reply still costs, and still came from somewhere.
+                if let Some(line) = attribution(reply.host.as_deref(), reply.cost) {
+                    eprintln!("\x1b[2m· {line}\x1b[0m");
+                }
                 messages.pop();
             }
             Ok(reply) => {
@@ -417,11 +426,12 @@ pub fn run(start: Start) -> i32 {
                 messages.push(Msg { role: "assistant", content: reply.text });
             }
             Err(e) => {
-                eprintln!("\x1b[31m{e}\x1b[0m");
-                // A pin is "only that host": say so, or a refusal from a
-                // constraint the user set reads as a broken session.
+                eprintln!("\x1b[31m{}\x1b[0m", e.message());
+                // A pin is "only that host": say so when a host actually
+                // refused, or a refusal from a constraint the user set reads
+                // as a broken session. A dead network gets no such note.
                 let order = p.routes.get(&model).map(|r| r.order.as_slice()).unwrap_or(&[]);
-                if let Some(note) = pinned_note(&model, order) {
+                if let Some(note) = pinned_note(&model, order, e.provider_answered()) {
                     eprintln!("\x1b[2m  {note}\x1b[0m");
                 }
                 messages.pop(); // the turn didn't happen; let it be retyped
@@ -509,6 +519,31 @@ struct Reply {
     cost: Option<f64>,
 }
 
+/// Why a send failed, and whether a provider was ever on the other end.
+///
+/// The distinction is what keeps the pin note honest: a `Provider` failure came
+/// back from the host the route chose, so the route is fair to mention; a
+/// `Transport` failure never reached a host at all.
+enum Failed {
+    /// curl could not run, could not connect, or died before any reply.
+    Transport(String),
+    /// A provider answered and refused — a rate limit, a rejected key, a model
+    /// it would not serve.
+    Provider(String),
+}
+
+impl Failed {
+    fn message(&self) -> &str {
+        match self {
+            Failed::Transport(m) | Failed::Provider(m) => m,
+        }
+    }
+
+    fn provider_answered(&self) -> bool {
+        matches!(self, Failed::Provider(_))
+    }
+}
+
 /// Send the conversation, print the reply as it streams, return it whole —
 /// with whatever the stream said about who served it and what it cost.
 fn stream_reply(
@@ -517,12 +552,12 @@ fn stream_reply(
     model: &str,
     messages: &[Msg],
     routing: Option<&serde_json::Value>,
-) -> Result<Reply, String> {
+) -> Result<Reply, Failed> {
     // The body goes through a 0600 file rather than the argv: prompts are the
     // user's own text and `/proc/<pid>/cmdline` is world-readable.
     let body_path = std::env::temp_dir().join(format!("aiterm-chat-{}.json", std::process::id()));
     crate::providers::write_private(&body_path, &chat_body(model, messages, routing))
-        .map_err(|e| format!("could not stage the request: {e}"))?;
+        .map_err(|e| Failed::Transport(format!("could not stage the request: {e}")))?;
 
     let mut child = std::process::Command::new("curl")
         .args([
@@ -544,14 +579,14 @@ fn stream_reply(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not run curl: {e}"))?;
+        .map_err(|e| Failed::Transport(format!("could not run curl: {e}")))?;
 
     child
         .stdin
         .take()
-        .ok_or("curl took no stdin")?
+        .ok_or_else(|| Failed::Transport("curl took no stdin".into()))?
         .write_all(crate::providers::curl_auth_config(key).as_bytes())
-        .map_err(|e| format!("could not pass the key to curl: {e}"))?;
+        .map_err(|e| Failed::Transport(format!("could not pass the key to curl: {e}")))?;
 
     let mut reply = String::new();
     // The host names itself on every chunk and the cost arrives on the last
@@ -581,13 +616,13 @@ fn stream_reply(
     let status = child.wait();
     let _ = std::fs::remove_file(&body_path);
     if let Some(e) = failed {
-        return Err(format!("The provider refused: {e}"));
+        return Err(Failed::Provider(format!("The provider refused: {e}")));
     }
     match status {
         Ok(s) if s.success() => Ok(Reply { text: reply, host, cost }),
         _ => {
             if reply.is_empty() {
-                Err("curl could not reach the provider.".into())
+                Err(Failed::Transport("curl could not reach the provider.".into()))
             } else {
                 // The stream broke mid-reply; what printed is what there is.
                 Ok(Reply { text: reply, host, cost })
@@ -686,15 +721,29 @@ mod tests {
         assert_eq!(attribution(None, None), None);
     }
 
-    /// A pinned model has one host and no fallback, so a refusal is the pin
-    /// doing its job. Say which pin, or "only that host" reads as a break.
+    /// A pinned model has one host and no fallback, so a refusal from that host
+    /// is the pin doing its job. Say which pin, or "only that host" reads as a
+    /// break — but say it only when a host answered: a request that never
+    /// reached one, and an unpinned model, both get silence.
     #[test]
-    fn a_refused_pin_names_the_hosts_it_was_held_to() {
+    fn only_a_hosts_refusal_of_a_pinned_model_names_the_pin() {
         let order = vec!["novita".to_string(), "deepinfra".to_string()];
-        let note = pinned_note("z-ai/glm-5.2", &order).unwrap();
+        let note = pinned_note("z-ai/glm-5.2", &order, true).unwrap();
         assert!(note.contains("z-ai/glm-5.2"), "{note}");
         assert!(note.contains("novita, deepinfra"), "{note}");
-        assert_eq!(pinned_note("z-ai/glm-5.2", &[]), None);
+        assert_eq!(pinned_note("z-ai/glm-5.2", &order, false), None, "the network died");
+        assert_eq!(pinned_note("z-ai/glm-5.2", &[], true), None, "no pin to name");
+    }
+
+    /// The two ways a send fails are told apart at the source, so the pin note
+    /// can ask which one it was rather than assuming.
+    #[test]
+    fn a_transport_failure_and_a_refusal_are_told_apart() {
+        let refused = Failed::Provider("The provider refused: Rate limited".into());
+        let dead = Failed::Transport("curl could not reach the provider.".into());
+        assert!(refused.provider_answered());
+        assert!(!dead.provider_answered());
+        assert_eq!(dead.message(), "curl could not reach the provider.");
     }
 
     /// One trailing backslash continues the message; a doubled one is a
