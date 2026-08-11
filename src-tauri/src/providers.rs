@@ -862,6 +862,31 @@ pub fn provider_policy_set(id: String, policy: Policy) -> Result<Vec<ProviderVie
 
 /// Set or clear one model's route. An empty `order` with no ceiling removes
 /// the entry rather than storing a route that says nothing.
+///
+/// OpenRouter only, for the same reason `/endpoints` and `/providers` are: a
+/// route names hosts only OpenRouter can route to, so a stored route on any
+/// other provider is dead weight the request path would never send.
+pub fn set_route(
+    list: &mut [Provider],
+    id: &str,
+    model: String,
+    route: Route,
+) -> Result<(), String> {
+    let p = list
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
+    if !p.is_openrouter() {
+        return Err("Provider routing is an OpenRouter feature.".into());
+    }
+    if route.order.is_empty() && route.max_price.is_empty() {
+        p.routes.remove(&model);
+    } else {
+        p.routes.insert(model, route);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn provider_route_set(
     id: String,
@@ -877,15 +902,7 @@ fn provider_route_set_sync(
     route: Route,
 ) -> Result<Vec<ProviderView>, String> {
     let mut list = load();
-    let p = list
-        .iter_mut()
-        .find(|p| p.id == id)
-        .ok_or("No such provider.")?;
-    if route.order.is_empty() && route.max_price.is_empty() {
-        p.routes.remove(&model);
-    } else {
-        p.routes.insert(model, route);
-    }
+    set_route(&mut list, &id, model, route)?;
     save(&list)?;
     Ok(list.iter().map(Provider::view).collect())
 }
@@ -1017,6 +1034,25 @@ mod tests {
         .unwrap();
         assert_eq!(list[0].startup_models, vec!["a/one", "b/two"]);
         assert!(set_startup_models(&mut list, "nope", vec![]).is_err());
+    }
+
+    /// A route names an OpenRouter host, so a provider that is not OpenRouter
+    /// must be refused rather than left holding a route nothing will ever send.
+    #[test]
+    fn a_route_cannot_be_stored_on_a_provider_that_is_not_openrouter() {
+        let mut list = vec![provider("local"), provider("openrouter")];
+        list[1].base_url = "https://openrouter.ai/api/v1".into();
+        let route = Route {
+            order: vec!["novita".into()],
+            allow_fallbacks: false,
+            ..Default::default()
+        };
+        let err = set_route(&mut list, "local", "z-ai/glm-5.2".into(), route.clone()).unwrap_err();
+        assert_eq!(err, "Provider routing is an OpenRouter feature.");
+        assert!(list[0].routes.is_empty());
+        // The same route on the OpenRouter provider still stores.
+        set_route(&mut list, "openrouter", "z-ai/glm-5.2".into(), route).unwrap();
+        assert_eq!(list[1].routes["z-ai/glm-5.2"].order, vec!["novita"]);
     }
 
     /// A 0.10.40 file predates routing entirely: no `policy`, no `routes`. It
