@@ -732,6 +732,164 @@ pub fn provider_model_endpoints(id: String, model: String) -> Result<Vec<Endpoin
     parse_endpoints(&fetch(p, &url)?, p, &model)
 }
 
+/// One provider in OpenRouter's directory. Country is optional and often
+/// missing — 29 of 101 providers reported none on 2026-08-10 — which is why
+/// `block_unknown_country` exists as its own decision.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DirectoryEntry {
+    pub slug: String,
+    pub name: String,
+    pub headquarters: Option<String>,
+    #[serde(default)]
+    pub datacenters: Vec<String>,
+}
+
+/// The `/providers` reply as directory rows.
+pub fn parse_directory(response: &str) -> Result<Vec<DirectoryEntry>, String> {
+    let body = checked_body(response)?;
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|_| "The provider did not return JSON.".to_string())?;
+    let items = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| "No provider list in the reply.".to_string())?;
+    Ok(items
+        .iter()
+        // A row with no `slug` is dropped: the slug is the only field a policy
+        // can act on, so such a row could never be blocked or pinned anyway.
+        .filter_map(|e| {
+            Some(DirectoryEntry {
+                slug: e.get("slug")?.as_str()?.to_string(),
+                name: e
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                headquarters: e
+                    .get("headquarters")
+                    .and_then(|h| h.as_str())
+                    .map(String::from),
+                datacenters: e
+                    .get("datacenters")
+                    .and_then(|d| d.as_array())
+                    .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+/// The policy compiled to slugs: what actually goes in `ignore`, and why.
+///
+/// A hand block wins the reason line, because it is the one the user typed and
+/// the one they will look for when they wonder where a host went.
+pub fn resolve_ignore(
+    policy: &Policy,
+    dir: &[DirectoryEntry],
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for e in dir {
+        let countries: Vec<&str> = e
+            .headquarters
+            .iter()
+            .map(String::as_str)
+            .chain(e.datacenters.iter().map(String::as_str))
+            .collect();
+        if countries.is_empty() {
+            if policy.block_unknown_country {
+                out.insert(e.slug.clone(), "no country".to_string());
+            }
+        } else if let Some(c) = countries.iter().find(|c| {
+            policy
+                .blocked_countries
+                .iter()
+                .any(|b| b.eq_ignore_ascii_case(c))
+        }) {
+            out.insert(e.slug.clone(), c.to_string());
+        }
+    }
+    // Hand blocks last: they overwrite a country reason, and they apply to
+    // slugs the directory has never heard of.
+    for slug in &policy.blocked_providers {
+        out.insert(slug.clone(), "blocked by hand".to_string());
+    }
+    out
+}
+
+/// The provider directory — every host OpenRouter can route to, with the
+/// country data a policy is written against. OpenRouter only, for the same
+/// reason `/endpoints` is.
+///
+/// `#[tauri::command(async)]` rather than `run_blocking`, matching the other
+/// commands here that make a network call: the curl is synchronous, and this
+/// keeps it off the GTK main thread.
+#[tauri::command(async)]
+pub fn provider_directory(id: String) -> Result<Vec<DirectoryEntry>, String> {
+    let list = load();
+    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    if !p.is_openrouter() {
+        return Err("Provider routing is an OpenRouter feature.".into());
+    }
+    if p.api_key.is_empty() {
+        return Err("No API key saved for this provider.".into());
+    }
+    parse_directory(&fetch(p, &format!("{}/providers", p.base_url))?)
+}
+
+/// Save a policy, compiling it against the live directory first.
+///
+/// A directory that will not load is a hard error rather than a silent save:
+/// storing a policy whose `resolved_ignore` is empty would read in the panel
+/// as "nothing is blocked", which is the opposite of what was asked for.
+#[tauri::command(async)]
+pub fn provider_policy_set(id: String, policy: Policy) -> Result<Vec<ProviderView>, String> {
+    let dir = provider_directory(id.clone())?;
+    let mut list = load();
+    let p = list
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
+    let mut policy = policy;
+    policy.resolved_ignore = resolve_ignore(&policy, &dir);
+    policy.resolved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    p.policy = policy;
+    save(&list)?;
+    Ok(list.iter().map(Provider::view).collect())
+}
+
+/// Set or clear one model's route. An empty `order` with no ceiling removes
+/// the entry rather than storing a route that says nothing.
+#[tauri::command]
+pub async fn provider_route_set(
+    id: String,
+    model: String,
+    route: Route,
+) -> Result<Vec<ProviderView>, String> {
+    crate::run_blocking(move || provider_route_set_sync(id, model, route)).await
+}
+
+fn provider_route_set_sync(
+    id: String,
+    model: String,
+    route: Route,
+) -> Result<Vec<ProviderView>, String> {
+    let mut list = load();
+    let p = list
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
+    if route.order.is_empty() && route.max_price.is_empty() {
+        p.routes.remove(&model);
+    } else {
+        p.routes.insert(model, route);
+    }
+    save(&list)?;
+    Ok(list.iter().map(Provider::view).collect())
+}
+
 /// Split the `-w` status off the body and pull out model ids.
 ///
 /// Kept separate from the request so the parsing — which is where the shapes
@@ -1039,6 +1197,86 @@ mod tests {
         assert_eq!(rows[0].excluded.as_deref(), Some("over cap"));  // $3.15/M
         assert_eq!(rows[1].excluded, None);                         // $1.58/M
         assert_eq!(rows[2].excluded, None);                         // $1.584/M... under 1.6
+    }
+
+    fn directory() -> Vec<DirectoryEntry> {
+        vec![
+            DirectoryEntry {
+                slug: "novita".into(),
+                name: "Novita".into(),
+                headquarters: Some("US".into()),
+                datacenters: vec![],
+            },
+            DirectoryEntry {
+                slug: "baidu".into(),
+                name: "Baidu".into(),
+                headquarters: Some("CN".into()),
+                datacenters: vec![],
+            },
+            // Headquartered Singapore, serving from China — the case that makes
+            // reading only `headquarters` wrong.
+            DirectoryEntry {
+                slug: "alibaba".into(),
+                name: "Alibaba".into(),
+                headquarters: Some("SG".into()),
+                datacenters: vec!["SG".into(), "CN".into()],
+            },
+            DirectoryEntry {
+                slug: "mystery".into(),
+                name: "Mystery".into(),
+                headquarters: None,
+                datacenters: vec![],
+            },
+        ]
+    }
+
+    #[test]
+    fn a_country_block_catches_headquarters_and_datacenters() {
+        let policy = Policy {
+            blocked_countries: vec!["CN".into()],
+            ..Default::default()
+        };
+        let out = resolve_ignore(&policy, &directory());
+        assert_eq!(out.get("baidu").map(String::as_str), Some("CN"));
+        assert_eq!(out.get("alibaba").map(String::as_str), Some("CN"));
+        assert!(!out.contains_key("novita"));
+        assert!(!out.contains_key("mystery"), "unknown is not blocked unless asked");
+    }
+
+    #[test]
+    fn blocking_unknown_countries_is_a_separate_decision() {
+        let policy = Policy {
+            blocked_countries: vec!["CN".into()],
+            block_unknown_country: true,
+            ..Default::default()
+        };
+        let out = resolve_ignore(&policy, &directory());
+        assert_eq!(out.get("mystery").map(String::as_str), Some("no country"));
+        assert!(!out.contains_key("novita"));
+    }
+
+    #[test]
+    fn a_hand_block_needs_no_country_data_and_wins_the_reason() {
+        let policy = Policy {
+            blocked_providers: vec!["novita".into(), "baidu".into()],
+            blocked_countries: vec!["CN".into()],
+            ..Default::default()
+        };
+        let out = resolve_ignore(&policy, &directory());
+        assert_eq!(out.get("novita").map(String::as_str), Some("blocked by hand"));
+        assert_eq!(out.get("baidu").map(String::as_str), Some("blocked by hand"));
+    }
+
+    #[test]
+    fn a_directory_reply_parses_both_country_fields() {
+        let body = r#"{"data":[
+          {"slug":"novita","name":"Novita","headquarters":"US","datacenters":null},
+          {"slug":"alibaba","name":"Alibaba","headquarters":"SG","datacenters":["SG","CN"]}]}
+200"#;
+        let dir = parse_directory(body).unwrap();
+        assert_eq!(dir[0].datacenters, Vec::<String>::new());
+        assert_eq!(dir[1].datacenters, vec!["SG", "CN"]);
+        assert_eq!(dir[1].headquarters.as_deref(), Some("SG"));
     }
 
     #[test]
