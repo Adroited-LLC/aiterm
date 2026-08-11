@@ -155,10 +155,20 @@ export default function ModelAccess() {
    *  providers before it lands, and the model-keyed caches below are cleared
    *  on that switch — so a late row must be dropped, not written. */
   const browsingRef = useRef<string | null>(null);
+  /** One tick per policy save, and one per move of the model browser. A save
+   *  captures it before its first await and tests it after each one: a newer
+   *  save, or any move of the browser, makes the captured value stale and the
+   *  settling save writes nothing. It is stronger than comparing the provider
+   *  id, which reads equal again when the user leaves a provider and comes
+   *  back — so `savePolicy` gates on this alone. */
+  const polGen = useRef(0);
   /** Route writes run one at a time — see `applyRoute`. */
   const routeQ = useRef<Promise<void>>(Promise.resolve());
 
   const browse = async (p: ProviderView) => {
+    // Every move of the browser, fold included, retires the saves in flight:
+    // the policy section they write into belongs to the provider being left.
+    polGen.current += 1;
     if (browsing === p.id) {
       setBrowsing(null); // second click folds it away
       browsingRef.current = null;
@@ -174,7 +184,8 @@ export default function ModelAccess() {
     // Likewise the policy: the draft, the directory and the section's own
     // open/closed state all belong to the provider being left. `polBusy` is
     // among them — a save still settling on the provider we are leaving must
-    // not leave this one's Save button reading "Saving…".
+    // not leave this one's Save button reading "Saving…", and the tick above
+    // stops that save from clearing the flag a later save has set.
     setPolOpen(false); setDir(null); setDraft(null); setPolErr(null); setPolBusy(false);
     if (!cards[p.id]) {
       try {
@@ -370,6 +381,10 @@ export default function ModelAccess() {
   const savePolicy = async () => {
     const p = browsingProv;
     if (!p || !draft || polBusy) return;
+    // Claim a tick before anything else. Two clicks in one tick both read
+    // `polBusy` false, and a fold-then-reopen resets it while the first save
+    // is still in flight — in both the second save now retires the first.
+    const myGen = (polGen.current += 1);
     const prompt = capValue(draft.prompt);
     const completion = capValue(draft.completion);
     if (prompt === "bad" || completion === "bad") {
@@ -403,7 +418,7 @@ export default function ModelAccess() {
       // The map is keyed by model id alone, so once the browser has moved on
       // it holds the *other* provider's rows — which this policy did not
       // touch. Wiping them there would blank a list that is on screen.
-      if (browsingRef.current !== provId) return;
+      if (polGen.current !== myGen) return;
       setEndpoints({});
       if (open) {
         try {
@@ -411,24 +426,24 @@ export default function ModelAccess() {
           // Merged, not assigned: another section opened while this was in
           // flight has already written its rows, and replacing the map would
           // strand it on "Asking the provider…" with no request left to land.
-          if (browsingRef.current === provId) setEndpoints((e) => ({ ...e, [open]: rows }));
+          if (polGen.current === myGen) setEndpoints((e) => ({ ...e, [open]: rows }));
         } catch (e) {
-          if (browsingRef.current === provId) setEpErr({ model: open, msg: String(e) });
+          if (polGen.current === myGen) setEpErr({ model: open, msg: String(e) });
         }
       }
     } catch (e) {
       // Errors are shown inside the policy section, which now belongs to
       // another provider — a failed save on the one we left must not print
       // there.
-      if (browsingRef.current === provId) setPolErr(String(e));
+      if (polGen.current === myGen) setPolErr(String(e));
     } finally {
-      // Guarded like the rest: `browse` already cleared this flag for the
-      // provider now on screen, and clearing it again would free that
-      // provider's Save button while its own save is still in flight. Folding
-      // the browser away instead of switching leaves the flag set, which is
-      // harmless — the section is not rendered, and reopening the provider
-      // runs the same reset in `browse`.
-      if (browsingRef.current === provId) setPolBusy(false);
+      // Gated like the rest, and for two reasons: `browse` already cleared
+      // this flag for the provider now on screen, and a save that started
+      // after this one owns the flag now. Clearing it from here would free the
+      // Save button while another save is still in flight. Folding the browser
+      // away leaves the flag set, which is harmless — the section is not
+      // rendered, and reopening the provider runs the reset in `browse`.
+      if (polGen.current === myGen) setPolBusy(false);
     }
   };
 
