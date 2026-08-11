@@ -76,20 +76,29 @@ export default function ModelAccess() {
   const [epErr, setEpErr] = useState<{ model: string; msg: string } | null>(null);
   /** The ceiling field being typed in, as text. One at a time, keyed
    *  `<model>:<side>`, so the stored value shows everywhere else and a
-   *  half-typed number is never sent. */
-  const [cap, setCap] = useState<{ key: string; text: string } | null>(null);
+   *  half-typed number is never sent. `bad` carries the number field's own
+   *  verdict on the text it could not parse, which reaches us as `""` and
+   *  would otherwise read as a deliberate clear. */
+  const [cap, setCap] = useState<{ key: string; text: string; bad: boolean } | null>(null);
   /** The newest provider list, including one a route write has just returned
    *  but React has not re-rendered from yet. */
   const provsRef = useRef<ProviderView[] | null>(null);
+  /** The provider the browser is open on *now*. A request that is in flight
+   *  captured the one it was sent for; the two differ when the user switches
+   *  providers before it lands, and the model-keyed caches below are cleared
+   *  on that switch — so a late row must be dropped, not written. */
+  const browsingRef = useRef<string | null>(null);
   /** Route writes run one at a time — see `applyRoute`. */
   const routeQ = useRef<Promise<void>>(Promise.resolve());
 
   const browse = async (p: ProviderView) => {
     if (browsing === p.id) {
       setBrowsing(null); // second click folds it away
+      browsingRef.current = null;
       return;
     }
     setBrowsing(p.id);
+    browsingRef.current = p.id;   // in flight already; the effect is too late
     setBrowseErr(null);
     setPicked(null);
     // Endpoints are keyed by model id alone, so a second OpenRouter account
@@ -131,10 +140,15 @@ export default function ModelAccess() {
     if (epOpen === modelId) { setEpOpen(null); return; }
     setEpOpen(modelId); setEpErr(null);
     if (!endpoints[modelId] && browsingProv) {
+      const provId = browsingProv.id;
       try {
-        const rows = await providerModelEndpoints(browsingProv.id, modelId);
+        const rows = await providerModelEndpoints(provId, modelId);
+        if (browsingRef.current !== provId) return;   // switched away mid-flight
         setEndpoints((e) => ({ ...e, [modelId]: rows }));
-      } catch (e) { setEpErr({ model: modelId, msg: String(e) }); }
+      } catch (e) {
+        if (browsingRef.current !== provId) return;
+        setEpErr({ model: modelId, msg: String(e) });
+      }
     }
   };
 
@@ -164,9 +178,13 @@ export default function ModelAccess() {
         // The rows carry `excluded`, which the new pin or ceiling may change.
         if (showing) {
           const rows = await providerModelEndpoints(provId, modelId);
+          if (browsingRef.current !== provId) return;   // switched away mid-flight
           setEndpoints((e) => ({ ...e, [modelId]: rows }));
         }
-      } catch (e) { setEpErr({ model: modelId, msg: String(e) }); }
+      } catch (e) {
+        if (browsingRef.current !== provId) return;
+        setEpErr({ model: modelId, msg: String(e) });
+      }
     });
     return routeQ.current;
   };
@@ -180,13 +198,18 @@ export default function ModelAccess() {
 
   const capKey = (modelId: string, side: keyof MaxPrice) => `${modelId}:${side}`;
 
+  /** The saved ceiling as field text. */
+  const capStored = (modelId: string, side: keyof MaxPrice) => {
+    const v = browsingProv?.routes[modelId]?.max_price[side];
+    return v == null ? "" : String(v);
+  };
+
   /** What the field shows: the draft while it is being typed in, the stored
    *  ceiling otherwise. */
   const capText = (modelId: string, side: keyof MaxPrice) => {
     const k = capKey(modelId, side);
     if (cap?.key === k) return cap.text;
-    const v = browsingProv?.routes[modelId]?.max_price[side];
-    return v == null ? "" : String(v);
+    return capStored(modelId, side);
   };
 
   /** What an empty field would fall back to. A per-model ceiling *replaces*
@@ -200,16 +223,26 @@ export default function ModelAccess() {
   };
 
   /** Blur or Enter, never per keystroke: each commit is a write to disk. */
-  const commitCap = async (modelId: string, side: keyof MaxPrice) => {
+  const commitCap = async (modelId: string, side: keyof MaxPrice, el?: HTMLInputElement) => {
     const k = capKey(modelId, side);
     if (cap?.key !== k) return;             // nothing was typed here
     const text = cap.text.trim();
+    const bad = cap.bad;
     setCap(null);
     if (!browsingProv) return;
+    // Garbage reverts to what is stored rather than clearing it. A number
+    // field hands us `""` for text it cannot parse, so only `badInput` tells
+    // `1e` from a field the user emptied on purpose. Clearing the draft does
+    // not put the stored text back on screen either — the bound value was
+    // `""` before and after, so React writes nothing — hence the box itself.
+    if (bad) { if (el) el.value = capStored(modelId, side); return; }
     const n = text === "" ? undefined : Number(text);
-    // Garbage reverts to what is stored rather than clearing it.
     if (n !== undefined && (!Number.isFinite(n) || n < 0)) return;
-    if (browsingProv.routes[modelId]?.max_price[side] === n) return; // no change
+    // Every good commit writes, even one that matches what is on screen. What
+    // it would be compared against is not settled until the write queued ahead
+    // of it lands, so a "no change" test here can only read a stale route —
+    // and retyping the old value inside one round trip would then keep the
+    // newer one. The last commit must win; a redundant write is the price.
     await applyRoute(modelId, (cur) => {
       const max_price: MaxPrice = { ...(cur?.max_price ?? {}) };
       if (n === undefined) delete max_price[side]; else max_price[side] = n;
@@ -240,6 +273,7 @@ export default function ModelAccess() {
   const refresh = () => providersList().then(setProviders).catch(() => setProviders([]));
   useEffect(() => { refresh(); }, []);
   useEffect(() => { provsRef.current = providers; }, [providers]);
+  useEffect(() => { browsingRef.current = browsing; }, [browsing]);
 
   const reset = () => {
     setEditing(null); setName(""); setBaseUrl(""); setApiKey(""); setError(null);
@@ -480,10 +514,14 @@ export default function ModelAccess() {
                                     placeholder={capHint(sel.id, side)}
                                     value={capText(sel.id, side)}
                                     onChange={(ev) =>
-                                      setCap({ key: capKey(sel.id, side), text: ev.target.value })}
-                                    onBlur={() => commitCap(sel.id, side)}
+                                      setCap({
+                                        key: capKey(sel.id, side),
+                                        text: ev.target.value,
+                                        bad: ev.target.validity.badInput,
+                                      })}
+                                    onBlur={(ev) => commitCap(sel.id, side, ev.currentTarget)}
                                     onKeyDown={(ev) => {
-                                      if (ev.key === "Enter") commitCap(sel.id, side);
+                                      if (ev.key === "Enter") commitCap(sel.id, side, ev.currentTarget);
                                     }}
                                   />
                                 </label>
