@@ -1231,8 +1231,13 @@ export default function App() {
     // is the id it resumes. Gated on the capability rather than on the agent's
     // name, which is the check this refactor exists to remove.
     if (!plan.caps.tui_drive) {
+      // The env rides along for the same reason it does on a fresh API
+      // launch: a resumed OpenCode tab without it answers "Authentication
+      // Error" and falls over to the engine's default model.
       openTab(s.title, s.project_path, plan.command, s.id, {
         sessionId: s.id, resumedId: s.id, agentId: plan.agent_id,
+        envProvider: plan.env_provider ?? undefined,
+        envModel: plan.env_model ?? undefined,
       });
       return;
     }

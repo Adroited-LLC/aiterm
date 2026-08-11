@@ -135,7 +135,7 @@ pub fn resolve_in(
         // Restart is a resume: the tab ended, and continuing the conversation
         // is what "start it again" means for every engine here today.
         LaunchRequest::Resume { session_id } | LaunchRequest::Restart { session_id } => {
-            reopen(list, &session_id, |b, id| b.resume(id))
+            reopen(list, providers, &session_id, |b, id| b.resume(id))
         }
 
         // Clear is not a reopen, and the difference is the whole feature: the
@@ -180,14 +180,29 @@ fn owner<'a>(list: &'a [Box<dyn AgentBackend>], session_id: &str) -> Option<&'a 
 /// action.
 fn reopen(
     list: &[Box<dyn AgentBackend>],
+    providers: &[Provider],
     session_id: &str,
     build: impl Fn(&dyn AgentBackend, &str) -> Option<String>,
 ) -> Option<LaunchPlan> {
     let backend = owner(list, session_id)?;
+    // A reopened API session needs its environment back, or it comes up
+    // unauthenticated and unrouted — measured 2026-08-10: a resumed GLM tab
+    // answered "Authentication Error" twice and fell over to OpenCode's
+    // default Llama. The backend's own record says what the session ran on;
+    // the provider is resolved the way the pin injection resolves it, as the
+    // first stored provider this engine accepts. Same gate as the fresh
+    // launch: only an engine that authenticates through us gets either value.
+    let (env_provider, env_model) = match backend.api_resume_context(session_id) {
+        Some((_, model)) if backend.needs_provider_key_env() => {
+            let p = providers.iter().find(|p| backend.accepts_api(p));
+            (p.map(|p| p.id.clone()), p.map(|_| model))
+        }
+        _ => (None, None),
+    };
     Some(LaunchPlan {
         command: build(backend, session_id)?,
-        env_provider: None,
-        env_model: None,
+        env_provider,
+        env_model,
         session_id: Some(session_id.to_string()),
         agent_id: backend.id().to_string(),
         caps: backend.caps(),
@@ -285,6 +300,9 @@ mod tests {
         can_resume: bool,
         can_clear: bool,
         prefix_models: bool,
+        /// What `api_resume_context` answers — the fake's stand-in for a
+        /// database that remembers what a session ran on.
+        resume_context: Option<(String, String)>,
         sessions: FakeSessions,
     }
 
@@ -300,6 +318,7 @@ mod tests {
                 can_resume: false,
                 can_clear: false,
                 prefix_models: false,
+                resume_context: None,
                 sessions: FakeSessions { ids: vec![] },
             }
         }
@@ -353,6 +372,9 @@ mod tests {
         fn resume(&self, session_id: &str) -> Option<String> {
             self.can_resume
                 .then(|| format!("{} --resume {session_id}", self.id))
+        }
+        fn api_resume_context(&self, _session_id: &str) -> Option<(String, String)> {
+            self.resume_context.clone()
         }
         fn clear(&self, session_id: &str) -> Option<String> {
             self.can_clear
@@ -647,6 +669,70 @@ mod tests {
         assert_eq!(plan.command, "api --resume chat-1");
         assert_eq!(plan.session_id.as_deref(), Some("chat-1"));
         assert!(plan.caps.resume);
+    }
+
+    /// The bug of 2026-08-10: a resumed OpenCode tab came up with no key and
+    /// no routing, answered "Authentication Error", and fell over to the
+    /// engine's default model. A reopen has to restore the environment the
+    /// session was launched with, resolved the same way a fresh launch
+    /// resolves it.
+    #[test]
+    fn resume_of_an_api_session_restores_its_environment() {
+        let list = vec![Box::new(FakeBackend {
+            id: "opencode",
+            accepts_openrouter_only: true,
+            needs_key: true,
+            can_resume: true,
+            resume_context: Some(("openrouter".into(), "z-ai/glm-5.2".into())),
+            sessions: FakeSessions { ids: vec!["ses_1"] },
+            ..Default::default()
+        }) as Box<dyn AgentBackend>];
+        let plan = resolve_in(
+            &list,
+            &[openrouter()],
+            LaunchRequest::Resume { session_id: "ses_1".into() },
+        )
+        .expect("no plan");
+        assert_eq!(plan.env_provider.as_deref(), Some("openrouter"));
+        assert_eq!(plan.env_model.as_deref(), Some("z-ai/glm-5.2"));
+    }
+
+    /// The same reopen with no stored provider the engine accepts: the env
+    /// stays empty rather than naming a provider that cannot authenticate it.
+    #[test]
+    fn resume_without_a_matching_provider_keeps_the_env_empty() {
+        let list = vec![Box::new(FakeBackend {
+            id: "opencode",
+            accepts_openrouter_only: true,
+            needs_key: true,
+            can_resume: true,
+            resume_context: Some(("openrouter".into(), "z-ai/glm-5.2".into())),
+            sessions: FakeSessions { ids: vec!["ses_1"] },
+            ..Default::default()
+        }) as Box<dyn AgentBackend>];
+        let plan = resolve_in(
+            &list,
+            &[provider("other", "https://api.example.com/v1")],
+            LaunchRequest::Resume { session_id: "ses_1".into() },
+        )
+        .expect("no plan");
+        assert_eq!(plan.env_provider, None);
+        assert_eq!(plan.env_model, None);
+    }
+
+    /// A session with no API context — every self-authenticating engine —
+    /// resumes exactly as before this field existed.
+    #[test]
+    fn resume_of_a_plain_session_carries_no_env() {
+        let list = vec![chat_like(vec!["chat-1"])];
+        let plan = resolve_in(
+            &list,
+            &[openrouter()],
+            LaunchRequest::Resume { session_id: "chat-1".into() },
+        )
+        .expect("no plan");
+        assert_eq!(plan.env_provider, None);
+        assert_eq!(plan.env_model, None);
     }
 
     /// The real harness, not a fake: `▶` on an `api` row has to produce the

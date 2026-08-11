@@ -242,6 +242,49 @@ fn part_text(data: &str) -> Option<String> {
     v.get("text").and_then(|t| t.as_str()).map(String::from)
 }
 
+/// What one session was running on: `(providerID, modelID)` from its newest
+/// assistant message — `("openrouter", "z-ai/glm-5.2")`.
+///
+/// This is what makes resume honest about the model. `opencode --session <id>`
+/// alone reopens the conversation on OpenCode's *default* model, not the
+/// session's — measured 2026-08-10, when a GLM session came back as
+/// Llama-4-Scout — so the resume command has to say the model, and the only
+/// place that knows it is OpenCode's own record of the last reply.
+///
+/// The newest assistant message rather than the first: a session whose model
+/// was deliberately switched mid-way should resume on the model it ended on.
+pub fn session_model(session_id: &str) -> Option<(String, String)> {
+    if !valid_id(session_id) {
+        return None;
+    }
+    let sql = format!(
+        "select json_extract(data, '$.providerID') as provider, \
+                json_extract(data, '$.modelID') as model \
+         from message \
+         where session_id = '{session_id}' \
+           and json_extract(data, '$.role') = 'assistant' \
+         order by time_created desc limit 1"
+    );
+    query(&sql).and_then(|json| parse_session_model(&json))
+}
+
+/// sqlite3's JSON for the query above → the pair, when both halves are there.
+/// A row with either missing is no answer at all: a bare model id could not be
+/// spelled into OpenCode's `provider/model` argument anyway.
+pub(crate) fn parse_session_model(json: &str) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        provider: Option<String>,
+        model: Option<String>,
+    }
+    let rows: Vec<Row> = serde_json::from_str(json.trim()).ok()?;
+    let r = rows.into_iter().next()?;
+    match (r.provider, r.model) {
+        (Some(p), Some(m)) if !p.is_empty() && !m.is_empty() => Some((p, m)),
+        _ => None,
+    }
+}
+
 /// Does OpenCode know this id?
 ///
 /// Every session, not only the listed ones: this answers "is this row ours",
@@ -505,6 +548,27 @@ mod tests {
                 s.id,
             );
         }
+    }
+
+    /// The resume-model query's reply, as sqlite3 -json really emits it.
+    #[test]
+    fn a_sessions_last_reply_names_its_provider_and_model() {
+        let json = r#"[{"provider":"openrouter","model":"z-ai/glm-5.2"}]"#;
+        assert_eq!(
+            parse_session_model(json),
+            Some(("openrouter".into(), "z-ai/glm-5.2".into())),
+        );
+    }
+
+    /// Half an answer is no answer: a missing or null side cannot be spelled
+    /// into `provider/model`, and empty output means no assistant reply yet.
+    #[test]
+    fn a_partial_or_empty_model_row_is_no_answer() {
+        assert_eq!(parse_session_model(r#"[{"provider":"openrouter","model":null}]"#), None);
+        assert_eq!(parse_session_model(r#"[{"provider":null,"model":"m"}]"#), None);
+        assert_eq!(parse_session_model(r#"[{"provider":"","model":"m"}]"#), None);
+        assert_eq!(parse_session_model(""), None);
+        assert_eq!(parse_session_model("not json"), None);
     }
 }
 

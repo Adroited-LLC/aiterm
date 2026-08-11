@@ -215,6 +215,15 @@ pub trait AgentBackend: Send + Sync {
         None
     }
 
+    /// What an existing session was running on — `(providerID, modelID)` in
+    /// the engine's own spelling — so a reopen can put its environment back.
+    /// `None` for an engine whose sessions carry no API context, which is
+    /// every engine that authenticates itself.
+    fn api_resume_context(&self, session_id: &str) -> Option<(String, String)> {
+        let _ = session_id;
+        None
+    }
+
     /// Whether this engine will run a model from this API provider.
     ///
     /// The routing question that used to be an `&&` in the renderer. Each
@@ -623,8 +632,19 @@ impl AgentBackend for OpenCodeBackend {
 
     /// `opencode --help`: `-s, --session <id>` reopens a stored session. The id
     /// is quoted like every other value that reaches `$SHELL -ic`.
+    ///
+    /// The model rides along when the database knows it, because `--session`
+    /// alone reopens the conversation on OpenCode's *default* model — measured
+    /// 2026-08-10, when a GLM session resumed as Llama-4-Scout.
     fn resume(&self, session_id: &str) -> Option<String> {
-        Some(format!("opencode --session {}", q(session_id)))
+        Some(opencode_resume_command(
+            session_id,
+            crate::opencode::session_model(session_id),
+        ))
+    }
+
+    fn api_resume_context(&self, session_id: &str) -> Option<(String, String)> {
+        crate::opencode::session_model(session_id)
     }
 
     /// `opencode --help` names sessions only to `--continue`/`--session` back
@@ -785,6 +805,21 @@ impl AgentBackend for ChatBackend {
     /// only the chat.
     fn resume(&self, session_id: &str) -> Option<String> {
         Some(format!("{} chat --resume {}", chat_exe(), q(session_id)))
+    }
+}
+
+/// The resume command, with the session's model spelled the way OpenCode
+/// wants it — `providerID/modelID`, the same shape its `-m` takes everywhere.
+/// Split out from [`AgentBackend::resume`] so the shape is testable without a
+/// database on the machine.
+fn opencode_resume_command(session_id: &str, model: Option<(String, String)>) -> String {
+    match model {
+        Some((provider, model)) => format!(
+            "opencode --session {} --model {}",
+            q(session_id),
+            q(&format!("{provider}/{model}")),
+        ),
+        None => format!("opencode --session {}", q(session_id)),
     }
 }
 
@@ -1707,14 +1742,27 @@ mod tests {
         assert_eq!(ChatBackend.clear("abc-123"), None);
     }
 
-    /// `opencode --help`: `-s, --session <id>`. Quoted, like everything else
-    /// that reaches `$SHELL -ic`.
+    /// `opencode --help`: `-s, --session <id>`, `-m <provider/model>`. Quoted,
+    /// like everything else that reaches `$SHELL -ic`. The pure helper is what
+    /// gets asserted — `resume()` itself consults the live database, so its
+    /// answer for a real id depends on the machine.
     #[test]
-    fn opencode_reopens_a_session_by_id() {
+    fn opencode_reopens_a_session_by_id_and_names_its_model() {
         assert_eq!(
-            OpenCodeBackend.resume("ses_03ee94418ffeDX6l2Xs5hpVzcN"),
-            Some("opencode --session 'ses_03ee94418ffeDX6l2Xs5hpVzcN'".into()),
+            opencode_resume_command(
+                "ses_03ee94418ffeDX6l2Xs5hpVzcN",
+                Some(("openrouter".into(), "z-ai/glm-5.2".into())),
+            ),
+            "opencode --session 'ses_03ee94418ffeDX6l2Xs5hpVzcN' --model 'openrouter/z-ai/glm-5.2'",
         );
+        // No recorded model — a session that never got a reply — resumes bare
+        // rather than inventing one.
+        assert_eq!(
+            opencode_resume_command("ses_03ee94418ffeDX6l2Xs5hpVzcN", None),
+            "opencode --session 'ses_03ee94418ffeDX6l2Xs5hpVzcN'",
+        );
+        // An id that is not OpenCode's shape never reaches the database, so
+        // this stays deterministic through the real `resume()`.
         assert_eq!(
             OpenCodeBackend.resume("a'b"),
             Some(r"opencode --session 'a'\''b'".into()),
