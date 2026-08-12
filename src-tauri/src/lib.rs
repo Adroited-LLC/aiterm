@@ -9,6 +9,7 @@ pub mod git;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;
+pub mod mcp;
 pub mod notify;
 pub mod opencode;
 pub mod opencode_agent;

@@ -42,5 +42,11 @@ fn main() {
         };
         std::process::exit(aiterm_lib::chat::run(start));
     }
+    // `aiterm mcp` is the stdio MCP server that exposes OpenCode delegation as a
+    // tool to any Claude Code session that adds it. Like `chat`, it is its own
+    // one-shot process that never touches a display — dispatch before Tauri.
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        std::process::exit(aiterm_lib::mcp::run());
+    }
     aiterm_lib::run()
 }
