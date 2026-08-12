@@ -11,6 +11,7 @@ pub mod indexer;
 pub mod launch;
 pub mod notify;
 pub mod opencode;
+pub mod opencode_agent;
 pub mod providers;
 pub mod rendercost;
 pub mod pty;
@@ -105,6 +106,7 @@ pub fn run() {
             sessions::claude_model_default,
             sessions::restore_claude_model_default,
             sessions::session_model,
+            opencode_agent::opencode_dispatch,
             hooklink::drain_session_events,
             trace::trace_set,
             trace::trace_status,
