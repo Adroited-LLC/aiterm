@@ -70,16 +70,18 @@ pub struct Caps {
     /// Transcript panels — tasks, artifacts, agents — and the composer pills
     /// that send `/model`, `/effort` and `/rewind`.
     pub panels: bool,
-    /// 🗑 — move this session's transcript to `~/.claude/trash`.
+    /// 🗑 — move this session to `~/.claude/trash`.
     ///
     /// Off by default, and that direction matters more here than anywhere else
-    /// in this struct. `session_delete` renames whatever
+    /// in this struct. For most engines `session_delete` renames whatever
     /// `find_session_file` hands it, and not every provider's answer is a file
-    /// that belongs to one session: OpenCode's is `opencode.db`, the single
-    /// database holding *every* OpenCode conversation on the machine. Trashing
-    /// one row would trash all of them. A backend gets a 🗑 by claiming it,
-    /// never by omission, and `session_delete` checks this itself rather than
-    /// trusting the UI to have hidden the button.
+    /// that belongs to one session — which is why the default is refusal, and
+    /// why OpenCode (whose answer is `opencode.db`, the single database holding
+    /// *every* OpenCode conversation on the machine) only claims this because
+    /// `session_delete` routes its ids to a row-level delete instead of the
+    /// rename. A backend gets a 🗑 by claiming it, never by omission, and
+    /// `session_delete` checks this itself rather than trusting the UI to have
+    /// hidden the button.
     pub delete: bool,
     /// The engine has configuration aiterm can read and show — the Settings
     /// button on its row in the Agents pane. Off by default: an engine whose
@@ -614,7 +616,7 @@ impl AgentBackend for OpenCodeBackend {
         &crate::opencode::OpencodeSessions
     }
 
-    /// Resume, and nothing else.
+    /// Resume and delete, and nothing else.
     ///
     /// There is a session reader now (`opencode.rs`), so a row exists to point
     /// ▶ at. The rest stay false for the same reasons as before: OpenCode has
@@ -622,12 +624,14 @@ impl AgentBackend for OpenCodeBackend {
     /// own screen in a way `term/screen.ts` was never written for, and keeps no
     /// transcript in the shape the panels parse.
     ///
-    /// `delete` is false because `find_session_file` answers with
+    /// `delete` is claimed even though `find_session_file` answers with
     /// `opencode.db` — the one database holding every OpenCode conversation on
-    /// the machine. A 🗑 wired to that would trash all of them at once, which
-    /// is the whole reason the flag exists.
+    /// the machine — because `session_delete` never renames an OpenCode
+    /// session: it branches to `opencode::delete_to_trash`, which dumps the
+    /// session's rows to the trash and deletes exactly those rows. The
+    /// file-move path cannot reach this backend's path.
     fn caps(&self) -> Caps {
-        Caps { resume: true, ..Default::default() }
+        Caps { resume: true, delete: true, ..Default::default() }
     }
 
     /// `opencode --help`: `-s, --session <id>` reopens a stored session. The id
@@ -1866,7 +1870,7 @@ mod tests {
         assert_eq!(CodexBackend.caps(), Caps { delete: true, ..Default::default() });
         assert_eq!(
             OpenCodeBackend.caps(),
-            Caps { resume: true, ..Default::default() },
+            Caps { resume: true, delete: true, ..Default::default() },
         );
         assert_eq!(
             ChatBackend.caps(),
@@ -1874,21 +1878,22 @@ mod tests {
         );
     }
 
-    /// The 🗑 moves a file into `~/.claude/trash`, so it may only be offered
-    /// where that file is one session and aiterm's to move.
+    /// The 🗑 is only offered where the engine has a delete that takes exactly
+    /// one session.
     ///
     /// Claude's transcripts, aiterm's own chat jsonls and Codex's rollouts all
-    /// qualify: one file per conversation, which trash and restore move as a
-    /// unit — a rollout goes back to Codex's own store, not claude's. OpenCode's
-    /// "file" is `opencode.db`, which is *every* OpenCode conversation at once —
-    /// the case this flag was added for, and the one where a 🗑 would be a
-    /// silent catastrophe rather than a mistake.
+    /// have one file per conversation, which trash and restore move as a unit
+    /// — a rollout goes back to Codex's own store, not claude's. OpenCode's
+    /// "file" is `opencode.db`, which is *every* OpenCode conversation at once
+    /// — its claim rides on `session_delete` branching to the row-level
+    /// `opencode::delete_to_trash` instead of the rename, and this test is the
+    /// reminder that removing that branch means removing the claim.
     #[test]
-    fn only_a_store_aiterm_owns_offers_a_delete() {
+    fn only_an_engine_with_a_single_session_delete_offers_one() {
         assert!(ClaudeBackend.caps().delete);
         assert!(ChatBackend.caps().delete);
         assert!(CodexBackend.caps().delete, "a rollout is one session's file");
-        assert!(!OpenCodeBackend.caps().delete, "opencode.db holds every session");
+        assert!(OpenCodeBackend.caps().delete, "row-level delete via opencode::delete_to_trash");
     }
 
     /// The UI gates on this map, so a backend missing from it is an engine

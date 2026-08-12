@@ -593,10 +593,16 @@ export default function SessionsPanel({
           </>
         ) : (
           <>
-            <button
-              className="act-btn" title="Restore session"
-              onClick={() => onRestore(t.id)}
-            >↩</button>
+            {/* An OpenCode entry is a row dump, not a file with a home to go
+                back to — restore would refuse it, so it is not offered. The
+                backend refuses on the same recognition; this hides a button,
+                it does not guard anything. */}
+            {!t.id.startsWith("ses_") && (
+              <button
+                className="act-btn" title="Restore session"
+                onClick={() => onRestore(t.id)}
+              >↩</button>
+            )}
             <button
               className="act-btn danger" title="Delete forever…"
               onClick={() => setConfirmDel(`trash:${t.id}`)}
@@ -850,12 +856,15 @@ export default function SessionsPanel({
                   stick — the process recreates its transcript seconds later,
                   rebuilt from the deletion point, losing the history before
                   it. Stop it first.
-                  And only where the engine's store is one file per session and
-                  aiterm's to move. OpenCode keeps every conversation in one
-                  `opencode.db`, so a delete there would trash all of them at
-                  once; Codex's rollouts are its own files in its own tree.
-                  `session_delete` refuses on the same flag — this hides a
-                  button, it does not guard anything. */}
+                  And only where the engine declares a delete that takes
+                  exactly one session. For file-per-session stores (claude,
+                  Codex, chats) that is a move into ~/.claude/trash; OpenCode
+                  keeps every conversation in one `opencode.db`, so its delete
+                  dumps the session's rows to the trash and removes them from
+                  the database — readable for the keep window, but not
+                  restorable by a rename, which is why its trash entry offers
+                  no ↩. `session_delete` refuses on the same flag — this hides
+                  a button, it does not guard anything. */}
               {!isRunning && !hasTab && caps.delete && (
                 <button
                   className="act-btn danger" title="Delete session…"

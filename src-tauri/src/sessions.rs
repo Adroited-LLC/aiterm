@@ -580,19 +580,23 @@ fn session_status_sync(session_id: String) -> SessionStatus {
 /// How long trashed sessions are kept before the next delete purges them.
 const TRASH_KEEP_DAYS: u64 = 7;
 
-/// Where `session_id`'s transcript is, if its engine permits a delete at all.
+/// Who owns `session_id` and where its transcript is, if its engine permits a
+/// delete at all.
 ///
 /// The gate on the destructive path, and it lives in Rust rather than in the
 /// sidebar because hiding a button is not a boundary: `session_delete` is an
 /// IPC command, and a command that destroys data must not depend on the UI
 /// having declined to call it.
 ///
-/// What it prevents is concrete. `find_session_file` returns whatever the
-/// owning provider considers the session's location, and for OpenCode that is
+/// The backend comes back with the path because the path is not always the
+/// thing to delete. `find_session_file` returns whatever the owning provider
+/// considers the session's location, and for OpenCode that is
 /// `~/.local/share/opencode/opencode.db` — the single database holding every
-/// OpenCode conversation on the machine. The delete below is a `rename` into
-/// `~/.claude/trash/<id>.jsonl`; run against that path it would move all of
-/// them, under one session's name, on one click.
+/// OpenCode conversation on the machine. The generic delete below is a
+/// `rename` into `~/.claude/trash/<id>.jsonl`; run against that path it would
+/// move all of them, under one session's name, on one click. So the caller
+/// branches on the backend and sends OpenCode ids to a row-level delete that
+/// never touches the rename.
 ///
 /// Taken over an explicit backend list so the refusal can be tested with fake
 /// backends rather than by having a real engine installed.
@@ -613,10 +617,10 @@ fn panels_denied(session_id: &str) -> bool {
         .is_some_and(|(b, _)| !b.caps().panels)
 }
 
-fn deletable(
-    list: &[Box<dyn crate::agents::AgentBackend>],
+fn deletable<'a>(
+    list: &'a [Box<dyn crate::agents::AgentBackend>],
     session_id: &str,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<(&'a dyn crate::agents::AgentBackend, std::path::PathBuf), String> {
     let (backend, path) =
         crate::agents::owner_in(list, session_id).ok_or("session not found")?;
     if !backend.caps().delete {
@@ -625,12 +629,14 @@ fn deletable(
             backend.display_name()
         ));
     }
-    Ok(path)
+    Ok((backend, path))
 }
 
 /// Delete a session: its transcript jsonl and task store move to
 /// ~/.claude/trash (kept for TRASH_KEEP_DAYS as an undo safety net,
-/// purged lazily on later deletes).
+/// purged lazily on later deletes). An OpenCode session has no file of its
+/// own to move; its rows are dumped to the trash and deleted from
+/// `opencode.db` instead.
 #[tauri::command]
 pub async fn session_delete(session_id: String) -> Result<(), String> {
     crate::run_blocking(move || session_delete_sync(session_id)).await
@@ -640,7 +646,8 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     if session_id.contains('/') || session_id.contains("..") {
         return Err("invalid session id".into());
     }
-    let path = deletable(&crate::agents::backends(), &session_id)?;
+    let backends = crate::agents::backends();
+    let (backend, path) = deletable(&backends, &session_id)?;
     let home = dirs::home_dir().ok_or("no home dir")?;
     let trash = home.join(".claude/trash");
     std::fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
@@ -663,6 +670,14 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
                 };
             }
         }
+    }
+
+    // OpenCode first, because for it `path` is the whole database and must
+    // never meet the rename below. Its delete dumps the session's rows to
+    // `<id>.jsonl` in the trash — readable for the keep window like any other
+    // trashed session — then removes exactly those rows.
+    if backend.id() == "opencode" {
+        return crate::opencode::delete_to_trash(&session_id, &trash);
     }
 
     // Same filesystem (~/.claude), so rename is atomic and cheap. Rename
@@ -796,9 +811,13 @@ fn trash_list_sync() -> Vec<TrashedSession> {
                 .unwrap_or(0);
             // parse_session rejects some transcripts (noise filters); trash
             // still lists those with a fallback label so nothing is invisible.
+            // An OpenCode dump is not a transcript at all — its header line
+            // carries the name.
             let (title, project_path) = match parse_session(&p, None) {
                 Some(s) => (s.title, s.project_path),
-                None => (format!("session {}", &id[..8.min(id.len())]), String::new()),
+                None => crate::opencode::dump_meta(&p).unwrap_or_else(|| {
+                    (format!("session {}", &id[..8.min(id.len())]), String::new())
+                }),
             };
             Some(TrashedSession { id, title, project_path, deleted_at })
         })
@@ -825,6 +844,19 @@ fn trash_restore_sync(session_id: String) -> Result<(), String> {
     let src = trash.join(format!("{session_id}.jsonl"));
     if !src.exists() {
         return Err("session not in trash".into());
+    }
+
+    // An OpenCode dump is rows pulled out of `opencode.db`, not a file that
+    // ever had a home to go back to. Putting the rows back is a write this
+    // app does not make; refusing plainly beats the alternatives — restoring
+    // it into claude's tree, or renaming it onto the database. The dump stays
+    // readable in the trash for the keep window.
+    if crate::opencode::dump_meta(&src).is_some() {
+        return Err(
+            "OpenCode sessions can't be restored automatically — the full \
+             conversation stays readable in ~/.claude/trash until it is purged."
+                .into(),
+        );
     }
 
     // Where it was when it was deleted, if that was recorded. Exact beats
@@ -2888,15 +2920,15 @@ mod tests {
     /// to rename, so the destructive step is never reached.
     #[test]
     fn delete_refuses_for_an_engine_that_does_not_claim_it() {
-        let err = deletable(&fake(false), "owned").expect_err("must refuse");
+        let err = deletable(&fake(false), "owned").map(|_| ()).expect_err("must refuse");
         assert!(err.contains("Fake Engine"), "the refusal should name the engine: {err}");
         assert_eq!(
-            deletable(&fake(true), "owned").ok(),
-            Some(std::path::PathBuf::from("/nonexistent/store.db")),
+            deletable(&fake(true), "owned").ok().map(|(b, p)| (b.id(), p)),
+            Some(("fake", std::path::PathBuf::from("/nonexistent/store.db"))),
             "an engine that claims the delete still gets its path",
         );
         assert_eq!(
-            deletable(&fake(true), "someone-elses").unwrap_err(),
+            deletable(&fake(true), "someone-elses").map(|_| ()).unwrap_err(),
             "session not found",
         );
     }

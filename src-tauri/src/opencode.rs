@@ -14,11 +14,16 @@
 //! The database is read by shelling out to the `sqlite3` binary in JSON mode,
 //! the same way `providers.rs` and `usage.rs` shell out to `curl` rather than
 //! linking an HTTP stack. Every SQLite crate is a C build, and this is one
-//! read-only reader for one optional engine — not worth a native dependency in
+//! small reader for one optional engine — not worth a native dependency in
 //! every build of the app. `sqlite3` missing, or the database missing, is the
 //! ordinary case (most machines have no OpenCode), so both mean "no sessions",
 //! never an error and never a panic — exactly how `CodexSessions` behaves when
 //! `~/.codex/sessions` is not there.
+//!
+//! Every query is read-only except one: [`delete_to_trash`], the single write
+//! this module makes, which removes one session's rows after dumping them to
+//! `~/.claude/trash`. Reads keep `-readonly` so nothing else can ever grow a
+//! write by accident.
 //!
 //! Read-only is `-readonly`, and deliberately *not* `immutable=1`: OpenCode
 //! runs in WAL mode, and `immutable` tells SQLite to ignore the write-ahead log
@@ -300,14 +305,191 @@ pub fn has_session(session_id: &str) -> bool {
     query(&sql).is_some_and(|json| !json.trim().is_empty())
 }
 
+/// How long the dump-and-delete steps may take. Longer than [`QUERY_TIMEOUT`]
+/// because a big session's parts are megabytes crossing the pipe, and giving
+/// up halfway through a delete someone asked for is worse than a slow sidebar.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The first line of a trash dump: enough to list the entry by name, and to
+/// recognize the file for what it is.
+const DUMP_KIND: &str = "opencode-session-dump";
+
+/// One read that may take its time, answered as rows or a reason.
+///
+/// [`query`]'s `None`-means-"nothing to show" is right for listing; a delete's
+/// dump step owes an error instead, because proceeding without the dump would
+/// break the promise the trash makes.
+fn rows(sql: &str) -> Result<Vec<serde_json::Value>, String> {
+    let bin = crate::agents::which("sqlite3").ok_or("sqlite3 is not installed")?;
+    let db = db_path().ok_or("OpenCode's database is not on this machine")?;
+    let out = crate::agents::run_bounded(
+        &bin.to_string_lossy(),
+        &["-json", "-readonly", &db.to_string_lossy(), sql],
+        DELETE_TIMEOUT,
+    )
+    .ok_or("could not read OpenCode's database")?;
+    let text = String::from_utf8_lossy(&out);
+    if text.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    serde_json::from_str(text.trim()).map_err(|e| format!("unreadable rows: {e}"))
+}
+
+/// Run one *write* against the database, and say why it failed.
+///
+/// Not [`crate::agents::run_bounded`], which folds every failure into `None` —
+/// the right shape for reads, where they all mean "no sessions". A destructive
+/// step owes a reason: a database locked by a running OpenCode and a missing
+/// `sqlite3` call for different next moves.
+fn execute(sql: &str) -> Result<(), String> {
+    let bin = crate::agents::which("sqlite3").ok_or("sqlite3 is not installed")?;
+    let db = db_path().ok_or("OpenCode's database is not on this machine")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let program = bin.to_string_lossy().into_owned();
+    let args = [db.to_string_lossy().into_owned(), sql.to_string()];
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new(&program).args(&args).output());
+    });
+    match rx.recv_timeout(DELETE_TIMEOUT) {
+        Ok(Ok(out)) if out.status.success() => Ok(()),
+        Ok(Ok(out)) => {
+            Err(format!("sqlite3: {}", String::from_utf8_lossy(&out.stderr).trim()))
+        }
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("timed out — is the database locked by a running OpenCode?".into()),
+    }
+}
+
+/// The id set a delete covers: the session and every descendant, spelled as a
+/// subquery. OpenCode mints a child session per subagent run (`parent_id`),
+/// and the schema's `ON DELETE CASCADE` does not fire — the CLI leaves
+/// `foreign_keys` off — so leaving children behind would orphan rows OpenCode
+/// still counts.
+fn tree_sql(session_id: &str) -> String {
+    format!(
+        "with recursive tree(id) as (\
+           select id from session where id = '{session_id}' \
+           union \
+           select s.id from session s join tree on s.parent_id = tree.id\
+         ) select id from tree"
+    )
+}
+
+/// Delete one session — dump first, rows after.
+///
+/// The dump is what lets this share the trash's promise: everything deleted is
+/// readable in `~/.claude/trash/<id>.jsonl` for the keep window. It is a JSON
+/// dump of the rows, not a transcript — readable, but not restorable by a
+/// rename, which is why `trash_restore` refuses these ids honestly instead of
+/// guessing.
+///
+/// The delete removes exactly the session rows the dump captured, listed by id
+/// — never re-derived, so the two can only disagree by rows written between
+/// the two steps, and the sidebar only offers this on stopped sessions.
+/// A failed delete removes the dump again: a trash entry for a session that
+/// still exists would be a lie in both directions.
+pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), String> {
+    if !valid_id(session_id) {
+        return Err("invalid session id".into());
+    }
+    let tree = tree_sql(session_id);
+    let sessions = rows(&format!("select * from session where id in ({tree})"))?;
+    if sessions.is_empty() {
+        return Err("session not found".into());
+    }
+    let ids: Vec<&str> = sessions
+        .iter()
+        .filter_map(|s| s.get("id").and_then(|i| i.as_str()))
+        .collect();
+    // Every id goes back into SQL text below, so each gets the same gate the
+    // root id got. A row that fails it means the store is not shaped the way
+    // this code believes — the only safe delete there is none.
+    if ids.len() != sessions.len() || !ids.iter().all(|i| valid_id(i)) {
+        return Err("OpenCode's session rows look unfamiliar — refusing to delete".into());
+    }
+    let messages = rows(&format!("select * from message where session_id in ({tree})"))?;
+    let parts = rows(&format!("select * from part where session_id in ({tree})"))?;
+
+    let root = sessions
+        .iter()
+        .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(session_id))
+        .ok_or("session not found")?;
+    let field = |v: &serde_json::Value, k: &str| {
+        v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string()
+    };
+    let header = serde_json::json!({
+        "kind": DUMP_KIND,
+        "version": 1,
+        "id": session_id,
+        "title": field(root, "title"),
+        "directory": field(root, "directory"),
+        "sessions": sessions.len(),
+        "messages": messages.len(),
+        "parts": parts.len(),
+    });
+
+    let dest = trash.join(format!("{session_id}.jsonl"));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&dest)?);
+        writeln!(out, "{header}")?;
+        for (table, rows) in
+            [("session", &sessions), ("message", &messages), ("part", &parts)]
+        {
+            for row in rows {
+                writeln!(out, "{}", serde_json::json!({ "table": table, "row": row }))?;
+            }
+        }
+        out.into_inner()?.sync_all()
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&dest);
+        return Err(format!("could not write the trash dump: {e}"));
+    }
+
+    let id_list =
+        ids.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "pragma busy_timeout = 3000; \
+         begin immediate; \
+         delete from part where session_id in ({id_list}); \
+         delete from message where session_id in ({id_list}); \
+         delete from session where id in ({id_list}); \
+         commit;"
+    );
+    if let Err(e) = execute(&sql) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Name and project for a trash dump, read off its header line.
+///
+/// `trash_list` titles claude transcripts by parsing them; a dump is not one,
+/// and without this it would list as `session ses_xxxx` from nowhere.
+pub fn dump_meta(path: &std::path::Path) -> Option<(String, String)> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let first = std::io::BufReader::new(file).lines().next()?.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&first).ok()?;
+    if v.get("kind").and_then(|k| k.as_str()) != Some(DUMP_KIND) {
+        return None;
+    }
+    let title = v.get("title").and_then(|t| t.as_str()).unwrap_or_default();
+    let dir = v.get("directory").and_then(|d| d.as_str()).unwrap_or_default();
+    Some((title.to_string(), dir.to_string()))
+}
+
 /// OpenCode's sessions as a [`SessionProvider`].
 ///
 /// `scan_with_paths` and `find_session_file` owe every caller a `PathBuf`, and
 /// what they return is the database — the honest answer, since that genuinely
 /// is where the session lives. It must never be *read* as a transcript, and it
 /// is not: `messages` answers first everywhere a transcript would be opened.
-/// It must never be *deleted* either, and it cannot be — `OpenCodeBackend`
-/// declares `delete: false`, which `session_delete` refuses on.
+/// It must never be *renamed into the trash* either, and it is not —
+/// `session_delete` routes OpenCode ids to [`delete_to_trash`] before its
+/// file-move path can see this database.
 pub struct OpencodeSessions;
 
 impl SessionProvider for OpencodeSessions {
@@ -569,6 +751,112 @@ mod tests {
         assert_eq!(parse_session_model(r#"[{"provider":"","model":"m"}]"#), None);
         assert_eq!(parse_session_model(""), None);
         assert_eq!(parse_session_model("not json"), None);
+    }
+
+    /* ---- delete ---------------------------------------------------------- */
+
+    /// The same gate the read queries have, on the one write: an id that is
+    /// not an OpenCode id gets a refusal before anything is dumped or touched
+    /// — the trash path handed in here does not even exist.
+    #[test]
+    fn delete_refuses_a_foreign_id_before_touching_anything() {
+        let nowhere = std::path::PathBuf::from("/nonexistent/trash");
+        assert_eq!(
+            delete_to_trash("00000000-0000-4000-8000-000000000000", &nowhere),
+            Err("invalid session id".into()),
+        );
+        assert_eq!(
+            delete_to_trash("ses_abc'; drop table session;--", &nowhere),
+            Err("invalid session id".into()),
+        );
+    }
+
+    /// A dump names itself on its first line, and `dump_meta` reads the name
+    /// back — that is what lets the trash list a deleted OpenCode session by
+    /// title instead of as `session ses_xxxx`, and lets restore recognize what
+    /// it must refuse.
+    #[test]
+    fn a_dumps_header_line_answers_with_its_title_and_directory() {
+        let p = std::env::temp_dir().join("aiterm-test-dump-meta.jsonl");
+        std::fs::write(
+            &p,
+            concat!(
+                r#"{"kind":"opencode-session-dump","version":1,"id":"ses_a","title":"hi","directory":"/home/x/p"}"#,
+                "\n",
+                r#"{"table":"session","row":{"id":"ses_a"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(dump_meta(&p), Some(("hi".into(), "/home/x/p".into())));
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    /// The whole delete, end to end, against a *copy* of this machine's real
+    /// store: dump written and readable, the session's rows gone, every other
+    /// session untouched.
+    ///
+    /// Ignored because it points `$HOME` at the copy for the whole process,
+    /// which would misdirect any test running beside it. Run it alone:
+    /// `cargo test --lib -- --ignored --exact opencode::tests::delete_roundtrip_against_a_copy_of_the_real_store`
+    /// It passes trivially on a machine with no OpenCode store.
+    #[test]
+    #[ignore]
+    fn delete_roundtrip_against_a_copy_of_the_real_store() {
+        let real = dirs::home_dir().unwrap().join(".local/share/opencode");
+        if !real.join("opencode.db").is_file() {
+            eprintln!("no OpenCode store on this machine; nothing to check");
+            return;
+        }
+        let fake = std::env::temp_dir().join("aiterm-oc-delete-roundtrip");
+        let _ = std::fs::remove_dir_all(&fake);
+        let store = fake.join(".local/share/opencode");
+        std::fs::create_dir_all(&store).unwrap();
+        // The WAL rides along: it holds everything since the last checkpoint,
+        // and a copy without it is a copy missing its newest sessions.
+        for suffix in ["opencode.db", "opencode.db-wal", "opencode.db-shm"] {
+            let src = real.join(suffix);
+            if src.is_file() {
+                std::fs::copy(&src, store.join(suffix)).unwrap();
+            }
+        }
+        std::env::set_var("HOME", &fake);
+
+        let all = sessions();
+        assert!(all.len() >= 2, "need at least two sessions to prove isolation");
+        let victim = all.last().unwrap().clone();
+        let keep = all.first().unwrap().clone();
+        let trash = fake.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+
+        delete_to_trash(&victim.id, &trash).expect("delete should succeed");
+
+        let dump = trash.join(format!("{}.jsonl", victim.id));
+        assert!(dump.is_file(), "the dump is the trash entry");
+        assert_eq!(
+            dump_meta(&dump).map(|(t, _)| t),
+            Some(victim.title.clone()),
+            "the dump header names the session",
+        );
+        assert!(!has_session(&victim.id), "the session's rows must be gone");
+        assert!(has_session(&keep.id), "every other session must survive");
+        let orphans = query(&format!(
+            "select id from message where session_id = '{}'",
+            victim.id
+        ))
+        .unwrap_or_default();
+        assert!(orphans.trim().is_empty(), "no message rows may be left behind");
+    }
+
+    /// A claude transcript's first line is JSON too — recognition rides on the
+    /// `kind` field, not on parsing succeeding.
+    #[test]
+    fn a_transcript_is_not_mistaken_for_a_dump() {
+        let p = std::env::temp_dir().join("aiterm-test-not-a-dump.jsonl");
+        std::fs::write(&p, "{\"type\":\"user\",\"cwd\":\"/home/x\"}\n").unwrap();
+        assert_eq!(dump_meta(&p), None);
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(dump_meta(std::path::Path::new("/nonexistent.jsonl")), None);
     }
 }
 
