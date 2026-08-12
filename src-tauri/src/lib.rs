@@ -107,6 +107,7 @@ pub fn run() {
             sessions::claude_model_default,
             sessions::restore_claude_model_default,
             sessions::session_model,
+            sessions::session_refusal,
             opencode_agent::opencode_dispatch,
             hooklink::drain_session_events,
             trace::trace_set,

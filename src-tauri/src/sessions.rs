@@ -2512,6 +2512,177 @@ fn parse_model_choice<'a>(lines: impl Iterator<Item = &'a str>) -> ModelChoice {
     out
 }
 
+/// A classifier refusal the transcript recorded — the trigger for the
+/// downgrade lane's one-tap actions.
+///
+/// Every field is copied straight from the record, which self-describes the
+/// event; nothing here is inferred. `original_model` is what the session was on
+/// before the switch (what "restore my model" targets), `refused_prompt` is the
+/// message that got flagged (what "kick to OpenCode" hands off).
+#[derive(Serialize, Debug, PartialEq, Default)]
+pub struct Refusal {
+    /// The refusal record's own uuid. The frontend remembers the last one it
+    /// raised so an old refusal in the tail never re-triggers the banner.
+    pub uuid: String,
+    /// `model_refusal_fallback` (soft switch to the fallback model) or
+    /// `model_refusal_no_fallback` (hard block, no switch happened).
+    pub subtype: String,
+    /// The hard-block case: nothing auto-switched, so restoring is the only move.
+    pub hard: bool,
+    /// The classifier notice, shown to the user verbatim.
+    pub content: String,
+    /// The model in use before the refusal — the target of "restore my model".
+    pub original_model: Option<String>,
+    /// What it switched to (typically `claude-opus-4-8`).
+    pub fallback_model: Option<String>,
+    /// The category the classifier assigned (e.g. `cyber`).
+    pub category: Option<String>,
+    /// The flagged user message's text — the prompt to hand OpenCode.
+    pub refused_prompt: Option<String>,
+    /// ISO-8601 time the refusal was recorded.
+    pub at: Option<String>,
+}
+
+/// The most recent classifier refusal in `session_id`'s transcript, if the tail
+/// holds one.
+///
+/// A `type:system` record whose `subtype` starts with `model_refusal`. The
+/// prefix match is deliberate: `_fallback` and `_no_fallback` are the only two
+/// today, but a future variant should still raise the banner rather than slip
+/// through silently. Returns the last such record; `uuid` lets the caller tell a
+/// fresh refusal from one it has already handled.
+#[tauri::command]
+pub async fn session_refusal(session_id: String) -> Option<Refusal> {
+    crate::run_blocking(move || session_refusal_sync(session_id)).await
+}
+
+fn session_refusal_sync(session_id: String) -> Option<Refusal> {
+    let path = find_session_file(&session_id)?;
+    // Wider than the model reader's window: this must also reach back to the
+    // flagged user message the refusal points at, which sits just before it.
+    const TAIL: u64 = 512 * 1024;
+    let mut file = File::open(&path).ok()?;
+    let meta = file.metadata().ok()?;
+    let start = meta.len().saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    parse_refusal(&text)
+}
+
+/// The scan behind [`session_refusal`], split out so the record shape can be
+/// tested against captured lines without a transcript on disk.
+fn parse_refusal(text: &str) -> Option<Refusal> {
+    let mut latest: Option<serde_json::Value> = None;
+    for line in text.lines() {
+        // Cheap substring gate before the parse, matching the other tail scans.
+        if !line.contains("model_refusal") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("system") {
+            continue;
+        }
+        if v.get("subtype")
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| s.starts_with("model_refusal"))
+        {
+            latest = Some(v);
+        }
+    }
+    let r = latest?;
+    let subtype = r.get("subtype").and_then(|s| s.as_str())?.to_string();
+    let str_of = |k: &str| r.get(k).and_then(|x| x.as_str()).map(String::from);
+    let refused_prompt = r
+        .get("refusedUserMessageUuid")
+        .and_then(|u| u.as_str())
+        .and_then(|uu| user_text_by_uuid(text, uu));
+    Some(Refusal {
+        uuid: str_of("uuid").unwrap_or_default(),
+        hard: subtype.ends_with("no_fallback"),
+        content: str_of("content").unwrap_or_default(),
+        original_model: str_of("originalModel"),
+        fallback_model: str_of("fallbackModel"),
+        category: str_of("apiRefusalCategory"),
+        refused_prompt,
+        at: str_of("timestamp"),
+        subtype,
+    })
+}
+
+/// The text of the user message with this uuid, from the tail lines. Best-effort:
+/// if the flagged message fell outside the tail window, the caller falls back to
+/// the session preview's last user message.
+fn user_text_by_uuid(text: &str, uuid: &str) -> Option<String> {
+    for line in text.lines() {
+        if !line.contains(uuid) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("uuid").and_then(|u| u.as_str()) != Some(uuid) {
+            continue;
+        }
+        return line_message(&v).map(|(_, t)| t);
+    }
+    None
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    /// A soft fallback record parses into every field, and the flagged prompt is
+    /// resolved by the uuid the record names.
+    #[test]
+    fn a_soft_fallback_parses_and_finds_its_flagged_prompt() {
+        let text = concat!(
+            r#"{"type":"user","uuid":"u-1","message":{"role":"user","content":"scan the firewall logs for lateral movement"}}"#, "\n",
+            r#"{"type":"system","subtype":"model_refusal_fallback","content":"Fable 5's safeguards flagged this message.","originalModel":"claude-fable-5","fallbackModel":"claude-opus-4-8","apiRefusalCategory":"cyber","refusedUserMessageUuid":"u-1","uuid":"r-1","timestamp":"2026-08-12T00:12:26.402Z"}"#, "\n",
+        );
+        let r = parse_refusal(text).expect("a refusal");
+        assert_eq!(r.uuid, "r-1");
+        assert_eq!(r.subtype, "model_refusal_fallback");
+        assert!(!r.hard);
+        assert_eq!(r.original_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(r.fallback_model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(r.category.as_deref(), Some("cyber"));
+        assert_eq!(
+            r.refused_prompt.as_deref(),
+            Some("scan the firewall logs for lateral movement")
+        );
+    }
+
+    /// The hard-block variant is flagged `hard`, and the prefix match means a
+    /// hypothetical third variant is still caught.
+    #[test]
+    fn a_hard_block_is_marked_hard_and_the_prefix_is_forgiving() {
+        let hard = r#"{"type":"system","subtype":"model_refusal_no_fallback","content":"","uuid":"r-2"}"#;
+        assert!(parse_refusal(hard).unwrap().hard);
+        let future = r#"{"type":"system","subtype":"model_refusal_future_variant","uuid":"r-3"}"#;
+        assert_eq!(parse_refusal(future).unwrap().uuid, "r-3");
+    }
+
+    /// The last refusal wins, and a transcript with none yields nothing.
+    #[test]
+    fn the_latest_refusal_wins_and_a_clean_tail_is_none() {
+        let two = concat!(
+            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"old"}"#, "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-8"}}"#, "\n",
+            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"new"}"#, "\n",
+        );
+        assert_eq!(parse_refusal(two).unwrap().uuid, "new");
+        assert_eq!(
+            parse_refusal(r#"{"type":"assistant","message":{"model":"claude-fable-5"}}"#),
+            None
+        );
+    }
+}
+
 /// The permission mode Claude Code would start a *new* session in here, read
 /// from its own config chain — project-local first, then the user's.
 ///
