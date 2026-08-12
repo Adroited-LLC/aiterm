@@ -148,7 +148,7 @@ fn tools_call(id: Value, request: &Value) -> Value {
         return result(id, tool_error("opencode_delegate needs both `task` and `cwd`"));
     };
 
-    let (default_provider, default_model) = default_target();
+    let (default_provider, default_model) = crate::opencode_agent::default_target();
     let provider = args
         .and_then(|a| a.get("provider"))
         .and_then(|p| p.as_str())
@@ -172,28 +172,6 @@ fn tools_call(id: Value, request: &Value) -> Value {
         ),
         Err(e) => result(id, tool_error(&format!("delegation failed: {e}"))),
     }
-}
-
-/// The provider and model to run under when the caller names neither: the first
-/// OpenRouter provider, and the model it is actually configured to launch with.
-///
-/// A `~` prefix on a startup entry marks it parked, so the launch model is the
-/// first entry *without* one — the same model an interactive OpenCode tab would
-/// open on. This is resolved from the launch settings, never hardcoded: change
-/// the pin in Model access and a delegated agent follows it.
-fn default_target() -> (Option<String>, Option<String>) {
-    let providers = crate::providers::load_providers();
-    let Some(p) = providers.iter().find(|p| p.is_openrouter()) else {
-        return (None, None);
-    };
-    let model = p
-        .startup_models
-        .iter()
-        .find(|m| !m.starts_with('~'))
-        .or_else(|| p.startup_models.first())
-        .map(|m| m.trim_start_matches('~').trim().to_string())
-        .filter(|m| !m.is_empty());
-    (Some(p.id.clone()), model)
 }
 
 /// A tool-result payload flagged as an error.

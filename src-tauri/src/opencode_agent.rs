@@ -46,6 +46,44 @@ pub struct Report {
     pub text: String,
 }
 
+/// The provider and model a delegated agent runs under when the caller names
+/// neither.
+#[derive(serde::Serialize)]
+pub struct AgentTarget {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+/// The provider and model OpenCode is configured to launch with: the first
+/// OpenRouter provider, and the model it would actually open on.
+///
+/// A `~` prefix on a startup entry marks it parked, so the launch model is the
+/// first entry *without* one — the same model an interactive OpenCode tab opens
+/// on. Resolved from the launch settings, never hardcoded: re-pin in Model
+/// access and both the MCP tool and the one-tap kick follow it.
+pub fn default_target() -> (Option<String>, Option<String>) {
+    let providers = crate::providers::load_providers();
+    let Some(p) = providers.iter().find(|p| p.is_openrouter()) else {
+        return (None, None);
+    };
+    let model = p
+        .startup_models
+        .iter()
+        .find(|m| !m.starts_with('~'))
+        .or_else(|| p.startup_models.first())
+        .map(|m| m.trim_start_matches('~').trim().to_string())
+        .filter(|m| !m.is_empty());
+    (Some(p.id.clone()), model)
+}
+
+/// The default OpenCode target, for a UI that needs to name it on a dispatch
+/// (the downgrade one-tap kick).
+#[tauri::command]
+pub fn opencode_default_target() -> AgentTarget {
+    let (provider, model) = default_target();
+    AgentTarget { provider, model }
+}
+
 /// Set the same two variables `pty_spawn` injects for an OpenCode tab, resolved
 /// the same way from the same store.
 ///

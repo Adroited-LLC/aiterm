@@ -223,6 +223,52 @@ export interface ModelChoice {
 // stays right whether the pill, a typed /model, or a launch flag changed it.
 export const sessionModel = (sessionId: string) =>
   invoke<ModelChoice>("session_model", { sessionId });
+
+// A classifier refusal recorded in a session's transcript — the trigger for the
+// downgrade one-tap. null when the tail holds none.
+export interface Refusal {
+  /** Unique id of the refusal record; dedupe on it so an old one doesn't re-fire. */
+  uuid: string;
+  /** "model_refusal_fallback" (soft switch) or "model_refusal_no_fallback" (hard block). */
+  subtype: string;
+  /** The hard-block case: nothing auto-switched, so restoring is the only move. */
+  hard: boolean;
+  /** The classifier notice, shown verbatim. */
+  content: string;
+  /** The model in use before the switch — the restore target, e.g. "claude-fable-5". */
+  original_model: string | null;
+  /** What it switched to, e.g. "claude-opus-4-8". */
+  fallback_model: string | null;
+  /** The category the classifier assigned, e.g. "cyber". */
+  category: string | null;
+  /** The flagged user message's text — the prompt to hand OpenCode. */
+  refused_prompt: string | null;
+  at: string | null;
+}
+export const sessionRefusal = (sessionId: string) =>
+  invoke<Refusal | null>("session_refusal", { sessionId });
+
+// Run a task on OpenCode headlessly and get its report back. Blocks for the whole
+// run, so call it off the UI path and show progress meanwhile.
+export interface OpencodeReport {
+  session_id: string;
+  text: string;
+}
+export const opencodeDispatch = (
+  prompt: string,
+  cwd: string,
+  provider: string | null,
+  model: string | null,
+) => invoke<OpencodeReport>("opencode_dispatch", { prompt, cwd, provider, model });
+
+// The provider + model OpenCode is configured to launch with (its live startup
+// pin), so a UI dispatch names the same model an interactive tab would open on.
+export interface AgentTarget {
+  provider: string | null;
+  model: string | null;
+}
+export const opencodeDefaultTarget = () =>
+  invoke<AgentTarget>("opencode_default_target");
 export interface UsageBar {
   kind: string;
   label: string;

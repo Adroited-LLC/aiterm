@@ -1346,6 +1346,60 @@ body.dragging * { pointer-events: none; }
 .diff-line.hunk { color: var(--blue); background: #61afef10; }
 .diff-line.meta { color: var(--text-faint); }
 
+/* ── Classifier-downgrade one-tap banner ─────────────────────────────── */
+.refusal-banner {
+  margin: 6px 8px 0;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-panel));
+  padding: 8px 10px;
+  font-size: 12.5px;
+}
+.refusal-banner.hard {
+  border-left-color: var(--red);
+  background: color-mix(in srgb, var(--red) 9%, var(--bg-panel));
+}
+.refusal-head { display: flex; align-items: center; gap: 8px; }
+.refusal-icon { color: var(--accent); flex-shrink: 0; }
+.refusal-banner.hard .refusal-icon { color: var(--red); }
+.refusal-text { flex: 1; color: var(--text); }
+.refusal-x {
+  background: none; border: none; color: var(--text-faint);
+  cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px;
+}
+.refusal-x:hover { color: var(--text); background: var(--bg-hover); }
+.refusal-acts { display: flex; gap: 8px; margin-top: 8px; }
+.refusal-btn {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.refusal-btn:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--accent); }
+.refusal-btn:disabled { opacity: 0.5; cursor: default; }
+.refusal-btn.primary { border-color: var(--accent); color: var(--accent); }
+.refusal-running { margin-top: 8px; color: var(--text-dim); font-size: 12px; }
+.refusal-report { margin-top: 8px; }
+.refusal-report-head { color: var(--text-faint); font-size: 11px; margin-bottom: 4px; }
+.refusal-report-body {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  color: var(--text);
+}
+.refusal-error { margin-top: 8px; color: var(--red); font-size: 12px; }
+
 /* ---------- settings modal ---------- */
 .modal-overlay {
   position: fixed;

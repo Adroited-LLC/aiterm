@@ -109,6 +109,7 @@ pub fn run() {
             sessions::session_model,
             sessions::session_refusal,
             opencode_agent::opencode_dispatch,
+            opencode_agent::opencode_default_target,
             hooklink::drain_session_events,
             trace::trace_set,
             trace::trace_status,

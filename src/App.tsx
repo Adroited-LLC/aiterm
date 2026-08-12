@@ -43,7 +43,10 @@ import {
   taskbarBadge,
   trayAlerts,
   desktopNotify, desktopNotifyClose,
+  Refusal, sessionRefusal, opencodeDispatch, opencodeDefaultTarget,
+  claudeModelDefault, restoreClaudeModelDefault,
 } from "./ipc";
+import RefusalBanner from "./components/RefusalBanner";
 import "./App.css";
 
 const OPTS_KEY = "aiterm.sessionOpts";
@@ -532,15 +535,52 @@ export default function App() {
     const iv = setInterval(refreshSessions, 30_000);
     return () => clearInterval(iv);
   }, [refreshSessions]);
+  // ── Classifier-downgrade one-tap ──────────────────────────────────────
+  // When the safeguard downgrades or blocks the active session, the CLI writes
+  // a `model_refusal*` marker to the transcript; `session_refusal` surfaces it
+  // and this raises the banner with the two one-tap moves. Baseline on session
+  // switch so a refusal already sitting in the tail never pops the banner — only
+  // a newly-appearing `uuid` does.
+  const [refusal, setRefusal] = useState<Refusal | null>(null);
+  const [ocTarget, setOcTarget] = useState<string | null>(null);
+  const handledRefusal = useRef<string | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
+  activeSessionIdRef.current = activeSessionId;
+
+  useEffect(() => {
+    setRefusal(null);
+    if (!activeSessionId) { handledRefusal.current = null; return; }
+    let alive = true;
+    sessionRefusal(activeSessionId)
+      .then((r) => { if (alive) handledRefusal.current = r?.uuid ?? null; })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [activeSessionId]);
+
+  const checkRefusal = useCallback(async () => {
+    const sid = activeSessionIdRef.current;
+    if (!sid) return;
+    try {
+      const r = await sessionRefusal(sid);
+      if (r && r.uuid !== handledRefusal.current) {
+        handledRefusal.current = r.uuid;
+        opencodeDefaultTarget().then((t) => setOcTarget(t.model)).catch(() => {});
+        setRefusal(r);
+      }
+    } catch { /* a transient read race is fine — the next event retries */ }
+  }, []);
+
   // Event-driven refresh: Claude's transcripts changed (backend debounces).
+  // A refusal lands in the transcript too, so the same event checks for one.
   useEffect(() => {
     const un = listen("sessions://changed", () => {
       refreshSessionList();
+      checkRefusal();
     });
     return () => {
       un.then((f) => f());
     };
-  }, [refreshSessionList]);
+  }, [refreshSessionList, checkRefusal]);
 
   // NOTE: there used to be a large effect here that watched for newly-appeared
   // sessions and decided some of them "superseded" older rows — hiding those
@@ -1881,6 +1921,33 @@ export default function App() {
               usage, the repo — stay, because they are true whatever is running.
               `onSetPermMode` goes with the TUI: it works by reading the status
               line and sending shift+tab. */}
+          {refusal && activeCaps.panels && (
+            <RefusalBanner
+              refusal={refusal}
+              targetModel={ocTarget}
+              onRestore={async () => {
+                const alias = (refusal.original_model ?? "").replace(/^claude-/, "").split("-")[0];
+                if (!alias || activeTab === null) { setRefusal(null); return; }
+                // Typing /model retargets the session AND rewrites the global
+                // default; save it first and put it back, so restoring the
+                // session doesn't quietly change what new sessions open on.
+                const prior = await claudeModelDefault();
+                handles.current.get(activeTab)?.sendComposed(`/model ${alias}`);
+                await restoreClaudeModelDefault(prior);
+                setRefusal(null);
+              }}
+              onKick={async () => {
+                const t = await opencodeDefaultTarget();
+                return opencodeDispatch(
+                  refusal.refused_prompt ?? "",
+                  activeProject ?? ".",
+                  t.provider,
+                  t.model,
+                );
+              }}
+              onDismiss={() => setRefusal(null)}
+            />
+          )}
           {showComposer && <Composer
             sessionId={activeCaps.panels ? activeSessionId : null}
             projectRoot={activeProject}
