@@ -232,6 +232,11 @@ pub fn dispatch(
     apply_agent_env(&mut cmd, provider, model);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
+    // Null stdin, or the child inherits the parent's. That is harmless from the
+    // GUI, but the MCP server's stdin is the JSON-RPC channel Claude Code speaks
+    // over — an inherited open pipe makes `opencode run` block reading it
+    // forever (and would corrupt the protocol). Headless runs read no input.
+    cmd.stdin(std::process::Stdio::null());
 
     let child = cmd.spawn().map_err(|e| format!("could not start opencode run: {e}"))?;
     let stdout = run_bounded_output(child, RUN_CEILING)?;
