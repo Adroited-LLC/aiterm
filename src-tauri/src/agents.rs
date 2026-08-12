@@ -1154,7 +1154,7 @@ pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
 /// up are usually the interactive ones. Bounded, because an interactive shell
 /// can block on anything a user has put in their profile, and a settings panel
 /// that never finishes loading is no better than one that hangs.
-fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
     let shell = std::env::var("SHELL").ok()?;
     // `bin` is a literal from our own backend list, never user input, but keep
     // the quoting correct anyway rather than relying on that staying true.

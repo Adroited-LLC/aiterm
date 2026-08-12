@@ -191,12 +191,34 @@ pub fn dispatch(
         return Err("nothing to dispatch — the prompt is empty".into());
     }
 
-    let mut cmd = std::process::Command::new("opencode");
+    // Resolve opencode's absolute path rather than trusting PATH. The desktop
+    // launcher starts aiterm with a minimal environment — `~/.opencode/bin` and
+    // node-manager shims are not on it — so a bare `Command::new("opencode")`
+    // fails with "No such file or directory". This is the same resolver
+    // detection uses: PATH first, then the user's login shell.
+    let bin = crate::agents::which("opencode")
+        .or_else(|| crate::agents::which_via_login_shell("opencode"))
+        .ok_or("opencode is not installed, or not on aiterm's PATH")?;
+    let mut cmd = std::process::Command::new(&bin);
     cmd.arg("run").args(["--format", "json"]);
     // Auto-approve tools: a dispatched agent runs unattended, so a permission
     // prompt would wedge it. This is the same `--auto` the CLI documents as
     // "dangerous" — appropriate here because the whole point is autonomous work.
     cmd.arg("--auto");
+    // opencode's own tool spawns need a usable PATH too; the minimal one the GUI
+    // hands us may lack the user's bin dirs. Prepend opencode's own directory and
+    // ~/.local/bin so `--auto` work can find its tools.
+    if let Ok(existing) = std::env::var("PATH") {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(dir) = bin.parent() {
+            parts.push(dir.to_string_lossy().into_owned());
+        }
+        if let Some(home) = dirs::home_dir() {
+            parts.push(format!("{}/.local/bin", home.display()));
+        }
+        parts.push(existing);
+        cmd.env("PATH", parts.join(":"));
+    }
     if let Some(m) = model {
         cmd.args(["-m", &model_flag(m)]);
     }
@@ -307,6 +329,32 @@ mod tests {
         assert!(report.text.to_uppercase().contains("PONG"), "expected PONG, got {:?}", report.text);
         // Don't litter the real db: dump+delete the probe session, then remove
         // the dump the trash step wrote into the temp dir.
+        let _ = crate::opencode::delete_to_trash(&report.session_id, &cwd);
+        let _ = std::fs::remove_file(cwd.join(format!("{}.jsonl", report.session_id)));
+    }
+
+    /// The GUI-PATH regression: with `~/.opencode/bin` stripped from PATH (as the
+    /// desktop launcher hands it), dispatch must still find opencode via the
+    /// login shell instead of failing "No such file or directory".
+    ///   cargo test --lib dispatch_resolves_without_path -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dispatch_resolves_without_path() {
+        if crate::agents::which_via_login_shell("opencode").is_none() {
+            eprintln!("no opencode via login shell; skipping");
+            return;
+        }
+        std::env::set_var("PATH", "/usr/bin:/bin"); // the minimal launcher PATH
+        let cwd = std::env::temp_dir();
+        let report = dispatch(
+            "Reply with exactly this one word and nothing else: PONG",
+            &cwd.to_string_lossy(),
+            Some("openrouter"),
+            Some("z-ai/glm-5.2"),
+        )
+        .expect("dispatch must resolve opencode via the login shell");
+        eprintln!("report: {:?}", report.text);
+        assert!(report.text.to_uppercase().contains("PONG"));
         let _ = crate::opencode::delete_to_trash(&report.session_id, &cwd);
         let _ = std::fs::remove_file(cwd.join(format!("{}.jsonl", report.session_id)));
     }
