@@ -44,7 +44,7 @@ import {
   trayAlerts,
   desktopNotify, desktopNotifyClose,
   Refusal, sessionRefusal, opencodeDispatch, opencodeDefaultTarget,
-  claudeModelDefault, restoreClaudeModelDefault,
+  claudeModelDefault, restoreClaudeModelDefault, sessionPreview,
 } from "./ipc";
 import RefusalBanner from "./components/RefusalBanner";
 import "./App.css";
@@ -1938,12 +1938,20 @@ export default function App() {
               }}
               onKick={async () => {
                 const t = await opencodeDefaultTarget();
-                return opencodeDispatch(
-                  refusal.refused_prompt ?? "",
-                  activeProject ?? ".",
-                  t.provider,
-                  t.model,
-                );
+                // Hand OpenCode the thread, not just the flagged line — Claude
+                // is blocked and can't curate the hand-off itself, so aiterm
+                // assembles the recent conversation as context. The flagged
+                // message is the task; the last user message is the fallback if
+                // the record couldn't resolve it.
+                const preview = activeSessionId ? await sessionPreview(activeSessionId) : [];
+                const task = refusal.refused_prompt
+                  ?? [...preview].reverse().find((m) => m.role === "user")?.text
+                  ?? "";
+                const context = preview.map((m) => `${m.role}: ${m.text}`).join("\n\n");
+                const prompt = context
+                  ? `You're picking up a task from a paused Claude Code session — its model was blocked by a safety classifier mid-conversation, so the work is being handed to you. Recent conversation, for context:\n\n${context}\n\n---\nComplete this task from that conversation:\n\n${task}`
+                  : task;
+                return opencodeDispatch(prompt, activeProject ?? ".", t.provider, t.model);
               }}
               onDismiss={() => setRefusal(null)}
             />
