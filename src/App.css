@@ -1368,16 +1368,21 @@ body.dragging * { pointer-events: none; }
 }
 
 /* ── Settings: rail + pane ──────────────────────────────────────────────
-   A fixed-size window, so switching sections never resizes it. The rail is
-   recessed (the panel's own --bg) and the active section carries a 2px accent
-   edge in the gutter — the one loud element; everything else is hairlines. */
+   Resizable from the corner grip; the chosen size is remembered across opens
+   (SettingsModal writes it to localStorage). Switching sections never resizes
+   it. The rail is recessed (the panel's own --bg) and the active section
+   carries a 2px accent edge in the gutter — the one loud element; everything
+   else is hairlines. */
 .settings-modal {
   flex-direction: row;
-  width: 780px;
+  width: min(900px, 94vw);
   max-width: 94vw;
-  height: min(600px, 88vh);
-  max-height: 88vh;
+  height: min(700px, 92vh);
+  max-height: 92vh;
+  min-width: 560px;
+  min-height: 400px;
   overflow: hidden;
+  resize: both;
 }
 .sm-rail {
   width: 172px;
@@ -1553,12 +1558,16 @@ body.dragging * { pointer-events: none; }
 .diag-acts { display: flex; gap: 8px; padding-bottom: 8px; }
 
 /* ── Model browser: filterable list left, card right ─────────────────── */
+/* flex: 1 so a taller settings window goes to the browser, not to blank
+   space below it. min-height stays auto: when the policy panel makes the
+   content taller than the pane, the pane scrolls rather than crushing it. */
 .mb {
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  flex: 1;
 }
 .mb-controls {
   display: flex;
@@ -1572,9 +1581,10 @@ body.dragging * { pointer-events: none; }
 .mb-controls .mb-search { flex: 1; min-width: 60px; width: auto; }
 .mb-controls .mb-ctx { width: auto; flex-shrink: 0; }
 .mb-wait { padding: 14px; }
-.mb-body { display: flex; height: 300px; }
+/* Grows with the window; 300px is the floor, not the size. */
+.mb-body { display: flex; flex: 1; min-height: 300px; }
 .mb-list {
-  width: 236px;
+  width: clamp(236px, 30%, 400px);
   flex-shrink: 0;
   overflow-y: auto;
   border-right: 1px solid var(--border);
@@ -2136,7 +2146,10 @@ button.acty-row:hover { background: var(--bg-hover); }
   white-space: pre-wrap;
 }
 
-.set-section { display: flex; flex-direction: column; gap: 8px; }
+/* flex: 1 hands the pane's spare height down to the model browser. Other
+   children keep their natural height, so it changes nothing when the
+   browser is closed. */
+.set-section { display: flex; flex-direction: column; gap: 8px; flex: 1; }
 .set-label {
   display: flex;
   align-items: center;

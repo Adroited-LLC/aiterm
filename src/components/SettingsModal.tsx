@@ -87,8 +87,33 @@ function Switch({ checked, onChange, label }: {
   );
 }
 
+/** Where the dragged window size lives between opens. */
+const SIZE_KEY = "aiterm.settingsModalSize";
+
 export default function SettingsModal({ settings, onChange, onClose, capsOf, activeProject }: Props) {
   const [tab, setTab] = useState<Tab>("appearance");
+  // Resizable via the CSS corner grip; the size carries over to the next
+  // open. Written straight to el.style rather than through React state so a
+  // re-render can never fight the browser over the size mid-drag. The CSS
+  // max-width/max-height still win, so a size saved on a big screen cannot
+  // push the window off a small one.
+  const modalRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = modalRef.current;
+    if (!el) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem(SIZE_KEY) ?? "null");
+      if (saved?.w > 0 && saved?.h > 0) {
+        el.style.width = `${saved.w}px`;
+        el.style.height = `${saved.h}px`;
+      }
+    } catch { /* a bad value just means the default size */ }
+    const ro = new ResizeObserver(() => {
+      localStorage.setItem(SIZE_KEY, JSON.stringify({ w: el.offsetWidth, h: el.offsetHeight }));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   /** Engine whose configuration panel is open, drilled into from Agents. */
   const [configFor, setConfigFor] = useState<AgentDetection | null>(null);
   // Each section starts at its top — the pane is one shared scroll element,
@@ -186,7 +211,7 @@ export default function SettingsModal({ settings, onChange, onClose, capsOf, act
 
   return (
     <div className="modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal settings-modal">
+      <div className="modal settings-modal" ref={modalRef}>
 
         <nav className="sm-rail">
           <div className="sm-rail-title">Settings</div>
