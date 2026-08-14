@@ -468,48 +468,67 @@ fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 fn scan_codex_dir(root: &std::path::Path) -> Vec<(Session, std::path::PathBuf)> {
     let mut files = Vec::new();
     codex_rollouts(root, &mut files);
-    files
-            .into_iter()
-            .filter_map(|path| {
-                let file = std::fs::File::open(&path).ok()?;
-                let mut first = String::new();
-                std::io::BufRead::read_line(
-                    &mut std::io::BufReader::new(file),
-                    &mut first,
-                )
-                .ok()?;
-                let h = parse_codex_header(&first)?;
-                let last_active = std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                Some((
-                    Session {
-                        id: h.id,
-                        // Stamped by the registry; see `scan_backends`.
-                        agent: String::new(),
-                        // The directory, matching how claude's rows read. A
-                        // rollout has no title of its own and inventing one
-                        // from the first message would mean reading the whole
-                        // file for every row in the list.
-                        title: std::path::Path::new(&h.cwd)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| h.cwd.clone()),
-                        project_path: h.cwd.clone(),
-                        group_path: h.cwd,
-                        branch: h.branch,
-                        forked: false,
-                        background: false,
-                        fork_parent: None,
-                        last_active,
-                    },
-                    path,
-                ))
-            })
-            .collect()
+    // Newer Codex writes MANY rollout files per conversation — one per turn or
+    // thread, each with its own `id` in the filename, all sharing the original
+    // conversation's `session_id` (and `parent_thread_id`) in their headers. A
+    // row per file both floods the list and, because rows key on the session
+    // id, makes a single click select every duplicate at once — and delete or
+    // resume then has no single file to act on. Collapse to one row per
+    // `session_id`, keeping the newest rollout (the live thread), the way claude
+    // fork rows and OpenCode child sessions are collapsed elsewhere.
+    let mut by_session: std::collections::HashMap<String, (Session, std::path::PathBuf)> =
+        std::collections::HashMap::new();
+    for path in files {
+        let Some((session, path)) = read_codex_row(&path) else {
+            continue;
+        };
+        match by_session.get(&session.id) {
+            Some((kept, _)) if kept.last_active >= session.last_active => {}
+            _ => {
+                by_session.insert(session.id.clone(), (session, path));
+            }
+        }
+    }
+    by_session.into_values().collect()
+}
+
+/// One rollout file → its session row, or `None` if it is not a readable
+/// rollout. The unit both [`scan_codex_dir`] and [`CodexSessions::find_session_file`]
+/// build on, so the row a click selects and the file a delete moves are read
+/// the same way.
+fn read_codex_row(path: &std::path::Path) -> Option<(Session, std::path::PathBuf)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut first).ok()?;
+    let h = parse_codex_header(&first)?;
+    let last_active = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((
+        Session {
+            id: h.id,
+            // Stamped by the registry; see `scan_backends`.
+            agent: String::new(),
+            // The directory, matching how claude's rows read. A rollout has no
+            // title of its own and inventing one from the first message would
+            // mean reading the whole file for every row in the list.
+            title: std::path::Path::new(&h.cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| h.cwd.clone()),
+            project_path: h.cwd.clone(),
+            group_path: h.cwd,
+            branch: h.branch,
+            forked: false,
+            background: false,
+            fork_parent: None,
+            last_active,
+        },
+        path.to_path_buf(),
+    ))
 }
 
 impl SessionProvider for CodexSessions {
@@ -518,15 +537,16 @@ impl SessionProvider for CodexSessions {
     }
 
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
-        // Codex puts the id in the filename, so this is a name match rather
-        // than a header read of every rollout on the machine.
+        // The id lives in the filename, but only for a conversation's ROOT
+        // rollout — the per-turn files that share its session_id carry their own
+        // ids in their names. So match on the header session_id (what a row is
+        // keyed by) and return the newest rollout: the live file the row stands
+        // for, and the one a delete or preview should act on.
         let root = codex_root()?;
-        let mut files = Vec::new();
-        codex_rollouts(&root, &mut files);
-        files.into_iter().find(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().contains(session_id))
-        })
+        scan_codex_dir(&root)
+            .into_iter()
+            .find(|(s, _)| s.id == session_id)
+            .map(|(_, p)| p)
     }
 }
 
@@ -1426,6 +1446,40 @@ mod tests {
         assert_eq!(parse_codex_header(""), None);
         assert_eq!(parse_codex_header("{\"payload\":{\"cwd\":\"/x\"}}"), None);
         assert_eq!(parse_codex_header("{\"timestamp\":\"2026"), None);
+    }
+
+    /// Newer Codex writes one rollout file per turn, all sharing the
+    /// conversation's `session_id`. The scan must collapse them to a single row
+    /// — the newest file — or the sidebar floods and a click selects every
+    /// duplicate. A second, separate session stays its own row.
+    #[test]
+    fn many_rollouts_of_one_session_collapse_to_the_newest() {
+        use std::io::Write;
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join("aiterm-codex-dedup-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, sid: &str, secs: u64| -> std::path::PathBuf {
+            let p = dir.join(name);
+            let mut f = std::fs::File::create(&p).unwrap();
+            writeln!(f, "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/proj\"}}}}").unwrap();
+            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+            p
+        };
+        // Three files of one conversation with ascending mtimes, plus a
+        // separate session. The middle-written file is the newest by mtime.
+        write("rollout-a-111.jsonl", "sess-1", 100);
+        let newest = write("rollout-b-222.jsonl", "sess-1", 300);
+        write("rollout-c-333.jsonl", "sess-1", 200);
+        write("rollout-d-444.jsonl", "sess-2", 50);
+
+        let mut rows = scan_codex_dir(&dir);
+        rows.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        assert_eq!(rows.len(), 2, "two sessions, not four files");
+        assert_eq!(rows[0].0.id, "sess-1");
+        assert_eq!(rows[0].1, newest, "the surviving file is the newest of the session");
+        assert_eq!(rows[1].0.id, "sess-2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A session row with only the fields adoption looks at.
