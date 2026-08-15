@@ -564,24 +564,33 @@ impl AgentBackend for CodexBackend {
         &CodexSessions
     }
 
-    /// Nothing, resume included. `codex resume` exists, but the path through
-    /// aiterm is parked with the diagnosis already done — four Claude-shaped
-    /// assumptions sit between a Codex row and a working reopen, and shipping
-    /// a ▶ that lands in a black pane is worse than not offering one. Flipping
-    /// `resume` here is the whole of the UI work when it is picked back up.
+    /// Resume and delete.
     ///
-    /// `delete` stays true, unlike everything else here. A rollout is one file
-    /// per session, so trashing one is exactly as scoped as trashing a claude
-    /// transcript — which is the same tool reaching into the same kind of other
-    /// tool's data, and has always been the point of the 🗑. Restore puts a
-    /// rollout back in Codex's own store rather than claude's, which is what
-    /// makes it a move rather than a theft.
+    /// `resume` was parked while the reopen path was claude-shaped, but the
+    /// `tui_drive` split settled that: a Codex row now resumes through the same
+    /// clean branch `aiterm chat` uses — the id it is given is the id it
+    /// reopens — so none of claude's stop-before-resume machinery (the part that
+    /// once turned "resume this" into "lose this") sits on this route. And the
+    /// row's id is the conversation's `session_id`, which is exactly what
+    /// `codex resume <SESSION_ID>` resolves against — even though Codex now
+    /// writes one rollout file per turn under that shared id (see
+    /// `scan_codex_dir`).
     ///
-    /// The engine this capability guards against is OpenCode, whose sessions
-    /// share one SQLite database: there, "delete this row" would have handed
-    /// the whole store to the trash.
+    /// `delete` stays true, as it always was: a rollout is one file per session,
+    /// so trashing one is exactly as scoped as trashing a claude transcript, and
+    /// restore puts it back in Codex's own store. (The capability exists to keep
+    /// OpenCode out, whose one shared database a per-row delete would have handed
+    /// away wholesale.)
     fn caps(&self) -> Caps {
-        Caps { delete: true, ..Default::default() }
+        Caps { resume: true, delete: true, ..Default::default() }
+    }
+
+    /// `codex resume <SESSION_ID>` — reopen a session by its UUID, confirmed on
+    /// codex-cli (`Session id (UUID) or session name`). No model/effort override:
+    /// resume reopens the session with the settings it already carries, unlike
+    /// [`Self::launch`], which is spelling out a fresh start.
+    fn resume(&self, session_id: &str) -> Option<String> {
+        Some(format!("codex resume {}", q(session_id)))
     }
 
     /// Codex has no `--session-id`. `codex --help` offers `resume` and `fork`
@@ -1789,15 +1798,23 @@ mod tests {
         assert!(cleared.contains("--session-id 'abc-123'"), "{cleared}");
     }
 
-    /// Codex declines rather than offering a command that lands in a black pane
-    /// — its resume path is parked. Nobody but claude re-keys, because nobody
-    /// else takes an id up front.
+    /// Nobody but claude re-keys, because nobody else takes an id up front.
     #[test]
-    fn engines_that_cannot_reopen_a_session_say_so() {
-        assert_eq!(CodexBackend.resume("abc-123"), None);
+    fn engines_that_cannot_rekey_a_session_say_so() {
         assert_eq!(CodexBackend.clear("abc-123"), None);
         assert_eq!(OpenCodeBackend.clear("abc-123"), None);
         assert_eq!(ChatBackend.clear("abc-123"), None);
+    }
+
+    /// Codex reopens by UUID through its own `resume` subcommand — the whole of
+    /// the fix, now that a Codex row's id is the conversation's session_id and
+    /// the non-`tui_drive` branch carries that id straight through to the tab.
+    #[test]
+    fn codex_resumes_by_session_uuid() {
+        assert_eq!(
+            CodexBackend.resume("019ffbf3-142f-7750").as_deref(),
+            Some("codex resume '019ffbf3-142f-7750'"),
+        );
     }
 
     /// `opencode --help`: `-s, --session <id>`, `-m <provider/model>`. Quoted,
@@ -1921,7 +1938,10 @@ mod tests {
                 config: true,
             },
         );
-        assert_eq!(CodexBackend.caps(), Caps { delete: true, ..Default::default() });
+        assert_eq!(
+            CodexBackend.caps(),
+            Caps { resume: true, delete: true, ..Default::default() }
+        );
         assert_eq!(
             OpenCodeBackend.caps(),
             Caps { resume: true, delete: true, ..Default::default() },
