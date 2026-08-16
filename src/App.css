@@ -1776,12 +1776,18 @@ body.dragging * { pointer-events: none; }
 /* The pin names a host the policy refuses — the one state where this line is
    describing a route that cannot run. */
 .mb-pin-warn { color: var(--red); }
-.ep-list { display: flex; flex-direction: column; margin-top: 8px; }
+.ep-list { display: flex; flex-direction: column; margin-top: 8px; overflow-x: auto; }
 /* One host's offer of this model: name, quantization, price, context, uptime. */
-.ep-row {
-  display: flex;
+/* A grid, not a flex row. As flex, two things knocked the columns out of
+   line: a wide quantization (`unknown` against `fp8`) pushed that row's price
+   left, and an excluded row carries a country cell the others do not, which
+   shifted its uptime. Fixed tracks put every value under its own heading, and
+   a row missing the last cell simply leaves that column empty. */
+.ep-row, .ep-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 54px 122px 38px 46px 62px;
   align-items: baseline;
-  gap: 10px;
+  gap: 8px;
   text-align: left;
   background: none;
   border: none;
@@ -1791,6 +1797,16 @@ body.dragging * { pointer-events: none; }
   padding: 5px 6px;
   cursor: pointer;
 }
+/* The headings: what each column of numbers actually means. */
+.ep-head {
+  cursor: default;
+  color: var(--text-faint);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  border-bottom-color: var(--border);
+}
+.ep-head span:not(:first-child) { text-align: right; }
 .ep-row:hover:not(:disabled) { background: var(--bg-hover); }
 .ep-row.on { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .ep-row.on .ep-name { color: var(--accent); }
@@ -1798,23 +1814,26 @@ body.dragging * { pointer-events: none; }
    hosts a rule removes is most of the value of the rule. */
 .ep-row.off { opacity: 0.45; cursor: default; }
 .ep-name {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text);
 }
-.ep-tag { font-size: 10px; color: var(--text-faint); flex-shrink: 0; }
+/* Every column but the name is a number or a code, so they read down the
+   column: right-aligned, and tabular figures so the digits line up too. */
+.ep-tag, .ep-off {
+  font-size: 10px;
+  color: var(--text-faint);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .ep-price, .ep-ctx, .ep-up {
-  flex-shrink: 0;
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
-.ep-price { min-width: 112px; }
-.ep-ctx { min-width: 34px; }
-.ep-up { min-width: 44px; }
-.ep-off { font-size: 10px; color: var(--text-faint); flex-shrink: 0; }
 /* The same control in two places: a model's own ceiling, and the account
    default in the policy section. */
 .ep-caps, .pol-caps { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 6px; }

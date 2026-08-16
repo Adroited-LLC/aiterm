@@ -963,6 +963,17 @@ export default function ModelAccess() {
                                 && <div className="set-hint mb-wait">Asking the provider…</div>
                             ) : (
                               <>
+                                {/* Cheapest first, and the headings say what
+                                    each column of figures is — "1M / 99.6%"
+                                    told you nothing on its own. */}
+                                <div className="ep-head">
+                                  <span>Host</span>
+                                  <span>Quant</span>
+                                  <span>In / out $/M</span>
+                                  <span>Ctx</span>
+                                  <span>Up</span>
+                                  <span />
+                                </div>
                                 {endpoints[sel.id].map((e) => (
                                   <button
                                     key={e.tag}
