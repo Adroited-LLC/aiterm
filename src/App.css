@@ -1346,6 +1346,41 @@ body.dragging * { pointer-events: none; }
 .diff-line.hunk { color: var(--blue); background: #61afef10; }
 .diff-line.meta { color: var(--text-faint); }
 
+/* ── Right-click menu ─────────────────────────────────────────────────
+   The backdrop covers the window so a click anywhere dismisses; it stays
+   transparent because a menu should not dim what you are pointing at. */
+.ctx-backdrop { position: fixed; inset: 0; z-index: 300; }
+.ctx-menu {
+  position: fixed;
+  min-width: 190px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px #0009;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.ctx-item {
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12.5px;
+  padding: 7px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-item:hover { background: var(--bg-hover); }
+.ctx-item.danger { color: var(--red); }
+/* Armed: the same item asking for the second click, loud enough that it is
+   plainly not the state you started in. */
+.ctx-item.danger.armed {
+  background: color-mix(in srgb, var(--red) 16%, transparent);
+  font-weight: 600;
+}
+
 /* ── Classifier-downgrade one-tap banner ─────────────────────────────── */
 .refusal-banner {
   margin: 6px 8px 0;

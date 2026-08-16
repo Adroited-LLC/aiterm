@@ -208,6 +208,26 @@ export default function SessionsPanel({
   // Searching always shows everything regardless of folds.
   const sectionOpen = (key: string) => !collapsedSections.has(key) || query.trim().length > 0;
   const [emptyConfirm, setEmptyConfirm] = useState(false);
+  // Right-click menu on the Trash header. Where it opened, and whether its one
+  // destructive item has been armed — a menu you had to summon is deliberate
+  // enough that a second click is confirmation, without a separate dialog.
+  const [trashMenu, setTrashMenu] = useState<{ x: number; y: number } | null>(null);
+  const [menuArmed, setMenuArmed] = useState(false);
+  const closeTrashMenu = () => { setTrashMenu(null); setMenuArmed(false); };
+  useEffect(() => {
+    if (!trashMenu) return;
+    // Escape closes it, and so does anything that moves the list underneath it —
+    // a menu pinned to a coordinate is wrong the moment the page scrolls.
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeTrashMenu(); };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("resize", closeTrashMenu);
+    window.addEventListener("scroll", closeTrashMenu, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", closeTrashMenu);
+      window.removeEventListener("scroll", closeTrashMenu, true);
+    };
+  }, [trashMenu]);
   const [showSettings, setShowSettings] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>(
     () => (localStorage.getItem("aiterm.viewMode") as ViewMode) || "recent",
@@ -1260,6 +1280,11 @@ export default function SessionsPanel({
             <div
               className="group-header static clickable"
               onClick={() => toggleSection("trash")}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenuArmed(false);
+                setTrashMenu({ x: e.clientX, y: e.clientY });
+              }}
             >
               <span className={"chevron" + (sectionOpen("trash") ? " open" : "")}>›</span>
               <span className="group-name">Trash</span>
@@ -1285,6 +1310,37 @@ export default function SessionsPanel({
           </div>
         )}
       </div>
+      {trashMenu && (
+        // The backdrop is what closes it on a click anywhere else, including a
+        // right-click somewhere new.
+        <div
+          className="ctx-backdrop"
+          onMouseDown={closeTrashMenu}
+          onContextMenu={(e) => { e.preventDefault(); closeTrashMenu(); }}
+        >
+          <div
+            className="ctx-menu"
+            style={{ left: trashMenu.x, top: trashMenu.y }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            {/* The count is the whole trash, never `filteredTrash` — emptying
+                ignores the search box, and a menu offering to remove the two
+                rows you can see while taking forty would be a lie. */}
+            <button
+              className={"ctx-item danger" + (menuArmed ? " armed" : "")}
+              onClick={() => {
+                if (!menuArmed) { setMenuArmed(true); return; }
+                closeTrashMenu();
+                onTrashEmpty();
+              }}
+            >
+              {menuArmed
+                ? `Delete ${trashed.length} session${trashed.length === 1 ? "" : "s"} for good?`
+                : `Empty trash (${trashed.length})`}
+            </button>
+          </div>
+        </div>
+      )}
       {dragId && dragPos && (
         <div className="drag-ghost" style={{ left: dragPos.x + 12, top: dragPos.y + 8 }}>
           {dragArm.current?.label ?? ""}
