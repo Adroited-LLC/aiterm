@@ -223,8 +223,20 @@ pub fn pty_spawn(
     Ok(id)
 }
 
+/// Send input to a pty.
+///
+/// `async`, and that is the whole point of it: Tauri runs a *sync* command on
+/// the GTK main thread, which is also the thread that has to be free for the
+/// window to draw. Every keystroke was therefore a write syscall scheduled
+/// against the frame loop, and under load — several agents streaming, the
+/// compositor busy — typing went soft and laggy exactly when the machine could
+/// least afford it. An async command runs on the runtime instead, so a
+/// keystroke never queues behind a frame.
+///
+/// The lock is held for the write and nothing else, with no await inside it, so
+/// this cannot block the runtime either.
 #[tauri::command]
-pub fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
+pub async fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
     let mut ptys = state.ptys.lock().unwrap();
     let pty = ptys.get_mut(&id).ok_or("no such pty")?;
     pty.writer
@@ -232,8 +244,16 @@ pub fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<
         .map_err(|e| e.to_string())
 }
 
+/// Off the main thread for the same reason as [`pty_write`]: a resize arrives
+/// on every window drag frame, and the ioctl has no business competing with the
+/// draw it was triggered by.
 #[tauri::command]
-pub fn pty_resize(state: State<'_, PtyManager>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+pub async fn pty_resize(
+    state: State<'_, PtyManager>,
+    id: u32,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
     let ptys = state.ptys.lock().unwrap();
     let pty = ptys.get(&id).ok_or("no such pty")?;
     pty.master

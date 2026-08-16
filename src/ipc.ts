@@ -1,3 +1,4 @@
+import { makeWriteQueue } from "./writeQueue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 
 export interface Session {
@@ -337,9 +338,38 @@ export const ptySpawn = (
   cwd, command, cols, rows, onOutput,
   envProvider: envProvider ?? null, envModel: envModel ?? null,
 });
-export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
-export const ptyResize = (id: number, cols: number, rows: number) =>
-  invoke<void>("pty_resize", { id, cols, rows });
+// `pty_write` and `pty_resize` are async commands, so they run on the runtime
+// rather than the GTK main thread — which is what stops a keystroke queueing
+// behind a frame. The cost of that is that two calls are two tasks, and nothing
+// says tasks are polled in the order they were spawned. Both go through a
+// per-pty queue so only one is ever in flight: input keeps its order, and a
+// burst or a paste merges into a single crossing of the IPC boundary.
+export const ptyWrite = makeWriteQueue((id, data) =>
+  invoke<void>("pty_write", { id, data }));
+
+/** Latest size wins — the sizes a window drag passes through on the way are of
+ *  no interest, and an out-of-order pair would leave the pty on the wrong one. */
+const pendingSize = new Map<number, { cols: number; rows: number }>();
+const resizing = new Map<number, Promise<void>>();
+export const ptyResize = (id: number, cols: number, rows: number): Promise<void> => {
+  pendingSize.set(id, { cols, rows });
+  const running = resizing.get(id);
+  if (running) return running;
+  const chain = (async () => {
+    try {
+      for (;;) {
+        const next = pendingSize.get(id);
+        if (!next) return;
+        pendingSize.delete(id);
+        await invoke<void>("pty_resize", { id, cols: next.cols, rows: next.rows });
+      }
+    } finally {
+      resizing.delete(id);
+    }
+  })();
+  resizing.set(id, chain);
+  return chain;
+};
 export const ptyKill = (id: number) => invoke<void>("pty_kill", { id });
 
 export const gitRepoState = (path: string) => invoke<RepoState>("git_repo_state", { path });
