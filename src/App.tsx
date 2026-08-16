@@ -47,6 +47,7 @@ import {
   claudeModelDefault, restoreClaudeModelDefault, sessionPreview,
 } from "./ipc";
 import RefusalBanner from "./components/RefusalBanner";
+import { nextAdoptionDelay } from "./adoption";
 import "./App.css";
 
 const OPTS_KEY = "aiterm.sessionOpts";
@@ -913,20 +914,24 @@ export default function App() {
         }
       }
     };
-    tick();
-    const every = setInterval(tick, 2000);
-    // Give up after a minute. An agent that has written nothing by then is one
-    // that does not write transcripts at all, and polling the disk forever on
-    // its behalf is worse than leaving the placeholder row in place — which
-    // still keeps the tab reachable, which was the point.
-    const giveUp = setTimeout(() => {
-      stop = true;
-      clearInterval(every);
-    }, 60_000);
+    // Keep looking on a backing-off schedule rather than to a flat deadline.
+    // The old one was a minute, on the assumption Codex wrote its transcript at
+    // launch; it does not, and a session measured on 2026-08-16 took 98.9s to
+    // appear — so adoption had already quit when the file it was waiting for
+    // arrived, and the conversation kept a placeholder row and a real row for
+    // good. `nextAdoptionDelay` owns the timings.
+    const startedAt = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const loop = async () => {
+      await tick();
+      if (stop) return;
+      const wait = nextAdoptionDelay(Date.now() - startedAt);
+      if (wait !== null) timer = setTimeout(loop, wait);
+    };
+    loop();
     return () => {
       stop = true;
-      clearInterval(every);
-      clearTimeout(giveUp);
+      if (timer) clearTimeout(timer);
     };
   }, [awaitingAdoption, refreshSessionList]);
 
