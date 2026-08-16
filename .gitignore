@@ -30,3 +30,6 @@ dist-ssr
 
 # Internal notes, not for the public repo
 PORTING-TO-OPCODE.md
+
+# Agent tooling config — local only, never published
+.claude/
