@@ -3,6 +3,7 @@ import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions 
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import { TermProgress } from "./TerminalView";
+import { stableOrder } from "../order";
 import { followRekey } from "../selection";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
@@ -252,13 +253,28 @@ export default function SessionsPanel({
   // Displayed id sequence per container, read by the drop handler.
   const containerSeq = useRef<Map<string, string[]>>(new Map());
 
+  // The order each list was last drawn in, so a refresh does not rearrange it.
+  // Written during render, which is safe because `stableOrder` is idempotent:
+  // feeding it back its own output returns the same list.
+  const shownOrder = useRef<Map<string, string[]>>(new Map());
+  const keepPut = <T,>(key: string, list: T[], id: (t: T) => string): T[] => {
+    const out = stableOrder(list, id, shownOrder.current.get(key));
+    shownOrder.current.set(key, out.map(id));
+    return out;
+  };
+
   useEffect(() => localStorage.setItem(GROUPS_KEY, JSON.stringify(groups)), [groups]);
   useEffect(() => localStorage.setItem(ORDER_KEY, JSON.stringify(orders)), [orders]);
 
   const filtered = useMemo(() => {
+    // Freeze the order first. Rows arrive sorted by `last_active`, which moves
+    // every time an agent writes a line — so with several sessions running the
+    // list rearranged itself under the cursor. `keepPut` lets a new session in
+    // at the top and then leaves every row where it is.
+    const stable = keepPut("all", sessions, (s) => s.id);
     const q = query.toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter(
+    if (!q) return stable;
+    return stable.filter(
       (s) =>
         s.title.toLowerCase().includes(q) ||
         s.project_path.toLowerCase().includes(q) ||
@@ -362,7 +378,10 @@ export default function SessionsPanel({
         label: path.split("/").filter(Boolean).pop() ?? path,
         sessions: ss,
       }));
-    return orderBy(secs, (s) => s.key, orders["sections:project"]);
+    // Sections are ranked by their newest session, which moves for the same
+    // reason rows do — so hold them still too, and let the hand-drag order win
+    // over both.
+    return orderBy(keepPut("sections", secs, (s) => s.key), (s) => s.key, orders["sections:project"]);
   }, [viewMode, filtered, searchList, orders]);
   if (viewMode === "project" && autoSections) {
     containerSeq.current.set("sections:project", autoSections.map((s) => s.key));
