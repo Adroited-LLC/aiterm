@@ -704,6 +704,15 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     if std::fs::write(&origin, path.to_string_lossy().as_bytes()).is_ok() {
         touch(&origin);
     }
+    // A Codex conversation is spread across every rollout that shares its
+    // session id, and the rename above only took the newest. Leaving the rest
+    // means the next scan collapses them straight back into a row: the delete
+    // appears to work, then undoes itself, showing older content. Take the
+    // whole set. Runs after the rename, so the file already moved is not in
+    // the list this finds.
+    if backend.id() == "codex" {
+        stash_codex_rollouts(&session_id, &trash);
+    }
     let tasks = home.join(".claude/tasks").join(&session_id);
     if tasks.is_dir() {
         let tasks_dest = trash.join(format!("{session_id}.tasks"));
@@ -882,6 +891,7 @@ fn trash_restore_sync(session_id: String) -> Result<(), String> {
         }
         std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&origin);
+        restore_codex_rollouts(&trash, &session_id);
         return restore_claude_sidecars(&trash, &session_id);
     }
 
@@ -947,6 +957,75 @@ fn is_claude_transcript(path: &Path, home: &Path) -> bool {
 /// Shared by both restore paths. Only claude has these — a Codex rollout is
 /// the whole of a Codex session — so for anything else these are simply
 /// absent, which is why nothing here treats a miss as a failure.
+/// Move a Codex conversation's remaining rollouts into the trash as a set.
+///
+/// They go into `<id>.rollouts/` beside the entry rather than alongside it, so
+/// `trash_list` still sees exactly one `<id>.jsonl` per deleted session and the
+/// preview still reads the newest file. `origins.json` inside records where
+/// each came from, because a rollout's path encodes the date it was written
+/// (`sessions/<y>/<m>/<d>/`) and nothing else could put it back.
+///
+/// Best-effort throughout: a rollout that will not move is left where it is
+/// rather than failing a delete that has already happened.
+fn stash_codex_rollouts(session_id: &str, trash: &Path) {
+    let extras = crate::agents::codex_session_files(session_id);
+    if extras.is_empty() {
+        return;
+    }
+    let dir = trash.join(format!("{session_id}.rollouts"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let mut origins = serde_json::Map::new();
+    for from in extras {
+        let Some(name) = from.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if std::fs::rename(&from, dir.join(&name)).is_ok() {
+            origins.insert(name, serde_json::Value::String(from.to_string_lossy().into_owned()));
+        }
+    }
+    let _ = std::fs::write(
+        dir.join("origins.json"),
+        serde_json::Value::Object(origins).to_string(),
+    );
+}
+
+/// Put a Codex conversation's stashed rollouts back where they came from.
+///
+/// A rollout already sitting at the destination is left alone: that is a file
+/// that came back by another route, and overwriting it to restore an older copy
+/// is the one outcome worse than an incomplete restore.
+fn restore_codex_rollouts(trash: &Path, session_id: &str) {
+    let dir = trash.join(format!("{session_id}.rollouts"));
+    if !dir.is_dir() {
+        return;
+    }
+    let Ok(raw) = std::fs::read_to_string(dir.join("origins.json")) else {
+        return;
+    };
+    let Ok(origins) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
+    else {
+        return;
+    };
+    for (name, dest) in origins {
+        let Some(dest) = dest.as_str().map(std::path::PathBuf::from) else {
+            continue;
+        };
+        if dest.exists() {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::rename(dir.join(&name), &dest);
+    }
+    let _ = std::fs::remove_file(dir.join("origins.json"));
+    // Only if everything left with it; anything that would not move stays in
+    // the trash rather than being silently dropped.
+    let _ = std::fs::remove_dir(&dir);
+}
+
 fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
     let tasks_src = trash.join(format!("{session_id}.tasks"));
@@ -979,6 +1058,12 @@ fn trash_delete_sync(session_id: String) -> Result<(), String> {
     let job = trash.join(format!("{session_id}.job"));
     if job.is_dir() {
         let _ = std::fs::remove_dir_all(job);
+    }
+    // The rest of a Codex conversation goes with it — the entry that named
+    // them is gone, so leaving them would be leaking a set nothing can restore.
+    let rollouts = trash.join(format!("{session_id}.rollouts"));
+    if rollouts.is_dir() {
+        let _ = std::fs::remove_dir_all(rollouts);
     }
     Ok(())
 }
@@ -2665,6 +2750,56 @@ mod refusal_tests {
         assert!(parse_refusal(hard).unwrap().hard);
         let future = r#"{"type":"system","subtype":"model_refusal_future_variant","uuid":"r-3"}"#;
         assert_eq!(parse_refusal(future).unwrap().uuid, "r-3");
+    }
+
+    /// The whole point of the multi-file delete: every rollout of a Codex
+    /// conversation goes to the trash together, and a restore puts every one of
+    /// them back where it came from. Anything left behind on delete is
+    /// collapsed straight back into a sidebar row; anything not restored is a
+    /// conversation that comes back with holes in it.
+    ///
+    /// Ignored because it points `$HOME` at a synthetic store for the whole
+    /// process. Run it alone:
+    ///   cargo test --lib codex_rollouts_round_trip -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn codex_rollouts_round_trip() {
+        let root = std::env::temp_dir().join("aiterm-codex-trash-roundtrip");
+        let _ = std::fs::remove_dir_all(&root);
+        let day = root.join(".codex/sessions/2026/08/16");
+        std::fs::create_dir_all(&day).unwrap();
+        let trash = root.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::env::set_var("HOME", &root);
+
+        let sid = "01a00b9c-0011-7973-a7ac-759454839aaf";
+        let made: Vec<std::path::PathBuf> = ["rollout-1.jsonl", "rollout-2.jsonl", "rollout-3.jsonl"]
+            .iter()
+            .map(|n| {
+                let p = day.join(n);
+                std::fs::write(
+                    &p,
+                    format!("{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/p\"}}}}\n"),
+                )
+                .unwrap();
+                p
+            })
+            .collect();
+
+        stash_codex_rollouts(sid, &trash);
+        let stashed = trash.join(format!("{sid}.rollouts"));
+        assert!(stashed.is_dir(), "the set went to the trash together");
+        for p in &made {
+            assert!(!p.exists(), "{} should have left the store", p.display());
+        }
+        assert!(stashed.join("origins.json").is_file(), "where they came from is recorded");
+
+        restore_codex_rollouts(&trash, sid);
+        for p in &made {
+            assert!(p.exists(), "{} should be back where it was", p.display());
+        }
+        assert!(!stashed.exists(), "nothing left in the trash once restored");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The last refusal wins, and a transcript with none yields nothing.

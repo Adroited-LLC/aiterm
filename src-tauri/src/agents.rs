@@ -492,6 +492,32 @@ fn scan_codex_dir(root: &std::path::Path) -> Vec<(Session, std::path::PathBuf)> 
     by_session.into_values().collect()
 }
 
+/// Every rollout file that belongs to `session_id`, oldest first.
+///
+/// A Codex conversation is not one file: it is every rollout sharing its
+/// `session_id` (see [`scan_codex_dir`]). Deleting one of them would leave the
+/// rest behind for the next scan to collapse back into a row, so the trash has
+/// to take the whole set.
+pub fn codex_session_files(session_id: &str) -> Vec<std::path::PathBuf> {
+    codex_root().map(|r| codex_session_files_in(&r, session_id)).unwrap_or_default()
+}
+
+/// The body of [`codex_session_files`], over an explicit root so it can be
+/// tested against a directory built for the purpose.
+fn codex_session_files_in(root: &std::path::Path, session_id: &str) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    codex_rollouts(root, &mut files);
+    let mut mine: Vec<(u64, std::path::PathBuf)> = files
+        .iter()
+        .filter_map(|p| {
+            let (s, path) = read_codex_row(p)?;
+            (s.id == session_id).then_some((s.last_active, path))
+        })
+        .collect();
+    mine.sort_by_key(|(at, _)| *at);
+    mine.into_iter().map(|(_, p)| p).collect()
+}
+
 /// One rollout file → its session row, or `None` if it is not a readable
 /// rollout. The unit both [`scan_codex_dir`] and [`CodexSessions::find_session_file`]
 /// build on, so the row a click selects and the file a delete moves are read
@@ -1455,6 +1481,38 @@ mod tests {
         assert_eq!(parse_codex_header(""), None);
         assert_eq!(parse_codex_header("{\"payload\":{\"cwd\":\"/x\"}}"), None);
         assert_eq!(parse_codex_header("{\"timestamp\":\"2026"), None);
+    }
+
+    /// A delete has to take the whole conversation, so this must find every
+    /// rollout sharing the session id — not just the newest, which is all
+    /// `find_session_file` answers with. Anything left behind is collapsed
+    /// straight back into a row by the next scan.
+    #[test]
+    fn a_conversations_rollouts_are_all_found_for_the_trash() {
+        use std::io::Write;
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join("aiterm-codex-files-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, sid: &str, secs: u64| {
+            let p = dir.join(name);
+            let mut f = std::fs::File::create(&p).unwrap();
+            writeln!(f, "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/p\"}}}}").unwrap();
+            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+            p
+        };
+        let first = write("rollout-a-1.jsonl", "sess-1", 100);
+        let third = write("rollout-c-3.jsonl", "sess-1", 300);
+        let second = write("rollout-b-2.jsonl", "sess-1", 200);
+        write("rollout-d-4.jsonl", "sess-2", 400);
+
+        assert_eq!(
+            codex_session_files_in(&dir, "sess-1"),
+            vec![first, second, third],
+            "every rollout of the conversation, oldest first, and nobody else's",
+        );
+        assert!(codex_session_files_in(&dir, "sess-nothing").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Newer Codex writes one rollout file per turn, all sharing the
