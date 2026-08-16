@@ -1376,6 +1376,11 @@ body.dragging * { pointer-events: none; }
 .ctx-item.danger { color: var(--red); }
 /* Armed: the same item asking for the second click, loud enough that it is
    plainly not the state you started in. */
+.ctx-note {
+  font-size: 11px;
+  color: var(--text-faint);
+  padding: 2px 10px 5px;
+}
 .ctx-item.danger.armed {
   background: color-mix(in srgb, var(--red) 16%, transparent);
   font-weight: 600;

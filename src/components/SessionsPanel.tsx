@@ -169,6 +169,10 @@ interface Props {
   onRestore: (id: string) => void;
   onTrashDelete: (id: string) => void;
   onTrashEmpty: () => void;
+  /** Move a whole set of sessions to the trash — the right-click action on a
+   *  project or group header. The panel has already excluded anything a per-row
+   *  🗑 would refuse. */
+  onTrashSessions: (sessions: Session[]) => void;
 }
 
 export default function SessionsPanel({
@@ -177,7 +181,7 @@ export default function SessionsPanel({
   capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
-  trashed, onRestore, onTrashDelete, onTrashEmpty,
+  trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
@@ -208,26 +212,59 @@ export default function SessionsPanel({
   // Searching always shows everything regardless of folds.
   const sectionOpen = (key: string) => !collapsedSections.has(key) || query.trim().length > 0;
   const [emptyConfirm, setEmptyConfirm] = useState(false);
-  // Right-click menu on the Trash header. Where it opened, and whether its one
-  // destructive item has been armed — a menu you had to summon is deliberate
-  // enough that a second click is confirmation, without a separate dialog.
-  const [trashMenu, setTrashMenu] = useState<{ x: number; y: number } | null>(null);
+  // Right-click menu. One destructive item, which arms on the first click and
+  // acts on the second — a menu you had to summon is deliberate enough that a
+  // second click is confirmation, without a separate dialog.
+  const [menu, setMenu] = useState<
+    null | { x: number; y: number; idle: string; armed: string; note?: string; run: () => void }
+  >(null);
   const [menuArmed, setMenuArmed] = useState(false);
-  const closeTrashMenu = () => { setTrashMenu(null); setMenuArmed(false); };
+  const closeMenu = () => { setMenu(null); setMenuArmed(false); };
   useEffect(() => {
-    if (!trashMenu) return;
+    if (!menu) return;
     // Escape closes it, and so does anything that moves the list underneath it —
     // a menu pinned to a coordinate is wrong the moment the page scrolls.
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeTrashMenu(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeMenu(); };
     window.addEventListener("keydown", onKey);
-    window.addEventListener("resize", closeTrashMenu);
-    window.addEventListener("scroll", closeTrashMenu, true);
+    window.addEventListener("resize", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
     return () => {
       window.removeEventListener("keydown", onKey);
-      window.removeEventListener("resize", closeTrashMenu);
-      window.removeEventListener("scroll", closeTrashMenu, true);
+      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
     };
-  }, [trashMenu]);
+  }, [menu]);
+
+  /** Right-click on a header that stands for a set of sessions.
+   *
+   *  Only the ones a per-row 🗑 would delete are offered: a running session is
+   *  excluded because trashing one does not stick — the process writes its
+   *  transcript again seconds later, rebuilt from the deletion point, losing
+   *  the history before it. The count says how many are being kept and why, so
+   *  "move 12" over a group of 14 is never a silent partial job.
+   */
+  const openSetMenu = (e: React.MouseEvent, what: string, group: Session[]) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const targets = group.filter(
+      (s) =>
+        !liveSessions.has(s.id) &&
+        !liveSlots.has(s.id) &&
+        !liveSlots.has(`shell:${s.project_path}`) &&
+        capsOf(s.agent).delete,
+    );
+    const kept = group.length - targets.length;
+    const n = targets.length;
+    setMenuArmed(false);
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      idle: n === 0 ? "Nothing here can be trashed" : `Move ${n} session${n === 1 ? "" : "s"} to trash`,
+      armed: `Move ${n} from ${what} to trash?`,
+      note: kept > 0 ? `${kept} still running — kept` : undefined,
+      run: () => { if (n > 0) onTrashSessions(targets); },
+    });
+  };
   const [showSettings, setShowSettings] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>(
     () => (localStorage.getItem("aiterm.viewMode") as ViewMode) || "recent",
@@ -1152,6 +1189,14 @@ export default function SessionsPanel({
                     }
                     toggleSection(key);
                   }}
+                  // Only in the project view. A date bucket is not a thing you
+                  // own — "trash everything from Older" has no use that is worth
+                  // putting one mis-click away from clearing out months.
+                  onContextMenu={
+                    viewMode === "project"
+                      ? (e) => openSetMenu(e, sec.label, sec.sessions)
+                      : undefined
+                  }
                 >
                   <span className={"chevron" + (open ? " open" : "")}>›</span>
                   <span className="group-name">{sec.label}</span>
@@ -1200,6 +1245,7 @@ export default function SessionsPanel({
                   setGroups((gs) =>
                     gs.map((x) => (x.id === g.id ? { ...x, collapsed: !x.collapsed } : x)));
                 }}
+                onContextMenu={(e) => openSetMenu(e, g.name, members)}
               >
                 <span className={"chevron" + (open ? " open" : "")}>›</span>
                 <span
@@ -1283,7 +1329,16 @@ export default function SessionsPanel({
               onContextMenu={(e) => {
                 e.preventDefault();
                 setMenuArmed(false);
-                setTrashMenu({ x: e.clientX, y: e.clientY });
+                setMenu({
+                  x: e.clientX,
+                  y: e.clientY,
+                  // The whole trash, never `filteredTrash` — emptying ignores
+                  // the search box, and offering to remove the two rows on
+                  // screen while taking forty would be a lie.
+                  idle: `Empty trash (${trashed.length})`,
+                  armed: `Delete ${trashed.length} session${trashed.length === 1 ? "" : "s"} for good?`,
+                  run: onTrashEmpty,
+                });
               }}
             >
               <span className={"chevron" + (sectionOpen("trash") ? " open" : "")}>›</span>
@@ -1310,34 +1365,30 @@ export default function SessionsPanel({
           </div>
         )}
       </div>
-      {trashMenu && (
+      {menu && (
         // The backdrop is what closes it on a click anywhere else, including a
         // right-click somewhere new.
         <div
           className="ctx-backdrop"
-          onMouseDown={closeTrashMenu}
-          onContextMenu={(e) => { e.preventDefault(); closeTrashMenu(); }}
+          onMouseDown={closeMenu}
+          onContextMenu={(e) => { e.preventDefault(); closeMenu(); }}
         >
           <div
             className="ctx-menu"
-            style={{ left: trashMenu.x, top: trashMenu.y }}
+            style={{ left: menu.x, top: menu.y }}
             onMouseDown={(e) => e.stopPropagation()}
           >
-            {/* The count is the whole trash, never `filteredTrash` — emptying
-                ignores the search box, and a menu offering to remove the two
-                rows you can see while taking forty would be a lie. */}
             <button
               className={"ctx-item danger" + (menuArmed ? " armed" : "")}
               onClick={() => {
                 if (!menuArmed) { setMenuArmed(true); return; }
-                closeTrashMenu();
-                onTrashEmpty();
+                closeMenu();
+                menu.run();
               }}
             >
-              {menuArmed
-                ? `Delete ${trashed.length} session${trashed.length === 1 ? "" : "s"} for good?`
-                : `Empty trash (${trashed.length})`}
+              {menuArmed ? menu.armed : menu.idle}
             </button>
+            {menu.note && <div className="ctx-note">{menu.note}</div>}
           </div>
         </div>
       )}

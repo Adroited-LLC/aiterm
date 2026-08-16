@@ -1450,6 +1450,36 @@ export default function App() {
     setPreviewSession((p) => (p?.id === s.id ? null : p));
     refreshSessions();
   };
+  /** Move a set of sessions to the trash — the right-click action on a project
+   *  or group header. Sequential rather than parallel: each delete renames a
+   *  transcript and its task and job records, and firing thirty of those at the
+   *  same directory at once is how a half-moved session happens. One refresh at
+   *  the end, so the sidebar redraws once instead of thirty times.
+   *
+   *  Failures are counted and reported. A per-row delete can afford to fail
+   *  quietly — you can see the row is still there — but in a set of thirty,
+   *  four that did not move would be invisible. */
+  const trashSessions = async (list: Session[]) => {
+    if (list.length === 0) return;
+    let failed = 0;
+    for (const s of list) {
+      try {
+        await sessionDelete(s.id);
+      } catch (e) {
+        failed += 1;
+        uiLog(`bulk trash failed for ${s.id}: ${e}`);
+      }
+    }
+    const moved = list.length - failed;
+    setPreviewSession((p) => (p && list.some((s) => s.id === p.id) ? null : p));
+    refreshSessions();
+    setNotice(
+      failed === 0
+        ? `Moved ${moved} session${moved === 1 ? "" : "s"} to the trash.`
+        : `Moved ${moved} of ${list.length}; ${failed} could not be trashed.`,
+    );
+  };
+
   const restoreTrashed = async (id: string) => {
     try {
       await trashRestore(id);
@@ -1797,6 +1827,7 @@ export default function App() {
                 onRestore={restoreTrashed}
                 onTrashDelete={deleteTrashed}
                 onTrashEmpty={emptyTrash}
+                onTrashSessions={trashSessions}
               />
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
