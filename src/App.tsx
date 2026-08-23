@@ -70,6 +70,9 @@ const USAGE_KEY = "aiterm.usageCache";
 const NO_CAPS: Caps = {
   fork: false, clear: false, resume: false, tui_drive: false, panels: false,
   delete: false, config: false,
+  // No roster knows about an engine aiterm does not know about either, so its
+  // tab is the only sign of life — the same answer every non-claude engine gets.
+  roster_liveness: false,
 };
 
 interface PanelToggles {
@@ -1783,6 +1786,13 @@ export default function App() {
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
+                // Tabs whose process is still running. `liveSlots` deliberately
+                // keeps an ended tab — you still need ⏻ to close it — but a
+                // terminal whose process died is not a live session, so the dot
+                // asks this instead.
+                runningSlots={new Set(
+                  tabs.filter((t) => !ended.has(t.key)).map((t) => t.slotId),
+                )}
                 liveSessions={liveShown}
                 attentionSlots={new Set(
                   tabs.filter((t) => attention.has(t.key)).map((t) => t.slotId),

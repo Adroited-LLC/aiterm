@@ -588,6 +588,10 @@ export interface Caps {
   delete: boolean;
   /** The engine has configuration aiterm can read — its Settings button. */
   config: boolean;
+  /** Something outside aiterm reports this engine's liveness (claude's own
+   *  `claude agents` roster). Only claude has one — so for every other engine a
+   *  live tab in this window is the only evidence a session is running. */
+  roster_liveness: boolean;
 }
 
 /** Every registered engine's capabilities, keyed by agent id.

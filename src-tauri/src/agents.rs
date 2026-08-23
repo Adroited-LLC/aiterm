@@ -88,6 +88,19 @@ pub struct Caps {
     /// config aiterm cannot read is better with no button than with an empty
     /// panel.
     pub config: bool,
+    /// Something outside aiterm reports whether this engine's sessions are
+    /// alive — for claude, `claude agents --json`, which `live_session_ids`
+    /// reads.
+    ///
+    /// Only claude has one, and the flag exists so the sidebar can tell "not in
+    /// the roster" from "not running". A claude row must trust the roster and
+    /// nothing else: after a background-mode resume the tab holds the frozen
+    /// parent while the conversation runs under another id, so an open tab is
+    /// not evidence of life and treating it as such put the green dot on the
+    /// wrong row. An engine with no roster has the opposite problem — nothing
+    /// could ever report it, so a Codex session ran with no dot at all — and
+    /// there a live tab in this window is the only evidence there is.
+    pub roster_liveness: bool,
 }
 
 /// What is known about an agent on this machine right now.
@@ -308,6 +321,7 @@ impl AgentBackend for ClaudeBackend {
             panels: true,
             delete: true,
             config: true,
+            roster_liveness: true,
         }
     }
 
@@ -1994,6 +2008,7 @@ mod tests {
                 panels: true,
                 delete: true,
                 config: true,
+                roster_liveness: true,
             },
         );
         assert_eq!(
@@ -2020,6 +2035,19 @@ mod tests {
     /// — its claim rides on `session_delete` branching to the row-level
     /// `opencode::delete_to_trash` instead of the rename, and this test is the
     /// reminder that removing that branch means removing the claim.
+    /// Only claude has a roster to be absent from. The green dot asks this
+    /// before deciding whether an open tab counts as proof a session is alive:
+    /// for claude it must not (a tab can hold a session the daemon moved on
+    /// from), and for everyone else it is the only proof available — without
+    /// which a running Codex session showed no dot at all.
+    #[test]
+    fn only_claude_has_an_external_liveness_roster() {
+        assert!(ClaudeBackend.caps().roster_liveness);
+        assert!(!CodexBackend.caps().roster_liveness);
+        assert!(!OpenCodeBackend.caps().roster_liveness);
+        assert!(!ChatBackend.caps().roster_liveness);
+    }
+
     #[test]
     fn only_an_engine_with_a_single_session_delete_offers_one() {
         assert!(ClaudeBackend.caps().delete);

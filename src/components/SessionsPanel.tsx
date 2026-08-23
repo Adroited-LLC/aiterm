@@ -119,6 +119,10 @@ interface Props {
   liveSlots: Set<string>;
   /** Session ids the Claude Code daemon is actually running right now. */
   liveSessions: Set<string>;
+  /** Slot ids whose terminal process is still alive — `liveSlots` minus the
+   *  tabs whose process ended. For an engine with no external roster this is
+   *  the only evidence a session is running. */
+  runningSlots: Set<string>;
   /** Slot ids whose terminal rang the bell (claude waiting on input). */
   attentionSlots: Set<string>;
   /** What the waiting session actually said, when it sent words rather than a
@@ -176,7 +180,7 @@ interface Props {
 }
 
 export default function SessionsPanel({
-  sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots,
+  sessions, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
   attentionText, progressSlots, activeSlot, rekey, opts,
   capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
@@ -698,7 +702,16 @@ export default function SessionsPanel({
     // parent, while the real conversation runs elsewhere wearing no badge and
     // offering a Delete that would truncate it.
     const hasTab = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
-    const isRunning = liveSessions.has(s.id);
+    // `liveSessions` is claude's roster, and it is the only word that counts
+    // for a claude row — precisely because of the case above. But no other
+    // engine appears in it at all, so asking it about a Codex session always
+    // answered "not running": a Codex tab could be mid-reply and its row wore
+    // no dot. Where there is no roster to consult, a tab whose process is still
+    // alive is the evidence, and it is the same evidence a person is using when
+    // they look at the terminal.
+    const isRunning =
+      liveSessions.has(s.id) ||
+      (!capsOf(s.agent).roster_liveness && runningSlots.has(s.id));
     const hasAttn =
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
     // Same two slot keys the badge is looked up under, so the sentence and the
