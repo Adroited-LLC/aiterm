@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
+import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
+import { TermProgress } from "./TerminalView";
+import { stableOrder } from "../order";
+import { followRekey } from "../selection";
 
 /** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
 function shortTime(ms: number): string {
@@ -31,6 +34,12 @@ export interface PendingSession {
   id: string;
   title: string;
   cwd: string;
+  /** The engine that was started, so the row wears its own mark. Every pending
+   *  row used to draw claude's starburst, which meant a fresh Codex or
+   *  OpenCode tab impersonated a claude session for as long as it took its
+   *  transcript to land. Empty for a tab whose engine is unknown — `AgentIcon`
+   *  has a generic glyph for exactly that. */
+  agent: string;
 }
 
 export interface SessionDisplayOpts {
@@ -110,15 +119,39 @@ interface Props {
   liveSlots: Set<string>;
   /** Session ids the Claude Code daemon is actually running right now. */
   liveSessions: Set<string>;
+  /** Slot ids whose terminal process is still alive — `liveSlots` minus the
+   *  tabs whose process ended. For an engine with no external roster this is
+   *  the only evidence a session is running. */
+  runningSlots: Set<string>;
   /** Slot ids whose terminal rang the bell (claude waiting on input). */
   attentionSlots: Set<string>;
+  /** What the waiting session actually said, when it sent words rather than a
+   *  bell (OSC 9). Keyed by slot, like `attentionSlots`. */
+  attentionText: Map<string, string>;
+  /** Long-running work a live session is reporting (OSC 9;4). */
+  progressSlots: Map<string, TermProgress>;
   /** Slot id of the terminal currently displayed. */
   activeSlot: string | null;
+  /** Set when a tab swapped the conversation it holds (/clear, /fork, or
+   *  picking another agent from claude's own agents screen). The click
+   *  selection follows it, so the highlight does not stay on the conversation
+   *  that was left behind. */
+  rekey: { from: string; to: string; seq: number } | null;
   opts: SessionDisplayOpts;
   onOptsChange: (o: SessionDisplayOpts) => void;
+  /** What an engine supports, by agent id. Every lifecycle button in a row is
+   *  drawn from this rather than from the row's agent *name*: an id with no
+   *  backend — a row from an engine since removed — answers all-false, and a
+   *  row with no buttons is a better failure than a row offering claude's. */
+  capsOf: (agent: string) => Caps;
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
   onFork: (s: Session) => void;
+  /** Park this conversation and start a fresh one in its tab — aiterm's own
+   *  clear, kin to ⑂: pure process control and disk, no claude machinery.
+   *  Only offered on rows whose engine declares `clear` and that have a live
+   *  terminal of their own. */
+  onClear: (s: Session) => void;
   onExit: (s: Session) => void;
   onNewShell: (s: Session) => void;
   onDelete: (s: Session) => void;
@@ -140,14 +173,19 @@ interface Props {
   onRestore: (id: string) => void;
   onTrashDelete: (id: string) => void;
   onTrashEmpty: () => void;
+  /** Move a whole set of sessions to the trash — the right-click action on a
+   *  project or group header. The panel has already excluded anything a per-row
+   *  🗑 would refuse. */
+  onTrashSessions: (sessions: Session[]) => void;
 }
 
 export default function SessionsPanel({
-  sessions, projects, activeProject, liveSlots, liveSessions, attentionSlots, activeSlot, opts,
-  onOptsChange, onSelect, onResume, onFork, onExit, onNewShell, onDelete,
+  sessions, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
+  attentionText, progressSlots, activeSlot, rekey, opts,
+  capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
-  trashed, onRestore, onTrashDelete, onTrashEmpty,
+  trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
@@ -178,6 +216,59 @@ export default function SessionsPanel({
   // Searching always shows everything regardless of folds.
   const sectionOpen = (key: string) => !collapsedSections.has(key) || query.trim().length > 0;
   const [emptyConfirm, setEmptyConfirm] = useState(false);
+  // Right-click menu. One destructive item, which arms on the first click and
+  // acts on the second — a menu you had to summon is deliberate enough that a
+  // second click is confirmation, without a separate dialog.
+  const [menu, setMenu] = useState<
+    null | { x: number; y: number; idle: string; armed: string; note?: string; run: () => void }
+  >(null);
+  const [menuArmed, setMenuArmed] = useState(false);
+  const closeMenu = () => { setMenu(null); setMenuArmed(false); };
+  useEffect(() => {
+    if (!menu) return;
+    // Escape closes it, and so does anything that moves the list underneath it —
+    // a menu pinned to a coordinate is wrong the moment the page scrolls.
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") closeMenu(); };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("resize", closeMenu);
+    window.addEventListener("scroll", closeMenu, true);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("resize", closeMenu);
+      window.removeEventListener("scroll", closeMenu, true);
+    };
+  }, [menu]);
+
+  /** Right-click on a header that stands for a set of sessions.
+   *
+   *  Only the ones a per-row 🗑 would delete are offered: a running session is
+   *  excluded because trashing one does not stick — the process writes its
+   *  transcript again seconds later, rebuilt from the deletion point, losing
+   *  the history before it. The count says how many are being kept and why, so
+   *  "move 12" over a group of 14 is never a silent partial job.
+   */
+  const openSetMenu = (e: React.MouseEvent, what: string, group: Session[]) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const targets = group.filter(
+      (s) =>
+        !liveSessions.has(s.id) &&
+        !liveSlots.has(s.id) &&
+        !liveSlots.has(`shell:${s.project_path}`) &&
+        capsOf(s.agent).delete,
+    );
+    const kept = group.length - targets.length;
+    const n = targets.length;
+    setMenuArmed(false);
+    setMenu({
+      x: e.clientX,
+      y: e.clientY,
+      idle: n === 0 ? "Nothing here can be trashed" : `Move ${n} session${n === 1 ? "" : "s"} to trash`,
+      armed: `Move ${n} from ${what} to trash?`,
+      note: kept > 0 ? `${kept} still running — kept` : undefined,
+      run: () => { if (n > 0) onTrashSessions(targets); },
+    });
+  };
   const [showSettings, setShowSettings] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>(
     () => (localStorage.getItem("aiterm.viewMode") as ViewMode) || "recent",
@@ -213,16 +304,38 @@ export default function SessionsPanel({
   const suppressClick = useRef(false);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
+
+  // Only a selection that held the old id moves; one built by ctrl-clicking
+  // rows for a drag belongs to the user and is left alone.
+  useEffect(() => {
+    if (!rekey) return;
+    setSelected((prev) => followRekey(prev, rekey.from, rekey.to));
+  }, [rekey]);
   // Displayed id sequence per container, read by the drop handler.
   const containerSeq = useRef<Map<string, string[]>>(new Map());
+
+  // The order each list was last drawn in, so a refresh does not rearrange it.
+  // Written during render, which is safe because `stableOrder` is idempotent:
+  // feeding it back its own output returns the same list.
+  const shownOrder = useRef<Map<string, string[]>>(new Map());
+  const keepPut = <T,>(key: string, list: T[], id: (t: T) => string): T[] => {
+    const out = stableOrder(list, id, shownOrder.current.get(key));
+    shownOrder.current.set(key, out.map(id));
+    return out;
+  };
 
   useEffect(() => localStorage.setItem(GROUPS_KEY, JSON.stringify(groups)), [groups]);
   useEffect(() => localStorage.setItem(ORDER_KEY, JSON.stringify(orders)), [orders]);
 
   const filtered = useMemo(() => {
+    // Freeze the order first. Rows arrive sorted by `last_active`, which moves
+    // every time an agent writes a line — so with several sessions running the
+    // list rearranged itself under the cursor. `keepPut` lets a new session in
+    // at the top and then leaves every row where it is.
+    const stable = keepPut("all", sessions, (s) => s.id);
     const q = query.toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter(
+    if (!q) return stable;
+    return stable.filter(
       (s) =>
         s.title.toLowerCase().includes(q) ||
         s.project_path.toLowerCase().includes(q) ||
@@ -326,7 +439,10 @@ export default function SessionsPanel({
         label: path.split("/").filter(Boolean).pop() ?? path,
         sessions: ss,
       }));
-    return orderBy(secs, (s) => s.key, orders["sections:project"]);
+    // Sections are ranked by their newest session, which moves for the same
+    // reason rows do — so hold them still too, and let the hand-drag order win
+    // over both.
+    return orderBy(keepPut("sections", secs, (s) => s.key), (s) => s.key, orders["sections:project"]);
   }, [viewMode, filtered, searchList, orders]);
   if (viewMode === "project" && autoSections) {
     containerSeq.current.set("sections:project", autoSections.map((s) => s.key));
@@ -557,10 +673,16 @@ export default function SessionsPanel({
           </>
         ) : (
           <>
-            <button
-              className="act-btn" title="Restore session"
-              onClick={() => onRestore(t.id)}
-            >↩</button>
+            {/* An OpenCode entry is a row dump, not a file with a home to go
+                back to — restore would refuse it, so it is not offered. The
+                backend refuses on the same recognition; this hides a button,
+                it does not guard anything. */}
+            {!t.id.startsWith("ses_") && (
+              <button
+                className="act-btn" title="Restore session"
+                onClick={() => onRestore(t.id)}
+              >↩</button>
+            )}
             <button
               className="act-btn danger" title="Delete forever…"
               onClick={() => setConfirmDel(`trash:${t.id}`)}
@@ -580,9 +702,22 @@ export default function SessionsPanel({
     // parent, while the real conversation runs elsewhere wearing no badge and
     // offering a Delete that would truncate it.
     const hasTab = liveSlots.has(s.id) || liveSlots.has(`shell:${s.project_path}`);
-    const isRunning = liveSessions.has(s.id);
+    // `liveSessions` is claude's roster, and it is the only word that counts
+    // for a claude row — precisely because of the case above. But no other
+    // engine appears in it at all, so asking it about a Codex session always
+    // answered "not running": a Codex tab could be mid-reply and its row wore
+    // no dot. Where there is no roster to consult, a tab whose process is still
+    // alive is the evidence, and it is the same evidence a person is using when
+    // they look at the terminal.
+    const isRunning =
+      liveSessions.has(s.id) ||
+      (!capsOf(s.agent).roster_liveness && runningSlots.has(s.id));
     const hasAttn =
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
+    // Same two slot keys the badge is looked up under, so the sentence and the
+    // dot can never disagree about which row is asking.
+    const notice = attentionText.get(s.id) ?? attentionText.get(`shell:${s.project_path}`);
+    const prog = progressSlots.get(s.id) ?? progressSlots.get(`shell:${s.project_path}`);
     const isShowing = activeSlot !== null &&
       (activeSlot === s.id || activeSlot === `shell:${s.project_path}`);
     // Tighter than `isShowing`: the displayed terminal is *this session's own*
@@ -590,6 +725,10 @@ export default function SessionsPanel({
     // in that project). Only this row has nothing to resume — you are already
     // looking at the conversation.
     const isFocusedSession = activeSlot === s.id;
+    // What this row's engine says it can do. Asked once per row: the three
+    // lifecycle buttons below used to compare `s.agent` to a name each, which
+    // is the check this refactor exists to remove.
+    const caps = capsOf(s.agent);
     const isDragging =
       dragId === s.id || (dragId !== null && dragActive.current && selected.has(dragId) && selected.has(s.id));
     return (
@@ -647,7 +786,7 @@ export default function SessionsPanel({
           {(isRunning || hasAttn) && (
             <span
               className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
-              title={hasAttn ? "Waiting for your input" : "Session is running"}
+              title={hasAttn ? notice ?? "Waiting for your input" : "Session is running"}
             />
           )}
         </div>
@@ -683,6 +822,28 @@ export default function SessionsPanel({
               )}
             </div>
           )}
+          {/* The sentence the session sent, shown only while it is still
+              waiting — once the badge clears this is a stale answer to a
+              question nobody is asking any more. */}
+          {hasAttn && notice && <div className="session-notice">{notice}</div>}
+          {prog && (
+            <div
+              className={"session-prog s" + prog.state}
+              title={
+                prog.state === 2 ? "Reported an error"
+                  : prog.state === 4 ? "Paused"
+                  : prog.pct !== null ? `${prog.pct}% done`
+                  : "Working"
+              }
+            >
+              <span
+                className="session-prog-fill"
+                // Indeterminate has no width to give, so it is shown as a
+                // moving sliver rather than a bar pretending to know.
+                style={prog.pct !== null ? { width: `${prog.pct}%` } : undefined}
+              />
+            </div>
+          )}
         </div>
         <div
           className={
@@ -696,7 +857,7 @@ export default function SessionsPanel({
               <span className="confirm-label">Stop it and resume?</span>
               <button
                 className="act-btn"
-                title="Stop the running session, then reopen it with claude --resume"
+                title="Stop the running session, then reopen it where it left off"
                 onClick={() => { setConfirmStop(null); onResume(s); }}
               >Resume</button>
               <button
@@ -727,14 +888,19 @@ export default function SessionsPanel({
                   The one exception is the tab you are looking at right now:
                   offering to stop and reopen the conversation you are typing
                   into is never what you meant. Every *other* live row keeps ▶,
-                  so the door-in problem above does not come back. */}
-              {!isFocusedSession && (
+                  so the door-in problem above does not come back.
+                  The second exception is an engine that cannot reopen anything.
+                  This button was ungated, so a Codex row's ▶ ran
+                  `claude --resume <codex-id>` against an id claude has never
+                  heard of — a black pane. The resolver declines it now; not
+                  offering it is the honest end of the same fix. */}
+              {!isFocusedSession && caps.resume && (
                 <button
                   className="act-btn"
                   title={
                     isRunning || hasTab
                       ? "Resume — stops the running session first"
-                      : "Resume claude session"
+                      : "Resume this session where it left off"
                   }
                   onClick={() =>
                     isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
@@ -742,12 +908,29 @@ export default function SessionsPanel({
                 >▶</button>
               )}
               {/* Branching is a deliberate act (two divergent lines from one
-                  history), not a workaround for resume being unavailable. */}
-              <button
-                className="act-btn"
-                title="Branch a copy at this point — listed idle, starts nothing"
-                onClick={() => onFork(s)}
-              >⑂</button>
+                  history), not a workaround for resume being unavailable.
+                  Only where the engine has fork machinery in its transcript —
+                  an API chat has none. */}
+              {caps.fork && (
+                <button
+                  className="act-btn"
+                  title="Branch a copy at this point — appears as a stopped session, resumable"
+                  onClick={() => onFork(s)}
+                >⑂</button>
+              )}
+              {/* aiterm's own clear — same end shape as typing /clear, built
+                  like ⑂: no claude machinery, just a fresh process on a
+                  minted id. Needs this session's own live terminal to act on,
+                  and an engine that can be told what to call the new
+                  conversation (Codex takes no session id, so it declares no
+                  clear). */}
+              {liveSlots.has(s.id) && caps.clear && (
+                <button
+                  className="act-btn"
+                  title="Clear — fresh conversation in this tab; this one becomes a stopped row"
+                  onClick={() => onClear(s)}
+                >✦</button>
+              )}
               {hasTab && (
                 <button
                   className="act-btn" title="Exit — close this tab"
@@ -761,8 +944,17 @@ export default function SessionsPanel({
               {/* Never offer Delete on a running session: trashing one doesn't
                   stick — the process recreates its transcript seconds later,
                   rebuilt from the deletion point, losing the history before
-                  it. Stop it first. */}
-              {!isRunning && !hasTab && (
+                  it. Stop it first.
+                  And only where the engine declares a delete that takes
+                  exactly one session. For file-per-session stores (claude,
+                  Codex, chats) that is a move into ~/.claude/trash; OpenCode
+                  keeps every conversation in one `opencode.db`, so its delete
+                  dumps the session's rows to the trash and removes them from
+                  the database — readable for the keep window, but not
+                  restorable by a rename, which is why its trash entry offers
+                  no ↩. `session_delete` refuses on the same flag — this hides
+                  a button, it does not guard anything. */}
+              {!isRunning && !hasTab && caps.delete && (
                 <button
                   className="act-btn danger" title="Delete session…"
                   onClick={() => setConfirmDel(s.id)}
@@ -793,8 +985,8 @@ export default function SessionsPanel({
         className={"session-item pending-item" + (isShowing ? " active showing" : "")}
         onClick={() => onSelectPending(p.id)}
       >
-        <div className="agent-badge claude">
-          <AgentIcon agent="claude" />
+        <div className={"agent-badge" + (p.agent === "claude" ? " claude" : "")}>
+          <AgentIcon agent={p.agent} />
           <span
             className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
             title={hasAttn ? "Waiting for your input" : "Session is starting"}
@@ -897,7 +1089,7 @@ export default function SessionsPanel({
             machine with no `~/Projects`, no way to begin one at all. */}
         <button
           className={"icon-btn" + (showNewSession ? " on" : "")}
-          title="New claude session…"
+          title="Start a session…"
           data-new-session-trigger=""
           onClick={() => setShowNewSession((v) => !v)}
         >＋</button>
@@ -1010,6 +1202,14 @@ export default function SessionsPanel({
                     }
                     toggleSection(key);
                   }}
+                  // Only in the project view. A date bucket is not a thing you
+                  // own — "trash everything from Older" has no use that is worth
+                  // putting one mis-click away from clearing out months.
+                  onContextMenu={
+                    viewMode === "project"
+                      ? (e) => openSetMenu(e, sec.label, sec.sessions)
+                      : undefined
+                  }
                 >
                   <span className={"chevron" + (open ? " open" : "")}>›</span>
                   <span className="group-name">{sec.label}</span>
@@ -1058,6 +1258,7 @@ export default function SessionsPanel({
                   setGroups((gs) =>
                     gs.map((x) => (x.id === g.id ? { ...x, collapsed: !x.collapsed } : x)));
                 }}
+                onContextMenu={(e) => openSetMenu(e, g.name, members)}
               >
                 <span className={"chevron" + (open ? " open" : "")}>›</span>
                 <span
@@ -1138,6 +1339,20 @@ export default function SessionsPanel({
             <div
               className="group-header static clickable"
               onClick={() => toggleSection("trash")}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenuArmed(false);
+                setMenu({
+                  x: e.clientX,
+                  y: e.clientY,
+                  // The whole trash, never `filteredTrash` — emptying ignores
+                  // the search box, and offering to remove the two rows on
+                  // screen while taking forty would be a lie.
+                  idle: `Empty trash (${trashed.length})`,
+                  armed: `Delete ${trashed.length} session${trashed.length === 1 ? "" : "s"} for good?`,
+                  run: onTrashEmpty,
+                });
+              }}
             >
               <span className={"chevron" + (sectionOpen("trash") ? " open" : "")}>›</span>
               <span className="group-name">Trash</span>
@@ -1163,6 +1378,33 @@ export default function SessionsPanel({
           </div>
         )}
       </div>
+      {menu && (
+        // The backdrop is what closes it on a click anywhere else, including a
+        // right-click somewhere new.
+        <div
+          className="ctx-backdrop"
+          onMouseDown={closeMenu}
+          onContextMenu={(e) => { e.preventDefault(); closeMenu(); }}
+        >
+          <div
+            className="ctx-menu"
+            style={{ left: menu.x, top: menu.y }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              className={"ctx-item danger" + (menuArmed ? " armed" : "")}
+              onClick={() => {
+                if (!menuArmed) { setMenuArmed(true); return; }
+                closeMenu();
+                menu.run();
+              }}
+            >
+              {menuArmed ? menu.armed : menu.idle}
+            </button>
+            {menu.note && <div className="ctx-note">{menu.note}</div>}
+          </div>
+        </div>
+      )}
       {dragId && dragPos && (
         <div className="drag-ghost" style={{ left: dragPos.x + 12, top: dragPos.y + 8 }}>
           {dragArm.current?.label ?? ""}

@@ -11,6 +11,14 @@ fn repo() -> String {
     concat!(env!("CARGO_MANIFEST_DIR"), "/..").to_string()
 }
 
+/// The commands below are `async` now: each hands its real work to the blocking
+/// pool so Tauri never runs it on the GTK main thread. Tests drive them through
+/// the same runtime Tauri would, which keeps them testing the command itself
+/// rather than a private twin of it.
+fn call<T>(f: impl std::future::Future<Output = T>) -> T {
+    tauri::async_runtime::block_on(f)
+}
+
 #[test]
 fn scans_claude_sessions() {
     let sessions = ClaudeProvider.scan();
@@ -25,7 +33,7 @@ fn scans_claude_sessions() {
 
 #[test]
 fn lists_directories() {
-    let entries = list_dir(repo()).expect("list_dir on repo root");
+    let entries = call(list_dir(repo())).expect("list_dir on repo root");
     assert!(entries.iter().any(|e| e.name == "src-tauri" && e.is_dir));
     // Dirs sort before files.
     let first_file = entries.iter().position(|e| !e.is_dir).unwrap_or(entries.len());
@@ -34,43 +42,43 @@ fn lists_directories() {
 
 #[test]
 fn reads_git_repo() {
-    let state = git_repo_state(repo());
+    let state = call(git_repo_state(repo()));
     assert!(state.is_repo);
     // Don't hardcode the branch name — this suite must pass on feature
     // branches too. Just require a non-empty current branch.
     let head_branch = state.branch.clone().expect("current branch");
     assert!(!head_branch.is_empty());
 
-    let log = git_log(repo(), 10).expect("git_log");
+    let log = call(git_log(repo(), 10)).expect("git_log");
     assert!(!log.is_empty());
     assert!(!log[0].short_id.is_empty());
     // Every commit except the root has parents recorded (graph edges).
     assert!(log[..log.len() - 1].iter().all(|c| !c.parents.is_empty()));
 
-    let branches = git_branches(repo()).expect("git_branches");
+    let branches = call(git_branches(repo())).expect("git_branches");
     // The reported HEAD branch is the one flagged is_head in the list.
     assert!(branches.iter().any(|b| b.name == head_branch && b.is_head));
 
-    git_status(repo()).expect("git_status");
+    call(git_status(repo())).expect("git_status");
 
     // Branch structure browsing: root tree has src-tauri/, subtree lists lib.rs.
-    let files = git_branch_files(repo(), "main".into(), "".into()).expect("branch files");
+    let files = call(git_branch_files(repo(), "main".into(), "".into())).expect("branch files");
     assert!(files.iter().any(|f| f.name == "src-tauri" && f.is_dir));
-    let sub = git_branch_files(repo(), "main".into(), "src-tauri/src".into()).expect("subtree");
+    let sub = call(git_branch_files(repo(), "main".into(), "src-tauri/src".into())).expect("subtree");
     assert!(sub.iter().any(|f| f.name == "lib.rs" && !f.is_dir));
-    let blog = git_branch_log(repo(), "main".into(), 5).expect("branch log");
+    let blog = call(git_branch_log(repo(), "main".into(), 5)).expect("branch log");
     assert!(!blog.is_empty() && !blog[0].summary.is_empty());
 }
 
 #[test]
 fn non_repo_reports_cleanly() {
-    let state = git_repo_state("/tmp".into());
+    let state = call(git_repo_state("/tmp".into()));
     assert!(!state.is_repo);
 }
 
 #[test]
 fn lists_projects_dir() {
-    let projects = aiterm_lib::fsx::list_projects();
+    let projects = call(aiterm_lib::fsx::list_projects());
     assert!(projects.iter().any(|p| p.name == "aiterm" && p.is_git));
     assert!(projects.iter().any(|p| p.name == "toponet"));
 }
@@ -82,7 +90,7 @@ fn artifacts_parse_from_transcripts() {
     let total: usize = ClaudeProvider
         .scan()
         .iter()
-        .map(|s| aiterm_lib::sessions::session_artifacts(s.id.clone()).len())
+        .map(|s| call(aiterm_lib::sessions::session_artifacts(s.id.clone())).len())
         .sum();
     assert!(total > 0, "expected some artifacts across sessions");
 }
@@ -95,7 +103,7 @@ fn preview_returns_conversation_tail() {
     let with_msgs = sessions
         .iter()
         .find_map(|s| {
-            let p = aiterm_lib::sessions::session_preview(s.id.clone());
+            let p = call(aiterm_lib::sessions::session_preview(s.id.clone()));
             (!p.is_empty()).then_some(p)
         })
         .expect("at least one session should have preview messages");
@@ -116,7 +124,7 @@ fn deletes_session_to_trash() {
     let file = dir.join(format!("{id}.jsonl"));
     std::fs::write(&file, "{\"type\":\"user\",\"cwd\":\"/tmp\"}\n").unwrap();
 
-    aiterm_lib::sessions::session_delete(id.into()).expect("delete should succeed");
+    call(aiterm_lib::sessions::session_delete(id.into())).expect("delete should succeed");
     assert!(!file.exists(), "transcript should leave the project dir");
     let trashed = home.join(".claude/trash").join(format!("{id}.jsonl"));
     assert!(trashed.exists(), "transcript should land in ~/.claude/trash");
@@ -128,17 +136,17 @@ fn deletes_session_to_trash() {
         .unwrap();
     assert!(age.as_secs() < 60, "trashed file should have a fresh mtime");
     assert!(
-        aiterm_lib::sessions::session_delete("../../etc/passwd".into()).is_err(),
+        call(aiterm_lib::sessions::session_delete("../../etc/passwd".into())).is_err(),
         "path traversal must be rejected"
     );
 
     // Trash listing shows it, restore brings it back to a project dir
     // derived from the transcript's cwd.
     assert!(
-        aiterm_lib::sessions::trash_list().iter().any(|t| t.id == id),
+        call(aiterm_lib::sessions::trash_list()).iter().any(|t| t.id == id),
         "trash_list should include the trashed session"
     );
-    aiterm_lib::sessions::trash_restore(id.into()).expect("restore should succeed");
+    call(aiterm_lib::sessions::trash_restore(id.into())).expect("restore should succeed");
     assert!(!trashed.exists(), "restore should empty the trash entry");
     let restored = home.join(".claude/projects/-tmp").join(format!("{id}.jsonl"));
     assert!(restored.exists(), "cwd /tmp flattens to projects/-tmp");
@@ -167,14 +175,14 @@ fn restores_a_codex_rollout_to_its_own_store() {
     )
     .unwrap();
 
-    aiterm_lib::sessions::session_delete(id.into()).expect("delete should succeed");
+    call(aiterm_lib::sessions::session_delete(id.into())).expect("delete should succeed");
     assert!(!file.exists(), "rollout should leave the codex store");
     assert!(
         home.join(".claude/trash").join(format!("{id}.origin")).exists(),
         "delete should record where it came from"
     );
 
-    aiterm_lib::sessions::trash_restore(id.into()).expect("restore should succeed");
+    call(aiterm_lib::sessions::trash_restore(id.into())).expect("restore should succeed");
     assert!(
         file.exists(),
         "rollout should return to its own store under its original filename"
@@ -188,6 +196,36 @@ fn restores_a_codex_rollout_to_its_own_store() {
 
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_dir_all(home.join(".codex/sessions/1999"));
+}
+
+/// The 🗑 renames whatever the owning provider calls the session's file. For
+/// OpenCode that "file" is `opencode.db` — the single database holding every
+/// OpenCode conversation on the machine — so a delete would move the whole
+/// store to the trash under one session's name.
+///
+/// The sidebar hides the button, but the command has to refuse on its own: a
+/// destructive IPC command that relies on the UI not calling it is not guarded.
+///
+/// Reads Matt's real database (never writes it) and skips where OpenCode has
+/// never run, so the suite still passes on a machine without it.
+#[test]
+fn refuses_to_delete_a_session_its_engine_does_not_own() {
+    let Some(db) = aiterm_lib::opencode::db_path() else {
+        return; // no OpenCode on this machine
+    };
+    let Some(session) = aiterm_lib::opencode::sessions().into_iter().next() else {
+        return; // installed, but nothing recorded to try deleting
+    };
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+
+    let err = call(aiterm_lib::sessions::session_delete(session.id.clone()))
+        .expect_err("an opencode session must not be deletable from aiterm");
+    assert!(err.contains("OpenCode"), "the refusal should name the engine: {err}");
+    assert!(db.exists(), "the database must still be where opencode left it");
+    assert!(
+        !home.join(".claude/trash").join(format!("{}.jsonl", session.id)).exists(),
+        "nothing should have reached the trash"
+    );
 }
 
 #[test]
@@ -260,7 +298,7 @@ fn parses_tasks_and_agents_from_transcript() {
         r#"{"type":"user","message":{"content":"<task-notification><task-id>xyz</task-id><tool-use-id>a2</tool-use-id><status>completed</status><summary>Refactor finished, 8 files.</summary><result>Refactored 8 files, all tests green.</result></task-notification>"}}"#, "\n",
     )).unwrap();
 
-    let tasks = aiterm_lib::sessions::session_tasks(id.into());
+    let tasks = call(aiterm_lib::sessions::session_tasks(id.into()));
     assert_eq!(tasks.len(), 2, "latest TodoWrite list should win");
     assert_eq!(tasks[0].subject, "build it");
     assert_eq!(tasks[1].status, "in_progress");
@@ -277,14 +315,14 @@ fn parses_tasks_and_agents_from_transcript() {
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","id":"u2","input":{"taskId":"2","status":"in_progress"}}]}}"#, "\n",
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","id":"u3","input":{"taskId":"3","status":"deleted"}}]}}"#, "\n",
     )).unwrap();
-    let tasks2 = aiterm_lib::sessions::session_tasks(id2.into());
+    let tasks2 = call(aiterm_lib::sessions::session_tasks(id2.into()));
     assert_eq!(tasks2.len(), 2, "deleted tasks drop; TaskCreate list beats stale TodoWrite");
     assert_eq!(tasks2[0].subject, "first task");
     assert_eq!(tasks2[0].status, "completed");
     assert_eq!(tasks2[1].status, "in_progress");
     let _ = std::fs::remove_file(&file2);
 
-    let agents = aiterm_lib::sessions::session_agents(id.into());
+    let agents = call(aiterm_lib::sessions::session_agents(id.into()));
     assert_eq!(agents.len(), 3);
     let by_id = |i: &str| agents.iter().find(|a| a.id == i).unwrap();
     assert_eq!(by_id("a1").status, "done");
@@ -345,8 +383,8 @@ fn keeps_both_fork_siblings() {
 
 #[test]
 fn full_text_search_finds_sessions() {
-    let r = aiterm_lib::indexer::reindex_sessions();
+    let r = call(aiterm_lib::indexer::reindex_sessions());
     assert!(r.total > 0, "expected sessions to index");
-    let hits = aiterm_lib::indexer::search_sessions("aiterm".into());
+    let hits = call(aiterm_lib::indexer::search_sessions("aiterm".into()));
     assert!(!hits.is_empty(), "searching 'aiterm' should hit this session");
 }

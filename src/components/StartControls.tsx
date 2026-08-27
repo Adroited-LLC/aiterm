@@ -1,16 +1,26 @@
 import { useEffect, useState } from "react";
-import { AgentChoice, agentChoices } from "../ipc";
+import { AgentChoice, ProviderView, agentChoices, providersList } from "../ipc";
 import AgentIcon from "./AgentIcon";
 
-/** What to start, once a directory is chosen. */
-export interface StartChoice {
-  agentId: string;
-  model: string | null;
-  effort: string | null;
-  /** Whether the agent will accept a pre-minted `--session-id`. Where false the
-   *  id aiterm generates is a tab handle only and no panel is keyed to it. */
-  mintsSessionId: boolean;
-}
+/**
+ * What to start, once a directory is chosen.
+ *
+ * One thing or the other, and the type says so. It used to be a single object
+ * with an agent id, a model, an effort and an optional `api` sub-object beside
+ * them — a shape in which "an agent AND an API model" was representable, and
+ * which of the two you meant was decided at the call site by whichever field it
+ * happened to test first.
+ *
+ * Two fields are gone rather than moved. `mintsSessionId` and the `openrouter`
+ * flag were the frontend answering questions that belong to the engine: whether
+ * an id can be pre-minted, and whether OpenCode's catalog can resolve a slug.
+ * The resolver answers both now, and its plan reports what it decided.
+ */
+export type StartChoice =
+  | { kind: "agent"; agentId: string; model: string | null; effort: string | null }
+  /** A model off a provider's startup list. Which engine runs it — OpenCode,
+   *  or aiterm's own chat console — is `launch.rs`'s answer, not this one's. */
+  | { kind: "api"; providerId: string; modelId: string };
 
 /**
  * Source, model and effort — the three decisions a new session needs.
@@ -35,6 +45,12 @@ export function useStartChoice() {
   const [agentId, setAgentId] = useState("");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
+  /** Providers with a key and a non-empty startup list — the only ones the
+   *  API dropdown has anything to say about. */
+  const [providers, setProviders] = useState<ProviderView[]>([]);
+  /** `JSON.stringify([providerId, modelId])`, or "" for none. JSON because a
+   *  model id can contain any separator this could have picked. */
+  const [apiModel, setApiModel] = useState("");
 
   useEffect(() => {
     agentChoices()
@@ -43,6 +59,11 @@ export function useStartChoice() {
         setAgentId((cur) => cur || list[0]?.id || "");
       })
       .catch(() => setAgents([]));
+    providersList()
+      .then((list) =>
+        setProviders(list.filter((p) => p.has_key && p.startup_models.length > 0)),
+      )
+      .catch(() => {});
   }, []);
 
   const agent = agents.find((a) => a.id === agentId) ?? null;
@@ -50,7 +71,10 @@ export function useStartChoice() {
   const efforts = models.find((m) => m.id === model)?.efforts ?? [];
 
   // Switching source invalidates both: a Claude alias is not a Codex slug.
-  const pickAgent = (id: string) => { setAgentId(id); setModel(""); setEffort(""); };
+  // It also ends an API pick — the tabs and the dropdown are one axis.
+  const pickAgent = (id: string) => {
+    setAgentId(id); setModel(""); setEffort(""); setApiModel("");
+  };
   // Switching model keeps the effort only if the new model still offers it.
   const pickModel = (id: string) => {
     setModel(id);
@@ -58,16 +82,19 @@ export function useStartChoice() {
     setEffort((cur) => (next.includes(cur) ? cur : ""));
   };
 
-  const choice = (): StartChoice => ({
-    agentId,
-    model: model || null,
-    effort: effort || null,
-    mintsSessionId: agent?.mints_session_id ?? false,
-  });
+  // The dropdown and the agent tabs are one axis — picking a model clears the
+  // agent selection and vice versa — so the choice is whichever one is set.
+  const choice = (): StartChoice => {
+    if (apiModel) {
+      const [providerId, modelId] = JSON.parse(apiModel) as [string, string];
+      return { kind: "api", providerId, modelId };
+    }
+    return { kind: "agent", agentId, model: model || null, effort: effort || null };
+  };
 
   return {
-    agents, agentId, model, effort, models, efforts,
-    pickAgent, pickModel, setEffort, choice,
+    agents, agentId, model, effort, models, efforts, providers, apiModel,
+    pickAgent, pickModel, setEffort, setApiModel, choice,
     ready: agents.length > 0,
   };
 }
@@ -75,7 +102,11 @@ export function useStartChoice() {
 type Ctl = ReturnType<typeof useStartChoice>;
 
 export default function StartControls({ ctl }: { ctl: Ctl }) {
-  const { agents, agentId, model, effort, models, efforts, pickAgent, pickModel, setEffort } = ctl;
+  const {
+    agents, agentId, model, effort, models, efforts, providers, apiModel,
+    pickAgent, pickModel, setEffort, setApiModel,
+  } = ctl;
+  const apiPicked = apiModel !== "";
   return (
     <div className="ns-agents">
       {agents.length > 1 && (
@@ -83,7 +114,7 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
           {agents.map((a) => (
             <button
               key={a.id}
-              className={"ns-agent-tab" + (a.id === agentId ? " on" : "")}
+              className={"ns-agent-tab" + (a.id === agentId && !apiPicked ? " on" : "")}
               onClick={() => pickAgent(a.id)}
               title={a.display_name}
             >
@@ -98,8 +129,14 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
           className="ns-select"
           value={model}
           onChange={(e) => pickModel(e.target.value)}
-          disabled={models.length === 0}
-          title={models.length ? "Model" : "This source publishes no model list"}
+          disabled={models.length === 0 || apiPicked}
+          title={
+            apiPicked
+              ? "An API model is picked instead"
+              : models.length
+                ? "Model"
+                : "This source publishes no model list"
+          }
         >
           <option value="">Default model</option>
           {models.map((m) => (
@@ -110,17 +147,47 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
           className="ns-select"
           value={effort}
           onChange={(e) => setEffort(e.target.value)}
-          disabled={efforts.length === 0}
-          title={efforts.length ? "Effort" : "Pick a model first"}
+          disabled={efforts.length === 0 || apiPicked}
+          title={
+            apiPicked ? "An API model is picked instead" : efforts.length ? "Effort" : "Pick a model first"
+          }
         >
           <option value="">Default effort</option>
           {efforts.map((e) => (
             <option key={e} value={e}>{e}</option>
           ))}
         </select>
+        {/* Providers appear once something is on their startup list — the
+            shortlist built in Settings → Model access. */}
+        {providers.length > 0 && (
+          <select
+            className="ns-select"
+            value={apiModel}
+            onChange={(e) => setApiModel(e.target.value)}
+            title="A model from a configured provider"
+          >
+            <option value="">API model</option>
+            {providers.map((p) => (
+              <optgroup key={p.id} label={p.name}>
+                {p.startup_models.map((m) => (
+                  <option key={m} value={JSON.stringify([p.id, m])}>{m}</option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        )}
       </div>
+      {apiPicked && (
+        <div className="empty-note">
+          Runs in OpenCode where it can, and aiterm's own chat console
+          otherwise. Either way the conversation is saved and resumable.
+        </div>
+      )}
       {agents.length === 0 && (
-        <div className="empty-note">No agent CLI found on this machine.</div>
+        <div className="empty-note">
+          No agent installed. Add a model under Settings → Model access, or
+          install claude or codex.
+        </div>
       )}
     </div>
   );

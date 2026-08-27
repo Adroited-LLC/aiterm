@@ -88,6 +88,18 @@ const AGENT_SESSION_MARKERS: &[&str] = &[
     "CLAUDE_PID",
 ];
 
+/// What the terminal on the other end can do.
+///
+/// xterm.js draws 24-bit colour in both its renderers, but nothing in `TERM`
+/// can say so — there is no truecolor terminfo entry to name, which is why
+/// `TERM` stays the 256-colour one programs actually look up. `COLORTERM` is
+/// the out-of-band signal they test for, and without it claude, delta and bat
+/// all quantise to 256 and say so in a startup tip.
+fn describe_terminal(cmd: &mut CommandBuilder) {
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+}
+
 /// Drop the parent session's markers so the child starts as its own session.
 ///
 /// Applies to shells as well as agent commands: a shell that inherits them is
@@ -108,6 +120,8 @@ pub fn pty_spawn(
     cols: u16,
     rows: u16,
     on_output: Channel<InvokeResponseBody>,
+    env_provider: Option<String>,
+    env_model: Option<String>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -129,8 +143,32 @@ pub fn pty_spawn(
         }
         None => CommandBuilder::new(&shell),
     };
-    cmd.env("TERM", "xterm-256color");
+    describe_terminal(&mut cmd);
     scrub_agent_markers(&mut cmd);
+    // A provider-backed tab (OpenCode on an OpenRouter model) gets the key as
+    // process environment, resolved here from the provider store. It never
+    // crosses the frontend and never touches a command line — /proc shows
+    // argv to everyone, but environ only to the same user, which is the same
+    // exposure as the tool's own credential file.
+    //
+    // That tab's routing rides in the same environment, for the same reason:
+    // the block is compiled here from stored state, so no routing decision
+    // crosses the frontend and none of it appears in argv.
+    // `OPENCODE_CONFIG_CONTENT` merges over the user's own config rather than
+    // replacing it, which is how a model's routing reaches OpenCode without
+    // aiterm ever writing their config file.
+    if let Some(pid) = env_provider {
+        if let Some(p) = crate::providers::load_providers().iter().find(|p| p.id == pid) {
+            if p.is_openrouter() && !p.api_key.is_empty() {
+                cmd.env("OPENROUTER_API_KEY", &p.api_key);
+            }
+            if let Some(model) = env_model.as_deref() {
+                if let Some(cfg) = crate::providers::opencode_config_content(p, model) {
+                    cmd.env("OPENCODE_CONFIG_CONTENT", cfg);
+                }
+            }
+        }
+    }
     if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
         cmd.cwd(dir);
     }
@@ -185,8 +223,20 @@ pub fn pty_spawn(
     Ok(id)
 }
 
+/// Send input to a pty.
+///
+/// `async`, and that is the whole point of it: Tauri runs a *sync* command on
+/// the GTK main thread, which is also the thread that has to be free for the
+/// window to draw. Every keystroke was therefore a write syscall scheduled
+/// against the frame loop, and under load — several agents streaming, the
+/// compositor busy — typing went soft and laggy exactly when the machine could
+/// least afford it. An async command runs on the runtime instead, so a
+/// keystroke never queues behind a frame.
+///
+/// The lock is held for the write and nothing else, with no await inside it, so
+/// this cannot block the runtime either.
 #[tauri::command]
-pub fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
+pub async fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
     let mut ptys = state.ptys.lock().unwrap();
     let pty = ptys.get_mut(&id).ok_or("no such pty")?;
     pty.writer
@@ -194,8 +244,16 @@ pub fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<
         .map_err(|e| e.to_string())
 }
 
+/// Off the main thread for the same reason as [`pty_write`]: a resize arrives
+/// on every window drag frame, and the ioctl has no business competing with the
+/// draw it was triggered by.
 #[tauri::command]
-pub fn pty_resize(state: State<'_, PtyManager>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+pub async fn pty_resize(
+    state: State<'_, PtyManager>,
+    id: u32,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
     let ptys = state.ptys.lock().unwrap();
     let pty = ptys.get(&id).ok_or("no such pty")?;
     pty.master
@@ -266,6 +324,36 @@ fn parent_of(pid: u32) -> Option<u32> {
         .lines()
         .find_map(|l| l.strip_prefix("PPid:"))
         .and_then(|v| v.trim().parse::<u32>().ok())
+}
+
+impl PtyManager {
+    /// The pty whose child tree contains `pid`, found by walking `pid`'s
+    /// ancestor chain up to some pty's direct child (the login shell).
+    ///
+    /// Walked upward rather than enumerating every pty's descendants because
+    /// the caller has one pid and there may be many ptys: one bounded /proc
+    /// walk answers for all of them. This is how a `SessionStart` hook's
+    /// claude pid becomes a tab — see `hooklink.rs`.
+    pub fn pty_for_descendant(&self, pid: u32) -> Option<u32> {
+        let roots: HashMap<u32, u32> = self
+            .ptys
+            .lock()
+            .ok()?
+            .iter()
+            .filter_map(|(id, p)| p.child_pid.map(|child| (child, *id)))
+            .collect();
+        let mut cur = pid;
+        for _ in 0..64 {
+            if let Some(&id) = roots.get(&cur) {
+                return Some(id);
+            }
+            match parent_of(cur) {
+                Some(p) if p > 1 => cur = p,
+                _ => return None,
+            }
+        }
+        None
+    }
 }
 
 /// Our own pid and every pid we descend from.
@@ -353,25 +441,28 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
 }
 
 #[tauri::command]
-pub fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
+pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
     // Take the instance out under the lock, then release it: the kill below
     // can block for over a second, and holding the map would stall every other
     // tab's writes and resizes for that whole time.
     let taken = state.ptys.lock().unwrap().remove(&id);
     if let Some(mut pty) = taken {
-        // `killer.kill()` only reaches the pty's direct child — the login
-        // shell. zsh forks the command rather than exec'ing it, so killing the
-        // shell orphaned every `claude` aiterm ever launched: they stayed in
-        // `claude agents` forever, which made their rows permanently "running"
-        // and left fork-a-copy as the only action the UI would offer.
-        if let Some(pid) = pty.child_pid {
-            kill_tree(pid, std::time::Duration::from_millis(1500));
-        }
-        let _ = pty.killer.kill();
-        // Closing a tab is one of the few things that changes the roster from
-        // inside aiterm. Say so, rather than letting the sidebar keep showing
-        // the session as running for the rest of the cache window.
-        crate::sessions::invalidate_roster();
+        crate::run_blocking(move || {
+            // `killer.kill()` only reaches the pty's direct child — the login
+            // shell. zsh forks the command rather than exec'ing it, so killing the
+            // shell orphaned every `claude` aiterm ever launched: they stayed in
+            // `claude agents` forever, which made their rows permanently "running"
+            // and left fork-a-copy as the only action the UI would offer.
+            if let Some(pid) = pty.child_pid {
+                kill_tree(pid, std::time::Duration::from_millis(1500));
+            }
+            let _ = pty.killer.kill();
+            // Closing a tab is one of the few things that changes the roster from
+            // inside aiterm. Say so, rather than letting the sidebar keep showing
+            // the session as running for the rest of the cache window.
+            crate::sessions::invalidate_roster();
+        })
+        .await;
     }
     Ok(())
 }
@@ -508,6 +599,28 @@ mod tests {
         std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    /// TERM names a terminfo entry programs look up; COLORTERM is the separate
+    /// signal for 24-bit colour, which no TERM value can carry. Both are
+    /// needed, and dropping either quietly costs colour depth rather than
+    /// failing.
+    #[test]
+    fn a_spawned_terminal_advertises_truecolour_as_well_as_256() {
+        let mut cmd = CommandBuilder::new("true");
+        describe_terminal(&mut cmd);
+        assert_eq!(cmd.get_env("TERM"), Some("xterm-256color".as_ref()));
+        assert_eq!(cmd.get_env("COLORTERM"), Some("truecolor".as_ref()));
+    }
+
+    /// A scrub after the description must not take the terminal's own
+    /// capabilities with it — they are not a parent session's markers.
+    #[test]
+    fn scrubbing_agent_markers_leaves_the_colour_signal_alone() {
+        let mut cmd = CommandBuilder::new("true");
+        describe_terminal(&mut cmd);
+        scrub_agent_markers(&mut cmd);
+        assert_eq!(cmd.get_env("COLORTERM"), Some("truecolor".as_ref()));
     }
 
     /// A shell tab is scrubbed too — it is one `claude` away from the same

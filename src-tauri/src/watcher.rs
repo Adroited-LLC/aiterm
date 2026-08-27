@@ -28,53 +28,61 @@ const SKIP: &[&str] = &[
 ];
 
 #[tauri::command]
-pub fn watch_project(
+pub async fn watch_project(
     app: AppHandle,
     state: State<'_, WatchState>,
     path: String,
 ) -> Result<(), String> {
-    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
-    let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    })
-    .map_err(|e| e.to_string())?;
-    watcher
-        .watch(Path::new(&path), RecursiveMode::Recursive)
+    // Registering an inotify watch is recursive: on a big tree it walks every
+    // directory before it returns, which is far too long to spend on the GTK
+    // main thread. Build and arm the watcher off it, then hand it back.
+    let watcher = crate::run_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
         .map_err(|e| e.to_string())?;
-    *state.0.lock().unwrap() = Some(watcher);
+        watcher
+            .watch(Path::new(&path), RecursiveMode::Recursive)
+            .map_err(|e| e.to_string())?;
 
-    std::thread::spawn(move || loop {
-        let first = match rx.recv() {
-            Ok(v) => v,
-            Err(_) => break, // watcher replaced or app shutting down
-        };
-        let mut git = false;
-        let mut tree = false;
-        let mut note = |ev: notify::Result<notify::Event>| {
-            if let Ok(ev) = ev {
-                for p in &ev.paths {
-                    let s = p.to_string_lossy();
-                    if SKIP.iter().any(|k| s.contains(k)) {
-                        continue;
-                    }
-                    if s.contains("/.git/") {
-                        git = true;
-                    } else {
-                        tree = true;
+        std::thread::spawn(move || loop {
+            let first = match rx.recv() {
+                Ok(v) => v,
+                Err(_) => break, // watcher replaced or app shutting down
+            };
+            let mut git = false;
+            let mut tree = false;
+            let mut note = |ev: notify::Result<notify::Event>| {
+                if let Ok(ev) = ev {
+                    for p in &ev.paths {
+                        let s = p.to_string_lossy();
+                        if SKIP.iter().any(|k| s.contains(k)) {
+                            continue;
+                        }
+                        if s.contains("/.git/") {
+                            git = true;
+                        } else {
+                            tree = true;
+                        }
                     }
                 }
+            };
+            note(first);
+            // Debounce: fold bursts (builds, checkouts) into one event, firing
+            // after 400ms of quiet.
+            while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_millis(400)) {
+                note(ev);
             }
-        };
-        note(first);
-        // Debounce: fold bursts (builds, checkouts) into one event, firing
-        // after 400ms of quiet.
-        while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_millis(400)) {
-            note(ev);
-        }
-        if git || tree {
-            let _ = app.emit("fs://changed", FsChanged { git, tree });
-        }
-    });
+            if git || tree {
+                let _ = app.emit("fs://changed", FsChanged { git, tree });
+            }
+        });
+        Ok::<_, String>(watcher)
+    })
+    .await?;
+    *state.0.lock().unwrap() = Some(watcher);
+
     Ok(())
 }
 

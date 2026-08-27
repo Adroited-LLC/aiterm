@@ -40,7 +40,11 @@ fn open(path: &str) -> Result<Repository, String> {
 }
 
 #[tauri::command]
-pub fn git_repo_state(path: String) -> RepoState {
+pub async fn git_repo_state(path: String) -> RepoState {
+    crate::run_blocking(move || git_repo_state_sync(path)).await
+}
+
+fn git_repo_state_sync(path: String) -> RepoState {
     let Ok(repo) = Repository::discover(&path) else {
         return RepoState {
             is_repo: false,
@@ -70,7 +74,11 @@ pub fn git_repo_state(path: String) -> RepoState {
 }
 
 #[tauri::command]
-pub fn git_status(path: String) -> Result<Vec<FileStatus>, String> {
+pub async fn git_status(path: String) -> Result<Vec<FileStatus>, String> {
+    crate::run_blocking(move || git_status_sync(path)).await
+}
+
+fn git_status_sync(path: String) -> Result<Vec<FileStatus>, String> {
     let repo = open(&path)?;
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
@@ -115,7 +123,11 @@ pub fn git_status(path: String) -> Result<Vec<FileStatus>, String> {
 }
 
 #[tauri::command]
-pub fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+    crate::run_blocking(move || git_branches_sync(path)).await
+}
+
+fn git_branches_sync(path: String) -> Result<Vec<BranchInfo>, String> {
     let repo = open(&path)?;
     let head_name = repo
         .head()
@@ -142,7 +154,11 @@ pub fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
 }
 
 #[tauri::command]
-pub fn git_log(path: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
+pub async fn git_log(path: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    crate::run_blocking(move || git_log_sync(path, limit)).await
+}
+
+fn git_log_sync(path: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
     let repo = open(&path)?;
     let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
     // Topological order across all local branches so the graph has proper lanes.
@@ -195,7 +211,15 @@ pub struct TreeEntry {
 
 /// Structure (not content) of a branch tip's tree at `subpath` ("" = root).
 #[tauri::command]
-pub fn git_branch_files(
+pub async fn git_branch_files(
+    path: String,
+    branch: String,
+    subpath: String,
+) -> Result<Vec<TreeEntry>, String> {
+    crate::run_blocking(move || git_branch_files_sync(path, branch, subpath)).await
+}
+
+fn git_branch_files_sync(
     path: String,
     branch: String,
     subpath: String,
@@ -233,7 +257,19 @@ pub fn git_branch_files(
 
 /// Recent commits reachable from one branch tip.
 #[tauri::command]
-pub fn git_branch_log(path: String, branch: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
+pub async fn git_branch_log(
+    path: String,
+    branch: String,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, String> {
+    crate::run_blocking(move || git_branch_log_sync(path, branch, limit)).await
+}
+
+fn git_branch_log_sync(
+    path: String,
+    branch: String,
+    limit: usize,
+) -> Result<Vec<CommitInfo>, String> {
     let repo = open(&path)?;
     let b = repo
         .find_branch(&branch, BranchType::Local)
@@ -260,7 +296,11 @@ pub fn git_branch_log(path: String, branch: String, limit: usize) -> Result<Vec<
 }
 
 #[tauri::command]
-pub fn git_diff_file(path: String, file: String) -> Result<String, String> {
+pub async fn git_diff_file(path: String, file: String) -> Result<String, String> {
+    crate::run_blocking(move || git_diff_file_sync(path, file)).await
+}
+
+fn git_diff_file_sync(path: String, file: String) -> Result<String, String> {
     let repo = open(&path)?;
     let mut opts = DiffOptions::new();
     opts.pathspec(&file).include_untracked(true).show_untracked_content(true);
@@ -282,7 +322,11 @@ pub fn git_diff_file(path: String, file: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn git_commit_diff(path: String, commit_id: String) -> Result<String, String> {
+pub async fn git_commit_diff(path: String, commit_id: String) -> Result<String, String> {
+    crate::run_blocking(move || git_commit_diff_sync(path, commit_id)).await
+}
+
+fn git_commit_diff_sync(path: String, commit_id: String) -> Result<String, String> {
     let repo = open(&path)?;
     let oid = git2::Oid::from_str(&commit_id).map_err(|e| e.to_string())?;
     let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;

@@ -1,3 +1,4 @@
+import { makeWriteQueue } from "./writeQueue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 
 export interface Session {
@@ -129,11 +130,41 @@ export const bgAgentSessionIds = () =>
 // cost a tab. See `unstoppable_session_ids`.
 export const unstoppableSessionIds = () =>
   invoke<string[]>("unstoppable_session_ids");
-// The session that took over this one's conversation by migrating to the
-// daemon (opening the agents view does this), or null — the normal answer.
-// A tab pinned to the parent shows live text over dead panels until it re-keys.
-export const sessionMigratedTo = (sessionId: string) =>
-  invoke<string | null>("session_migrated_to", { sessionId });
+/** How a conversation left the session id a tab is pinned to.
+ *  - `background`: the agents view moved it to the daemon; the old id is a dead
+ *    end that nothing will write again.
+ *  - `cleared`: `/clear` started a fresh conversation in the same terminal; the
+ *    old id is a finished conversation that stays resumable on its own. */
+export type MoveKind = "background" | "cleared";
+export interface SessionMove {
+  id: string;
+  kind: MoveKind;
+}
+// The session that took over this one's conversation, or null — the normal
+// answer. A tab pinned to the old id shows live text over dead panels until it
+// re-keys, and its live conversation sits unowned in the sidebar.
+export const sessionMovedTo = (sessionId: string) =>
+  invoke<SessionMove | null>("session_moved_to", { sessionId });
+/** A session start one of our claudes reported through its SessionStart hook,
+ *  already resolved to the pty it happened in. `source` is claude's own word
+ *  for why: "startup", "resume", "clear", "compact". */
+export interface SessionEvent {
+  ptyId: number;
+  sessionId: string;
+  source: string;
+}
+// Collect (and consume) the hook reports since last asked. The exact
+// counterpart to the sessionMovedTo heuristic: no inference, just what each
+// claude process said about itself, tied to the pty aiterm ran it in.
+export const drainSessionEvents = () =>
+  invoke<SessionEvent[]>("drain_session_events");
+/** Whether verbose trace capture is on (Settings → Diagnostics). */
+export const traceStatus = () => invoke<boolean>("trace_status");
+/** Toggle verbose trace capture. On: returns the trace.log path (truncated
+ *  fresh); off: returns null. Works in release builds — the filter is
+ *  runtime-reloadable. */
+export const traceSet = (on: boolean) =>
+  invoke<string | null>("trace_set", { on });
 // Journal-visible logging from the webview. Release builds drop the console,
 // so errors the UI catches quietly would otherwise vanish — send the ones
 // worth keeping to stderr, where journalctl already collects them.
@@ -193,6 +224,52 @@ export interface ModelChoice {
 // stays right whether the pill, a typed /model, or a launch flag changed it.
 export const sessionModel = (sessionId: string) =>
   invoke<ModelChoice>("session_model", { sessionId });
+
+// A classifier refusal recorded in a session's transcript — the trigger for the
+// downgrade one-tap. null when the tail holds none.
+export interface Refusal {
+  /** Unique id of the refusal record; dedupe on it so an old one doesn't re-fire. */
+  uuid: string;
+  /** "model_refusal_fallback" (soft switch) or "model_refusal_no_fallback" (hard block). */
+  subtype: string;
+  /** The hard-block case: nothing auto-switched, so restoring is the only move. */
+  hard: boolean;
+  /** The classifier notice, shown verbatim. */
+  content: string;
+  /** The model in use before the switch — the restore target, e.g. "claude-fable-5". */
+  original_model: string | null;
+  /** What it switched to, e.g. "claude-opus-4-8". */
+  fallback_model: string | null;
+  /** The category the classifier assigned, e.g. "cyber". */
+  category: string | null;
+  /** The flagged user message's text — the prompt to hand OpenCode. */
+  refused_prompt: string | null;
+  at: string | null;
+}
+export const sessionRefusal = (sessionId: string) =>
+  invoke<Refusal | null>("session_refusal", { sessionId });
+
+// Run a task on OpenCode headlessly and get its report back. Blocks for the whole
+// run, so call it off the UI path and show progress meanwhile.
+export interface OpencodeReport {
+  session_id: string;
+  text: string;
+}
+export const opencodeDispatch = (
+  prompt: string,
+  cwd: string,
+  provider: string | null,
+  model: string | null,
+) => invoke<OpencodeReport>("opencode_dispatch", { prompt, cwd, provider, model });
+
+// The provider + model OpenCode is configured to launch with (its live startup
+// pin), so a UI dispatch names the same model an interactive tab would open on.
+export interface AgentTarget {
+  provider: string | null;
+  model: string | null;
+}
+export const opencodeDefaultTarget = () =>
+  invoke<AgentTarget>("opencode_default_target");
 export interface UsageBar {
   kind: string;
   label: string;
@@ -250,10 +327,49 @@ export const reindexSessions = () =>
 export const ptySpawn = (
   cwd: string | null, command: string | null, cols: number, rows: number,
   onOutput: Channel<ArrayBuffer>,
-) => invoke<number>("pty_spawn", { cwd, command, cols, rows, onOutput });
-export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
-export const ptyResize = (id: number, cols: number, rows: number) =>
-  invoke<void>("pty_resize", { id, cols, rows });
+  /** Provider id whose API key the backend injects as process environment
+   *  (OPENROUTER_API_KEY) — the key itself never reaches the frontend. */
+  envProvider?: string,
+  /** Model id whose routing the backend compiles into the same environment
+   *  (OPENCODE_CONFIG_CONTENT). The id only: the routing is read from the
+   *  provider store in Rust, so no routing decision crosses IPC. */
+  envModel?: string,
+) => invoke<number>("pty_spawn", {
+  cwd, command, cols, rows, onOutput,
+  envProvider: envProvider ?? null, envModel: envModel ?? null,
+});
+// `pty_write` and `pty_resize` are async commands, so they run on the runtime
+// rather than the GTK main thread — which is what stops a keystroke queueing
+// behind a frame. The cost of that is that two calls are two tasks, and nothing
+// says tasks are polled in the order they were spawned. Both go through a
+// per-pty queue so only one is ever in flight: input keeps its order, and a
+// burst or a paste merges into a single crossing of the IPC boundary.
+export const ptyWrite = makeWriteQueue((id, data) =>
+  invoke<void>("pty_write", { id, data }));
+
+/** Latest size wins — the sizes a window drag passes through on the way are of
+ *  no interest, and an out-of-order pair would leave the pty on the wrong one. */
+const pendingSize = new Map<number, { cols: number; rows: number }>();
+const resizing = new Map<number, Promise<void>>();
+export const ptyResize = (id: number, cols: number, rows: number): Promise<void> => {
+  pendingSize.set(id, { cols, rows });
+  const running = resizing.get(id);
+  if (running) return running;
+  const chain = (async () => {
+    try {
+      for (;;) {
+        const next = pendingSize.get(id);
+        if (!next) return;
+        pendingSize.delete(id);
+        await invoke<void>("pty_resize", { id, cols: next.cols, rows: next.rows });
+      }
+    } finally {
+      resizing.delete(id);
+    }
+  })();
+  resizing.set(id, chain);
+  return chain;
+};
 export const ptyKill = (id: number) => invoke<void>("pty_kill", { id });
 
 export const gitRepoState = (path: string) => invoke<RepoState>("git_repo_state", { path });
@@ -314,6 +430,49 @@ export interface ProviderView {
   /** Last four characters, for telling two keys apart. Empty when there is no
    *  key or it is too short to redact meaningfully. */
   key_hint: string;
+  /** Whether an OpenRouter management key is stored, and its last four. The
+   *  activity endpoint refuses an inference key, so this is the second
+   *  credential a provider can hold — never returned, same as the first. */
+  has_management_key: boolean;
+  management_key_hint: string;
+  /** Model ids picked for the new-session menu — the shortlist, not the
+   *  catalog. */
+  startup_models: string[];
+  /** Account-wide routing rules. Present on every provider; only OpenRouter
+   *  does anything with it. */
+  policy: Policy;
+  /** Per-model routing, keyed by model id. A route outlives its star, so
+   *  re-adding a model to the shortlist restores its pin. */
+  routes: Record<string, Route>;
+}
+
+/** A ceiling in USD per *million* tokens — OpenRouter's unit for `max_price`,
+ *  which is not the per-token unit `/models` and `/endpoints` quote. Either
+ *  field absent means no ceiling on that side; Rust omits an unset one rather
+ *  than sending null. */
+export interface MaxPrice {
+  prompt?: number;
+  completion?: number;
+}
+
+/** Which hosts this account will not use. `resolved_ignore` maps a provider
+ *  slug to why it is out — compiled when the policy is saved, sent verbatim as
+ *  OpenRouter's `ignore`. */
+export interface Policy {
+  blocked_countries: string[];
+  block_unknown_country: boolean;
+  blocked_providers: string[];
+  max_price: MaxPrice;
+  resolved_ignore: Record<string, string>;
+  /** Epoch seconds. 0 means never compiled. */
+  resolved_at: number;
+}
+
+/** What one model prefers. An empty `order` is "no pin". */
+export interface Route {
+  order: string[];
+  allow_fallbacks: boolean;
+  max_price: MaxPrice;
 }
 
 export const providersList = () => invoke<ProviderView[]>("providers_list");
@@ -326,6 +485,309 @@ export const providerDelete = (id: string) =>
 /** Ask the provider for its model list — proves the key and URL actually work. */
 export const providerModels = (id: string) =>
   invoke<string[]>("provider_models", { id });
+
+/** What a provider says about one model. Everything past the id is optional —
+ *  OpenRouter fills all of it, a bare llama.cpp fills none. Prices are USD per
+ *  token as quoted; scale by 1e6 to show $/M. */
+export interface ModelCard {
+  id: string;
+  name: string | null;
+  description: string | null;
+  context_length: number | null;
+  prompt_price: number | null;
+  completion_price: number | null;
+  modalities: string[];
+}
+export const providerModelCards = (id: string) =>
+  invoke<ModelCard[]>("provider_model_cards", { id });
+/** Replace a provider's startup shortlist — what the new-session menu offers. */
+export const providerStartupSet = (id: string, models: string[]) =>
+  invoke<ProviderView[]>("provider_startup_set", { id, models });
+
+/** One host's offer of one model. Prices are USD per token as quoted; scale by
+ *  1e6 to show $/M. `excluded` is why the stored policy rules the row out. */
+export interface EndpointCard {
+  provider_name: string;
+  /** The routing slug — `novita`. What `order` and `ignore` take. */
+  slug: string;
+  /** The full tag — `novita/fp8`. Shown, never sent: a pin cannot name a
+   *  quantization. */
+  tag: string;
+  quantization: string | null;
+  context_length: number | null;
+  prompt_price: number | null;
+  completion_price: number | null;
+  max_completion_tokens: number | null;
+  uptime_30m: number | null;
+  excluded: string | null;
+}
+
+/** One provider in OpenRouter's directory. `headquarters` is often missing,
+ *  which is why `block_unknown_country` is its own decision. */
+export interface DirectoryEntry {
+  slug: string;
+  name: string;
+  headquarters: string | null;
+  datacenters: string[];
+}
+
+/** One day of one model on one host. Account-wide, not app-wide: it includes
+ *  traffic aiterm never launched. */
+export interface ActivityRow {
+  date: string;
+  model: string;
+  provider_name: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** USD. */
+  usage: number;
+}
+
+/** Who hosts this model, annotated against the stored policy. OpenRouter
+ *  only — `/endpoints` on a bare llama.cpp is a 404 nobody can act on. */
+export const providerModelEndpoints = (id: string, model: string) =>
+  invoke<EndpointCard[]>("provider_model_endpoints", { id, model });
+/** Every host OpenRouter knows, with the countries the policy filters on. */
+export const providerDirectory = (id: string) =>
+  invoke<DirectoryEntry[]>("provider_directory", { id });
+/** Compiles the policy against the live directory before saving — a directory
+ *  that will not load fails the save rather than storing an empty rule. */
+export const providerPolicySet = (id: string, policy: Policy) =>
+  invoke<ProviderView[]>("provider_policy_set", { id, policy });
+/** Replace one model's route. An empty `order` clears the pin. */
+export const providerRouteSet = (id: string, model: string, route: Route) =>
+  invoke<ProviderView[]>("provider_route_set", { id, model, route });
+/** Daily spend per model per host. Needs a management key — an inference key
+ *  comes back with OpenRouter's own sentence saying so. */
+export const providerActivity = (id: string) =>
+  invoke<ActivityRow[]>("provider_activity", { id });
+/** Store the management key `/activity` wants, or clear it with `""`. Blank
+ *  does *not* keep the stored one here — unlike `providerSave`, this field has
+ *  a Forget button instead of a rule to remember. */
+export const providerManagementKeySet = (id: string, key: string) =>
+  invoke<ProviderView[]>("provider_management_key_set", { id, key });
+
+/** What an engine supports, so the UI gates on a declaration rather than on an
+ *  agent's name. Snake_case because it arrives straight off `Caps` in Rust. */
+export interface Caps {
+  /** ⑂ in the sidebar. */
+  fork: boolean;
+  /** ✦ re-key. */
+  clear: boolean;
+  /** ▶ — reopen where it left off. */
+  resume: boolean;
+  /** The screen poll in `term/screen.ts` and the Tui* dialogs. */
+  tui_drive: boolean;
+  /** Transcript panels and the `/model` `/effort` `/rewind` pills. */
+  panels: boolean;
+  /** 🗑 — only where the store is one file per session and aiterm's to move.
+   *  Off for OpenCode, whose "file" is the one database holding every OpenCode
+   *  conversation. Hiding the button is the courtesy; `session_delete` refuses
+   *  on the same flag, which is the actual guard. */
+  delete: boolean;
+  /** The engine has configuration aiterm can read — its Settings button. */
+  config: boolean;
+  /** Something outside aiterm reports this engine's liveness (claude's own
+   *  `claude agents` roster). Only claude has one — so for every other engine a
+   *  live tab in this window is the only evidence a session is running. */
+  roster_liveness: boolean;
+}
+
+/** Every registered engine's capabilities, keyed by agent id.
+ *
+ *  The same flags `detectAgents` carries, but free: that one probes PATH and
+ *  runs `--version` per agent, and these gate a render — which buttons a row
+ *  offers, whether the claude-shaped subsystems run against the active tab.
+ *  Fetched once on mount. An id absent from the map is an engine that is no
+ *  longer registered, and the caller treats it as capable of nothing. */
+export const agentCaps = () => invoke<Record<string, Caps>>("agent_caps");
+
+/** Which file set a value. `injected` is aiterm's own --settings file. */
+export type ClaudeLayerId = "user" | "project" | "projectLocal" | "injected";
+
+export interface ClaudeLayer {
+  id: ClaudeLayerId;
+  path: string;
+  present: boolean;
+  /** Why an existing file could not be used. */
+  error: string | null;
+  /** Both the raw editor's starting content and the token a save is compared
+   *  against to detect collisions (file moved under us). */
+  text: string;
+}
+
+export interface ClaudeSetting {
+  key: string;
+  concern: string;
+  effective: unknown;
+  winner: ClaudeLayerId;
+  /** Lowest precedence first, so the last entry is the winner. */
+  setIn: { layer: ClaudeLayerId; value: unknown }[];
+  /** Claude collects this key from every layer that sets it, so the earlier
+   *  entries in `setIn` are also in force — not overridden. */
+  merged: boolean;
+  /** True when a segment of this key's own path contained a literal `.` —
+   *  the dotted `key` string cannot be split back into the path it came
+   *  from, so an inline edit must not be routed through it. */
+  ambiguous: boolean;
+}
+
+export interface ClaudeSettingsView {
+  layers: ClaudeLayer[];
+  settings: ClaudeSetting[];
+  errors: string[];
+  order: string[];
+  /** Flags aiterm adds to every claude launch, from the launcher's own list. */
+  injectedFlags: string[];
+}
+
+export interface ClaudeDoc {
+  source: string;
+  path: string;
+  present: boolean;
+  lines: number;
+  imports: ClaudeDoc[];
+}
+
+export interface ClaudeMcpView {
+  servers: { name: string; scope: string; command: string | null; enabled: boolean | null }[];
+  /** False means nothing local was readable — not the same as none configured. */
+  localConfigRead: boolean;
+  /** One per source that exists but is malformed. */
+  errors: string[];
+}
+
+export interface ClaudeSkill {
+  name: string;
+  description: string;
+  source: string;
+  path: string;
+}
+
+export interface ClaudeSkillsView {
+  skills: ClaudeSkill[];
+  /** Installed plugins switched off in settings, whose skills are therefore
+   *  absent from `skills` — a short list needs that number to be readable. */
+  disabledPlugins: number;
+  errors: string[];
+}
+
+export const claudeSettings = (project: string | null) =>
+  invoke<ClaudeSettingsView>("claude_settings", { project });
+export const claudeInstructions = (project: string | null) =>
+  invoke<ClaudeDoc[]>("claude_instructions", { project });
+export const claudeMcp = (project: string | null) =>
+  invoke<ClaudeMcpView>("claude_mcp", { project });
+export const claudeSkills = (project: string | null) =>
+  invoke<ClaudeSkillsView>("claude_skills", { project });
+
+/** A hook fires a shell command on its own, unattended, so the row it shows
+ *  up in has to carry enough to judge it: which event, which layer put it
+ *  there, and the command in full. */
+export interface ClaudeHook {
+  event: string;
+  matcher: string | null;
+  command: string;
+  layer: string;
+  isAiterm: boolean;
+}
+
+export interface ClaudeHooksView {
+  hooks: ClaudeHook[];
+  errors: string[];
+}
+
+/** Hooks are additive across every layer that sets them — none of them
+ *  "overrides" another — so this exists to show each one with the layer it
+ *  actually came from rather than collapsing them into one winner the way
+ *  `claudeSettings` does for ordinary keys. */
+export const claudeHooks = (project: string | null) =>
+  invoke<ClaudeHooksView>("claude_hooks", { project });
+
+/** Why a save was refused. `collision` is the one the UI must treat specially —
+ *  it means the file moved under us and the answer is to reload, not to fix
+ *  anything. */
+export type ClaudeSaveError =
+  | { kind: "collision" }
+  | { kind: "notAnObject" }
+  | { kind: "invalid"; detail: string }
+  | { kind: "io"; detail: string };
+
+/** Replace one layer's whole file. `loadedText` must be the bytes last read. */
+export const claudeSaveLayer = (path: string, newText: string, loadedText: string) =>
+  invoke<void>("claude_save_layer", { path, newText, loadedText });
+
+/** Change a single key in one layer, applied onto the file as it stands so keys
+ *  the panel does not understand are not dropped. */
+export const claudeSetKey = (
+  path: string,
+  dottedKey: string,
+  value: unknown,
+  loadedText: string,
+) => invoke<void>("claude_set_key", { path, dottedKey, value, loadedText });
+
+/** One reading of the web process's cost counters. Cumulative since it
+ *  started, so a measurement is always the difference between two calls —
+ *  `ok: false` means no web process was found and the numbers mean nothing. */
+export type RendererProbe = { cpuMs: number; gpuMs: number | null; ok: boolean };
+
+/** Sampled either side of a known repaint burst, this is what turns the
+ *  GPU/DOM trade from a claim into a number for the machine in front of you. */
+export const rendererProbe = () => invoke<RendererProbe>("renderer_probe");
+
+/** Put a number on the taskbar icon (0 clears it). Emitted as the Unity
+ *  LauncherEntry D-Bus signal, which Plasma honours — Tauri's own
+ *  `setBadgeCount` goes through libunity and does nothing outside Unity. */
+export const taskbarBadge = (count: number) => invoke<void>("taskbar_badge", { count });
+
+/** Rebuild the tray icon's menu: one row per waiting session. The taskbar icon
+ *  cannot do this — Plasma takes its menu from the .desktop file's static
+ *  Actions — so the count goes there and the list goes in the tray. */
+/** Raise a desktop popup, or update one already on screen by passing its id.
+ *  Returns the daemon's id. Unlike the taskbar count and the tray menu, this
+ *  needs nothing from the desktop — GNOME and Plasma both implement it. */
+export const desktopNotify = (summary: string, body: string, replaces: number) =>
+  invoke<number | null>("desktop_notify", { summary, body, replaces });
+
+/** Take a popup down once the session it was about stops waiting. */
+export const desktopNotifyClose = (id: number) =>
+  invoke<void>("desktop_notify_close", { id });
+
+export const trayAlerts = (alerts: { key: number; title: string; message?: string }[]) =>
+  invoke<void>("tray_alerts", { alerts });
+
+
+/** What the user asked for, in the terms the UI actually has. Which engine
+ *  answers is `launch.rs`'s business — nothing here names one. Sent in
+ *  camelCase, which is what `LaunchRequest` deserializes. */
+export type LaunchRequest =
+  | { kind: "agent"; agentId: string; model: string | null; effort: string | null }
+  | { kind: "apiModel"; providerId: string; modelId: string }
+  | { kind: "resume"; sessionId: string }
+  | { kind: "restart"; sessionId: string }
+  | { kind: "clear"; sessionId: string };
+
+/** Everything a tab needs to open, and nothing about who produced it. */
+export interface LaunchPlan {
+  command: string;
+  /** Provider id whose key `pty_spawn` injects into the tab environment.
+   *  `null` means no key is needed. */
+  env_provider: string | null;
+  /** Model id whose routing `pty_spawn` compiles into the tab environment,
+   *  in the provider catalog's spelling. Set only alongside `env_provider`. */
+  env_model: string | null;
+  /** Non-null = a real session id panels may key to. `null` = the tab needs a
+   *  handle of its own, and nothing should be keyed to it as a session. */
+  session_id: string | null;
+  agent_id: string;
+  caps: Caps;
+}
+
+/** Turn intent into a plan. Rejects when nothing here can start it — the
+ *  caller keeps whatever fallback it had rather than inventing a command. */
+export const resolveLaunch = (request: LaunchRequest) =>
+  invoke<LaunchPlan>("resolve_launch", { request });
 
 /** A model a backend can start on, with the effort levels *that model* takes. */
 export interface ModelOption {
@@ -347,12 +809,6 @@ export interface AgentChoice {
 
 export const agentChoices = () => invoke<AgentChoice[]>("agent_choices");
 
-/** The shell command that starts a session. Built in Rust so command-line
- *  syntax — the one thing that is certainly per-agent — stays with the agent. */
-export const agentLaunchCommand = (
-  agentId: string,
-  spec: { model?: string | null; effort?: string | null; sessionId?: string | null },
-) => invoke<string>("agent_launch_command", { agentId, spec });
 
 /** The id of the session an agent just started in `cwd`, once it exists.
  *

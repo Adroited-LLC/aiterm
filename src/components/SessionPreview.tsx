@@ -5,12 +5,16 @@ interface Props {
   session: Session;
   onResume: (s: Session) => void;
   onClose: () => void;
+  /** Whether this session's engine can be resumed at all. The sidebar's ▶ is
+   *  hidden when it cannot, and this is its twin — offering it here would put
+   *  the same declined request behind a second button. */
+  canResume: boolean;
 }
 
 /** Read-only tail of a session's conversation, shown in the terminal area
  *  when a sidebar item is selected — so you can check it's the right
  *  session before ▶ actually resumes it. */
-export default function SessionPreview({ session, onResume, onClose }: Props) {
+export default function SessionPreview({ session, onResume, onClose, canResume }: Props) {
   const [msgs, setMsgs] = useState<PreviewMsg[] | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
 
@@ -42,9 +46,11 @@ export default function SessionPreview({ session, onResume, onClose }: Props) {
             {"  ·  "}{relTime(session.last_active)}
           </div>
         </div>
-        <button className="preview-resume" onClick={() => onResume(session)}>
-          ▶ Resume session
-        </button>
+        {canResume && (
+          <button className="preview-resume" onClick={() => onResume(session)}>
+            ▶ Resume session
+          </button>
+        )}
         <button className="icon-btn" title="Close preview" onClick={onClose}>✕</button>
       </div>
       <div className="preview-body" ref={bodyRef}>
@@ -64,7 +70,8 @@ export default function SessionPreview({ session, onResume, onClose }: Props) {
         )}
       </div>
       <div className="preview-foot">
-        Preview — showing the last {msgs?.length ?? 0} messages · ▶ resumes claude in this window
+        Preview — showing the last {msgs?.length ?? 0} messages
+        {canResume ? " · ▶ reopens it in this window" : " · reopening isn't available for this one"}
       </div>
     </div>
   );

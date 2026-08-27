@@ -82,9 +82,16 @@ pub async fn list_fonts() -> Vec<FontFamily> {
         .unwrap_or_default()
 }
 
+/// Only fonts that can draw a–z belong in a picker. Fontconfig knows plenty
+/// that can't — the X11 pointer font ("Cursor", which even reports itself
+/// monospace), dingbat and symbol faces — and a terminal grid sized against a
+/// family whose every glyph comes from fallback never lines up.
+const HAS_LETTERS: &str = ":charset=61-7a";
+const MONO_WITH_LETTERS: &str = ":mono:charset=61-7a";
+
 fn list_fonts_blocking() -> Vec<FontFamily> {
-    let mono = fc_families(&[":mono"]);
-    fc_families(&[])
+    let mono = fc_families(&[MONO_WITH_LETTERS]);
+    fc_families(&[HAS_LETTERS])
         .into_iter()
         .map(|name| FontFamily {
             mono: mono.contains(&name),
@@ -261,5 +268,26 @@ mod tests {
     fn refuses_non_font_files() {
         let err = install_font_files_blocking(vec!["/etc/hosts".into()]).unwrap_err();
         assert!(err.contains("not a font file"), "{err}");
+    }
+
+    /// The X11 pointer font ships as family "Cursor", reports itself
+    /// monospace, and contains arrows and hourglasses instead of letters —
+    /// picked as a terminal font it renders the whole grid from fallback
+    /// metrics and nothing lines up. Any family fontconfig knows but which
+    /// cannot draw a–z must not be offered.
+    #[test]
+    fn a_font_with_no_letters_is_not_offered() {
+        if Command::new("fc-list").arg("--version").output().is_err() {
+            return; // no fontconfig on this machine — nothing to assert
+        }
+        let raw = fc_families(&[]);
+        if !raw.iter().any(|f| f == "Cursor") {
+            return; // no specimen installed here — nothing to prove
+        }
+        let offered = list_fonts_blocking();
+        assert!(
+            !offered.iter().any(|f| f.name == "Cursor"),
+            "the pointer font made it into the picker"
+        );
     }
 }

@@ -133,10 +133,22 @@ impl SessionIndex {
     }
 }
 
-/// Extract searchable user/assistant text from a session transcript, capped
-/// so huge sessions don't bloat the index.
-fn extract_texts(path: &Path) -> (String, String) {
-    const CAP: usize = 200_000;
+/// How much of one session's text the index will hold, per role.
+const CAP: usize = 200_000;
+
+/// Extract searchable user/assistant text for a session, capped so huge
+/// sessions don't bloat the index.
+///
+/// The backend that produced the row gets asked first. A session is not always
+/// a file — OpenCode keeps its conversations in a SQLite database, and `path`
+/// for one of its rows is that database — so a reader that only knows how to
+/// open a transcript would index every OpenCode session as having said nothing,
+/// which is the same "visible in the sidebar, invisible to search" split that
+/// Codex used to have. Where the backend answers, the path is never opened.
+fn extract_texts(session: &Session, path: &Path) -> (String, String) {
+    if let Some(msgs) = crate::agents::backend_messages(&session.agent, &session.id) {
+        return texts_from_messages(msgs);
+    }
     let mut user = String::new();
     let mut assistant = String::new();
     let Ok(file) = File::open(path) else {
@@ -183,6 +195,34 @@ fn extract_texts(path: &Path) -> (String, String) {
     (user, assistant)
 }
 
+/// The same two buckets, from a conversation a backend handed over whole.
+///
+/// Kept in step with the loop above deliberately: the same cap, the same
+/// user/assistant split, and the same rule that a message which is nothing but
+/// an injected system block is not something anyone said. What you can search
+/// for must not depend on where the session happened to be stored.
+fn texts_from_messages(msgs: Vec<(String, String)>) -> (String, String) {
+    let mut user = String::new();
+    let mut assistant = String::new();
+    for (role, text) in msgs {
+        if user.len() >= CAP && assistant.len() >= CAP {
+            break;
+        }
+        if crate::sessions::is_only_system_block(&text) {
+            continue;
+        }
+        let bucket = match role.as_str() {
+            "user" => &mut user,
+            _ => &mut assistant,
+        };
+        if bucket.len() < CAP {
+            bucket.push_str(&text);
+            bucket.push('\n');
+        }
+    }
+    (user, assistant)
+}
+
 #[derive(Serialize)]
 pub struct ReindexResult {
     pub indexed: usize,
@@ -192,7 +232,11 @@ pub struct ReindexResult {
 /// Bring the index up to date with the session store (mtime-based, so only
 /// new/changed transcripts get re-read).
 #[tauri::command]
-pub fn reindex_sessions() -> ReindexResult {
+pub async fn reindex_sessions() -> ReindexResult {
+    crate::run_blocking(reindex_sessions_sync).await
+}
+
+fn reindex_sessions_sync() -> ReindexResult {
     let sessions = crate::agents::scan_all_with_paths();
     let total = sessions.len();
     let Some(idx) = global() else {
@@ -207,7 +251,7 @@ pub fn reindex_sessions() -> ReindexResult {
         if idx.stored_mtime(&s.id) == Some(s.last_active) {
             continue;
         }
-        let (user_text, assistant_text) = extract_texts(path);
+        let (user_text, assistant_text) = extract_texts(s, path);
         idx.upsert(s, s.last_active, &user_text, &assistant_text);
         indexed += 1;
     }
@@ -219,7 +263,11 @@ pub fn reindex_sessions() -> ReindexResult {
 
 /// Ranked full-text search across titles, project dirs, and message text.
 #[tauri::command]
-pub fn search_sessions(query: String) -> Vec<Session> {
+pub async fn search_sessions(query: String) -> Vec<Session> {
+    crate::run_blocking(move || search_sessions_sync(query)).await
+}
+
+fn search_sessions_sync(query: String) -> Vec<Session> {
     let Some(idx) = global() else { return vec![] };
     let by_id: std::collections::HashMap<String, Session> = crate::agents::scan_all_with_paths()
         .into_iter()

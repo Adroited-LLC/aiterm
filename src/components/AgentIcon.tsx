@@ -49,6 +49,19 @@ export default function AgentIcon({ agent, size = 16 }: { agent: string; size?: 
     );
   }
 
+  if (agent === "opencode") {
+    // `</>` — the one mark here that says "code" rather than naming a vendor,
+    // and the only free-floating one: every other glyph has an outline, so at
+    // 16px the silhouette alone separates it from the generic terminal below.
+    return (
+      <svg {...common} fill="none" stroke="currentColor" strokeWidth="1.8"
+        strokeLinecap="round" strokeLinejoin="round">
+        <path d="M9.3 8.4 5.4 12l3.9 3.6M14.7 8.4 18.6 12l-3.9 3.6" />
+        <path d="M13.3 6.4 10.7 17.6" opacity="0.65" />
+      </svg>
+    );
+  }
+
   // Anything else: a generic terminal, so an unknown source is still legible.
   return (
     <svg {...common} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">

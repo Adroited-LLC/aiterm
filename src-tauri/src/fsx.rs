@@ -19,7 +19,11 @@ pub struct ProjectInfo {
 /// All project directories under ~/Projects, whether or not they still have
 /// Claude sessions (transcripts get purged after cleanupPeriodDays).
 #[tauri::command]
-pub fn list_projects() -> Vec<ProjectInfo> {
+pub async fn list_projects() -> Vec<ProjectInfo> {
+    crate::run_blocking(list_projects_sync).await
+}
+
+fn list_projects_sync() -> Vec<ProjectInfo> {
     let Some(home) = dirs::home_dir() else {
         return vec![];
     };
@@ -59,7 +63,11 @@ pub fn list_projects() -> Vec<ProjectInfo> {
 
 /// Open a file with the desktop's default application.
 #[tauri::command]
-pub fn open_path(path: String) -> Result<(), String> {
+pub async fn open_path(path: String) -> Result<(), String> {
+    crate::run_blocking(move || open_path_sync(path)).await
+}
+
+fn open_path_sync(path: String) -> Result<(), String> {
     std::process::Command::new("xdg-open")
         .arg(&path)
         .spawn()
@@ -68,7 +76,11 @@ pub fn open_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+pub async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    crate::run_blocking(move || list_dir_sync(path)).await
+}
+
+fn list_dir_sync(path: String) -> Result<Vec<DirEntry>, String> {
     let mut entries: Vec<DirEntry> = std::fs::read_dir(&path)
         .map_err(|e| e.to_string())?
         .flatten()

@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
@@ -13,16 +14,25 @@ import "@xterm/xterm/css/xterm.css";
  *  built-in DOM renderer left behind. Guarded so that if WebGL can't init (no
  *  GPU context) the terminal is never worse than the DOM default. On GPU
  *  context loss, dispose so xterm reverts to the DOM renderer rather than
- *  freezing on a dead canvas. */
-function attachRenderer(term: Terminal) {
+ *  freezing on a dead canvas.
+ *
+ *  Returns the addon so a settings change can take it away again: disposing a
+ *  WebglAddon is how xterm is told to go back to drawing in the DOM, and there
+ *  is no other switch. `null` means the terminal is already on the DOM
+ *  renderer, whether by choice or because WebGL would not start. */
+function attachRenderer(term: Terminal): WebglAddon | null {
   try {
     const webgl = new WebglAddon();
     webgl.onContextLoss(() => webgl.dispose());
     term.loadAddon(webgl);
+    return webgl;
   } catch {
     /* WebGL unavailable — xterm's built-in DOM renderer remains */
+    return null;
   }
 }
+
+export type { TermProgress };
 
 export interface TermTab {
   key: number;
@@ -31,6 +41,28 @@ export interface TermTab {
   command: string | null;
   /** Claude session id when this tab was opened via resume. */
   sessionId?: string;
+  /** The session id this tab was deliberately opened to reopen — set by resume
+   *  and by the ended-tab restart, unset for a fresh start.
+   *
+   *  What the migration watcher checks before re-keying a tab away from its
+   *  pinned id: "this tab asked for that conversation" is a fact the tab knows,
+   *  and it used to be inferred by sniffing the command text for `--resume
+   *  <id>`. That inference broke the moment the command grew shell quoting. */
+  resumedId?: string;
+  /** Provider whose key the backend injects into this tab's environment. */
+  envProvider?: string;
+  /** Model whose routing the backend compiles into this tab's environment.
+   *  The id only — the routing itself is read from the provider store in
+   *  Rust and never passes through here. */
+  envModel?: string;
+  /** The engine running in this tab, as `LaunchPlan.agent_id` named it.
+   *
+   *  Not decoration: it is what the app looks a tab's capabilities up by, and
+   *  so what decides whether the screen poll, the `/model` `/effort` `/rewind`
+   *  pills and the tasks panel run against it at all. Undefined for a tab with
+   *  no engine — a plain shell — which is the same answer as an engine that is
+   *  no longer registered: capable of nothing. */
+  agentId?: string;
   /** Dedupe key linking this terminal to a sidebar item: a session id for
    *  resumes, "shell:<path>" for project shells. One terminal per slot. */
   slotId: string;
@@ -62,6 +94,10 @@ export interface TermTab {
 
 /** Control surface a mounted terminal registers with the app. */
 export interface TermHandle {
+  /** The backend pty this terminal runs on. What lets a SessionStart hook
+   *  report — "session X started in process Y" — be traced to a tab: the
+   *  backend resolves Y's ancestry to a pty, and this is the other end. */
+  ptyId: number;
   /** Send raw bytes to the PTY. */
   write: (data: string) => void;
   /** Force a clean TUI repaint (SIGWINCH jiggle) — Ctrl+Shift+L. */
@@ -98,6 +134,12 @@ interface Props {
   onActivity: (key: number) => void;
   /** Bell = the program wants eyes (claude prompts ring it); typing clears. */
   onAttention: (key: number, on: boolean) => void;
+  /** What the program wants eyes *for*. A bell is one byte and carries no
+   *  payload; OSC 9 carries the sentence. It arrives on this tab's own pty, so
+   *  no pid-to-tab lookup is needed to know who is asking. */
+  onNotify: (key: number, message: string) => void;
+  /** OSC 9;4 progress. `null` means the program withdrew it. */
+  onProgress: (key: number, progress: TermProgress | null) => void;
   /** Focus the terminal when it becomes active. Once true only while the
    *  composer was hidden, back when the composer held a text input that would
    *  have been fighting for the same keystrokes. It is a pill strip now, so
@@ -109,18 +151,28 @@ interface Props {
   lineHeight: number;
   /** Weight for ordinary text; bold is derived from it. */
   fontWeight: number;
+  /** Which renderer draws this terminal — see `AppSettings.termRenderer`. */
+  renderer: "gpu" | "dom";
   theme: Record<string, string>;
 }
 
 export default function TerminalView({
-  tab, active, onExit, onRegister, onActivity, onAttention, autoFocus, fontSize, fontFamily,
-  lineHeight, fontWeight, theme,
+  tab, active, onExit, onRegister, onActivity, onAttention, onNotify, onProgress,
+  autoFocus, fontSize, fontFamily, lineHeight, fontWeight, renderer, theme,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
   const ptyIdRef = useRef<number | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  /** The live WebGL addon, when one is attached. Held because switching back to
+   *  the DOM renderer is done by disposing it. */
+  const webglRef = useRef<WebglAddon | null>(null);
+  /** Read inside the mount effect, which must not re-run when the setting
+   *  changes — a new Terminal would mean a new PTY. The effect below switches
+   *  the renderer under the terminal that already exists. */
+  const rendererRef = useRef(renderer);
+  rendererRef.current = renderer;
 
   useEffect(() => {
     if (!elRef.current || started.current) return;
@@ -145,7 +197,9 @@ export default function TerminalView({
     termRef.current = term;
     term.loadAddon(fit);
     term.open(elRef.current);
-    attachRenderer(term);
+    if (rendererRef.current === "gpu") {
+      webglRef.current = attachRenderer(term);
+    }
     fit.fit();
 
     let unlistenExit: UnlistenFn | null = null;
@@ -170,7 +224,10 @@ export default function TerminalView({
     };
 
     (async () => {
-      const id = await ptySpawn(tab.cwd, tab.command, term.cols, term.rows, onOutput);
+      const id = await ptySpawn(
+        tab.cwd, tab.command, term.cols, term.rows, onOutput,
+        tab.envProvider, tab.envModel,
+      );
       if (disposed) {
         ptyKill(id);
         return;
@@ -198,6 +255,33 @@ export default function TerminalView({
       let pending = 0;
 
       term.onBell(() => onAttention(tab.key, true));
+
+      // Returning true claims the sequence. Nothing else in aiterm reads OSC 9,
+      // and an unclaimed sequence is passed through to be printed, which would
+      // spray notification text into the buffer.
+      term.parser.registerOscHandler(9, (data) => {
+        const parsed = parseOsc9(data);
+        if (parsed?.kind === "progress") {
+          onProgress(tab.key, parsed.progress);
+        } else if (parsed?.kind === "message") {
+          onNotify(tab.key, parsed.message);
+          onAttention(tab.key, true);
+        }
+        return true;
+      });
+      // Shift+Enter means "new line", not "send". A PTY has no key for that —
+      // Shift+Enter arrives as the same \r as Enter — but backslash-return is
+      // already the continuation gesture claude's composer understands, the
+      // shell treats as an escaped newline, and aiterm chat reads the same
+      // way. So the interception simply types it for you.
+      term.attachCustomKeyEventHandler((ev) => {
+        if (ev.type === "keydown" && ev.key === "Enter" && ev.shiftKey) {
+          pending += 1; // the line is definitely not empty now
+          ptyWrite(id, "\\\r");
+          return false;
+        }
+        return true;
+      });
       term.onData((data) => {
         onAttention(tab.key, false);
         if (data === "\r" || data === "\n" || data === "\x03") pending = 0;
@@ -208,6 +292,7 @@ export default function TerminalView({
       term.onResize(({ cols, rows }) => ptyResize(id, cols, rows));
 
       onRegister(tab.key, {
+        ptyId: id,
         write: (data) => ptyWrite(id, data),
         redraw,
         paste: (text) => {
@@ -283,6 +368,29 @@ export default function TerminalView({
       fitRef.current?.fit();
     }
   }, [fontSize]);
+
+  /** Swap the renderer under a running terminal.
+   *
+   *  Neither direction touches the PTY, so the session carries on through the
+   *  change — which is the point of making it a setting rather than something
+   *  that only applies to the next tab: the two can be compared on the same
+   *  screenful of output. A refit and full repaint follow because the new
+   *  renderer inherits nothing from the old one's surface. */
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    const live = webglRef.current;
+    if (renderer === "gpu" && !live) {
+      webglRef.current = attachRenderer(term);
+    } else if (renderer === "dom" && live) {
+      live.dispose();
+      webglRef.current = null;
+    } else {
+      return;
+    }
+    fitRef.current?.fit();
+    term.refresh(0, term.rows - 1);
+  }, [renderer]);
 
   useEffect(() => {
     const term = termRef.current;

@@ -1,41 +1,87 @@
 pub mod agents;
 pub mod cache;
+pub mod chat;
+pub mod claudecfg;
 pub mod diag;
 pub mod fonts;
 pub mod fsx;
 pub mod git;
+pub mod hooklink;
 pub mod indexer;
+pub mod launch;
+pub mod mcp;
+pub mod notify;
+pub mod opencode;
+pub mod opencode_agent;
 pub mod providers;
+pub mod rendercost;
 pub mod pty;
 pub mod sessions;
+pub mod taskbar;
+pub mod trace;
+pub mod tray;
 pub mod usage;
 pub mod watcher;
 pub mod winstate;
 
+/// Run a blocking body on the async runtime's blocking pool. Tauri executes
+/// non-async commands on the GTK main thread, where every millisecond is a
+/// frame — a command routed through here costs the main loop nothing.
+pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .expect("blocking command panicked")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    trace::init();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty::PtyManager::default())
         .manage(watcher::WatchState::default())
-        .invoke_handler(tauri::generate_handler![
+        // Wrapped so a debug build logs every IPC call before it dispatches.
+        // In release `log_invokes` is the identity function and the generated
+        // handler is passed straight through — see `trace.rs`.
+        .invoke_handler(trace::log_invokes(tauri::generate_handler![
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
             agents::detect_agents,
+            agents::agent_caps,
+            rendercost::renderer_probe,
+            claudecfg::claude_settings,
+            claudecfg::claude_save_layer,
+            claudecfg::claude_set_key,
+            claudecfg::claude_instructions,
+            claudecfg::claude_mcp,
+            claudecfg::claude_skills,
+            claudecfg::claude_hooks,
+            taskbar::taskbar_badge,
+            notify::desktop_notify,
+            notify::desktop_notify_close,
+            tray::tray_alerts,
             agents::adopt_agent_session,
             diag::diag_log_path,
             diag::diag_log_tail,
             diag::diag_environment,
             agents::agent_choices,
-            agents::agent_launch_command,
+            launch::resolve_launch,
             providers::providers_list,
             providers::provider_save,
             providers::provider_delete,
             providers::provider_models,
+            providers::provider_model_cards,
+            providers::provider_model_endpoints,
+            providers::provider_startup_set,
+            providers::provider_directory,
+            providers::provider_policy_set,
+            providers::provider_route_set,
+            providers::provider_activity,
+            providers::provider_management_key_set,
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,
@@ -50,7 +96,7 @@ pub fn run() {
             sessions::running_session_ids,
             sessions::bg_agent_session_ids,
             sessions::unstoppable_session_ids,
-            sessions::session_migrated_to,
+            sessions::session_moved_to,
             sessions::ui_log,
             sessions::live_session_ids,
             sessions::stop_session,
@@ -61,6 +107,12 @@ pub fn run() {
             sessions::claude_model_default,
             sessions::restore_claude_model_default,
             sessions::session_model,
+            sessions::session_refusal,
+            opencode_agent::opencode_dispatch,
+            opencode_agent::opencode_default_target,
+            hooklink::drain_session_events,
+            trace::trace_set,
+            trace::trace_status,
             usage::usage_limits,
             fonts::list_fonts,
             fonts::font_packages,
@@ -80,7 +132,7 @@ pub fn run() {
             git::git_log,
             git::git_diff_file,
             git::git_commit_diff,
-        ])
+        ]))
         .setup(|app| {
             // First line of every log: which build this is and what launched
             // it. The crash that took an hour to pin down last night was an
@@ -99,6 +151,10 @@ pub fn run() {
                     .unwrap_or_else(|| "?".into())
             );
 
+            // The settings file claude launches load their SessionStart hook
+            // from. Every launch, because it embeds this binary's path.
+            hooklink::install();
+
             // Push sessions-list refreshes when an agent's transcripts change
             // (new/cleared/forked sessions) instead of waiting for the 30s poll.
             if let Err(e) = watcher::watch_claude_projects(app.handle().clone()) {
@@ -107,6 +163,12 @@ pub fn run() {
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.
+            // The tray is where a waiting session can be reached from while
+            // aiterm is behind something. Failing to create one is not worth
+            // refusing to start over.
+            if let Err(e) = tray::init(app.handle()) {
+                crate::diag!("tray", "could not create tray icon: {e}");
+            }
             winstate::correct_restored_size(app.handle());
             // Then measure what actually landed, once the compositor has
             // settled the surface, and remember it for next launch.
