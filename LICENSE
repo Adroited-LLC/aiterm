@@ -8,13 +8,20 @@ are granted.
 You may:
 
   1. read, clone, and build this software for your own personal use;
-  2. open issues and submit contributions to it.
+  2. modify it for your own personal use, or to prepare a contribution to it;
+  3. open issues and submit contributions to it.
 
-You may not, without prior written permission from Adroited LLC:
+A work derived from this software — any fork, port, modified copy, or work
+that incorporates part of it — remains subject to this notice. You may not,
+without prior written permission from Adroited LLC:
 
-  1. use or run it for any commercial purpose;
-  2. publish, distribute, sublicense, or sell it, in whole or in part;
-  3. remove or alter this notice, or claim authorship of any part of it.
+  1. use or run this software, or any work derived from it, for any
+     commercial purpose;
+  2. sell this software or any work derived from it, or charge any fee for
+     it, or include it in anything sold;
+  3. publish, distribute, or sublicense this software or any work derived
+     from it, in whole or in part;
+  4. remove or alter this notice, or claim authorship of any part of it.
 
 Any contribution submitted to this project is submitted on the understanding
 that copyright in it is assigned to Adroited LLC.
