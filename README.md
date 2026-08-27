@@ -4,6 +4,11 @@ A desktop workbench for running [Claude Code](https://claude.com/claude-code) se
 
 Built with Tauri 2, React, and xterm.js. Linux-first (developed and packaged on Fedora); the stack is cross-platform but other platforms are untested.
 
+> **Work in progress.** aiterm is built around one person's daily use and
+> released often, so interfaces move, rough edges are expected, and nothing here
+> is promised to be stable. It is developed in the open but is not open source —
+> see [LICENSE](LICENSE) before using it or anything derived from it.
+
 ## What it does
 
 - **Real terminals.** Each tab is a native PTY running `claude` (or a plain shell). No re-implementation of the CLI — the terminal is the terminal.
