@@ -5,9 +5,10 @@ A desktop workbench for running [Claude Code](https://claude.com/claude-code) se
 Built with Tauri 2, React, and xterm.js. Linux-first (developed and packaged on Fedora); the stack is cross-platform but other platforms are untested.
 
 > **Work in progress.** aiterm is built around one person's daily use and
-> released often, so interfaces move, rough edges are expected, and nothing here
-> is promised to be stable. It is developed in the open but is not open source —
-> see [LICENSE](LICENSE) before using it or anything derived from it.
+> released often, so interfaces move and rough edges are expected. Free to
+> build, run and modify for your own use, at home or at work — but it is not
+> open source: it may not be sold, offered as a service, or redistributed.
+> See [LICENSE](LICENSE).
 
 ## What it does
 
