@@ -3,6 +3,7 @@ use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,10 +43,31 @@ struct PendingEnrollment {
     expires_at: SystemTime,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PendingPairing {
+    pub id: String,
+    pub name: String,
+    pub fingerprint: String,
+    pub requested_at: u64,
+}
+
+struct PendingDevice {
+    view: PendingPairing,
+    public_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingOutcome {
+    Approved(TrustedDevice),
+    Denied,
+}
+
 #[derive(Default)]
 struct StoreState {
     devices: Vec<StoredDevice>,
-    pending: Vec<PendingEnrollment>,
+    enrollments: Vec<PendingEnrollment>,
+    pending_pairings: Vec<PendingDevice>,
+    pairing_outcomes: HashMap<String, PairingOutcome>,
 }
 
 pub struct DeviceStore {
@@ -74,7 +96,9 @@ impl DeviceStore {
             root,
             state: Mutex::new(StoreState {
                 devices,
-                pending: Vec::new(),
+                enrollments: Vec::new(),
+                pending_pairings: Vec::new(),
+                pairing_outcomes: HashMap::new(),
             }),
         })
     }
@@ -86,21 +110,23 @@ impl DeviceStore {
             .checked_add(ENROLLMENT_LIFETIME)
             .ok_or_else(|| AuthError::new("pairing.invalid_time", "pairing time overflow"))?;
         let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
-        state.pending.retain(|item| item.expires_at >= now);
-        state.pending.push(PendingEnrollment { secret, expires_at });
+        state.enrollments.retain(|item| item.expires_at >= now);
+        state
+            .enrollments
+            .push(PendingEnrollment { secret, expires_at });
         Ok(EnrollmentQr { secret })
     }
 
-    pub fn approve_at(
+    pub fn submit_pairing_at(
         &self,
         secret: &[u8],
         device_name: &str,
         public_key: &[u8],
         now: SystemTime,
-    ) -> Result<TrustedDevice, AuthError> {
+    ) -> Result<PendingPairing, AuthError> {
         let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
         let Some(position) = state
-            .pending
+            .enrollments
             .iter()
             .position(|item| bool::from(item.secret.as_slice().ct_eq(secret)))
         else {
@@ -111,7 +137,7 @@ impl DeviceStore {
         };
         // Consume before validation: a failed or denied request never gets a
         // second attempt with the same QR secret.
-        let pending = state.pending.remove(position);
+        let pending = state.enrollments.remove(position);
         if now > pending.expires_at {
             return Err(AuthError::new(
                 "pairing.expired",
@@ -132,22 +158,96 @@ impl DeviceStore {
         let canonical_key = verifying_key.to_encoded_point(true);
         let canonical_bytes = canonical_key.as_bytes();
         let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical_bytes));
-        let view = TrustedDevice {
+        let view = PendingPairing {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             fingerprint,
+            requested_at: unix_seconds(now),
+        };
+        state.pending_pairings.push(PendingDevice {
+            view: view.clone(),
+            public_key: URL_SAFE_NO_PAD.encode(canonical_bytes),
+        });
+        Ok(view)
+    }
+
+    pub fn approve_pairing_at(
+        &self,
+        request_id: &str,
+        now: SystemTime,
+    ) -> Result<TrustedDevice, AuthError> {
+        let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
+        let position = state
+            .pending_pairings
+            .iter()
+            .position(|pairing| pairing.view.id == request_id)
+            .ok_or_else(|| {
+                AuthError::new("pairing.unknown_request", "pairing request does not exist")
+            })?;
+        let pending = state.pending_pairings.remove(position);
+        let view = TrustedDevice {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: pending.view.name,
+            fingerprint: pending.view.fingerprint,
             created_at: unix_seconds(now),
             last_seen_at: None,
         };
         let stored = StoredDevice {
             view: view.clone(),
-            public_key: URL_SAFE_NO_PAD.encode(canonical_bytes),
+            public_key: pending.public_key,
         };
         let mut devices = state.devices.clone();
         devices.push(stored);
         persist_devices(&self.root.join(DEVICES_FILE), &devices)?;
         state.devices = devices;
+        state.pairing_outcomes.insert(
+            request_id.to_string(),
+            PairingOutcome::Approved(view.clone()),
+        );
         Ok(view)
+    }
+
+    pub fn approve_at(
+        &self,
+        secret: &[u8],
+        device_name: &str,
+        public_key: &[u8],
+        now: SystemTime,
+    ) -> Result<TrustedDevice, AuthError> {
+        let pending = self.submit_pairing_at(secret, device_name, public_key, now)?;
+        self.approve_pairing_at(&pending.id, now)
+    }
+
+    pub fn list_pending_pairings(&self) -> Vec<PendingPairing> {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .pending_pairings
+                    .iter()
+                    .map(|pairing| pairing.view.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn take_pairing_outcome(&self, request_id: &str) -> Option<PairingOutcome> {
+        self.state.lock().ok()?.pairing_outcomes.remove(request_id)
+    }
+
+    pub fn deny_pairing(&self, request_id: &str) -> Result<bool, AuthError> {
+        let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
+        let original_len = state.pending_pairings.len();
+        state
+            .pending_pairings
+            .retain(|pairing| pairing.view.id != request_id);
+        if state.pending_pairings.len() == original_len {
+            return Ok(false);
+        }
+        state
+            .pairing_outcomes
+            .insert(request_id.to_string(), PairingOutcome::Denied);
+        Ok(true)
     }
 
     pub fn verify_proof(
@@ -248,7 +348,7 @@ fn unix_seconds(time: SystemTime) -> u64 {
 }
 
 #[cfg(unix)]
-fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
@@ -260,7 +360,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -270,13 +370,13 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn set_private_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
+pub(crate) fn set_private_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn set_private_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
+pub(crate) fn set_private_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
