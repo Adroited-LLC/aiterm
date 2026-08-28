@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { UsageAmount, UsageBar, UsageSource, relTime } from "../ipc";
+import BrandIcon from "./BrandIcon";
+import { brandForUsageSource } from "../brand";
 
 /**
  * How much of everything you have left, for every service aiterm can see.
@@ -199,7 +201,10 @@ function SourceCard({ src }: { src: UsageSourceAt }) {
   return (
     <div className="usage-src">
       <div className="usage-src-head">
-        <span className="usage-src-name">{src.name}</span>
+        <span className="usage-src-name">
+          <BrandIcon name={brandForUsageSource(src.id, src.name)} size={14} className="inline" />
+          {src.name}
+        </span>
         {src.plan && <span className="usage-src-plan">{src.plan}</span>}
         <span className="usage-src-spacer" />
         {src.account && <span className="usage-src-acct" title={src.account}>{src.account}</span>}
@@ -325,7 +330,10 @@ export function UsagePanel({ sources, onRefresh, refreshing }: Props) {
           const h = s.state === "ok" ? headline(s) : { text: "—", severity: "none" };
           return (
             <span key={s.id} className={"usage-chip sev-" + h.severity}>
-              <span className="usage-chip-name">{s.name}</span>
+              <span className="usage-chip-name">
+                <BrandIcon name={brandForUsageSource(s.id, s.name)} size={12} className="inline" />
+                {s.name}
+              </span>
               <span className="usage-chip-value">{h.text}</span>
               <span
                 className="usage-chip-rule"

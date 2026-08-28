@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { AgentChoice, ProviderView, agentChoices, providersList } from "../ipc";
 import AgentIcon from "./AgentIcon";
+import BrandIcon from "./BrandIcon";
+import { brandForModel } from "../brand";
 
 /**
  * What to start, once a directory is chosen.
@@ -192,6 +194,14 @@ export default function StartControls({ ctl, onOpenModelAccess }: Props) {
       </div>
       <div className="ns-selects">
         {isApi ? (
+          <>
+          {/* The vendor of the chosen model, since a native select cannot
+              draw one per option. */}
+          <BrandIcon
+            name={brandForModel(apiModel ? (JSON.parse(apiModel) as [string, string])[1] : null)}
+            size={14}
+            className="ns-model-brand"
+          />
           <select
             className="ns-select"
             value={apiModel}
@@ -206,6 +216,7 @@ export default function StartControls({ ctl, onOpenModelAccess }: Props) {
               </optgroup>
             ))}
           </select>
+          </>
         ) : (
           <select
             className="ns-select"

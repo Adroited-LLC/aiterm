@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
+import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
 import { followRekey } from "../selection";
@@ -780,7 +781,10 @@ export default function SessionsPanel({
           onSelect(s);
         }}
       >
-        <div className={"agent-badge" + (s.agent === "claude" ? " claude" : "")}>
+        <div
+          className={"agent-badge" + (s.agent === "claude" ? " claude" : "") + agentTint(s.agent).className}
+          style={agentTint(s.agent).style}
+        >
           <AgentIcon agent={s.agent} />
           {/* Green: the session is running. Whether aiterm also has a tab for
               it is still tracked (`hasTab`, for the row's actions) but no
@@ -987,7 +991,10 @@ export default function SessionsPanel({
         className={"session-item pending-item" + (isShowing ? " active showing" : "")}
         onClick={() => onSelectPending(p.id)}
       >
-        <div className={"agent-badge" + (p.agent === "claude" ? " claude" : "")}>
+        <div
+          className={"agent-badge" + (p.agent === "claude" ? " claude" : "") + agentTint(p.agent).className}
+          style={agentTint(p.agent).style}
+        >
           <AgentIcon agent={p.agent} />
           <span
             className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}

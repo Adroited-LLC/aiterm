@@ -22,6 +22,7 @@ import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
 import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
+import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
 import { UsagePanel, UsageSourceAt, mergeUsage } from "./components/UsagePanel";
@@ -2108,7 +2109,9 @@ export default function App() {
                   view, so there is still a way back from a file. */}
               {!activeTabObj && (
                 <button
-                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")}
+                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")
+                    + agentTint(previewSession?.agent).className}
+                  style={agentTint(previewSession?.agent).style}
                   title={previewSession?.project_path ?? undefined}
                   onClick={() => setActiveFileTab(null)}
                 >
@@ -2122,7 +2125,9 @@ export default function App() {
               )}
               {activeTabObj && (
                 <button
-                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")}
+                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")
+                    + agentTint(activeTabObj.agentId).className}
+                  style={agentTint(activeTabObj.agentId).style}
                   title={activeTabObj.cwd ?? undefined}
                   onClick={() => {
                     setActiveFileTab(null);

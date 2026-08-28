@@ -1,6 +1,7 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
+import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
@@ -510,6 +511,7 @@ export default function SettingsModal({
                         <span className={"agent-dot" + (a.available ? " on" : "")} />
                         <div className="agent-text">
                           <div className="agent-name">
+                            <AgentIcon agent={a.id} size={14} />
                             {a.display_name}
                             <span className="agent-state">
                               {a.available ? (a.version ?? "installed") : "not installed"}
