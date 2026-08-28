@@ -18,7 +18,8 @@ Built with Tauri 2, React, and xterm.js. Linux-first (developed and packaged on 
 - **Dialogs over the TUI.** Claude's own `/model`, `/rewind`, permission prompts, and the "Switch model?" confirm are detected from the screen and presented as real dialogs — keyboard-first, closed-loop (every keystroke is verified against what the TUI actually drew), and honest about failure. The TUI underneath stays the source of truth.
 - **Composer pills.** Model, effort, tasks, artifacts, running agents, permission mode, git, and usage — read live from the session transcript and Claude's config, so they stay right no matter who changed them.
 - **Usage.** Plan limits (the same data as `/usage`) as compact bars, plus the session's context-window fill read from the transcript.
-- **Panels.** File explorer, git (branches, log, per-file diffs with inotify-driven refresh), and an agents view for background sessions.
+- **Panels.** File explorer, git (branches, log, per-file diffs with inotify-driven refresh), and an agents view for background sessions. The Agent panel's tasks and artifacts read Claude Code, Grok, and Codex sessions — each engine's own on-disk shape.
+- **File tabs.** The center is a browser-style tab strip: the session's terminal in a locked tab, and files from the explorer (or the artifacts list) opening beside it in an in-app CodeMirror editor — syntax highlighting, search, Ctrl+S save with a conflict guard so an agent's concurrent write is never silently clobbered.
 - **Comforts.** Themes, font picker with system font install, per-panel layout persistence, window-state restore, attention bell when a session needs input.
 
 ## Running it

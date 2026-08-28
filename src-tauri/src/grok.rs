@@ -200,6 +200,109 @@ fn user_query(body: &str) -> String {
     }
 }
 
+/// The session's task list, from `todo_write` calls in the transcript.
+/// `merge:false` replaces the whole list — the common case — and
+/// `merge:true` upserts by id, so the list is replayed rather than
+/// last-write-wins.
+pub fn parse_tasks(text: &str) -> Vec<crate::sessions::SessionTask> {
+    let mut tasks: Vec<crate::sessions::SessionTask> = Vec::new();
+    for line in text.lines() {
+        if !line.contains("todo_write") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else { continue };
+        for call in calls {
+            if call.get("name").and_then(|n| n.as_str()) != Some("todo_write") {
+                continue;
+            }
+            // Arguments arrive as a JSON string, not an object.
+            let Some(args) = call
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+            else {
+                continue;
+            };
+            let Some(todos) = args.get("todos").and_then(|t| t.as_array()) else { continue };
+            if !args.get("merge").and_then(|m| m.as_bool()).unwrap_or(false) {
+                tasks.clear();
+            }
+            for t in todos {
+                let (Some(id), Some(content)) = (
+                    t.get("id").and_then(|x| x.as_str()),
+                    t.get("content").and_then(|x| x.as_str()),
+                ) else {
+                    continue;
+                };
+                let status = t
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("pending")
+                    .to_string();
+                if let Some(existing) = tasks.iter_mut().find(|x| x.id == id) {
+                    existing.subject = content.to_string();
+                    existing.status = status;
+                } else {
+                    tasks.push(crate::sessions::SessionTask {
+                        id: id.to_string(),
+                        subject: content.to_string(),
+                        status,
+                        active_form: None,
+                        blocked_by: vec![],
+                    });
+                }
+            }
+        }
+    }
+    tasks
+}
+
+/// Files the session wrote, from `write` and `search_replace` calls, newest
+/// touch first. Grok records carry no timestamps, so `at` stays empty and
+/// the order is the transcript's own; the panel shows no time for these
+/// rather than a made-up one.
+pub fn parse_artifacts(text: &str) -> Vec<crate::sessions::Artifact> {
+    let mut order: Vec<String> = Vec::new();
+    let mut tool_of: std::collections::HashMap<String, &'static str> = Default::default();
+    for line in text.lines() {
+        if !line.contains("file_path") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else { continue };
+        for call in calls {
+            let tool = match call.get("name").and_then(|n| n.as_str()) {
+                Some("write") | Some("create_file") => "Write",
+                Some("search_replace") | Some("edit_file") | Some("apply_patch") => "Edit",
+                _ => continue,
+            };
+            let Some(fp) = call
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                .and_then(|args| args.get("file_path").and_then(|f| f.as_str()).map(String::from))
+            else {
+                continue;
+            };
+            if let Some(pos) = order.iter().position(|p| p == &fp) {
+                order.remove(pos);
+            }
+            tool_of.insert(fp.clone(), tool);
+            order.push(fp);
+        }
+    }
+    order
+        .into_iter()
+        .rev()
+        .map(|path| crate::sessions::Artifact {
+            tool: tool_of[&path].to_string(),
+            path,
+            at: String::new(),
+        })
+        .collect()
+}
+
 impl SessionProvider for GrokSessions {
     fn scan_with_paths(&self) -> Vec<(Session, PathBuf)> {
         sessions_root().map(|r| scan_dir(&r)).unwrap_or_default()
@@ -216,6 +319,18 @@ impl SessionProvider for GrokSessions {
         let dir = session_dir(session_id)?;
         let text = std::fs::read_to_string(dir.join("chat_history.jsonl")).ok()?;
         Some(parse_messages(&text))
+    }
+
+    fn tasks(&self, session_id: &str) -> Option<Vec<crate::sessions::SessionTask>> {
+        let dir = session_dir(session_id)?;
+        let text = std::fs::read_to_string(dir.join("chat_history.jsonl")).ok()?;
+        Some(parse_tasks(&text))
+    }
+
+    fn artifacts(&self, session_id: &str) -> Option<Vec<crate::sessions::Artifact>> {
+        let dir = session_dir(session_id)?;
+        let text = std::fs::read_to_string(dir.join("chat_history.jsonl")).ok()?;
+        Some(parse_artifacts(&text))
     }
 }
 
@@ -299,7 +414,7 @@ impl AgentBackend for GrokBackend {
     /// TUI driving, no transcript panels: both read claude's shapes. No
     /// delete — see the module doc.
     fn caps(&self) -> Caps {
-        Caps { resume: true, clear: true, ..Default::default() }
+        Caps { resume: true, clear: true, tasks: true, ..Default::default() }
     }
 
     /// `grok --resume <id>`: "UUID-shaped values always mean IDs".
@@ -448,5 +563,38 @@ mod tests {
             "grok --resume 'e63b0f22-7d69-4084-aaf3-733816255e8e'"
         );
         assert_eq!(GrokBackend.clear("abc").unwrap(), "grok --session-id 'abc'");
+    }
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+
+    #[test]
+    fn todo_write_replays_replace_and_merge() {
+        let log = concat!(
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"todo_write","arguments":"{\"todos\":[{\"id\":\"1\",\"content\":\"Load context\",\"status\":\"in_progress\"},{\"id\":\"2\",\"content\":\"Pull data\",\"status\":\"pending\"}],\"merge\":false}"}]}"#, "\n",
+            r#"{"type":"tool_result","content":"ok"}"#, "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"todo_write","arguments":"{\"todos\":[{\"id\":\"1\",\"content\":\"Load context\",\"status\":\"completed\"}],\"merge\":true}"}]}"#, "\n",
+        );
+        let tasks = parse_tasks(log);
+        assert_eq!(tasks.len(), 2, "merge:true updates in place, it does not truncate");
+        assert_eq!(tasks[0].status, "completed");
+        assert_eq!(tasks[1].subject, "Pull data");
+    }
+
+    #[test]
+    fn artifacts_read_newest_first_with_the_last_tool_kept() {
+        let log = concat!(
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"write","arguments":"{\"file_path\":\"/tmp/a.py\",\"content\":\"x\"}"}]}"#, "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"write","arguments":"{\"file_path\":\"/tmp/b.md\",\"content\":\"y\"}"}]}"#, "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"search_replace","arguments":"{\"file_path\":\"/tmp/a.py\",\"new_string\":\"z\"}"}]}"#, "\n",
+        );
+        let arts = parse_artifacts(log);
+        assert_eq!(arts.len(), 2);
+        assert_eq!(arts[0].path, "/tmp/a.py", "last touched leads");
+        assert_eq!(arts[0].tool, "Edit", "the write was later edited");
+        assert_eq!(arts[1].tool, "Write");
+        assert_eq!(arts[0].at, "", "grok records carry no timestamps — none is invented");
     }
 }

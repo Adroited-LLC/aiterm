@@ -70,6 +70,12 @@ pub struct Caps {
     /// Transcript panels — tasks, artifacts, agents — and the composer pills
     /// that send `/model`, `/effort` and `/rewind`.
     pub panels: bool,
+    /// The Agent panel's Tasks and Artifacts tabs — this engine records a task
+    /// list and file edits in a shape aiterm knows how to read. Separate from
+    /// `panels`: that flag also turns on the `/model` `/effort` `/rewind`
+    /// pills, which speak claude's slash commands — an engine can be readable
+    /// here without being steerable there.
+    pub tasks: bool,
     /// 🗑 — move this session to `~/.claude/trash`.
     ///
     /// Off by default, and that direction matters more here than anywhere else
@@ -319,6 +325,7 @@ impl AgentBackend for ClaudeBackend {
             resume: true,
             tui_drive: true,
             panels: true,
+            tasks: true,
             delete: true,
             config: true,
             roster_liveness: true,
@@ -571,6 +578,304 @@ fn read_codex_row(path: &std::path::Path) -> Option<(Session, std::path::PathBuf
     ))
 }
 
+/// Index just past `key:` / `"key":` in `s`, or `None`. Tolerant of both
+/// spellings because codex plans exist on disk in both — quoted when the
+/// arguments were serialized, bare when the model typed object-literal
+/// shorthand into the exec runtime.
+fn after_key(s: &str, key: &str) -> Option<usize> {
+    for probe in [format!("\"{key}\""), key.to_string()] {
+        let mut from = 0;
+        while let Some(i) = s[from..].find(&probe) {
+            let at = from + i + probe.len();
+            let tail = s[at..].trim_start();
+            if let Some(rest) = tail.strip_prefix(':') {
+                return Some(s.len() - rest.len());
+            }
+            from = at;
+        }
+    }
+    None
+}
+
+/// The slice inside the first balanced `open…close` pair, respecting
+/// double-quoted strings — a plan step's own text may contain brackets.
+fn balanced(s: &str, open: char, close: char) -> Option<&str> {
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    let mut start = None;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+        } else if c == open {
+            depth += 1;
+            if depth == 1 {
+                start = Some(i + c.len_utf8());
+            }
+        } else if c == close {
+            if depth == 1 {
+                return Some(&s[start?..i]);
+            }
+            depth = depth.saturating_sub(1);
+        }
+    }
+    None
+}
+
+/// Top-level `{…}` object slices inside array content, string-aware.
+fn top_objects(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => {
+                depth += 1;
+                if depth == 1 {
+                    start = i + 1;
+                }
+            }
+            '}' => {
+                if depth == 1 {
+                    out.push(&s[start..i]);
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A double-quoted string at the (whitespace-trimmed) head of `s`, with
+/// escapes resolved.
+fn quoted_string_at(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let mut chars = s.chars();
+    if chars.next() != Some('"') {
+        return None;
+    }
+    let (mut out, mut esc) = (String::new(), false);
+    for c in chars {
+        if esc {
+            out.push(match c {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                other => other,
+            });
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+fn string_value(obj: &str, key: &str) -> Option<String> {
+    quoted_string_at(&obj[after_key(obj, key)?..])
+}
+
+/// The `plan:[…]` steps out of JavaScript source calling
+/// `tools.update_plan({…})` — what current codex CLIs actually write to the
+/// rollout: the plan tool is reached through the exec JS runtime, so the
+/// arguments are source text, not JSON. Returns `(step, status)` pairs.
+pub fn extract_js_plan(input: &str) -> Option<Vec<(String, String)>> {
+    let at = input.find("update_plan")?;
+    let rest = &input[at + "update_plan".len()..];
+    let arr = balanced(&rest[after_key(rest, "plan")?..], '[', ']')?;
+    let steps: Vec<(String, String)> = top_objects(arr)
+        .into_iter()
+        .filter_map(|obj| {
+            Some((
+                string_value(obj, "step")?,
+                string_value(obj, "status").unwrap_or_else(|| "pending".into()),
+            ))
+        })
+        .collect();
+    (!steps.is_empty()).then_some(steps)
+}
+
+/// File paths named by an `apply_patch` envelope embedded in an exec input.
+/// The patch rides inside a JS string literal, so its newlines are the
+/// two-character `\n` — a path ends at the first backslash, quote or real
+/// newline, whichever comes first.
+pub fn patch_paths(input: &str) -> Vec<(String, &'static str)> {
+    let mut out = Vec::new();
+    for (marker, tool) in [("*** Add File: ", "Write"), ("*** Update File: ", "Edit")] {
+        let mut from = 0;
+        while let Some(i) = input[from..].find(marker) {
+            let start = from + i + marker.len();
+            let end = input[start..]
+                .find(|c: char| c == '\\' || c == '"' || c == '\n' || c == '\r')
+                .map(|e| start + e)
+                .unwrap_or(input.len());
+            let path = input[start..end].trim();
+            if !path.is_empty() {
+                out.push((path.to_string(), tool));
+            }
+            from = end;
+        }
+    }
+    out
+}
+
+fn plan_json_steps(v: &serde_json::Value) -> Option<Vec<(String, String)>> {
+    let arr = v.get("plan")?.as_array()?;
+    let steps: Vec<(String, String)> = arr
+        .iter()
+        .filter_map(|s| {
+            Some((
+                s.get("step")?.as_str()?.to_string(),
+                s.get("status")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("pending")
+                    .to_string(),
+            ))
+        })
+        .collect();
+    (!steps.is_empty()).then_some(steps)
+}
+
+/// The session's task list: its last `update_plan` call, since the tool's
+/// semantics are replace-the-list. Both on-disk spellings are read — a
+/// native `update_plan` call with JSON arguments, and the exec-embedded JS
+/// form observed on codex 0.149.
+pub fn codex_tasks(session_id: &str) -> Vec<crate::sessions::SessionTask> {
+    use std::io::BufRead;
+    let mut last: Option<Vec<(String, String)>> = None;
+    for path in codex_session_files(session_id) {
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if !line.contains("update_plan") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(p) = v.get("payload") else { continue };
+            // Call side only — outputs echo the same text back.
+            let pt = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if pt != "custom_tool_call" && pt != "function_call" {
+                continue;
+            }
+            let plan = if p.get("name").and_then(|n| n.as_str()) == Some("update_plan") {
+                p.get("arguments")
+                    .or_else(|| p.get("input"))
+                    .and_then(|a| a.as_str())
+                    .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                    .as_ref()
+                    .and_then(plan_json_steps)
+            } else {
+                p.get("input").and_then(|i| i.as_str()).and_then(extract_js_plan)
+            };
+            if plan.is_some() {
+                last = plan;
+            }
+        }
+    }
+    last.unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (step, status))| crate::sessions::SessionTask {
+            id: (i + 1).to_string(),
+            subject: step,
+            status: match status.as_str() {
+                "completed" | "in_progress" => status,
+                _ => "pending".to_string(),
+            },
+            active_form: None,
+            blocked_by: vec![],
+        })
+        .collect()
+}
+
+/// Files the session wrote — `patch_apply_end` events (approved patches,
+/// which carry a structured `changes` map) and `apply_patch` envelopes
+/// inside exec calls. Writes done through plain shell redirection are
+/// invisible here; this is the subset codex records structurally.
+pub fn codex_artifacts(session_id: &str) -> Vec<crate::sessions::Artifact> {
+    use std::io::BufRead;
+    let mut latest: std::collections::HashMap<String, (String, String)> = Default::default();
+    for path in codex_session_files(session_id) {
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if !line.contains("apply_patch") && !line.contains("patch_apply_end") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let ts = v
+                .get("timestamp")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let Some(p) = v.get("payload") else { continue };
+            match p.get("type").and_then(|t| t.as_str()) {
+                Some("patch_apply_end") => {
+                    if p.get("success").and_then(|b| b.as_bool()) == Some(false) {
+                        continue;
+                    }
+                    let Some(changes) = p.get("changes").and_then(|c| c.as_object()) else {
+                        continue;
+                    };
+                    for (fp, ch) in changes {
+                        let tool = match ch.get("type").and_then(|t| t.as_str()) {
+                            Some("add") => "Write",
+                            Some("update") => "Edit",
+                            _ => continue,
+                        };
+                        latest.insert(fp.clone(), (tool.to_string(), ts.clone()));
+                    }
+                }
+                Some("custom_tool_call") | Some("function_call") => {
+                    let Some(input) = p
+                        .get("input")
+                        .or_else(|| p.get("arguments"))
+                        .and_then(|i| i.as_str())
+                    else {
+                        continue;
+                    };
+                    for (fp, tool) in patch_paths(input) {
+                        latest.insert(fp, (tool.to_string(), ts.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out: Vec<crate::sessions::Artifact> = latest
+        .into_iter()
+        .map(|(path, (tool, at))| crate::sessions::Artifact { path, tool, at })
+        .collect();
+    out.sort_by(|a, b| b.at.cmp(&a.at));
+    out
+}
+
 impl SessionProvider for CodexSessions {
     fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
         codex_root().map(|r| scan_codex_dir(&r)).unwrap_or_default()
@@ -587,6 +892,14 @@ impl SessionProvider for CodexSessions {
             .into_iter()
             .find(|(s, _)| s.id == session_id)
             .map(|(_, p)| p)
+    }
+
+    fn tasks(&self, session_id: &str) -> Option<Vec<crate::sessions::SessionTask>> {
+        Some(codex_tasks(session_id))
+    }
+
+    fn artifacts(&self, session_id: &str) -> Option<Vec<crate::sessions::Artifact>> {
+        Some(codex_artifacts(session_id))
     }
 }
 
@@ -622,7 +935,7 @@ impl AgentBackend for CodexBackend {
     /// OpenCode out, whose one shared database a per-row delete would have handed
     /// away wholesale.)
     fn caps(&self) -> Caps {
-        Caps { resume: true, delete: true, ..Default::default() }
+        Caps { resume: true, delete: true, tasks: true, ..Default::default() }
     }
 
     /// `codex resume <SESSION_ID>` — reopen a session by its UUID, confirmed on
@@ -2007,6 +2320,7 @@ mod tests {
                 resume: true,
                 tui_drive: true,
                 panels: true,
+                tasks: true,
                 delete: true,
                 config: true,
                 roster_liveness: true,
@@ -2014,7 +2328,7 @@ mod tests {
         );
         assert_eq!(
             CodexBackend.caps(),
-            Caps { resume: true, delete: true, ..Default::default() }
+            Caps { resume: true, delete: true, tasks: true, ..Default::default() }
         );
         assert_eq!(
             OpenCodeBackend.caps(),
@@ -2235,3 +2549,41 @@ mod tests {
 
 
 
+
+#[cfg(test)]
+mod codex_panel_tests {
+    use super::*;
+
+    #[test]
+    fn a_js_plan_with_bare_keys_is_read() {
+        let input = "const p = await tools.update_plan({plan:[\n  {step:\"Snapshot state\",status:\"in_progress\"},\n  {step:\"Implement [phase 2]\",status:\"pending\"}\n]}); text(p);\n";
+        let plan = extract_js_plan(input).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0], ("Snapshot state".to_string(), "in_progress".to_string()));
+        assert_eq!(plan[1].0, "Implement [phase 2]", "brackets inside a step are not structure");
+    }
+
+    #[test]
+    fn a_js_plan_with_quoted_keys_and_an_explanation_is_read() {
+        let input = concat!(
+            "const p = await tools.update_plan({explanation:\"baseline done\",",
+            "\"plan\":[{\"step\":\"Copy new2 to new3\",\"status\":\"completed\"},",
+            "{\"step\":\"Wire cancellation\",\"status\":\"in_progress\"}]}); text(p);"
+        );
+        let plan = extract_js_plan(input).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0], ("Copy new2 to new3".to_string(), "completed".to_string()));
+        assert_eq!(plan[1].1, "in_progress");
+    }
+
+    #[test]
+    fn patch_paths_stop_at_the_escaped_newline() {
+        // Inside an exec input the patch is a JS string literal, so its
+        // newlines are the two characters backslash-n.
+        let input = "const patch = \"*** Begin Patch\\n*** Add File: /tmp/a.md\\n+hello\\n*** Update File: /tmp/b.rs\\n+world\\n*** End Patch\";";
+        let paths = patch_paths(input);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], ("/tmp/a.md".to_string(), "Write"));
+        assert_eq!(paths[1], ("/tmp/b.rs".to_string(), "Edit"));
+    }
+}
