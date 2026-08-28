@@ -348,6 +348,23 @@ export interface ProjectInfo {
 export const watchProject = (path: string) => invoke<void>("watch_project", { path });
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
 export const openPath = (path: string) => invoke<void>("open_path", { path });
+
+/** A text file for the in-app viewer — see `fsx.rs`. */
+export interface TextFile {
+  content: string;
+  /** mtime the content was read at; the save's compare-and-swap token. */
+  mtime_ms: number;
+  /** Only the head of a >2 MB file — shown read-only. */
+  truncated: boolean;
+}
+
+export const readTextFile = (path: string) =>
+  invoke<TextFile>("read_text_file", { path });
+/** Returns the new mtime. Rejects with "changed-on-disk" when the file moved
+ *  past `expectedMtimeMs`; pass null to overwrite deliberately. */
+export const writeTextFile = (
+  path: string, content: string, expectedMtimeMs: number | null,
+) => invoke<number>("write_text_file", { path, content, expectedMtimeMs });
 export const listProjects = () => invoke<ProjectInfo[]>("list_projects");
 export const searchSessions = (query: string) =>
   invoke<Session[]>("search_sessions", { query });
@@ -613,6 +630,10 @@ export interface Caps {
   tui_drive: boolean;
   /** Transcript panels and the `/model` `/effort` `/rewind` pills. */
   panels: boolean;
+  /** The Agent panel's Tasks and Artifacts tabs — the engine records a task
+   *  list and file edits aiterm can read. Separate from `panels`, which also
+   *  turns on pills that speak claude's slash commands. */
+  tasks: boolean;
   /** 🗑 — only where the store is one file per session and aiterm's to move.
    *  Off for OpenCode, whose "file" is the one database holding every OpenCode
    *  conversation. Hiding the button is the courtesy; `session_delete` refuses

@@ -5,8 +5,11 @@ import {
 } from "../ipc";
 
 interface Props {
-  /** Claude session id of the active terminal tab, if it's a claude tab. */
+  /** Session id of the active terminal tab, when its engine records tasks
+   *  and artifacts aiterm can read (`caps.tasks`). */
   sessionId: string | null;
+  /** Open an artifact in a center file tab instead of the system app. */
+  onOpenFile?: (path: string) => void;
 }
 
 function statusIcon(t: SessionTask) {
@@ -16,7 +19,7 @@ function statusIcon(t: SessionTask) {
   return <span className="task-icon">○</span>;
 }
 
-export default function AgentPanel({ sessionId }: Props) {
+export default function AgentPanel({ sessionId, onOpenFile }: Props) {
   const [tab, setTab] = useState<"tasks" | "artifacts">("tasks");
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -46,8 +49,8 @@ export default function AgentPanel({ sessionId }: Props) {
   if (!sessionId) {
     return (
       <div className="empty-note">
-        Tasks and artifacts appear here for engines that record them. Claude
-        Code is the only one that does today.
+        Tasks and artifacts appear here for engines that record them —
+        Claude Code, Grok, and Codex today.
       </div>
     );
   }
@@ -123,7 +126,8 @@ export default function AgentPanel({ sessionId }: Props) {
               key={a.path}
               className="task-row artifact-row"
               title={`${a.path} (${a.tool})`}
-              onClick={() => openPath(a.path).catch(() => {})}
+              onClick={() =>
+                onOpenFile ? onOpenFile(a.path) : openPath(a.path).catch(() => {})}
             >
               <span className={"artifact-tool " + a.tool.toLowerCase()}>
                 {a.tool === "Write" ? "W" : "E"}
@@ -132,7 +136,9 @@ export default function AgentPanel({ sessionId }: Props) {
                 {a.path.split("/").pop()}
                 <span className="artifact-dir"> {homeAbbrev(a.path).replace(/\/[^/]*$/, "")}</span>
               </span>
-              <span className="artifact-time">{relTime(new Date(a.at).getTime())}</span>
+              {a.at && (
+                <span className="artifact-time">{relTime(new Date(a.at).getTime())}</span>
+              )}
             </div>
           ))}
         </div>

@@ -3261,3 +3261,165 @@ input[type="range"]::-webkit-slider-thumb {
    and `SessionsPanel`'s delete confirm — never `window.confirm`, which is a
    native dialog that would block the whole window, terminal tabs included. */
 .acfg-hook-confirm { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+/* ---------- center tab strip + in-app file tabs ---------- */
+
+.center-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 4px 6px 0;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: none;
+}
+.center-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 5px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  background: none;
+  color: var(--text-faint);
+  font-size: 12px;
+  max-width: 220px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.center-tab:hover:not(.on) { background: var(--bg-hover); color: var(--text); }
+.center-tab.on {
+  background: var(--bg);
+  color: var(--text);
+  border-color: var(--border);
+}
+.center-tab.locked { font-weight: 600; }
+.center-tab-name { overflow: hidden; text-overflow: ellipsis; }
+.center-tab-shell { font-size: 11px; color: var(--accent); }
+.center-tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+.center-tab-close {
+  margin-left: 2px;
+  padding: 0 3px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  line-height: 1.2;
+}
+.center-tab-close:hover { background: var(--bg-hover); color: var(--text); }
+.center-tab-close.arm { background: #a94438; color: #fff; }
+
+.file-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  background: var(--bg);
+}
+.file-view { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.file-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  flex: none;
+}
+.file-bar-path {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+}
+.file-bar-note { color: var(--text-faint); }
+.file-bar-btn:disabled { opacity: 0.45; cursor: default; }
+.file-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  flex: none;
+}
+.file-banner.error { color: #e07d72; }
+.file-banner .danger { color: #e07d72; }
+.file-editor { flex: 1; min-height: 0; overflow: hidden; }
+.file-editor .cm-editor {
+  height: 100%;
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+}
+.file-editor .cm-editor.cm-focused { outline: none; }
+.file-editor .cm-scroller {
+  font-family: var(--font-mono, monospace);
+  line-height: 1.55;
+}
+.file-editor .cm-gutters {
+  background: var(--bg-panel);
+  color: var(--text-faint);
+  border-right: 1px solid var(--border);
+}
+.file-editor .cm-activeLine { background: color-mix(in srgb, var(--bg-hover) 55%, transparent); }
+.file-editor .cm-activeLineGutter { background: var(--bg-hover); }
+.file-editor .cm-selectionBackground,
+.file-editor .cm-content ::selection { background: var(--bg-active); }
+.file-editor .cm-cursor { border-left-color: var(--text); }
+.file-editor .cm-panels {
+  background: var(--bg-raised);
+  color: var(--text);
+  border-color: var(--border);
+}
+.file-editor .cm-panels input, .file-editor .cm-panels button {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+/* Syntax tokens (classHighlighter): mid-luminance, readable on every theme. */
+.tok-keyword { color: #c678dd; }
+.tok-atom, .tok-bool { color: #d19a66; }
+.tok-number { color: #d19a66; }
+.tok-string, .tok-string2 { color: #98c379; }
+.tok-comment { color: #8a919f; font-style: italic; }
+.tok-typeName, .tok-className, .tok-namespace { color: #e5c07b; }
+.tok-propertyName, .tok-labelName { color: #e06c75; }
+.tok-variableName { color: var(--text); }
+.tok-definition.tok-variableName { color: #61afef; }
+.tok-function.tok-variableName, .tok-macroName { color: #61afef; }
+.tok-operator { color: #56b6c2; }
+.tok-meta, .tok-punctuation { color: var(--text-dim); }
+.tok-link { color: #61afef; text-decoration: underline; }
+.tok-heading { color: #61afef; font-weight: 600; }
+.tok-emphasis { font-style: italic; }
+.tok-strong { font-weight: 700; }
+.tok-invalid { color: #e07d72; }
+
+/* File rows in the explorer grow a hover affordance for the system app. */
+.tree-ext {
+  visibility: hidden;
+  margin-left: auto;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 4px;
+  border-radius: 4px;
+}
+.tree-row:hover .tree-ext { visibility: visible; }
+.tree-ext:hover { background: var(--bg-hover); color: var(--text); }

@@ -30,8 +30,14 @@ function FileIcon() {
 }
 
 export default function FileExplorer({
-  root, refreshKey = 0,
-}: { root: string | null; refreshKey?: number }) {
+  root, refreshKey = 0, onOpenFile,
+}: {
+  root: string | null;
+  refreshKey?: number;
+  /** Open a file in a center tab. Absent, files fall back to the system
+   *  app — the pre-tab behaviour. */
+  onOpenFile?: (path: string) => void;
+}) {
   const [tree, setTree] = useState<Node[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [openErr, setOpenErr] = useState<string | null>(null);
@@ -124,13 +130,25 @@ export default function FileExplorer({
         <div
           className="tree-row"
           style={{ paddingLeft: 8 + n.depth * 14 }}
-          onClick={() => toggleNode(n)}
-          onDoubleClick={() => !n.is_dir && openFile(n.path)}
+          onClick={() =>
+            n.is_dir ? toggleNode(n)
+              : onOpenFile ? onOpenFile(n.path)
+                : openFile(n.path)}
           title={n.path}
         >
           {n.is_dir ? <Chevron open={n.expanded} /> : <span className="chevron-spacer" />}
           {n.is_dir ? <FolderIcon /> : <FileIcon />}
           <span className="tree-name">{n.name}</span>
+          {!n.is_dir && onOpenFile && (
+            <button
+              className="tree-ext"
+              title="Open with the system app"
+              onClick={(e) => {
+                e.stopPropagation();
+                openFile(n.path);
+              }}
+            >↗</button>
+          )}
         </div>
         {n.expanded && n.children && renderNodes(n.children)}
       </div>
