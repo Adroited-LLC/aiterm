@@ -406,7 +406,9 @@ export default function SettingsSection({ project }: { project: string | null })
           <code key={f} className="acfg-flag">{f}</code>
         ))}
         <div className="acfg-empty">
-          These two are on every claude aiterm launches.
+          {view.injectedFlags.length > 0
+            ? "This is claude's current permission mode — change it in Settings → Agents."
+            : "Claude starts in its own default permission mode — change it in Settings → Agents."}
           {view.injectedFlags.some((f) => f.includes("skip-permissions")) &&
             " Permission prompts are off in these sessions."}
         </div>

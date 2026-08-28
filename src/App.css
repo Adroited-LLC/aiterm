@@ -3115,6 +3115,22 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 /* Claude Code configuration panel — a drill-down from the Agents list. */
+/* Permission preset per engine, in its Agents row. */
+.agent-perm { margin-top: 7px; }
+.agent-perm-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.agent-perm-label .ns-select { flex: none; }
+.agent-perm-note {
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
 .agent-config-btn {
   margin-left: auto;
   background: var(--bg-raised);

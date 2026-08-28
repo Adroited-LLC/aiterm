@@ -11,6 +11,7 @@ import {
 import {
   Caps, FontFamily, FontPackage,
   AgentDetection, detectAgents, homeAbbrev,
+  AgentPermissions, agentPermissions, agentPermissionSet,
   fontPackages, installFontFiles, installFontPackage, listFonts,
   diagEnvironment, diagLogPath, diagLogTail, openPath,
   traceSet, traceStatus,
@@ -138,8 +139,20 @@ export default function SettingsModal({
   // opens and when explicitly re-checked — never on a timer. `null` is "not
   // asked yet", which is a different thing to show than an empty list.
   const [agents, setAgents] = useState<AgentDetection[] | null>(null);
-  const refreshAgents = () => detectAgents().then(setAgents).catch(() => setAgents([]));
+  // Permission presets per engine, keyed by agent id for the row that renders
+  // them. Loaded alongside detection — it is one small file read.
+  const [perms, setPerms] = useState<AgentPermissions[]>([]);
+  const refreshAgents = () => {
+    detectAgents().then(setAgents).catch(() => setAgents([]));
+    agentPermissions().then(setPerms).catch(() => setPerms([]));
+  };
   useEffect(() => { if (tab === "agents" && agents === null) refreshAgents(); }, [tab, agents]);
+  // A change takes effect on the next session the engine opens; the returned
+  // list is authoritative, so the dropdown reflects exactly what was stored.
+  const setPermission = (agentId: string, mode: string) => {
+    setPerms((prev) => prev.map((p) => (p.agent_id === agentId ? { ...p, selected: mode } : p)));
+    agentPermissionSet(agentId, mode).then(setPerms).catch(() => refreshAgents());
+  };
 
   // Diagnostics: what aiterm is and what it has been doing. Read on demand —
   // the log tail is a file read and the environment spawns a detect, so
@@ -517,6 +530,32 @@ export default function SettingsModal({
                               sessions, so aiterm adopts the id once it starts.
                             </div>
                           )}
+                          {/* How much this engine asks before acting, applied
+                              to every session aiterm starts or resumes for it.
+                              Only shown for an installed engine that has a
+                              permission switch — the API chat harness has none. */}
+                          {a.available && (() => {
+                            const p = perms.find((x) => x.agent_id === a.id);
+                            if (!p) return null;
+                            const cur = p.modes.find((m) => m.id === p.selected);
+                            return (
+                              <div className="agent-perm">
+                                <label className="agent-perm-label">
+                                  Permissions
+                                  <select
+                                    className="ns-select"
+                                    value={p.selected}
+                                    onChange={(e) => setPermission(a.id, e.target.value)}
+                                  >
+                                    {p.modes.map((m) => (
+                                      <option key={m.id} value={m.id}>{m.label}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                                {cur && <div className="agent-perm-note">{cur.note}</div>}
+                              </div>
+                            );
+                          })()}
                         </div>
                         {capsOf(a.id).config && a.available && (
                           <button className="agent-config-btn" onClick={() => setConfigFor(a)}>

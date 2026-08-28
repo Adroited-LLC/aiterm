@@ -144,6 +144,22 @@ pub struct ModelOption {
     pub default_effort: Option<String>,
 }
 
+/// One way an engine can be told how much to ask before acting, spelled the
+/// way that engine spells it. See `permissions.rs` for how one is chosen.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+pub struct PermissionMode {
+    /// Stable id, the thing stored. Where the engine names the mode itself
+    /// (claude's and grok's `--permission-mode` values) that name is used, so
+    /// the file reads the way the engine's own docs do.
+    pub id: &'static str,
+    pub label: &'static str,
+    /// One line on what it does, in the engine's own terms.
+    pub note: &'static str,
+    /// The flags it is spelled as, each a complete `--flag value` group.
+    /// Empty for the engine's own default, which is "pass nothing".
+    pub flags: &'static [&'static str],
+}
+
 /// What to start. Every field optional — the honest default for all of them is
 /// "whatever the agent would do on its own", which is not the same as any value
 /// we could pick for it.
@@ -222,6 +238,15 @@ pub trait AgentBackend: Send + Sync {
         Caps::default()
     }
 
+    /// The permission modes this engine can be opened in, the first being what
+    /// aiterm uses when nothing is stored. Empty where the engine has no such
+    /// switch — the API chat harness — and the setting then does not show.
+    /// Applied by the launch resolver to every start, resume and clear, never
+    /// by `launch` itself: see `permissions.rs`.
+    fn permission_modes(&self) -> &'static [PermissionMode] {
+        &[]
+    }
+
     /// The command that reopens an existing session. `None` where the engine
     /// cannot be told to resume — the caller keeps whatever fallback it had.
     fn resume(&self, session_id: &str) -> Option<String> {
@@ -284,17 +309,87 @@ pub(crate) fn q(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// The flags every claude aiterm launches carries.
+/// Claude's permission modes, from `claude --help` 2.1.220's `--permission-mode`
+/// choices, plus `--dangerously-skip-permissions` for the one that never asks.
 ///
-/// Public and used by the launcher below, so the configuration panel can show
-/// what a session actually starts with instead of a hand-copied list that will
-/// eventually disagree with it.
-///
-/// `--allow-dangerously-skip-permissions` is the consequential one: it disables
-/// the permission prompt outright. Kept from the frontend's old `CLAUDE_CMD`,
-/// reasoning unchanged.
-pub const CLAUDE_LAUNCH_FLAGS: &[&str] =
-    &["--permission-mode auto", "--allow-dangerously-skip-permissions"];
+/// The first is the flag pair every claude launch carried before this was a
+/// setting (the frontend's old `CLAUDE_CMD`, relocated), so a fresh install
+/// behaves as it always did. `--allow-dangerously-skip-permissions` rides
+/// along with every asking mode: it does not skip anything itself, it makes
+/// "bypass permissions" reachable from claude's own shift+tab cycle, which the
+/// composer's mode pill relies on.
+pub const CLAUDE_PERMISSION_MODES: &[PermissionMode] = &[
+    PermissionMode {
+        id: "auto",
+        label: "Auto",
+        note: "Claude's auto mode: routine actions run, the rest ask. What aiterm has always started with.",
+        flags: &["--permission-mode auto", "--allow-dangerously-skip-permissions"],
+    },
+    PermissionMode {
+        id: "manual",
+        label: "Ask for everything",
+        note: "Every tool call waits for approval.",
+        flags: &["--permission-mode manual", "--allow-dangerously-skip-permissions"],
+    },
+    PermissionMode {
+        id: "acceptEdits",
+        label: "Accept edits",
+        note: "File edits run without asking; commands still ask.",
+        flags: &["--permission-mode acceptEdits", "--allow-dangerously-skip-permissions"],
+    },
+    PermissionMode {
+        id: "plan",
+        label: "Plan mode",
+        note: "Reads and plans, changes nothing until told to.",
+        flags: &["--permission-mode plan", "--allow-dangerously-skip-permissions"],
+    },
+    PermissionMode {
+        id: "bypassPermissions",
+        label: "Skip all permissions",
+        note: "--dangerously-skip-permissions: nothing asks. For work you would let run unattended.",
+        flags: &["--dangerously-skip-permissions"],
+    },
+];
+
+/// Codex's, from `codex --help`: an approval policy (`-a`) and a sandbox
+/// (`-s`), or the one flag that switches both off.
+pub const CODEX_PERMISSION_MODES: &[PermissionMode] = &[
+    PermissionMode {
+        id: "default",
+        label: "Codex's own default",
+        note: "Whatever ~/.codex/config.toml says; out of the box, the model asks before commands.",
+        flags: &[],
+    },
+    PermissionMode {
+        id: "never",
+        label: "Never ask, workspace sandbox",
+        note: "-a never -s workspace-write: commands run without approval, confined to the workspace.",
+        flags: &["-a never", "-s workspace-write"],
+    },
+    PermissionMode {
+        id: "bypass",
+        label: "Skip approvals and sandbox",
+        note: "--dangerously-bypass-approvals-and-sandbox: nothing asks and nothing is confined.",
+        flags: &["--dangerously-bypass-approvals-and-sandbox"],
+    },
+];
+
+/// OpenCode's: permissions live in opencode.json, and the CLI's one switch is
+/// `--auto`, which approves anything that file does not explicitly deny.
+pub const OPENCODE_PERMISSION_MODES: &[PermissionMode] = &[
+    PermissionMode {
+        id: "default",
+        label: "Ask per opencode.json",
+        note: "OpenCode's own permission config decides what asks.",
+        flags: &[],
+    },
+    PermissionMode {
+        id: "auto",
+        label: "Auto-approve",
+        note: "--auto: approves everything opencode.json does not explicitly deny.",
+        flags: &["--auto"],
+    },
+];
 
 pub struct ClaudeBackend;
 
@@ -378,12 +473,16 @@ impl AgentBackend for ClaudeBackend {
             .collect()
     }
 
-    /// `--permission-mode auto --allow-dangerously-skip-permissions` is kept
-    /// exactly as the frontend's old `CLAUDE_CMD` had it, flags and reasoning
-    /// unchanged — see the comment this replaced in App.tsx. Moving it here is
-    /// a relocation, not a behaviour change.
+    fn permission_modes(&self) -> &'static [PermissionMode] {
+        CLAUDE_PERMISSION_MODES
+    }
+
+    /// No permission flags here: they are the setting in `permissions.rs`,
+    /// appended by the resolver so a resume carries the same ones as a start.
+    /// Before that setting existed, `--permission-mode auto
+    /// --allow-dangerously-skip-permissions` was hardcoded on this line.
     fn launch(&self, spec: &LaunchSpec) -> String {
-        let mut cmd = format!("claude {}", CLAUDE_LAUNCH_FLAGS.join(" "));
+        let mut cmd = String::from("claude");
         // The SessionStart hook that reports the session id and pid back to
         // aiterm — additional settings, so the user's own config is untouched.
         // Absent only if the settings file could not be written, in which case
@@ -966,6 +1065,10 @@ impl AgentBackend for CodexBackend {
         codex_models().unwrap_or_default()
     }
 
+    fn permission_modes(&self) -> &'static [PermissionMode] {
+        CODEX_PERMISSION_MODES
+    }
+
     /// Effort is a config override, not a flag: `codex --help` has no effort
     /// option, and `model_reasoning_effort` is a real config key — verified
     /// 2026-07-27 in the native binary of codex-cli 0.145.0.
@@ -1044,6 +1147,10 @@ impl AgentBackend for OpenCodeBackend {
     /// in Model access and they appear here, prefixed for its catalog.
     fn models(&self) -> Vec<ModelOption> {
         opencode_models(&crate::providers::load_providers())
+    }
+
+    fn permission_modes(&self) -> &'static [PermissionMode] {
+        OPENCODE_PERMISSION_MODES
     }
 
     fn launch(&self, spec: &LaunchSpec) -> String {
@@ -1628,14 +1735,19 @@ fn read_version(bin: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The permission flags are no longer baked into `launch()` — they are the
+    /// setting the resolver appends — so `launch()` is bare, and the flags the
+    /// panel shows are the first mode's until a choice is stored. This pins the
+    /// default so nobody's sessions change: claude's first mode is exactly the
+    /// invocation aiterm always ran.
     #[test]
-    fn the_launcher_uses_the_flag_list_the_panel_will_show() {
-        // A panel that re-typed these would drift from what is actually run, and
-        // this is the surface where being wrong is worst.
-        let cmd = ClaudeBackend.launch(&LaunchSpec::default());
-        for flag in CLAUDE_LAUNCH_FLAGS {
-            assert!(cmd.contains(flag), "{flag} missing from {cmd}");
-        }
+    fn claudes_default_mode_is_the_invocation_aiterm_always_ran() {
+        let first = CLAUDE_PERMISSION_MODES.first().expect("claude has modes");
+        assert_eq!(first.id, "auto");
+        assert_eq!(
+            first.flags,
+            &["--permission-mode auto", "--allow-dangerously-skip-permissions"],
+        );
     }
 
     #[test]
@@ -2043,27 +2155,20 @@ mod tests {
 
     /* ---- launch commands ------------------------------------------------ */
 
-    /// Picking nothing must produce what aiterm always ran, plus at most the
-    /// hook `--settings` flag — which is environmental (it appears once the
-    /// running app has written its settings file), so the assertion is a
-    /// prefix, not an exact match.
+    /// `launch()` no longer carries permission flags — the resolver appends the
+    /// chosen mode's — so with nothing picked the command is just the program
+    /// plus, once the app has written its settings file, the hook `--settings`
+    /// flag (environmental, hence the strip rather than an exact match).
     #[test]
-    fn claude_with_no_choices_is_the_command_aiterm_always_used() {
+    fn claude_launch_is_bare_of_permission_flags() {
         let cmd = ClaudeBackend.launch(&LaunchSpec::default());
-        assert!(
-            cmd.starts_with("claude --permission-mode auto --allow-dangerously-skip-permissions"),
-            "{cmd}"
-        );
-        // Nothing else may sneak in: strip the one known optional flag and
-        // what remains must be exactly the historical invocation.
+        assert!(!cmd.contains("--permission-mode"), "{cmd}");
+        assert!(!cmd.contains("skip-permissions"), "{cmd}");
         let stripped = match crate::hooklink::settings_flag() {
             Some(flag) => cmd.replace(&flag, ""),
             None => cmd,
         };
-        assert_eq!(
-            stripped,
-            "claude --permission-mode auto --allow-dangerously-skip-permissions",
-        );
+        assert_eq!(stripped, "claude");
     }
 
     /// OpenCode is an engine, not a menu entry: the Model-access dropdown is
