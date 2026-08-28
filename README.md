@@ -37,3 +37,32 @@ You'll want the `claude` CLI installed and signed in; aiterm reads its state fro
 The session/fork model — what owns a session's lifetime, how resume and background mode move ids, why tabs own processes — is written up in [SESSION-MODEL.md](SESSION-MODEL.md).
 
 The recurring principle: read state from where Claude already keeps it (transcripts, config files, the drawn screen) rather than tracking a copy, so the UI can't drift from the truth. Where aiterm drives the TUI, it does so closed-loop and refuses to guess.
+
+## Development workflow
+
+The canonical repo is [`Adroited-LLC/aiterm`](https://github.com/Adroited-LLC/aiterm) (Matt's). Day-to-day work happens in the fork [`jallisonfl/aiterm`](https://github.com/jallisonfl/aiterm), on the `5lime` branch. The cycle:
+
+1. **Before starting a task — sync from upstream.** Check whether Matt's `main` has moved, and if it has, pull it down into the working branch:
+
+   ```bash
+   git fetch upstream
+   git rev-list --count 5lime..upstream/main   # non-zero → needs pulling down
+   git checkout 5lime && git merge upstream/main
+   ```
+
+2. **Do the work on `5lime`** (in the fork), committing and pushing there:
+
+   ```bash
+   git push origin 5lime
+   ```
+
+3. **When a version is ready, publish it to the fork's `main`:**
+
+   ```bash
+   git checkout main && git merge 5lime
+   git push origin main
+   ```
+
+4. **Open a pull request** from `jallisonfl:main` into `Adroited-LLC:main` for Matt to review and merge.
+
+Remotes: `origin` → `github.com/jallisonfl/aiterm`, `upstream` → `github.com/Adroited-LLC/aiterm`.
