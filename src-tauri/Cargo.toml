@@ -25,6 +25,11 @@ serde = { version = "1", features = ["derive"] }
 # put there. Without it serde_json sorts them alphabetically on the way out.
 serde_json = { version = "1", features = ["preserve_order"] }
 ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+base64 = "0.22"
+subtle = "2.6"
 portable-pty = "0.9.0"
 git2 = "0.21.0"
 dirs = "6.0.0"
