@@ -37,6 +37,9 @@ export interface AppSettings {
    *  argued about, and it stays on GPU unless someone changes it. */
   termRenderer: "gpu" | "dom";
   panelScale: PanelScales;
+  /** Pixel size of the toolbar and panel icons (Lucide set). Row actions and
+   *  inline marks scale with it, a step under. */
+  iconSize: number;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -52,6 +55,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   termFontWeight: 400,
   termRenderer: "gpu",
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
+  iconSize: 16,
 };
 
 /** Weights offered for terminal text, and what to call them.
@@ -260,6 +264,7 @@ export function applySettings(s: AppSettings) {
   r.setProperty("--magenta", t.term.magenta);
   r.setProperty("--font-ui", s.uiFont ? `"${s.uiFont}", ${UI_FALLBACK}` : UI_FALLBACK);
   r.setProperty("--font-mono", s.termFont ? `"${s.termFont}", ${MONO_FALLBACK}` : MONO_FALLBACK);
+  r.setProperty("--icon-size", `${s.iconSize}px`);
 }
 
 export function termFontFamily(s: AppSettings): string {

@@ -20,6 +20,7 @@
   --text-dim: #8b8fa3;
   --text-faint: #5c6070;
   --accent: #da7756;
+  --icon-size: 16px;
   /* Claude's colour, fixed. `--accent` is whatever the active theme picked —
      `applySettings` overwrites it on every theme — so on one-dark it is
      #61afef and on nord #88c0d0, which drew Claude in blue two millimetres
@@ -353,11 +354,25 @@ body.dragging * { pointer-events: none; }
   border: none;
   color: var(--text-dim);
   font-size: 13px;
-  padding: 3px 7px;
+  padding: 3px 6px;
   border-radius: 5px;
   cursor: pointer;
   line-height: 1.2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
 }
+
+/* UI icons — the Lucide set, via `Icon`. Sized by the Appearance setting
+   (`--icon-size`, from `settings.iconSize`), not by the call site: `md` is the
+   setting, `sm` a step under it for row actions and inline marks, `lg` a step
+   over. Lucide writes width/height="24" on the element; these win. */
+.ui-icon { flex: none; vertical-align: -0.2em; }
+.ui-icon.md { width: var(--icon-size); height: var(--icon-size); }
+.ui-icon.sm { width: calc(var(--icon-size) * 0.8); height: calc(var(--icon-size) * 0.8); }
+.ui-icon.lg { width: calc(var(--icon-size) * 1.2); height: calc(var(--icon-size) * 1.2); }
+.agent-badge .ui-icon, .icon-btn .ui-icon { vertical-align: middle; }
 .icon-btn:hover { background: var(--bg-hover); color: var(--text); }
 .icon-btn.on { color: var(--accent); }
 

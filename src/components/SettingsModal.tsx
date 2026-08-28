@@ -1,6 +1,8 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
+import Icon from "./Icon";
+import { X } from "lucide-react";
 import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
@@ -261,7 +263,7 @@ export default function SettingsModal({
             {tab === "diagnostics" && (
               <button className="set-recheck" onClick={refreshDiag}>Refresh</button>
             )}
-            <button className="icon-btn" title="Close (Esc)" onClick={onClose}>✕</button>
+            <button className="icon-btn" title="Close (Esc)" onClick={onClose}><Icon of={X} /></button>
           </div>
           <div className="sm-pane-body" ref={paneRef}>
 
@@ -277,6 +279,14 @@ export default function SettingsModal({
                     />
                   ))}
                 </div>
+                <Row label="Icon size" desc="Toolbar and panel buttons; row actions follow a step smaller">
+                  <input
+                    type="range" min={12} max={24} step={1}
+                    value={settings.iconSize}
+                    onChange={(e) => set({ iconSize: +e.target.value })}
+                  />
+                  <span className="srow-value">{settings.iconSize}px</span>
+                </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
                     <button

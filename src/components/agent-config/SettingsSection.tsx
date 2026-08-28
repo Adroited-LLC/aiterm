@@ -11,6 +11,8 @@ import {
   openPath,
 } from "../../ipc";
 import RawLayerEditor from "./RawLayerEditor";
+import Icon from "../Icon";
+import { X } from "lucide-react";
 
 const LAYER_LABEL: Record<string, string> = {
   user: "user",
@@ -244,7 +246,7 @@ function SettingRow({
                 disabled={disabled}
                 onClick={() => setItems(items.filter((_, j) => j !== i))}
               >
-                ×
+                <Icon of={X} size="sm" />
               </button>
             </span>
           ))}

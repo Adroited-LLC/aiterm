@@ -22,6 +22,10 @@ import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
 import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
+import Icon from "./components/Icon";
+import {
+  FolderOpen, GitBranch, Keyboard, ListChecks, PanelLeft, Play, Plus, RefreshCw, Settings as SettingsIcon, X,
+} from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
@@ -1991,27 +1995,27 @@ export default function App() {
             className={"icon-btn" + (showSessions ? " on" : "")}
             title="Toggle sessions panel"
             onClick={() => setShowSessions(!showSessions)}
-          >▤</button>
+          ><Icon of={PanelLeft} /></button>
           <button
             className={"icon-btn" + (showExplorer ? " on" : "")}
             title="Toggle file explorer"
             onClick={() => setShowExplorer(!showExplorer)}
-          >🗀</button>
+          ><Icon of={FolderOpen} /></button>
           <button
             className={"icon-btn" + (showGit ? " on" : "")}
             title="Toggle repository panel"
             onClick={() => setShowGit(!showGit)}
-          >⎇</button>
+          ><Icon of={GitBranch} /></button>
           <button
             className={"icon-btn" + (showAgent ? " on" : "")}
             title="Toggle tasks panel"
             onClick={() => setShowAgent(!showAgent)}
-          >☑</button>
+          ><Icon of={ListChecks} /></button>
           <button
             className={"icon-btn" + (showComposer ? " on" : "")}
             title="Toggle input composer"
             onClick={() => setShowComposer(!showComposer)}
-          >⌨</button>
+          ><Icon of={Keyboard} /></button>
           <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
           <Clock />
         </div>
@@ -2031,7 +2035,7 @@ export default function App() {
             className={"icon-btn" + (showSettingsModal ? " on" : "")}
             title="Settings"
             onClick={() => setShowSettingsModal(!showSettingsModal)}
-          >⚙</button>
+          ><Icon of={SettingsIcon} /></button>
         </div>
       </div>
       <div className="main">
@@ -2158,7 +2162,7 @@ export default function App() {
                       e.stopPropagation();
                       closeFileTab(f.key);
                     }}
-                  >×</span>
+                  ><Icon of={X} size="sm" /></span>
                 </button>
               ))}
             </div>
@@ -2243,7 +2247,7 @@ export default function App() {
                 tab is the one on screen. */}
             {tabs.length === 0 && !previewSession && !fileOnScreen && (
               <div className="empty-note big empty-start">
-                <div>Pick a session on the left — ▶ resumes it, ＋ opens a shell</div>
+                <div>Pick a session on the left — <Icon of={Play} size="sm" /> resumes it, <Icon of={Plus} size="sm" /> opens a shell</div>
                 <div className="empty-start-controls">
                   <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
                   <button className="tui-pick" onClick={browseNewSession}>
@@ -2377,7 +2381,7 @@ export default function App() {
                   >
                     <div className="panel-header">
                       <span>EXPLORER</span>
-                      <button className="icon-btn" onClick={() => setShowExplorer(false)}>✕</button>
+                      <button className="icon-btn" onClick={() => setShowExplorer(false)}><Icon of={X} /></button>
                     </div>
                     <FileExplorer root={activeProject} refreshKey={explorerRefresh} onOpenFile={openFileTab} />
                   </div>
@@ -2391,8 +2395,8 @@ export default function App() {
                       <span>REPOSITORY</span>
                       <div>
                         <button className="icon-btn" title="Refresh"
-                          onClick={() => setGitRefresh((n) => n + 1)}>⟳</button>
-                        <button className="icon-btn" onClick={() => setShowGit(false)}>✕</button>
+                          onClick={() => setGitRefresh((n) => n + 1)}><Icon of={RefreshCw} /></button>
+                        <button className="icon-btn" onClick={() => setShowGit(false)}><Icon of={X} /></button>
                       </div>
                     </div>
                     <GitPanel root={activeProject} refreshKey={gitRefresh} />
@@ -2405,7 +2409,7 @@ export default function App() {
                   <div className="panel agent" style={{ flex: 1, minHeight: 0, ...zoomFor("agent") }}>
                     <div className="panel-header">
                       <span>AGENT{activeTabObj?.title ? ` — ${activeTabObj.title}` : ""}</span>
-                      <button className="icon-btn" onClick={() => setShowAgent(false)}>✕</button>
+                      <button className="icon-btn" onClick={() => setShowAgent(false)}><Icon of={X} /></button>
                     </div>
                     {/* Gated on `tasks`, not `panels`: the panel reads task
                         lists and file edits, which grok and codex also record

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { UsageAmount, UsageBar, UsageSource, relTime } from "../ipc";
 import BrandIcon from "./BrandIcon";
+import Icon from "./Icon";
+import { RefreshCw, X } from "lucide-react";
 import { brandForUsageSource } from "../brand";
 
 /**
@@ -391,8 +393,8 @@ export function UsagePanel({ sources, onRefresh, refreshing }: Props) {
                 title="Read it again now"
                 disabled={refreshing}
                 onClick={onRefresh}
-              >⟳</button>
-              <button className="icon-btn" title="Close" onClick={() => setOpen(false)}>✕</button>
+              ><Icon of={RefreshCw} /></button>
+              <button className="icon-btn" title="Close" onClick={() => setOpen(false)}><Icon of={X} /></button>
             </div>
           </div>
           <div className="usage-panel-body">

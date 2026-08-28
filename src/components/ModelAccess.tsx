@@ -7,6 +7,8 @@ import {
 } from "../ipc";
 import RoutingActivity from "./RoutingActivity";
 import BrandIcon from "./BrandIcon";
+import Icon from "./Icon";
+import { Star, X } from "lucide-react";
 import { brandForModel, brandForName, brandForUrl } from "../brand";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
@@ -695,7 +697,7 @@ export default function ModelAccess({ focusProvider }: Props) {
                     <button className="act-btn" onClick={() => setConfirmDel(null)}>Cancel</button>
                   </>
                 ) : (
-                  <button className="act-btn danger" onClick={() => setConfirmDel(p.id)}>✕</button>
+                  <button className="act-btn danger" onClick={() => setConfirmDel(p.id)}><Icon of={X} size="sm" /></button>
                 )}
               </div>
             </div>
@@ -774,7 +776,7 @@ export default function ModelAccess({ focusProvider }: Props) {
                           }))}
                         >
                           <BrandIcon name={brandForName(s)} size={12} className="inline" />
-                          {s} ✕
+                          {s} <Icon of={X} size="sm" />
                         </button>
                       ))}
                     </div>
@@ -948,7 +950,7 @@ export default function ModelAccess({ focusProvider }: Props) {
                         {m.name ?? m.id}
                       </span>
                       {browsingProv?.startup_models.includes(m.id) && (
-                        <span className="mb-star" title="On the startup list">★</span>
+                        <span className="mb-star" title="On the startup list"><Icon of={Star} size="sm" fill="currentColor" /></span>
                       )}
                       {isFree(m) && <span className="mb-free">free</span>}
                     </button>
@@ -977,8 +979,8 @@ export default function ModelAccess({ focusProvider }: Props) {
                       onClick={() => toggleStartup(sel.id)}
                     >
                       {browsingProv?.startup_models.includes(sel.id)
-                        ? "★ On the startup list — remove"
-                        : "☆ Add to startup list"}
+                        ? <><Icon of={Star} size="sm" fill="currentColor" /> On the startup list — remove</>
+                        : <><Icon of={Star} size="sm" /> Add to startup list</>}
                     </button>
                     {isOpenRouter && (
                       <div className="ep">

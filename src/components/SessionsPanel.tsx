@@ -2,6 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
+import Icon from "./Icon";
+import {
+  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Play, RefreshCw, Search,
+  Settings as SettingsIcon, Trash2, X,
+} from "lucide-react";
 import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
@@ -645,10 +650,7 @@ export default function SessionsPanel({
   const renderTrash = (t: TrashedSession) => (
     <div key={t.id} className="session-item trash-item">
       <div className="agent-badge trash-badge">
-        <svg viewBox="0 0 16 16" width="13" height="13" fill="none"
-          stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-          <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.8 9.5a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9L12 4M6.5 7v4.5M9.5 7v4.5" />
-        </svg>
+        <Icon of={Trash2} />
       </div>
       <div className="session-text">
         <div className="session-title-row">
@@ -689,7 +691,7 @@ export default function SessionsPanel({
             <button
               className="act-btn danger" title="Delete forever…"
               onClick={() => setConfirmDel(`trash:${t.id}`)}
-            >✕</button>
+            ><Icon of={X} size="sm" /></button>
           </>
         )}
       </div>
@@ -807,7 +809,7 @@ export default function SessionsPanel({
                     : "Continues an earlier session past a compaction"
                 }
               >
-                ⑂
+                <Icon of={GitFork} size="sm" />
               </span>
             )}
             <span className="session-title">{s.title}</span>
@@ -820,9 +822,7 @@ export default function SessionsPanel({
               )}
               {opts.showBranch && s.branch && (
                 <span className="branch">
-                  <svg viewBox="0 0 16 16" width="9" height="9" fill="currentColor">
-                    <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628a2.25 2.25 0 0 1-1.5-2.122z" />
-                  </svg>
+                  <Icon of={GitBranch} size="sm" />
                   {s.branch}
                 </span>
               )}
@@ -911,7 +911,7 @@ export default function SessionsPanel({
                   onClick={() =>
                     isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
                   }
-                >▶</button>
+                ><Icon of={Play} size="sm" /></button>
               )}
               {/* Branching is a deliberate act (two divergent lines from one
                   history), not a workaround for resume being unavailable.
@@ -922,7 +922,7 @@ export default function SessionsPanel({
                   className="act-btn"
                   title="Branch a copy at this point — appears as a stopped session, resumable"
                   onClick={() => onFork(s)}
-                >⑂</button>
+                ><Icon of={GitFork} size="sm" /></button>
               )}
               {/* aiterm's own clear — same end shape as typing /clear, built
                   like ⑂: no claude machinery, just a fresh process on a
@@ -965,10 +965,7 @@ export default function SessionsPanel({
                   className="act-btn danger" title="Delete session…"
                   onClick={() => setConfirmDel(s.id)}
                 >
-                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none"
-                    stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                    <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.8 9.5a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9L12 4M6.5 7v4.5M9.5 7v4.5" />
-                  </svg>
+                  <Icon of={Trash2} size="sm" />
                 </button>
               )}
             </>
@@ -1036,10 +1033,7 @@ export default function SessionsPanel({
         onClick={() => onSelectProject(p)}
       >
         <div className="agent-badge folder">
-          <svg className="agent-icon" viewBox="0 0 24 24" width="15" height="15" fill="none"
-            stroke="currentColor" strokeWidth="2">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-          </svg>
+          <Icon of={Folder} className="agent-icon" />
           {(isLive || hasAttn) && (
             <span
               className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
@@ -1061,7 +1055,7 @@ export default function SessionsPanel({
           <button
             className="act-btn" title="Start claude here"
             onClick={(e) => { e.stopPropagation(); onProjectClaude(p); }}
-          >▶</button>
+          ><Icon of={Play} size="sm" /></button>
           <button
             className="act-btn" title="New shell here"
             onClick={(e) => { e.stopPropagation(); onProjectShell(p); }}
@@ -1075,11 +1069,7 @@ export default function SessionsPanel({
     <div className="sessions-panel">
       <div className="panel-toolbar">
         <div className="search-box">
-          <svg className="search-icon" viewBox="0 0 16 16" width="12" height="12"
-            fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-            <circle cx="7" cy="7" r="4.5" />
-            <path d="M10.5 10.5L14 14" />
-          </svg>
+          <Icon of={Search} size="sm" className="search-icon" />
           <input
             className="search-input"
             placeholder="Search sessions…"
@@ -1088,7 +1078,7 @@ export default function SessionsPanel({
             onKeyDown={(e) => e.key === "Escape" && setQuery("")}
           />
           {query && (
-            <button className="search-clear" title="Clear" onClick={() => setQuery("")}>✕</button>
+            <button className="search-clear" title="Clear" onClick={() => setQuery("")}><Icon of={X} size="sm" /></button>
           )}
         </div>
         {/* Starting a session used to require a row to start it *from*: ▶ on a
@@ -1102,20 +1092,13 @@ export default function SessionsPanel({
           data-new-session-trigger=""
           onClick={() => setShowNewSession((v) => !v)}
         >＋</button>
-        <button className="icon-btn" title="Refresh" onClick={onRefresh}>⟳</button>
+        <button className="icon-btn" title="Refresh" onClick={onRefresh}><Icon of={RefreshCw} /></button>
         <button
           className="icon-btn"
           title={anyOpen ? "Collapse all" : "Expand all"}
           onClick={toggleAll}
         >
-          <svg viewBox="0 0 16 16" width="12" height="12" fill="none"
-            stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-            {anyOpen ? (
-              <path d="M4 9.5L8 6l4 3.5M4 13.5L8 10l4 3.5" transform="translate(0 -1.5)" />
-            ) : (
-              <path d="M4 3l4 3.5L12 3M4 8l4 3.5L12 8" transform="translate(0 1)" />
-            )}
-          </svg>
+          {anyOpen ? <Icon of={ChevronsDownUp} size="sm" /> : <Icon of={ChevronsUpDown} size="sm" />}
         </button>
         <div className="settings-wrap">
           <button
@@ -1123,7 +1106,7 @@ export default function SessionsPanel({
             title="Display settings"
             onClick={() => setShowSettings(!showSettings)}
           >
-            ⚙
+            <Icon of={SettingsIcon} />
           </button>
           {showSettings && (
             <div className="settings-pop">
@@ -1306,7 +1289,7 @@ export default function SessionsPanel({
                   className="icon-btn group-del"
                   title="Ungroup (items go back to the main list)"
                   onClick={(e) => { e.stopPropagation(); deleteGroup(g.id); }}
-                >✕</button>
+                ><Icon of={X} size="sm" /></button>
               </div>
               {open && members.map((s) => renderItem(s, `group:${g.id}`))}
             </div>
@@ -1381,7 +1364,7 @@ export default function SessionsPanel({
                   className="icon-btn group-del"
                   title="Empty trash…"
                   onClick={(e) => { e.stopPropagation(); setEmptyConfirm(true); }}
-                >✕</button>
+                ><Icon of={X} size="sm" /></button>
               )}
             </div>
             {sectionOpen("trash") && filteredTrash.map(renderTrash)}

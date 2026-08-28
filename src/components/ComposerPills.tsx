@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { ReactNode, useEffect, useRef, useState } from "react";
 import GitPanel from "./GitPanel";
 import { CYCLE_MODES, PermissionMode } from "../term/screen";
 import {
@@ -6,6 +6,11 @@ import {
   homeAbbrev, openPath, relTime,
   sessionAgents, sessionArtifacts, sessionModel, sessionTasks,
 } from "../ipc";
+import Icon from "./Icon";
+import {
+  Circle, CircleCheck, CircleDot, Gauge, Gem, GitBranch, History, LayoutGrid, ListChecks,
+  ChartPie, ShieldCheck, Sparkles,
+} from "lucide-react";
 
 /** Aliases used only to shorten a recorded model id for the pill — "claude-
  *  opus-5" to "opus". The picker no longer lists these: it shows claude's own
@@ -288,7 +293,7 @@ export default function ComposerPills({
   const fmtTok = (n: number) =>
     n >= 1_000_000 ? (n / 1_000_000).toFixed(2) + "M" : Math.round(n / 1000) + "k";
 
-  const pill = (key: PanelKey, icon: string, label: string, count: string, extra = "") => (
+  const pill = (key: PanelKey, icon: ReactNode, label: string, count: string, extra = "") => (
     <button
       className={"cpill" + (open === key ? " on" : "") + (extra ? " " + extra : "")}
       onClick={() => (open === key ? close() : setOpen(key))}
@@ -314,7 +319,8 @@ export default function ComposerPills({
               {tasks.map((t) => (
                 <div key={t.id} className={"task-row " + t.status} title={t.subject}>
                   <span className={"task-icon" + (t.status === "completed" ? " done" : t.status === "in_progress" ? " busy" : "")}>
-                    {t.status === "completed" ? "●" : t.status === "in_progress" ? "◐" : "○"}
+                    {t.status === "completed" ? <Icon of={CircleCheck} size="sm" />
+                      : t.status === "in_progress" ? <Icon of={CircleDot} size="sm" /> : <Icon of={Circle} size="sm" />}
                   </span>
                   <span className="task-subject">
                     {t.status === "in_progress" && t.active_form ? t.active_form : t.subject}
@@ -508,24 +514,24 @@ export default function ComposerPills({
             onClick={() => openModelPicker()}
             title="Choose a model — opens claude's picker as a dialog"
           >
-            <span className="cpill-icon">◆</span>
+            <span className="cpill-icon"><Icon of={Gem} size="sm" /></span>
             <span className="cpill-label">Model</span>
             <span className="cpill-count">{shownModel}</span>
           </button>
         )}
         {onCommand && pill(
-          "effort", "≡", "Effort", shownEffort,
+          "effort", <Icon of={Gauge} size="sm" />, "Effort", shownEffort,
           pendingEffort && pick.effort !== "auto" ? "pending" : "",
         )}
-        {sessionId && pill("tasks", "◑", "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
-        {sessionId && pill("artifacts", "▤", "Artifacts", artifacts.length ? `${artifacts.length}` : "")}
+        {sessionId && pill("tasks", <Icon of={ListChecks} size="sm" />, "Tasks", tasks.length ? `${done}/${tasks.length}` : "")}
+        {sessionId && pill("artifacts", <Icon of={LayoutGrid} size="sm" />, "Artifacts", artifacts.length ? `${artifacts.length}` : "")}
         {sessionId && pill(
-          "agents", "✳", "Agents",
+          "agents", <Icon of={Sparkles} size="sm" />, "Agents",
           agents.length ? (running ? `${running} active` : `${agents.length}`) : "",
           running ? "busy" : "",
         )}
         {(session || ctx !== null) && pill(
-          "usage", "▮", "Usage",
+          "usage", <Icon of={ChartPie} size="sm" />, "Usage",
           [
             session ? `${Math.round(session.percent)}%` : "",
             ctx !== null ? `${fmtTok(ctx)} ctx` : "",
@@ -538,7 +544,7 @@ export default function ComposerPills({
             : session ? "sev-" + session.severity : "",
         )}
         {onSetPermMode && permMode && pill(
-          "perms", "⛨", "Perms", permMode,
+          "perms", <Icon of={ShieldCheck} size="sm" />, "Perms", permMode,
           permMode === "bypass permissions" ? "sev-warning" : "",
         )}
         {onOpenRewind && (
@@ -547,11 +553,11 @@ export default function ComposerPills({
             onClick={() => openRewind()}
             title="Rewind — restore the code and/or conversation to an earlier point"
           >
-            <span className="cpill-icon">⟲</span>
+            <span className="cpill-icon"><Icon of={History} size="sm" /></span>
             <span className="cpill-label">Rewind</span>
           </button>
         )}
-        {projectRoot && pill("git", "⎇", "Git", "")}
+        {projectRoot && pill("git", <Icon of={GitBranch} size="sm" />, "Git", "")}
       </div>
     </div>
   );
