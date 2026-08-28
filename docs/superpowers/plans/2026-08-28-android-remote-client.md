@@ -82,7 +82,7 @@ impl TerminalSize {
 }
 ```
 
-Add `pub mod remote;` and `pub mod services;` to `lib.rs`; use `serde_cbor` for envelopes and reject unknown kinds/fields deliberately.
+Add `pub mod remote;` and `pub mod services;` to `lib.rs`; use `ciborium` for envelopes and reject unknown kinds/fields deliberately.
 
 - [ ] **Step 4: Run the focused test and full Rust test suite**
 

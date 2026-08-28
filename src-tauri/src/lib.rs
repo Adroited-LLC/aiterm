@@ -16,6 +16,8 @@ pub mod opencode;
 pub mod opencode_agent;
 pub mod providers;
 pub mod rendercost;
+pub mod remote;
+pub mod services;
 pub mod pty;
 pub mod sessions;
 pub mod taskbar;
