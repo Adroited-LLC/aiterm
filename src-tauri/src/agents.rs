@@ -1508,6 +1508,49 @@ fn pick_adopted(
         .map(|s| s.id.clone())
 }
 
+fn pick_clear_successor(
+    sessions: &[Session],
+    previous_id: &str,
+    cwd: &str,
+    since_ms: u64,
+    known: &[String],
+) -> Option<String> {
+    let known: std::collections::HashSet<&str> = known.iter().map(String::as_str).collect();
+    let mut candidates = sessions.iter().filter(|s| {
+        s.id != previous_id
+            && s.project_path == cwd
+            && s.last_active >= since_ms
+            && !known.contains(s.id.as_str())
+    });
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then(|| candidate.id.clone())
+}
+
+/// The session Codex created after an explicit `/clear` in an existing tab.
+///
+/// Codex has no SessionStart hook for an in-place clear: it changes its own
+/// session id while keeping the same PTY alive. The terminal supplies the
+/// exact clear submission and the session ids visible at that instant; this
+/// command accepts only one newly-written row, never a "newest wins" guess.
+#[tauri::command(async)]
+pub fn clear_successor_session(
+    agent_id: String,
+    previous_id: String,
+    cwd: String,
+    since_ms: u64,
+    known: Vec<String>,
+) -> Option<String> {
+    let list = backends();
+    let backend = list.iter().find(|b| b.id() == agent_id)?;
+    pick_clear_successor(
+        &backend.sessions().scan(),
+        &previous_id,
+        &cwd,
+        since_ms,
+        &known,
+    )
+}
+
 /// Resolve `bin` against PATH, the way a shell would.
 ///
 /// Deliberately not `which`/`command -v`: spawning a shell to ask whether a
@@ -1896,11 +1939,11 @@ mod tests {
     #[test]
     fn adoption_takes_the_session_that_appeared_where_we_launched() {
         let rows = vec![
-            row("old", "/home/m/opcode", 100),
-            row("new", "/home/m/opcode", 500),
+            row("old", "/workspace/project", 100),
+            row("new", "/workspace/project", 500),
         ];
         assert_eq!(
-            pick_adopted(&rows, "/home/m/opcode", 400, &["old".into()]),
+            pick_adopted(&rows, "/workspace/project", 400, &["old".into()]),
             Some("new".into())
         );
     }
@@ -1910,9 +1953,9 @@ mod tests {
         // The whole hazard: an old conversation in the same directory that the
         // user is still typing into has a fresh mtime, and stealing it would
         // repoint the tab at their work.
-        let rows = vec![row("busy", "/home/m/opcode", 9_999)];
+        let rows = vec![row("busy", "/workspace/project", 9_999)];
         assert_eq!(
-            pick_adopted(&rows, "/home/m/opcode", 400, &["busy".into()]),
+            pick_adopted(&rows, "/workspace/project", 400, &["busy".into()]),
             None
         );
     }
@@ -1921,14 +1964,46 @@ mod tests {
     fn adoption_ignores_other_directories_and_stale_rows() {
         let rows = vec![
             row("elsewhere", "/home/m/aiterm", 500),
-            row("stale", "/home/m/opcode", 100),
+            row("stale", "/workspace/project", 100),
         ];
-        assert_eq!(pick_adopted(&rows, "/home/m/opcode", 400, &[]), None);
+        assert_eq!(pick_adopted(&rows, "/workspace/project", 400, &[]), None);
     }
 
     #[test]
     fn adoption_finds_nothing_before_the_agent_has_written_anything() {
-        assert_eq!(pick_adopted(&[], "/home/m/opcode", 400, &[]), None);
+        assert_eq!(pick_adopted(&[], "/workspace/project", 400, &[]), None);
+    }
+
+    #[test]
+    fn clear_successor_adopts_the_only_new_session_in_its_terminal_directory() {
+        // If `/clear` changes a Codex TUI from `before` to `after`, the tab
+        // must follow `after`; otherwise the new row looks unowned and a click
+        // tries to resume a conversation that the existing terminal still has
+        // open.
+        let rows = vec![
+            row("before", "/workspace/project", 100),
+            row("after", "/workspace/project", 500),
+            row("elsewhere", "/home/m/aiterm", 600),
+        ];
+        assert_eq!(
+            pick_clear_successor(&rows, "before", "/workspace/project", 400, &["before".into()]),
+            Some("after".into()),
+        );
+    }
+
+    #[test]
+    fn clear_successor_refuses_an_ambiguous_new_session() {
+        // A second terminal can start Codex in the same directory at the same
+        // time. Re-keying either tab to a guess would swap their conversations.
+        let rows = vec![
+            row("before", "/workspace/project", 100),
+            row("first", "/workspace/project", 500),
+            row("second", "/workspace/project", 600),
+        ];
+        assert_eq!(
+            pick_clear_successor(&rows, "before", "/workspace/project", 400, &["before".into()]),
+            None,
+        );
     }
 
     #[test]
@@ -2002,7 +2077,7 @@ mod tests {
         std::fs::create_dir_all(&day).expect("temp dir");
         std::fs::write(
             day.join("rollout-2026-07-28T20-43-28-aaa.jsonl"),
-            "{\"payload\":{\"session_id\":\"aaa\",\"cwd\":\"/home/m/opcode\",\
+            "{\"payload\":{\"session_id\":\"aaa\",\"cwd\":\"/workspace/project\",\
              \"git\":{\"branch\":\"main\"}}}\n{\"more\":\"lines\"}\n",
         )
         .unwrap();
@@ -2017,9 +2092,9 @@ mod tests {
         assert_eq!(found.len(), 1, "one real rollout, two decoys");
         let (s, path) = &found[0];
         assert_eq!(s.id, "aaa");
-        assert_eq!(s.project_path, "/home/m/opcode");
-        // Titled by directory, the way claude's rows read.
-        assert_eq!(s.title, "opcode");
+        assert_eq!(s.project_path, "/workspace/project");
+        // Titled by the working-directory basename.
+        assert_eq!(s.title, "project");
         assert_eq!(s.branch.as_deref(), Some("main"));
         assert!(path.ends_with("rollout-2026-07-28T20-43-28-aaa.jsonl"));
     }
