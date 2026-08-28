@@ -41,29 +41,37 @@ The recurring principle: read state from where Claude already keeps it (transcri
 
 ## Development workflow
 
-The canonical repo is [`Adroited-LLC/aiterm`](https://github.com/Adroited-LLC/aiterm) (Matt's). Day-to-day work happens in the fork [`jallisonfl/aiterm`](https://github.com/jallisonfl/aiterm), on the `5lime` branch. The cycle:
+Three repos, each with one job. The remote names below are the ones in this checkout (`git remote -v`).
 
-1. **Before starting a task — sync from upstream.** Check whether Matt's `main` has moved, and if it has, pull it down into the working branch:
+- **`Adroited-LLC/aiterm`** — remote `origin`. The canonical repo, Matt's. Read-only for us; it takes pull requests and squash-merges them.
+- **`jallisonfl/aiterm`** — remote `fork`. John's private repo and the home of day-to-day work, on branch `5lime`. Despite the remote's name it is **not a GitHub fork** of the canonical repo — it is an independent repo that happens to share history. GitHub only accepts cross-repo pull requests from real forks, so a PR opened from here is refused every time, whatever branch it comes from.
+- **`jallisonfl/aiterm-upstream`** — remote `upstream-fork`. A real fork of the canonical repo, public because a fork of a public repo cannot be private. It exists only to carry PR branches.
 
-   ```bash
-   git fetch upstream
-   git rev-list --count 5lime..upstream/main   # non-zero → needs pulling down
-   git checkout 5lime && git merge upstream/main
-   ```
+The cycle:
 
-2. **Do the work on `5lime`** (in the fork), committing and pushing there:
+1. **Sync from upstream before starting.** If `origin/main` has moved, merge it into `5lime`. Upstream squash-merges, so `5lime` keeps its own history and this merge is expected to be routine:
 
    ```bash
-   git push origin 5lime
+   git fetch origin
+   git rev-list --count 5lime..origin/main   # non-zero → needs merging
+   git merge origin/main                    # on 5lime
    ```
 
-3. **When a version is ready, publish it to the fork's `main`:**
+2. **Work on `5lime`**, commit there, and push to the private repo when john says so (`5lime:main` keeps its `main` current too):
 
    ```bash
-   git checkout main && git merge 5lime
-   git push origin main
+   git push fork 5lime 5lime:main
    ```
 
-4. **Open a pull request** from `jallisonfl:main` into `Adroited-LLC:main` for Matt to review and merge.
+3. **To submit upstream**, cut a topic branch from `origin/main`, cherry-pick the commits to send — not this section, not repo housekeeping — check it builds, push it to the fork, and open the PR from `jallisonfl:<topic>` into `Adroited-LLC:main`:
 
-Remotes: `origin` → `github.com/jallisonfl/aiterm`, `upstream` → `github.com/Adroited-LLC/aiterm`.
+   ```bash
+   git checkout -B <topic> origin/main
+   git cherry-pick <commits>
+   (cd src-tauri && cargo test --lib) && npx tsc --noEmit
+   git push -u upstream-fork <topic>
+   ```
+
+   Opening the PR through the API needs `GITHUB_CLASSIC_TOKEN`; the fine-scoped `GITHUB_TOKEN` is refused for a repo we do not own ("Resource not accessible by personal access token"). Both live in `~/AI-OS/.env`.
+
+4. **After pulling a commit that adds npm packages, run `npm install`** in the checkout — otherwise `npm run tauri dev` comes up with a Vite "Failed to resolve import" overlay instead of the app.
