@@ -20,6 +20,7 @@
   --text-dim: #8b8fa3;
   --text-faint: #5c6070;
   --accent: #da7756;
+  --icon-size: 16px;
   /* Claude's colour, fixed. `--accent` is whatever the active theme picked —
      `applySettings` overwrites it on every theme — so on one-dark it is
      #61afef and on nord #88c0d0, which drew Claude in blue two millimetres
@@ -75,13 +76,7 @@ body.dragging * { pointer-events: none; }
 /* The panel toggles share the line with the usage strip and were a size down
    from its numbers; glyphs like ⎇ and ☑ need the extra pixels to read. */
 .topbar-left .icon-btn { font-size: 15px; }
-.topbar-title {
-  flex: 1;
-  text-align: center;
-  color: var(--text-dim);
-  font-size: 12px;
-}
-.topbar-right { display: flex; gap: 2px; align-items: center; }
+.topbar-right { display: flex; gap: 2px; align-items: center; margin-left: auto; }
 .topbar-right .icon-btn { font-size: 11px; }
 
 /* ---------- usage: top-bar strip + its panel ----------
@@ -353,11 +348,25 @@ body.dragging * { pointer-events: none; }
   border: none;
   color: var(--text-dim);
   font-size: 13px;
-  padding: 3px 7px;
+  padding: 3px 6px;
   border-radius: 5px;
   cursor: pointer;
   line-height: 1.2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
 }
+
+/* UI icons — the Lucide set, via `Icon`. Sized by the Appearance setting
+   (`--icon-size`, from `settings.iconSize`), not by the call site: `md` is the
+   setting, `sm` a step under it for row actions and inline marks, `lg` a step
+   over. Lucide writes width/height="24" on the element; these win. */
+.ui-icon { flex: none; vertical-align: -0.2em; }
+.ui-icon.md { width: var(--icon-size); height: var(--icon-size); }
+.ui-icon.sm { width: calc(var(--icon-size) * 0.8); height: calc(var(--icon-size) * 0.8); }
+.ui-icon.lg { width: calc(var(--icon-size) * 1.2); height: calc(var(--icon-size) * 1.2); }
+.agent-badge .ui-icon, .icon-btn .ui-icon { vertical-align: middle; }
 .icon-btn:hover { background: var(--bg-hover); color: var(--text); }
 .icon-btn.on { color: var(--accent); }
 
@@ -576,12 +585,16 @@ body.dragging * { pointer-events: none; }
   letter-spacing: 0.5px;
 }
 
+/* The start view when nothing is open: the same controls as the sidebar's
+   ＋ menu, drawn a size up — this is the whole pane, not a corner of it. */
 .empty-start {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 14px;
+  gap: 20px;
+  font-size: 14.5px;
 }
+.empty-start > div:first-child .ui-icon { vertical-align: -0.15em; }
 
 .sessions-list {
   overflow-y: auto;
@@ -2972,11 +2985,16 @@ input[type="range"]::-webkit-slider-thumb {
 .empty-start-controls {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  width: 300px;
+  gap: 12px;
+  width: 460px;
   max-width: 100%;
   text-align: left;
 }
+.empty-start-controls .ns-agent-tab { font-size: 13.5px; padding: 8px 10px; gap: 8px; }
+.empty-start-controls .ns-agent-tab .agent-icon { font-size: 18px; }
+.empty-start-controls .ns-select { font-size: 13.5px; padding: 7px 28px 7px 10px; }
+.empty-start-controls .tui-pick { font-size: 14.5px; padding: 9px 14px; }
+.empty-start-controls .ns-tab-setup { font-size: 10px; }
 .empty-start-controls .ns-agents { border-bottom: none; padding-bottom: 0; margin-bottom: 0; }
 
 /* Per-source tinting, so the mark carries meaning at a glance rather than
@@ -3468,3 +3486,55 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .tree-row:hover .tree-ext { visibility: visible; }
 .tree-ext:hover { background: var(--bg-hover); color: var(--text); }
+
+/* ---------- session flyout (hover on a sidebar row) ---------- */
+/* Fixed, placed by the panel beside the hovered row: it has to escape the
+   list's own scrolling. The content order is the memory-jogging order — the
+   words first, then when, then the machinery. */
+.sfly {
+  position: relative;
+  width: 380px;
+  max-height: min(70vh, 640px);
+  overflow-y: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  padding: 10px 12px 8px;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  user-select: text;
+  cursor: text;
+}
+.sfly-head .icon-btn { margin-left: auto; padding: 2px 5px; cursor: pointer; }
+.sfly-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.sfly-title { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sfly-loading { color: var(--text-faint); padding: 6px 0; }
+.sfly-block { margin: 8px 0; }
+.sfly-label {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-faint); margin-bottom: 3px;
+}
+.sfly-quote {
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--border);
+  padding: 1px 0 1px 8px;
+  margin: 3px 0;
+  max-height: 7.2em;
+  overflow: hidden;
+}
+.sfly-quote.user { color: var(--text); border-left-color: var(--accent); }
+.sfly-facts { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.sfly-fact { display: flex; align-items: flex-start; gap: 7px; overflow-wrap: anywhere; }
+.sfly-fact > .ui-icon, .sfly-fact > .brand-icon { flex: none; margin-top: 2px; color: var(--text-faint); }
+.sfly-dim { color: var(--text-faint); }
+.sfly-mono { font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.sfly-chip { display: inline-flex; align-items: center; gap: 3px; margin-left: 8px; color: var(--text-dim); font-size: 11px; }
+.sfly-ctx { display: flex; flex-direction: column; gap: 3px; flex: 1; }
+.sfly-track { display: block; height: 3px; width: 100%; }
+.sfly-files { display: flex; flex-direction: column; gap: 1px; color: var(--text-dim); }
+.sfly-foot { margin-top: 6px; font-size: 11px; }

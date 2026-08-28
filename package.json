@@ -24,6 +24,7 @@
     "@xterm/addon-webgl": "^0.20.0-beta.290",
     "@xterm/xterm": "^6.1.0-beta.291",
     "codemirror": "^6.0.2",
+    "lucide-react": "^1.35.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

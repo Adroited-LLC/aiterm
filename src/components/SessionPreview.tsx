@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { PreviewMsg, Session, homeAbbrev, relTime, sessionPreview } from "../ipc";
+import Icon from "./Icon";
+import { GitBranch, Play, X } from "lucide-react";
 
 interface Props {
   session: Session;
@@ -42,16 +44,16 @@ export default function SessionPreview({ session, onResume, onClose, canResume }
           <div className="preview-title">{session.title}</div>
           <div className="preview-sub">
             {homeAbbrev(session.project_path)}
-            {session.branch ? `  ⎇ ${session.branch}` : ""}
+            {session.branch ? <>{"  "}<Icon of={GitBranch} size="sm" /> {session.branch}</> : ""}
             {"  ·  "}{relTime(session.last_active)}
           </div>
         </div>
         {canResume && (
           <button className="preview-resume" onClick={() => onResume(session)}>
-            ▶ Resume session
+            <Icon of={Play} size="sm" /> Resume session
           </button>
         )}
-        <button className="icon-btn" title="Close preview" onClick={onClose}>✕</button>
+        <button className="icon-btn" title="Close preview" onClick={onClose}><Icon of={X} /></button>
       </div>
       <div className="preview-body" ref={bodyRef}>
         {msgs === null ? (

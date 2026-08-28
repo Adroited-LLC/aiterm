@@ -95,6 +95,39 @@ export interface PreviewMsg {
 export const listSessions = () => invoke<Session[]>("list_sessions");
 export const sessionPreview = (sessionId: string) =>
   invoke<PreviewMsg[]>("session_preview", { sessionId });
+
+/** Everything worth remembering about a session, from one read of its
+ *  transcript — the sidebar's hover flyout. See `detail.rs`. */
+export interface SessionDetail {
+  id: string;
+  started: string | null;
+  last_active: string | null;
+  cwd: string | null;
+  branch: string | null;
+  cli_version: string | null;
+  /** In order of first use; more than one means the model was switched. */
+  models: string[];
+  effort: string | null;
+  permission_mode: string | null;
+  user_messages: number;
+  assistant_messages: number;
+  tool_calls: number;
+  tools: { name: string; count: number }[];
+  /** What the context window held at the last assistant turn. */
+  context_tokens: number | null;
+  context_window: number | null;
+  output_tokens: number;
+  title: string | null;
+  first_prompt: string | null;
+  last_user: string | null;
+  last_assistant: string | null;
+  /** Written or edited, most recent first. */
+  files: string[];
+  pr_links: string[];
+  compactions: number;
+}
+export const sessionDetail = (sessionId: string) =>
+  invoke<SessionDetail | null>("session_detail", { sessionId });
 export const sessionDelete = (sessionId: string) =>
   invoke<void>("session_delete", { sessionId });
 

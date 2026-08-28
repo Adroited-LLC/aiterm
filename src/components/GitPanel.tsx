@@ -5,6 +5,8 @@ import {
   gitLog, gitRepoState, gitStatus, relTime,
 } from "../ipc";
 import { computeGraph, laneColor } from "../graph";
+import Icon from "./Icon";
+import { ArrowDown, ArrowUp, CircleDot, GitBranch, X } from "lucide-react";
 
 const COL = 13;
 const ROW_H = 30;
@@ -23,7 +25,7 @@ function DiffView({ text, onClose, title }: { text: string; onClose: () => void;
     <div className="diff-view">
       <div className="diff-header">
         <span className="diff-title">{title}</span>
-        <button className="icon-btn" onClick={onClose}>✕</button>
+        <button className="icon-btn" onClick={onClose}><Icon of={X} /></button>
       </div>
       <pre className="diff-body">
         {text.split("\n").map((line, i) => {
@@ -184,7 +186,7 @@ function BranchesView({
             style={{ paddingLeft: 8 + depth * 14 }}
             onClick={() => toggleBranch(b.name)}
           >
-            <span className="st-code">{b.is_head ? "●" : "⎇"}</span>
+            <span className="st-code">{b.is_head ? <Icon of={CircleDot} size="sm" /> : <Icon of={GitBranch} size="sm" />}</span>
             <span className="git-row-text">{n.label}</span>
             {b.upstream && <span className="upstream">{b.upstream}</span>}
             <span className={"chevron" + (open ? " open" : "")}>›</span>
@@ -273,9 +275,9 @@ export default function GitPanel({ root, refreshKey }: { root: string | null; re
   return (
     <div className="git-panel">
       <div className="git-head">
-        <span className="branch-chip">⎇ {state?.branch ?? "—"}</span>
+        <span className="branch-chip"><Icon of={GitBranch} size="sm" /> {state?.branch ?? "—"}</span>
         {state && (state.ahead > 0 || state.behind > 0) && (
-          <span className="sync-chip">↑{state.ahead} ↓{state.behind}</span>
+          <span className="sync-chip"><Icon of={ArrowUp} size="sm" />{state.ahead} <Icon of={ArrowDown} size="sm" />{state.behind}</span>
         )}
         <div className="git-tabs">
           {(["changes", "branches", "log"] as Tab[]).map((t) => (

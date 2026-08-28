@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { Refusal, OpencodeReport } from "../ipc";
+import Icon from "./Icon";
+import { X } from "lucide-react";
 
 /** "claude-fable-5" → "Fable 5", "claude-opus-4-8" → "Opus 4.8". */
 function prettyModel(id: string | null): string {
@@ -65,7 +67,7 @@ export default function RefusalBanner({ refusal, targetModel, onRestore, onKick,
             </>
           )}
         </span>
-        <button className="refusal-x" title="Dismiss" onClick={onDismiss}>✕</button>
+        <button className="refusal-x" title="Dismiss" onClick={onDismiss}><Icon of={X} size="sm" /></button>
       </div>
 
       {kick.state === "idle" && (

@@ -18,6 +18,7 @@ pub mod permissions;
 pub mod providers;
 pub mod rendercost;
 pub mod pty;
+pub mod detail;
 pub mod sessions;
 pub mod taskbar;
 pub mod trace;
@@ -90,6 +91,7 @@ pub fn run() {
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,
+            detail::session_detail,
             sessions::session_delete,
             sessions::trash_list,
             sessions::trash_restore,

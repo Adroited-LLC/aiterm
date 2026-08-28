@@ -3,6 +3,8 @@ import {
   AgentRun, Artifact, SessionTask, homeAbbrev, openPath, relTime,
   sessionAgents, sessionArtifacts, sessionTasks,
 } from "../ipc";
+import Icon from "./Icon";
+import { Ban, Circle, CircleCheck } from "lucide-react";
 
 interface Props {
   /** Session id of the active terminal tab, when its engine records tasks
@@ -13,10 +15,10 @@ interface Props {
 }
 
 function statusIcon(t: SessionTask) {
-  if (t.status === "completed") return <span className="task-icon done">●</span>;
+  if (t.status === "completed") return <span className="task-icon done"><Icon of={CircleCheck} size="sm" /></span>;
   if (t.status === "in_progress") return <span className="task-icon busy">◐</span>;
-  if (t.blocked_by.length > 0) return <span className="task-icon blocked">⊘</span>;
-  return <span className="task-icon">○</span>;
+  if (t.blocked_by.length > 0) return <span className="task-icon blocked"><Icon of={Ban} size="sm" /></span>;
+  return <span className="task-icon"><Icon of={Circle} size="sm" /></span>;
 }
 
 export default function AgentPanel({ sessionId, onOpenFile }: Props) {
