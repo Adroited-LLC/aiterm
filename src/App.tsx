@@ -20,9 +20,9 @@ import {
 } from "./term/screen";
 import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
-import SettingsModal from "./components/SettingsModal";
+import SettingsModal, { SettingsTab } from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
-import { UsageBars } from "./components/UsageBars";
+import { UsagePanel, UsageSourceAt, mergeUsage } from "./components/UsagePanel";
 import { Clock } from "./components/Clock";
 import {
   AppSettings, applySettings, loadSettings, saveSettings, termFontFamily, termTheme,
@@ -31,10 +31,9 @@ import {
   Caps,
   ProjectInfo, Session,
   TrashedSession,
-  UsageBar,
   agentCaps,
   listProjects, listSessions, materializeFork,
-  reindexSessions, sessionFork, uiLog, usageLimits,
+  reindexSessions, sessionFork, uiLog, usageReport,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
   drainSessionEvents,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
@@ -54,7 +53,10 @@ const OPTS_KEY = "aiterm.sessionOpts";
 const SIZES_KEY = "aiterm.panelSizes";
 const FONT_KEY = "aiterm.fontScale";
 const PANELS_KEY = "aiterm.panelToggles";
-const USAGE_KEY = "aiterm.usageCache";
+const USAGE_KEY = "aiterm.usageReport";
+// The old cache held Anthropic bars only, under a different shape. Drop it
+// rather than teach the loader to read a format nothing writes any more.
+localStorage.removeItem("aiterm.usageCache");
 
 // (The constant that used to sit here — claude's own flags, spelled out in the
 // renderer as a fallback for the backend's answer — is gone. Every command a
@@ -147,6 +149,23 @@ function loadJSON<T>(key: string, fallback: T): T {
     return raw ? { ...fallback, ...JSON.parse(raw) } : fallback;
   } catch {
     return fallback;
+  }
+}
+
+/** The usage reading from the last run, so a cold start has something to show.
+ *
+ *  Not `loadJSON`: this one is an array, and that helper's object spread would
+ *  hand back `{0: …, 1: …}`. Everything it loads comes back stale by
+ *  definition — the numbers were true when they were written, and the panel
+ *  says how long ago that was until a live read replaces them. */
+function loadUsageCache(): UsageSourceAt[] {
+  try {
+    const raw = localStorage.getItem(USAGE_KEY);
+    const v = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(v)) return [];
+    return v.map((s: UsageSourceAt) => ({ ...s, stale: true }));
+  } catch {
+    return [];
   }
 }
 
@@ -377,13 +396,31 @@ export default function App() {
 
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  /** Where the settings window should open, when a caller has somewhere in
+   *  mind. Cleared on close so the ⚙ button still opens on the first tab. */
+  const [settingsTarget, setSettingsTarget] = useState<
+    { tab: SettingsTab; provider: string | null } | null
+  >(null);
+  /** Bumped when the settings window closes: the empty pane's start controls
+   *  re-read providers, so a shortlist just starred shows up without a
+   *  restart. */
+  const [settingsGen, setSettingsGen] = useState(0);
+  const closeSettings = () => {
+    setShowSettingsModal(false);
+    setSettingsTarget(null);
+    setSettingsGen((g) => g + 1);
+  };
+  const openModelAccess = (provider?: string) => {
+    setSettingsTarget({ tab: "models", provider: provider ?? null });
+    setShowSettingsModal(true);
+  };
   useEffect(() => {
     applySettings(settings);
     saveSettings(settings);
   }, [settings]);
   useEffect(() => {
     if (!showSettingsModal) return;
-    const h = (e: KeyboardEvent) => e.key === "Escape" && setShowSettingsModal(false);
+    const h = (e: KeyboardEvent) => e.key === "Escape" && closeSettings();
     window.addEventListener("keydown", h, true);
     return () => window.removeEventListener("keydown", h, true);
   }, [showSettingsModal]);
@@ -490,38 +527,51 @@ export default function App() {
     };
   }, []);
 
-  // Plan usage, fetched once for everything that shows it. `/api/oauth/usage`
-  // rate limits, so a second poller is not just waste — a refused request
-  // returns [] and that view blanks while the other still shows bars.
-  // Keep the last good reading: [] means "couldn't ask", never "zero usage".
+  // Usage across every service, fetched once for everything that shows it.
+  // `/api/oauth/usage` rate limits, so a second poller is not just waste — a
+  // refused request comes back with no numbers, and that view would blank
+  // while the other still showed bars. `mergeUsage` keeps the last good
+  // reading per source, because "couldn't ask" must never render as "you have
+  // used nothing".
   //
   // Seeded from the last reading written to disk, so a cold start shows
   // something immediately instead of an empty strip for up to a minute — the
   // first call often lands on a rate limit, which made the gap longer still.
   // Written on every success rather than on exit: an exit hook does not run
   // when the app is killed, which is exactly when the cache would be wanted.
-  const cached = loadJSON(USAGE_KEY, { at: 0, bars: [] as UsageBar[] });
-  const [usage, setUsage] = useState<UsageBar[]>(cached.bars);
-  const [usageAt, setUsageAt] = useState<number>(cached.at);
-  const [usageFresh, setUsageFresh] = useState(false);
-  useEffect(() => {
-    let alive = true;
-    const load = () =>
-      usageLimits()
-        .then((b) => {
-          if (!alive || !b.length) return;
-          setUsage(b);
-          setUsageAt(Date.now());
-          setUsageFresh(true);
-          try {
-            localStorage.setItem(USAGE_KEY, JSON.stringify({ at: Date.now(), bars: b }));
-          } catch { /* quota — the cache is a convenience, not a requirement */ }
-        })
-        .catch(() => {});
-    load();
-    const iv = setInterval(load, 60_000);
-    return () => { alive = false; clearInterval(iv); };
+  // What comes off disk is marked stale on the way in: it was true when it was
+  // written, and the panel says how long ago that was until a live read lands.
+  const [usageSources, setUsageSources] = useState<UsageSourceAt[]>(loadUsageCache);
+  const [usageBusy, setUsageBusy] = useState(false);
+  // The merge needs the reading currently on screen, and reading it out of
+  // state inside the updater would mean writing localStorage from a render.
+  const usageRef = useRef<UsageSourceAt[]>(usageSources);
+  const readUsage = useCallback(() => {
+    setUsageBusy(true);
+    return usageReport()
+      .then((next) => {
+        const merged = mergeUsage(usageRef.current, next);
+        usageRef.current = merged;
+        setUsageSources(merged);
+        try {
+          localStorage.setItem(USAGE_KEY, JSON.stringify(merged));
+        } catch { /* quota — the cache is a convenience, not a requirement */ }
+      })
+      .catch(() => {})
+      .finally(() => setUsageBusy(false));
   }, []);
+  useEffect(() => {
+    readUsage();
+    const iv = setInterval(readUsage, 60_000);
+    return () => clearInterval(iv);
+  }, [readUsage]);
+  // The composer's usage pill shows plan limits for the session it is attached
+  // to, and those sessions are claude — so it gets Anthropic's bars, not the
+  // whole report.
+  const claudeUsage = useMemo(
+    () => usageSources.find((s) => s.id === "anthropic"),
+    [usageSources],
+  );
 
   // List-only refresh: cheap, safe to run on every fs event.
   const refreshSessionList = useCallback(() => {
@@ -1655,14 +1705,14 @@ export default function App() {
    *  session the ＋ menu would. It used to take the first installed agent on
    *  its defaults — a different session from the one the menu offers, with
    *  nothing on the button to say so. */
-  const emptyCtl = useStartChoice();
+  const emptyCtl = useStartChoice(settingsGen);
   /** Same as the menu, but choose the directory first. The empty pane's copy is
    *  the only instruction a first run gets, and it used to name two buttons
    *  that live in a panel you can close — and that on a fresh machine has
    *  nothing in it to press them on. */
   const browseNewSession = useCallback(async () => {
     if (!emptyCtl.ready) {
-      setNotice("Nothing to start yet — add a model under Settings → Model access, or install claude or codex.");
+      setNotice("Nothing to start yet — set up the API tab, or install claude, codex or grok.");
       return;
     }
     try {
@@ -1755,7 +1805,7 @@ export default function App() {
             title="Toggle input composer"
             onClick={() => setShowComposer(!showComposer)}
           >⌨</button>
-          <UsageBars bars={usage} />
+          <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
           <Clock />
         </div>
         <div className="topbar-title">
@@ -1816,6 +1866,7 @@ export default function App() {
                 onOptsChange={setOpts}
                 onSelect={selectSession}
                 onResume={resumeSession}
+                onOpenModelAccess={openModelAccess}
                 onFork={(s) =>
                   forkSession(s).catch((e) =>
                     setNotice(`Couldn't fork "${s.title}": ${e}`),
@@ -1907,7 +1958,7 @@ export default function App() {
               <div className="empty-note big empty-start">
                 <div>Pick a session on the left — ▶ resumes it, ＋ opens a shell</div>
                 <div className="empty-start-controls">
-                  <StartControls ctl={emptyCtl} />
+                  <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
                   <button className="tui-pick" onClick={browseNewSession}>
                     Start a new session…
                   </button>
@@ -2005,8 +2056,8 @@ export default function App() {
           {showComposer && <Composer
             sessionId={activeCaps.panels ? activeSessionId : null}
             projectRoot={activeProject}
-            usage={usage}
-            usageAsOf={usageFresh ? null : usageAt || null}
+            usage={claudeUsage?.bars ?? []}
+            usageAsOf={claudeUsage?.stale ? claudeUsage.at : null}
             onCommand={activeTab === null || agentsView || !activeCaps.panels
               ? undefined
               : (text) => handles.current.get(activeTab)?.sendComposed(text)}
@@ -2087,9 +2138,11 @@ export default function App() {
         <SettingsModal
           settings={settings}
           onChange={setSettings}
-          onClose={() => setShowSettingsModal(false)}
+          onClose={closeSettings}
           capsOf={capsOf}
           activeProject={activeProject}
+          initialTab={settingsTarget?.tab}
+          focusProvider={settingsTarget?.provider}
         />
       )}
     </div>

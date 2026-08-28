@@ -20,11 +20,18 @@
   --text-dim: #8b8fa3;
   --text-faint: #5c6070;
   --accent: #da7756;
+  /* Claude's colour, fixed. `--accent` is whatever the active theme picked —
+     `applySettings` overwrites it on every theme — so on one-dark it is
+     #61afef and on nord #88c0d0, which drew Claude in blue two millimetres
+     from Codex, also blue. A mark that changes colour per theme is not
+     identity. Themes do not override this one. */
+  --claude: #da7756;
   --green: #98c379;
   --red: #e06c75;
   --yellow: #e5c07b;
   --blue: #61afef;
   --cyan: #56b6c2;
+  --magenta: #c678dd;
   --font-ui: -apple-system, "Segoe UI", "Inter", system-ui, sans-serif;
   --font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", "Fira Code", monospace;
 }
@@ -65,6 +72,9 @@ body.dragging * { pointer-events: none; }
   flex-shrink: 0;
 }
 .topbar-left { display: flex; gap: 2px; }
+/* The panel toggles share the line with the usage strip and were a size down
+   from its numbers; glyphs like ⎇ and ☑ need the extra pixels to read. */
+.topbar-left .icon-btn { font-size: 15px; }
 .topbar-title {
   flex: 1;
   text-align: center;
@@ -74,23 +84,13 @@ body.dragging * { pointer-events: none; }
 .topbar-right { display: flex; gap: 2px; align-items: center; }
 .topbar-right .icon-btn { font-size: 11px; }
 
-/* ---------- plan usage bars (top-bar widget) ---------- */
-.usage-bars {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 3px;
-  margin-left: 10px;
-  padding-left: 10px;
-  border-left: 1px solid var(--border);
-}
-.usage-bar {
-  position: relative;
-  padding: 2px 0;
-  cursor: default;
-}
+/* ---------- usage: top-bar strip + its panel ----------
+   The strip replaced three 42px textless bars that only gave up their numbers
+   on hover. Every chip now carries its service's name and worst number as
+   text; the 2px rule under it is the old bar, kept because a shape reads
+   faster than a digit — but it is under the number now, not instead of it. */
 .usage-track {
-  width: 42px;
+  width: 100%;
   height: 4px;
   border-radius: 2px;
   background: var(--bg-active);
@@ -105,25 +105,157 @@ body.dragging * { pointer-events: none; }
 .usage-fill.sev-warning { background: #e0a34e; }
 .usage-fill.sev-severe,
 .usage-fill.sev-critical { background: #e05a4e; }
-.usage-tip {
+
+.usage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+.usage-strip {
+  display: flex;
+  /* Baseline, not stretch: the chips carry different font sizes and the "+2"
+     and "?" markers carry no bar at all, so aligning their boxes leaves the
+     text stepping up and down across the strip. */
+  align-items: baseline;
+  gap: 10px;
+  padding: 3px 7px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: inherit;
+  font-family: inherit;
+  cursor: pointer;
+}
+.usage-strip:hover { background: var(--bg-hover); }
+.usage-strip.on { background: var(--bg-active); border-color: var(--border); }
+/* The 2px groove is the chip's own bottom border, so an empty rule still reads
+   as "0% of something" rather than as a missing element. */
+.usage-chip {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  padding-bottom: 4px;
+  border-bottom: 2px solid var(--bg-active);
+  white-space: nowrap;
+}
+.usage-chip-name { color: var(--text-dim); font-size: 11px; }
+.usage-chip-value {
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.usage-chip.sev-warning .usage-chip-value { color: #e0a34e; }
+.usage-chip.sev-critical .usage-chip-value { color: #e05a4e; }
+.usage-chip.sev-none .usage-chip-value { color: var(--text-faint); }
+.usage-chip-rule {
+  position: absolute;
+  left: 0;
+  bottom: -2px;
+  height: 2px;
+  border-radius: 1px;
+  background: #4a9eff;
+  transition: width 0.4s ease;
+}
+.usage-chip.sev-warning .usage-chip-rule { background: #e0a34e; }
+.usage-chip.sev-critical .usage-chip-rule { background: #e05a4e; }
+.usage-chip.sev-none .usage-chip-rule { background: none; }
+.usage-chip.more,
+.usage-chip.unknown {
+  border-bottom: none;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.usage-chip.unknown { color: var(--yellow); }
+
+.usage-panel {
   position: absolute;
   top: calc(100% + 6px);
   left: 0;
-  z-index: 50;
+  z-index: 60;
+  width: 380px;
+  max-height: 70vh;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  white-space: nowrap;
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 9px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
-  pointer-events: none;
+  border-radius: 8px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5);
+  cursor: default;
 }
-.usage-tip-label { color: var(--text); font-size: 12px; font-weight: 600; }
-.usage-tip-pct { color: var(--text-dim); font-size: 11px; }
-.usage-tip-reset { color: var(--text-faint); font-size: 11px; }
+.usage-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 6px 6px 11px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 11px;
+  letter-spacing: 0.6px;
+}
+.usage-panel-body { overflow-y: auto; padding: 4px 0; }
+.usage-panel-foot {
+  padding: 7px 11px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.usage-src { padding: 9px 11px; }
+.usage-src + .usage-src { border-top: 1px solid var(--border); }
+.usage-src-head { display: flex; align-items: baseline; gap: 7px; }
+.usage-src-name { color: var(--text); font-size: 13px; font-weight: 600; }
+.usage-src-plan {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-active);
+  color: var(--text-dim);
+  font-size: 10px;
+}
+.usage-src-spacer { flex: 1; }
+.usage-src-acct {
+  max-width: 21ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.usage-src-detail {
+  margin-top: 5px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.usage-src-detail.rejected, .usage-src-detail.unreachable { color: var(--yellow); }
+.usage-src-detail.stale { color: var(--text-faint); }
+.usage-src-note { margin-top: 5px; color: var(--text-dim); font-size: 11px; }
+.usage-row { margin-top: 8px; }
+.usage-row-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.usage-row-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 12px;
+}
+.usage-row-value {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.usage-row-sub { margin-top: 4px; color: var(--text-faint); font-size: 11px; }
 
 /* Transient bottom-center toast (resume-not-resumable, etc.). */
 .app-toast {
@@ -648,8 +780,8 @@ body.dragging * { pointer-events: none; }
 }
 .agent-badge .agent-icon { margin: 0; }
 .agent-badge.claude {
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-raised));
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: color-mix(in srgb, var(--claude) 12%, var(--bg-raised));
+  border-color: color-mix(in srgb, var(--claude) 30%, var(--border));
 }
 .badge-dot {
   position: absolute;
@@ -725,7 +857,7 @@ body.dragging * { pointer-events: none; }
 }
 
 .agent-icon { color: var(--text-dim); margin-top: 2px; flex-shrink: 0; }
-.agent-icon.claude { color: var(--accent); }
+.agent-icon.claude { color: var(--claude); }
 
 .session-text { flex: 1; min-width: 0; }
 .session-title {
@@ -2686,6 +2818,11 @@ input[type="range"]::-webkit-slider-thumb {
   text-overflow: ellipsis;
 }
 .prov-test { font-size: 11px; color: var(--accent); margin-top: 3px; word-break: break-word; }
+/* The step still to do on a provider row, or at the top of its model
+   browser. Faint, not accent: it is a pointer, not a result. */
+.prov-todo { font-size: 11px; color: var(--text-faint); margin-top: 3px; }
+.prov-todo b { color: var(--text); font-weight: 500; }
+.mb-todo { margin: 0 0 8px; }
 .prov-acts { display: flex; gap: 3px; flex-shrink: 0; }
 .prov-form {
   border-top: 1px solid var(--border);
@@ -2735,9 +2872,37 @@ input[type="range"]::-webkit-slider-thumb {
   background: var(--accent);
   border-color: var(--accent);
 }
+/* The one control whose whole job is naming the source must not take the
+   theme's colour for Claude — see `--claude`. */
+.ns-agent-tab.claude.on {
+  background: var(--claude);
+  border-color: var(--claude);
+}
 .ns-agent-tab .agent-icon { flex-shrink: 0; }
 
 .ns-selects { display: flex; gap: 5px; }
+/* The API tab before anything is configured: still a tab, so the source is
+   visible, with a tag saying that clicking it starts the setup. */
+.ns-agent-tab.setup { border-style: dashed; }
+.ns-tab-setup {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  margin-left: 2px;
+}
+.ns-agent-tab.setup:hover .ns-tab-setup { color: var(--accent); }
+/* A link inside a note: text that goes somewhere, not a button that acts. */
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 /* The native control is unreadable here: webkit2gtk draws its own light
    background for `select` (and a lighter one again when disabled), which on a
    dark panel came out as grey text on near-white. `appearance: none` takes the
@@ -2793,6 +2958,7 @@ input[type="range"]::-webkit-slider-thumb {
    being four shapes in the same grey. */
 .agent-icon.codex, .agent-icon.openai { color: var(--green); }
 .agent-icon.api { color: var(--blue); }
+.agent-icon.grok { color: var(--magenta); }
 /* OpenCode runs the same API models the socket marks, so it takes the hue next
    to it rather than an unrelated fifth — related engines, related colour. */
 .agent-icon.opencode { color: var(--cyan); }

@@ -6,6 +6,7 @@ pub mod diag;
 pub mod fonts;
 pub mod fsx;
 pub mod git;
+pub mod grok;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;
@@ -113,7 +114,7 @@ pub fn run() {
             hooklink::drain_session_events,
             trace::trace_set,
             trace::trace_status,
-            usage::usage_limits,
+            usage::usage_report,
             fonts::list_fonts,
             fonts::font_packages,
             fonts::install_font_package,

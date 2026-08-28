@@ -21,6 +21,8 @@ interface Props {
   /** Start a session in this directory, as `choice`. */
   onPick: (path: string, choice: StartChoice) => void;
   onClose: () => void;
+  /** Open Settings → Model access, from the setup note in the controls. */
+  onOpenModelAccess?: (providerId?: string) => void;
 }
 
 /**
@@ -45,7 +47,7 @@ interface Props {
  * for you. The agent row is hidden entirely when only one agent is installed,
  * since a picker with one option is furniture.
  */
-export default function NewSessionMenu({ places, onPick, onClose }: Props) {
+export default function NewSessionMenu({ places, onPick, onClose, onOpenModelAccess }: Props) {
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
   const ctl = useStartChoice();
@@ -118,7 +120,12 @@ export default function NewSessionMenu({ places, onPick, onClose }: Props) {
 
   return (
     <div className="new-session-pop" ref={popRef} onKeyDown={onKeyDown}>
-      <StartControls ctl={ctl} />
+      <StartControls
+        ctl={ctl}
+        // Close first: the settings window is modal, and this popover has
+        // nothing to say once the answer lives over there.
+        onOpenModelAccess={onOpenModelAccess && ((id) => { onClose(); onOpenModelAccess(id); })}
+      />
       <input
         ref={inputRef}
         className="new-session-input"

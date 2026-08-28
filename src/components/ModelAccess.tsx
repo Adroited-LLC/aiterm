@@ -12,6 +12,7 @@ import RoutingActivity from "./RoutingActivity";
 const PRESETS: { name: string; base_url: string }[] = [
   { name: "OpenRouter", base_url: "https://openrouter.ai/api/v1" },
   { name: "OpenAI", base_url: "https://api.openai.com/v1" },
+  { name: "xAI (Grok)", base_url: "https://api.x.ai/v1" },
   { name: "Groq", base_url: "https://api.groq.com/openai/v1" },
   { name: "Together", base_url: "https://api.together.xyz/v1" },
   { name: "Local (llama.cpp / vLLM)", base_url: "http://localhost:8080/v1" },
@@ -98,7 +99,15 @@ const capValue = (f: CapField): number | undefined | "bad" => {
  * Leaving the field blank when editing keeps the stored key, so changing a URL
  * does not mean digging the secret out again.
  */
-export default function ModelAccess() {
+interface Props {
+  /** A provider to open the model browser on as soon as the list loads —
+   *  the ＋ menu sends someone here to finish one step, and this puts that
+   *  step on screen instead of a list of rows to read. Unknown ids are
+   *  ignored; `null` or absent opens nothing. */
+  focusProvider?: string | null;
+}
+
+export default function ModelAccess({ focusProvider }: Props) {
   const [providers, setProviders] = useState<ProviderView[] | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   const [name, setName] = useState("");
@@ -567,6 +576,18 @@ export default function ModelAccess() {
 
   const refresh = () => providersList().then(setProviders).catch(() => setProviders([]));
   useEffect(() => { refresh(); }, []);
+  // Once, on the first list that has it: `browse` fetches the catalog, which
+  // is the same request Test makes, so the key is proven and the shortlist is
+  // one click away in a single move. Every later refresh is left alone — the
+  // user may have folded the browser on purpose.
+  const focused = useRef(false);
+  useEffect(() => {
+    if (focused.current || !focusProvider || !providers) return;
+    const p = providers.find((x) => x.id === focusProvider);
+    if (!p) return;
+    focused.current = true;
+    browse(p);
+  }, [providers, focusProvider]);   // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { provsRef.current = providers; }, [providers]);
   useEffect(() => { browsingRef.current = browsing; }, [browsing]);
 
@@ -639,6 +660,17 @@ export default function ModelAccess() {
                 </div>
                 <div className="prov-url">{p.base_url}</div>
                 {tested[p.id] && <div className="prov-test">{tested[p.id]}</div>}
+                {/* The step that is missing, said on the row it is missing
+                    from. A provider is not in the ＋ menu until both are
+                    done, and nothing else on this screen says so. */}
+                {!p.has_key && (
+                  <div className="prov-todo">No key yet — Edit to add one.</div>
+                )}
+                {p.has_key && p.startup_models.length === 0 && (
+                  <div className="prov-todo">
+                    Not in the ＋ menu yet — open Models and ★ the ones to offer.
+                  </div>
+                )}
               </div>
               <div className="prov-acts">
                 <button
@@ -853,6 +885,12 @@ export default function ModelAccess() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+          {starred.length === 0 && all && all.length > 0 && (
+            <div className="prov-todo mb-todo">
+              Nothing on the startup list yet. Select a model below and
+              {" "}<b>☆ Add to startup list</b> — that is what puts it in the ＋ menu.
             </div>
           )}
           <div className="mb-controls">

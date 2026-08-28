@@ -257,6 +257,7 @@ export function applySettings(s: AppSettings) {
   r.setProperty("--yellow", t.vars.yellow);
   r.setProperty("--blue", t.vars.blue);
   r.setProperty("--cyan", t.vars.cyan);
+  r.setProperty("--magenta", t.term.magenta);
   r.setProperty("--font-ui", s.uiFont ? `"${s.uiFont}", ${UI_FALLBACK}` : UI_FALLBACK);
   r.setProperty("--font-mono", s.termFont ? `"${s.termFont}", ${MONO_FALLBACK}` : MONO_FALLBACK);
 }
