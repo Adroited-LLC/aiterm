@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
+import {
+  Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
+} from "../ipc";
+import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
@@ -299,6 +302,56 @@ export default function SessionsPanel({
   const [groups, setGroups] = useState<Group[]>(loadGroups);
   const [orders, setOrders] = useState<Record<string, string[]>>(loadOrders);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // ---- hover flyout ----
+  // Opens beside a row after the pointer has rested on it — a flyout that
+  // chased the pointer down the list would be noise. Details are read once
+  // per session and kept for the panel's life; a transcript changes only
+  // while its session is running, and a running one is refetched on each
+  // open. Placed from the row's rectangle: fixed, so it escapes the list's
+  // scrolling, above the row when the row is in the lower half of the window
+  // so the card never runs off the bottom.
+  const [fly, setFly] = useState<{ s: Session; top?: number; bottom?: number; left: number } | null>(null);
+  const flyTimer = useRef<number | null>(null);
+  const flyCache = useRef<Map<string, SessionDetail>>(new Map());
+  const [flyDetail, setFlyDetail] = useState<SessionDetail | null>(null);
+  const flyEnter = (s: Session, el: HTMLElement, running: boolean) => {
+    if (flyTimer.current) window.clearTimeout(flyTimer.current);
+    flyTimer.current = window.setTimeout(() => {
+      const r = el.getBoundingClientRect();
+      const panel = el.closest(".panel")?.getBoundingClientRect();
+      const left = (panel?.right ?? r.right) + 8;
+      const lower = r.top > window.innerHeight / 2;
+      setFly(lower
+        ? { s, left, bottom: Math.max(8, window.innerHeight - r.bottom) }
+        : { s, left, top: Math.max(8, r.top) });
+      const cached = flyCache.current.get(s.id);
+      setFlyDetail(cached && !running ? cached : null);
+      if (!cached || running) {
+        sessionDetail(s.id).then((d) => {
+          if (!d) return;
+          flyCache.current.set(s.id, d);
+          setFlyDetail((cur) => (cur === null || cur.id === d.id ? d : cur));
+        }).catch(() => {});
+      }
+    }, 450);
+  };
+  const flyLeave = () => {
+    if (flyTimer.current) { window.clearTimeout(flyTimer.current); flyTimer.current = null; }
+    setFly(null);
+  };
+  useEffect(() => {
+    // Anything that moves the row from under the pointer closes the card.
+    const close = () => setFly(null);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("pointerdown", close, true);
+    window.addEventListener("keydown", close, true);
+    return () => {
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("pointerdown", close, true);
+      window.removeEventListener("keydown", close, true);
+    };
+  }, []);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
   const [dragOverItem, setDragOverItem] = useState<string | null>(null);
@@ -741,6 +794,8 @@ export default function SessionsPanel({
         key={s.id}
         data-item={container ? s.id : undefined}
         data-container={container}
+        onMouseEnter={(e) => { if (!isDragging) flyEnter(s, e.currentTarget, isRunning); }}
+        onMouseLeave={flyLeave}
         onPointerDown={(e) => {
           if (e.button !== 0 || !container || searchList) return;
           if ((e.target as HTMLElement).closest("button")) return;
@@ -1067,6 +1122,11 @@ export default function SessionsPanel({
 
   return (
     <div className="sessions-panel">
+      {fly && (
+        <div style={{ position: "fixed", left: fly.left, top: fly.top, bottom: fly.bottom, zIndex: 70, pointerEvents: "none" }}>
+          <SessionFlyout session={fly.s} detail={flyDetail && flyDetail.id === fly.s.id ? flyDetail : null} />
+        </div>
+      )}
       <div className="panel-toolbar">
         <div className="search-box">
           <Icon of={Search} size="sm" className="search-icon" />

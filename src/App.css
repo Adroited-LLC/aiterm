@@ -3486,3 +3486,53 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .tree-row:hover .tree-ext { visibility: visible; }
 .tree-ext:hover { background: var(--bg-hover); color: var(--text); }
+
+/* ---------- session flyout (hover on a sidebar row) ---------- */
+/* Fixed, placed by the panel beside the hovered row: it has to escape the
+   list's own scrolling. The content order is the memory-jogging order — the
+   words first, then when, then the machinery. */
+.sfly {
+  position: relative;
+  width: 380px;
+  max-height: min(70vh, 640px);
+  overflow-y: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  padding: 10px 12px 8px;
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  pointer-events: none;
+}
+.sfly-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.sfly-title { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sfly-loading { color: var(--text-faint); padding: 6px 0; }
+.sfly-block { margin: 8px 0; }
+.sfly-label {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-faint); margin-bottom: 3px;
+}
+.sfly-quote {
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--border);
+  padding: 1px 0 1px 8px;
+  margin: 3px 0;
+  max-height: 7.2em;
+  overflow: hidden;
+}
+.sfly-quote.user { color: var(--text); border-left-color: var(--accent); }
+.sfly-facts { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.sfly-fact { display: flex; align-items: flex-start; gap: 7px; overflow-wrap: anywhere; }
+.sfly-fact > .ui-icon, .sfly-fact > .brand-icon { flex: none; margin-top: 2px; color: var(--text-faint); }
+.sfly-dim { color: var(--text-faint); }
+.sfly-mono { font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.sfly-chip { display: inline-flex; align-items: center; gap: 3px; margin-left: 8px; color: var(--text-dim); font-size: 11px; }
+.sfly-ctx { display: flex; flex-direction: column; gap: 3px; flex: 1; }
+.sfly-track { display: block; height: 3px; width: 100%; }
+.sfly-files { display: flex; flex-direction: column; gap: 1px; color: var(--text-dim); }
+.sfly-foot { margin-top: 6px; font-size: 11px; }
