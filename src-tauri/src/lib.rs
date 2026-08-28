@@ -71,6 +71,7 @@ pub fn run() {
             diag::diag_log_tail,
             diag::diag_environment,
             agents::agent_choices,
+            agents::clear_successor_session,
             launch::resolve_launch,
             permissions::agent_permissions,
             permissions::agent_permission_set,

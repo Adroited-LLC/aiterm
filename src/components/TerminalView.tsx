@@ -7,6 +7,7 @@ import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
 import { boldWeightFor } from "../settings";
+import { TerminalInputLine } from "../terminalInput";
 import "@xterm/xterm/css/xterm.css";
 
 /** Attach the GPU WebGL renderer. It owns its own surface and clears+repaints
@@ -140,6 +141,10 @@ interface Props {
   onNotify: (key: number, message: string) => void;
   /** OSC 9;4 progress. `null` means the program withdrew it. */
   onProgress: (key: number, progress: TermProgress | null) => void;
+  /** The line the user just submitted through this terminal. This is kept
+   * deliberately narrow: lifecycle watchers may use an explicit command as
+   * evidence, but never inspect ordinary prompt text. */
+  onLineSubmit: (key: number, line: string) => void;
   /** Focus the terminal when it becomes active. Once true only while the
    *  composer was hidden, back when the composer held a text input that would
    *  have been fighting for the same keystrokes. It is a pill strip now, so
@@ -158,7 +163,7 @@ interface Props {
 
 export default function TerminalView({
   tab, active, onExit, onRegister, onActivity, onAttention, onNotify, onProgress,
-  autoFocus, fontSize, fontFamily, lineHeight, fontWeight, renderer, theme,
+  onLineSubmit, autoFocus, fontSize, fontFamily, lineHeight, fontWeight, renderer, theme,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -253,6 +258,7 @@ export default function TerminalView({
       // clear. That is the safe direction to be wrong in — the cost is a
       // confirmation you did not need, never a half-written prompt sent.
       let pending = 0;
+      const inputLine = new TerminalInputLine();
 
       term.onBell(() => onAttention(tab.key, true));
 
@@ -284,9 +290,17 @@ export default function TerminalView({
       });
       term.onData((data) => {
         onAttention(tab.key, false);
-        if (data === "\r" || data === "\n" || data === "\x03") pending = 0;
-        else if (data === "\x7f" || data === "\b") pending = Math.max(0, pending - 1);
-        else if (data >= " ") pending += data.length;
+        const submitted = inputLine.write(data);
+        if (data === "\r" || data === "\n") {
+          onLineSubmit(tab.key, submitted ?? "");
+          pending = 0;
+        } else if (data === "\x03") {
+          pending = 0;
+        } else if (data === "\x7f" || data === "\b") {
+          pending = Math.max(0, pending - 1);
+        } else if (data >= " ") {
+          pending += data.length;
+        }
         ptyWrite(id, data);
       });
       term.onResize(({ cols, rows }) => ptyResize(id, cols, rows));
@@ -296,6 +310,7 @@ export default function TerminalView({
         write: (data) => ptyWrite(id, data),
         redraw,
         paste: (text) => {
+          inputLine.paste(text);
           pending += text.length;
           ptyWrite(
             id,

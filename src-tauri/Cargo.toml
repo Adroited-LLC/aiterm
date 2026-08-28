@@ -1,6 +1,6 @@
 [package]
 name = "aiterm"
-version = "0.10.55"
+version = "0.10.58"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -41,4 +41,3 @@ tauri-plugin-dialog = "2"
 # check per event site, which is the cost of having the switch at all.
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt"] }
-
