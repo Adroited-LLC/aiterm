@@ -899,3 +899,56 @@ export const diagLogTail = (lines: number) => invoke<string>("diag_log_tail", { 
 /** Build, desktop and which agents aiterm can see — the first questions of any
  *  "it is behaving oddly" conversation, answered without a scavenger hunt. */
 export const diagEnvironment = () => invoke<[string, string][]>("diag_environment");
+
+// --- Remote Access -----------------------------------------------------
+//
+// The phone gateway. Every one of these is a desktop-only decision: the
+// gateway deliberately exposes no way for a paired phone to enable itself,
+// approve another device, or revoke one. Trust is granted at this keyboard.
+
+export type {
+  RemoteStatus,
+  PairingInvite,
+  PendingPairing,
+  TrustedDevice,
+} from "./remoteAccess.ts";
+import type {
+  RemoteStatus,
+  PairingInvite,
+  PendingPairing,
+  TrustedDevice,
+} from "./remoteAccess.ts";
+
+/** Whether the gateway is listening, and on what, with its pinned fingerprint. */
+export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
+
+/** Addresses the gateway may bind. Loopback is excluded: a phone cannot reach
+ *  it, so offering it would only ever be a mistake the user has to debug. */
+export const remoteInterfaces = () => invoke<string[]>("remote_interfaces");
+
+export const remoteStart = (address: string, port: number) =>
+  invoke<RemoteStatus>("remote_start", { address, port });
+
+/** Closes the listener and every live connection. Does not revoke devices —
+ *  turning remote access off is not the same statement as distrusting a phone. */
+export const remoteStop = () => invoke<RemoteStatus>("remote_stop");
+
+/** A single-use, five-minute enrollment QR, rendered to SVG by the backend so
+ *  the secret never exists as a string in this process. */
+export const remoteBeginPairing = () => invoke<PairingInvite>("remote_begin_pairing");
+
+/** Phones that have scanned a QR and are waiting for a decision here. */
+export const remotePendingPairings = () =>
+  invoke<PendingPairing[]>("remote_pending_pairings");
+
+export const remoteApproveDevice = (requestId: string) =>
+  invoke<TrustedDevice>("remote_approve_device", { requestId });
+
+export const remoteDenyDevice = (requestId: string) =>
+  invoke<boolean>("remote_deny_device", { requestId });
+
+export const remoteDevices = () => invoke<TrustedDevice[]>("remote_devices");
+
+/** Forgets the device's key and drops its live connections. */
+export const remoteRevokeDevice = (deviceId: string) =>
+  invoke<boolean>("remote_revoke_device", { deviceId });

@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
+import RemoteAccessSettings from "./RemoteAccessSettings";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
@@ -37,7 +38,13 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
   { key: "agent", label: "Agent" },
 ];
 
-export type SettingsTab = "appearance" | "fonts" | "agents" | "models" | "diagnostics";
+export type SettingsTab =
+  | "appearance"
+  | "fonts"
+  | "agents"
+  | "models"
+  | "remote"
+  | "diagnostics";
 type Tab = SettingsTab;
 
 const NAV: { key: Tab; label: string }[] = [
@@ -45,6 +52,7 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "fonts", label: "Fonts" },
   { key: "agents", label: "Agents" },
   { key: "models", label: "Model access" },
+  { key: "remote", label: "Remote access" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
 
@@ -479,6 +487,8 @@ export default function SettingsModal({
                 {notice && <div className="set-notice">{notice}</div>}
               </Group>
             </>}
+
+            {tab === "remote" && <RemoteAccessSettings />}
 
             {tab === "agents" && configFor && (
               <ClaudeConfig agent={configFor} project={activeProject} onBack={() => setConfigFor(null)} />
