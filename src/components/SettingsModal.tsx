@@ -22,6 +22,12 @@ interface Props {
   onClose: () => void;
   capsOf: (agent: string) => Caps;
   activeProject: string | null;
+  /** Open on this tab rather than the first — for a caller that knows what
+   *  the user came to do, like the ＋ menu's setup note. */
+  initialTab?: SettingsTab;
+  /** With `initialTab: "models"`: the provider to open the model browser on
+   *  straight away, so the step that was missing is the one on screen. */
+  focusProvider?: string | null;
 }
 
 const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
@@ -31,7 +37,8 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
   { key: "agent", label: "Agent" },
 ];
 
-type Tab = "appearance" | "fonts" | "agents" | "models" | "diagnostics";
+export type SettingsTab = "appearance" | "fonts" | "agents" | "models" | "diagnostics";
+type Tab = SettingsTab;
 
 const NAV: { key: Tab; label: string }[] = [
   { key: "appearance", label: "Appearance" },
@@ -90,8 +97,10 @@ function Switch({ checked, onChange, label }: {
 /** Where the dragged window size lives between opens. */
 const SIZE_KEY = "aiterm.settingsModalSize";
 
-export default function SettingsModal({ settings, onChange, onClose, capsOf, activeProject }: Props) {
-  const [tab, setTab] = useState<Tab>("appearance");
+export default function SettingsModal({
+  settings, onChange, onClose, capsOf, activeProject, initialTab, focusProvider,
+}: Props) {
+  const [tab, setTab] = useState<Tab>(initialTab ?? "appearance");
   // Resizable via the CSS corner grip; the size carries over to the next
   // open. Written straight to el.style rather than through React state so a
   // re-render can never fight the browser over the size mid-drag. The CSS
@@ -410,7 +419,7 @@ export default function SettingsModal({ settings, onChange, onClose, capsOf, act
               </Group>
             </>}
 
-            {tab === "models" && <ModelAccess />}
+            {tab === "models" && <ModelAccess focusProvider={focusProvider} />}
 
             {/* Everything you would otherwise have to be talked through finding:
                 which build this is, what it can see, and what it has been doing.

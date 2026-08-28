@@ -20,7 +20,7 @@ import {
 } from "./term/screen";
 import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
-import SettingsModal from "./components/SettingsModal";
+import SettingsModal, { SettingsTab } from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
 import { UsageBars } from "./components/UsageBars";
 import { Clock } from "./components/Clock";
@@ -377,13 +377,31 @@ export default function App() {
 
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  /** Where the settings window should open, when a caller has somewhere in
+   *  mind. Cleared on close so the ⚙ button still opens on the first tab. */
+  const [settingsTarget, setSettingsTarget] = useState<
+    { tab: SettingsTab; provider: string | null } | null
+  >(null);
+  /** Bumped when the settings window closes: the empty pane's start controls
+   *  re-read providers, so a shortlist just starred shows up without a
+   *  restart. */
+  const [settingsGen, setSettingsGen] = useState(0);
+  const closeSettings = () => {
+    setShowSettingsModal(false);
+    setSettingsTarget(null);
+    setSettingsGen((g) => g + 1);
+  };
+  const openModelAccess = (provider?: string) => {
+    setSettingsTarget({ tab: "models", provider: provider ?? null });
+    setShowSettingsModal(true);
+  };
   useEffect(() => {
     applySettings(settings);
     saveSettings(settings);
   }, [settings]);
   useEffect(() => {
     if (!showSettingsModal) return;
-    const h = (e: KeyboardEvent) => e.key === "Escape" && setShowSettingsModal(false);
+    const h = (e: KeyboardEvent) => e.key === "Escape" && closeSettings();
     window.addEventListener("keydown", h, true);
     return () => window.removeEventListener("keydown", h, true);
   }, [showSettingsModal]);
@@ -1655,7 +1673,7 @@ export default function App() {
    *  session the ＋ menu would. It used to take the first installed agent on
    *  its defaults — a different session from the one the menu offers, with
    *  nothing on the button to say so. */
-  const emptyCtl = useStartChoice();
+  const emptyCtl = useStartChoice(settingsGen);
   /** Same as the menu, but choose the directory first. The empty pane's copy is
    *  the only instruction a first run gets, and it used to name two buttons
    *  that live in a panel you can close — and that on a fresh machine has
@@ -1816,6 +1834,7 @@ export default function App() {
                 onOptsChange={setOpts}
                 onSelect={selectSession}
                 onResume={resumeSession}
+                onOpenModelAccess={openModelAccess}
                 onFork={(s) =>
                   forkSession(s).catch((e) =>
                     setNotice(`Couldn't fork "${s.title}": ${e}`),
@@ -1907,7 +1926,7 @@ export default function App() {
               <div className="empty-note big empty-start">
                 <div>Pick a session on the left — ▶ resumes it, ＋ opens a shell</div>
                 <div className="empty-start-controls">
-                  <StartControls ctl={emptyCtl} />
+                  <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
                   <button className="tui-pick" onClick={browseNewSession}>
                     Start a new session…
                   </button>
@@ -2087,9 +2106,11 @@ export default function App() {
         <SettingsModal
           settings={settings}
           onChange={setSettings}
-          onClose={() => setShowSettingsModal(false)}
+          onClose={closeSettings}
           capsOf={capsOf}
           activeProject={activeProject}
+          initialTab={settingsTarget?.tab}
+          focusProvider={settingsTarget?.provider}
         />
       )}
     </div>

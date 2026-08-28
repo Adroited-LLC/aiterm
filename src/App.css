@@ -2686,6 +2686,11 @@ input[type="range"]::-webkit-slider-thumb {
   text-overflow: ellipsis;
 }
 .prov-test { font-size: 11px; color: var(--accent); margin-top: 3px; word-break: break-word; }
+/* The step still to do on a provider row, or at the top of its model
+   browser. Faint, not accent: it is a pointer, not a result. */
+.prov-todo { font-size: 11px; color: var(--text-faint); margin-top: 3px; }
+.prov-todo b { color: var(--text); font-weight: 500; }
+.mb-todo { margin: 0 0 8px; }
 .prov-acts { display: flex; gap: 3px; flex-shrink: 0; }
 .prov-form {
   border-top: 1px solid var(--border);
@@ -2738,6 +2743,20 @@ input[type="range"]::-webkit-slider-thumb {
 .ns-agent-tab .agent-icon { flex-shrink: 0; }
 
 .ns-selects { display: flex; gap: 5px; }
+/* The setup note under the selects: what the API dropdown is waiting on,
+   and the button that goes there. Same voice as .empty-note, but a line, not
+   a block — it sits inside a popover that is mostly list. */
+.ns-setup {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.ns-setup span { min-width: 0; }
+.ns-setup .act-btn { flex-shrink: 0; }
 /* The native control is unreadable here: webkit2gtk draws its own light
    background for `select` (and a lighter one again when disabled), which on a
    dark panel came out as grey text on near-white. `appearance: none` takes the

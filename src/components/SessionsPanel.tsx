@@ -147,6 +147,8 @@ interface Props {
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
   onFork: (s: Session) => void;
+  /** Open Settings → Model access — the ＋ menu's setup note lands there. */
+  onOpenModelAccess?: (providerId?: string) => void;
   /** Park this conversation and start a fresh one in its tab — aiterm's own
    *  clear, kin to ⑂: pure process control and disk, no claude machinery.
    *  Only offered on rows whose engine declares `clear` and that have a live
@@ -183,7 +185,7 @@ export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
   attentionText, progressSlots, activeSlot, rekey, opts,
   capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
-  onSelectProject, onProjectShell, onProjectClaude, onNewSession,
+  onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
 }: Props) {
@@ -1133,6 +1135,7 @@ export default function SessionsPanel({
           places={startPoints}
           onPick={(path, choice) => { setShowNewSession(false); onNewSession(path, choice); }}
           onClose={() => setShowNewSession(false)}
+          onOpenModelAccess={onOpenModelAccess}
         />
       )}
       <div className="view-tabs">

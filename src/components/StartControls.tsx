@@ -40,14 +40,22 @@ export type StartChoice =
  * publishes a different set per model, and it is not cosmetic (gpt-5.6-sol
  * offers `ultra`, gpt-5.5 stops at `xhigh`).
  */
-export function useStartChoice() {
+/**
+ * `reloadKey`: change it to re-read the agent and provider lists. The ＋ menu
+ * remounts every open and needs nothing; the empty pane's copy lives as long
+ * as the window does, and would otherwise keep saying "no startup models"
+ * after they were picked in Settings.
+ */
+export function useStartChoice(reloadKey?: unknown) {
   const [agents, setAgents] = useState<AgentChoice[]>([]);
   const [agentId, setAgentId] = useState("");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
-  /** Providers with a key and a non-empty startup list — the only ones the
-   *  API dropdown has anything to say about. */
-  const [providers, setProviders] = useState<ProviderView[]>([]);
+  /** Every configured provider. The dropdown offers only the ones with a
+   *  key and a non-empty startup list; the rest are what the setup note is
+   *  about — a provider half-configured is the state most worth explaining. */
+  const [allProviders, setAllProviders] = useState<ProviderView[]>([]);
+  const providers = allProviders.filter((p) => p.has_key && p.startup_models.length > 0);
   /** `JSON.stringify([providerId, modelId])`, or "" for none. JSON because a
    *  model id can contain any separator this could have picked. */
   const [apiModel, setApiModel] = useState("");
@@ -59,12 +67,8 @@ export function useStartChoice() {
         setAgentId((cur) => cur || list[0]?.id || "");
       })
       .catch(() => setAgents([]));
-    providersList()
-      .then((list) =>
-        setProviders(list.filter((p) => p.has_key && p.startup_models.length > 0)),
-      )
-      .catch(() => {});
-  }, []);
+    providersList().then(setAllProviders).catch(() => {});
+  }, [reloadKey]);
 
   const agent = agents.find((a) => a.id === agentId) ?? null;
   const models = agent?.models ?? [];
@@ -93,7 +97,7 @@ export function useStartChoice() {
   };
 
   return {
-    agents, agentId, model, effort, models, efforts, providers, apiModel,
+    agents, agentId, model, effort, models, efforts, providers, allProviders, apiModel,
     pickAgent, pickModel, setEffort, setApiModel, choice,
     ready: agents.length > 0,
   };
@@ -101,12 +105,50 @@ export function useStartChoice() {
 
 type Ctl = ReturnType<typeof useStartChoice>;
 
-export default function StartControls({ ctl }: { ctl: Ctl }) {
+/**
+ * Why the API dropdown is not showing, and the one step that would make it.
+ *
+ * The dropdown lists providers with a key *and* a startup shortlist, and it
+ * used to vanish silently when neither existed — which from the menu looks
+ * like "no API way in", not "one thing left to do". Three states, each named
+ * with the provider it is about and a button that lands on it:
+ *
+ * - a key but an empty shortlist: the common one — Test worked, nothing was
+ *   starred, and nothing said stars were the point;
+ * - a provider with no key;
+ * - no provider at all.
+ */
+function setupNote(all: ProviderView[]): { text: string; action: string; provider?: string } {
+  const unstarred = all.find((p) => p.has_key && p.startup_models.length === 0);
+  if (unstarred) {
+    return {
+      text: `${unstarred.name} is connected but has no startup models yet.`,
+      action: "Pick models",
+      provider: unstarred.id,
+    };
+  }
+  const keyless = all.find((p) => !p.has_key);
+  if (keyless) {
+    return { text: `${keyless.name} has no API key yet.`, action: "Add key", provider: keyless.id };
+  }
+  return { text: "Or run any API model — OpenRouter, xAI, OpenAI…", action: "Add a provider" };
+}
+
+interface Props {
+  ctl: Ctl;
+  /** Open Settings → Model access, on this provider when one is named. When
+   *  absent the note still says what is missing; it just cannot take you
+   *  there. */
+  onOpenModelAccess?: (providerId?: string) => void;
+}
+
+export default function StartControls({ ctl, onOpenModelAccess }: Props) {
   const {
-    agents, agentId, model, effort, models, efforts, providers, apiModel,
+    agents, agentId, model, effort, models, efforts, providers, allProviders, apiModel,
     pickAgent, pickModel, setEffort, setApiModel,
   } = ctl;
   const apiPicked = apiModel !== "";
+  const setup = providers.length === 0 ? setupNote(allProviders) : null;
   return (
     <div className="ns-agents">
       {agents.length > 1 && (
@@ -183,10 +225,22 @@ export default function StartControls({ ctl }: { ctl: Ctl }) {
           otherwise. Either way the conversation is saved and resumable.
         </div>
       )}
+      {setup && (
+        <div className="ns-setup">
+          <span>{setup.text}</span>
+          {onOpenModelAccess && (
+            <button
+              className="act-btn"
+              title="Settings → Model access"
+              onClick={() => onOpenModelAccess(setup.provider)}
+            >{setup.action}</button>
+          )}
+        </div>
+      )}
       {agents.length === 0 && (
         <div className="empty-note">
-          No agent installed. Add a model under Settings → Model access, or
-          install claude or codex.
+          No agent CLI installed — install claude, codex or opencode, or start
+          from an API model above.
         </div>
       )}
     </div>
