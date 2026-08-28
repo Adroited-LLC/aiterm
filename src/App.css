@@ -76,13 +76,7 @@ body.dragging * { pointer-events: none; }
 /* The panel toggles share the line with the usage strip and were a size down
    from its numbers; glyphs like ⎇ and ☑ need the extra pixels to read. */
 .topbar-left .icon-btn { font-size: 15px; }
-.topbar-title {
-  flex: 1;
-  text-align: center;
-  color: var(--text-dim);
-  font-size: 12px;
-}
-.topbar-right { display: flex; gap: 2px; align-items: center; }
+.topbar-right { display: flex; gap: 2px; align-items: center; margin-left: auto; }
 .topbar-right .icon-btn { font-size: 11px; }
 
 /* ---------- usage: top-bar strip + its panel ----------
@@ -591,12 +585,16 @@ body.dragging * { pointer-events: none; }
   letter-spacing: 0.5px;
 }
 
+/* The start view when nothing is open: the same controls as the sidebar's
+   ＋ menu, drawn a size up — this is the whole pane, not a corner of it. */
 .empty-start {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 14px;
+  gap: 20px;
+  font-size: 14.5px;
 }
+.empty-start > div:first-child .ui-icon { vertical-align: -0.15em; }
 
 .sessions-list {
   overflow-y: auto;
@@ -2987,11 +2985,16 @@ input[type="range"]::-webkit-slider-thumb {
 .empty-start-controls {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  width: 300px;
+  gap: 12px;
+  width: 460px;
   max-width: 100%;
   text-align: left;
 }
+.empty-start-controls .ns-agent-tab { font-size: 13.5px; padding: 8px 10px; gap: 8px; }
+.empty-start-controls .ns-agent-tab .agent-icon { font-size: 18px; }
+.empty-start-controls .ns-select { font-size: 13.5px; padding: 7px 28px 7px 10px; }
+.empty-start-controls .tui-pick { font-size: 14.5px; padding: 9px 14px; }
+.empty-start-controls .ns-tab-setup { font-size: 10px; }
 .empty-start-controls .ns-agents { border-bottom: none; padding-bottom: 0; margin-bottom: 0; }
 
 /* Per-source tinting, so the mark carries meaning at a glance rather than

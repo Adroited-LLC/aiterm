@@ -530,7 +530,10 @@ export default function ComposerPills({
           agents.length ? (running ? `${running} active` : `${agents.length}`) : "",
           running ? "busy" : "",
         )}
-        {(session || ctx !== null) && pill(
+        {/* Only with a session: the plan figure is already in the top strip,
+            and the context window belongs to a session — on the empty pane
+            the pill was a number with nothing for it to be about. */}
+        {sessionId && (session || ctx !== null) && pill(
           "usage", <Icon of={ChartPie} size="sm" />, "Usage",
           [
             session ? `${Math.round(session.percent)}%` : "",
