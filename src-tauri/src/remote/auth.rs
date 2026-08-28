@@ -14,6 +14,10 @@ use subtle::ConstantTimeEq;
 const STORE_VERSION: u8 = 1;
 const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(300);
 const DEVICES_FILE: &str = "trusted-devices.json";
+/// How long a submitted pairing request, and the answer the desktop gave
+/// it, stay in memory. A phone that walks away mid-pairing must not pin a
+/// record for the life of the process.
+const PAIRING_RETENTION: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedDevice {
@@ -54,6 +58,7 @@ pub struct PendingPairing {
 struct PendingDevice {
     view: PendingPairing,
     public_key: String,
+    expires_at: SystemTime,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +72,7 @@ struct StoreState {
     devices: Vec<StoredDevice>,
     enrollments: Vec<PendingEnrollment>,
     pending_pairings: Vec<PendingDevice>,
-    pairing_outcomes: HashMap<String, PairingOutcome>,
+    pairing_outcomes: HashMap<String, (PairingOutcome, SystemTime)>,
 }
 
 pub struct DeviceStore {
@@ -125,6 +130,7 @@ impl DeviceStore {
         now: SystemTime,
     ) -> Result<PendingPairing, AuthError> {
         let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
+        prune_pairings(&mut state, now);
         let Some(position) = state
             .enrollments
             .iter()
@@ -167,6 +173,7 @@ impl DeviceStore {
         state.pending_pairings.push(PendingDevice {
             view: view.clone(),
             public_key: URL_SAFE_NO_PAD.encode(canonical_bytes),
+            expires_at: now + PAIRING_RETENTION,
         });
         Ok(view)
     }
@@ -197,12 +204,17 @@ impl DeviceStore {
             public_key: pending.public_key,
         };
         let mut devices = state.devices.clone();
+        // One phone, one row. Pairing a phone that is already trusted — after
+        // a reinstall, or because the user simply scanned again — used to add
+        // a second row holding the same key, so revoking the row the user
+        // could see left a working credential behind.
+        devices.retain(|device| device.view.fingerprint != stored.view.fingerprint);
         devices.push(stored);
         persist_devices(&self.root.join(DEVICES_FILE), &devices)?;
         state.devices = devices;
         state.pairing_outcomes.insert(
             request_id.to_string(),
-            PairingOutcome::Approved(view.clone()),
+            (PairingOutcome::Approved(view.clone()), now + PAIRING_RETENTION),
         );
         Ok(view)
     }
@@ -232,10 +244,39 @@ impl DeviceStore {
     }
 
     pub fn take_pairing_outcome(&self, request_id: &str) -> Option<PairingOutcome> {
-        self.state.lock().ok()?.pairing_outcomes.remove(request_id)
+        self.state
+            .lock()
+            .ok()?
+            .pairing_outcomes
+            .remove(request_id)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Drop enrollments, pairing requests, and collected answers that have
+    /// aged out. Called on every pairing submission; the gateway also calls it
+    /// on a timer so an idle desktop does not hold stale state.
+    pub fn prune_at(&self, now: SystemTime) {
+        if let Ok(mut state) = self.state.lock() {
+            prune_state(&mut state, now);
+        }
+    }
+
+    /// How many in-flight pairing records the store is holding. Exposed so the
+    /// desktop can show, and tests can assert, that nothing accumulates.
+    pub fn pending_state_len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| {
+                state.enrollments.len() + state.pending_pairings.len() + state.pairing_outcomes.len()
+            })
+            .unwrap_or(0)
     }
 
     pub fn deny_pairing(&self, request_id: &str) -> Result<bool, AuthError> {
+        self.deny_pairing_at(request_id, SystemTime::now())
+    }
+
+    pub fn deny_pairing_at(&self, request_id: &str, now: SystemTime) -> Result<bool, AuthError> {
         let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
         let original_len = state.pending_pairings.len();
         state
@@ -246,7 +287,7 @@ impl DeviceStore {
         }
         state
             .pairing_outcomes
-            .insert(request_id.to_string(), PairingOutcome::Denied);
+            .insert(request_id.to_string(), (PairingOutcome::Denied, now + PAIRING_RETENTION));
         Ok(true)
     }
 
@@ -256,14 +297,24 @@ impl DeviceStore {
         nonce: &[u8],
         signature_der: &[u8],
     ) -> Result<(), AuthError> {
-        let state = self.state.lock().map_err(|_| AuthError::poisoned())?;
-        let device = state
+        self.verify_proof_at(device_id, nonce, signature_der, SystemTime::now())
+    }
+
+    pub fn verify_proof_at(
+        &self,
+        device_id: &str,
+        nonce: &[u8],
+        signature_der: &[u8],
+        now: SystemTime,
+    ) -> Result<(), AuthError> {
+        let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
+        let position = state
             .devices
             .iter()
-            .find(|device| device.view.id == device_id)
+            .position(|device| device.view.id == device_id)
             .ok_or_else(|| AuthError::new("auth.unknown_device", "device is not trusted"))?;
         let public_key = URL_SAFE_NO_PAD
-            .decode(&device.public_key)
+            .decode(&state.devices[position].public_key)
             .map_err(|_| AuthError::new("auth.invalid_device_record", "invalid stored key"))?;
         let verifying_key = VerifyingKey::from_sec1_bytes(&public_key)
             .map_err(|_| AuthError::new("auth.invalid_device_record", "invalid stored key"))?;
@@ -271,7 +322,19 @@ impl DeviceStore {
             .map_err(|_| AuthError::new("auth.invalid_proof", "invalid device proof"))?;
         verifying_key
             .verify(nonce, &signature)
-            .map_err(|_| AuthError::new("auth.invalid_proof", "invalid device proof"))
+            .map_err(|_| AuthError::new("auth.invalid_proof", "invalid device proof"))?;
+
+        // Only a proof that actually verified counts as a sighting. Recording
+        // the attempt instead would let anyone who knows a device id keep the
+        // settings panel showing a phone as freshly connected.
+        let seen = unix_seconds(now);
+        if state.devices[position].view.last_seen_at != Some(seen) {
+            let mut devices = state.devices.clone();
+            devices[position].view.last_seen_at = Some(seen);
+            persist_devices(&self.root.join(DEVICES_FILE), &devices)?;
+            state.devices = devices;
+        }
+        Ok(())
     }
 
     pub fn list_devices(&self) -> Vec<TrustedDevice> {
@@ -299,6 +362,18 @@ impl DeviceStore {
         state.devices = devices;
         Ok(true)
     }
+}
+
+fn prune_state(state: &mut StoreState, now: SystemTime) {
+    state.enrollments.retain(|item| item.expires_at >= now);
+    prune_pairings(state, now);
+}
+
+fn prune_pairings(state: &mut StoreState, now: SystemTime) {
+    state.pending_pairings.retain(|item| item.expires_at >= now);
+    state
+        .pairing_outcomes
+        .retain(|_, (_, expires_at)| *expires_at >= now);
 }
 
 fn load_devices(path: &Path) -> Result<Vec<StoredDevice>, AuthError> {
