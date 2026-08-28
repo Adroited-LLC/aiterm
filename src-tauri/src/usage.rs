@@ -2,7 +2,7 @@
 //! agents it launches, and credit balances for the API providers it is
 //! configured with.
 //!
-//! Three sources, each read the way its own tool reads it:
+//! Four sources, each read the way its own tool reads it:
 //!
 //! * **Claude** — `GET https://api.anthropic.com/api/oauth/usage` with the
 //!   OAuth token Claude Code stores in `~/.claude/.credentials.json`, plus the
@@ -24,6 +24,23 @@
 //!   surface, with checks for auth, config, install, network and state — has no
 //!   rate-limit or quota check in it. The TUI's own `/usage` view is fed by the
 //!   endpoint above.
+//! * **Grok** — `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
+//!   with the OIDC access token grok stores in `~/.grok/auth.json`. Found the
+//!   same way: `strings` over `~/.grok/bin/grok` has a `billing.rs` extension
+//!   carrying the path `/billing?format=credits`, the header name
+//!   `x-grok-client-mode`, and a response struct (`creditUsagePercent`,
+//!   `currentPeriod`, `prepaidBalance`, `onDemandCap`…); the base was found by
+//!   curling the path under each host the binary names — the CLI's chat proxy
+//!   answers 200, `api.x.ai` and `grok.com/rest` 404. The header turned out
+//!   not to matter and is not sent. The reply is one rolling window (weekly,
+//!   for a SuperGrok account) as a percent used with its start and end, plus a
+//!   per-product split (Grok Build, Imagine, App Builder, Chat).
+//!
+//!   The token expires every few hours and grok refreshes it whenever it runs.
+//!   This module never refreshes it itself: the binary's own log lines talk of
+//!   "sibling rotation" and "refresh-token double-spend", which is a rotating
+//!   refresh token, and spending it from here would sign the CLI out. An
+//!   expired token is reported as *rejected* with "open grok", not repaired.
 //! * **API providers** — `GET {base_url}/credits` with the saved bearer token.
 //!   Verified against OpenRouter, which answers
 //!   `{"data":{"total_credits":…,"total_usage":…}}`. Any provider whose reply
@@ -63,7 +80,7 @@ use serde::Serialize;
 pub struct UsageBar {
     /// Stable-ish key for React lists and for picking a bar out by meaning:
     /// "session" | "weekly_all" | "weekly_scoped" from Anthropic, or
-    /// "codex_primary" | "codex_secondary".
+    /// "codex_primary" | "codex_secondary", or "grok_period".
     pub kind: String,
     /// Human label: "Current session", "All models", "Fable", "Weekly limit".
     pub label: String,
@@ -83,11 +100,13 @@ pub struct UsageAmount {
     pub amount: f64,
     /// The total this counts against, when the source names one.
     pub of: Option<f64>,
-    /// ISO currency code, **only when the payload actually says one**.
-    /// Anthropic's `spend` object carries `"currency":"USD"`; OpenRouter's
-    /// `/credits` and Codex's `credits.balance` do not name a currency at all,
-    /// so this is empty for them and the UI prints a bare number rather than
-    /// inventing a dollar sign.
+    /// ISO currency code, when the amount is known to be money in one.
+    /// Anthropic's `spend` object carries `"currency":"USD"` itself;
+    /// OpenRouter's `/credits` does not name one, but its credits are defined
+    /// in dollars, so "USD" is set for that shape (see `parse_provider_credits`).
+    /// Codex's `credits.balance` and Grok's `prepaidBalance` name nothing and
+    /// are documented nowhere, so they stay empty and the UI prints a bare
+    /// number rather than guessing a symbol.
     pub currency: String,
     /// "remaining" — `amount` is what is left of `of`.
     /// "used" — `amount` is what has been spent out of `of`.
@@ -98,7 +117,7 @@ pub struct UsageAmount {
 /// see the module note on why silence is not an acceptable way to say "no".
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct UsageSource {
-    /// "anthropic" | "codex" | "provider:<provider id>".
+    /// "anthropic" | "codex" | "grok" | "provider:<provider id>".
     pub id: String,
     pub name: String,
     /// "ok" — the numbers below are real.
@@ -701,6 +720,240 @@ fn codex_source() -> Option<UsageSource> {
 }
 
 // ---------------------------------------------------------------------------
+// Grok
+// ---------------------------------------------------------------------------
+
+/// The one billing call the grok CLI makes — see the module note on how it
+/// was found.
+const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+
+/// `~/.grok`, the same directory `grok.rs` reads sessions and models from.
+fn grok_home() -> Option<std::path::PathBuf> {
+    Some(dirs::home_dir()?.join(".grok"))
+}
+
+struct GrokAuth {
+    access_token: String,
+    email: String,
+}
+
+/// What `~/.grok/auth.json` says.
+///
+/// The file is a map keyed by `"<issuer>::<client id>"`, one entry per way
+/// grok has been signed in, each with an `auth_mode`. The `"oidc"` entry is
+/// the grok.com account whose plan the billing endpoint reports on; an entry
+/// for an API key would carry no plan. `Ok(None)` means the file is there but
+/// holds no account login — grok is installed and signed in some other way.
+fn grok_auth() -> Result<Option<GrokAuth>, String> {
+    let path = grok_home().ok_or("no home directory")?.join("auth.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| format!("{} is not readable", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "auth.json is not JSON".to_string())?;
+    let Some(entries) = v.as_object() else {
+        return Err("auth.json is not an object".into());
+    };
+    let account = entries
+        .values()
+        .find(|e| e.get("auth_mode").and_then(|m| m.as_str()) == Some("oidc"));
+    let Some(account) = account else {
+        return Ok(None);
+    };
+    let token = account.get("key").and_then(|k| k.as_str()).unwrap_or("");
+    if token.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(GrokAuth {
+        access_token: token.to_string(),
+        email: account
+            .get("email")
+            .and_then(|e| e.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }))
+}
+
+/// "USAGE_PERIOD_TYPE_WEEKLY" → "Weekly limit". Anything unrecognised keeps
+/// its own last word rather than being called weekly on a guess.
+fn grok_period_label(kind: &str) -> String {
+    match kind {
+        "USAGE_PERIOD_TYPE_WEEKLY" => "Weekly limit".to_string(),
+        "USAGE_PERIOD_TYPE_DAILY" => "Daily limit".to_string(),
+        "USAGE_PERIOD_TYPE_MONTHLY" => "Monthly limit".to_string(),
+        other => match other.rsplit('_').next().filter(|w| !w.is_empty()) {
+            Some(w) => format!("{} limit", title_case(&w.to_lowercase())),
+            None => "Limit".to_string(),
+        },
+    }
+}
+
+/// "GrokBuild" → "Grok Build", "GrokAppBuilder" → "App Builder". The product
+/// names arrive as one CamelCase word each with a "Grok" prefix that would
+/// read four times over on one line; only Grok Build keeps it, because that is
+/// the CLI's own name and "Build" alone is not one.
+fn grok_product_label(product: &str) -> String {
+    if product == "GrokBuild" {
+        return "Grok Build".to_string();
+    }
+    let mut words: Vec<String> = vec![];
+    for ch in product.chars() {
+        if ch.is_uppercase() || words.is_empty() {
+            words.push(ch.to_string());
+        } else if let Some(last) = words.last_mut() {
+            last.push(ch);
+        }
+    }
+    if words.len() > 1 && words[0] == "Grok" {
+        words.remove(0);
+    }
+    words.join(" ")
+}
+
+/// Turn the `/billing?format=credits` body into a source.
+pub fn parse_grok(status: u16, body: &str) -> UsageSource {
+    let mut src = UsageSource::blank("grok", "Grok");
+    if status == 401 || status == 403 {
+        src.state = "rejected".into();
+        src.detail = "Grok's saved login was refused or has expired. Open grok once — it refreshes its own token — or run `grok login`.".into();
+        return src;
+    }
+    if status == 429 {
+        src.state = "rejected".into();
+        src.detail = "grok.com rate-limited the usage request. It will retry in a minute.".into();
+        return src;
+    }
+    if !(200..300).contains(&status) {
+        src.state = "unreachable".into();
+        src.detail = format!("grok.com answered HTTP {status}.");
+        return src;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        src.state = "unreachable".into();
+        src.detail = "grok.com did not answer with JSON.".into();
+        return src;
+    };
+    let Some(config) = v.get("config").filter(|c| c.is_object()) else {
+        src.state = "unreachable".into();
+        src.detail = "grok.com answered, but with no usage in it.".into();
+        return src;
+    };
+
+    if let Some(percent) = config.get("creditUsagePercent").and_then(|p| p.as_f64()) {
+        let period = config.get("currentPeriod");
+        let kind = period
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        // The reply's `end` is already ISO-8601 (with a `+00:00` offset rather
+        // than `Z`, which `Date` parses the same), so it goes through as is.
+        let resets_at = period
+            .and_then(|p| p.get("end"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("")
+            .to_string();
+        src.bars.push(UsageBar {
+            kind: "grok_period".into(),
+            label: grok_period_label(kind),
+            percent,
+            severity: severity_for(percent).to_string(),
+            resets_at,
+        });
+    }
+
+    // Where the window went. Products with no `usagePercent` (Chat, on this
+    // account) are left out rather than printed as 0%, since the field's
+    // absence reads more like "not metered here" than "unused".
+    if let Some(products) = config.get("productUsage").and_then(|p| p.as_array()) {
+        let parts: Vec<String> = products
+            .iter()
+            .filter_map(|p| {
+                let name = p.get("product").and_then(|n| n.as_str())?;
+                let pct = p.get("usagePercent").and_then(|u| u.as_f64())?;
+                Some(format!("{} {}%", grok_product_label(name), pct.round() as i64))
+            })
+            .collect();
+        if !parts.is_empty() {
+            src.notes.push(parts.join(" · "));
+        }
+    }
+
+    // `{"val":N}` wrappers. Neither names a currency, so neither gets one.
+    let val = |key: &str| {
+        config
+            .get(key)
+            .and_then(|o| o.get("val"))
+            .and_then(|n| n.as_f64())
+    };
+    if let Some(cap) = val("onDemandCap").filter(|c| *c > 0.0) {
+        src.amounts.push(UsageAmount {
+            label: "On-demand".into(),
+            amount: val("onDemandUsed").unwrap_or(0.0),
+            of: Some(cap),
+            currency: String::new(),
+            sense: "used".into(),
+        });
+    }
+    if let Some(balance) = val("prepaidBalance").filter(|b| *b > 0.0) {
+        src.amounts.push(UsageAmount {
+            label: "Prepaid balance".into(),
+            amount: balance,
+            of: None,
+            currency: String::new(),
+            sense: "remaining".into(),
+        });
+    }
+
+    if src.bars.is_empty() && src.amounts.is_empty() {
+        src.state = "unreachable".into();
+        src.detail = "grok.com answered, but with no usage in it.".into();
+    }
+    src
+}
+
+/// `None` when grok is not installed here — same rule as Codex: an absent
+/// tool gets no row.
+fn grok_source() -> Option<UsageSource> {
+    let home = grok_home()?;
+    if !home.is_dir() {
+        return None;
+    }
+    let auth = match grok_auth() {
+        Err(_) => {
+            return Some(UsageSource::failed(
+                "grok",
+                "Grok",
+                "signed_out",
+                "No grok login found. Run `grok login`.",
+            ))
+        }
+        Ok(None) => {
+            return Some(UsageSource::failed(
+                "grok",
+                "Grok",
+                "signed_out",
+                "grok is signed in with an API key, which has no plan usage to report.",
+            ))
+        }
+        Ok(Some(a)) => a,
+    };
+    let headers = vec!["Accept: application/json".to_string()];
+    let mut src = match curl_get(GROK_BILLING_URL, &auth.access_token, &headers) {
+        Err(e) => UsageSource::failed(
+            "grok",
+            "Grok",
+            "unreachable",
+            &format!("Could not reach grok.com — {e}"),
+        ),
+        Ok((status, body)) => parse_grok(status, &body),
+    };
+    // The billing reply says nothing about who it is for; auth.json does.
+    if src.state == "ok" {
+        src.account = auth.email;
+    }
+    Some(src)
+}
+
+// ---------------------------------------------------------------------------
 // Configured API providers
 // ---------------------------------------------------------------------------
 
@@ -761,10 +1014,12 @@ pub fn parse_provider_credits(id: &str, name: &str, status: u16, body: &str) -> 
                 // number; the lifetime spend goes in a note where it cannot be
                 // mistaken for a limit.
                 of: None,
-                // OpenRouter's reply names no currency. It is dollars in
-                // practice, but the payload does not say so and this file does
-                // not print what the payload did not say.
-                currency: String::new(),
+                // The reply names no currency, but this shape is OpenRouter's
+                // and OpenRouter's credits are dollars — its docs define
+                // `total_credits` and `total_usage` in USD and the dashboard
+                // prints them with a `$`. A balance read "0.93" was being taken
+                // for a count of something, so the unit is stated.
+                currency: "USD".into(),
                 sense: "remaining".into(),
             });
             src.notes
@@ -820,6 +1075,7 @@ pub fn usage_report() -> Vec<UsageSource> {
     std::thread::scope(|s| {
         let claude = s.spawn(anthropic_source);
         let codex = s.spawn(codex_source);
+        let grok = s.spawn(grok_source);
         let provider_jobs: Vec<_> = providers
             .iter()
             .map(|p| s.spawn(move || provider_source(p)))
@@ -833,6 +1089,9 @@ pub fn usage_report() -> Vec<UsageSource> {
         }
         if let Ok(Some(c)) = codex.join() {
             out.push(c);
+        }
+        if let Ok(Some(g)) = grok.join() {
+            out.push(g);
         }
         for j in provider_jobs {
             if let Ok(p) = j.join() {
@@ -1037,6 +1296,69 @@ mod tests {
         assert_eq!(parse_codex(200, "{}").state, "unreachable");
     }
 
+    /// The live `/billing?format=credits` reply, curled with the token from
+    /// `~/.grok/auth.json` while this was written.
+    const GROK_BODY: &str = r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-21T09:08:48.910873+00:00","end":"2026-08-28T09:08:48.910873+00:00"},"creditUsagePercent":22.0,"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"productUsage":[{"product":"GrokBuild","usagePercent":19.0},{"product":"GrokImagine","usagePercent":2.0},{"product":"GrokAppBuilder","usagePercent":1.0},{"product":"GrokChat"}],"isUnifiedBillingUser":true,"prepaidBalance":{"val":0},"topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD","billingPeriodStart":"2026-08-21T09:08:48.910873+00:00","billingPeriodEnd":"2026-08-28T09:08:48.910873+00:00"}}"#;
+
+    #[test]
+    fn grok_period_becomes_a_bar() {
+        let src = parse_grok(200, GROK_BODY);
+        assert_eq!(src.state, "ok", "{}", src.detail);
+        assert_eq!(src.id, "grok");
+        assert_eq!(src.bars.len(), 1);
+        let b = &src.bars[0];
+        assert_eq!(b.kind, "grok_period");
+        assert_eq!(b.label, "Weekly limit");
+        assert_eq!(b.percent, 22.0);
+        assert_eq!(b.severity, "normal");
+        assert_eq!(b.resets_at, "2026-08-28T09:08:48.910873+00:00");
+        // Chat has no percent and is left out rather than shown as 0%.
+        assert_eq!(src.notes, vec!["Grok Build 19% · Imagine 2% · App Builder 1%"]);
+        // Zero balances and a zero cap are not worth a row.
+        assert!(src.amounts.is_empty());
+    }
+
+    #[test]
+    fn grok_balances_show_only_when_there_are_any() {
+        let body = r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_DAILY","end":"2026-09-01T00:00:00+00:00"},"creditUsagePercent":91.5,"onDemandCap":{"val":50},"onDemandUsed":{"val":12.5},"prepaidBalance":{"val":3}}}"#;
+        let src = parse_grok(200, body);
+        assert_eq!(src.bars[0].label, "Daily limit");
+        assert_eq!(src.bars[0].severity, "critical");
+        assert_eq!(src.amounts.len(), 2);
+        assert_eq!(src.amounts[0].label, "On-demand");
+        assert_eq!(src.amounts[0].amount, 12.5);
+        assert_eq!(src.amounts[0].of, Some(50.0));
+        assert_eq!(src.amounts[0].sense, "used");
+        assert_eq!(src.amounts[1].label, "Prepaid balance");
+        assert_eq!(src.amounts[1].amount, 3.0);
+        // Nothing in the payload names a currency, so none is claimed.
+        assert_eq!(src.amounts[1].currency, "");
+    }
+
+    #[test]
+    fn grok_labels_are_read_not_guessed() {
+        assert_eq!(grok_period_label("USAGE_PERIOD_TYPE_MONTHLY"), "Monthly limit");
+        assert_eq!(grok_period_label("USAGE_PERIOD_TYPE_FORTNIGHTLY"), "Fortnightly limit");
+        assert_eq!(grok_period_label(""), "Limit");
+        assert_eq!(grok_product_label("GrokBuild"), "Grok Build");
+        assert_eq!(grok_product_label("GrokAppBuilder"), "App Builder");
+        assert_eq!(grok_product_label("GrokImagine"), "Imagine");
+        assert_eq!(grok_product_label("Voice"), "Voice");
+    }
+
+    #[test]
+    fn grok_failures_are_told_apart() {
+        let rejected = parse_grok(
+            401,
+            r#"{"error":"Invalid or expired credentials (auth_kind=bearer, upstream=Unauthenticated)"}"#,
+        );
+        assert_eq!(rejected.state, "rejected");
+        assert!(rejected.detail.contains("Open grok"), "{}", rejected.detail);
+        assert_eq!(parse_grok(502, "").state, "unreachable");
+        assert_eq!(parse_grok(200, "{}").state, "unreachable");
+        assert_eq!(parse_grok(200, r#"{"config":{}}"#).state, "unreachable");
+    }
+
     /// The live OpenRouter reply, curled with a real key while this was written.
     #[test]
     fn openrouter_credits_are_the_difference_not_the_total() {
@@ -1047,6 +1369,8 @@ mod tests {
         let a = &src.amounts[0];
         assert!((a.amount - 0.926444864).abs() < 1e-9, "got {}", a.amount);
         assert_eq!(a.sense, "remaining");
+        // OpenRouter credits are dollars, so the chip prints a `$`.
+        assert_eq!(a.currency, "USD");
         // The lifetime total is not a budget, so it must not become one.
         assert_eq!(a.of, None, "drew a bar against lifetime top-ups");
         assert_eq!(src.notes, vec!["550.67 spent of 551.59 ever added."]);
@@ -1102,6 +1426,10 @@ mod tests {
             None => println!("codex is not installed here"),
             Some(c) => check(c),
         }
+        match grok_source() {
+            None => println!("grok is not installed here"),
+            Some(g) => check(g),
+        }
         match std::env::var("OPENROUTER_API_KEY") {
             Err(_) => println!("OPENROUTER_API_KEY unset — skipped the provider path"),
             Ok(key) => check(provider_source(
@@ -1126,6 +1454,7 @@ mod tests {
         for src in [
             parse_anthropic(200, ANTHROPIC_BODY),
             parse_codex(200, CODEX_BODY),
+            parse_grok(200, GROK_BODY),
             parse_provider_credits(
                 "openrouter",
                 "OpenRouter",

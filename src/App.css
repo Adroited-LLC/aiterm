@@ -66,6 +66,9 @@ body.dragging * { pointer-events: none; }
   flex-shrink: 0;
 }
 .topbar-left { display: flex; gap: 2px; }
+/* The panel toggles share the line with the usage strip and were a size down
+   from its numbers; glyphs like ⎇ and ☑ need the extra pixels to read. */
+.topbar-left .icon-btn { font-size: 15px; }
 .topbar-title {
   flex: 1;
   text-align: center;

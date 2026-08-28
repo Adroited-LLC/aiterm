@@ -91,9 +91,10 @@ function resetsIn(iso: string): string {
 }
 
 /**
- * A money-ish number, with a currency symbol only where the service actually
- * named a currency — OpenRouter and Codex do not, so their numbers print bare
- * rather than acquiring a dollar sign this app made up.
+ * A money-ish number, with a currency symbol only where the backend is sure of
+ * the currency — Anthropic names it and OpenRouter's credits are dollars, so
+ * those get a `$`; Codex and Grok balances name nothing and print bare rather
+ * than acquiring a symbol this app made up.
  *
  * Four decimals under 1 so a balance of 93 cents does not round to nothing,
  * which is exactly the case where the number matters most.
@@ -291,9 +292,11 @@ export function UsagePanel({ sources, onRefresh, refreshing }: Props) {
         bars: [], amounts: [], notes: [], at: 0, stale: false,
       } as UsageSourceAt];
 
-  // Three chips is what fits beside the toggles on a narrow window; the rest
-  // are a count, and the panel has all of them.
-  const shown = chips.length > 3 ? chips.slice(0, 3) : chips;
+  // Four chips: one per agent CLI (Claude, Codex, Grok) plus the API balance,
+  // which is the whole point of the strip — a fourth service folded into a
+  // "+1" is a service you cannot read. Past that they are a count, and the
+  // panel has all of them.
+  const shown = chips.length > 4 ? chips.slice(0, 4) : chips;
   const hidden = chips.length - shown.length;
 
   // Sources whose numbers we do not currently know. "no_balance" is not one of

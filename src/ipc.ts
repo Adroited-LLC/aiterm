@@ -282,8 +282,9 @@ export interface UsageAmount {
   amount: number;
   /** The total `amount` counts against, when the service names one. */
   of: number | null;
-  /** ISO code, and only when the payload actually said one — OpenRouter and
-   *  Codex name no currency, so their numbers print bare. */
+  /** ISO code when the amount is known to be money in one: Anthropic says
+   *  "USD" itself, and OpenRouter's credits are dollars by its own docs. Codex
+   *  and Grok name nothing, so their balances print bare. */
   currency: string;
   /** "remaining" — `amount` is what is left. "used" — it is what was spent. */
   sense: string;
@@ -291,7 +292,7 @@ export interface UsageAmount {
 /** One service's answer. Always present, even when it could not be reached:
  *  see `usage.rs` on why an absent row is not an acceptable way to say "no". */
 export interface UsageSource {
-  /** "anthropic" | "codex" | "provider:<id>". */
+  /** "anthropic" | "codex" | "grok" | "provider:<id>". */
   id: string;
   name: string;
   /** "ok" | "signed_out" | "unreachable" | "rejected" | "no_balance". */
