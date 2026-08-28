@@ -123,6 +123,8 @@ pub fn run() {
             fsx::list_dir,
             fsx::open_path,
             fsx::list_projects,
+            fsx::read_text_file,
+            fsx::write_text_file,
             indexer::reindex_sessions,
             indexer::search_sessions,
             git::git_repo_state,

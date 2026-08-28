@@ -66,6 +66,20 @@ pub trait SessionProvider: Send + Sync {
         None
     }
 
+    /// The session's task list, for an engine that records one in its own
+    /// shape — grok's `todo_write`, codex's `update_plan`. `None` means
+    /// "scan the claude transcript", which stays the default.
+    fn tasks(&self, session_id: &str) -> Option<Vec<SessionTask>> {
+        let _ = session_id;
+        None
+    }
+
+    /// Files the session wrote, same contract as [`Self::tasks`].
+    fn artifacts(&self, session_id: &str) -> Option<Vec<Artifact>> {
+        let _ = session_id;
+        None
+    }
+
     fn scan(&self) -> Vec<Session> {
         self.scan_with_paths().into_iter().map(|(s, _)| s).collect()
     }
@@ -1275,8 +1289,16 @@ pub async fn session_tasks(session_id: String) -> Vec<SessionTask> {
 }
 
 fn session_tasks_sync(session_id: String) -> Vec<SessionTask> {
-    if panels_denied(&session_id) {
-        return vec![];
+    let list = crate::agents::backends();
+    if let Some((owner, _)) = crate::agents::owner_in(&list, &session_id) {
+        if !owner.caps().tasks {
+            return vec![];
+        }
+        // An engine that records tasks in its own shape answers through its
+        // provider; claude's `None` falls through to the transcript scan.
+        if let Some(tasks) = owner.sessions().tasks(&session_id) {
+            return tasks;
+        }
     }
     if let Some(path) = resolve_live_session_file(&session_id) {
         if let Ok(file) = File::open(&path) {
@@ -2441,8 +2463,14 @@ pub async fn session_artifacts(session_id: String) -> Vec<Artifact> {
 }
 
 fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
-    if panels_denied(&session_id) {
-        return vec![];
+    let list = crate::agents::backends();
+    if let Some((owner, _)) = crate::agents::owner_in(&list, &session_id) {
+        if !owner.caps().tasks {
+            return vec![];
+        }
+        if let Some(artifacts) = owner.sessions().artifacts(&session_id) {
+            return artifacts;
+        }
     }
     let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];

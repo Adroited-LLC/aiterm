@@ -20,6 +20,8 @@ import {
 } from "./term/screen";
 import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
+import FileView from "./components/FileView";
+import AgentIcon from "./components/AgentIcon";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
 import SessionPreview from "./components/SessionPreview";
 import { UsagePanel, UsageSourceAt, mergeUsage } from "./components/UsagePanel";
@@ -71,7 +73,7 @@ localStorage.removeItem("aiterm.usageCache");
  *  black pane. */
 const NO_CAPS: Caps = {
   fork: false, clear: false, resume: false, tui_drive: false, panels: false,
-  delete: false, config: false,
+  tasks: false, delete: false, config: false,
   // No roster knows about an engine aiterm does not know about either, so its
   // tab is the only sign of life — the same answer every non-claude engine gets.
   roster_liveness: false,
@@ -130,6 +132,16 @@ function describeEnd(why: EndedWhy | undefined): string {
  *  One object rather than a tail of positional arguments: these are all
  *  optional and mostly unrelated, so the call sites that set the last one were
  *  spelling `undefined` three times to get to it. */
+/** A file open in the center strip, pinned to the terminal tab it was
+ *  opened beside — switching sessions switches to that session's files. */
+interface FileTab {
+  key: number;
+  /** The terminal tab this file belongs to; null when it was opened with no
+   *  terminal on screen. */
+  termKey: number | null;
+  path: string;
+}
+
 interface OpenTabOpts {
   sessionId?: string;
   fresh?: boolean;
@@ -185,6 +197,16 @@ export default function App() {
   const nextKey = useRef(1);
   const [gitRefresh, setGitRefresh] = useState(0);
   const [explorerRefresh, setExplorerRefresh] = useState(0);
+  // Center file tabs — the browser-tab strip beside the (locked) terminal.
+  const [fileTabs, setFileTabs] = useState<FileTab[]>([]);
+  /** Key of the file tab on screen; null = the terminal. Reset on terminal
+   *  switch: arriving at a session shows the session. */
+  const [activeFileTab, setActiveFileTab] = useState<number | null>(null);
+  const [dirtyFiles, setDirtyFiles] = useState<Set<number>>(new Set());
+  /** File tab whose × was clicked once while dirty — a second click within
+   *  the window discards. An inline arm instead of a blocking dialog. */
+  const [fileCloseArm, setFileCloseArm] = useState<number | null>(null);
+  const fileCloseTimer = useRef<number | null>(null);
 
   // Tabs whose terminal rang the bell while not being looked at.
   const [attention, setAttention] = useState<Set<number>>(new Set());
@@ -672,6 +694,74 @@ export default function App() {
     },
     [],
   );
+
+  // Switching terminal, or picking a different session to preview, puts that
+  // terminal or preview on screen — a file tab left selected would cover it.
+  useEffect(() => setActiveFileTab(null), [activeTab, previewSession?.id]);
+
+  /** Whether a file tab belongs on the strip right now. A file opened with no
+   *  terminal (from a preview, or the empty start view) has no terminal to
+   *  belong to, so it belongs to all of them: it stays reachable after a
+   *  session starts instead of vanishing until every tab is closed. */
+  const showsFile = useCallback(
+    (f: FileTab) => f.termKey === null || f.termKey === activeTab,
+    [activeTab],
+  );
+  /** A file tab is the thing on screen in the center right now. */
+  const fileOnScreen =
+    activeFileTab !== null && fileTabs.some((f) => showsFile(f) && f.key === activeFileTab);
+
+  const openFileTab = useCallback((path: string) => {
+    const term = activeTabRef.current;
+    setFileTabs((list) => {
+      const existing = list.find(
+        (f) => f.path === path && (f.termKey === term || f.termKey === null),
+      );
+      if (existing) {
+        setActiveFileTab(existing.key);
+        return list;
+      }
+      const key = nextKey.current++;
+      setActiveFileTab(key);
+      return [...list, { key, termKey: term, path }];
+    });
+  }, []);
+
+  const noteFileDirty = useCallback((key: number, dirty: boolean) => {
+    setDirtyFiles((prev) => {
+      if (prev.has(key) === dirty) return prev;
+      const next = new Set(prev);
+      if (dirty) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
+
+  const closeFileTab = useCallback((key: number) => {
+    if (dirtyFiles.has(key) && fileCloseArm !== key) {
+      setFileCloseArm(key);
+      if (fileCloseTimer.current !== null) clearTimeout(fileCloseTimer.current);
+      fileCloseTimer.current = window.setTimeout(() => setFileCloseArm(null), 2600);
+      return;
+    }
+    setFileCloseArm(null);
+    setDirtyFiles((prev) => {
+      if (!prev.has(key)) return prev;
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
+    setFileTabs((list) => {
+      const closing = list.find((f) => f.key === key);
+      const next = list.filter((f) => f.key !== key);
+      setActiveFileTab((cur) => {
+        if (cur !== key) return cur;
+        const sib = next.filter((f) => f.termKey === closing?.termKey);
+        return sib[sib.length - 1]?.key ?? null;
+      });
+      return next;
+    });
+  }, [dirtyFiles, fileCloseArm]);
 
   const registerHandle = useCallback((key: number, handle: TermHandle | null) => {
     if (handle) handles.current.set(key, handle);
@@ -1209,6 +1299,19 @@ export default function App() {
   // all three things. Removed rather than left running for nobody to read.
 
   const closeTab = useCallback((key: number) => {
+    setFileTabs((list) => {
+      const dropped = list.filter((f) => f.termKey === key).map((f) => f.key);
+      if (dropped.length) {
+        setDirtyFiles((prev) => {
+          const next = new Set(prev);
+          dropped.forEach((k) => next.delete(k));
+          return next;
+        });
+        setActiveFileTab((cur) =>
+          cur !== null && dropped.includes(cur) ? null : cur);
+      }
+      return list.filter((f) => f.termKey !== key);
+    });
     setEnded((m) => {
       if (!m.has(key)) return m;
       const next = new Map(m);
@@ -1896,6 +1999,62 @@ export default function App() {
         )}
 
         <div className="panel terminal-panel">
+          {(activeTabObj !== null || fileTabs.some(showsFile)) && (
+            <div className="center-tabs">
+              {/* No terminal: the locked tab is the preview, or the start
+                  view, so there is still a way back from a file. */}
+              {!activeTabObj && (
+                <button
+                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")}
+                  title={previewSession?.project_path ?? undefined}
+                  onClick={() => setActiveFileTab(null)}
+                >
+                  {previewSession
+                    ? <AgentIcon agent={previewSession.agent} size={13} />
+                    : null}
+                  <span className="center-tab-name">
+                    {previewSession ? previewSession.title : "Start"}
+                  </span>
+                </button>
+              )}
+              {activeTabObj && (
+                <button
+                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")}
+                  title={activeTabObj.cwd ?? undefined}
+                  onClick={() => {
+                    setActiveFileTab(null);
+                    if (activeTab !== null) handles.current.get(activeTab)?.focus();
+                  }}
+                >
+                  {activeTabObj.agentId
+                    ? <AgentIcon agent={activeTabObj.agentId} size={13} />
+                    : <span className="center-tab-shell">❯</span>}
+                  <span className="center-tab-name">{activeTabObj.title}</span>
+                </button>
+              )}
+              {fileTabs.filter(showsFile).map((f) => (
+                <button
+                  key={f.key}
+                  className={"center-tab" + (activeFileTab === f.key ? " on" : "")}
+                  title={f.path}
+                  onClick={() => setActiveFileTab(f.key)}
+                >
+                  {dirtyFiles.has(f.key) && <span className="center-tab-dot" />}
+                  <span className="center-tab-name">{basename(f.path)}</span>
+                  <span
+                    className={"center-tab-close" + (fileCloseArm === f.key ? " arm" : "")}
+                    title={fileCloseArm === f.key
+                      ? "Unsaved changes — click again to discard"
+                      : "Close"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeFileTab(f.key);
+                    }}
+                  >×</span>
+                </button>
+              ))}
+            </div>
+          )}
           <div className="term-stack">
             {tabs.map((t) => (
               <TerminalView
@@ -1916,6 +2075,22 @@ export default function App() {
                 renderer={settings.termRenderer}
                 theme={xtermTheme}
               />
+            ))}
+            {fileTabs.map((f) => (
+              <div
+                key={f.key}
+                className="file-layer"
+                style={{
+                  display: showsFile(f) && f.key === activeFileTab ? "flex" : "none",
+                }}
+              >
+                <FileView
+                  path={f.path}
+                  active={showsFile(f) && f.key === activeFileTab}
+                  refreshKey={explorerRefresh}
+                  onDirty={(d) => noteFileDirty(f.key, d)}
+                />
+              </div>
             ))}
             {activeTab !== null && ended.has(activeTab) && (
               <div className="term-ended">
@@ -1954,7 +2129,10 @@ export default function App() {
                 </div>
               </div>
             )}
-            {tabs.length === 0 && !previewSession && (
+            {/* The preview pane sits above the file layer, and the start view
+                would show through under it — neither is drawn while a file
+                tab is the one on screen. */}
+            {tabs.length === 0 && !previewSession && !fileOnScreen && (
               <div className="empty-note big empty-start">
                 <div>Pick a session on the left — ▶ resumes it, ＋ opens a shell</div>
                 <div className="empty-start-controls">
@@ -1965,7 +2143,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            {previewSession && (
+            {previewSession && !fileOnScreen && (
               <SessionPreview
                 session={previewSession}
                 onResume={resumeSession}
@@ -2092,7 +2270,7 @@ export default function App() {
                       <span>EXPLORER</span>
                       <button className="icon-btn" onClick={() => setShowExplorer(false)}>✕</button>
                     </div>
-                    <FileExplorer root={activeProject} refreshKey={explorerRefresh} />
+                    <FileExplorer root={activeProject} refreshKey={explorerRefresh} onOpenFile={openFileTab} />
                   </div>
                 )}
                 {showExplorer && showGit && (
@@ -2120,13 +2298,17 @@ export default function App() {
                       <span>AGENT{activeTabObj?.title ? ` — ${activeTabObj.title}` : ""}</span>
                       <button className="icon-btn" onClick={() => setShowAgent(false)}>✕</button>
                     </div>
-                    {/* The panel's prop doc has always said "if it's a claude
-                        tab"; this is that assumption enforced instead of
-                        assumed. It reads a claude transcript for tasks,
-                        artifacts and subagent runs, so an engine that declares
-                        no `panels` hands it no session and it says so — the
-                        same empty state as a shell tab, which is the truth. */}
-                    <AgentPanel sessionId={activeCaps.panels ? activeSessionId : null} />
+                    {/* Gated on `tasks`, not `panels`: the panel reads task
+                        lists and file edits, which grok and codex also record
+                        in shapes the backend can read. The pills stay behind
+                        `panels`, because they speak claude's slash commands.
+                        An engine that declares neither hands it no session and
+                        the panel says so — the same empty state as a shell
+                        tab, which is the truth. */}
+                    <AgentPanel
+                      sessionId={activeCaps.tasks ? activeSessionId : null}
+                      onOpenFile={openFileTab}
+                    />
                   </div>
                 </>
               )}
