@@ -2897,12 +2897,6 @@ input[type="range"]::-webkit-slider-thumb {
   background: var(--accent);
   border-color: var(--accent);
 }
-/* The one control whose whole job is naming the source must not take the
-   theme's colour for Claude — see `--claude`. */
-.ns-agent-tab.claude.on {
-  background: var(--claude);
-  border-color: var(--claude);
-}
 .ns-agent-tab .agent-icon { flex-shrink: 0; }
 
 .ns-selects { display: flex; gap: 5px; }
