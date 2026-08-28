@@ -41,15 +41,20 @@ The recurring principle: read state from where Claude already keeps it (transcri
 
 ## Development workflow
 
-Three repos, each with one job. The remote names below are the ones in this checkout (`git remote -v`).
+Two branches in our own copy, and a pull request upstream whenever the second one moves.
+
+- **`5lime`** is dev. All work happens here.
+- **`main`** is prod-ready. When a version is ready, `5lime` is merged into `main`, and every update of `main` goes to the original repo as a pull request.
+
+The repos, with the remote names in this checkout (`git remote -v`):
 
 - **`Adroited-LLC/aiterm`** — remote `origin`. The canonical repo, Matt's. Read-only for us; it takes pull requests and squash-merges them.
-- **`jallisonfl/aiterm`** — remote `fork`. John's private repo and the home of day-to-day work, on branch `5lime`. Despite the remote's name it is **not a GitHub fork** of the canonical repo — it is an independent repo that happens to share history. GitHub only accepts cross-repo pull requests from real forks, so a PR opened from here is refused every time, whatever branch it comes from.
-- **`jallisonfl/aiterm-upstream`** — remote `upstream-fork`. A real fork of the canonical repo, public because a fork of a public repo cannot be private. It exists only to carry PR branches.
+- **`jallisonfl/aiterm`** — remote `fork`. Our own copy, private, holding `5lime` and `main`. It is *not* a GitHub fork of the canonical repo (an independent repo that shares history), and GitHub only accepts cross-repo pull requests from real forks — so no PR can be opened from here, which is why the next one exists.
+- **`jallisonfl/aiterm-upstream`** — remote `upstream-fork`. A real fork of the canonical repo, public because a fork of a public repo cannot be private. It carries a mirror of `main` for the sole purpose of opening pull requests from it. Nothing is developed there.
 
 The cycle:
 
-1. **Sync from upstream before starting.** If `origin/main` has moved, merge it into `5lime`. Upstream squash-merges, so `5lime` keeps its own history and this merge is expected to be routine:
+1. **Sync from upstream before starting.** If `origin/main` has moved, merge it into `5lime`. Upstream squash-merges, so `5lime` keeps its own history and this merge is routine:
 
    ```bash
    git fetch origin
@@ -57,21 +62,20 @@ The cycle:
    git merge origin/main                    # on 5lime
    ```
 
-2. **Work on `5lime`**, commit there, and push to the private repo when john says so (`5lime:main` keeps its `main` current too):
+2. **Work on `5lime`** and push it to our copy when john says so:
 
    ```bash
-   git push fork 5lime 5lime:main
+   git push fork 5lime
    ```
 
-3. **To submit upstream**, cut a topic branch from `origin/main`, cherry-pick the commits to send — not this section, not repo housekeeping — check it builds, push it to the fork, and open the PR from `jallisonfl:<topic>` into `Adroited-LLC:main`:
+3. **Publish a version** — merge dev into prod, push prod to our copy and to the PR fork:
 
    ```bash
-   git checkout -B <topic> origin/main
-   git cherry-pick <commits>
-   (cd src-tauri && cargo test --lib) && npx tsc --noEmit
-   git push -u upstream-fork <topic>
+   git checkout main && git merge 5lime
+   git push fork main
+   git push upstream-fork main
    ```
 
-   Opening the PR through the API needs `GITHUB_CLASSIC_TOKEN`; the fine-scoped `GITHUB_TOKEN` is refused for a repo we do not own ("Resource not accessible by personal access token"). Both live in `~/AI-OS/.env`.
+4. **Open the pull request** from `jallisonfl:main` (the fork `aiterm-upstream`) into `Adroited-LLC:main`. Through the API, that is `POST /repos/Adroited-LLC/aiterm/pulls` with `head: jallisonfl:main`, `head_repo: jallisonfl/aiterm-upstream`, `base: main` — and it needs `GITHUB_CLASSIC_TOKEN`; the fine-scoped `GITHUB_TOKEN` is refused for a repo we do not own. Both live in `~/AI-OS/.env`. Check the build first: `(cd src-tauri && cargo test --lib) && npx tsc --noEmit`.
 
-4. **After pulling a commit that adds npm packages, run `npm install`** in the checkout — otherwise `npm run tauri dev` comes up with a Vite "Failed to resolve import" overlay instead of the app.
+After pulling a commit that adds npm packages, run `npm install` in the checkout — otherwise `npm run tauri dev` comes up with a Vite "Failed to resolve import" overlay instead of the app.
