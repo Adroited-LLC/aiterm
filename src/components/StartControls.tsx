@@ -172,7 +172,7 @@ export default function StartControls({ ctl, onOpenModelAccess }: Props) {
         {agents.map((a) => (
           <button
             key={a.id}
-            className={"ns-agent-tab" + (a.id === agentId ? " on" : "")}
+            className={"ns-agent-tab " + a.id + (a.id === agentId ? " on" : "")}
             onClick={() => pickAgent(a.id)}
             title={a.display_name}
           >

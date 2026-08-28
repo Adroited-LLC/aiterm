@@ -305,7 +305,7 @@ export function UsagePanel({ sources, onRefresh, refreshing }: Props) {
   // disk, which is stale but carries no failure to report.
   const blind = sources.filter(
     (s) => (s.state !== "ok" && s.state !== "no_balance") || (s.stale && !!s.detail),
-  ).length;
+  );
   const newest = sources.reduce((a, s) => Math.max(a, s.at), 0);
   const providers = sources.filter((s) => s.id.startsWith("provider:")).length;
 
@@ -343,10 +343,20 @@ export function UsagePanel({ sources, onRefresh, refreshing }: Props) {
           );
         })}
         {hidden > 0 && <span className="usage-chip more">+{hidden}</span>}
-        {blind > 0 && (
+        {blind.length > 0 && (
+          // Named, one per line: "one service could not be read" sends you
+          // into the panel to find out which, which is the question the mark
+          // exists to answer. A stale source says when it was last read too,
+          // since its number is still on the chip and is that old.
           <span
             className="usage-chip unknown"
-            title={blind === 1 ? "One service could not be read" : `${blind} services could not be read`}
+            title={blind
+              .map((s) =>
+                s.stale
+                  ? `${s.name}: last read ${relTime(s.at)} — ${s.detail}`
+                  : `${s.name}: ${s.detail}`,
+              )
+              .join("\n")}
           >?</span>
         )}
       </button>

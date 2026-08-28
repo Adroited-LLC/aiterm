@@ -20,6 +20,12 @@
   --text-dim: #8b8fa3;
   --text-faint: #5c6070;
   --accent: #da7756;
+  /* Claude's colour, fixed. `--accent` is whatever the active theme picked —
+     `applySettings` overwrites it on every theme — so on one-dark it is
+     #61afef and on nord #88c0d0, which drew Claude in blue two millimetres
+     from Codex, also blue. A mark that changes colour per theme is not
+     identity. Themes do not override this one. */
+  --claude: #da7756;
   --green: #98c379;
   --red: #e06c75;
   --yellow: #e5c07b;
@@ -774,8 +780,8 @@ body.dragging * { pointer-events: none; }
 }
 .agent-badge .agent-icon { margin: 0; }
 .agent-badge.claude {
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg-raised));
-  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: color-mix(in srgb, var(--claude) 12%, var(--bg-raised));
+  border-color: color-mix(in srgb, var(--claude) 30%, var(--border));
 }
 .badge-dot {
   position: absolute;
@@ -851,7 +857,7 @@ body.dragging * { pointer-events: none; }
 }
 
 .agent-icon { color: var(--text-dim); margin-top: 2px; flex-shrink: 0; }
-.agent-icon.claude { color: var(--accent); }
+.agent-icon.claude { color: var(--claude); }
 
 .session-text { flex: 1; min-width: 0; }
 .session-title {
@@ -2865,6 +2871,12 @@ input[type="range"]::-webkit-slider-thumb {
   color: #fff;
   background: var(--accent);
   border-color: var(--accent);
+}
+/* The one control whose whole job is naming the source must not take the
+   theme's colour for Claude — see `--claude`. */
+.ns-agent-tab.claude.on {
+  background: var(--claude);
+  border-color: var(--claude);
 }
 .ns-agent-tab .agent-icon { flex-shrink: 0; }
 
