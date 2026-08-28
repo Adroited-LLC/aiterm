@@ -3504,8 +3504,10 @@ input[type="range"]::-webkit-slider-thumb {
   font-size: 12px;
   color: var(--text);
   line-height: 1.4;
-  pointer-events: none;
+  user-select: text;
+  cursor: text;
 }
+.sfly-head .icon-btn { margin-left: auto; padding: 2px 5px; cursor: pointer; }
 .sfly-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .sfly-title { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sfly-loading { color: var(--text-faint); padding: 6px 0; }

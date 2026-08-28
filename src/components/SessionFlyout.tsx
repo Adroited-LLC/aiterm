@@ -14,7 +14,8 @@ import AgentIcon from "./AgentIcon";
 import BrandIcon from "./BrandIcon";
 import Icon from "./Icon";
 import { brandForModel } from "../brand";
-import { Clock, FileCode2, GitBranch, GitPullRequest, Hammer, MessageSquare, PieChart, Folder } from "lucide-react";
+import { useState } from "react";
+import { Check, Clock, Copy, FileCode2, GitBranch, GitPullRequest, Hammer, MessageSquare, PieChart, Folder } from "lucide-react";
 
 /** "1h 22m", "14m", "40s". */
 export function fmtDuration(ms: number): string {
@@ -51,6 +52,39 @@ function windowFor(models: string[], said: number | null): number | null {
   return 200_000;
 }
 
+/** The card as plain text, for the clipboard: the same facts in the same
+ *  order, one per line, so what is pasted reads like what was seen. */
+export function detailText(session: Session, d: SessionDetail): string {
+  const started = d.started ? new Date(d.started).getTime() : NaN;
+  const ended = d.last_active ? new Date(d.last_active).getTime() : NaN;
+  const dur = !isNaN(started) && !isNaN(ended) ? fmtDuration(ended - started) : "";
+  const win = windowFor(d.models, d.context_window);
+  const lines: string[] = [];
+  lines.push(d.title || session.title);
+  lines.push(`Session ${d.id} (${session.agent})`);
+  if (d.first_prompt) lines.push("", "Started with:", d.first_prompt);
+  if (d.last_user && d.last_user !== d.first_prompt) lines.push("", "Last prompt:", d.last_user);
+  if (d.last_assistant) lines.push("", "Last reply:", d.last_assistant);
+  lines.push("");
+  if (d.started) {
+    lines.push(`When: ${fmtWhen(d.started)}${d.last_active && d.last_active !== d.started ? ` → ${fmtWhen(d.last_active)}` : ""}${dur ? ` (${dur})` : ""}`);
+  }
+  const where = d.cwd ?? session.project_path;
+  if (where) lines.push(`Where: ${where}${(d.branch ?? session.branch) ? ` on ${d.branch ?? session.branch}` : ""}`);
+  if (d.models.length) {
+    lines.push(`Model: ${d.models.join(" → ")}${d.effort ? `, ${d.effort} effort` : ""}${d.permission_mode ? `, ${d.permission_mode}` : ""}`);
+  }
+  lines.push(`Messages: ${d.user_messages} prompts, ${d.assistant_messages} replies${d.tool_calls ? `, ${d.tool_calls} tool calls` : ""}${d.compactions ? `, compacted ${d.compactions}×` : ""}`);
+  if (d.context_tokens !== null) {
+    lines.push(`Context: ${fmtTok(d.context_tokens)}${win ? ` of ${fmtTok(win)}` : ""}${d.output_tokens ? `, ${fmtTok(d.output_tokens)} written` : ""}`);
+  }
+  if (d.tools.length) lines.push(`Tools: ${d.tools.map((t) => `${t.name} ×${t.count}`).join(", ")}`);
+  if (d.files.length) lines.push("", "Files touched:", ...d.files.map((f) => `  ${f}`));
+  if (d.pr_links.length) lines.push("", "Pull requests:", ...d.pr_links.map((u) => `  ${u}`));
+  if (d.cli_version) lines.push("", `${session.agent} ${d.cli_version}`);
+  return lines.join("\n");
+}
+
 export default function SessionFlyout({ session, detail }: {
   session: Session;
   /** Null while loading. */
@@ -63,12 +97,25 @@ export default function SessionFlyout({ session, detail }: {
   const win = d ? windowFor(d.models, d.context_window) : null;
   const ctxPct = d?.context_tokens && win ? Math.min(100, (d.context_tokens / win) * 100) : null;
   const title = d?.title || session.title;
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    if (!d) return;
+    navigator.clipboard.writeText(detailText(session, d)).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {});
+  };
 
   return (
     <div className="sfly" role="tooltip">
       <div className="sfly-head">
         <AgentIcon agent={session.agent} size={16} />
         <span className="sfly-title">{title}</span>
+        {d && (
+          <button className="icon-btn" title="Copy this summary" onClick={copy}>
+            <Icon of={copied ? Check : Copy} size="sm" />
+          </button>
+        )}
       </div>
 
       {!d && <div className="sfly-loading">Reading the transcript…</div>}

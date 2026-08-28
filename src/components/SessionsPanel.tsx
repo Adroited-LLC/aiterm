@@ -336,13 +336,23 @@ export default function SessionsPanel({
       }
     }, 450);
   };
+  // Leaving the row does not close the card at once: the pointer needs the
+  // gap between row and card to cross into it, and once in it the card is
+  // held open so its text can be selected and copied.
+  const flyClose = useRef<number | null>(null);
   const flyLeave = () => {
     if (flyTimer.current) { window.clearTimeout(flyTimer.current); flyTimer.current = null; }
-    setFly(null);
+    if (flyClose.current) window.clearTimeout(flyClose.current);
+    flyClose.current = window.setTimeout(() => setFly(null), 250);
+  };
+  const flyHold = () => {
+    if (flyClose.current) { window.clearTimeout(flyClose.current); flyClose.current = null; }
   };
   useEffect(() => {
-    // Anything that moves the row from under the pointer closes the card.
-    const close = () => setFly(null);
+    // Anything that moves the row from under the pointer closes the card —
+    // except acting inside the card itself, which is selecting its text.
+    const inCard = (e: Event) => (e.target as HTMLElement | null)?.closest?.(".sfly") != null;
+    const close = (e: Event) => { if (!inCard(e)) setFly(null); };
     window.addEventListener("scroll", close, true);
     window.addEventListener("pointerdown", close, true);
     window.addEventListener("keydown", close, true);
@@ -1123,7 +1133,11 @@ export default function SessionsPanel({
   return (
     <div className="sessions-panel">
       {fly && (
-        <div style={{ position: "fixed", left: fly.left, top: fly.top, bottom: fly.bottom, zIndex: 70, pointerEvents: "none" }}>
+        <div
+          style={{ position: "fixed", left: fly.left, top: fly.top, bottom: fly.bottom, zIndex: 70 }}
+          onMouseEnter={flyHold}
+          onMouseLeave={flyLeave}
+        >
           <SessionFlyout session={fly.s} detail={flyDetail && flyDetail.id === fly.s.id ? flyDetail : null} />
         </div>
       )}
