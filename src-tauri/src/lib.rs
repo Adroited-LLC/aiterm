@@ -114,7 +114,7 @@ pub fn run() {
             hooklink::drain_session_events,
             trace::trace_set,
             trace::trace_status,
-            usage::usage_limits,
+            usage::usage_report,
             fonts::list_fonts,
             fonts::font_packages,
             fonts::install_font_package,
