@@ -2892,10 +2892,14 @@ input[type="range"]::-webkit-slider-thumb {
   cursor: pointer;
 }
 .ns-agent-tab:hover { color: var(--text); border-color: var(--text-faint); }
+/* Selected: the same tab, lit — brighter text, raised ground, a firmer edge.
+   Not the accent fill: the engine's mark already says which one is chosen,
+   and a solid block of colour in the corner of the panel is louder than the
+   answer deserves. */
 .ns-agent-tab.on {
-  color: #fff;
-  background: var(--accent);
-  border-color: var(--accent);
+  color: var(--text);
+  background: var(--bg-raised);
+  border-color: var(--text-faint);
 }
 .ns-agent-tab .agent-icon { flex-shrink: 0; }
 
