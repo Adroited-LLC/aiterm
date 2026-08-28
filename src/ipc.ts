@@ -877,6 +877,19 @@ export const adoptAgentSession = (
   known: string[],
 ) => invoke<string | null>("adopt_agent_session", { agentId, cwd, sinceMs, known });
 
+/** The one session an agent created after this terminal explicitly cleared its
+ * current conversation. `null` includes ambiguity: the caller must never
+ * guess which of two new conversations belongs to its terminal. */
+export const clearSuccessorSession = (
+  agentId: string,
+  previousId: string,
+  cwd: string,
+  sinceMs: number,
+  known: string[],
+) => invoke<string | null>("clear_successor_session", {
+  agentId, previousId, cwd, sinceMs, known,
+});
+
 /** Where aiterm writes its diagnostics. */
 export const diagLogPath = () => invoke<string | null>("diag_log_path");
 

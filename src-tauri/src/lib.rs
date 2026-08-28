@@ -70,6 +70,7 @@ pub fn run() {
             diag::diag_log_tail,
             diag::diag_environment,
             agents::agent_choices,
+            agents::clear_successor_session,
             launch::resolve_launch,
             providers::providers_list,
             providers::provider_save,

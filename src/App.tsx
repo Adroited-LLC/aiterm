@@ -40,7 +40,7 @@ import {
   drainSessionEvents,
   sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
-  adoptAgentSession, resolveLaunch,
+  adoptAgentSession, clearSuccessorSession, resolveLaunch,
   taskbarBadge,
   trayAlerts,
   desktopNotify, desktopNotifyClose,
@@ -227,6 +227,18 @@ export default function App() {
   // re-run it on every tab change).
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
+  // Codex changes its session id in-place for `/clear` but has no hook that
+  // reports that transition. A terminal's submitted command is the missing
+  // provenance: only a tab that explicitly sent `/clear` may adopt a newly
+  // written session row.
+  const clearIntents = useRef(new Map<number, {
+    previousId: string;
+    cwd: string;
+    since: number;
+    known: string[];
+    inFlight: boolean;
+  }>());
+  const [clearIntentRevision, setClearIntentRevision] = useState(0);
 
   // The tab on screen and the session it is keyed to. Read this high up
   // because everything claude-shaped below gates on which engine is in it.
@@ -852,6 +864,32 @@ export default function App() {
     lastOutput.current.set(key, Date.now());
   }, []);
 
+  const noteLineSubmit = useCallback((key: number, line: string) => {
+    const tab = tabsRef.current.find((t) => t.key === key);
+    if (
+      line.trim() !== "/clear" || tab?.agentId !== "codex" || !tab.sessionId || !tab.cwd
+    ) return;
+    const known = new Set(
+      sessionsRef.current
+        .filter((s) => s.project_path === tab.cwd)
+        .map((s) => s.id),
+    );
+    // A tab created in the same project after this one may not have reached
+    // the sidebar snapshot yet. It is still a known owner, never a clear child.
+    for (const other of tabsRef.current) {
+      if (other.key !== key && other.cwd === tab.cwd && other.sessionId) known.add(other.sessionId);
+    }
+    known.add(tab.sessionId);
+    clearIntents.current.set(key, {
+      previousId: tab.sessionId,
+      cwd: tab.cwd,
+      since: Date.now(),
+      known: [...known],
+      inFlight: false,
+    });
+    setClearIntentRevision((revision) => revision + 1);
+  }, []);
+
   const noteAttention = useCallback((key: number, on: boolean) => {
     // A bell on the tab you're actively looking at isn't news.
     if (on && key === activeTabRef.current && document.hasFocus()) return;
@@ -1077,6 +1115,71 @@ export default function App() {
       if (timer) clearTimeout(timer);
     };
   }, [awaitingAdoption, refreshSessionList]);
+
+  // Codex `/clear` keeps the existing PTY but starts a new conversation id.
+  // Without this handoff the terminal remains attached to the old sidebar row,
+  // while the live row looks unowned; clicking it launches `codex resume` into
+  // a thread that already has this terminal as its active writer. The intent
+  // recorded above lets us accept a successor without guessing from the
+  // directory's normal stream of Codex sessions.
+  useEffect(() => {
+    if (clearIntents.current.size === 0) return;
+    let stop = false;
+    const tick = async () => {
+      for (const [key, intent] of clearIntents.current) {
+        if (stop) return;
+        if (intent.inFlight) continue;
+        const tab = tabsRef.current.find((t) => t.key === key);
+        if (!tab || tab.sessionId !== intent.previousId || tab.agentId !== "codex") {
+          clearIntents.current.delete(key);
+          setClearIntentRevision((revision) => revision + 1);
+          continue;
+        }
+        try {
+          intent.inFlight = true;
+          const successor = await clearSuccessorSession(
+            tab.agentId, intent.previousId, intent.cwd, intent.since, intent.known,
+          );
+          if (stop || clearIntents.current.get(key) !== intent) continue;
+          if (!successor) {
+            intent.inFlight = false;
+            continue;
+          }
+          setTabs((list) =>
+            list.map((item) => item.key === key
+              ? {
+                  ...item,
+                  sessionId: successor,
+                  slotId: successor,
+                  fresh: false,
+                  title: basename(item.cwd ?? "") || item.title,
+                }
+              : item),
+          );
+          noteRekey(intent.previousId, successor);
+          setVacated((previous) => new Set(previous).add(intent.previousId));
+          clearIntents.current.delete(key);
+          setClearIntentRevision((revision) => revision + 1);
+          uiLog(`codex clear: re-keyed tab ${key} ${intent.previousId} -> ${successor}`);
+          setNotice(
+            `"${tab.title}" was cleared — this tab is the new conversation. ` +
+              "The old one is in the sidebar, resumable.",
+          );
+          refreshSessionList();
+        } catch {
+          // The newly-created rollout can appear after the first poll. Keep
+          // the explicit intent and try again; ambiguity remains a safe no-op.
+          if (clearIntents.current.get(key) === intent) intent.inFlight = false;
+        }
+      }
+    };
+    void tick();
+    const interval = window.setInterval(() => { void tick(); }, 500);
+    return () => {
+      stop = true;
+      window.clearInterval(interval);
+    };
+  }, [clearIntentRevision, noteRekey, refreshSessionList]);
 
   // A conversation can change its session id while staying in this same pty.
   // Two things do it: moving to the daemon (all that opening the agents view
@@ -2067,6 +2170,7 @@ export default function App() {
                 onAttention={noteAttention}
                 onNotify={noteNotify}
                 onProgress={noteProgress}
+                onLineSubmit={noteLineSubmit}
                 autoFocus
                 fontSize={termFont}
                 fontFamily={xtermFont}
