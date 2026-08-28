@@ -41,15 +41,17 @@ The recurring principle: read state from where Claude already keeps it (transcri
 
 ## Development workflow
 
-Two branches in our own copy, and a pull request upstream whenever the second one moves.
+These instructions are for me, 5lime (jallisonfl), and the agents working in my copy — not a contributor guide for this repo. They describe how my changes reach it.
+
+Two branches in my own copy, and a pull request upstream whenever the second one moves.
 
 - **`5lime`** is dev. All work happens here.
 - **`main`** is prod-ready. When a version is ready, `5lime` is merged into `main`, and every update of `main` goes to the original repo as a pull request.
 
 The repos, with the remote names in this checkout (`git remote -v`):
 
-- **`Adroited-LLC/aiterm`** — remote `origin`. The canonical repo, Matt's. Read-only for us; it takes pull requests and squash-merges them.
-- **`jallisonfl/aiterm`** — remote `fork`. Our own copy, private, holding `5lime` and `main`. It is *not* a GitHub fork of the canonical repo (an independent repo that shares history), and GitHub only accepts cross-repo pull requests from real forks — so no PR can be opened from here, which is why the next one exists.
+- **`Adroited-LLC/aiterm`** — remote `origin`. The canonical repo, Matt's. Read-only for me; it takes pull requests and squash-merges them.
+- **`jallisonfl/aiterm`** — remote `fork`. My own copy, private, holding `5lime` and `main`. It is *not* a GitHub fork of the canonical repo (an independent repo that shares history), and GitHub only accepts cross-repo pull requests from real forks — so no PR can be opened from here, which is why the next one exists.
 - **`jallisonfl/aiterm-upstream`** — remote `upstream-fork`. A real fork of the canonical repo, public because a fork of a public repo cannot be private. It carries a mirror of `main` for the sole purpose of opening pull requests from it. Nothing is developed there.
 
 The cycle:
@@ -62,13 +64,13 @@ The cycle:
    git merge origin/main                    # on 5lime
    ```
 
-2. **Work on `5lime`** and push it to our copy when john says so:
+2. **Work on `5lime`** and push it to my copy when I say so:
 
    ```bash
    git push fork 5lime
    ```
 
-3. **Publish a version** — merge dev into prod, push prod to our copy and to the PR fork:
+3. **Publish a version** — merge dev into prod, push prod to my copy and to the PR fork:
 
    ```bash
    git checkout main && git merge 5lime
@@ -76,6 +78,6 @@ The cycle:
    git push upstream-fork main
    ```
 
-4. **Open the pull request** from `jallisonfl:main` (the fork `aiterm-upstream`) into `Adroited-LLC:main`. Through the API, that is `POST /repos/Adroited-LLC/aiterm/pulls` with `head: jallisonfl:main`, `head_repo: jallisonfl/aiterm-upstream`, `base: main` — and it needs `GITHUB_CLASSIC_TOKEN`; the fine-scoped `GITHUB_TOKEN` is refused for a repo we do not own. Both live in `~/AI-OS/.env`. Check the build first: `(cd src-tauri && cargo test --lib) && npx tsc --noEmit`.
+4. **Open the pull request** from `jallisonfl:main` (the fork `aiterm-upstream`) into `Adroited-LLC:main`. Through the API, that is `POST /repos/Adroited-LLC/aiterm/pulls` with `head: jallisonfl:main`, `head_repo: jallisonfl/aiterm-upstream`, `base: main` — and it needs `GITHUB_CLASSIC_TOKEN`; the fine-scoped `GITHUB_TOKEN` is refused for a repo I do not own. Both live in `~/AI-OS/.env`. Check the build first: `(cd src-tauri && cargo test --lib) && npx tsc --noEmit`.
 
 After pulling a commit that adds npm packages, run `npm install` in the checkout — otherwise `npm run tauri dev` comes up with a Vite "Failed to resolve import" overlay instead of the app.
