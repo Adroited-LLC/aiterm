@@ -695,12 +695,28 @@ export default function App() {
     [],
   );
 
-  useEffect(() => setActiveFileTab(null), [activeTab]);
+  // Switching terminal, or picking a different session to preview, puts that
+  // terminal or preview on screen — a file tab left selected would cover it.
+  useEffect(() => setActiveFileTab(null), [activeTab, previewSession?.id]);
+
+  /** Whether a file tab belongs on the strip right now. A file opened with no
+   *  terminal (from a preview, or the empty start view) has no terminal to
+   *  belong to, so it belongs to all of them: it stays reachable after a
+   *  session starts instead of vanishing until every tab is closed. */
+  const showsFile = useCallback(
+    (f: FileTab) => f.termKey === null || f.termKey === activeTab,
+    [activeTab],
+  );
+  /** A file tab is the thing on screen in the center right now. */
+  const fileOnScreen =
+    activeFileTab !== null && fileTabs.some((f) => showsFile(f) && f.key === activeFileTab);
 
   const openFileTab = useCallback((path: string) => {
     const term = activeTabRef.current;
     setFileTabs((list) => {
-      const existing = list.find((f) => f.path === path && f.termKey === term);
+      const existing = list.find(
+        (f) => f.path === path && (f.termKey === term || f.termKey === null),
+      );
       if (existing) {
         setActiveFileTab(existing.key);
         return list;
@@ -1983,9 +1999,24 @@ export default function App() {
         )}
 
         <div className="panel terminal-panel">
-          {(activeTabObj !== null ||
-            fileTabs.some((f) => f.termKey === activeTab)) && (
+          {(activeTabObj !== null || fileTabs.some(showsFile)) && (
             <div className="center-tabs">
+              {/* No terminal: the locked tab is the preview, or the start
+                  view, so there is still a way back from a file. */}
+              {!activeTabObj && (
+                <button
+                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")}
+                  title={previewSession?.project_path ?? undefined}
+                  onClick={() => setActiveFileTab(null)}
+                >
+                  {previewSession
+                    ? <AgentIcon agent={previewSession.agent} size={13} />
+                    : null}
+                  <span className="center-tab-name">
+                    {previewSession ? previewSession.title : "Start"}
+                  </span>
+                </button>
+              )}
               {activeTabObj && (
                 <button
                   className={"center-tab locked" + (activeFileTab === null ? " on" : "")}
@@ -2001,7 +2032,7 @@ export default function App() {
                   <span className="center-tab-name">{activeTabObj.title}</span>
                 </button>
               )}
-              {fileTabs.filter((f) => f.termKey === activeTab).map((f) => (
+              {fileTabs.filter(showsFile).map((f) => (
                 <button
                   key={f.key}
                   className={"center-tab" + (activeFileTab === f.key ? " on" : "")}
@@ -2050,14 +2081,12 @@ export default function App() {
                 key={f.key}
                 className="file-layer"
                 style={{
-                  display:
-                    f.termKey === activeTab && f.key === activeFileTab
-                      ? "flex" : "none",
+                  display: showsFile(f) && f.key === activeFileTab ? "flex" : "none",
                 }}
               >
                 <FileView
                   path={f.path}
-                  active={f.termKey === activeTab && f.key === activeFileTab}
+                  active={showsFile(f) && f.key === activeFileTab}
                   refreshKey={explorerRefresh}
                   onDirty={(d) => noteFileDirty(f.key, d)}
                 />
@@ -2100,7 +2129,10 @@ export default function App() {
                 </div>
               </div>
             )}
-            {tabs.length === 0 && !previewSession && (
+            {/* The preview pane sits above the file layer, and the start view
+                would show through under it — neither is drawn while a file
+                tab is the one on screen. */}
+            {tabs.length === 0 && !previewSession && !fileOnScreen && (
               <div className="empty-note big empty-start">
                 <div>Pick a session on the left — ▶ resumes it, ＋ opens a shell</div>
                 <div className="empty-start-controls">
@@ -2111,7 +2143,7 @@ export default function App() {
                 </div>
               </div>
             )}
-            {previewSession && (
+            {previewSession && !fileOnScreen && (
               <SessionPreview
                 session={previewSession}
                 onResume={resumeSession}
