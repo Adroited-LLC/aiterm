@@ -1680,7 +1680,7 @@ export default function App() {
    *  nothing in it to press them on. */
   const browseNewSession = useCallback(async () => {
     if (!emptyCtl.ready) {
-      setNotice("Nothing to start yet — add a model under Settings → Model access, or install claude or codex.");
+      setNotice("Nothing to start yet — set up the API tab, or install claude, codex or grok.");
       return;
     }
     try {

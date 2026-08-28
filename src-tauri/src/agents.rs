@@ -274,7 +274,7 @@ pub trait AgentBackend: Send + Sync {
 /// Model ids and effort levels come from the frontend. They are chosen from
 /// lists we produced, but "the UI only sends good values" is not a security
 /// boundary — this string is handed to `$SHELL -ic`.
-fn q(value: &str) -> String {
+pub(crate) fn q(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -983,6 +983,7 @@ pub fn backends() -> Vec<Box<dyn AgentBackend>> {
     vec![
         Box::new(ClaudeBackend),
         Box::new(CodexBackend),
+        Box::new(crate::grok::GrokBackend),
         Box::new(OpenCodeBackend),
         Box::new(ChatBackend),
     ]
@@ -1277,7 +1278,7 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 /// A missing binary is the ordinary case, not an error: most machines will have
 /// one of these agents and not the others, and that is worth showing plainly
 /// rather than treating as a failure.
-fn detect_cli(id: &str, display_name: &str, bin: &str) -> Detection {
+pub(crate) fn detect_cli(id: &str, display_name: &str, bin: &str) -> Detection {
     // PATH first because it is free; the shell only when that fails, so the
     // common case never spawns anything to answer "is it installed".
     let found = which(bin).or_else(|| which_via_login_shell(bin));

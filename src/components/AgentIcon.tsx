@@ -49,6 +49,19 @@ export default function AgentIcon({ agent, size = 16 }: { agent: string; size?: 
     );
   }
 
+  if (agent === "grok") {
+    // A slash through a ring — a stroke that cuts, which is the feel of the
+    // name, without being anyone's letterform.
+    return (
+      <svg {...common} fill="none" stroke="currentColor" strokeWidth="1.8"
+        strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="8.2" opacity="0.55" />
+        <path d="M16.5 7.5 7.5 16.5" />
+        <path d="M13.2 7.5h3.3v3.3" />
+      </svg>
+    );
+  }
+
   if (agent === "opencode") {
     // `</>` — the one mark here that says "code" rather than naming a vendor,
     // and the only free-floating one: every other glyph has an outline, so at

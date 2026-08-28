@@ -25,6 +25,7 @@
   --yellow: #e5c07b;
   --blue: #61afef;
   --cyan: #56b6c2;
+  --magenta: #c678dd;
   --font-ui: -apple-system, "Segoe UI", "Inter", system-ui, sans-serif;
   --font-mono: "JetBrainsMono Nerd Font", "JetBrains Mono", "Fira Code", monospace;
 }
@@ -2743,20 +2744,28 @@ input[type="range"]::-webkit-slider-thumb {
 .ns-agent-tab .agent-icon { flex-shrink: 0; }
 
 .ns-selects { display: flex; gap: 5px; }
-/* The setup note under the selects: what the API dropdown is waiting on,
-   and the button that goes there. Same voice as .empty-note, but a line, not
-   a block — it sits inside a popover that is mostly list. */
-.ns-setup {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-top: 6px;
-  font-size: 11px;
+/* The API tab before anything is configured: still a tab, so the source is
+   visible, with a tag saying that clicking it starts the setup. */
+.ns-agent-tab.setup { border-style: dashed; }
+.ns-tab-setup {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   color: var(--text-faint);
+  margin-left: 2px;
 }
-.ns-setup span { min-width: 0; }
-.ns-setup .act-btn { flex-shrink: 0; }
+.ns-agent-tab.setup:hover .ns-tab-setup { color: var(--accent); }
+/* A link inside a note: text that goes somewhere, not a button that acts. */
+.linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 /* The native control is unreadable here: webkit2gtk draws its own light
    background for `select` (and a lighter one again when disabled), which on a
    dark panel came out as grey text on near-white. `appearance: none` takes the
@@ -2812,6 +2821,7 @@ input[type="range"]::-webkit-slider-thumb {
    being four shapes in the same grey. */
 .agent-icon.codex, .agent-icon.openai { color: var(--green); }
 .agent-icon.api { color: var(--blue); }
+.agent-icon.grok { color: var(--magenta); }
 /* OpenCode runs the same API models the socket marks, so it takes the hue next
    to it rather than an unrelated fifth — related engines, related colour. */
 .agent-icon.opencode { color: var(--cyan); }

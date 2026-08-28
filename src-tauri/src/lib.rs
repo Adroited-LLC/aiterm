@@ -6,6 +6,7 @@ pub mod diag;
 pub mod fonts;
 pub mod fsx;
 pub mod git;
+pub mod grok;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;

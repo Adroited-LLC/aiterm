@@ -505,6 +505,12 @@ export default function SettingsModal({
                           {/* Which copy was found — worth showing when several
                               are installed and the wrong one is on PATH. */}
                           {a.path && <div className="agent-path">{homeAbbrev(a.path)}</div>}
+                          {a.id === "grok" && a.available && (
+                            <div className="agent-path">
+                              Sessions are listed, searchable and resumable. Grok takes
+                              the session id aiterm mints, so a new tab has its row at once.
+                            </div>
+                          )}
                           {a.id === "codex" && a.available && (
                             <div className="agent-path">
                               Sessions are listed and searchable. Codex names its own
