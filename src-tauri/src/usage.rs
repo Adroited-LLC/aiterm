@@ -391,7 +391,7 @@ pub fn parse_anthropic(status: u16, body: &str) -> UsageSource {
         return src;
     }
     if status == 429 {
-        src.state = "rejected".into();
+        src.state = "limited".into();
         src.detail = "Anthropic rate-limited the usage request. It will retry in a minute.".into();
         return src;
     }
@@ -572,7 +572,7 @@ pub fn parse_codex(status: u16, body: &str) -> UsageSource {
         return src;
     }
     if status == 429 {
-        src.state = "rejected".into();
+        src.state = "limited".into();
         src.detail = "ChatGPT rate-limited the usage request. It will retry in a minute.".into();
         return src;
     }
@@ -818,7 +818,7 @@ pub fn parse_grok(status: u16, body: &str) -> UsageSource {
         return src;
     }
     if status == 429 {
-        src.state = "rejected".into();
+        src.state = "limited".into();
         src.detail = "grok.com rate-limited the usage request. It will retry in a minute.".into();
         return src;
     }
@@ -1206,7 +1206,7 @@ mod tests {
         assert!(rejected.detail.contains("sign in"), "{}", rejected.detail);
 
         let limited = parse_anthropic(429, "{}");
-        assert_eq!(limited.state, "rejected");
+        assert_eq!(limited.state, "limited");
         assert!(
             limited.detail.contains("rate-limited"),
             "{}",

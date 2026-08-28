@@ -45,6 +45,10 @@ export interface UsageSourceAt extends UsageSource {
   /** True when this is a kept reading and the latest attempt failed —
    *  `detail` then says why the refresh failed, not why the numbers are gone. */
   stale: boolean;
+  /** The state of that failed attempt ("limited", "unreachable", …) when
+   *  `stale`; "" otherwise. What kind of failure decides whether the strip
+   *  flags it. */
+  failed: string;
 }
 
 /**
@@ -68,12 +72,12 @@ export function mergeUsage(
 ): UsageSourceAt[] {
   const before = new Map(prev.map((p) => [p.id, p]));
   return next.map((s) => {
-    if (s.state === "ok") return { ...s, at: now, stale: false };
+    if (s.state === "ok") return { ...s, at: now, stale: false, failed: "" };
     const old = before.get(s.id);
     if (old && old.state === "ok") {
-      return { ...old, stale: true, detail: s.detail || old.detail };
+      return { ...old, stale: true, failed: s.state, detail: s.detail || old.detail };
     }
-    return { ...s, at: now, stale: false };
+    return { ...s, at: now, stale: false, failed: "" };
   });
 }
 
@@ -294,7 +298,7 @@ export function UsagePanel({ sources, onRefresh, refreshing }: Props) {
     ? sources
     : [{
         id: "pending", name: "Usage", state: "ok", detail: "", plan: "", account: "",
-        bars: [], amounts: [], notes: [], at: 0, stale: false,
+        bars: [], amounts: [], notes: [], at: 0, stale: false, failed: "",
       } as UsageSourceAt];
 
   // Four chips: one per agent CLI (Claude, Codex, Grok) plus the API balance,
@@ -307,9 +311,13 @@ export function UsagePanel({ sources, onRefresh, refreshing }: Props) {
   // Sources whose numbers we do not currently know. "no_balance" is not one of
   // them — most OpenAI-compatible endpoints simply do not publish a balance,
   // and flagging that would cry wolf. Neither is a cache freshly loaded from
-  // disk, which is stale but carries no failure to report.
+  // disk, which is stale but carries no failure to report. Nor is a rate
+  // limit ("limited"): the service will answer the next poll, the number on
+  // the chip is a minute old at most, and a mark that lit every time
+  // Anthropic said "not right now" was a mark you learned to ignore.
+  const routine = (state: string) => state === "ok" || state === "no_balance" || state === "limited";
   const blind = sources.filter(
-    (s) => (s.state !== "ok" && s.state !== "no_balance") || (s.stale && !!s.detail),
+    (s) => !routine(s.state) || (s.stale && !!s.detail && !routine(s.failed)),
   );
   const newest = sources.reduce((a, s) => Math.max(a, s.at), 0);
   const providers = sources.filter((s) => s.id.startsWith("provider:")).length;

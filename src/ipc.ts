@@ -295,7 +295,9 @@ export interface UsageSource {
   /** "anthropic" | "codex" | "grok" | "provider:<id>". */
   id: string;
   name: string;
-  /** "ok" | "signed_out" | "unreachable" | "rejected" | "no_balance". */
+  /** "ok" | "signed_out" | "unreachable" | "rejected" | "limited" | "no_balance".
+   *  "limited" is a 429: the service will answer again shortly, nothing is
+   *  wrong with the login. */
   state: string;
   /** What to do about a non-"ok" state. Empty when "ok". */
   detail: string;

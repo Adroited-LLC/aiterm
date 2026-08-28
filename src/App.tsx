@@ -176,7 +176,7 @@ function loadUsageCache(): UsageSourceAt[] {
     const raw = localStorage.getItem(USAGE_KEY);
     const v = raw ? JSON.parse(raw) : null;
     if (!Array.isArray(v)) return [];
-    return v.map((s: UsageSourceAt) => ({ ...s, stale: true }));
+    return v.map((s: UsageSourceAt) => ({ ...s, stale: true, failed: s.failed ?? "" }));
   } catch {
     return [];
   }

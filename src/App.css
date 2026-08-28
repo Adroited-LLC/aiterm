@@ -232,6 +232,8 @@ body.dragging * { pointer-events: none; }
   line-height: 1.45;
 }
 .usage-src-detail.rejected, .usage-src-detail.unreachable { color: var(--yellow); }
+/* A rate limit is not a fault; it reads as quietly as a stale stamp. */
+.usage-src-detail.limited { color: var(--text-faint); }
 .usage-src-detail.stale { color: var(--text-faint); }
 .usage-src-note { margin-top: 5px; color: var(--text-dim); font-size: 11px; }
 .usage-row { margin-top: 8px; }
