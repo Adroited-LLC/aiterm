@@ -20,12 +20,53 @@
 //! trash is a separate piece of work, so the button is withheld rather than
 //! wired to something that half-works.
 
-use crate::agents::{q, detect_cli, AgentBackend, Caps, Detection, LaunchSpec, ModelOption};
+use crate::agents::{q, detect_cli, AgentBackend, Caps, Detection, LaunchSpec, ModelOption, PermissionMode};
 use crate::sessions::{Session, SessionProvider};
 use std::path::{Path, PathBuf};
 
 pub struct GrokBackend;
 pub struct GrokSessions;
+
+/// Grok's permission presets, from `grok --help` 1.0.5: a `--permission-mode`
+/// with the same value set as claude's, plus `--always-approve` for the
+/// no-questions case.
+///
+/// The first — Grok's own default — passes nothing, so `[ui] permission_mode`
+/// in the user's `~/.grok/config.toml` still decides, which is where grok's
+/// mode lived before aiterm offered to override it. Picking anything else here
+/// is the override.
+pub const GROK_PERMISSION_MODES: &[PermissionMode] = &[
+    PermissionMode {
+        id: "default",
+        label: "Grok's own default",
+        note: "Whatever ~/.grok/config.toml's [ui] permission_mode says.",
+        flags: &[],
+    },
+    PermissionMode {
+        id: "acceptEdits",
+        label: "Accept edits",
+        note: "--permission-mode acceptEdits: file edits run without asking; commands still ask.",
+        flags: &["--permission-mode acceptEdits"],
+    },
+    PermissionMode {
+        id: "auto",
+        label: "Auto",
+        note: "--permission-mode auto: routine actions run, the rest ask.",
+        flags: &["--permission-mode auto"],
+    },
+    PermissionMode {
+        id: "plan",
+        label: "Plan mode",
+        note: "--permission-mode plan: reads and plans, changes nothing until told to.",
+        flags: &["--permission-mode plan"],
+    },
+    PermissionMode {
+        id: "bypassPermissions",
+        label: "Skip all permissions",
+        note: "--always-approve: every tool call runs without asking.",
+        flags: &["--always-approve"],
+    },
+];
 
 fn grok_home() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".grok"))
@@ -415,6 +456,10 @@ impl AgentBackend for GrokBackend {
     /// delete — see the module doc.
     fn caps(&self) -> Caps {
         Caps { resume: true, clear: true, tasks: true, ..Default::default() }
+    }
+
+    fn permission_modes(&self) -> &'static [PermissionMode] {
+        GROK_PERMISSION_MODES
     }
 
     /// `grok --resume <id>`: "UUID-shaped values always mean IDs".

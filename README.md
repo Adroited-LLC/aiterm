@@ -39,6 +39,17 @@ The session/fork model — what owns a session's lifetime, how resume and backgr
 
 The recurring principle: read state from where Claude already keeps it (transcripts, config files, the drawn screen) rather than tracking a copy, so the UI can't drift from the truth. Where aiterm drives the TUI, it does so closed-loop and refuses to guess.
 
+## Brand icons
+
+Every engine, model vendor and API host aiterm names draws its real mark, from the LobeHub set ([lobehub.com/icons](https://lobehub.com/icons), MIT). The SVGs are vendored under `src/assets/icons` — mono (`currentColor`, so it follows the theme) and colour where the brand has one — with `brands.json` (title, primary colour, which variants exist) and `models.json` (LobeHub's model-id → brand rules) beside them. `src/brandMap.ts` resolves an agent id, a model id, a provider name or a base URL to a brand; `src/brand.ts` loads the SVG (the engines eagerly, everything else on demand); `BrandIcon` draws it.
+
+To pick up a newer set, bump `@lobehub/icons-static-svg` in `package.json`, set `ICONS_VERSION` in `scripts/sync-icons.mjs` to the matching `@lobehub/icons` release, and run:
+
+```bash
+node scripts/sync-icons.mjs        # svg + brands.json + models.json
+node scripts/sync-icons.mjs --png  # also the light/dark PNG sets, if something needs them
+```
+
 ## Development workflow
 
 These instructions are for me, 5lime (jallisonfl), and the agents working in my copy — not a contributor guide for this repo. They describe how my changes reach it.

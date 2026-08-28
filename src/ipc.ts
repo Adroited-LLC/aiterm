@@ -295,7 +295,9 @@ export interface UsageSource {
   /** "anthropic" | "codex" | "grok" | "provider:<id>". */
   id: string;
   name: string;
-  /** "ok" | "signed_out" | "unreachable" | "rejected" | "no_balance". */
+  /** "ok" | "signed_out" | "unreachable" | "rejected" | "limited" | "no_balance".
+   *  "limited" is a 429: the service will answer again shortly, nothing is
+   *  wrong with the login. */
   state: string;
   /** What to do about a non-"ok" state. Empty when "ok". */
   detail: string;
@@ -861,6 +863,30 @@ export interface AgentChoice {
 }
 
 export const agentChoices = () => invoke<AgentChoice[]>("agent_choices");
+
+/** One permission/approval preset an engine can start under. `flags` is what
+ *  it adds to the command; empty for the engine's own default. */
+export interface PermissionMode {
+  id: string;
+  label: string;
+  note: string;
+  flags: string[];
+}
+/** An engine's permission presets and the one currently in force. Only engines
+ *  that have a permission switch are returned. */
+export interface AgentPermissions {
+  agent_id: string;
+  display_name: string;
+  modes: PermissionMode[];
+  /** The id of the mode in force — stored, or the first when nothing is. */
+  selected: string;
+}
+/** Every engine with a permission switch, its modes, and the one in force. */
+export const agentPermissions = () => invoke<AgentPermissions[]>("agent_permissions");
+/** Store the mode an engine starts in; returns the refreshed list. Rejects an
+ *  id the engine does not list. */
+export const agentPermissionSet = (agentId: string, mode: string) =>
+  invoke<AgentPermissions[]>("agent_permission_set", { agentId, mode });
 
 
 /** The id of the session an agent just started in `cwd`, once it exists.

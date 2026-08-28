@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod notify;
 pub mod opencode;
 pub mod opencode_agent;
+pub mod permissions;
 pub mod providers;
 pub mod rendercost;
 pub mod pty;
@@ -72,6 +73,8 @@ pub fn run() {
             agents::agent_choices,
             agents::clear_successor_session,
             launch::resolve_launch,
+            permissions::agent_permissions,
+            permissions::agent_permission_set,
             providers::providers_list,
             providers::provider_save,
             providers::provider_delete,

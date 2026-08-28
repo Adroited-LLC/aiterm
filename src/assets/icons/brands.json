@@ -1,0 +1,1824 @@
+{
+  "ace": {
+    "title": "ace",
+    "color": "#000",
+    "group": "model"
+  },
+  "adobe": {
+    "title": "Adobe",
+    "color": "#EB1000",
+    "group": "application",
+    "color_svg": true
+  },
+  "adobefirefly": {
+    "title": "AdobeFirefly",
+    "color": "#EB1000",
+    "group": "application",
+    "color_svg": true
+  },
+  "agentvoice": {
+    "title": "AgentVoice",
+    "color": "#0f6fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "agnesai": {
+    "title": "Agnes AI",
+    "color": "#000",
+    "group": "application"
+  },
+  "agui": {
+    "title": "AG-UI",
+    "color": "#fff",
+    "group": "application"
+  },
+  "ai2": {
+    "title": "Ai2",
+    "color": "#f0529c",
+    "group": "model",
+    "color_svg": true
+  },
+  "ai21": {
+    "title": "AI21",
+    "color": "#E91E63",
+    "group": "model"
+  },
+  "ai302": {
+    "title": "302.AI",
+    "color": "#8E47FF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "ai360": {
+    "title": "AI360",
+    "color": "#006ffb",
+    "group": "provider",
+    "color_svg": true
+  },
+  "aihubmix": {
+    "title": "AiHubMix",
+    "color": "#006FFB",
+    "group": "provider",
+    "color_svg": true
+  },
+  "aimass": {
+    "title": "AiMass",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "aionlabs": {
+    "title": "AionLabs",
+    "color": "#0f172a",
+    "group": "model",
+    "color_svg": true
+  },
+  "airjelly": {
+    "title": "AirJelly",
+    "color": "#00C8FF",
+    "group": "application",
+    "color_svg": true
+  },
+  "aistudio": {
+    "title": "Google AI Studio",
+    "color": "#000",
+    "group": "provider"
+  },
+  "akashchat": {
+    "title": "AkashChat",
+    "color": "#000",
+    "group": "provider",
+    "color_svg": true
+  },
+  "alephalpha": {
+    "title": "AlephAlpha",
+    "color": "#fff",
+    "group": "provider"
+  },
+  "alibaba": {
+    "title": "Alibaba",
+    "color": "#FF6003",
+    "group": "provider",
+    "color_svg": true
+  },
+  "alibabacloud": {
+    "title": "AlibabaCloud",
+    "color": "#FF6A00",
+    "group": "provider",
+    "color_svg": true
+  },
+  "amp": {
+    "title": "Amp",
+    "color": "#F34E3F",
+    "group": "application",
+    "color_svg": true
+  },
+  "anspire": {
+    "title": "Anspire",
+    "color": "#514BFD",
+    "group": "provider",
+    "color_svg": true
+  },
+  "antgroup": {
+    "title": "AntGroup",
+    "color": "#1677ff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "anthropic": {
+    "title": "Anthropic",
+    "color": "#F1F0E8",
+    "group": "provider"
+  },
+  "antigravity": {
+    "title": "Antigravity",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "anyscale": {
+    "title": "Anyscale",
+    "color": "#0163FB",
+    "group": "provider",
+    "color_svg": true
+  },
+  "apertis": {
+    "title": "Apertis",
+    "color": "#0d9488",
+    "group": "provider",
+    "color_svg": true
+  },
+  "apple": {
+    "title": "Apple",
+    "color": "#fff",
+    "group": "provider"
+  },
+  "arcee": {
+    "title": "Arcee",
+    "color": "#008C8C",
+    "group": "model",
+    "color_svg": true
+  },
+  "askverdict": {
+    "title": "AskVerdict",
+    "color": "#E8A317",
+    "group": "application",
+    "color_svg": true
+  },
+  "assemblyai": {
+    "title": "AssemblyAI",
+    "color": "#2545D3",
+    "group": "model",
+    "color_svg": true
+  },
+  "atlascloud": {
+    "title": "Atlas Cloud",
+    "color": "#7036F0",
+    "group": "provider"
+  },
+  "automatic": {
+    "title": "Automatic",
+    "color": "#E00054",
+    "group": "application",
+    "color_svg": true
+  },
+  "aws": {
+    "title": "AWS",
+    "color": "#222F3E",
+    "group": "provider",
+    "color_svg": true
+  },
+  "aya": {
+    "title": "Aya",
+    "color": "#416FDC",
+    "group": "model",
+    "color_svg": true
+  },
+  "azure": {
+    "title": "Azure",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "azureai": {
+    "title": "AzureAI",
+    "color": "#000",
+    "group": "provider",
+    "color_svg": true
+  },
+  "baai": {
+    "title": "BAAI",
+    "color": "#000",
+    "group": "model"
+  },
+  "baichuan": {
+    "title": "Baichuan",
+    "color": "#FF6933",
+    "group": "model",
+    "color_svg": true
+  },
+  "baidu": {
+    "title": "Baidu",
+    "color": "#2932E1",
+    "group": "provider",
+    "color_svg": true
+  },
+  "baiducloud": {
+    "title": "BaiduCloud",
+    "color": "#2468f2",
+    "group": "provider",
+    "color_svg": true
+  },
+  "bailian": {
+    "title": "BaiLian",
+    "color": "#615ced",
+    "group": "provider",
+    "color_svg": true
+  },
+  "baseten": {
+    "title": "Baseten",
+    "color": "#19E76E",
+    "group": "provider"
+  },
+  "bedrock": {
+    "title": "Bedrock",
+    "color": "#222F3E",
+    "group": "provider",
+    "color_svg": true
+  },
+  "bfl": {
+    "title": "Black Forest Labs",
+    "color": "#fff",
+    "group": "provider"
+  },
+  "bilibili": {
+    "title": "bilibili",
+    "color": "#FB7299",
+    "group": "provider",
+    "color_svg": true
+  },
+  "bilibiliindex": {
+    "title": "bilibili index",
+    "color": "#5E19B7",
+    "group": "model"
+  },
+  "bing": {
+    "title": "Bing",
+    "color": "#174ae4",
+    "group": "application",
+    "color_svg": true
+  },
+  "bocha": {
+    "title": "Bocha",
+    "color": "#006EFF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "brave": {
+    "title": "Brave",
+    "color": "#FF4000",
+    "group": "provider",
+    "color_svg": true
+  },
+  "briaai": {
+    "title": "BRIA AI",
+    "color": "#671ECC",
+    "group": "provider",
+    "color_svg": true
+  },
+  "browserless": {
+    "title": "Browserless",
+    "color": "#fff",
+    "group": "provider"
+  },
+  "burncloud": {
+    "title": "BurnCloud",
+    "color": "#E95513",
+    "group": "provider",
+    "color_svg": true
+  },
+  "bytedance": {
+    "title": "ByteDance",
+    "color": "#325AB4",
+    "group": "provider",
+    "color_svg": true
+  },
+  "capcut": {
+    "title": "CapCut",
+    "color": "#fff",
+    "group": "application"
+  },
+  "celestoai": {
+    "title": "CelestoAI",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "centml": {
+    "title": "CentML",
+    "color": "#004331",
+    "group": "provider",
+    "color_svg": true
+  },
+  "cerebras": {
+    "title": "Cerebras",
+    "color": "#F15A29",
+    "group": "provider",
+    "color_svg": true
+  },
+  "chatglm": {
+    "title": "ChatGLM",
+    "color": "#4268FA",
+    "group": "model",
+    "color_svg": true
+  },
+  "cherrystudio": {
+    "title": "CherryStudio",
+    "color": "#EA5E5D",
+    "group": "application",
+    "color_svg": true
+  },
+  "civitai": {
+    "title": "Civitai",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "claude": {
+    "title": "Claude",
+    "color": "#D97757",
+    "group": "model",
+    "color_svg": true
+  },
+  "claudecode": {
+    "title": "Claude Code",
+    "color": "#D97757",
+    "group": "application",
+    "color_svg": true
+  },
+  "cline": {
+    "title": "Cline",
+    "color": "#323B43",
+    "group": "application"
+  },
+  "clipdrop": {
+    "title": "Clipdrop",
+    "color": "#000",
+    "group": "application"
+  },
+  "cloudflare": {
+    "title": "Cloudflare",
+    "color": "#F38020",
+    "group": "provider",
+    "color_svg": true
+  },
+  "codebuddy": {
+    "title": "CodeBuddy",
+    "color": "#6c4dff",
+    "group": "application",
+    "color_svg": true
+  },
+  "codeflicker": {
+    "title": "CodeFlicker",
+    "color": "#32EDDA",
+    "group": "application",
+    "color_svg": true
+  },
+  "codegeex": {
+    "title": "CodeGeeX",
+    "color": "#00e7e7",
+    "group": "model",
+    "color_svg": true
+  },
+  "codex": {
+    "title": "Codex",
+    "color": "#fff",
+    "group": "model",
+    "color_svg": true
+  },
+  "cogvideo": {
+    "title": "CogVideo",
+    "color": "#000",
+    "group": "model",
+    "color_svg": true
+  },
+  "cogview": {
+    "title": "CogView",
+    "color": "#000",
+    "group": "model",
+    "color_svg": true
+  },
+  "cohere": {
+    "title": "Cohere",
+    "color": "#39594D",
+    "group": "provider",
+    "color_svg": true
+  },
+  "colab": {
+    "title": "Colab",
+    "color": "#F9AB00",
+    "group": "application",
+    "color_svg": true
+  },
+  "cometapi": {
+    "title": "CometAPI",
+    "color": "#00ACE2",
+    "group": "provider",
+    "color_svg": true
+  },
+  "comfyui": {
+    "title": "ComfyUI",
+    "color": "#F0FF41",
+    "group": "application",
+    "color_svg": true
+  },
+  "commanda": {
+    "title": "CommandA",
+    "color": "#39594D",
+    "group": "model",
+    "color_svg": true
+  },
+  "copilot": {
+    "title": "Copilot",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "copilotkit": {
+    "title": "CopilotKit",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "coqui": {
+    "title": "Coqui",
+    "color": "#03363D",
+    "group": "application",
+    "color_svg": true
+  },
+  "coze": {
+    "title": "Coze",
+    "color": "#4D53E8",
+    "group": "application"
+  },
+  "crewai": {
+    "title": "CrewAI",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "crusoe": {
+    "title": "Crusoe",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "cursor": {
+    "title": "Cursor",
+    "color": "#000",
+    "group": "application"
+  },
+  "cybercut": {
+    "title": "CyberCut",
+    "color": "#000",
+    "group": "application"
+  },
+  "dalle": {
+    "title": "DALL-E",
+    "color": "#000",
+    "group": "model",
+    "color_svg": true
+  },
+  "dbrx": {
+    "title": "DBRX",
+    "color": "#EE3D2C",
+    "group": "model",
+    "color_svg": true
+  },
+  "deepai": {
+    "title": "DeepAI",
+    "color": "#fff",
+    "group": "application"
+  },
+  "deepcogito": {
+    "title": "Deep Cogito",
+    "color": "#4e81ee",
+    "group": "model",
+    "color_svg": true
+  },
+  "deepinfra": {
+    "title": "DeepInfra",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "deepl": {
+    "title": "DeepL",
+    "color": "#0F2B46",
+    "group": "application",
+    "color_svg": true
+  },
+  "deepmind": {
+    "title": "DeepMind",
+    "color": "#4285F4",
+    "group": "provider",
+    "color_svg": true
+  },
+  "deepseek": {
+    "title": "DeepSeek",
+    "color": "#4D6BFE",
+    "group": "model",
+    "color_svg": true
+  },
+  "devin": {
+    "title": "Devin",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "dify": {
+    "title": "Dify",
+    "color": "#03F",
+    "group": "application",
+    "color_svg": true
+  },
+  "doc2x": {
+    "title": "Doc2X",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "docsearch": {
+    "title": "DocSearch",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "dolphin": {
+    "title": "Dolphin",
+    "color": "#6186db",
+    "group": "model"
+  },
+  "doubao": {
+    "title": "Doubao",
+    "color": "#FFF",
+    "group": "model",
+    "color_svg": true
+  },
+  "dreammachine": {
+    "title": "DreamMachine",
+    "color": "#000",
+    "group": "application"
+  },
+  "elevenlabs": {
+    "title": "ElevenLabs",
+    "color": "#fff",
+    "group": "model"
+  },
+  "elevenx": {
+    "title": "11x",
+    "color": "#fff",
+    "group": "application"
+  },
+  "essentialai": {
+    "title": "Essential AI",
+    "color": "#111322",
+    "group": "model",
+    "color_svg": true
+  },
+  "exa": {
+    "title": "Exa",
+    "color": "#1f40ed",
+    "group": "provider",
+    "color_svg": true
+  },
+  "fal": {
+    "title": "Fal",
+    "color": "#EC0648",
+    "group": "provider",
+    "color_svg": true
+  },
+  "fastgpt": {
+    "title": "FastGPT",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "featherless": {
+    "title": "featherless.ai",
+    "color": "#FFE184",
+    "group": "provider",
+    "color_svg": true
+  },
+  "figma": {
+    "title": "Figma",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "firecrawl": {
+    "title": "Firecrawl",
+    "color": "#ff4d00",
+    "group": "application",
+    "color_svg": true
+  },
+  "fireworks": {
+    "title": "Fireworks",
+    "color": "#5019C5",
+    "group": "provider",
+    "color_svg": true
+  },
+  "fishaudio": {
+    "title": "FishAudio",
+    "color": "#fff",
+    "group": "model"
+  },
+  "flora": {
+    "title": "Flora",
+    "color": "#000",
+    "group": "application"
+  },
+  "flowith": {
+    "title": "Flowith",
+    "color": "#fff",
+    "group": "application"
+  },
+  "flux": {
+    "title": "Flux",
+    "color": "#fff",
+    "group": "model"
+  },
+  "friendli": {
+    "title": "Friendli",
+    "color": "#101723",
+    "group": "provider"
+  },
+  "gemini": {
+    "title": "Gemini",
+    "color": "#fff",
+    "group": "model",
+    "color_svg": true
+  },
+  "geminicli": {
+    "title": "Gemini CLI",
+    "color": "#1E1E2E",
+    "group": "application",
+    "color_svg": true
+  },
+  "gemma": {
+    "title": "Gemma",
+    "color": "#2E96FF",
+    "group": "model",
+    "color_svg": true
+  },
+  "giteeai": {
+    "title": "GiteeAI",
+    "color": "#000",
+    "group": "provider"
+  },
+  "github": {
+    "title": "Github",
+    "color": "#000",
+    "group": "provider"
+  },
+  "githubcopilot": {
+    "title": "GithubCopilot",
+    "color": "#000",
+    "group": "application"
+  },
+  "glama": {
+    "title": "Glama",
+    "color": "#000",
+    "group": "application"
+  },
+  "glif": {
+    "title": "Glif",
+    "color": "#000",
+    "group": "application"
+  },
+  "glmv": {
+    "title": "GLM-V",
+    "color": "#0039C6",
+    "group": "model",
+    "color_svg": true
+  },
+  "google": {
+    "title": "Google",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "googlecloud": {
+    "title": "GoogleCloud",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "goose": {
+    "title": "Goose",
+    "color": "#fff",
+    "group": "application"
+  },
+  "gradio": {
+    "title": "Gradio",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "greptile": {
+    "title": "Greptile",
+    "color": "#44A775",
+    "group": "application",
+    "color_svg": true
+  },
+  "grok": {
+    "title": "Grok",
+    "color": "#000",
+    "group": "model"
+  },
+  "groq": {
+    "title": "Groq",
+    "color": "#F55036",
+    "group": "provider"
+  },
+  "hailuo": {
+    "title": "Hailuo",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "haiper": {
+    "title": "Haiper",
+    "color": "#9581ff",
+    "group": "application"
+  },
+  "happyhorse": {
+    "title": "Hedra",
+    "color": "#000",
+    "group": "model"
+  },
+  "hedra": {
+    "title": "Hedra",
+    "color": "#000",
+    "group": "application"
+  },
+  "hermesagent": {
+    "title": "Hermes Agent",
+    "color": "#fff",
+    "group": "application"
+  },
+  "higress": {
+    "title": "Higress",
+    "color": "#3E5CF4",
+    "group": "provider",
+    "color_svg": true
+  },
+  "huawei": {
+    "title": "Huawei",
+    "color": "#C7000B",
+    "group": "provider",
+    "color_svg": true
+  },
+  "huaweicloud": {
+    "title": "HuaweiCloud",
+    "color": "#C7000B",
+    "group": "provider",
+    "color_svg": true
+  },
+  "huggingface": {
+    "title": "HuggingFace",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "hunyuan": {
+    "title": "Hunyuan",
+    "color": "#0053e0",
+    "group": "model",
+    "color_svg": true
+  },
+  "hyperbolic": {
+    "title": "Hyperbolic",
+    "color": "#594CE9",
+    "group": "provider",
+    "color_svg": true
+  },
+  "ibm": {
+    "title": "IBM",
+    "color": "#0F62FE",
+    "group": "provider"
+  },
+  "ideogram": {
+    "title": "Ideogram",
+    "color": "#fff",
+    "group": "application"
+  },
+  "iflytekcloud": {
+    "title": "iFlyTekCloud",
+    "color": "#2A80E2",
+    "group": "provider",
+    "color_svg": true
+  },
+  "inception": {
+    "title": "Inception",
+    "color": "#fff",
+    "group": "model"
+  },
+  "inference": {
+    "title": "Inference",
+    "color": "#000",
+    "group": "provider"
+  },
+  "infermatic": {
+    "title": "Infermatic",
+    "color": "#4334F5",
+    "group": "provider",
+    "color_svg": true
+  },
+  "infinigence": {
+    "title": "Infinigence",
+    "color": "#7952ea",
+    "group": "provider",
+    "color_svg": true
+  },
+  "inflection": {
+    "title": "Inflection",
+    "color": "#038247",
+    "group": "model"
+  },
+  "internlm": {
+    "title": "InternLM",
+    "color": "#1B3882",
+    "group": "provider",
+    "color_svg": true
+  },
+  "jimeng": {
+    "title": "Jimeng",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "jina": {
+    "title": "Jina",
+    "color": "#000",
+    "group": "provider"
+  },
+  "junie": {
+    "title": "Junie",
+    "color": "#47E054",
+    "group": "application",
+    "color_svg": true
+  },
+  "kagi": {
+    "title": "Kagi",
+    "color": "#FEB219",
+    "group": "provider"
+  },
+  "kilocode": {
+    "title": "Kilo Code",
+    "color": "#F8F676",
+    "group": "application"
+  },
+  "kimi": {
+    "title": "Kimi",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "kiro": {
+    "title": "Kiro",
+    "color": "#9046ff",
+    "group": "application",
+    "color_svg": true
+  },
+  "kling": {
+    "title": "Kling",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "kluster": {
+    "title": "Kluster",
+    "color": "#6525F7",
+    "group": "provider",
+    "color_svg": true
+  },
+  "kolors": {
+    "title": "Kolors",
+    "color": "#83FF63",
+    "group": "model",
+    "color_svg": true
+  },
+  "krea": {
+    "title": "Krea",
+    "color": "#000",
+    "group": "application"
+  },
+  "kwaikat": {
+    "title": "KwaiKAT",
+    "color": "#0A67FF",
+    "group": "model"
+  },
+  "kwaipilot": {
+    "title": "Kwaipilot",
+    "color": "#000",
+    "group": "model",
+    "color_svg": true
+  },
+  "lambda": {
+    "title": "Lambda",
+    "color": "#000",
+    "group": "provider"
+  },
+  "langchain": {
+    "title": "LangChain",
+    "color": "#7FC8FF",
+    "group": "application",
+    "color_svg": true
+  },
+  "langfuse": {
+    "title": "Langfuse",
+    "color": "#1B1917",
+    "group": "application",
+    "color_svg": true
+  },
+  "langgraph": {
+    "title": "LangGraph",
+    "color": "#1C3C3C",
+    "group": "application",
+    "color_svg": true
+  },
+  "langsmith": {
+    "title": "LangSmith",
+    "color": "#1C3C3C",
+    "group": "application",
+    "color_svg": true
+  },
+  "leptonai": {
+    "title": "LeptonAI",
+    "color": "#2F80ED",
+    "group": "provider",
+    "color_svg": true
+  },
+  "lg": {
+    "title": "LG AI",
+    "color": "#C00C3F",
+    "group": "provider",
+    "color_svg": true
+  },
+  "lightricks": {
+    "title": "Lightricks",
+    "color": "#000",
+    "group": "application"
+  },
+  "liquid": {
+    "title": "Liquid",
+    "color": "#fff",
+    "group": "model"
+  },
+  "livekit": {
+    "title": "LiveKit",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "llamaindex": {
+    "title": "LlamaIndex",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "llava": {
+    "title": "LLaVA",
+    "color": "#CB2D30",
+    "group": "model",
+    "color_svg": true
+  },
+  "llmapi": {
+    "title": "LLM API",
+    "color": "#3F35FF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "lmstudio": {
+    "title": "LM Studio",
+    "color": "#4338CA",
+    "group": "provider"
+  },
+  "lobehub": {
+    "title": "LobeHub",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "longcat": {
+    "title": "LongCat",
+    "color": "#fff",
+    "group": "model",
+    "color_svg": true
+  },
+  "lovable": {
+    "title": "Lovable",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "lovart": {
+    "title": "Lovart",
+    "color": "#000",
+    "group": "application"
+  },
+  "luma": {
+    "title": "Luma",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "magic": {
+    "title": "Magic",
+    "color": "#fff",
+    "group": "model"
+  },
+  "make": {
+    "title": "Make",
+    "color": "#ff009a",
+    "group": "application",
+    "color_svg": true
+  },
+  "manus": {
+    "title": "Manus",
+    "color": "#fff",
+    "group": "application"
+  },
+  "mastra": {
+    "title": "Mastra",
+    "color": "#000",
+    "group": "application"
+  },
+  "mcp": {
+    "title": "ModelContextProtocol",
+    "color": "#FFF",
+    "group": "application"
+  },
+  "mcpso": {
+    "title": "MCP.so",
+    "color": "#1C3F6B",
+    "group": "application",
+    "color_svg": true
+  },
+  "menlo": {
+    "title": "MENLO",
+    "color": "#FF5C00",
+    "group": "provider",
+    "color_svg": true
+  },
+  "meshy": {
+    "title": "Meshy",
+    "color": "#000",
+    "group": "model",
+    "color_svg": true
+  },
+  "meta": {
+    "title": "Meta",
+    "color": "#1d65c1",
+    "group": "provider",
+    "color_svg": true
+  },
+  "metaai": {
+    "title": "MetaAI",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "metagpt": {
+    "title": "MetaGPT",
+    "color": "#000",
+    "group": "application"
+  },
+  "microsoft": {
+    "title": "Azure",
+    "color": "#00A4EF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "midjourney": {
+    "title": "Midjourney",
+    "color": "#fff",
+    "group": "application"
+  },
+  "minimax": {
+    "title": "Minimax",
+    "color": "#F23F5D",
+    "group": "model",
+    "color_svg": true
+  },
+  "mistral": {
+    "title": "Mistral",
+    "color": "#FA520F",
+    "group": "model",
+    "color_svg": true
+  },
+  "modelscope": {
+    "title": "ModelScope",
+    "color": "#624AFF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "monica": {
+    "title": "Monica",
+    "color": "#6841ea",
+    "group": "application",
+    "color_svg": true
+  },
+  "moonshot": {
+    "title": "MoonshotAI",
+    "color": "#16191E",
+    "group": "provider"
+  },
+  "morph": {
+    "title": "Morph",
+    "color": "#000",
+    "group": "model",
+    "color_svg": true
+  },
+  "moxt": {
+    "title": "Moxt",
+    "color": "#29C16A",
+    "group": "application",
+    "color_svg": true
+  },
+  "myshell": {
+    "title": "MyShell",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "n8n": {
+    "title": "n8n",
+    "color": "#EA4B71",
+    "group": "application",
+    "color_svg": true
+  },
+  "nanobanana": {
+    "title": "NanoBanana",
+    "color": "#FCD53F",
+    "group": "model",
+    "color_svg": true
+  },
+  "nebius": {
+    "title": "Nebius",
+    "color": "#DAFF33",
+    "group": "provider"
+  },
+  "newapi": {
+    "title": "New API",
+    "color": "#dd2e57",
+    "group": "provider",
+    "color_svg": true
+  },
+  "notebooklm": {
+    "title": "NotebookLM",
+    "color": "#fff",
+    "group": "application"
+  },
+  "notion": {
+    "title": "Notion",
+    "color": "#fff",
+    "group": "application"
+  },
+  "nousresearch": {
+    "title": "NousResearch",
+    "color": "#fff",
+    "group": "provider"
+  },
+  "nova": {
+    "title": "Nova",
+    "color": "#222F3E",
+    "group": "model",
+    "color_svg": true
+  },
+  "novelai": {
+    "title": "NovelAI",
+    "color": "#E1E4FF",
+    "group": "application"
+  },
+  "novita": {
+    "title": "Novita AI",
+    "color": "#23D57C",
+    "group": "provider",
+    "color_svg": true
+  },
+  "nplcloud": {
+    "title": "NPLCloud",
+    "color": "#00D1B2",
+    "group": "provider",
+    "color_svg": true
+  },
+  "nvidia": {
+    "title": "Nvidia",
+    "color": "#74B71B",
+    "group": "provider",
+    "color_svg": true
+  },
+  "obsidian": {
+    "title": "Obsidian",
+    "color": "#A88BFA",
+    "group": "application",
+    "color_svg": true
+  },
+  "ollama": {
+    "title": "Ollama",
+    "color": "#fff",
+    "group": "provider"
+  },
+  "openai": {
+    "title": "OpenAI",
+    "color": "#000",
+    "group": "provider"
+  },
+  "openchat": {
+    "title": "OpenChat",
+    "color": "#4A7FE3",
+    "group": "model",
+    "color_svg": true
+  },
+  "openclaw": {
+    "title": "OpenClaw",
+    "color": "#ff4d4d",
+    "group": "application",
+    "color_svg": true
+  },
+  "opencode": {
+    "title": "opencode",
+    "color": "#000",
+    "group": "application"
+  },
+  "openhands": {
+    "title": "OpenHands",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "openhuman": {
+    "title": "OpenHuman",
+    "color": "#000",
+    "group": "application"
+  },
+  "openrouter": {
+    "title": "OpenRouter",
+    "color": "#C8FF00",
+    "group": "provider",
+    "color_svg": true
+  },
+  "openwebui": {
+    "title": "OpenWebUI",
+    "color": "#fff",
+    "group": "application"
+  },
+  "palm": {
+    "title": "PaLM",
+    "color": "#FFF",
+    "group": "model",
+    "color_svg": true
+  },
+  "parasail": {
+    "title": "Parasail",
+    "color": "#000",
+    "group": "provider"
+  },
+  "perplexity": {
+    "title": "Perplexity",
+    "color": "#22B8CD",
+    "group": "provider",
+    "color_svg": true
+  },
+  "phidata": {
+    "title": "Phidata",
+    "color": "#FF4017",
+    "group": "application",
+    "color_svg": true
+  },
+  "phind": {
+    "title": "phind",
+    "color": "#000",
+    "group": "model"
+  },
+  "pi": {
+    "title": "Pi",
+    "color": "#000",
+    "group": "provider"
+  },
+  "pika": {
+    "title": "Pika",
+    "color": "#FDF7EF",
+    "group": "application"
+  },
+  "pixverse": {
+    "title": "PixVerse",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "player2": {
+    "title": "Player2",
+    "color": "#A8A6FF",
+    "group": "application",
+    "color_svg": true
+  },
+  "poe": {
+    "title": "Poe",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "pollinations": {
+    "title": "Pollinations",
+    "color": "#000",
+    "group": "application"
+  },
+  "poolside": {
+    "title": "Poolside",
+    "color": "#4137FF",
+    "group": "model",
+    "color_svg": true
+  },
+  "ppio": {
+    "title": "PPIO",
+    "color": "#2874ff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "prunaai": {
+    "title": "PrunaAI",
+    "color": "#AC51FF",
+    "group": "model",
+    "color_svg": true
+  },
+  "pydanticai": {
+    "title": "PydanticAI",
+    "color": "#E92063",
+    "group": "application",
+    "color_svg": true
+  },
+  "qingyan": {
+    "title": "Qingyan",
+    "color": "#1041F3",
+    "group": "application",
+    "color_svg": true
+  },
+  "qiniu": {
+    "title": "Qiniu",
+    "color": "#06AEEF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "qoder": {
+    "title": "Qoder",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "qwen": {
+    "title": "Qwen",
+    "color": "#615ced",
+    "group": "model",
+    "color_svg": true
+  },
+  "railway": {
+    "title": "Railway",
+    "color": "#853bce",
+    "group": "application"
+  },
+  "recraft": {
+    "title": "Recraft",
+    "color": "#000",
+    "group": "application"
+  },
+  "relace": {
+    "title": "Relace",
+    "color": "#000",
+    "group": "model"
+  },
+  "replicate": {
+    "title": "Replicate",
+    "color": "#EA2805",
+    "group": "provider"
+  },
+  "replit": {
+    "title": "Replit",
+    "color": "#FD5402",
+    "group": "application",
+    "color_svg": true
+  },
+  "reve": {
+    "title": "Reve",
+    "color": "#000",
+    "group": "model"
+  },
+  "roocode": {
+    "title": "RooCode",
+    "color": "#000",
+    "group": "application"
+  },
+  "rsshub": {
+    "title": "RSSHub",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "runway": {
+    "title": "Runway",
+    "color": "#fff",
+    "group": "application"
+  },
+  "rwkv": {
+    "title": "RWKV",
+    "color": "#3431C3",
+    "group": "model",
+    "color_svg": true
+  },
+  "sambanova": {
+    "title": "SambaNova",
+    "color": "#EE7624",
+    "group": "provider",
+    "color_svg": true
+  },
+  "search1api": {
+    "title": "Search1API",
+    "color": "#0066FF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "searchapi": {
+    "title": "SearchApi",
+    "color": "#4f46e5",
+    "group": "provider"
+  },
+  "searxng": {
+    "title": "SearXNG",
+    "color": "#3050FF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "sensenova": {
+    "title": "SenseNova",
+    "color": "#5B2AD8",
+    "group": "model",
+    "color_svg": true
+  },
+  "siliconcloud": {
+    "title": "SiliconCloud",
+    "color": "#6E29F6",
+    "group": "provider",
+    "color_svg": true
+  },
+  "sillytavern": {
+    "title": "SillyTavern",
+    "color": "#333",
+    "group": "application",
+    "color_svg": true
+  },
+  "skywork": {
+    "title": "Skywork",
+    "color": "#fff",
+    "group": "model",
+    "color_svg": true
+  },
+  "slock": {
+    "title": "Slock",
+    "color": "#ffd440",
+    "group": "application"
+  },
+  "smithery": {
+    "title": "Smithery",
+    "color": "#EA580C",
+    "group": "application",
+    "color_svg": true
+  },
+  "snowflake": {
+    "title": "Snowflake",
+    "color": "#249EDC",
+    "group": "provider",
+    "color_svg": true
+  },
+  "sophnet": {
+    "title": "SophNet",
+    "color": "#6200ee",
+    "group": "provider",
+    "color_svg": true
+  },
+  "sora": {
+    "title": "Sora",
+    "color": "#0968DA",
+    "group": "model",
+    "color_svg": true
+  },
+  "spark": {
+    "title": "Spark",
+    "color": "#0070f0",
+    "group": "model",
+    "color_svg": true
+  },
+  "speedai": {
+    "title": "SpeedAI",
+    "color": "#6366F1",
+    "group": "provider",
+    "color_svg": true
+  },
+  "stability": {
+    "title": "Stability",
+    "color": "#330066",
+    "group": "provider",
+    "color_svg": true
+  },
+  "statecloud": {
+    "title": "StateCloud",
+    "color": "#DF0428",
+    "group": "provider",
+    "color_svg": true
+  },
+  "stepfun": {
+    "title": "StepFun",
+    "color": "#000",
+    "group": "model",
+    "color_svg": true
+  },
+  "straico": {
+    "title": "Straico",
+    "color": "#464bba",
+    "group": "provider",
+    "color_svg": true
+  },
+  "streamlake": {
+    "title": "StreamLake",
+    "color": "#1D70FF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "submodel": {
+    "title": "SubModel",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "suno": {
+    "title": "Suno",
+    "color": "#000",
+    "group": "application"
+  },
+  "sync": {
+    "title": "Sync",
+    "color": "#0000FF",
+    "group": "application"
+  },
+  "targon": {
+    "title": "Targon",
+    "color": "#68C3FF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "tavily": {
+    "title": "Tavily",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "tencent": {
+    "title": "Tencent",
+    "color": "#0052D9",
+    "group": "provider",
+    "color_svg": true
+  },
+  "tencentcloud": {
+    "title": "TencentCloud",
+    "color": "#2151d1",
+    "group": "provider",
+    "color_svg": true
+  },
+  "tiangong": {
+    "title": "Tiangong",
+    "color": "#0057ff",
+    "group": "application",
+    "color_svg": true
+  },
+  "tii": {
+    "title": "Technology Innovation Institute",
+    "color": "#6400FF",
+    "group": "provider",
+    "color_svg": true
+  },
+  "together": {
+    "title": "together.ai",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "topazlabs": {
+    "title": "TopazLabs",
+    "color": "#000",
+    "group": "application"
+  },
+  "trae": {
+    "title": "TRAE",
+    "color": "#32F08C",
+    "group": "application",
+    "color_svg": true
+  },
+  "tripo": {
+    "title": "Tripo",
+    "color": "#000",
+    "group": "application",
+    "color_svg": true
+  },
+  "turix": {
+    "title": "TuriX",
+    "color": "#F7AD8A",
+    "group": "application"
+  },
+  "udio": {
+    "title": "Udio",
+    "color": "#e30a5d",
+    "group": "application",
+    "color_svg": true
+  },
+  "unstructured": {
+    "title": "Unstructured",
+    "color": "#0ADDF8",
+    "group": "application",
+    "color_svg": true
+  },
+  "upstage": {
+    "title": "Upsate",
+    "color": "#908AF9",
+    "group": "provider",
+    "color_svg": true
+  },
+  "v0": {
+    "title": "V0",
+    "color": "#000",
+    "group": "application"
+  },
+  "vectorizerai": {
+    "title": "Vectorizer.AI",
+    "color": "#3659FF",
+    "group": "application"
+  },
+  "venice": {
+    "title": "Venice",
+    "color": "#E05A2D",
+    "group": "application",
+    "color_svg": true
+  },
+  "vercel": {
+    "title": "Vercel",
+    "color": "#000",
+    "group": "provider"
+  },
+  "vertexai": {
+    "title": "VertexAI",
+    "color": "#4285F4",
+    "group": "provider",
+    "color_svg": true
+  },
+  "vidu": {
+    "title": "Vidu",
+    "color": "#22D5FF",
+    "group": "application",
+    "color_svg": true
+  },
+  "viggle": {
+    "title": "Viggle",
+    "color": "#000",
+    "group": "application"
+  },
+  "vllm": {
+    "title": "vLLM",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "volcengine": {
+    "title": "Volcengine",
+    "color": "#fff",
+    "group": "provider",
+    "color_svg": true
+  },
+  "voyage": {
+    "title": "Voyage",
+    "color": "#012E33",
+    "group": "model",
+    "color_svg": true
+  },
+  "wenxin": {
+    "title": "Wenxin",
+    "color": "#167ADF",
+    "group": "model",
+    "color_svg": true
+  },
+  "windsurf": {
+    "title": "Windsurf",
+    "color": "#fff",
+    "group": "application"
+  },
+  "workersai": {
+    "title": "WorkersAI",
+    "color": "#F38020",
+    "group": "provider",
+    "color_svg": true
+  },
+  "worldrouter": {
+    "title": "WorldRouter",
+    "color": "#000",
+    "group": "provider"
+  },
+  "xai": {
+    "title": "Grok",
+    "color": "#fff",
+    "group": "provider"
+  },
+  "xiaomimimo": {
+    "title": "XiaomiMiMo",
+    "color": "#000",
+    "group": "model"
+  },
+  "xinference": {
+    "title": "Xinference",
+    "color": "#781ff5",
+    "group": "provider",
+    "color_svg": true
+  },
+  "xpay": {
+    "title": "xpay",
+    "color": "#0F1C4D",
+    "group": "provider",
+    "color_svg": true
+  },
+  "xuanyuan": {
+    "title": "轩辕",
+    "color": "#fff",
+    "group": "model",
+    "color_svg": true
+  },
+  "yandex": {
+    "title": "Yandex",
+    "color": "#FB3E1C",
+    "group": "provider"
+  },
+  "yi": {
+    "title": "Yi",
+    "color": "#003425",
+    "group": "model",
+    "color_svg": true
+  },
+  "youmind": {
+    "title": "YouMind",
+    "color": "#000",
+    "group": "application"
+  },
+  "yuanbao": {
+    "title": "Yuanbao",
+    "color": "#fff",
+    "group": "application",
+    "color_svg": true
+  },
+  "zai": {
+    "title": "Z.ai",
+    "color": "#000",
+    "group": "application"
+  },
+  "zapier": {
+    "title": "Zapier",
+    "color": "#FF4F00",
+    "group": "application",
+    "color_svg": true
+  },
+  "zeabur": {
+    "title": "Zeabur",
+    "color": "#6300FF",
+    "group": "application",
+    "color_svg": true
+  },
+  "zencoder": {
+    "title": "Zencoder",
+    "color": "#E65C2C",
+    "group": "application",
+    "color_svg": true
+  },
+  "zenmux": {
+    "title": "ZenMux",
+    "color": "#000",
+    "group": "provider"
+  },
+  "zeroone": {
+    "title": "01.AI",
+    "color": "#003425",
+    "group": "provider",
+    "color_svg": true
+  },
+  "zhipu": {
+    "title": "Zhipu",
+    "color": "#3859FF",
+    "group": "provider",
+    "color_svg": true
+  }
+}

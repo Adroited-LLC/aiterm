@@ -232,6 +232,8 @@ body.dragging * { pointer-events: none; }
   line-height: 1.45;
 }
 .usage-src-detail.rejected, .usage-src-detail.unreachable { color: var(--yellow); }
+/* A rate limit is not a fault; it reads as quietly as a stale stamp. */
+.usage-src-detail.limited { color: var(--text-faint); }
 .usage-src-detail.stale { color: var(--text-faint); }
 .usage-src-note { margin-top: 5px; color: var(--text-dim); font-size: 11px; }
 .usage-row { margin-top: 8px; }
@@ -779,10 +781,14 @@ body.dragging * { pointer-events: none; }
   flex-shrink: 0;
 }
 .agent-badge .agent-icon { margin: 0; }
-.agent-badge.claude {
-  background: color-mix(in srgb, var(--claude) 12%, var(--bg-raised));
-  border-color: color-mix(in srgb, var(--claude) 30%, var(--border));
+/* Tinted with the engine's own colour — `--brand` is set per badge from
+   `agentAccent`: the vendor's primary where it has one, the theme's hue for
+   that engine where the mark is ink. Claude's is the theme's `--claude`. */
+.agent-badge.branded {
+  background: color-mix(in srgb, var(--brand) 12%, var(--bg-raised));
+  border-color: color-mix(in srgb, var(--brand) 30%, var(--border));
 }
+.agent-badge.claude { --brand: var(--claude); }
 .badge-dot {
   position: absolute;
   right: -2px;
@@ -858,6 +864,27 @@ body.dragging * { pointer-events: none; }
 
 .agent-icon { color: var(--text-dim); margin-top: 2px; flex-shrink: 0; }
 .agent-icon.claude { color: var(--claude); }
+
+/* A brand mark from the LobeHub set (`brand.ts`), inline SVG sized by
+   font-size: the file says width/height 1em, so the span's font-size is the
+   icon's size and the mono form takes `currentColor` like a glyph. A mark
+   still loading is the same empty box, so rows do not shift when it lands. */
+.brand-icon {
+  display: inline-flex;
+  width: 1em;
+  height: 1em;
+  flex: none;
+  vertical-align: -0.15em;
+  line-height: 1;
+}
+.brand-icon svg { width: 1em; height: 1em; display: block; }
+/* In a row of text: sits before the name, on the baseline. */
+.brand-icon.inline { margin-right: 6px; align-self: center; }
+.usage-chip-name, .usage-src-name, .mb-item-name, .mb-card-name, .ep-name, .pol-chip, .acty-name {
+  display: inline-flex; align-items: center;
+}
+.usage-chip-name .brand-icon.inline { margin-right: 4px; }
+.ns-model-brand { align-self: center; margin-right: 2px; }
 
 .session-text { flex: 1; min-width: 0; }
 .session-title {
@@ -2867,16 +2894,14 @@ input[type="range"]::-webkit-slider-thumb {
   cursor: pointer;
 }
 .ns-agent-tab:hover { color: var(--text); border-color: var(--text-faint); }
+/* Selected: the same tab, lit — brighter text, raised ground, a firmer edge.
+   Not the accent fill: the engine's mark already says which one is chosen,
+   and a solid block of colour in the corner of the panel is louder than the
+   answer deserves. */
 .ns-agent-tab.on {
-  color: #fff;
-  background: var(--accent);
-  border-color: var(--accent);
-}
-/* The one control whose whole job is naming the source must not take the
-   theme's colour for Claude — see `--claude`. */
-.ns-agent-tab.claude.on {
-  background: var(--claude);
-  border-color: var(--claude);
+  color: var(--text);
+  background: var(--bg-raised);
+  border-color: var(--text-faint);
 }
 .ns-agent-tab .agent-icon { flex-shrink: 0; }
 
@@ -3115,6 +3140,22 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 /* Claude Code configuration panel — a drill-down from the Agents list. */
+/* Permission preset per engine, in its Agents row. */
+.agent-perm { margin-top: 7px; }
+.agent-perm-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.agent-perm-label .ns-select { flex: none; }
+.agent-perm-note {
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
 .agent-config-btn {
   margin-left: auto;
   background: var(--bg-raised);
@@ -3296,6 +3337,10 @@ input[type="range"]::-webkit-slider-thumb {
   color: var(--text);
   border-color: var(--border);
 }
+/* A session tab carries a hairline of its engine's colour along the top, so
+   which engine is in front reads from the tab strip without the icon. */
+.center-tab.branded { box-shadow: inset 0 2px 0 var(--brand); }
+.center-tab.branded.on { box-shadow: inset 0 2px 0 var(--brand); }
 .center-tab.locked { font-weight: 600; }
 .center-tab-name { overflow: hidden; text-overflow: ellipsis; }
 .center-tab-shell { font-size: 11px; color: var(--accent); }

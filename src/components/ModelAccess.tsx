@@ -6,6 +6,8 @@ import {
   providerSave, providerStartupSet, providersList, Route,
 } from "../ipc";
 import RoutingActivity from "./RoutingActivity";
+import BrandIcon from "./BrandIcon";
+import { brandForModel, brandForName, brandForUrl } from "../brand";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
  *  these are just the ones most people are reaching for. */
@@ -653,6 +655,7 @@ export default function ModelAccess({ focusProvider }: Props) {
                   {healthy[p.id] && (
                     <span className="prov-dot" title="Answered a model list this session" />
                   )}
+                  <BrandIcon name={brandForUrl(p.base_url) ?? brandForName(p.name)} size={14} className="inline" />
                   {p.name}
                   <span className="prov-key">
                     {p.has_key ? (p.key_hint ? `key …${p.key_hint}` : "key saved") : "no key"}
@@ -769,7 +772,10 @@ export default function ModelAccess({ focusProvider }: Props) {
                             ...d,
                             providers: d.providers.filter((x) => x !== s),
                           }))}
-                        >{s} ✕</button>
+                        >
+                          <BrandIcon name={brandForName(s)} size={12} className="inline" />
+                          {s} ✕
+                        </button>
                       ))}
                     </div>
                   )}
@@ -937,7 +943,10 @@ export default function ModelAccess({ focusProvider }: Props) {
                       className={"mb-item" + (sel?.id === m.id ? " on" : "")}
                       onClick={() => setPicked(m.id)}
                     >
-                      <span className="mb-item-name">{m.name ?? m.id}</span>
+                      <span className="mb-item-name">
+                        <BrandIcon name={brandForModel(m.id)} size={13} className="inline" />
+                        {m.name ?? m.id}
+                      </span>
                       {browsingProv?.startup_models.includes(m.id) && (
                         <span className="mb-star" title="On the startup list">★</span>
                       )}
@@ -950,7 +959,10 @@ export default function ModelAccess({ focusProvider }: Props) {
                 </div>
                 {sel && (
                   <div className="mb-card">
-                    <div className="mb-card-name">{sel.name ?? sel.id}</div>
+                    <div className="mb-card-name">
+                      <BrandIcon name={brandForModel(sel.id)} size={15} className="inline" />
+                      {sel.name ?? sel.id}
+                    </div>
                     <div className="mb-card-id">
                       <code>{sel.id}</code>
                       <button className="act-btn" onClick={() => copyId(sel.id)}>
@@ -1022,7 +1034,10 @@ export default function ModelAccess({ focusProvider }: Props) {
                                     title={e.excluded ? `Excluded: ${e.excluded}` : `Pin ${e.provider_name}`}
                                     onClick={() => pin(sel.id, e.slug)}
                                   >
-                                    <span className="ep-name">{e.provider_name}</span>
+                                    <span className="ep-name">
+                                      <BrandIcon name={brandForName(e.provider_name)} size={12} className="inline" />
+                                      {e.provider_name}
+                                    </span>
                                     <span className="ep-tag">{e.quantization ?? ""}</span>
                                     <span className="ep-price">
                                       {fmtPrice(e.prompt_price)} / {fmtPrice(e.completion_price)}
@@ -1107,7 +1122,10 @@ export default function ModelAccess({ focusProvider }: Props) {
                 key={s.name}
                 className="prov-preset"
                 onClick={() => { setName(s.name); setBaseUrl(s.base_url); }}
-              >{s.name}</button>
+              >
+                <BrandIcon name={brandForUrl(s.base_url) ?? brandForName(s.name)} size={13} className="inline" />
+                {s.name}
+              </button>
             ))}
           </div>
         )}
