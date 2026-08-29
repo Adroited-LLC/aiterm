@@ -21,6 +21,8 @@
   --text-faint: #5c6070;
   --accent: #da7756;
   --icon-size: 16px;
+  --icon-size-sm: 13px;
+  --icon-size-lg: 19px;
   /* Claude's colour, fixed. `--accent` is whatever the active theme picked —
      `applySettings` overwrites it on every theme — so on one-dark it is
      #61afef and on nord #88c0d0, which drew Claude in blue two millimetres
@@ -364,8 +366,8 @@ body.dragging * { pointer-events: none; }
    over. Lucide writes width/height="24" on the element; these win. */
 .ui-icon { flex: none; vertical-align: -0.2em; }
 .ui-icon.md { width: var(--icon-size); height: var(--icon-size); }
-.ui-icon.sm { width: calc(var(--icon-size) * 0.8); height: calc(var(--icon-size) * 0.8); }
-.ui-icon.lg { width: calc(var(--icon-size) * 1.2); height: calc(var(--icon-size) * 1.2); }
+.ui-icon.sm { width: var(--icon-size-sm); height: var(--icon-size-sm); }
+.ui-icon.lg { width: var(--icon-size-lg); height: var(--icon-size-lg); }
 .agent-badge .ui-icon, .icon-btn .ui-icon { vertical-align: middle; }
 .icon-btn:hover { background: var(--bg-hover); color: var(--text); }
 .icon-btn.on { color: var(--accent); }

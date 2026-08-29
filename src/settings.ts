@@ -264,7 +264,13 @@ export function applySettings(s: AppSettings) {
   r.setProperty("--magenta", t.term.magenta);
   r.setProperty("--font-ui", s.uiFont ? `"${s.uiFont}", ${UI_FALLBACK}` : UI_FALLBACK);
   r.setProperty("--font-mono", s.termFont ? `"${s.termFont}", ${MONO_FALLBACK}` : MONO_FALLBACK);
+  // Three plain pixel values rather than one and a calc(): WebKitGTK does not
+  // apply calc() as an SVG root's width, and an unapplied width leaves the
+  // element at the 24px Lucide writes on it — every small icon drawn larger
+  // than the large ones.
   r.setProperty("--icon-size", `${s.iconSize}px`);
+  r.setProperty("--icon-size-sm", `${Math.round(s.iconSize * 0.8)}px`);
+  r.setProperty("--icon-size-lg", `${Math.round(s.iconSize * 1.2)}px`);
 }
 
 export function termFontFamily(s: AppSettings): string {
