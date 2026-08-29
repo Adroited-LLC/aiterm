@@ -160,7 +160,10 @@ struct RemoteRosterTab {
 
 #[derive(Deserialize)]
 struct StateSnapshotReply {
+    transfer_id: String,
     revision: u64,
+    index: u32,
+    total: u32,
     tabs: Vec<RemoteRosterTab>,
 }
 
@@ -573,11 +576,142 @@ async fn authenticated_connection_starts_with_a_recoverable_tab_state_snapshot()
     let state = authenticate(&mut socket, &key, &device_id).await;
     let state: StateSnapshotReply = decode(&state.payload);
     assert_eq!(state.revision, 1);
+    assert_eq!(state.index, 0);
+    assert_eq!(state.total, 1);
+    assert!(!state.transfer_id.is_empty());
     assert_eq!(state.tabs.len(), 1);
     assert_eq!(state.tabs[0].id, tab.as_str());
     assert_eq!(state.tabs[0].title, "Before auth");
     assert_eq!(state.tabs[0].size, TerminalSize::try_new(34, 7).unwrap());
     assert_eq!(state.tabs[0].focus, "unowned");
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn authenticated_roster_snapshot_is_a_bounded_complete_ordered_transfer() {
+    let root = private_test_dir("chunked-tab-state");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let title = "x".repeat(16 * 1024);
+    let mut expected = Vec::new();
+    for index in 0..80 {
+        expected.push(
+            registry
+                .open_desktop(TabLaunch::new(
+                    format!("{index}:{title}"),
+                    format!("roster-{index}"),
+                    TerminalSize::try_new(80, 24).unwrap(),
+                ))
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+
+    let first = authenticate(&mut socket, &key, &device_id).await;
+    let mut chunks = vec![decode::<StateSnapshotReply>(&first.payload)];
+    let total = chunks[0].total;
+    while chunks.len() < total as usize {
+        let frame = response(&mut socket).await;
+        assert_eq!(frame.kind, "state.snapshot");
+        chunks.push(decode(&frame.payload));
+    }
+
+    assert!(total > 1, "the oversized roster must exercise chunking");
+    assert!(chunks.iter().all(|chunk| chunk.transfer_id == chunks[0].transfer_id));
+    assert_eq!(
+        chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
+        (0..total).collect::<Vec<_>>(),
+    );
+    let actual = chunks
+        .into_iter()
+        .flat_map(|chunk| chunk.tabs.into_iter().map(|tab| tab.id))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+
+    for tab in registry.list() {
+        registry.close(tab.id()).ok();
+    }
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn sustained_registry_events_cannot_starve_a_correlated_inbound_request() {
+    let root = private_test_dir("fair-registry-events");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let tab = registry
+        .open_desktop(TabLaunch::new(
+            "flood",
+            "flood",
+            TerminalSize::try_new(80, 24).unwrap(),
+        ))
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    let keep_flooding = Arc::new(AtomicBool::new(true));
+    let flood_flag = keep_flooding.clone();
+    let flood_registry = registry.clone();
+    let flood_tab = tab.clone();
+    let flood = tokio::spawn(async move {
+        let mut sequence = 0u64;
+        while flood_flag.load(Ordering::SeqCst) {
+            flood_registry
+                .update(&flood_tab, TabUpdate::new().title(format!("title-{sequence}")))
+                .unwrap();
+            sequence += 1;
+            tokio::task::yield_now().await;
+        }
+    });
+    socket.send(request(991, "tab.list", b"")).await.unwrap();
+
+    let mut registry_events = 0usize;
+    let correlated = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = response(&mut socket).await;
+            if event.request_id == 991 {
+                break event;
+            }
+            if event.kind == "tab.changed" || event.kind == "state.snapshot" {
+                registry_events += 1;
+            }
+        }
+    })
+    .await
+    .expect("a sustained title stream must not starve inbound work");
+    keep_flooding.store(false, Ordering::SeqCst);
+    flood.await.unwrap();
+
+    assert_eq!(correlated.kind, "tab.list");
+    assert!(
+        registry_events <= 8,
+        "inbound work was delayed behind {registry_events} registry events"
+    );
 
     registry.close(&tab).ok();
     gateway.stop().await.unwrap();
