@@ -951,12 +951,18 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
         return Err("verified OpenCode dump operations are unsupported on this platform".into());
     }
 
+    let codex_rollouts = if backend.id() == "codex" {
+        verified_codex_rollout_sources(&session_id, &path, &home)?
+    } else {
+        Vec::new()
+    };
     archive_generic_session_sources(
         verified.ok_or("session transcript was not verified")?,
         &path,
         &session_id,
         &home,
         &trash_dir,
+        codex_rollouts,
     )?;
     // Where it came from, so restore can put it back rather than deduce a
     // destination. Deducing worked while every session was claude's and the
@@ -965,17 +971,6 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     // deduction cannot produce and would silently restore into claude's tree
     // instead — a file neither agent would ever find again.
     //
-    // Best-effort: a missing sidecar falls back to the old behaviour, which is
-    // still right for everything trashed before this existed.
-    // A Codex conversation is spread across every rollout that shares its
-    // session id, and the rename above only took the newest. Leaving the rest
-    // means the next scan collapses them straight back into a row: the delete
-    // appears to work, then undoes itself, showing older content. Take the
-    // whole set. Runs after the rename, so the file already moved is not in
-    // the list this finds.
-    if backend.id() == "codex" {
-        stash_codex_rollouts_verified(&session_id, &trash_dir, &home);
-    }
     // Claude Code keeps a second, independent record of a session under
     // `~/.claude/jobs/<short>/`, and nothing there follows the transcript. Left
     // behind, it is a ghost: `claude agents` goes on listing a session you
@@ -993,45 +988,97 @@ fn archive_generic_session_sources(
     session_id: &str,
     home: &Path,
     trash_dir: &VerifiedDirectory,
+    codex_rollouts: Vec<(VerifiedSessionFile, Vec<u8>)>,
 ) -> Result<(), String> {
-    let mut archive_entries = vec![(
-        transcript,
-        std::ffi::OsString::from(format!("{session_id}.jsonl")),
-    )];
+    #[cfg(target_os = "linux")]
+    let mut archive_inputs = vec![VerifiedArchiveInput::Entry {
+        source: transcript,
+        destination_name: std::ffi::OsString::from(format!("{session_id}.jsonl")),
+    }];
+    #[cfg(not(target_os = "linux"))]
+    let _ = (transcript, codex_rollouts);
     let tasks_root = home.join(".claude/tasks");
     let tasks = tasks_root.join(session_id);
     match std::fs::symlink_metadata(&tasks) {
-        Ok(_) => archive_entries.push((
-            verified_directory_entry(&tasks_root, &tasks)?,
-            std::ffi::OsString::from(format!("{session_id}.tasks")),
-        )),
+        #[cfg(target_os = "linux")]
+        Ok(_) => archive_inputs.push(VerifiedArchiveInput::Entry {
+            source: verified_directory_entry(&tasks_root, &tasks)?,
+            destination_name: std::ffi::OsString::from(format!("{session_id}.tasks")),
+        }),
+        #[cfg(not(target_os = "linux"))]
+        Ok(_) => return Err("leased session archive operations require Linux".into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("could not inspect session task archive: {error}")),
     }
     let jobs_root = home.join(".claude/jobs");
     if let Some(job) = find_job_dir_checked(&jobs_root, session_id)? {
-        archive_entries.push((
-            verified_directory_entry(&jobs_root, &job)?,
-            std::ffi::OsString::from(format!("{session_id}.job")),
-        ));
+        #[cfg(target_os = "linux")]
+        archive_inputs.push(VerifiedArchiveInput::Entry {
+            source: verified_directory_entry(&jobs_root, &job)?,
+            destination_name: std::ffi::OsString::from(format!("{session_id}.job")),
+        });
+        #[cfg(not(target_os = "linux"))]
+        return Err("leased session archive operations require Linux".into());
     }
     #[cfg(target_os = "linux")]
-    archive_verified_entries_with_hooks(
+    {
+        if !codex_rollouts.is_empty() {
+            archive_inputs.push(VerifiedArchiveInput::FileSet {
+                sources: codex_rollouts,
+                destination_name: std::ffi::OsString::from(format!("{session_id}.rollouts")),
+            });
+        }
+        archive_inputs.push(VerifiedArchiveInput::Generated {
+            bytes: transcript_path.as_os_str().as_bytes().to_vec(),
+            destination_name: std::ffi::OsString::from(format!("{session_id}.origin")),
+        });
+        archive_verified_inputs_with_hooks(
         trash_dir,
-        archive_entries,
+        archive_inputs,
         ArchiveLimits::default(),
         || {},
         || Ok(()),
-    )?;
+        )?;
+    }
     #[cfg(not(target_os = "linux"))]
     return Err("leased session archive operations require Linux".into());
-
-    let origin_name = format!("{session_id}.origin");
-    let _ = trash_dir.write_atomic(
-        OsStr::new(&origin_name),
-        transcript_path.to_string_lossy().as_bytes(),
-    );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verified_codex_rollout_sources(
+    session_id: &str,
+    selected: &Path,
+    home: &Path,
+) -> Result<Vec<(VerifiedSessionFile, Vec<u8>)>, String> {
+    let root = home.join(".codex/sessions");
+    let mut sources = Vec::new();
+    for path in crate::agents::codex_session_files(session_id) {
+        if path == selected {
+            continue;
+        }
+        if sources.len() >= ArchiveLimits::default().entries {
+            return Err("session rollout archive exceeds entry limit".into());
+        }
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| "session rollout escapes its store")?
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        validate_archive_relative_path(&relative, ArchiveLimits::default())?;
+        sources.push((verified_session_file("codex", &path, home)?, relative));
+    }
+    Ok(sources)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verified_codex_rollout_sources(
+    _session_id: &str,
+    _selected: &Path,
+    _home: &Path,
+) -> Result<Vec<(VerifiedSessionFile, Vec<u8>)>, String> {
+    Err("leased session archive operations require Linux".into())
 }
 
 #[cfg(unix)]
@@ -1512,12 +1559,28 @@ impl Drop for HeldWriteLease {
 
 #[cfg(target_os = "linux")]
 struct PreparedLeasedArchive {
-    source: VerifiedSessionFile,
+    sources: Vec<VerifiedSessionFile>,
     destination_name: CString,
     archive: HeldWriteLease,
     archive_hash: [u8; 32],
     archive_size: u64,
     retirements: Vec<ExactFileRetirement>,
+}
+
+#[cfg(target_os = "linux")]
+enum VerifiedArchiveInput {
+    Entry {
+        source: VerifiedSessionFile,
+        destination_name: std::ffi::OsString,
+    },
+    FileSet {
+        sources: Vec<(VerifiedSessionFile, Vec<u8>)>,
+        destination_name: std::ffi::OsString,
+    },
+    Generated {
+        bytes: Vec<u8>,
+        destination_name: std::ffi::OsString,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -1691,8 +1754,13 @@ fn for_each_directory_entry(
     }
     let result = (|| {
         loop {
+            unsafe { *libc::__errno_location() = 0 };
             let entry = unsafe { libc::readdir(stream) };
             if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(0) {
+                    return Err(error.to_string());
+                }
                 break;
             }
             let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
@@ -1955,22 +2023,186 @@ fn prepare_leased_archive(
             retirements
         }
     };
-    let (archive_hash, archive_size) = hash_exact_file_bounded(
-        &archive.file,
-        limits
-            .bytes
-            .checked_add((limits.entries as u64).saturating_mul(8192))
-            .ok_or("archive bound overflow")?,
-    )?;
+    let archive_bound = u64::try_from(limits.entries)
+        .ok()
+        .and_then(|entries| entries.checked_mul(8192))
+        .and_then(|overhead| limits.bytes.checked_add(overhead))
+        .ok_or("archive bound overflow")?;
+    let (archive_hash, archive_size) = hash_exact_file_bounded(&archive.file, archive_bound)?;
     let destination_name = CString::new(destination_name.as_bytes())
         .map_err(|_| "invalid trash destination name")?;
     Ok(PreparedLeasedArchive {
-        source,
+        sources: vec![source],
         destination_name,
         archive,
         archive_hash,
         archive_size,
         retirements,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_archive_relative_path(path: &[u8], limits: ArchiveLimits) -> Result<(), String> {
+    if path.is_empty() || path.len() > limits.path_bytes {
+        return Err("sidecar archive path exceeds path limit".into());
+    }
+    let mut components = 0usize;
+    for component in path.split(|byte| *byte == b'/') {
+        components = components
+            .checked_add(1)
+            .ok_or("sidecar path depth overflow")?;
+        if components.saturating_sub(1) > limits.depth
+            || component.is_empty()
+            || component.len() > limits.component_bytes
+            || component == b"."
+            || component == b".."
+            || component.contains(&0)
+        {
+            return Err("sidecar archive contains an invalid relative path".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_leased_file_set_archive(
+    sources: Vec<(VerifiedSessionFile, Vec<u8>)>,
+    destination: &VerifiedDirectory,
+    destination_name: std::ffi::OsString,
+    limits: ArchiveLimits,
+) -> Result<PreparedLeasedArchive, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+
+    if sources.is_empty() || sources.len() > limits.entries {
+        return Err("session rollout archive exceeds entry limit".into());
+    }
+    let archive = HeldWriteLease::anonymous_in(&destination.file)?;
+    let mut writer = archive.file.try_clone().map_err(|error| error.to_string())?;
+    writer.write_all(SIDECAR_ARCHIVE_MAGIC).map_err(|error| error.to_string())?;
+    writer
+        .write_all(&SIDECAR_ARCHIVE_VERSION.to_le_bytes())
+        .and_then(|_| {
+            let count = u32::try_from(sources.len()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "rollout count overflow")
+            })?;
+            writer.write_all(&count.to_le_bytes())
+        })
+        .map_err(|error| error.to_string())?;
+    let mut total_bytes = 0u64;
+    let mut retirements = Vec::with_capacity(sources.len());
+    for (source, relative) in &sources {
+        if !matches!(source.kind, VerifiedEntryKind::File) {
+            return Err("session rollout archive source is not a regular file".into());
+        }
+        validate_archive_relative_path(relative, limits)?;
+        let before = source.object.metadata().map_err(|error| error.to_string())?;
+        (limits.before_file_read)(&source.object);
+        let remaining = limits.bytes.saturating_sub(total_bytes);
+        if before.len() > remaining {
+            return Err("session rollout archive exceeds byte limit".into());
+        }
+        write_sidecar_record_prefix(
+            &mut writer,
+            1,
+            relative,
+            before.mode(),
+            before.mtime(),
+            before.mtime_nsec() as u32,
+            before.len(),
+        )?;
+        let mut digest = Sha256::new();
+        let mut copied = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let allowed = remaining.saturating_sub(copied);
+            let request = buffer.len().min(
+                usize::try_from(allowed.saturating_add(1)).unwrap_or(buffer.len()),
+            );
+            let read = source
+                .object
+                .read_at(&mut buffer[..request], copied)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(read as u64)
+                .ok_or("session rollout byte count overflow")?;
+            if copied > remaining {
+                return Err("session rollout archive exceeds byte limit".into());
+            }
+            digest.update(&buffer[..read]);
+            writer.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+        }
+        let after = source.object.metadata().map_err(|error| error.to_string())?;
+        if copied != before.len()
+            || before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+        {
+            return Err("session rollout changed while it was archived".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(copied)
+            .ok_or("session rollout byte count overflow")?;
+        retirements.push(ExactFileRetirement {
+            source: source.object.try_clone().map_err(|error| error.to_string())?,
+            archive: None,
+            size: copied,
+            modified: before.modified().map_err(|error| error.to_string())?,
+            hash: digest.finalize().into(),
+        });
+    }
+    set_archive_metadata(&archive.file, 0o600, std::time::SystemTime::now())?;
+    archive.file.sync_all().map_err(|error| error.to_string())?;
+    let archive_bound = limits
+        .entries
+        .try_into()
+        .ok()
+        .and_then(|entries: u64| entries.checked_mul(8192))
+        .and_then(|overhead| limits.bytes.checked_add(overhead))
+        .ok_or("archive bound overflow")?;
+    let (archive_hash, archive_size) = hash_exact_file_bounded(&archive.file, archive_bound)?;
+    let destination_name = CString::new(destination_name.as_bytes())
+        .map_err(|_| "invalid trash destination name")?;
+    Ok(PreparedLeasedArchive {
+        sources: sources.into_iter().map(|(source, _)| source).collect(),
+        destination_name,
+        archive,
+        archive_hash,
+        archive_size,
+        retirements,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_generated_archive(
+    bytes: Vec<u8>,
+    destination: &VerifiedDirectory,
+    destination_name: std::ffi::OsString,
+    limits: ArchiveLimits,
+) -> Result<PreparedLeasedArchive, String> {
+    use std::io::Write;
+
+    if u64::try_from(bytes.len()).map_err(|_| "generated archive size overflow")? > limits.bytes {
+        return Err("generated session archive exceeds byte limit".into());
+    }
+    let archive = HeldWriteLease::anonymous_in(&destination.file)?;
+    let mut writer = archive.file.try_clone().map_err(|error| error.to_string())?;
+    writer.write_all(&bytes).map_err(|error| error.to_string())?;
+    set_archive_metadata(&archive.file, 0o600, std::time::SystemTime::now())?;
+    archive.file.sync_all().map_err(|error| error.to_string())?;
+    let (archive_hash, archive_size) = hash_exact_file_bounded(&archive.file, limits.bytes)?;
+    let destination_name = CString::new(destination_name.as_bytes())
+        .map_err(|_| "invalid trash destination name")?;
+    Ok(PreparedLeasedArchive {
+        sources: Vec::new(),
+        destination_name,
+        archive,
+        archive_hash,
+        archive_size,
+        retirements: Vec::new(),
     })
 }
 
@@ -2004,18 +2236,66 @@ fn archive_verified_entries_with_hooks(
     before_prepare: impl FnOnce(),
     after_publish: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    if entries.is_empty() {
+    archive_verified_inputs_with_hooks(
+        destination,
+        entries
+            .into_iter()
+            .map(|(source, destination_name)| VerifiedArchiveInput::Entry {
+                source,
+                destination_name,
+            })
+            .collect(),
+        limits,
+        before_prepare,
+        after_publish,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn archive_verified_inputs_with_hooks(
+    destination: &VerifiedDirectory,
+    inputs: Vec<VerifiedArchiveInput>,
+    limits: ArchiveLimits,
+    before_prepare: impl FnOnce(),
+    after_publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if inputs.is_empty() {
         return Err("session delete has no verified archive source".into());
     }
     before_prepare();
-    let mut prepared = Vec::with_capacity(entries.len().min(16));
-    for (source, name) in entries {
-        prepared.push(prepare_leased_archive(source, destination, name, limits)?);
+    let mut prepared = Vec::with_capacity(inputs.len().min(16));
+    for input in inputs {
+        prepared.push(match input {
+            VerifiedArchiveInput::Entry {
+                source,
+                destination_name,
+            } => prepare_leased_archive(source, destination, destination_name, limits)?,
+            VerifiedArchiveInput::FileSet {
+                sources,
+                destination_name,
+            } => prepare_leased_file_set_archive(sources, destination, destination_name, limits)?,
+            VerifiedArchiveInput::Generated {
+                bytes,
+                destination_name,
+            } => prepare_generated_archive(bytes, destination, destination_name, limits)?,
+        });
     }
+    let mut published = Vec::with_capacity(prepared.len());
     for archive in &prepared {
-        archive
+        if let Err(error) = archive
             .archive
-            .publish(&destination.file, &archive.destination_name)?;
+            .publish(&destination.file, &archive.destination_name)
+        {
+            let visible = published
+                .iter()
+                .map(|name: &CString| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "session archive publication was partial; durable recoverable entries: {visible}: {error}"
+            ));
+        }
+        published.push(archive.destination_name.clone());
     }
     destination
         .file
@@ -2028,14 +2308,19 @@ fn archive_verified_entries_with_hooks(
             &archive.destination_name,
             &archive.archive.file,
         )? {
+            let visible_source = archive
+                .sources
+                .first()
+                .map(|source| source.display_parent.join(&source.name).display().to_string())
+                .unwrap_or_else(|| "generated archive metadata".into());
             return Err(format!(
-                "exact archive destination changed before source retirement; source remains visible at {}",
-                archive.source.display_parent.join(&archive.source.name).display()
+                "exact archive destination changed before source retirement; source remains visible at {visible_source}",
             ));
         }
-        let archive_bound = limits
-            .bytes
-            .checked_add((limits.entries as u64).saturating_mul(8192))
+        let archive_bound = u64::try_from(limits.entries)
+            .ok()
+            .and_then(|entries| entries.checked_mul(8192))
+            .and_then(|overhead| limits.bytes.checked_add(overhead))
             .ok_or("archive bound overflow")?;
         let (hash, size) = hash_exact_file_bounded(&archive.archive.file, archive_bound)?;
         if hash != archive.archive_hash || size != archive.archive_size {
@@ -2045,9 +2330,23 @@ fn archive_verified_entries_with_hooks(
             verify_exact_file(retirement)?;
         }
     }
-    let mut recovery = Vec::with_capacity(prepared.len());
+    let mut recovery = Vec::new();
     for archive in &prepared {
-        recovery.push(quarantine_prepared_source(&archive.source)?);
+        for source in &archive.sources {
+            match quarantine_prepared_source(source) {
+                Ok(path) => recovery.push(path),
+                Err(error) => {
+                    let locations = recovery
+                        .iter()
+                        .map(|path: &std::path::PathBuf| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "durable session archives exist but source quarantine was partial; recoverable quarantines: {locations}: {error}"
+                    ));
+                }
+            }
+        }
     }
     for archive in &prepared {
         if let Err(error) = retire_exact_files(&archive.retirements) {
@@ -2102,6 +2401,7 @@ fn parse_sidecar_archive(
     }
     let file_len = reader.metadata().map_err(|error| error.to_string())?.len();
     let mut records = Vec::with_capacity(count);
+    let mut seen_paths = std::collections::BTreeSet::new();
     let mut total_bytes = 0u64;
     for _ in 0..count {
         let kind = read_archive_array::<1>(&mut reader)?[0];
@@ -2124,18 +2424,9 @@ fn parse_sidecar_archive(
         }
         let mut path = vec![0u8; path_len];
         reader.read_exact(&mut path).map_err(|error| error.to_string())?;
-        let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
-        if components.is_empty()
-            || components.len().saturating_sub(1) > limits.depth
-            || components.iter().any(|component| {
-                component.is_empty()
-                    || component.len() > limits.component_bytes
-                    || *component == b"."
-                    || *component == b".."
-                    || component.contains(&0)
-            })
-        {
-            return Err("sidecar archive contains an invalid relative path".into());
+        validate_archive_relative_path(&path, limits)?;
+        if !seen_paths.insert(path.clone()) {
+            return Err("sidecar archive contains a duplicate path".into());
         }
         total_bytes = total_bytes
             .checked_add(content_len)
@@ -2275,8 +2566,12 @@ fn restore_sidecar_archive(
                 let request = buffer.len().min(
                     usize::try_from(record.content_len - copied).unwrap_or(buffer.len()),
                 );
+                let offset = record
+                    .content_offset
+                    .checked_add(copied)
+                    .ok_or("restored sidecar offset overflow")?;
                 let read = archive
-                    .read_at(&mut buffer[..request], record.content_offset + copied)
+                    .read_at(&mut buffer[..request], offset)
                     .map_err(|error| error.to_string())?;
                 if read == 0 {
                     return Err("sidecar archive is truncated".into());
@@ -2300,6 +2595,129 @@ fn restore_sidecar_archive(
         }
     }
     restored_root.sync_all().map_err(|error| error.to_string())?;
+    destination.file.sync_all().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn open_or_create_restored_parent(
+    root: &File,
+    path: &[u8],
+) -> Result<(File, std::ffi::OsString), String> {
+    let mut components = path.split(|byte| *byte == b'/').peekable();
+    let mut current = root.try_clone().map_err(|error| error.to_string())?;
+    loop {
+        let component = components.next().ok_or("sidecar path is empty")?;
+        if components.peek().is_none() {
+            return Ok((current, OsStr::from_bytes(component).to_os_string()));
+        }
+        let name = CString::new(component).map_err(|_| "invalid restored path component")?;
+        let descriptor = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        let descriptor = if descriptor >= 0 {
+            descriptor
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error.to_string());
+            }
+            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                let create_error = std::io::Error::last_os_error();
+                if create_error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(create_error.to_string());
+                }
+            }
+            let opened = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_DIRECTORY
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                )
+            };
+            if opened < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            opened
+        };
+        current = unsafe { File::from_raw_fd(descriptor) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+
+    let archive = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(archive_path)
+        .map_err(|error| error.to_string())?;
+    let records = parse_sidecar_archive(&archive, ArchiveLimits::default())?;
+    if records.iter().any(|record| record.kind != 1) {
+        return Err("session rollout archive contains an unexpected directory record".into());
+    }
+    let destination = VerifiedDirectory::open(destination_root)?;
+    for record in records {
+        let (parent, name) = open_or_create_restored_parent(&destination.file, &record.path)?;
+        let name = CString::new(name.as_bytes()).map_err(|_| "invalid restored filename")?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_EXCL
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut output = unsafe { File::from_raw_fd(descriptor) };
+        let mut copied = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        while copied < record.content_len {
+            let request = buffer.len().min(
+                usize::try_from(record.content_len - copied).unwrap_or(buffer.len()),
+            );
+            let offset = record
+                .content_offset
+                .checked_add(copied)
+                .ok_or("restored rollout offset overflow")?;
+            let read = archive
+                .read_at(&mut buffer[..request], offset)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                return Err("session rollout archive is truncated".into());
+            }
+            output.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+            copied = copied
+                .checked_add(read as u64)
+                .ok_or("restored rollout byte count overflow")?;
+        }
+        set_archive_metadata(
+            &output,
+            record.mode,
+            UNIX_EPOCH
+                .checked_add(std::time::Duration::new(
+                    record.mtime_sec.max(0) as u64,
+                    record.mtime_nsec,
+                ))
+                .ok_or("restored rollout timestamp overflow")?,
+        )?;
+        output.sync_all().map_err(|error| error.to_string())?;
+        parent.sync_all().map_err(|error| error.to_string())?;
+    }
     destination.file.sync_all().map_err(|error| error.to_string())
 }
 
@@ -2584,37 +3002,36 @@ pub(crate) fn archive_rooted_session_sources(
     session_id: &str,
 ) -> Result<(), String> {
     let trash = VerifiedDirectory::open(trash_path)?;
-    let mut entries = vec![(
-        verified_file_under(session_root, transcript_path)?,
-        std::ffi::OsString::from(format!("{session_id}.jsonl")),
-    )];
+    let mut inputs = vec![VerifiedArchiveInput::Entry {
+        source: verified_file_under(session_root, transcript_path)?,
+        destination_name: std::ffi::OsString::from(format!("{session_id}.jsonl")),
+    }];
     let tasks = tasks_root.join(session_id);
     match std::fs::symlink_metadata(&tasks) {
-        Ok(_) => entries.push((
-            verified_directory_entry(tasks_root, &tasks)?,
-            std::ffi::OsString::from(format!("{session_id}.tasks")),
-        )),
+        Ok(_) => inputs.push(VerifiedArchiveInput::Entry {
+            source: verified_directory_entry(tasks_root, &tasks)?,
+            destination_name: std::ffi::OsString::from(format!("{session_id}.tasks")),
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("could not inspect session task archive: {error}")),
     }
     if let Some(job) = job_path {
-        entries.push((
-            verified_directory_entry(jobs_root, job)?,
-            std::ffi::OsString::from(format!("{session_id}.job")),
-        ));
+        inputs.push(VerifiedArchiveInput::Entry {
+            source: verified_directory_entry(jobs_root, job)?,
+            destination_name: std::ffi::OsString::from(format!("{session_id}.job")),
+        });
     }
-    archive_verified_entries_with_hooks(
+    inputs.push(VerifiedArchiveInput::Generated {
+        bytes: transcript_path.as_os_str().as_bytes().to_vec(),
+        destination_name: std::ffi::OsString::from(format!("{session_id}.origin")),
+    });
+    archive_verified_inputs_with_hooks(
         &trash,
-        entries,
+        inputs,
         ArchiveLimits::default(),
         || {},
         || Ok(()),
-    )?;
-    let _ = trash.write_atomic(
-        OsStr::new(&format!("{session_id}.origin")),
-        transcript_path.to_string_lossy().as_bytes(),
-    );
-    Ok(())
+    )
 }
 
 #[cfg(not(unix))]
@@ -2816,7 +3233,7 @@ fn trash_restore_sync(session_id: String) -> Result<(), String> {
         }
         std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&origin);
-        restore_codex_rollouts(&trash, &session_id);
+        restore_codex_rollouts(&trash, &session_id)?;
         return restore_claude_sidecars(&trash, &session_id);
     }
 
@@ -2917,44 +3334,29 @@ fn stash_codex_rollouts(session_id: &str, trash: &Path) {
     );
 }
 
-fn stash_codex_rollouts_verified(session_id: &str, trash: &VerifiedDirectory, home: &Path) {
-    let extras = crate::agents::codex_session_files(session_id);
-    let directory_name = format!("{session_id}.rollouts");
-    let Ok(directory) = trash.create_directory(OsStr::new(&directory_name)) else { return };
-    let mut origins = serde_json::Map::new();
-    for from in extras {
-        let Some(name) = from.file_name().map(|name| name.to_string_lossy().into_owned()) else {
-            continue;
-        };
-        if verified_session_file("codex", &from, home)
-            .and_then(|source| source.rename_to(&directory, OsStr::new(&name)))
-            .is_ok()
-        {
-            origins.insert(name, serde_json::Value::String(from.to_string_lossy().into_owned()));
-        }
-    }
-    let _ = directory.write_atomic(
-        OsStr::new("origins.json"),
-        serde_json::Value::Object(origins).to_string().as_bytes(),
-    );
-}
-
 /// Put a Codex conversation's stashed rollouts back where they came from.
 ///
 /// A rollout already sitting at the destination is left alone: that is a file
 /// that came back by another route, and overwriting it to restore an older copy
 /// is the one outcome worse than an incomplete restore.
-fn restore_codex_rollouts(trash: &Path, session_id: &str) {
+fn restore_codex_rollouts(trash: &Path, session_id: &str) -> Result<(), String> {
     let dir = trash.join(format!("{session_id}.rollouts"));
+    if dir.is_file() {
+        let home = dirs::home_dir().ok_or("no home dir")?;
+        let sessions = home.join(".codex/sessions");
+        restore_file_set_archive(&dir, &sessions)?;
+        std::fs::remove_file(&dir).map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     if !dir.is_dir() {
-        return;
+        return Ok(());
     }
     let Ok(raw) = std::fs::read_to_string(dir.join("origins.json")) else {
-        return;
+        return Ok(());
     };
     let Ok(origins) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw)
     else {
-        return;
+        return Ok(());
     };
     for (name, dest) in origins {
         let Some(dest) = dest.as_str().map(std::path::PathBuf::from) else {
@@ -2972,6 +3374,7 @@ fn restore_codex_rollouts(trash: &Path, session_id: &str) {
     // Only if everything left with it; anything that would not move stays in
     // the trash rather than being silently dropped.
     let _ = std::fs::remove_dir(&dir);
+    Ok(())
 }
 
 fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String> {
@@ -4817,7 +5220,7 @@ mod refusal_tests {
         }
         assert!(stashed.join("origins.json").is_file(), "where they came from is recorded");
 
-        restore_codex_rollouts(&trash, sid);
+        restore_codex_rollouts(&trash, sid).unwrap();
         for p in &made {
             assert!(p.exists(), "{} should be back where it was", p.display());
         }
@@ -5726,8 +6129,8 @@ mod tests {
         std::fs::create_dir_all(&trash_path).unwrap();
         std::fs::write(&main_path, b"main rollout").unwrap();
         std::fs::write(&extra_path, b"extra rollout").unwrap();
-        let main = verified_directory_entry(&dated, &main_path).unwrap();
-        let extra = verified_directory_entry(&dated, &extra_path).unwrap();
+        let main = verified_file_under(&sessions, &main_path).unwrap();
+        let extra = verified_file_under(&sessions, &extra_path).unwrap();
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
 
         archive_verified_inputs_with_hooks(
@@ -6028,6 +6431,7 @@ mod tests {
             id,
             &home,
             &trash,
+            Vec::new(),
         )
         .unwrap_err();
         assert!(error.contains("symlink or special file"), "{error}");
@@ -6070,7 +6474,8 @@ mod tests {
         let verified = verified_session_file("claude", &transcript, &home).unwrap();
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
 
-        archive_generic_session_sources(verified, &transcript, id, &home, &trash).unwrap();
+        archive_generic_session_sources(verified, &transcript, id, &home, &trash, Vec::new())
+            .unwrap();
         assert_eq!(
             std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
             b"roundtrip transcript"
