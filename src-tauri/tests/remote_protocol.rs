@@ -77,3 +77,14 @@ fn terminal_size_keeps_valid_dimensions() {
     assert_eq!(size.cols(), 80);
     assert_eq!(size.rows(), 24);
 }
+
+/// Taking focus is the one terminal action with no desktop equivalent: without
+/// it a second client can attach but never type, which is the state the phone
+/// spends most of its life in.
+#[test]
+fn accepts_an_explicit_take_focus_request() {
+    let request = RemoteRequest::decode(&cbor_request(1, "terminal.focus", b""))
+        .expect("taking input ownership is part of the terminal protocol");
+
+    assert_eq!(request.kind(), "terminal.focus");
+}

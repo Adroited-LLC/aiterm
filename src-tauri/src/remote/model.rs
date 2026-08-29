@@ -18,6 +18,10 @@ const KNOWN_REQUESTS: &[&str] = &[
     "terminal.input",
     "terminal.resize",
     "terminal.detach",
+    // Taking input ownership is its own request because it is a deliberate act.
+    // Attaching gives a second client a read-only view; only this says "I am
+    // typing now", and the broker announces it to everyone else on the stream.
+    "terminal.focus",
 ];
 
 #[derive(Clone, Debug, Deserialize)]

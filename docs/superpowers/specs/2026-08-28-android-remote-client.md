@@ -71,6 +71,48 @@ deletes the device record. Pairing has no
 implicit approval and no fallback to HTTP, an unpinned certificate, a bearer
 token alone, or mDNS-discovered hosts.
 
+## The pairing payload
+
+The QR encodes one versioned URI and nothing else:
+
+```text
+aiterm://pair?v=1&h=<host>&h=<host>&p=<port>&f=<fingerprint>&s=<secret>&n=<name>
+```
+
+- `v` is the payload version. A phone that does not know the version stops;
+  it never guesses at a field layout that governs trust.
+- `h` repeats, once per candidate address, in the order the desktop prefers.
+  Repetition rather than a delimiter keeps IPv6 literals intact. The phone
+  tries them in order and keeps the one that worked.
+- `p` is the TCP port; `f` is the base64url SHA-256 of the listener's SPKI,
+  which the phone pins before it sends anything; `s` is the base64url of the
+  32-byte single-use enrollment secret; `n` is the desktop's display name,
+  percent-encoded, shown to the user so they can confirm which machine they
+  are pairing with.
+
+The secret appears in the QR and in the `pair.request` frame, and nowhere
+else on either side. The desktop renders the QR to an image in the backend
+so the payload never becomes a string in its renderer process; the phone
+parses it in memory and never writes it to storage or a log.
+
+Pairing then runs over the same `/v1/ws` socket as everything else. The
+client opens TLS with `f` pinned and sends CBOR:
+
+```text
+-> { kind: "pair.request", enrollment_secret: bytes, device_name: text,
+     public_key: bytes }   // SEC1 compressed P-256, 33 bytes
+<- { kind: "pair.pending", request_id: text }
+<- { kind: "pair.approved", device_id: text }   // or { kind: "pair.denied" }
+```
+
+An already-trusted device instead answers the server's opening challenge:
+
+```text
+<- { kind: "auth.challenge", nonce: bytes }   // 32 bytes
+-> { kind: "auth.proof", device_id: text, signature_der: bytes }
+<- { kind: "auth.ok" }
+```
+
 ## Transport and protocol
 
 All traffic uses TLS 1.3 with the desktop certificate pinned from pairing.

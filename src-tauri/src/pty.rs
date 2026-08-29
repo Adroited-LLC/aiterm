@@ -3,9 +3,9 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct PtyInstance {
     master: Box<dyn MasterPty + Send>,
@@ -44,6 +44,45 @@ struct PtyExit {
     /// though the process chose it sends you looking for a failure that never
     /// happened.
     signal: Option<String>,
+}
+
+/// A second listener on a pty's life, for anything that is not the desktop
+/// window.
+///
+/// The remote gateway needs the same bytes xterm.js gets, and it cannot get
+/// them from the frontend: the renderer is not running when a phone attaches to
+/// a tab nobody is looking at, and routing terminal traffic through it would
+/// put every remote keystroke behind a frame. So the reader thread calls here
+/// as well as sending on its Channel — *as well as*, never instead of. The
+/// desktop path below must behave identically whether or not anyone is
+/// observing.
+pub trait PtyObserver: Send + Sync {
+    fn on_output(&self, pty_id: u32, bytes: &[u8]);
+    fn on_exit(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>);
+}
+
+/// Process-global because pty reader threads have nothing else in common: each
+/// one is spawned by a command, owns no state, and would otherwise need the
+/// broker threaded through `pty_spawn`'s signature for a feature that is off by
+/// default. Unregistered costs one uncontended read lock per 8 KiB chunk.
+static OBSERVER: RwLock<Option<Arc<dyn PtyObserver>>> = RwLock::new(None);
+
+pub fn set_observer(observer: Arc<dyn PtyObserver>) {
+    if let Ok(mut slot) = OBSERVER.write() {
+        *slot = Some(observer);
+    }
+}
+
+/// Called when Remote Access is switched off: the broker stops seeing traffic
+/// the moment the listener closes, rather than at the next app restart.
+pub fn clear_observer() {
+    if let Ok(mut slot) = OBSERVER.write() {
+        *slot = None;
+    }
+}
+
+fn observer() -> Option<Arc<dyn PtyObserver>> {
+    OBSERVER.read().ok()?.clone()
 }
 
 /// Environment variables that mean "you are already inside an agent session".
@@ -206,6 +245,9 @@ pub fn pty_spawn(
                     // the byte stream with a persistent UTF-8 decoder, so a char
                     // split across two chunks is reassembled correctly.
                     let _ = on_output.send(InvokeResponseBody::Raw(buf[..n].to_vec()));
+                    if let Some(observer) = observer() {
+                        observer.on_output(id, &buf[..n]);
+                    }
                 }
             }
         }
@@ -217,7 +259,17 @@ pub fn pty_spawn(
         let status = child.wait().ok();
         let code = status.as_ref().map(|s| s.exit_code());
         let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
-        let _ = app_reader.emit("pty://exit", PtyExit { id, code, signal });
+        let _ = app_reader.emit(
+            "pty://exit",
+            PtyExit {
+                id,
+                code,
+                signal: signal.clone(),
+            },
+        );
+        if let Some(observer) = observer() {
+            observer.on_exit(id, code, signal.as_deref());
+        }
     });
 
     Ok(id)
@@ -232,16 +284,20 @@ pub fn pty_spawn(
 /// compositor busy — typing went soft and laggy exactly when the machine could
 /// least afford it. An async command runs on the runtime instead, so a
 /// keystroke never queues behind a frame.
-///
-/// The lock is held for the write and nothing else, with no await inside it, so
-/// this cannot block the runtime either.
 #[tauri::command]
 pub async fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
-    let mut ptys = state.ptys.lock().unwrap();
+    write_to_pty(&state, id, data.as_bytes())
+}
+
+/// The write itself, with no transport attached, so a remote client reaches a
+/// pty through the same code the window does instead of a parallel copy.
+///
+/// The lock is held for the write and nothing else, with no await inside it, so
+/// this cannot block the runtime the command above runs on.
+pub fn write_to_pty(manager: &PtyManager, id: u32, data: &[u8]) -> Result<(), String> {
+    let mut ptys = manager.ptys.lock().unwrap();
     let pty = ptys.get_mut(&id).ok_or("no such pty")?;
-    pty.writer
-        .write_all(data.as_bytes())
-        .map_err(|e| e.to_string())
+    pty.writer.write_all(data).map_err(|e| e.to_string())
 }
 
 /// Off the main thread for the same reason as [`pty_write`]: a resize arrives
@@ -254,7 +310,12 @@ pub async fn pty_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let ptys = state.ptys.lock().unwrap();
+    resize_pty(&state, id, cols, rows)
+}
+
+/// Split from the command for the same reason as [`write_to_pty`].
+pub fn resize_pty(manager: &PtyManager, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+    let ptys = manager.ptys.lock().unwrap();
     let pty = ptys.get(&id).ok_or("no such pty")?;
     pty.master
         .resize(PtySize {
@@ -264,6 +325,29 @@ pub async fn pty_resize(
             pixel_height: 0,
         })
         .map_err(|e| e.to_string())
+}
+
+/// Reaches the pty table through the Tauri state the app already manages, so
+/// the remote broker can stay free of Tauri types: it holds this as a
+/// `PtyControl` and never learns where the ptys live.
+pub struct AppPtyControl {
+    app: AppHandle,
+}
+
+impl AppPtyControl {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl crate::remote::terminal::PtyControl for AppPtyControl {
+    fn write(&self, pty_id: u32, data: &[u8]) -> Result<(), String> {
+        write_to_pty(&self.app.state::<PtyManager>(), pty_id, data)
+    }
+
+    fn resize(&self, pty_id: u32, cols: u16, rows: u16) -> Result<(), String> {
+        resize_pty(&self.app.state::<PtyManager>(), pty_id, cols, rows)
+    }
 }
 
 /// True while `pid` names a *running* process. A killed child keeps its
@@ -632,6 +716,32 @@ mod tests {
         for key in ["PATH", "HOME"] {
             assert!(cmd.get_env(key).is_some(), "{key} was lost");
         }
+    }
+
+    /// The observer is strictly additive, so the property that matters is that
+    /// an unregistered one is genuinely absent — the reader thread must do
+    /// nothing extra for a desktop that never enabled Remote Access. The
+    /// fan-out itself is covered by `tests/remote_terminal.rs`.
+    #[test]
+    fn the_pty_observer_is_absent_until_something_registers() {
+        struct Counting(AtomicU32);
+        impl PtyObserver for Counting {
+            fn on_output(&self, _pty_id: u32, _bytes: &[u8]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn on_exit(&self, _pty_id: u32, _code: Option<u32>, _signal: Option<&str>) {}
+        }
+
+        assert!(observer().is_none(), "nothing should be observing by default");
+        let counting = Arc::new(Counting(AtomicU32::new(0)));
+        set_observer(counting.clone());
+        observer()
+            .expect("a registered observer should be handed back")
+            .on_output(1, b"x");
+        assert_eq!(counting.0.load(Ordering::SeqCst), 1);
+
+        clear_observer();
+        assert!(observer().is_none(), "clearing must really unregister");
     }
 
     #[test]
