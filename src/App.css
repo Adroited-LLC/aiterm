@@ -1851,7 +1851,6 @@ body.dragging * { pointer-events: none; }
    later in this file, and an equal-specificity override would lose the tie. */
 .mb-controls .mb-search { flex: 1; min-width: 60px; width: auto; }
 .mb-controls .mb-ctx { width: auto; flex-shrink: 0; }
-.mb-controls-2 { padding-top: 0; flex-wrap: wrap; }
 .mb-sort { display: inline-flex; align-items: center; gap: 6px; }
 .mb-spacer { flex: 1; }
 .mb-pin { display: inline-flex; align-items: center; gap: 4px; }
