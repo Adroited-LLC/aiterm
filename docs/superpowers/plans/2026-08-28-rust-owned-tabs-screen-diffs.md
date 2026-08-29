@@ -17,8 +17,9 @@
 - Rust owns tab lifecycle, metadata, focus, dimensions, and screen state. React owns only presentation state.
 - The existing xterm.js desktop renderer, selection, paste, scrollback, OSC handling, and TUI overlays must keep working with Remote Access disabled.
 - Exactly one attachment owns input and resize. Desktop and phone use the same authorization path.
-- Remote recovery uses a complete typed snapshot. Live updates use revisioned typed changed-row diffs and never historical byte replay.
+- Remote recovery uses a complete typed viewport snapshot. Scrollback is fetched as a separate bounded page. Live updates use revisioned typed changed-row diffs and never historical byte replay.
 - Screen work is bounded to 512 columns, 512 rows, 5,000 scrollback rows, 1 MiB serialized frames, and at most one diff emission per 16 ms.
+- A cell carries at most its base scalar plus 32 combining scalars. Oversized multi-row snapshots/diffs are split on row boundaries into ordered sub-1 MiB transfer chunks and applied atomically; semantic rows are never truncated.
 - Terminal output, input, QR payloads, credentials, and enrollment secrets never enter logs.
 - The unfinished untracked Android Task 8 files are out of scope for this plan and must be preserved unchanged.
 
@@ -507,6 +508,15 @@ Expected: FAIL because `TerminalBroker` returns `Replay::{Snapshot,Delta}` conta
 - [ ] **Step 3: Make the remote terminal module a registry adapter**
 
 Delete `ReplayBuffer`, `Chunk`, `Stream { pty_id, ... }`, `by_pty`, `open_stream`, and the process-global observer hookup. Keep opaque remote `AttachmentId` values, but make their target a `TabId`. On attach, subscribe as `AttachmentKind::Remote` and immediately send the current `ScreenSnapshot`. Forward coalesced `ScreenDiff` events; if the bounded event queue drops or a client supplies an unknown revision, send a new snapshot. Route input, resize, focus, detach, tab list/open/close, and scrollback requests into `TabRegistry`.
+
+Encode semantic snapshots and diffs as ordered row-boundary transfer chunks.
+Each chunk must serialize below 1 MiB and identify the transfer, tab, kind,
+base/final revision, row range, index, and total. The receiver applies a
+transfer only after every chunk validates; missing, duplicate, out-of-order, or
+invalid chunks discard the transfer and request a fresh snapshot. A partial
+transfer never advances the receiver revision. Send scrollback through the same
+bounded row-chunk mechanism as a separate resource, not inside the live
+snapshot.
 
 Coalesce remote damage with a per-attachment 16 ms Tokio interval. Merge row
 patches by row index so the newest row wins, carry the oldest base revision and

@@ -192,11 +192,12 @@ Server events include `state.snapshot`, `session.changed`, `agent.changed`,
 screen cells, not PTY bytes.
 
 A `terminal.snapshot` contains `tab_id`, monotonically increasing `revision`,
-rows, columns, the visible rows, cursor, terminal modes, and enough bounded
-scrollback to populate the initial phone view. Each cell contains its UTF-8
-grapheme, display width, foreground/background color, and attribute flags.
-Continuation cells for wide glyphs are explicit. Further scrollback is fetched
-in bounded pages without mutating the canonical live viewport.
+rows, columns, the complete visible viewport, cursor, and terminal modes.
+Scrollback is a separate bounded, paged resource; the server may send an initial
+page beside the snapshot to populate the phone without making live viewport
+diffs depend on history mutation. Each cell contains its bounded UTF-8 grapheme,
+display width, foreground/background color, and attribute flags. Continuation
+cells for wide glyphs are explicit.
 
 A `terminal.diff` contains `tab_id`, `base_revision`, `revision`, changed rows,
 and any changed cursor, mode, title, or focus data. Rust coalesces PTY damage to
@@ -206,6 +207,13 @@ phone applies a diff only when `base_revision` equals its current revision. An
 attach, reconnect, unknown revision, dropped event, resize, or revision mismatch
 gets a new snapshot instead of replaying terminal bytes. This makes recovery
 independent of which historical escape sequences are still buffered.
+
+A semantic snapshot or diff may require multiple wire frames. The server splits
+it on complete row boundaries into an ordered transfer whose individual frames
+are each smaller than 1 MiB. The phone validates and buffers a bounded transfer,
+then replaces/applies it atomically only after every chunk arrives. A missing,
+duplicate, out-of-order, or invalid chunk discards the entire transfer and
+requests a new snapshot; partial transfers never advance the client's revision.
 
 Attaching a second client remains read-capable but its input and resize requests
 are rejected with `terminal.input_not_owned` until it explicitly takes focus.
