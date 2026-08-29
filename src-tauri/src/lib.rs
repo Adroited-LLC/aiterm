@@ -58,6 +58,7 @@ pub fn run() {
             librarian::librarian_tidy,
             librarian::librarian_tag,
             librarian::librarian_default_prompts,
+            detail::session_conversation,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,

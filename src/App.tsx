@@ -26,6 +26,9 @@ import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
 import { useLibrarian } from "./librarian";
+import { useRelay } from "./relay";
+import BringIn from "./components/BringIn";
+import { Users } from "lucide-react";
 import { LIBRARIAN_DIR_SUFFIX } from "./ipc";
 import {
   FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
@@ -468,6 +471,17 @@ export default function App() {
   /** The librarian: names, tags and threads for the session list, written
    *  by whatever small model Settings chose. */
   const librarian = useLibrarian(settings.librarian, sessions);
+  /** A second agent brought into the active session — see `relay.ts`. */
+  const progressRef = useRef(progress);
+  progressRef.current = progress;
+  const relayCtl = useRelay({
+    tabs: () => tabsRef.current,
+    handle: (key) => handles.current.get(key),
+    quietFor: (key) => Date.now() - (lastOutput.current.get(key) ?? 0),
+    busy: (key) => progressRef.current.has(key),
+    open: (cwd, choice, prompt) => newSession(cwd, choice, prompt),
+  });
+  const [showBringIn, setShowBringIn] = useState(false);
   useEffect(() => {
     applySettings(settings);
     saveSettings(settings);
@@ -704,7 +718,7 @@ export default function App() {
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,
-     opts: OpenTabOpts = {}) => {
+     opts: OpenTabOpts = {}): number => {
       setPreviewSession(null);
       // Opening a terminal on a slot is the deliberate act of going back to
       // it — if its id was on the vacated list (green dot suppressed), it has
@@ -715,16 +729,15 @@ export default function App() {
         next.delete(slotId);
         return next;
       });
-      setTabs((t) => {
-        const existing = t.find((x) => x.slotId === slotId);
-        if (existing) {
-          setActiveTab(existing.key);
-          return t;
-        }
-        const key = nextKey.current++;
-        setActiveTab(key);
-        return [...t, { key, title, cwd, command, slotId, ...opts }];
-      });
+      const existing = tabsRef.current.find((x) => x.slotId === slotId);
+      if (existing) {
+        setActiveTab(existing.key);
+        return existing.key;
+      }
+      const key = nextKey.current++;
+      setActiveTab(key);
+      setTabs((t) => [...t, { key, title, cwd, command, slotId, ...opts }]);
+      return key;
     },
     [],
   );
@@ -1917,7 +1930,7 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string) => {
+  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string): Promise<{ key: number; sessionId?: string } | null> => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
     // the two are presented differently: a model tab is titled by its model
@@ -1949,16 +1962,17 @@ export default function App() {
           // tab's environment — set only for an engine that has said it
           // authenticates no other way. `env_model` names the model whose
           // routing goes in beside it; the routing is compiled in Rust.
-          openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             envProvider: plan.env_provider ?? undefined,
             envModel: plan.env_model ?? undefined,
             agentId: plan.agent_id,
           });
+          return { key, sessionId: plan.session_id ?? undefined };
         } catch (e) {
           setNotice(`Couldn't start ${choice.modelId}: ${e}`);
         }
-        return;
+        return null;
       }
 
       case "agent": {
@@ -1976,7 +1990,7 @@ export default function App() {
           // placeholder row keeps the tab reachable, but nothing is keyed to it
           // as a session, because there is no session by that name and never
           // will be.
-          openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             fresh: true,
             agentId: plan.agent_id,
@@ -1993,12 +2007,14 @@ export default function App() {
                     .map((s) => s.id),
                 },
           });
+          return { key, sessionId: plan.session_id ?? undefined };
         } catch (e) {
           setNotice(`Couldn't start ${choice.agentId}: ${e}`);
         }
-        return;
+        return null;
       }
     }
+    return null;
   }, [openTab]);
 
   /** The empty pane's own source/model/effort, so its button starts the same
@@ -2282,6 +2298,46 @@ export default function App() {
                   </button>
                 );
               })}
+              {/* Right side: bring a second agent into the session in front. */}
+              {activeTabObj?.sessionId && !previewSession && (
+                <div className="strip-right">
+                  {relayCtl.relay && relayCtl.relay.aKey === activeTab || relayCtl.relay && relayCtl.relay.bKey === activeTab ? (
+                    <span className={"relay-pill " + relayCtl.relay!.phase} title={relayCtl.relay!.note || undefined}>
+                      <Icon of={Users} size="sm" />
+                      {relayCtl.relay!.phase === "opening" && `bringing in ${relayCtl.relay!.bName}…`}
+                      {relayCtl.relay!.phase === "waitB" && `round ${relayCtl.relay!.round}/${relayCtl.relay!.rounds} · waiting on ${relayCtl.relay!.bName}`}
+                      {relayCtl.relay!.phase === "waitA" && `round ${relayCtl.relay!.round}/${relayCtl.relay!.rounds} · waiting on ${relayCtl.relay!.aName}`}
+                      {relayCtl.relay!.phase === "done" && `done — ${relayCtl.relay!.note}`}
+                      {relayCtl.relay!.phase === "stopped" && "stopped"}
+                      {relayCtl.relay!.phase === "error" && `stopped: ${relayCtl.relay!.note}`}
+                      {(relayCtl.relay!.phase === "waitA" || relayCtl.relay!.phase === "waitB" || relayCtl.relay!.phase === "opening") ? (
+                        <button className="relay-x" title="Stop relaying" onClick={() => relayCtl.stop()}><Icon of={X} size="sm" /></button>
+                      ) : (
+                        <button className="relay-x" title="Dismiss" onClick={relayCtl.clear}><Icon of={X} size="sm" /></button>
+                      )}
+                      {relayCtl.relay!.bKey >= 0 && (
+                        <button className="relay-jump" onClick={() => setActiveTab(activeTab === relayCtl.relay!.aKey ? relayCtl.relay!.bKey : relayCtl.relay!.aKey)}>
+                          {activeTab === relayCtl.relay!.aKey ? "their tab" : "first tab"}
+                        </button>
+                      )}
+                    </span>
+                  ) : (
+                    <button className="strip-btn" title="Bring a second agent into this session — they talk to each other, you decide" onClick={() => setShowBringIn((v) => !v)}>
+                      <Icon of={Users} size="sm" /> Bring in…
+                    </button>
+                  )}
+                  {showBringIn && (
+                    <BringIn
+                      onClose={() => setShowBringIn(false)}
+                      onOpenModelAccess={openModelAccess}
+                      onGo={(choice, focus, rounds) => {
+                        setShowBringIn(false);
+                        if (activeTab !== null) void relayCtl.start({ aKey: activeTab, choice, focus, rounds });
+                      }}
+                    />
+                  )}
+                </div>
+              )}
             </div>
           )}
           {/* The session's own files, in a row of their own under the strip:

@@ -534,3 +534,63 @@ mod tests {
         assert_eq!(clip("abcdefghij", 5), "abcde…");
     }
 }
+
+/// The conversation as a list of turns, oldest first — what a second agent
+/// is handed when it is brought into a session. Tool calls and injected
+/// system blocks are left out; only what was said. Trimmed from the front
+/// to `max_chars`, keeping the opening user message so the ask is never
+/// lost, with a marker where the cut was made.
+#[tauri::command]
+pub async fn session_conversation(session_id: String, max_chars: usize) -> Vec<(String, String)> {
+    crate::run_blocking(move || conversation_sync(&session_id, max_chars)).await
+}
+
+fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)> {
+    let list = crate::agents::backends();
+    let Some((backend, path)) = crate::agents::owner_in(&list, session_id) else { return vec![] };
+    let mut turns: Vec<(String, String)> = match backend.sessions().messages(session_id) {
+        Some(m) => m,
+        None => {
+            let Ok(file) = File::open(&path) else { return vec![] };
+            BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|l| crate::sessions::line_may_hold_message(l))
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+                .filter_map(|v| crate::sessions::line_message(&v))
+                .collect()
+        }
+    };
+    turns.retain(|(_, t)| !crate::sessions::is_only_system_block(t) && !t.trim().is_empty());
+    // Adjacent same-role turns (an assistant that spoke, used a tool, spoke
+    // again) read as one.
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (role, text) in turns {
+        match merged.last_mut() {
+            Some((r, t)) if *r == role => {
+                t.push_str("\n\n");
+                t.push_str(&text);
+            }
+            _ => merged.push((role, text)),
+        }
+    }
+    let total: usize = merged.iter().map(|(_, t)| t.len()).sum();
+    if total <= max_chars || merged.len() < 3 {
+        return merged;
+    }
+    // Keep the first turn and as much of the tail as fits.
+    let first = merged.remove(0);
+    let mut budget = max_chars.saturating_sub(first.1.len());
+    let mut tail: Vec<(String, String)> = Vec::new();
+    for turn in merged.into_iter().rev() {
+        if turn.1.len() > budget {
+            break;
+        }
+        budget -= turn.1.len();
+        tail.push(turn);
+    }
+    tail.reverse();
+    let mut out = vec![first, ("system".into(), "[… earlier turns omitted for length …]".into())];
+    out.extend(tail);
+    out
+}

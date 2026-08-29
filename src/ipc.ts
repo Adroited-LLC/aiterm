@@ -1028,3 +1028,9 @@ export const librarianRenameThread = (id: string, name: string) =>
 /** Set or clear one hand-set tag on a thread or a session. */
 export const librarianTag = (target: { kind: "thread" | "session"; id: string }, tag: string, on: boolean) =>
   invoke<void>("librarian_tag", { target, tag, on });
+
+/** A session's conversation as ordered (role, text) turns — what a second
+ *  agent is handed when brought in. Trimmed from the front to `maxChars`,
+ *  the opening ask kept. */
+export const sessionConversation = (sessionId: string, maxChars: number) =>
+  invoke<[string, string][]>("session_conversation", { sessionId, maxChars });
