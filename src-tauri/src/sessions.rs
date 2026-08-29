@@ -1402,9 +1402,115 @@ const MAX_EXACT_ARCHIVE_ENTRIES: usize = 512;
 const MAX_EXACT_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
+const SIDECAR_ARCHIVE_MAGIC: &[u8; 16] = b"AITERM-SIDECAR\0\0";
+#[cfg(target_os = "linux")]
+const SIDECAR_ARCHIVE_VERSION: u16 = 1;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ArchiveLimits {
+    entries: usize,
+    bytes: u64,
+    depth: usize,
+    component_bytes: usize,
+    path_bytes: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            entries: MAX_EXACT_ARCHIVE_ENTRIES,
+            bytes: MAX_EXACT_ARCHIVE_BYTES,
+            depth: MAX_SESSION_DISCOVERY_DEPTH,
+            component_bytes: 255,
+            path_bytes: 4096,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct HeldWriteLease {
+    file: File,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldWriteLease {
+    fn anonymous_in(directory: &File) -> Result<Self, String> {
+        static IGNORE_SIGIO: std::sync::Once = std::sync::Once::new();
+        IGNORE_SIGIO.call_once(|| unsafe {
+            libc::signal(libc::SIGIO, libc::SIG_IGN);
+        });
+        let dot = CString::new(".").unwrap();
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                dot.as_ptr(),
+                libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(format!(
+                "anonymous session archives are unavailable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) } != 0 {
+            return Err(format!(
+                "exclusive session archive leases are unavailable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { file })
+    }
+
+    fn publish(&self, directory: &File, name: &CString) -> Result<(), String> {
+        let empty = CString::new("").unwrap();
+        if unsafe {
+            libc::linkat(
+                self.file.as_raw_fd(),
+                empty.as_ptr(),
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not publish exact session archive without overwrite: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldWriteLease {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fcntl(self.file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedLeasedArchive {
+    source: VerifiedSessionFile,
+    destination_name: CString,
+    archive: HeldWriteLease,
+    archive_hash: [u8; 32],
+    archive_size: u64,
+    retirements: Vec<ExactFileRetirement>,
+}
+
+#[cfg(target_os = "linux")]
 struct ExactFileRetirement {
     source: File,
-    archive: File,
+    archive: Option<File>,
     size: u64,
     modified: std::time::SystemTime,
     hash: [u8; 32],
@@ -1431,6 +1537,745 @@ fn hash_exact_file(file: &File) -> Result<([u8; 32], u64), String> {
             .ok_or("session archive size overflow")?;
     }
     Ok((digest.finalize().into(), offset))
+}
+
+#[cfg(target_os = "linux")]
+fn hash_exact_file_bounded(file: &File, limit: u64) -> Result<([u8; 32], u64), String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+
+    let mut digest = Sha256::new();
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let remaining = limit.saturating_sub(offset);
+        let request = buffer.len().min(
+            usize::try_from(remaining.saturating_add(1)).unwrap_or(buffer.len()),
+        );
+        let read = file
+            .read_at(&mut buffer[..request], offset)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or("session archive size overflow")?;
+        if offset > limit {
+            return Err("session archive exceeds byte limit".into());
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok((digest.finalize().into(), offset))
+}
+
+#[cfg(target_os = "linux")]
+fn set_archive_metadata(file: &File, mode: u32, modified: std::time::SystemTime) -> Result<(), String> {
+    use std::time::Duration;
+
+    if unsafe { libc::fchmod(file.as_raw_fd(), (mode & 0o7777) as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let times = [
+        libc::timespec {
+            tv_sec: duration.as_secs().try_into().map_err(|_| "archive timestamp overflow")?,
+            tv_nsec: duration.subsec_nanos().into(),
+        },
+        libc::timespec {
+            tv_sec: duration.as_secs().try_into().map_err(|_| "archive timestamp overflow")?,
+            tv_nsec: duration.subsec_nanos().into(),
+        },
+    ];
+    if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_regular_into_anonymous_archive(
+    source: &File,
+    archive: &File,
+    limits: ArchiveLimits,
+) -> Result<ExactFileRetirement, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::os::unix::fs::{FileExt, MetadataExt};
+
+    let before = source.metadata().map_err(|error| error.to_string())?;
+    if !before.is_file() {
+        return Err("exact archive source is not a regular file".into());
+    }
+    let modified = before.modified().map_err(|error| error.to_string())?;
+    let mut destination = archive.try_clone().map_err(|error| error.to_string())?;
+    destination.set_len(0).map_err(|error| error.to_string())?;
+    destination
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let remaining = limits.bytes.saturating_sub(offset);
+        let request = buffer.len().min(
+            usize::try_from(remaining.saturating_add(1)).unwrap_or(buffer.len()),
+        );
+        let read = source
+            .read_at(&mut buffer[..request], offset)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or("session archive size overflow")?;
+        if offset > limits.bytes {
+            return Err("session archive exceeds byte limit".into());
+        }
+        digest.update(&buffer[..read]);
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+    }
+    let after = source.metadata().map_err(|error| error.to_string())?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || offset != before.len()
+    {
+        return Err("session changed while its exact archive was copied".into());
+    }
+    let source_hash: [u8; 32] = digest.finalize().into();
+    let (fresh_hash, fresh_size) = hash_exact_file_bounded(source, limits.bytes)?;
+    if source_hash != fresh_hash || offset != fresh_size {
+        return Err("session changed while its exact archive was verified".into());
+    }
+    set_archive_metadata(archive, before.mode(), std::time::SystemTime::now())?;
+    archive.sync_all().map_err(|error| error.to_string())?;
+    Ok(ExactFileRetirement {
+        source: source.try_clone().map_err(|error| error.to_string())?,
+        archive: None,
+        size: offset,
+        modified,
+        hash: source_hash,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn for_each_directory_entry(
+    directory: &File,
+    mut visit: impl FnMut(&OsStr) -> Result<(), String>,
+) -> Result<(), String> {
+    let cloned = directory.try_clone().map_err(|error| error.to_string())?;
+    let raw = std::os::fd::IntoRawFd::into_raw_fd(cloned);
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        unsafe { libc::close(raw) };
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let result = (|| {
+        loop {
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            visit(OsStr::from_bytes(name.to_bytes()))?;
+        }
+        Ok(())
+    })();
+    unsafe { libc::closedir(stream) };
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn write_sidecar_record_prefix(
+    archive: &mut File,
+    kind: u8,
+    path: &[u8],
+    mode: u32,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    content_len: u64,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let path_len: u16 = path.len().try_into().map_err(|_| "sidecar path is too long")?;
+    archive.write_all(&[kind]).map_err(|error| error.to_string())?;
+    archive
+        .write_all(&path_len.to_le_bytes())
+        .and_then(|_| archive.write_all(&mode.to_le_bytes()))
+        .and_then(|_| archive.write_all(&mtime_sec.to_le_bytes()))
+        .and_then(|_| archive.write_all(&mtime_nsec.to_le_bytes()))
+        .and_then(|_| archive.write_all(&content_len.to_le_bytes()))
+        .and_then(|_| archive.write_all(path))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn write_sidecar_tree(
+    source: &File,
+    archive: &mut File,
+    relative: &mut Vec<u8>,
+    depth: usize,
+    limits: ArchiveLimits,
+    entries: &mut usize,
+    bytes: &mut u64,
+    retirements: &mut Vec<ExactFileRetirement>,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+
+    if depth > limits.depth {
+        return Err("session sidecar archive exceeds maximum depth".into());
+    }
+    for_each_directory_entry(source, |name| {
+        let component = name.as_bytes();
+        if component.is_empty() || component.len() > limits.component_bytes || component.contains(&0) {
+            return Err("session sidecar component exceeds name limit".into());
+        }
+        let previous_len = relative.len();
+        if !relative.is_empty() {
+            relative.push(b'/');
+        }
+        relative.extend_from_slice(component);
+        if relative.len() > limits.path_bytes {
+            relative.truncate(previous_len);
+            return Err("session sidecar path exceeds path limit".into());
+        }
+        *entries = entries
+            .checked_add(1)
+            .ok_or("session sidecar entry count overflow")?;
+        if *entries > limits.entries {
+            relative.truncate(previous_len);
+            return Err("session sidecar archive exceeds entry limit".into());
+        }
+        let name_c = CString::new(component).map_err(|_| "invalid sidecar entry name")?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                source.as_raw_fd(),
+                name_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            relative.truncate(previous_len);
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let stat = unsafe { stat.assume_init() };
+        let result = match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                write_sidecar_record_prefix(
+                    archive,
+                    2,
+                    relative,
+                    stat.st_mode as u32,
+                    stat.st_mtime,
+                    stat.st_mtime_nsec as u32,
+                    0,
+                )?;
+                let descriptor = unsafe {
+                    libc::openat(
+                        source.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDONLY
+                            | libc::O_DIRECTORY
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                    )
+                };
+                if descriptor < 0 {
+                    Err(std::io::Error::last_os_error().to_string())
+                } else {
+                    let child = unsafe { File::from_raw_fd(descriptor) };
+                    write_sidecar_tree(
+                        &child,
+                        archive,
+                        relative,
+                        depth + 1,
+                        limits,
+                        entries,
+                        bytes,
+                        retirements,
+                    )
+                }
+            }
+            libc::S_IFREG => {
+                let descriptor = unsafe {
+                    libc::openat(
+                        source.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if descriptor < 0 {
+                    Err(std::io::Error::last_os_error().to_string())
+                } else {
+                    let file = unsafe { File::from_raw_fd(descriptor) };
+                    let before = file.metadata().map_err(|error| error.to_string())?;
+                    let declared = before.len();
+                    let remaining = limits.bytes.saturating_sub(*bytes);
+                    if declared > remaining {
+                        Err("session sidecar archive exceeds byte limit".into())
+                    } else {
+                        write_sidecar_record_prefix(
+                            archive,
+                            1,
+                            relative,
+                            stat.st_mode as u32,
+                            stat.st_mtime,
+                            stat.st_mtime_nsec as u32,
+                            declared,
+                        )?;
+                        let mut digest = Sha256::new();
+                        let mut copied = 0u64;
+                        let mut buffer = [0u8; 64 * 1024];
+                        loop {
+                            let allowed = remaining.saturating_sub(copied);
+                            let request = buffer.len().min(
+                                usize::try_from(allowed.saturating_add(1))
+                                    .unwrap_or(buffer.len()),
+                            );
+                            let read = file
+                                .read_at(&mut buffer[..request], copied)
+                                .map_err(|error| error.to_string())?;
+                            if read == 0 {
+                                break;
+                            }
+                            copied = copied
+                                .checked_add(read as u64)
+                                .ok_or("session sidecar byte count overflow")?;
+                            if copied > remaining {
+                                return Err("session sidecar archive exceeds byte limit".into());
+                            }
+                            digest.update(&buffer[..read]);
+                            archive
+                                .write_all(&buffer[..read])
+                                .map_err(|error| error.to_string())?;
+                        }
+                        let after = file.metadata().map_err(|error| error.to_string())?;
+                        if copied != declared
+                            || before.len() != after.len()
+                            || before.modified().ok() != after.modified().ok()
+                        {
+                            Err("session sidecar changed while it was archived".into())
+                        } else {
+                            *bytes = bytes
+                                .checked_add(copied)
+                                .ok_or("session sidecar byte count overflow")?;
+                            let modified = before.modified().map_err(|error| error.to_string())?;
+                            retirements.push(ExactFileRetirement {
+                                source: file,
+                                archive: None,
+                                size: copied,
+                                modified,
+                                hash: digest.finalize().into(),
+                            });
+                            Ok(())
+                        }
+                    }
+                }
+            }
+            _ => Err("session sidecar contains a symlink or special file".into()),
+        };
+        relative.truncate(previous_len);
+        result
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_leased_archive(
+    source: VerifiedSessionFile,
+    destination: &VerifiedDirectory,
+    destination_name: std::ffi::OsString,
+    limits: ArchiveLimits,
+) -> Result<PreparedLeasedArchive, String> {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let archive = HeldWriteLease::anonymous_in(&destination.file)?;
+    let retirements = match source.kind {
+        VerifiedEntryKind::File => vec![copy_regular_into_anonymous_archive(
+            &source.object,
+            &archive.file,
+            limits,
+        )?],
+        VerifiedEntryKind::Directory => {
+            let mut writer = archive.file.try_clone().map_err(|error| error.to_string())?;
+            writer.write_all(SIDECAR_ARCHIVE_MAGIC).map_err(|error| error.to_string())?;
+            writer
+                .write_all(&SIDECAR_ARCHIVE_VERSION.to_le_bytes())
+                .and_then(|_| writer.write_all(&0u32.to_le_bytes()))
+                .map_err(|error| error.to_string())?;
+            let mut entries = 0usize;
+            let mut bytes = 0u64;
+            let mut retirements = Vec::new();
+            write_sidecar_tree(
+                &source.object,
+                &mut writer,
+                &mut Vec::new(),
+                0,
+                limits,
+                &mut entries,
+                &mut bytes,
+                &mut retirements,
+            )?;
+            let count: u32 = entries.try_into().map_err(|_| "sidecar entry count overflow")?;
+            use std::os::unix::fs::FileExt;
+            archive
+                .file
+                .write_all_at(&count.to_le_bytes(), SIDECAR_ARCHIVE_MAGIC.len() as u64 + 2)
+                .map_err(|error| error.to_string())?;
+            let mode = source.object.metadata().map_err(|error| error.to_string())?.mode();
+            set_archive_metadata(&archive.file, mode, std::time::SystemTime::now())?;
+            archive.file.sync_all().map_err(|error| error.to_string())?;
+            retirements
+        }
+    };
+    let (archive_hash, archive_size) = hash_exact_file_bounded(
+        &archive.file,
+        limits
+            .bytes
+            .checked_add((limits.entries as u64).saturating_mul(8192))
+            .ok_or("archive bound overflow")?,
+    )?;
+    let destination_name = CString::new(destination_name.as_bytes())
+        .map_err(|_| "invalid trash destination name")?;
+    Ok(PreparedLeasedArchive {
+        source,
+        destination_name,
+        archive,
+        archive_hash,
+        archive_size,
+        retirements,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_prepared_source(source: &VerifiedSessionFile) -> Result<std::path::PathBuf, String> {
+    let source_name = CString::new(source.name.as_bytes())
+        .map_err(|_| "invalid session entry name")?;
+    let quarantine_name = format!(".aiterm-quarantine-{}", uuid::Uuid::new_v4());
+    let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
+    let quarantine_path = source.display_parent.join(&quarantine_name);
+    rename_noreplace(
+        source.parent.as_raw_fd(),
+        &source_name,
+        source.parent.as_raw_fd(),
+        &quarantine,
+    )
+    .map_err(|error| {
+        format!(
+            "durable archives are visible but source quarantine failed at {}: {error}",
+            quarantine_path.display()
+        )
+    })?;
+    Ok(quarantine_path)
+}
+
+#[cfg(target_os = "linux")]
+fn archive_verified_entries_with_hooks(
+    destination: &VerifiedDirectory,
+    entries: Vec<(VerifiedSessionFile, std::ffi::OsString)>,
+    limits: ArchiveLimits,
+    before_prepare: impl FnOnce(),
+    after_publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Err("session delete has no verified archive source".into());
+    }
+    before_prepare();
+    let mut prepared = Vec::with_capacity(entries.len().min(16));
+    for (source, name) in entries {
+        prepared.push(prepare_leased_archive(source, destination, name, limits)?);
+    }
+    for archive in &prepared {
+        archive
+            .archive
+            .publish(&destination.file, &archive.destination_name)?;
+    }
+    destination
+        .file
+        .sync_all()
+        .map_err(|error| format!("could not make session archives durable: {error}"))?;
+    after_publish()?;
+    for archive in &prepared {
+        let archive_bound = limits
+            .bytes
+            .checked_add((limits.entries as u64).saturating_mul(8192))
+            .ok_or("archive bound overflow")?;
+        let (hash, size) = hash_exact_file_bounded(&archive.archive.file, archive_bound)?;
+        if hash != archive.archive_hash || size != archive.archive_size {
+            return Err("held session archive changed before source retirement".into());
+        }
+        for retirement in &archive.retirements {
+            verify_exact_file(retirement)?;
+        }
+    }
+    let mut recovery = Vec::with_capacity(prepared.len());
+    for archive in &prepared {
+        recovery.push(quarantine_prepared_source(&archive.source)?);
+    }
+    for archive in &prepared {
+        if let Err(error) = retire_exact_files(&archive.retirements) {
+            let locations = recovery
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "durable session archives exist but source retirement was partial; recoverable quarantines: {locations}: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct SidecarArchiveRecord {
+    kind: u8,
+    path: Vec<u8>,
+    mode: u32,
+    mtime_sec: i64,
+    mtime_nsec: u32,
+    content_offset: u64,
+    content_len: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn read_archive_array<const N: usize>(file: &mut File) -> Result<[u8; N], String> {
+    let mut value = [0u8; N];
+    file.read_exact(&mut value).map_err(|error| error.to_string())?;
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_sidecar_archive(
+    file: &File,
+    limits: ArchiveLimits,
+) -> Result<Vec<SidecarArchiveRecord>, String> {
+    let mut reader = file.try_clone().map_err(|error| error.to_string())?;
+    reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    if read_archive_array::<16>(&mut reader)? != *SIDECAR_ARCHIVE_MAGIC {
+        return Err("sidecar archive has invalid magic".into());
+    }
+    let version = u16::from_le_bytes(read_archive_array::<2>(&mut reader)?);
+    if version != SIDECAR_ARCHIVE_VERSION {
+        return Err("sidecar archive has unsupported version".into());
+    }
+    let count = u32::from_le_bytes(read_archive_array::<4>(&mut reader)?) as usize;
+    if count > limits.entries {
+        return Err("sidecar archive exceeds entry limit".into());
+    }
+    let file_len = reader.metadata().map_err(|error| error.to_string())?.len();
+    let mut records = Vec::with_capacity(count);
+    let mut total_bytes = 0u64;
+    for _ in 0..count {
+        let kind = read_archive_array::<1>(&mut reader)?[0];
+        if kind != 1 && kind != 2 {
+            return Err("sidecar archive has invalid entry kind".into());
+        }
+        let path_len = u16::from_le_bytes(read_archive_array::<2>(&mut reader)?) as usize;
+        if path_len == 0 || path_len > limits.path_bytes {
+            return Err("sidecar archive path exceeds path limit".into());
+        }
+        let mode = u32::from_le_bytes(read_archive_array::<4>(&mut reader)?);
+        let mtime_sec = i64::from_le_bytes(read_archive_array::<8>(&mut reader)?);
+        let mtime_nsec = u32::from_le_bytes(read_archive_array::<4>(&mut reader)?);
+        if mtime_nsec >= 1_000_000_000 {
+            return Err("sidecar archive has invalid timestamp".into());
+        }
+        let content_len = u64::from_le_bytes(read_archive_array::<8>(&mut reader)?);
+        if kind == 2 && content_len != 0 {
+            return Err("sidecar directory record contains file bytes".into());
+        }
+        let mut path = vec![0u8; path_len];
+        reader.read_exact(&mut path).map_err(|error| error.to_string())?;
+        let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        if components.is_empty()
+            || components.len().saturating_sub(1) > limits.depth
+            || components.iter().any(|component| {
+                component.is_empty()
+                    || component.len() > limits.component_bytes
+                    || *component == b"."
+                    || *component == b".."
+                    || component.contains(&0)
+            })
+        {
+            return Err("sidecar archive contains an invalid relative path".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(content_len)
+            .ok_or("sidecar archive byte count overflow")?;
+        if total_bytes > limits.bytes {
+            return Err("sidecar archive exceeds byte limit".into());
+        }
+        let content_offset = reader
+            .stream_position()
+            .map_err(|error| error.to_string())?;
+        let next = content_offset
+            .checked_add(content_len)
+            .ok_or("sidecar archive offset overflow")?;
+        if next > file_len {
+            return Err("sidecar archive is truncated".into());
+        }
+        reader.seek(SeekFrom::Start(next)).map_err(|error| error.to_string())?;
+        records.push(SidecarArchiveRecord {
+            kind,
+            path,
+            mode,
+            mtime_sec,
+            mtime_nsec,
+            content_offset,
+            content_len,
+        });
+    }
+    if reader.stream_position().map_err(|error| error.to_string())? != file_len {
+        return Err("sidecar archive has trailing bytes".into());
+    }
+    Ok(records)
+}
+
+#[cfg(target_os = "linux")]
+fn create_directory_exclusive(parent: &File, name: &OsStr) -> Result<File, String> {
+    let name = CString::new(name.as_bytes()).map_err(|_| "invalid restored directory name")?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_restored_parent(root: &File, path: &[u8]) -> Result<(File, std::ffi::OsString), String> {
+    let mut components = path.split(|byte| *byte == b'/').peekable();
+    let mut current = root.try_clone().map_err(|error| error.to_string())?;
+    loop {
+        let component = components.next().ok_or("sidecar path is empty")?;
+        if components.peek().is_none() {
+            return Ok((current, OsStr::from_bytes(component).to_os_string()));
+        }
+        let name = CString::new(component).map_err(|_| "invalid restored path component")?;
+        let descriptor = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        current = unsafe { File::from_raw_fd(descriptor) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_sidecar_archive(
+    archive_path: &Path,
+    destination_root: &Path,
+    root_name: &OsStr,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+
+    if root_name.as_bytes().is_empty()
+        || root_name.as_bytes().len() > ArchiveLimits::default().component_bytes
+        || root_name.as_bytes().contains(&b'/')
+        || root_name.as_bytes().contains(&0)
+    {
+        return Err("invalid restored sidecar root name".into());
+    }
+    let archive = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(archive_path)
+        .map_err(|error| error.to_string())?;
+    let records = parse_sidecar_archive(&archive, ArchiveLimits::default())?;
+    let destination = VerifiedDirectory::open(destination_root)?;
+    let restored_root = create_directory_exclusive(&destination.file, root_name)?;
+    for record in records {
+        let (parent, name) = open_restored_parent(&restored_root, &record.path)?;
+        if record.kind == 2 {
+            let directory = create_directory_exclusive(&parent, &name)?;
+            set_archive_metadata(
+                &directory,
+                record.mode,
+                UNIX_EPOCH
+                    .checked_add(std::time::Duration::new(
+                        record.mtime_sec.max(0) as u64,
+                        record.mtime_nsec,
+                    ))
+                    .ok_or("restored sidecar timestamp overflow")?,
+            )?;
+        } else {
+            let name = CString::new(name.as_bytes()).map_err(|_| "invalid restored filename")?;
+            let descriptor = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o600,
+                )
+            };
+            if descriptor < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            let mut output = unsafe { File::from_raw_fd(descriptor) };
+            let mut copied = 0u64;
+            let mut buffer = [0u8; 64 * 1024];
+            while copied < record.content_len {
+                let request = buffer.len().min(
+                    usize::try_from(record.content_len - copied).unwrap_or(buffer.len()),
+                );
+                let read = archive
+                    .read_at(&mut buffer[..request], record.content_offset + copied)
+                    .map_err(|error| error.to_string())?;
+                if read == 0 {
+                    return Err("sidecar archive is truncated".into());
+                }
+                output.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+                copied = copied
+                    .checked_add(read as u64)
+                    .ok_or("restored sidecar byte count overflow")?;
+            }
+            set_archive_metadata(
+                &output,
+                record.mode,
+                UNIX_EPOCH
+                    .checked_add(std::time::Duration::new(
+                        record.mtime_sec.max(0) as u64,
+                        record.mtime_nsec,
+                    ))
+                    .ok_or("restored sidecar timestamp overflow")?,
+            )?;
+            output.sync_all().map_err(|error| error.to_string())?;
+        }
+    }
+    restored_root.sync_all().map_err(|error| error.to_string())?;
+    destination.file.sync_all().map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -1517,7 +2362,7 @@ fn copy_exact_file(
     }
     Ok(ExactFileRetirement {
         source: source.try_clone().map_err(|error| error.to_string())?,
-        archive: destination,
+        archive: Some(destination),
         size: source_size,
         modified,
         hash: source_hash,
@@ -1602,7 +2447,11 @@ fn archive_exact_file(
     })?;
     verify_exact_file(&retirement)?;
     after_verification();
-    if !directory_entry_is_exact_object(&destination.file, &final_name, &retirement.archive)? {
+    let archive = retirement
+        .archive
+        .as_ref()
+        .ok_or("exact trash archive descriptor is missing")?;
+    if !directory_entry_is_exact_object(&destination.file, &final_name, archive)? {
         return Err(format!(
             "exact trash destination changed; source remains recoverable at {} and is not retired",
             quarantine_path.display()
@@ -4938,7 +5787,7 @@ mod tests {
                     .custom_flags(libc::O_NONBLOCK)
                     .open(&destination)
                     .expect_err("the held write lease must reject a competing writer");
-                assert!(matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK | libc::EAGAIN)));
+                assert!(matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK));
                 Ok(())
             },
         )
@@ -5017,7 +5866,7 @@ mod tests {
             || Ok(()),
         )
         .unwrap_err();
-        assert!(error.contains("entry limit"));
+        assert!(error.contains("entry limit"), "{error}");
         assert!(source.is_dir());
         assert!(!trash_path.join("session.tasks").exists());
         assert_eq!(std::fs::read_dir(&trash_path).unwrap().count(), 0);
