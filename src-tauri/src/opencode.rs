@@ -182,6 +182,125 @@ pub fn messages(session_id: &str) -> Vec<(String, String)> {
     query(&sql).map(|json| parse_messages(&json)).unwrap_or_default()
 }
 
+/// One row of the detail query: text and tool parts with their message.
+#[derive(serde::Deserialize)]
+struct DetailRow {
+    message_id: String,
+    message_data: String,
+    part_data: String,
+}
+
+/// The session row's columns the flyout wants.
+#[derive(serde::Deserialize)]
+struct DetailSession {
+    directory: Option<String>,
+    title: Option<String>,
+    time_created: Option<u64>,
+    time_updated: Option<u64>,
+    model: Option<String>,
+    permission: Option<String>,
+}
+
+/// What the flyout shows for an OpenCode session: the session row for where
+/// and when, each assistant message's `modelID` and `tokens`, and the tool
+/// parts for the counts and the files. Shapes are OpenCode's own message
+/// and part records (`role`, `modelID`, `providerID`, `time.created`,
+/// `tokens.{input,output,cache.{read,write}}`; `type:"tool"`, `tool`,
+/// `state.input.filePath`). There is no OpenCode session on this machine
+/// to read one off, so the reader takes every field as optional and says
+/// nothing where a field is missing.
+pub(crate) fn parse_detail(id: &str, session_json: &str, rows_json: &str) -> crate::detail::SessionDetail {
+    use crate::detail::{iso_from_ms, note_message, push_unique, top_tools, touch_file, SessionDetail};
+    let mut d = SessionDetail { id: id.to_string(), ..Default::default() };
+    if let Ok(rows) = serde_json::from_str::<Vec<DetailSession>>(session_json.trim()) {
+        if let Some(s) = rows.into_iter().next() {
+            d.cwd = s.directory.filter(|x| !x.is_empty());
+            d.title = s.title.filter(|x| !x.is_empty());
+            d.started = s.time_created.map(iso_from_ms);
+            d.last_active = s.time_updated.map(iso_from_ms);
+            d.permission_mode = s.permission.filter(|x| !x.is_empty());
+            if let Some(m) = s.model.filter(|x| !x.is_empty()) {
+                // The session's declared model — the transcript's own comes
+                // first below, and this stands in only when there is none.
+                d.models.push(m);
+            }
+        }
+    }
+    let session_model = d.models.pop();
+    let rows: Vec<DetailRow> = serde_json::from_str(rows_json.trim()).unwrap_or_default();
+    let mut tools: std::collections::HashMap<String, u32> = Default::default();
+    let mut current: Option<(String, String, String)> = None; // (message id, role, text so far)
+    let flush = |cur: &mut Option<(String, String, String)>, d: &mut SessionDetail| {
+        if let Some((_, role, text)) = cur.take() {
+            if !text.trim().is_empty() {
+                note_message(d, &role, &text);
+            }
+        }
+    };
+    for r in rows {
+        let Ok(part) = serde_json::from_str::<serde_json::Value>(&r.part_data) else { continue };
+        let new_message = current.as_ref().map(|c| c.0 != r.message_id).unwrap_or(true);
+        if new_message {
+            flush(&mut current, &mut d);
+            let Ok(m) = serde_json::from_str::<serde_json::Value>(&r.message_data) else { continue };
+            let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if let Some(ms) = m.pointer("/time/created").and_then(|x| x.as_u64()) {
+                let iso = iso_from_ms(ms);
+                if d.started.as_deref().is_none_or(|s| iso.as_str() < s) {
+                    d.started = Some(iso.clone());
+                }
+                if d.last_active.as_deref().is_none_or(|s| iso.as_str() > s) {
+                    d.last_active = Some(iso);
+                }
+            }
+            if role == "assistant" {
+                if let Some(model) = m.get("modelID").and_then(|x| x.as_str()) {
+                    push_unique(&mut d.models, model);
+                }
+                if let Some(t) = m.get("tokens") {
+                    let u = |p: &str| t.pointer(p).and_then(|x| x.as_u64()).unwrap_or(0);
+                    let input = u("/input") + u("/cache/read") + u("/cache/write");
+                    if input > 0 {
+                        d.context_tokens = Some(input);
+                    }
+                    d.output_tokens += u("/output");
+                }
+            }
+            current = Some((r.message_id.clone(), role, String::new()));
+        }
+        match part.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let (Some(cur), Some(text)) = (current.as_mut(), part.get("text").and_then(|t| t.as_str())) {
+                    if !cur.2.is_empty() {
+                        cur.2.push('\n');
+                    }
+                    cur.2.push_str(text);
+                }
+            }
+            Some("tool") => {
+                d.tool_calls += 1;
+                let name = part.get("tool").and_then(|t| t.as_str()).unwrap_or("tool");
+                *tools.entry(name.to_string()).or_insert(0) += 1;
+                if matches!(name, "edit" | "write" | "patch" | "multiedit") {
+                    if let Some(fp) = ["/state/input/filePath", "/state/input/path", "/state/input/file_path"]
+                        .iter()
+                        .find_map(|p| part.pointer(p).and_then(|x| x.as_str()))
+                    {
+                        touch_file(&mut d.files, fp);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut current, &mut d);
+    if d.models.is_empty() {
+        d.models.extend(session_model);
+    }
+    d.tools = top_tools(tools);
+    d
+}
+
 /// sqlite3's JSON for the join above → `(role, text)` per message.
 ///
 /// A message's text parts are joined into one turn: OpenCode splits an
@@ -504,8 +623,71 @@ impl SessionProvider for OpencodeSessions {
         has_session(session_id).then(db_path)?
     }
 
+    fn detail(&self, session_id: &str) -> Option<crate::detail::SessionDetail> {
+        if !valid_id(session_id) {
+            return None;
+        }
+        let session = query(&format!(
+            "select directory, title, time_created, time_updated, model, permission \
+             from session where id = '{session_id}'"
+        ))?;
+        let rows = query(&format!(
+            "select p.message_id as message_id, m.data as message_data, p.data as part_data \
+             from part p join message m on m.id = p.message_id \
+             where p.session_id = '{session_id}' \
+               and json_extract(p.data, '$.type') in ('text', 'tool') \
+             order by m.time_created, p.time_created"
+        ))
+        .unwrap_or_default();
+        Some(parse_detail(session_id, &session, &rows))
+    }
+
     fn messages(&self, session_id: &str) -> Option<Vec<(String, String)>> {
         valid_id(session_id).then(|| messages(session_id))
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    #[test]
+    fn rows_become_the_flyout() {
+        let session = r#"[{"directory":"/w","title":"Fix the thing","time_created":1787967144650,"time_updated":1787967600000,"model":"anthropic/claude-sonnet-4","permission":null}]"#;
+        let rows = serde_json::json!([
+            {"message_id":"m1","message_data":r#"{"role":"user","time":{"created":1787967144650}}"#,
+             "part_data":r#"{"type":"text","text":"fix the thing"}"#},
+            {"message_id":"m2","message_data":r#"{"role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","time":{"created":1787967150000},"tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":900,"write":0}}}"#,
+             "part_data":r#"{"type":"text","text":"On it"}"#},
+            {"message_id":"m2","message_data":r#"{"role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","time":{"created":1787967150000},"tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":900,"write":0}}}"#,
+             "part_data":r#"{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"/w/a.rs"}}}"#},
+            {"message_id":"m2","message_data":r#"{"role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","time":{"created":1787967150000},"tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":900,"write":0}}}"#,
+             "part_data":r#"{"type":"text","text":"— done."}"#},
+            {"message_id":"m3","message_data":r#"{"role":"assistant","modelID":"gpt-5","providerID":"openai","time":{"created":1787967200000},"tokens":{"input":200,"output":30,"cache":{"read":1000,"write":50}}}"#,
+             "part_data":r#"{"type":"tool","tool":"bash","state":{"input":{"command":"ls"}}}"#},
+        ]).to_string();
+        let d = parse_detail("ses_x", session, &rows);
+        assert_eq!(d.cwd.as_deref(), Some("/w"));
+        assert_eq!(d.title.as_deref(), Some("Fix the thing"));
+        assert_eq!(d.started.as_deref(), Some("2026-08-29T01:32:24.650Z"));
+        assert_eq!(d.last_active.as_deref(), Some("2026-08-29T01:40:00.000Z"), "the session row's update time outlasts the last message");
+        assert_eq!(d.models, vec!["claude-sonnet-4", "gpt-5"], "the transcript's models, in order of first use");
+        assert_eq!((d.user_messages, d.assistant_messages), (1, 1), "a tool-only message is not a reply");
+        assert_eq!(d.first_prompt.as_deref(), Some("fix the thing"));
+        assert_eq!(d.last_assistant.as_deref(), Some("On it\n— done."), "a reply split across parts is one turn");
+        assert_eq!(d.tool_calls, 2);
+        assert_eq!(d.tools[0].name, "bash");
+        assert_eq!(d.files, vec!["/w/a.rs"]);
+        assert_eq!(d.context_tokens, Some(1250), "last assistant turn's input side");
+        assert_eq!(d.output_tokens, 50);
+    }
+
+    #[test]
+    fn a_bare_session_row_falls_back_to_its_declared_model() {
+        let d = parse_detail("ses_x", r#"[{"directory":"/w","title":"t","time_created":1,"time_updated":2,"model":"openai/gpt-5","permission":"ask"}]"#, "");
+        assert_eq!(d.models, vec!["openai/gpt-5"]);
+        assert_eq!(d.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(d.user_messages, 0);
     }
 }
 

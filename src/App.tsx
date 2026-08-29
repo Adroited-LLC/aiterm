@@ -1,3 +1,4 @@
+import { TimeFormatContext } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -23,8 +24,9 @@ import AgentPanel from "./components/AgentPanel";
 import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
+import HomeDashboard from "./components/HomeDashboard";
 import {
-  FolderOpen, GitBranch, Keyboard, ListChecks, PanelLeft, Play, Plus, RefreshCw, Settings as SettingsIcon, X,
+  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -139,11 +141,15 @@ function describeEnd(why: EndedWhy | undefined): string {
  *  spelling `undefined` three times to get to it. */
 /** A file open in the center strip, pinned to the terminal tab it was
  *  opened beside — switching sessions switches to that session's files. */
+/** The owner of a file tab: a terminal key, a preview, or home (null). */
+type FileScope = number | string | null;
+
 interface FileTab {
   key: number;
-  /** The terminal tab this file belongs to; null when it was opened with no
-   *  terminal on screen. */
-  termKey: number | null;
+  /** What this file belongs to — see `fileScope`: a terminal tab's key, a
+   *  `preview:<id>` string for a file opened off a session preview, or null
+   *  for one opened from the home view. */
+  termKey: FileScope;
   path: string;
 }
 
@@ -714,26 +720,51 @@ export default function App() {
 
   // Switching terminal, or picking a different session to preview, puts that
   // terminal or preview on screen — a file tab left selected would cover it.
-  useEffect(() => setActiveFileTab(null), [activeTab, previewSession?.id]);
+  /** What is in front, for the purpose of owning files: the preview when one
+   *  is up (it covers the terminal, and the explorer shows *its* project),
+   *  else the active terminal, else home. A file opened now belongs to this,
+   *  and only files belonging to this are in the row. */
+  const fileScope: FileScope = previewSession ? `preview:${previewSession.id}` : activeTab;
+  const fileScopeRef = useRef<FileScope>(fileScope);
+  fileScopeRef.current = fileScope;
+  /** Which file each scope had on screen, so switching away and back finds
+   *  it where it was left — the file row is part of the session, not a
+   *  shared strip. */
+  const fileFor = useRef(new Map<FileScope, number | null>());
+  const prevScope = useRef(fileScope);
+  useEffect(() => {
+    if (prevScope.current !== fileScope) {
+      prevScope.current = fileScope;
+      const k = fileFor.current.get(fileScope) ?? null;
+      setActiveFileTab(k !== null && fileTabs.some((f) => f.key === k) ? k : null);
+    } else {
+      fileFor.current.set(fileScope, activeFileTab);
+    }
+  }, [fileScope, activeFileTab]);
+  // A preview is transient: the files opened off it go when it does, rather
+  // than lingering unreachable until the same session is previewed again.
+  useEffect(() => {
+    const keep = previewSession ? `preview:${previewSession.id}` : null;
+    setFileTabs((list) => list.some((f) => typeof f.termKey === "string" && f.termKey !== keep)
+      ? list.filter((f) => typeof f.termKey !== "string" || f.termKey === keep)
+      : list);
+  }, [previewSession?.id]);
 
-  /** Whether a file tab belongs on the strip right now. A file opened with no
-   *  terminal (from a preview, or the empty start view) has no terminal to
-   *  belong to, so it belongs to all of them: it stays reachable after a
-   *  session starts instead of vanishing until every tab is closed. */
+  /** Whether a file tab belongs to what is in front. Files open where they
+   *  were opened from and nowhere else; ones opened from the home view belong
+   *  to it, and the home tab is how they are reached. */
   const showsFile = useCallback(
-    (f: FileTab) => f.termKey === null || f.termKey === activeTab,
-    [activeTab],
+    (f: FileTab) => f.termKey === fileScope,
+    [fileScope],
   );
   /** A file tab is the thing on screen in the center right now. */
   const fileOnScreen =
     activeFileTab !== null && fileTabs.some((f) => showsFile(f) && f.key === activeFileTab);
 
   const openFileTab = useCallback((path: string) => {
-    const term = activeTabRef.current;
+    const term = fileScopeRef.current;
     setFileTabs((list) => {
-      const existing = list.find(
-        (f) => f.path === path && (f.termKey === term || f.termKey === null),
-      );
+      const existing = list.find((f) => f.path === path && f.termKey === term);
       if (existing) {
         setActiveFileTab(existing.key);
         return list;
@@ -1433,6 +1464,51 @@ export default function App() {
     });
   }, []);
 
+  /** Show the start view with the open sessions left running behind it —
+   *  the home tab, and where a closed last tab lands. */
+  const goHome = useCallback(() => {
+    setPreviewSession(null);
+    setActiveFileTab(null);
+    setActiveTab(null);
+  }, []);
+
+  /** Tab strip reordering: drop `from` where `to` sits, shifting the rest. */
+  const dragKey = useRef<number | null>(null);
+  const [dragOver, setDragOver] = useState<number | null>(null);
+  const moveTab = useCallback((from: number | null, to: number) => {
+    if (from === null || from === to) return;
+    setTabs((t) => {
+      const a = t.findIndex((x) => x.key === from);
+      const b = t.findIndex((x) => x.key === to);
+      if (a < 0 || b < 0) return t;
+      const next = [...t];
+      const [moved] = next.splice(a, 1);
+      next.splice(b, 0, moved);
+      return next;
+    });
+  }, []);
+
+  // Ctrl+PageDown / Ctrl+PageUp walk the session tabs, wrapping. Not Ctrl+W:
+  // that is delete-word to every shell and editor in the terminal.
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+      if (e.key !== "PageDown" && e.key !== "PageUp") return;
+      const list = tabsRef.current;
+      if (list.length === 0) return;
+      e.preventDefault();
+      const cur = list.findIndex((t) => t.key === activeTabRef.current);
+      const step = e.key === "PageDown" ? 1 : -1;
+      const next = list[(cur + step + list.length) % list.length];
+      setPreviewSession(null);
+      setActiveFileTab(null);
+      setActiveTab(next.key);
+      handles.current.get(next.key)?.focus();
+    };
+    window.addEventListener("keydown", h, true);
+    return () => window.removeEventListener("keydown", h, true);
+  }, []);
+
   /** A terminal's process ended. Whether that closes the tab depends entirely
    *  on why.
    *
@@ -1830,7 +1906,7 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
+  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string) => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
     // the two are presented differently: a model tab is titled by its model
@@ -1850,6 +1926,7 @@ export default function App() {
             kind: "apiModel",
             providerId: choice.providerId,
             modelId: choice.modelId,
+            prompt: prompt || null,
           });
           setActiveProject(cwd);
           // A tab handle where the plan names no session: an engine that writes
@@ -1881,6 +1958,7 @@ export default function App() {
             agentId: choice.agentId,
             model: choice.model,
             effort: choice.effort,
+            prompt: prompt || null,
           });
           // No session id on the plan means the engine would not take one —
           // Codex has no `--session-id` — so the slot is a tab handle: the
@@ -1917,23 +1995,37 @@ export default function App() {
    *  its defaults — a different session from the one the menu offers, with
    *  nothing on the button to say so. */
   const emptyCtl = useStartChoice(settingsGen);
-  /** Same as the menu, but choose the directory first. The empty pane's copy is
-   *  the only instruction a first run gets, and it used to name two buttons
-   *  that live in a panel you can close — and that on a fresh machine has
-   *  nothing in it to press them on. */
-  const browseNewSession = useCallback(async () => {
+  /** Where the home screen's prompt box starts its session. The project the
+   *  sidebar has selected, or the one worked in most recently — the folder
+   *  chip on the box swaps it, and holds the swap until the next selection. */
+  const [homeCwdPick, setHomeCwdPick] = useState<string | null>(null);
+  useEffect(() => { setHomeCwdPick(null); }, [activeProject]);
+  const homeCwd = homeCwdPick ?? activeProject
+    ?? [...sessions].sort((a, b) => b.last_active - a.last_active)[0]?.project_path ?? null;
+  const pickHomeCwd = useCallback(async () => {
+    try {
+      const picked = await openDialog({ directory: true, title: "Start the session in…" });
+      if (typeof picked === "string") setHomeCwdPick(picked);
+    } catch { /* cancelled */ }
+  }, []);
+  /** The prompt box's submit: a session in `homeCwd` with the prompt as its
+   *  first message, or an empty one when nothing was typed. No folder known
+   *  yet means ask for one first. */
+  const launchFromHome = useCallback(async (prompt: string) => {
     if (!emptyCtl.ready) {
       setNotice("Nothing to start yet — set up the API tab, or install claude, codex or grok.");
       return;
     }
-    try {
-      const picked = await openDialog({ directory: true, title: "Start a session in…" });
-      if (typeof picked !== "string") return;
-      newSession(picked, emptyCtl.choice());
-    } catch {
-      /* cancelled, or no chooser available */
+    let cwd = homeCwd;
+    if (!cwd) {
+      try {
+        const picked = await openDialog({ directory: true, title: "Start the session in…" });
+        if (typeof picked !== "string") return;
+        cwd = picked;
+      } catch { return; }
     }
-  }, [newSession, emptyCtl]);
+    void newSession(cwd, emptyCtl.choice(), prompt.trim() || undefined);
+  }, [newSession, emptyCtl, homeCwd]);
 
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
@@ -1982,7 +2074,13 @@ export default function App() {
 
   const showRight = showExplorer || showGit;
 
+  const timeFormatCtx = useMemo(() => ({
+    format: settings.timeFormat,
+    setFormat: (f: AppSettings["timeFormat"]) => setSettings((s) => ({ ...s, timeFormat: f })),
+  }), [settings.timeFormat]);
+
   return (
+    <TimeFormatContext.Provider value={timeFormatCtx}>
     <div className="app">
       {notice && (
         <div className="app-toast" role="status" onClick={() => setNotice(null)}>
@@ -2017,9 +2115,10 @@ export default function App() {
             onClick={() => setShowComposer(!showComposer)}
           ><Icon of={Keyboard} /></button>
           <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
-          <Clock />
         </div>
+        <div className="topbar-spacer" />
         <div className="topbar-right">
+          <Clock />
           <button className="icon-btn" title="Smaller fonts (Ctrl+-)" onClick={() => bumpFont(-1)}>A−</button>
           <button
             className="icon-btn"
@@ -2104,47 +2203,98 @@ export default function App() {
         )}
 
         <div className="panel terminal-panel">
-          {(activeTabObj !== null || fileTabs.some(showsFile)) && (
+          {(tabs.length > 0 || previewSession || fileTabs.some(showsFile)) && (
             <div className="center-tabs">
-              {/* No terminal: the locked tab is the preview, or the start
-                  view, so there is still a way back from a file. */}
-              {!activeTabObj && (
+              {/* Leftmost, always: the way back to the start view — or the
+                  preview that stands in for it — so a file or a session is
+                  never a dead end. */}
+              {previewSession ? (
                 <button
-                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")
-                    + agentTint(previewSession?.agent).className}
-                  style={agentTint(previewSession?.agent).style}
-                  title={previewSession?.project_path ?? undefined}
+                  className={"center-tab locked on" + agentTint(previewSession.agent).className}
+                  style={agentTint(previewSession.agent).style}
+                  title={previewSession.project_path}
                   onClick={() => setActiveFileTab(null)}
                 >
-                  {previewSession
-                    ? <AgentIcon agent={previewSession.agent} size={13} />
-                    : null}
-                  <span className="center-tab-name">
-                    {previewSession ? previewSession.title : "Start"}
-                  </span>
+                  <AgentIcon agent={previewSession.agent} size={13} />
+                  <span className="center-tab-name">{previewSession.title}</span>
                 </button>
-              )}
-              {activeTabObj && (
+              ) : (
                 <button
-                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")
-                    + agentTint(activeTabObj.agentId).className}
-                  style={agentTint(activeTabObj.agentId).style}
-                  title={activeTabObj.cwd ?? undefined}
-                  onClick={() => {
-                    setActiveFileTab(null);
-                    if (activeTab !== null) handles.current.get(activeTab)?.focus();
-                  }}
+                  className={"center-tab home-tab" + (activeTab === null ? " on" : "")}
+                  title="Home — start a session"
+                  onClick={goHome}
                 >
-                  {activeTabObj.agentId
-                    ? <AgentIcon agent={activeTabObj.agentId} size={13} />
-                    : <span className="center-tab-shell">❯</span>}
-                  <span className="center-tab-name">{activeTabObj.title}</span>
+                  <Icon of={Home} size="sm" />
                 </button>
               )}
+              {/* Every open session, in the order they sit — drag one to move
+                  it, middle-click or × to close (which ends its process; the
+                  conversation stays on disk and in the sidebar). */}
+              {tabs.map((t) => {
+                const on = t.key === activeTab && !previewSession;
+                const tint = agentTint(t.agentId);
+                return (
+                  <button
+                    key={t.key}
+                    className={"center-tab session" + (on ? " on" : "") + tint.className
+                      + (ended.has(t.key) ? " ended" : "") + (dragOver === t.key ? " drop" : "")}
+                    style={tint.style}
+                    title={t.cwd ?? undefined}
+                    draggable
+                    onDragStart={(e) => { dragKey.current = t.key; e.dataTransfer.effectAllowed = "move"; }}
+                    onDragOver={(e) => { if (dragKey.current !== null) { e.preventDefault(); setDragOver(t.key); } }}
+                    onDragLeave={() => setDragOver((k) => (k === t.key ? null : k))}
+                    onDrop={(e) => { e.preventDefault(); moveTab(dragKey.current, t.key); dragKey.current = null; setDragOver(null); }}
+                    onDragEnd={() => { dragKey.current = null; setDragOver(null); }}
+                    onClick={() => {
+                      setPreviewSession(null);
+                      setActiveFileTab(null);
+                      setActiveTab(t.key);
+                      handles.current.get(t.key)?.focus();
+                    }}
+                    onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeTab(t.key); } }}
+                  >
+                    {t.agentId
+                      ? <AgentIcon agent={t.agentId} size={13} />
+                      : <span className="center-tab-shell">❯</span>}
+                    <span className="center-tab-name">{t.title}</span>
+                    {attention.has(t.key) && !on && <span className="center-tab-dot" title="Waiting for you" />}
+                    <span
+                      className="center-tab-close"
+                      title="Close (ends the session's process)"
+                      onClick={(e) => { e.stopPropagation(); closeTab(t.key); }}
+                    ><Icon of={X} size="sm" /></span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {/* The session's own files, in a row of their own under the strip:
+              what this session opened travels with it, and the leftmost tab
+              is the way back to its terminal. */}
+          {fileTabs.some(showsFile) && (
+            <div className="center-tabs file-row">
+              <button
+                className={"center-tab sub back" + (activeFileTab === null ? " on" : "")}
+                title={previewSession ? "Back to the preview" : activeTabObj ? "Back to the terminal" : "Back to the start view"}
+                onClick={() => {
+                  setActiveFileTab(null);
+                  if (activeTab !== null) handles.current.get(activeTab)?.focus();
+                }}
+              >
+                {previewSession
+                  ? <AgentIcon agent={previewSession.agent} size={12} />
+                  : activeTabObj
+                  ? (activeTabObj.agentId
+                      ? <AgentIcon agent={activeTabObj.agentId} size={12} />
+                      : <span className="center-tab-shell">❯</span>)
+                  : <Icon of={Home} size="sm" />}
+                <span className="center-tab-name">{previewSession ? "Preview" : activeTabObj ? "Terminal" : "Home"}</span>
+              </button>
               {fileTabs.filter(showsFile).map((f) => (
                 <button
                   key={f.key}
-                  className={"center-tab" + (activeFileTab === f.key ? " on" : "")}
+                  className={"center-tab sub" + (activeFileTab === f.key ? " on" : "")}
                   title={f.path}
                   onClick={() => setActiveFileTab(f.key)}
                 >
@@ -2242,16 +2392,20 @@ export default function App() {
             {/* The preview pane sits above the file layer, and the start view
                 would show through under it — neither is drawn while a file
                 tab is the one on screen. */}
-            {tabs.length === 0 && !previewSession && !fileOnScreen && (
-              <div className="empty-note big empty-start">
-                <div>Pick a session on the left — <Icon of={Play} size="sm" /> resumes it, <Icon of={Plus} size="sm" /> opens a shell</div>
-                <div className="empty-start-controls">
-                  <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
-                  <button className="tui-pick" onClick={browseNewSession}>
-                    Start a new session…
-                  </button>
-                </div>
-              </div>
+            {activeTab === null && !previewSession && !fileOnScreen && (
+              <HomeDashboard
+                sessions={sessions}
+                liveIds={new Set(tabs.map((t) => t.slotId).filter((k): k is string => !!k))}
+                alerts={alerts}
+                onSelect={selectSession}
+                onResume={(s) => { void resumeSession(s); }}
+                onGoTab={(key) => setActiveTab(key)}
+                controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />}
+                ready={emptyCtl.ready}
+                cwd={homeCwd}
+                onPickCwd={pickHomeCwd}
+                onLaunch={launchFromHome}
+              />
             )}
             {previewSession && !fileOnScreen && (
               <SessionPreview
@@ -2438,6 +2592,7 @@ export default function App() {
         />
       )}
     </div>
+    </TimeFormatContext.Provider>
   );
 }
 

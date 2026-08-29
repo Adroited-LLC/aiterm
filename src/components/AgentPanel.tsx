@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
+import { fmtTime, fullTime, useTimeFormat } from "../timefmt";
 import {
-  AgentRun, Artifact, SessionTask, homeAbbrev, openPath, relTime,
+  AgentRun, Artifact, SessionTask, homeAbbrev, openPath,
   sessionAgents, sessionArtifacts, sessionTasks,
 } from "../ipc";
 import Icon from "./Icon";
@@ -22,6 +23,7 @@ function statusIcon(t: SessionTask) {
 }
 
 export default function AgentPanel({ sessionId, onOpenFile }: Props) {
+  const { format: timeFormat } = useTimeFormat();
   const [tab, setTab] = useState<"tasks" | "artifacts">("tasks");
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -139,7 +141,7 @@ export default function AgentPanel({ sessionId, onOpenFile }: Props) {
                 <span className="artifact-dir"> {homeAbbrev(a.path).replace(/\/[^/]*$/, "")}</span>
               </span>
               {a.at && (
-                <span className="artifact-time">{relTime(new Date(a.at).getTime())}</span>
+                <span className="artifact-time" title={fullTime(new Date(a.at).getTime())}>{fmtTime(new Date(a.at).getTime(), timeFormat)}</span>
               )}
             </div>
           ))}

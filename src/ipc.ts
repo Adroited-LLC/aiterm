@@ -479,13 +479,7 @@ export function homeAbbrev(p: string): string {
   return p.replace(/^\/home\/[^/]+/, "~");
 }
 
-export function relTime(ms: number): string {
-  const s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 60) return "just now";
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
-}
+export { relTime } from "./timefmt";
 
 /** What aiterm found for one agent on this machine — see `agents.rs`. */
 export interface AgentDetection {
@@ -581,6 +575,8 @@ export interface ModelCard {
   prompt_price: number | null;
   completion_price: number | null;
   modalities: string[];
+  /** Epoch seconds the provider listed it, where it says. */
+  created: number | null;
 }
 export const providerModelCards = (id: string) =>
   invoke<ModelCard[]>("provider_model_cards", { id });
@@ -850,8 +846,8 @@ export const trayAlerts = (alerts: { key: number; title: string; message?: strin
  *  answers is `launch.rs`'s business — nothing here names one. Sent in
  *  camelCase, which is what `LaunchRequest` deserializes. */
 export type LaunchRequest =
-  | { kind: "agent"; agentId: string; model: string | null; effort: string | null }
-  | { kind: "apiModel"; providerId: string; modelId: string }
+  | { kind: "agent"; agentId: string; model: string | null; effort: string | null; prompt?: string | null }
+  | { kind: "apiModel"; providerId: string; modelId: string; prompt?: string | null }
   | { kind: "resume"; sessionId: string }
   | { kind: "restart"; sessionId: string }
   | { kind: "clear"; sessionId: string };

@@ -598,6 +598,8 @@ pub struct ModelCard {
     pub completion_price: Option<f64>,
     /// What the model accepts: "text", "image", …
     pub modalities: Vec<String>,
+    /// Epoch seconds the provider listed it, where it says (OpenRouter does).
+    pub created: Option<u64>,
 }
 
 /// Split the `-w` status off the body and turn an HTTP failure into the
@@ -663,6 +665,7 @@ pub fn parse_model_cards(response: &str) -> Result<Vec<ModelCard>, String> {
                     .and_then(|v| v.as_str())
                     .map(String::from),
                 context_length: m.get("context_length").and_then(|v| v.as_u64()),
+                created: m.get("created").and_then(|v| v.as_u64()),
                 prompt_price: price(m, "prompt"),
                 completion_price: price(m, "completion"),
                 modalities: m
@@ -1398,6 +1401,7 @@ mod tests {
                 name: Some("Anthropic: Claude Sonnet 5".into()),
                 description: Some("Fast frontier model.".into()),
                 context_length: Some(1_000_000),
+                created: None,
                 prompt_price: Some(0.000003),
                 completion_price: Some(0.000015),
                 modalities: vec!["text".into(), "image".into()],

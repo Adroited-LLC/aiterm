@@ -1,4 +1,5 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
+import { fmtTime, fullTime, useTimeFormat } from "../timefmt";
 import GitPanel from "./GitPanel";
 import { CYCLE_MODES, PermissionMode } from "../term/screen";
 import {
@@ -149,6 +150,7 @@ export default function ComposerPills({
   onOpenModelPicker, onOpenRewind, permMode, onSetPermMode,
 }: Props) {
   const bars = usage;
+  const { format: timeFormat } = useTimeFormat();
   const [open, setOpen] = useState<PanelKey | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [tasks, setTasks] = useState<SessionTask[]>([]);
@@ -350,7 +352,7 @@ export default function ComposerPills({
                   {a.path.split("/").pop()}
                   <span className="artifact-dir"> {homeAbbrev(a.path).replace(/\/[^/]*$/, "")}</span>
                 </span>
-                <span className="artifact-time">{relTime(new Date(a.at).getTime())}</span>
+                <span className="artifact-time" title={fullTime(new Date(a.at).getTime())}>{fmtTime(new Date(a.at).getTime(), timeFormat)}</span>
               </div>
             ))
           )}
