@@ -39,7 +39,12 @@ class EnrollmentSecret private constructor(private var bytes: ByteArray?) {
         data object AlreadyConsumed : Consumption<Nothing>
     }
 
-    internal suspend fun <T> consume(block: suspend (ByteArray) -> T): Consumption<T> {
+    /**
+     * Claims the secret at the protocol boundary where it is first placed in
+     * a pair.request. The callback is deliberately synchronous so callers
+     * cannot retain the mutable bytes across a suspension point.
+     */
+    internal fun <T> consume(block: (ByteArray) -> T): Consumption<T> {
         val claimed = synchronized(this) {
             bytes?.also { bytes = null }
         } ?: return Consumption.AlreadyConsumed
@@ -50,6 +55,8 @@ class EnrollmentSecret private constructor(private var bytes: ByteArray?) {
             claimed.fill(0)
         }
     }
+
+    internal fun isAvailable(): Boolean = synchronized(this) { bytes != null }
 
     internal fun discard() {
         val discarded = synchronized(this) {

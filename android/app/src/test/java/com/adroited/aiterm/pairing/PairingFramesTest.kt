@@ -3,6 +3,7 @@ package com.adroited.aiterm.pairing
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PairingFramesTest {
@@ -47,6 +48,52 @@ class PairingFramesTest {
             PairDeniedFrame(),
             PairingFrames.decode(hex("a1646b696e646b706169722e64656e696564")),
         )
+        assertEquals(
+            PairExpiredFrame(),
+            PairingFrames.decode(hex("a1646b696e646c706169722e65787069726564")),
+        )
+    }
+
+    @Test
+    fun openingChallengeFixture_requiresExactlyA32ByteNonce() {
+        val frame = PairingFrames.decode(
+            hex(
+                "a2" +
+                    "646b696e646e617574682e6368616c6c656e6765" +
+                    "656e6f6e63655820" +
+                    "000102030405060708090a0b0c0d0e0f" +
+                    "101112131415161718191a1b1c1d1e1f",
+            ),
+        )
+
+        assertTrue(frame is AuthChallengeFrame)
+        assertArrayEquals(ByteArray(32) { it.toByte() }, (frame as AuthChallengeFrame).nonce)
+    }
+
+    @Test
+    fun malformedExtraOrDuplicateChallengeFields_areRejected() {
+        val invalidChallenges = listOf(
+            // 31-byte nonce.
+            "a2" +
+                "646b696e646e617574682e6368616c6c656e6765" +
+                "656e6f6e6365581f" + "00".repeat(31),
+            // Unknown field.
+            "a3" +
+                "646b696e646e617574682e6368616c6c656e6765" +
+                "656e6f6e63655820" + "00".repeat(32) +
+                "656578747261f5",
+            // Duplicate nonce map key.
+            "a3" +
+                "646b696e646e617574682e6368616c6c656e6765" +
+                "656e6f6e63655820" + "00".repeat(32) +
+                "656e6f6e63655820" + "01".repeat(32),
+        )
+
+        invalidChallenges.forEach { bytes ->
+            assertThrows(PairingProtocolException::class.java) {
+                PairingFrames.decode(hex(bytes))
+            }
+        }
     }
 
     @Test
@@ -56,6 +103,11 @@ class PairingFramesTest {
         }
         assertThrows(PairingProtocolException::class.java) {
             PairingFrames.decode(ByteArray(0))
+        }
+        assertThrows(PairingProtocolException::class.java) {
+            // A malformed UTF-8 map key must stay inside the explicit
+            // protocol-failure boundary rather than escaping the listener.
+            PairingFrames.decode(hex("a161fff5"))
         }
         assertThrows(PairingProtocolException::class.java) {
             PairingFrames.decode(

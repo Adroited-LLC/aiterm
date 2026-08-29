@@ -32,6 +32,8 @@ data class PairingEndpoint(val host: String, val port: Int)
 sealed interface EnrollmentOutcome {
     data class Approved(val deviceId: String) : EnrollmentOutcome
     data object Denied : EnrollmentOutcome
+    data object Expired : EnrollmentOutcome
+    data object ConsumedPayload : EnrollmentOutcome
     data object FingerprintMismatch : EnrollmentOutcome
     data object TlsIdentityMismatch : EnrollmentOutcome
     data class Unreachable(val detail: String) : EnrollmentOutcome
@@ -43,7 +45,7 @@ interface PairingTransport {
     suspend fun enroll(
         endpoint: PairingEndpoint,
         serverSpkiFingerprint: String,
-        enrollmentSecret: ByteArray,
+        enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
         onPending: () -> Unit,
@@ -80,30 +82,34 @@ class PairingRepository(
             return PairingResult.Rejected(PairingFailure.PROTOCOL_ERROR)
         }
 
-        return when (val consumption = payload.secret.consume { enrollmentSecret ->
-            val publicKey = try {
-                deviceKeys.devicePublicKey()
-            } catch (_: DeviceKeyException) {
-                return@consume PairingResult.Rejected(PairingFailure.KEY_UNAVAILABLE)
-            }
+        if (!payload.secret.isAvailable()) {
+            return PairingResult.Rejected(PairingFailure.CONSUMED_PAYLOAD)
+        }
+        val publicKey = try {
+            deviceKeys.devicePublicKey()
+        } catch (_: DeviceKeyException) {
+            payload.discard()
+            return PairingResult.Rejected(PairingFailure.KEY_UNAVAILABLE)
+        }
 
-            pairClaimed(
+        return try {
+            pairUnclaimed(
                 payload = payload,
-                enrollmentSecret = enrollmentSecret,
+                enrollmentSecret = payload.secret,
                 deviceName = deviceName,
                 devicePublicKey = publicKey,
                 onAwaitingApproval = onAwaitingApproval,
             )
-        }) {
-            is EnrollmentSecret.Consumption.Used -> consumption.value
-            EnrollmentSecret.Consumption.AlreadyConsumed ->
-                PairingResult.Rejected(PairingFailure.CONSUMED_PAYLOAD)
+        } finally {
+            // A scan is one attempt. If no candidate reached a valid opening
+            // challenge, erase the still-unclaimed bytes when that attempt ends.
+            payload.discard()
         }
     }
 
-    private suspend fun pairClaimed(
+    private suspend fun pairUnclaimed(
         payload: PairingPayload,
-        enrollmentSecret: ByteArray,
+        enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
         onAwaitingApproval: () -> Unit,
@@ -150,6 +156,10 @@ class PairingRepository(
                 }
                 EnrollmentOutcome.Denied ->
                     return PairingResult.Rejected(PairingFailure.DENIED_BY_DESKTOP)
+                EnrollmentOutcome.Expired ->
+                    return PairingResult.Rejected(PairingFailure.EXPIRED_PAYLOAD)
+                EnrollmentOutcome.ConsumedPayload ->
+                    return PairingResult.Rejected(PairingFailure.CONSUMED_PAYLOAD)
                 EnrollmentOutcome.FingerprintMismatch ->
                     return PairingResult.Rejected(PairingFailure.FINGERPRINT_MISMATCH)
                 EnrollmentOutcome.TlsIdentityMismatch ->
@@ -174,7 +184,7 @@ class OkHttpPairingTransport : PairingTransport {
     override suspend fun enroll(
         endpoint: PairingEndpoint,
         serverSpkiFingerprint: String,
-        enrollmentSecret: ByteArray,
+        enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
         onPending: () -> Unit,
@@ -190,7 +200,7 @@ class OkHttpPairingTransport : PairingTransport {
             return EnrollmentOutcome.Unreachable("invalid candidate endpoint")
         }
 
-        return withTimeoutOrNull(APPROVAL_TIMEOUT_MILLIS) {
+        val outcome = withTimeoutOrNull(APPROVAL_TIMEOUT_MILLIS) {
             awaitEnrollment(
                 client = pinnedClient.client,
                 pinMismatchObserved = pinnedClient.trustManager::didObserveMismatch,
@@ -200,7 +210,12 @@ class OkHttpPairingTransport : PairingTransport {
                 devicePublicKey = devicePublicKey,
                 onPending = onPending,
             )
-        } ?: EnrollmentOutcome.Indeterminate("approval timed out")
+        }
+        return outcome ?: if (enrollmentSecret.isAvailable()) {
+            EnrollmentOutcome.Unreachable("opening challenge timed out")
+        } else {
+            EnrollmentOutcome.Indeterminate("approval timed out")
+        }
     }
 
     private fun pinnedClient(fingerprint: String): PinnedClient {
@@ -233,7 +248,7 @@ class OkHttpPairingTransport : PairingTransport {
         client: OkHttpClient,
         pinMismatchObserved: () -> Boolean,
         request: Request,
-        enrollmentSecret: ByteArray,
+        enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
         onPending: () -> Unit,
@@ -245,6 +260,7 @@ class OkHttpPairingTransport : PairingTransport {
 
         fun finish(outcome: EnrollmentOutcome, closeSocket: Boolean = true) {
             if (completed.compareAndSet(false, true)) {
+                state.set(State.FINISHED)
                 if (closeSocket) socket.get()?.cancel()
                 if (continuation.isActive) continuation.resume(outcome)
             }
@@ -252,30 +268,9 @@ class OkHttpPairingTransport : PairingTransport {
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                state.set(State.WAITING_FOR_PENDING)
-                val encoded = try {
-                    PairingFrames.encode(
-                        PairRequestFrame(
-                            enrollmentSecret = enrollmentSecret,
-                            deviceName = deviceName,
-                            publicKey = devicePublicKey,
-                        ),
-                    )
-                } catch (_: Exception) {
-                    finish(EnrollmentOutcome.ProtocolFailure("request encoding failed"))
-                    return
-                }
-                val message = encoded.toByteString()
-                encoded.fill(0)
-                secretSent.set(true)
-                val sent = try {
-                    webSocket.send(message)
-                } finally {
-                    enrollmentSecret.fill(0)
-                }
-                if (!sent) {
-                    finish(EnrollmentOutcome.Indeterminate("enrollment send failed"))
-                    return
+                socket.compareAndSet(null, webSocket)
+                if (!state.compareAndSet(State.WAITING_FOR_OPEN, State.WAITING_FOR_CHALLENGE)) {
+                    finish(EnrollmentOutcome.ProtocolFailure("duplicate open callback"))
                 }
             }
 
@@ -284,6 +279,8 @@ class OkHttpPairingTransport : PairingTransport {
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                socket.compareAndSet(null, webSocket)
+                if (completed.get()) return
                 val frame = try {
                     PairingFrames.decode(bytes.toByteArray())
                 } catch (_: PairingProtocolException) {
@@ -291,6 +288,52 @@ class OkHttpPairingTransport : PairingTransport {
                     return
                 }
                 when (state.get()) {
+                    State.WAITING_FOR_CHALLENGE -> when (frame) {
+                        is AuthChallengeFrame -> {
+                            // The Rust gateway's nonce is only signed by an
+                            // already-enrolled auth.proof. A pair.request does
+                            // not echo or sign it; validation gates secret use.
+                            val sendFailure = when (
+                                val consumption = enrollmentSecret.consume { secret ->
+                                    val encoded = try {
+                                        PairingFrames.encode(
+                                            PairRequestFrame(
+                                                enrollmentSecret = secret,
+                                                deviceName = deviceName,
+                                                publicKey = devicePublicKey,
+                                            ),
+                                        )
+                                    } catch (_: Exception) {
+                                        return@consume EnrollmentOutcome.ProtocolFailure(
+                                            "request encoding failed",
+                                        )
+                                    }
+                                    val message = encoded.toByteString()
+                                    encoded.fill(0)
+                                    state.set(State.WAITING_FOR_PENDING)
+                                    // Conservatively classify any teardown
+                                    // from this point as indeterminate: send()
+                                    // may have queued enrollment material.
+                                    secretSent.set(true)
+                                    val sent = runCatching { webSocket.send(message) }
+                                        .getOrDefault(false)
+                                    if (sent) {
+                                        null
+                                    } else {
+                                        EnrollmentOutcome.Indeterminate("enrollment send failed")
+                                    }
+                                }
+                            ) {
+                                is EnrollmentSecret.Consumption.Used -> consumption.value
+                                EnrollmentSecret.Consumption.AlreadyConsumed ->
+                                    EnrollmentOutcome.ConsumedPayload
+                            }
+                            if (sendFailure != null) finish(sendFailure)
+                        }
+                        else -> finish(
+                            EnrollmentOutcome.ProtocolFailure("opening challenge required"),
+                        )
+                    }
                     State.WAITING_FOR_PENDING -> when (frame) {
                         is PairPendingFrame -> {
                             state.set(State.WAITING_FOR_DECISION)
@@ -301,6 +344,7 @@ class OkHttpPairingTransport : PairingTransport {
                     State.WAITING_FOR_DECISION -> when (frame) {
                         is PairApprovedFrame -> finish(EnrollmentOutcome.Approved(frame.deviceId))
                         is PairDeniedFrame -> finish(EnrollmentOutcome.Denied)
+                        is PairExpiredFrame -> finish(EnrollmentOutcome.Expired)
                         else -> finish(EnrollmentOutcome.ProtocolFailure("decision response required"))
                     }
                     State.WAITING_FOR_OPEN ->
@@ -324,7 +368,8 @@ class OkHttpPairingTransport : PairingTransport {
         }
 
         val webSocket = client.newWebSocket(request, listener)
-        socket.set(webSocket)
+        socket.compareAndSet(null, webSocket)
+        if (completed.get()) webSocket.cancel()
         continuation.invokeOnCancellation { webSocket.cancel() }
     }
 
@@ -360,6 +405,7 @@ class OkHttpPairingTransport : PairingTransport {
 
     private enum class State {
         WAITING_FOR_OPEN,
+        WAITING_FOR_CHALLENGE,
         WAITING_FOR_PENDING,
         WAITING_FOR_DECISION,
         FINISHED,
@@ -371,7 +417,10 @@ class OkHttpPairingTransport : PairingTransport {
     )
 
     companion object {
-        private const val APPROVAL_TIMEOUT_MILLIS = 5 * 60 * 1_000L
+        // Rust starts its 300-second approval timer only after TLS, the opening
+        // challenge, and pair.request. Keep a small transport grace period so
+        // its terminal pair.expired frame wins the boundary race.
+        private const val APPROVAL_TIMEOUT_MILLIS = (5 * 60 + 15) * 1_000L
     }
 }
 

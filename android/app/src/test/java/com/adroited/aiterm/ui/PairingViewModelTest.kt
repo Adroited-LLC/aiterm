@@ -1,6 +1,7 @@
 package com.adroited.aiterm.ui
 
 import com.adroited.aiterm.pairing.EnrollmentOutcome
+import com.adroited.aiterm.pairing.EnrollmentSecret
 import com.adroited.aiterm.pairing.FakeDeviceKeys
 import com.adroited.aiterm.pairing.FakePairedDesktopStore
 import com.adroited.aiterm.pairing.PairingEndpoint
@@ -92,12 +93,16 @@ class PairingViewModelTest {
         override suspend fun enroll(
             endpoint: PairingEndpoint,
             serverSpkiFingerprint: String,
-            enrollmentSecret: ByteArray,
+            enrollmentSecret: EnrollmentSecret,
             deviceName: String,
             devicePublicKey: ByteArray,
             onPending: () -> Unit,
         ): EnrollmentOutcome {
             attempts++
+            val consumption = enrollmentSecret.consume { Unit }
+            if (consumption is EnrollmentSecret.Consumption.AlreadyConsumed) {
+                return EnrollmentOutcome.ConsumedPayload
+            }
             onPending()
             approvalGate.await()
             return EnrollmentOutcome.Approved("device-approved")

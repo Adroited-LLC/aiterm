@@ -98,7 +98,7 @@ internal class RecordingPairingTransport(
     override suspend fun enroll(
         endpoint: PairingEndpoint,
         serverSpkiFingerprint: String,
-        enrollmentSecret: ByteArray,
+        enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
         onPending: () -> Unit,
@@ -114,6 +114,17 @@ internal class RecordingPairingTransport(
                 onPending,
             )
         }
-        return outcomes[endpoint.host] ?: fallback
+        val outcome = outcomes[endpoint.host] ?: fallback
+        if (
+            outcome is EnrollmentOutcome.Unreachable ||
+            outcome is EnrollmentOutcome.FingerprintMismatch ||
+            outcome is EnrollmentOutcome.TlsIdentityMismatch
+        ) {
+            return outcome
+        }
+        return when (enrollmentSecret.consume { Unit }) {
+            is EnrollmentSecret.Consumption.Used -> outcome
+            EnrollmentSecret.Consumption.AlreadyConsumed -> EnrollmentOutcome.ConsumedPayload
+        }
     }
 }

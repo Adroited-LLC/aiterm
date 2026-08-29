@@ -3,6 +3,8 @@ package com.adroited.aiterm.pairing
 import com.adroited.aiterm.security.SpkiFingerprint
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.async
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -332,6 +334,89 @@ class PairingRepositoryTest {
         assertEquals(server.hostName, store.all().single().hosts.first())
     }
 
+    // ---- Opening authentication challenge ----
+
+    @Test
+    fun enrollmentSecret_isNotSentUntilTheRustOpeningChallengeIsValidated() = runBlocking {
+        val secret = ByteArray(32) { (it + 17).toByte() }
+        val payload = parsedPayload(
+            pairingUri(
+                hosts = listOf(server.hostName),
+                port = server.port,
+                fingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+                secret = secret,
+            ),
+            scannedAt,
+        )
+        val recordingServer = ChallengeGateServer()
+        server.enqueue(MockResponse.Builder().webSocketUpgrade(recordingServer).build())
+
+        val pairing = async(Dispatchers.IO) {
+            repositoryWith(OkHttpPairingTransport()).pair(payload, deviceName, scannedAt)
+        }
+        assertTrue(recordingServer.awaitOpen())
+        assertFalse(
+            "pair.request leaked before auth.challenge",
+            recordingServer.awaitRequest(300, TimeUnit.MILLISECONDS),
+        )
+
+        recordingServer.sendChallenge()
+        val result = pairing.await()
+
+        assertTrue("expected approved pairing, got $result", result is PairingResult.Paired)
+        assertTrue(recordingServer.awaitRequest(5, TimeUnit.SECONDS))
+        assertArrayEqualsBytes(secret, recordingServer.pairRequest!!.enrollmentSecret)
+    }
+
+    @Test
+    fun malformedOrOutOfOrderOpeningChallenge_sendsNoEnrollmentMaterial() = runBlocking {
+        val openingFrames = listOf(
+            malformedChallengeBytes().toByteString(),
+            pendingFixtureBytes().toByteString(),
+        )
+
+        openingFrames.forEach { openingFrame ->
+            val payload = parsedPayload(
+                pairingUri(
+                    hosts = listOf(server.hostName),
+                    port = server.port,
+                    fingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+                ),
+                scannedAt,
+            )
+            val openingServer = OpeningFrameServer(openingFrame)
+            server.enqueue(MockResponse.Builder().webSocketUpgrade(openingServer).build())
+
+            val result = repositoryWith(OkHttpPairingTransport()).pair(payload, deviceName, scannedAt)
+
+            assertEquals(PairingResult.Rejected(PairingFailure.PROTOCOL_ERROR), result)
+            assertFalse(
+                "pair.request leaked after an invalid opening frame",
+                openingServer.awaitRequest(300, TimeUnit.MILLISECONDS),
+            )
+        }
+    }
+
+    @Test
+    fun duplicateOpeningChallenge_isAProtocolFailureAndNeverPersists() = runBlocking {
+        val payload = parsedPayload(
+            pairingUri(
+                hosts = listOf(server.hostName),
+                port = server.port,
+                fingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+            ),
+            scannedAt,
+        )
+        val duplicateServer = DuplicateChallengeServer()
+        server.enqueue(MockResponse.Builder().webSocketUpgrade(duplicateServer).build())
+
+        val result = repositoryWith(OkHttpPairingTransport()).pair(payload, deviceName, scannedAt)
+
+        assertEquals(PairingResult.Rejected(PairingFailure.PROTOCOL_ERROR), result)
+        assertTrue(duplicateServer.awaitRequest())
+        assertEquals(emptyList<PairedDesktop>(), store.all())
+    }
+
     // ---- Approval ----
 
     @Test
@@ -392,6 +477,26 @@ class PairingRepositoryTest {
     }
 
     @Test
+    fun desktopPairExpiredResponse_mapsToExpiredPayloadAndPersistsNothing() = runBlocking {
+        val payload = parsedPayload(
+            pairingUri(
+                hosts = listOf(server.hostName),
+                port = server.port,
+                fingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+            ),
+            scannedAt,
+        )
+        val expiredServer = ExpiredServer()
+        server.enqueue(MockResponse.Builder().webSocketUpgrade(expiredServer).build())
+
+        val result = repositoryWith(OkHttpPairingTransport()).pair(payload, deviceName, scannedAt)
+
+        assertEquals(PairingResult.Rejected(PairingFailure.EXPIRED_PAYLOAD), result)
+        assertTrue(expiredServer.awaitRequest())
+        assertEquals(emptyList<PairedDesktop>(), store.all())
+    }
+
+    @Test
     fun pendingApproval_doesNotPersistUntilTheApprovedResponseArrives() = runBlocking {
         val payload = parsedPayload(pairingUri(), scannedAt)
         var pendingWasReported = false
@@ -399,11 +504,14 @@ class PairingRepositoryTest {
             override suspend fun enroll(
                 endpoint: PairingEndpoint,
                 serverSpkiFingerprint: String,
-                enrollmentSecret: ByteArray,
+                enrollmentSecret: EnrollmentSecret,
                 deviceName: String,
                 devicePublicKey: ByteArray,
                 onPending: () -> Unit,
             ): EnrollmentOutcome {
+                if (enrollmentSecret.consume { Unit } is EnrollmentSecret.Consumption.AlreadyConsumed) {
+                    return EnrollmentOutcome.ConsumedPayload
+                }
                 onPending()
                 pendingWasReported = true
                 assertEquals(emptyList<PairedDesktop>(), store.all())
@@ -512,8 +620,115 @@ class PairingRepositoryTest {
             }
         }
 
-        override fun onOpen(webSocket: WebSocket, response: Response) = Unit
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            webSocket.send(validChallengeBytes().toByteString())
+        }
 
         fun awaitRequestFrame(): Boolean = received.await(5, TimeUnit.SECONDS)
     }
+
+    private class ChallengeGateServer : WebSocketListener() {
+        @Volatile
+        var pairRequest: PairRequestFrame? = null
+            private set
+
+        private val opened = CountDownLatch(1)
+        private val received = CountDownLatch(1)
+        private lateinit var socket: WebSocket
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            socket = webSocket
+            opened.countDown()
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            val frame = PairingFrames.decode(bytes.toByteArray())
+            if (frame is PairRequestFrame) {
+                pairRequest = frame
+                received.countDown()
+                webSocket.send(pendingFixtureBytes().toByteString())
+                webSocket.send(approvedFixtureBytes().toByteString())
+            }
+        }
+
+        fun awaitOpen(): Boolean = opened.await(5, TimeUnit.SECONDS)
+
+        fun awaitRequest(timeout: Long, unit: TimeUnit): Boolean = received.await(timeout, unit)
+
+        fun sendChallenge() {
+            check(opened.count == 0L)
+            check(socket.send(validChallengeBytes().toByteString()))
+        }
+    }
+
+    private class OpeningFrameServer(private val openingFrame: ByteString) : WebSocketListener() {
+        private val received = CountDownLatch(1)
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            webSocket.send(openingFrame)
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            received.countDown()
+        }
+
+        fun awaitRequest(timeout: Long, unit: TimeUnit): Boolean = received.await(timeout, unit)
+    }
+
+    private class DuplicateChallengeServer : WebSocketListener() {
+        private val received = CountDownLatch(1)
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            webSocket.send(validChallengeBytes().toByteString())
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            received.countDown()
+            webSocket.send(validChallengeBytes().toByteString())
+        }
+
+        fun awaitRequest(): Boolean = received.await(5, TimeUnit.SECONDS)
+    }
+
+    private class ExpiredServer : WebSocketListener() {
+        private val received = CountDownLatch(1)
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            webSocket.send(validChallengeBytes().toByteString())
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            received.countDown()
+            webSocket.send(pendingFixtureBytes().toByteString())
+            webSocket.send(expiredFixtureBytes().toByteString())
+        }
+
+        fun awaitRequest(): Boolean = received.await(5, TimeUnit.SECONDS)
+    }
 }
+
+private fun validChallengeBytes(): ByteArray = hexBytes(
+    "a2" +
+        "646b696e646e617574682e6368616c6c656e6765" +
+        "656e6f6e63655820" +
+        "000102030405060708090a0b0c0d0e0f" +
+        "101112131415161718191a1b1c1d1e1f",
+)
+
+private fun malformedChallengeBytes(): ByteArray = hexBytes(
+    "a2" +
+        "646b696e646e617574682e6368616c6c656e6765" +
+        "656e6f6e6365581f" + "00".repeat(31),
+)
+
+private fun pendingFixtureBytes(): ByteArray =
+    hexBytes("a2646b696e646c706169722e70656e64696e676a726571756573745f696469726571756573742d31")
+
+private fun approvedFixtureBytes(): ByteArray =
+    hexBytes("a2646b696e646d706169722e617070726f766564696465766963655f6964696465766963652d3432")
+
+private fun expiredFixtureBytes(): ByteArray =
+    hexBytes("a1646b696e646c706169722e65787069726564")
+
+private fun hexBytes(value: String): ByteArray =
+    value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
