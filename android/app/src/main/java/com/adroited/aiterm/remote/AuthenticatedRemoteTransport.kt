@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 
 interface RemoteBinarySocket {
     suspend fun receive(): ByteArray
@@ -155,7 +156,12 @@ class AuthenticatedRemoteTransport(
 
     private suspend fun readLoop(active: RemoteBinarySocket) {
         try {
-            while (true) accept(RemoteWireCodec.decodeEvent(active.receive()))
+            while (true) {
+                accept(RemoteWireCodec.decodeEvent(active.receive()))
+                // Correlated attach/resume continuations must publish their
+                // generation before a following terminal event is consumed.
+                yield()
+            }
         } catch (_: CancellationException) {
             // Explicit close/lock owns teardown.
         } catch (error: Exception) {

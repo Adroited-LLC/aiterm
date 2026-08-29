@@ -67,14 +67,22 @@ class RemoteTerminalViewModel(
     fun loadOlderScrollback() = client.requestNextScrollbackPage()
     fun openSession(id: String, cols: Int, rows: Int) =
         client.openSession(id, TerminalSize(cols, rows))
+    fun previewSession(id: String) = client.previewSession(id)
+    fun closeSession(id: String) = client.closeSession(id)
     fun stopSession(id: String) = client.stopSession(id)
     fun forkSession(id: String) = client.forkSession(id)
     fun deleteSession(id: String) = client.deleteSession(id)
     fun closeTab(id: String) = client.closeTab(id)
     fun openShell(projectPath: String?, cols: Int, rows: Int) =
         client.openShell(projectPath, TerminalSize(cols, rows))
-    fun startAgent(agent: com.adroited.aiterm.remote.RemoteAgentChoice, cwd: String, cols: Int, rows: Int) =
-        client.startAgent(agent, cwd, TerminalSize(cols, rows))
+    fun startAgent(
+        agent: com.adroited.aiterm.remote.RemoteAgentChoice,
+        modelId: String?,
+        effort: String?,
+        cwd: String,
+        cols: Int,
+        rows: Int,
+    ) = client.startAgent(agent, modelId, effort, cwd, TerminalSize(cols, rows))
 
     override fun onCleared() {
         client.lock()

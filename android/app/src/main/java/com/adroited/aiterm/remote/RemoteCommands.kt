@@ -36,6 +36,7 @@ data class RemoteFocusEvent(
 
 data class RemoteTitleEvent(val tabId: String, val attachmentId: String, val title: String)
 data class RemoteTerminalExitEvent(val tabId: String, val attachmentId: String, val exit: RemoteTabExit)
+@Serializable data class RemotePreviewMessage(val role: String, val text: String)
 
 @Serializable
 data class RemoteModelOption(
@@ -90,6 +91,7 @@ object RemoteCommands {
         encode(ScrollbackPayload.serializer(), ScrollbackPayload(tabId, attachmentId, offset, count))
     fun session(sessionId: String): ByteArray =
         encode(SessionIdPayload.serializer(), SessionIdPayload(sessionId))
+    fun previewSession(sessionId: String): ByteArray = session(sessionId)
     fun openSession(sessionId: String, size: TerminalSize): ByteArray =
         encode(SessionOpenPayload.serializer(), SessionOpenPayload(sessionId, size))
     fun closeSession(sessionId: String, tabId: String?): ByteArray =
@@ -120,6 +122,14 @@ object RemoteCommands {
         if (it.agents.size > 64 || it.caps.size > 64) malformed()
         RemoteAgentRoster(it.agents, it.caps)
     }
+
+    fun sessionPreview(payload: ByteArray): List<RemotePreviewMessage> =
+        decode(SessionPreviewReply.serializer(), payload).messages.also { messages ->
+            if (messages.size > 512 || messages.any {
+                    it.role.length !in 1..64 || it.text.encodeToByteArray().size > 64 * 1_024
+                } || messages.sumOf { it.text.encodeToByteArray().size } >= RemoteWireCodec.MAX_FRAME_BYTES
+            ) malformed()
+        }
 
     fun attached(payload: ByteArray): AttachedTerminal = decode(AttachedReply.serializer(), payload).let {
         if (it.tabId.isBlank() || it.attachmentId.isBlank() || it.title.length > 4_096) malformed()
@@ -215,6 +225,7 @@ object RemoteCommands {
         val size: TerminalSize,
     )
     @Serializable private data class SessionListReply(val sessions: List<RemoteSession>)
+    @Serializable private data class SessionPreviewReply(val messages: List<RemotePreviewMessage>)
     @Serializable private data class TabListReply(val tabs: List<RemoteTab>)
     @Serializable private data class AgentListReply(
         val agents: List<RemoteAgentChoice>,

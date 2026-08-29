@@ -38,6 +38,8 @@ data class RemoteClientState(
     val pendingTransfers: Int = 0,
     val tabs: List<RemoteTab> = emptyList(),
     val sessions: List<RemoteSession> = emptyList(),
+    val previewSessionId: String? = null,
+    val previewMessages: List<RemotePreviewMessage> = emptyList(),
     val agents: List<RemoteAgentChoice> = emptyList(),
     val agentCaps: Map<String, RemoteAgentCaps> = emptyMap(),
     val activeTabId: String? = null,
@@ -215,7 +217,16 @@ class RemoteClient(
             Selection(lifecycleGeneration, selectionGeneration, tabId, active)
         }
         launchOwned(selection.lifecycleGeneration) {
-            selectionMutex.withLock { runSelection(selection) }
+            try {
+                selectionMutex.withLock { runSelection(selection) }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                accept(
+                    selection.lifecycleGeneration,
+                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                )
+            }
         }
     }
 
@@ -269,6 +280,25 @@ class RemoteClient(
         }
     }
 
+    fun previewSession(sessionId: String) {
+        launchRequest("session.preview", RemoteCommands.previewSession(sessionId)) { payload ->
+            mutableState.value = mutableState.value.copy(
+                previewSessionId = sessionId,
+                previewMessages = RemoteCommands.sessionPreview(payload),
+            )
+        }
+    }
+
+    fun closeSession(sessionId: String) {
+        val tabId = synchronized(lifecycleLock) {
+            mutableState.value.tabs.singleOrNull { it.sessionId == sessionId }?.id
+        }
+        launchRequest("session.close", RemoteCommands.closeSession(sessionId, tabId)) {
+            refreshSessions()
+            refreshTabs()
+        }
+    }
+
     fun deleteSession(sessionId: String) = sessionMutation("session.delete", sessionId)
     fun forkSession(sessionId: String) = sessionMutation("session.fork", sessionId)
     fun stopSession(sessionId: String) = sessionMutation("session.stop", sessionId)
@@ -283,14 +313,22 @@ class RemoteClient(
         }
     }
 
-    fun startAgent(agent: RemoteAgentChoice, cwd: String, size: TerminalSize) {
-        val model = agent.models.firstOrNull()
+    fun startAgent(
+        agent: RemoteAgentChoice,
+        modelId: String?,
+        effort: String?,
+        cwd: String,
+        size: TerminalSize,
+    ) {
+        val model = modelId?.let { selected -> agent.models.singleOrNull { it.id == selected } }
+        if (modelId != null && model == null) return
+        if (effort != null && model?.efforts?.contains(effort) != true) return
         launchRequest(
             "agent.action",
             RemoteCommands.startAgent(
                 agentId = agent.id,
                 model = model?.id,
-                effort = model?.defaultEffort,
+                effort = effort ?: model?.defaultEffort,
                 cwd = cwd,
                 title = agent.displayName,
                 size = size,
@@ -521,9 +559,21 @@ class RemoteClient(
         )
         val generation = lifecycleGeneration
         launchOwned(generation) {
-            when (val response = active.request(request)) {
-                is RemoteResponse.Error -> accept(generation, RemoteServerEvent.Failure(response.code, response.message))
-                is RemoteResponse.Success -> Unit
+            try {
+                when (val response = active.request(request)) {
+                    is RemoteResponse.Error -> accept(
+                        generation,
+                        RemoteServerEvent.Failure(response.code, response.message),
+                    )
+                    is RemoteResponse.Success -> Unit
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                accept(
+                    generation,
+                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                )
             }
         }
     }
@@ -637,6 +687,8 @@ class RemoteClient(
     private suspend fun requestIgnoringError(transport: RemoteTransport, kind: String, payload: ByteArray) {
         try {
             transport.request(RemoteRequest(nextRequestId.getAndIncrement(), kind, payload))
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
         } catch (_: Exception) {
             // Connection teardown owns cleanup when the detach cannot be delivered.
         }

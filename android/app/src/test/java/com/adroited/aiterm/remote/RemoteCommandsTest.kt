@@ -1,6 +1,7 @@
 package com.adroited.aiterm.remote
 
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class RemoteCommandsTest {
@@ -15,6 +16,21 @@ class RemoteCommandsTest {
             ),
             RemoteCommands.input("t", "a", byteArrayOf('x'.code.toByte())),
         )
+    }
+
+    @Test
+    fun sessionPreviewDecodesTheExactRustMessageShape() {
+        val messages = RemoteCommands.sessionPreview(
+            hex(
+                "a1" +
+                    "686d65737361676573" +
+                    "81a2" +
+                    "64726f6c656475736572" +
+                    "64746578746568656c6c6f",
+            ),
+        )
+
+        assertEquals(listOf(RemotePreviewMessage("user", "hello")), messages)
     }
 
     private fun hex(value: String): ByteArray =

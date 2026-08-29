@@ -1,6 +1,7 @@
 package com.adroited.aiterm.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
@@ -50,13 +51,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -69,6 +79,7 @@ import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.terminal.CellAttributes
+import com.adroited.aiterm.terminal.CursorShape
 import com.adroited.aiterm.terminal.ScreenCell
 import com.adroited.aiterm.terminal.ScreenSnapshot
 import com.adroited.aiterm.terminal.ScreenRow
@@ -90,11 +101,15 @@ fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit)
         onSelectTab = viewModel::selectTab,
         onCloseTab = viewModel::closeTab,
         onOpenSession = { id, cols, rows -> viewModel.openSession(id, cols, rows) },
+        onPreviewSession = viewModel::previewSession,
+        onCloseSession = viewModel::closeSession,
         onStopSession = viewModel::stopSession,
         onForkSession = viewModel::forkSession,
         onDeleteSession = viewModel::deleteSession,
         onOpenShell = { cols, rows -> viewModel.openShell(null, cols, rows) },
-        onStartAgent = { agent, cwd, cols, rows -> viewModel.startAgent(agent, cwd, cols, rows) },
+        onStartAgent = { agent, model, effort, cwd, cols, rows ->
+            viewModel.startAgent(agent, model, effort, cwd, cols, rows)
+        },
         onInput = viewModel::sendInput,
         onTakeFocus = viewModel::takeFocus,
         onResize = viewModel::resize,
@@ -113,11 +128,20 @@ fun TerminalScreenContent(
     onSelectTab: (String) -> Unit = {},
     onCloseTab: (String) -> Unit = {},
     onOpenSession: (String, Int, Int) -> Unit = { _, _, _ -> },
+    onPreviewSession: (String) -> Unit = {},
+    onCloseSession: (String) -> Unit = {},
     onStopSession: (String) -> Unit = {},
     onForkSession: (String) -> Unit = {},
     onDeleteSession: (String) -> Unit = {},
     onOpenShell: (Int, Int) -> Unit = { _, _ -> },
-    onStartAgent: (com.adroited.aiterm.remote.RemoteAgentChoice, String, Int, Int) -> Unit = { _, _, _, _ -> },
+    onStartAgent: (
+        com.adroited.aiterm.remote.RemoteAgentChoice,
+        String?,
+        String?,
+        String,
+        Int,
+        Int,
+    ) -> Unit = { _, _, _, _, _, _ -> },
     onInput: (String) -> Unit = {},
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
     onResize: (Int, Int) -> Unit = { _, _ -> },
@@ -143,11 +167,15 @@ fun TerminalScreenContent(
                     },
                     onCloseTab = onCloseTab,
                     onOpenSession = { onOpenSession(it, cols, rows) },
+                    onPreviewSession = onPreviewSession,
+                    onCloseSession = onCloseSession,
                     onStopSession = onStopSession,
                     onForkSession = onForkSession,
                     onDeleteSession = { id -> deleteTarget = state.sessions.firstOrNull { it.id == id } },
                     onOpenShell = { onOpenShell(cols, rows) },
-                    onStartAgent = { agent, cwd -> onStartAgent(agent, cwd, cols, rows) },
+                    onStartAgent = { agent, model, effort, cwd ->
+                        onStartAgent(agent, model, effort, cwd, cols, rows)
+                    },
                 )
             }
         },
@@ -257,11 +285,13 @@ private fun SessionDrawer(
     onSelectTab: (String) -> Unit,
     onCloseTab: (String) -> Unit,
     onOpenSession: (String) -> Unit,
+    onPreviewSession: (String) -> Unit,
+    onCloseSession: (String) -> Unit,
     onStopSession: (String) -> Unit,
     onForkSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
     onOpenShell: () -> Unit,
-    onStartAgent: (com.adroited.aiterm.remote.RemoteAgentChoice, String) -> Unit,
+    onStartAgent: (com.adroited.aiterm.remote.RemoteAgentChoice, String?, String?, String) -> Unit,
 ) {
     Text("LIVE TABS", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.labelMedium)
     state.tabs.forEach { tab ->
@@ -287,8 +317,24 @@ private fun SessionDrawer(
         Text("NEW AGENT", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
         state.agents.forEach { agent ->
             Column(Modifier.padding(horizontal = 12.dp)) {
-                TextButton(onClick = { onStartAgent(agent, launchPath) }) {
-                    Text("Start ${agent.displayName} · ${agent.models.firstOrNull()?.displayName ?: "default"}")
+                if (agent.models.isEmpty()) {
+                    TextButton(onClick = { onStartAgent(agent, null, null, launchPath) }) {
+                        Text("Start ${agent.displayName} · default")
+                    }
+                }
+                agent.models.forEach { model ->
+                    val efforts = model.efforts.ifEmpty { listOfNotNull(model.defaultEffort) }
+                    if (efforts.isEmpty()) {
+                        TextButton(onClick = { onStartAgent(agent, model.id, null, launchPath) }) {
+                            Text("Start ${agent.displayName} · ${model.displayName}")
+                        }
+                    } else {
+                        efforts.forEach { effort ->
+                            TextButton(onClick = { onStartAgent(agent, model.id, effort, launchPath) }) {
+                                Text("Start ${agent.displayName} · ${model.displayName} · $effort")
+                            }
+                        }
+                    }
                 }
                 val caps = state.agentCaps[agent.id]
                 if (caps != null) {
@@ -315,9 +361,22 @@ private fun SessionDrawer(
                 Text("${session.agent} · ${session.projectPath}", style = MaterialTheme.typography.labelMedium, maxLines = 1)
                 Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                     TextButton(onClick = { onOpenSession(session.id) }) { Text("Open") }
+                    TextButton(onClick = { onPreviewSession(session.id) }) { Text("Preview") }
+                    TextButton(onClick = { onCloseSession(session.id) }) { Text("Close") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                     TextButton(onClick = { onStopSession(session.id) }) { Text("Stop") }
                     TextButton(onClick = { onForkSession(session.id) }) { Text("Fork") }
                     TextButton(onClick = { onDeleteSession(session.id) }) { Text("Delete") }
+                }
+                if (state.previewSessionId == session.id) {
+                    state.previewMessages.takeLast(8).forEach { message ->
+                        Text(
+                            "${message.role}: ${message.text}",
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 3,
+                        )
+                    }
                 }
             }
         }
@@ -333,6 +392,12 @@ private fun TerminalGrid(
 ) {
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
+    val scrollState = rememberScrollState()
+    var imeValue by remember { mutableStateOf(TextFieldValue()) }
+    val density = LocalDensity.current
+    val cellWidth = with(density) { 8.4.dp.toPx() }
+    val lineHeight = with(density) { 16.sp.toPx() }
+    val cursorThickness = with(density) { 2.dp.toPx() }
     Box(
         modifier.background(Color(0xFF07111B)).clickable {
             focusRequester.requestFocus()
@@ -340,7 +405,7 @@ private fun TerminalGrid(
         }.padding(horizontal = 4.dp, vertical = 3.dp).testTag("terminal-grid"),
     ) {
         SelectionContainer {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
+            Column(Modifier.verticalScroll(scrollState)) {
                 scrollback.asReversed().forEach { row ->
                     TerminalRowText(buildTerminalRow(row.cells, -1, screen))
                 }
@@ -349,10 +414,49 @@ private fun TerminalGrid(
                 }
             }
         }
+        Canvas(Modifier.fillMaxSize()) {
+            val cursor = screen?.cursor ?: return@Canvas
+            if (!cursor.visible) return@Canvas
+            val x = cursor.col * cellWidth
+            val y = (scrollback.size + cursor.row) * lineHeight - scrollState.value
+            if (y + lineHeight < 0 || y > size.height) return@Canvas
+            val color = Color(0xFF63D3E1)
+            when (cursor.shape) {
+                CursorShape.Block -> drawRect(
+                    color.copy(alpha = 0.35f),
+                    topLeft = Offset(x, y),
+                    size = Size(cellWidth, lineHeight),
+                )
+                CursorShape.Beam -> drawRect(
+                    color,
+                    topLeft = Offset(x, y),
+                    size = Size(cursorThickness, lineHeight),
+                )
+                CursorShape.Underline -> drawRect(
+                    color,
+                    topLeft = Offset(x, y + lineHeight - cursorThickness),
+                    size = Size(cellWidth, cursorThickness),
+                )
+            }
+        }
         BasicTextField(
-            value = "",
-            onValueChange = { if (it.isNotEmpty()) onInput(it) },
-            modifier = Modifier.size(1.dp).focusRequester(focusRequester).testTag("terminal-input"),
+            value = imeValue,
+            onValueChange = { next ->
+                if (next.composition == null && next.text.isNotEmpty()) {
+                    onInput(next.text.replace("\n", "\r"))
+                    imeValue = TextFieldValue()
+                } else {
+                    imeValue = next
+                }
+            },
+            modifier = Modifier.size(1.dp).focusRequester(focusRequester)
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    terminalKeySequence(event.key, screen?.modes?.applicationCursor == true)?.let {
+                        onInput(it)
+                        true
+                    } ?: false
+                }.testTag("terminal-input"),
             textStyle = TextStyle(color = Color.Transparent),
         )
     }
@@ -380,7 +484,6 @@ private fun buildTerminalRow(
 ): AnnotatedString = buildAnnotatedString {
     cells.forEachIndexed { col, cell ->
         if (cell.continuation) return@forEachIndexed
-        val cursor = screen?.cursor?.let { it.visible && it.row == row && it.col == col } == true
         val foreground = cell.foreground.color(default = Color(0xFFD8E6EF))
         val background = cell.background.color(default = Color.Transparent)
         val effectiveForeground = when {
@@ -390,7 +493,6 @@ private fun buildTerminalRow(
             else -> foreground
         }
         val effectiveBackground = when {
-            cursor -> Color(0xFF63D3E1).copy(alpha = 0.72f)
             cell.attributes.inverse -> foreground
             else -> background
         }
@@ -438,6 +540,8 @@ private fun ExtraKeys(screen: ScreenSnapshot?, scrollback: List<ScreenRow>, onIn
         ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
         ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
         ExtraKey("Tab") { send("\t") }
+        ExtraKey("Enter") { send("\r") }
+        ExtraKey("⌫") { send("\u007f") }
         ExtraKey("←") { send(if (applicationCursor) "\u001bOD" else "\u001b[D") }
         ExtraKey("↑") { send(if (applicationCursor) "\u001bOA" else "\u001b[A") }
         ExtraKey("↓") { send(if (applicationCursor) "\u001bOB" else "\u001b[B") }
@@ -481,7 +585,31 @@ private fun CellAttributes.span(foreground: Color, background: Color) = SpanStyl
 private fun TerminalColor.color(default: Color): Color = when (this) {
     TerminalColor.Default -> default
     is TerminalColor.Rgb -> Color(red, green, blue)
-    is TerminalColor.Indexed -> TERMINAL_PALETTE[index.coerceIn(0, 15)]
+    is TerminalColor.Indexed -> terminalIndexedColor(index)
+}
+
+internal fun terminalIndexedColor(index: Int): Color {
+    val value = index.coerceIn(0, 255)
+    if (value < 16) return TERMINAL_PALETTE[value]
+    if (value < 232) {
+        val cube = value - 16
+        val levels = intArrayOf(0, 95, 135, 175, 215, 255)
+        return Color(levels[cube / 36], levels[(cube / 6) % 6], levels[cube % 6])
+    }
+    val gray = 8 + (value - 232) * 10
+    return Color(gray, gray, gray)
+}
+
+internal fun terminalKeySequence(key: Key, applicationCursor: Boolean): String? = when (key) {
+    Key.Backspace -> "\u007f"
+    Key.Enter, Key.NumPadEnter -> "\r"
+    Key.Tab -> "\t"
+    Key.Escape -> "\u001b"
+    Key.DirectionLeft -> if (applicationCursor) "\u001bOD" else "\u001b[D"
+    Key.DirectionUp -> if (applicationCursor) "\u001bOA" else "\u001b[A"
+    Key.DirectionDown -> if (applicationCursor) "\u001bOB" else "\u001b[B"
+    Key.DirectionRight -> if (applicationCursor) "\u001bOC" else "\u001b[C"
+    else -> null
 }
 
 private fun Color.ifTransparent(fallback: Color): Color = if (alpha == 0f) fallback else this
