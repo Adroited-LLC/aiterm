@@ -1339,8 +1339,19 @@ impl VerifiedSessionFile {
             ))?;
             after_quarantine();
 
-            let quarantined = self.open_named(&quarantine)?;
-            if !same_file_identity(&self.object, &quarantined)? {
+            let quarantined = self.open_named(&quarantine).map_err(|error| {
+                format!(
+                    "could not verify quarantined session entry at {}; the replacement was not moved: {error}",
+                    quarantine_path.display()
+                )
+            })?;
+            let same_identity = same_file_identity(&self.object, &quarantined).map_err(|error| {
+                format!(
+                    "could not compare quarantined session entry identity; object remains recoverable at {}: {error}",
+                    quarantine_path.display()
+                )
+            })?;
+            if !same_identity {
                 return match rename_noreplace(
                     self.parent.as_raw_fd(),
                     &quarantine,
@@ -4221,6 +4232,68 @@ mod tests {
             std::fs::read(&original_elsewhere).unwrap(),
             b"verified original"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_inode_trash_never_moves_an_unopenable_quarantine_replacement() {
+        use std::cell::RefCell;
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-session-quarantine-open-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "15151515-1515-4515-8515-151515151515";
+        let source = project.join(format!("{id}.jsonl"));
+        let held_original = project.join("held-original.jsonl");
+        let outside = root.join("outside-sentinel");
+        std::fs::write(&source, b"verified original").unwrap();
+        std::fs::write(&outside, b"outside sentinel").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        let quarantine_path = RefCell::new(None);
+
+        let error = verified
+            .rename_to_with_hooks(
+                &trash,
+                OsStr::new(&format!("{id}.jsonl")),
+                || {},
+                || {
+                    let quarantine = std::fs::read_dir(&project)
+                        .unwrap()
+                        .flatten()
+                        .find(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .contains(".aiterm-quarantine-")
+                        })
+                        .unwrap()
+                        .path();
+                    std::fs::rename(&quarantine, &held_original).unwrap();
+                    symlink(&outside, &quarantine).unwrap();
+                    quarantine_path.replace(Some(quarantine));
+                },
+            )
+            .unwrap_err();
+
+        let quarantine = quarantine_path.into_inner().unwrap();
+        assert!(error.contains(&quarantine.to_string_lossy().to_string()));
+        assert!(std::fs::symlink_metadata(&quarantine)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
+        assert_eq!(std::fs::read(&held_original).unwrap(), b"verified original");
+        assert!(!source.exists());
+        assert!(!trash_path.join(format!("{id}.jsonl")).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
