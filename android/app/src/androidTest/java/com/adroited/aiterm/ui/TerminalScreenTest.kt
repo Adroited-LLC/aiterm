@@ -1,8 +1,15 @@
 package com.adroited.aiterm.ui
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -50,10 +57,40 @@ class TerminalScreenTest {
 
         compose.onNodeWithTag("terminal-grid").assertIsDisplayed()
         compose.onNodeWithText("hello").assertIsDisplayed()
-        compose.onNodeWithText("CONNECTED").assertIsDisplayed()
+        compose.onAllNodesWithText("CONNECTED").onFirst().assertIsDisplayed()
         compose.onNodeWithText("Esc").assertIsDisplayed()
         compose.onNodeWithText("Take Focus").performClick()
 
         assertTrue(focusRequested)
+    }
+
+    @Test
+    fun portraitToLandscapeConstraintsKeepTheScreenAndReportANewCanonicalViewport() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        val landscape = mutableStateOf(false)
+        compose.setContent {
+            Box(Modifier.size(if (landscape.value) 800.dp else 400.dp, if (landscape.value) 400.dp else 800.dp)) {
+                TerminalScreenContent(
+                    state = RemoteClientState(connection = ConnectionState.Connected),
+                    screen = ScreenSnapshot(
+                        tabId = "tab-rotation",
+                        revision = 8,
+                        cols = 6,
+                        rows = 1,
+                        visible = listOf(ScreenRow("rotate".map { ScreenCell(it.toString()) })),
+                        cursor = CursorState(0, 0, true),
+                    ),
+                    onResize = { cols, rows -> sizes += cols to rows },
+                )
+            }
+        }
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
+        val initial = sizes.last()
+
+        compose.runOnIdle { landscape.value = true }
+        compose.waitUntil(8_000) { sizes.any { it != initial } }
+
+        compose.onNodeWithText("rotate").assertIsDisplayed()
+        assertTrue(sizes.any { it != initial })
     }
 }

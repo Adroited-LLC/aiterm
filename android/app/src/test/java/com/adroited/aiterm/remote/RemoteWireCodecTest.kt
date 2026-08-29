@@ -136,6 +136,33 @@ class RemoteWireCodecTest {
         assertEquals(true, snapshot.visible.single().cells.single().attributes.bold)
     }
 
+    @Test
+    fun rosterDescriptorUsesTheRustCamelCaseFieldContract() {
+        val payload = fixture(
+            linkedMapOf(
+                "transfer_id" to "roster-1",
+                "revision" to 12,
+                "index" to 0,
+                "total" to 1,
+                "tabs" to listOf(
+                    linkedMapOf(
+                        "id" to "tab-1",
+                        "title" to "Shell",
+                        "sessionId" to "session-1",
+                        "size" to linkedMapOf("cols" to 80, "rows" to 24),
+                        "focus" to "self",
+                        "state" to "running",
+                    ),
+                ),
+            ),
+        )
+
+        val chunk = RemoteWireCodec.decodeStateSnapshot(payload)
+
+        assertEquals("session-1", chunk.tabs.single().sessionId)
+        assertEquals(WireFocusOwner.Self, chunk.tabs.single().focus)
+    }
+
     private fun fixture(value: Any?): ByteArray {
         val output = ByteArrayOutputStream()
         fun writeHeader(major: Int, size: Int) {

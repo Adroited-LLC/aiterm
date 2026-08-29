@@ -3,6 +3,7 @@ package com.adroited.aiterm.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -21,6 +22,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DrawerValue
@@ -52,6 +54,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -68,16 +71,20 @@ import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.terminal.CellAttributes
 import com.adroited.aiterm.terminal.ScreenCell
 import com.adroited.aiterm.terminal.ScreenSnapshot
+import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.TerminalColor
 import kotlinx.coroutines.launch
+import java.net.URI
 
 @Composable
 fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     val screen by viewModel.client.screen.collectAsStateWithLifecycle()
+    val scrollback by viewModel.client.scrollback.collectAsStateWithLifecycle()
     TerminalScreenContent(
         state = state,
         screen = screen,
+        scrollback = scrollback,
         onBack = onBack,
         onReconnect = viewModel::reconnect,
         onSelectTab = viewModel::selectTab,
@@ -87,9 +94,11 @@ fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit)
         onForkSession = viewModel::forkSession,
         onDeleteSession = viewModel::deleteSession,
         onOpenShell = { cols, rows -> viewModel.openShell(null, cols, rows) },
+        onStartAgent = { agent, cwd, cols, rows -> viewModel.startAgent(agent, cwd, cols, rows) },
         onInput = viewModel::sendInput,
         onTakeFocus = viewModel::takeFocus,
         onResize = viewModel::resize,
+        onLoadScrollback = viewModel::loadOlderScrollback,
     )
 }
 
@@ -98,6 +107,7 @@ fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit)
 fun TerminalScreenContent(
     state: RemoteClientState,
     screen: ScreenSnapshot?,
+    scrollback: List<ScreenRow> = emptyList(),
     onBack: () -> Unit = {},
     onReconnect: () -> Unit = {},
     onSelectTab: (String) -> Unit = {},
@@ -107,9 +117,11 @@ fun TerminalScreenContent(
     onForkSession: (String) -> Unit = {},
     onDeleteSession: (String) -> Unit = {},
     onOpenShell: (Int, Int) -> Unit = { _, _ -> },
+    onStartAgent: (com.adroited.aiterm.remote.RemoteAgentChoice, String, Int, Int) -> Unit = { _, _, _, _ -> },
     onInput: (String) -> Unit = {},
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
     onResize: (Int, Int) -> Unit = { _, _ -> },
+    onLoadScrollback: () -> Unit = {},
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
@@ -135,6 +147,7 @@ fun TerminalScreenContent(
                     onForkSession = onForkSession,
                     onDeleteSession = { id -> deleteTarget = state.sessions.firstOrNull { it.id == id } },
                     onOpenShell = { onOpenShell(cols, rows) },
+                    onStartAgent = { agent, cwd -> onStartAgent(agent, cwd, cols, rows) },
                 )
             }
         },
@@ -173,6 +186,7 @@ fun TerminalScreenContent(
                     }
                     TerminalGrid(
                         screen = screen,
+                        scrollback = scrollback,
                         modifier = Modifier.fillMaxSize(),
                         onInput = onInput,
                     )
@@ -190,7 +204,13 @@ fun TerminalScreenContent(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
                     ) { Text("Take Focus") }
                 }
-                ExtraKeys(screen, onInput)
+                if (screen != null) {
+                    TextButton(
+                        onClick = onLoadScrollback,
+                        modifier = Modifier.fillMaxWidth().height(36.dp).testTag("load-scrollback"),
+                    ) { Text("Load older history · ${scrollback.size} rows") }
+                }
+                ExtraKeys(screen, scrollback, onInput)
             }
         }
     }
@@ -241,6 +261,7 @@ private fun SessionDrawer(
     onForkSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
     onOpenShell: () -> Unit,
+    onStartAgent: (com.adroited.aiterm.remote.RemoteAgentChoice, String) -> Unit,
 ) {
     Text("LIVE TABS", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.labelMedium)
     state.tabs.forEach { tab ->
@@ -261,6 +282,31 @@ private fun SessionDrawer(
         Text("New shell ${cols}×${rows}")
     }
     HorizontalDivider(Modifier.padding(vertical = 12.dp))
+    val launchPath = state.sessions.firstOrNull()?.projectPath
+    if (state.agents.isNotEmpty() && launchPath != null) {
+        Text("NEW AGENT", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
+        state.agents.forEach { agent ->
+            Column(Modifier.padding(horizontal = 12.dp)) {
+                TextButton(onClick = { onStartAgent(agent, launchPath) }) {
+                    Text("Start ${agent.displayName} · ${agent.models.firstOrNull()?.displayName ?: "default"}")
+                }
+                val caps = state.agentCaps[agent.id]
+                if (caps != null) {
+                    Text(
+                        listOfNotNull(
+                            "resume".takeIf { caps.resume },
+                            "fork".takeIf { caps.fork },
+                            "tasks".takeIf { caps.tasks },
+                            "delete".takeIf { caps.delete },
+                        ).joinToString(" · ").ifBlank { "terminal only" },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        HorizontalDivider(Modifier.padding(vertical = 12.dp))
+    }
     Text("SESSIONS", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
     LazyColumn(modifier = Modifier.fillMaxHeight()) {
         items(state.sessions, key = RemoteSession::id) { session ->
@@ -281,6 +327,7 @@ private fun SessionDrawer(
 @Composable
 private fun TerminalGrid(
     screen: ScreenSnapshot?,
+    scrollback: List<ScreenRow>,
     modifier: Modifier,
     onInput: (String) -> Unit,
 ) {
@@ -292,19 +339,14 @@ private fun TerminalGrid(
             keyboard?.show()
         }.padding(horizontal = 4.dp, vertical = 3.dp).testTag("terminal-grid"),
     ) {
-        Column {
-            screen?.visible?.forEachIndexed { rowIndex, row ->
-                BasicText(
-                    text = buildTerminalRow(row.cells, rowIndex, screen),
-                    style = TextStyle(
-                        color = Color(0xFFD8E6EF),
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 13.sp,
-                        lineHeight = 16.sp,
-                    ),
-                    maxLines = 1,
-                    softWrap = false,
-                )
+        SelectionContainer {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                scrollback.asReversed().forEach { row ->
+                    TerminalRowText(buildTerminalRow(row.cells, -1, screen))
+                }
+                screen?.visible?.forEachIndexed { rowIndex, row ->
+                    TerminalRowText(buildTerminalRow(row.cells, rowIndex, screen))
+                }
             }
         }
         BasicTextField(
@@ -316,14 +358,29 @@ private fun TerminalGrid(
     }
 }
 
+@Composable
+private fun TerminalRowText(row: AnnotatedString) {
+    BasicText(
+        text = row,
+        style = TextStyle(
+            color = Color(0xFFD8E6EF),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 13.sp,
+            lineHeight = 16.sp,
+        ),
+        maxLines = 1,
+        softWrap = false,
+    )
+}
+
 private fun buildTerminalRow(
     cells: List<ScreenCell>,
     row: Int,
-    screen: ScreenSnapshot,
+    screen: ScreenSnapshot?,
 ): AnnotatedString = buildAnnotatedString {
     cells.forEachIndexed { col, cell ->
         if (cell.continuation) return@forEachIndexed
-        val cursor = screen.cursor.visible && screen.cursor.row == row && screen.cursor.col == col
+        val cursor = screen?.cursor?.let { it.visible && it.row == row && it.col == col } == true
         val foreground = cell.foreground.color(default = Color(0xFFD8E6EF))
         val background = cell.background.color(default = Color.Transparent)
         val effectiveForeground = when {
@@ -341,10 +398,21 @@ private fun buildTerminalRow(
         append(cell.text)
         pop()
     }
+    SAFE_LINK.findAll(toString()).forEach { match ->
+        val candidate = match.value.trimEnd('.', ',', ')', ']', '}')
+        if (candidate.length <= 2_048 && isSafeRemoteLink(candidate)) {
+            addLink(LinkAnnotation.Url(candidate), match.range.first, match.range.first + candidate.length)
+            addStyle(
+                SpanStyle(color = Color(0xFF74D9EA), textDecoration = TextDecoration.Underline),
+                match.range.first,
+                match.range.first + candidate.length,
+            )
+        }
+    }
 }
 
 @Composable
-private fun ExtraKeys(screen: ScreenSnapshot?, onInput: (String) -> Unit) {
+private fun ExtraKeys(screen: ScreenSnapshot?, scrollback: List<ScreenRow>, onInput: (String) -> Unit) {
     var control by remember { mutableStateOf(false) }
     var alt by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
@@ -383,6 +451,11 @@ private fun ExtraKeys(screen: ScreenSnapshot?, onInput: (String) -> Unit) {
             clipboard.getText()?.text?.let { text ->
                 send(if (screen?.modes?.bracketedPaste == true) "\u001b[200~$text\u001b[201~" else text)
             }
+        }
+        ExtraKey("Copy screen") {
+            val text = (scrollback.asReversed() + (screen?.visible ?: emptyList()))
+                .joinToString("\n", transform = ScreenRow::plainText)
+            clipboard.setText(AnnotatedString(text))
         }
     }
 }
@@ -435,3 +508,12 @@ private val TERMINAL_PALETTE = listOf(
     Color(0xFF536575), Color(0xFFFF7378), Color(0xFF70D9B7), Color(0xFFFFCC66),
     Color(0xFF79AFFF), Color(0xFFD892EA), Color(0xFF74D9EA), Color(0xFFFFFFFF),
 )
+
+private val SAFE_LINK = Regex("https?://[^\\s<>{}\\[\\]\\\"']+")
+
+internal fun isSafeRemoteLink(candidate: String): Boolean = try {
+    val uri = URI(candidate)
+    uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank() && uri.userInfo == null
+} catch (_: Exception) {
+    false
+}

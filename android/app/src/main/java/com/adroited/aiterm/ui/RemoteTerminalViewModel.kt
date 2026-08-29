@@ -53,7 +53,10 @@ class RemoteTerminalViewModel(
 
     fun reconnect() {
         viewModelScope.launch {
-            if (client.connect()) client.refreshSessions()
+            if (client.connect()) {
+                client.refreshSessions()
+                client.refreshAgents()
+            }
         }
     }
 
@@ -61,6 +64,7 @@ class RemoteTerminalViewModel(
     fun sendInput(text: String) = client.sendInput(text)
     fun takeFocus(cols: Int, rows: Int) = client.takeFocus(TerminalSize(cols, rows))
     fun resize(cols: Int, rows: Int) = client.resize(TerminalSize(cols, rows))
+    fun loadOlderScrollback() = client.requestNextScrollbackPage()
     fun openSession(id: String, cols: Int, rows: Int) =
         client.openSession(id, TerminalSize(cols, rows))
     fun stopSession(id: String) = client.stopSession(id)
@@ -69,6 +73,8 @@ class RemoteTerminalViewModel(
     fun closeTab(id: String) = client.closeTab(id)
     fun openShell(projectPath: String?, cols: Int, rows: Int) =
         client.openShell(projectPath, TerminalSize(cols, rows))
+    fun startAgent(agent: com.adroited.aiterm.remote.RemoteAgentChoice, cwd: String, cols: Int, rows: Int) =
+        client.startAgent(agent, cwd, TerminalSize(cols, rows))
 
     override fun onCleared() {
         client.lock()

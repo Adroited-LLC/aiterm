@@ -140,6 +140,51 @@ class RemoteClientTest {
         assertEquals(ConnectionState.Connected, client.state.value.connection)
         client.lock()
     }
+
+    @Test
+    fun completeScrollbackPageIsPublishedOnlyForTheVisibleTab() = runTest {
+        val store = DefaultTerminalScreenStore()
+        store.replace(
+            ScreenSnapshot(
+                tabId = "tab-1",
+                revision = 5,
+                cols = 4,
+                rows = 1,
+                visible = listOf(ScreenRow(listOf(ScreenCell("live")))),
+                cursor = CursorState(0, 0, true),
+            ),
+        )
+        val client = RemoteClient(
+            transportFactory = { FakeRemoteTransport() },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        client.acceptForTest(
+            RemoteServerEvent.TerminalChunk(
+                TerminalTransferChunk(
+                    transferId = "history-1",
+                    tabId = "tab-1",
+                    attachmentId = "attachment-1",
+                    kind = TerminalTransferKind.Scrollback,
+                    baseRevision = 5,
+                    finalRevision = 5,
+                    rowStart = 0,
+                    rowEnd = 1,
+                    index = 0,
+                    total = 1,
+                    requestId = 3,
+                    part = TerminalTransferPart.Scrollback(
+                        listOf(ScreenRow(listOf(ScreenCell("old")))),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(listOf("old"), client.scrollback.value.map(ScreenRow::plainText))
+    }
 }
 
 private class FakeRemoteTransport : RemoteTransport {

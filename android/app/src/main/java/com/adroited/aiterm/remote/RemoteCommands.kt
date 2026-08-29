@@ -34,6 +34,42 @@ data class RemoteFocusEvent(
     val size: TerminalSize,
 )
 
+data class RemoteTitleEvent(val tabId: String, val attachmentId: String, val title: String)
+
+@Serializable
+data class RemoteModelOption(
+    val id: String,
+    @SerialName("display_name") val displayName: String,
+    val efforts: List<String>,
+    @SerialName("default_effort") val defaultEffort: String? = null,
+)
+
+@Serializable
+data class RemoteAgentChoice(
+    val id: String,
+    @SerialName("display_name") val displayName: String,
+    val models: List<RemoteModelOption>,
+    @SerialName("mints_session_id") val mintsSessionId: Boolean,
+)
+
+@Serializable
+data class RemoteAgentCaps(
+    val fork: Boolean,
+    val clear: Boolean,
+    val resume: Boolean,
+    @SerialName("tui_drive") val tuiDrive: Boolean,
+    val panels: Boolean,
+    val tasks: Boolean,
+    val delete: Boolean,
+    val config: Boolean,
+    @SerialName("roster_liveness") val rosterLiveness: Boolean,
+)
+
+data class RemoteAgentRoster(
+    val agents: List<RemoteAgentChoice>,
+    val caps: Map<String, RemoteAgentCaps>,
+)
+
 @OptIn(ExperimentalSerializationApi::class)
 object RemoteCommands {
     private val cbor = Cbor {
@@ -59,11 +95,30 @@ object RemoteCommands {
         encode(SessionClosePayload.serializer(), SessionClosePayload(sessionId, tabId))
     fun shell(projectPath: String?, title: String?, size: TerminalSize): ByteArray =
         encode(TabOpenPayload.serializer(), TabOpenPayload(projectPath = projectPath, title = title, size = size))
+    fun startAgent(
+        agentId: String,
+        model: String?,
+        effort: String?,
+        cwd: String,
+        title: String,
+        size: TerminalSize,
+    ): ByteArray = encode(
+        AgentStartPayload.serializer(),
+        AgentStartPayload(agentId = agentId, model = model, effort = effort, cwd = cwd, title = title, size = size),
+    )
 
     fun sessions(payload: ByteArray): List<RemoteSession> =
         decode(SessionListReply.serializer(), payload).sessions.also { sessions ->
             if (sessions.size > 4_096 || sessions.any { it.id.length !in 1..512 }) malformed()
         }
+
+    fun tabs(payload: ByteArray): List<RemoteTab> = decode(TabListReply.serializer(), payload).tabs.also {
+        if (it.size > 128) malformed()
+    }
+    fun agents(payload: ByteArray): RemoteAgentRoster = decode(AgentListReply.serializer(), payload).let {
+        if (it.agents.size > 64 || it.caps.size > 64) malformed()
+        RemoteAgentRoster(it.agents, it.caps)
+    }
 
     fun attached(payload: ByteArray): AttachedTerminal = decode(AttachedReply.serializer(), payload).let {
         if (it.tabId.isBlank() || it.attachmentId.isBlank() || it.title.length > 4_096) malformed()
@@ -72,6 +127,7 @@ object RemoteCommands {
 
     fun openedTab(payload: ByteArray): String = decode(TabOpenedReply.serializer(), payload).tabId
     fun openedSessionTab(payload: ByteArray): String = decode(SessionOpenedReply.serializer(), payload).tabId
+    fun startedAgentTab(payload: ByteArray): String = decode(AgentStartedReply.serializer(), payload).tabId
 
     fun focus(payload: ByteArray): RemoteFocusEvent = decode(FocusReply.serializer(), payload).let {
         RemoteFocusEvent(
@@ -84,6 +140,11 @@ object RemoteCommands {
             },
             it.size,
         )
+    }
+
+    fun title(payload: ByteArray): RemoteTitleEvent = decode(TitleReply.serializer(), payload).let {
+        if (it.title.length > 4_096) malformed()
+        RemoteTitleEvent(it.tabId, it.attachmentId, it.title)
     }
 
     private fun <T> encode(serializer: kotlinx.serialization.KSerializer<T>, value: T): ByteArray =
@@ -136,7 +197,21 @@ object RemoteCommands {
         val title: String?,
         val size: TerminalSize,
     )
+    @Serializable private data class AgentStartPayload(
+        val action: String = "start",
+        @SerialName("agent_id") val agentId: String,
+        val model: String?,
+        val effort: String?,
+        val cwd: String,
+        val title: String,
+        val size: TerminalSize,
+    )
     @Serializable private data class SessionListReply(val sessions: List<RemoteSession>)
+    @Serializable private data class TabListReply(val tabs: List<RemoteTab>)
+    @Serializable private data class AgentListReply(
+        val agents: List<RemoteAgentChoice>,
+        val caps: Map<String, RemoteAgentCaps>,
+    )
     @Serializable private data class AttachedReply(
         @SerialName("tab_id") val tabId: String,
         @SerialName("attachment_id") val attachmentId: String,
@@ -148,10 +223,19 @@ object RemoteCommands {
         @SerialName("tab_id") val tabId: String,
         @SerialName("selected_existing") val selectedExisting: Boolean,
     )
+    @Serializable private data class AgentStartedReply(
+        @SerialName("tab_id") val tabId: String,
+        @SerialName("session_id") val sessionId: String?,
+    )
     @Serializable private data class FocusReply(
         @SerialName("tab_id") val tabId: String,
         @SerialName("attachment_id") val attachmentId: String,
         val focus: WireFocusOwner,
         val size: TerminalSize,
+    )
+    @Serializable private data class TitleReply(
+        @SerialName("tab_id") val tabId: String,
+        @SerialName("attachment_id") val attachmentId: String,
+        val title: String,
     )
 }

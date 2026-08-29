@@ -139,11 +139,13 @@ class AuthenticatedRemoteTransport(
         when (event.kind) {
             "terminal.snapshot", "terminal.diff", "terminal.scrollback" -> {
                 requireKnownCorrelation(event.requestId)
+                val chunk = RemoteWireCodec.decodeTerminalChunk(event.payload, event.requestId)
                 emitOrClose(
-                    RemoteServerEvent.TerminalChunk(
-                        RemoteWireCodec.decodeTerminalChunk(event.payload, event.requestId),
-                    ),
+                    RemoteServerEvent.TerminalChunk(chunk),
                 )
+                if (chunk.kind == TerminalTransferKind.Scrollback && chunk.index + 1 == chunk.total &&
+                    event.requestId > 0
+                ) completeTransferOnlyRequest(event)
             }
             "state.snapshot" -> {
                 if (event.requestId != 0L) protocolFailure()
@@ -165,6 +167,13 @@ class AuthenticatedRemoteTransport(
         if (event.kind != request.kind) protocolFailure()
         rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Success(event.requestId, event.kind, event.payload))
+    }
+
+    private fun completeTransferOnlyRequest(event: RemoteEventEnvelope) {
+        val request = synchronized(stateLock) { pending.remove(event.requestId) } ?: protocolFailure()
+        if (request.kind != "terminal.scrollback") protocolFailure()
+        rememberCompleted(event.requestId)
+        request.deferred.complete(RemoteResponse.Success(event.requestId, request.kind, event.payload))
     }
 
     private fun acceptError(event: RemoteEventEnvelope) {

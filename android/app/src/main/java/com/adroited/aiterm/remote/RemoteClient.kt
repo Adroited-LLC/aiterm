@@ -2,6 +2,7 @@ package com.adroited.aiterm.remote
 
 import com.adroited.aiterm.terminal.TerminalScreenStore
 import com.adroited.aiterm.terminal.ApplyResult
+import com.adroited.aiterm.terminal.ScreenRow
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -34,6 +35,8 @@ data class RemoteClientState(
     val pendingTransfers: Int = 0,
     val tabs: List<RemoteTab> = emptyList(),
     val sessions: List<RemoteSession> = emptyList(),
+    val agents: List<RemoteAgentChoice> = emptyList(),
+    val agentCaps: Map<String, RemoteAgentCaps> = emptyMap(),
     val activeTabId: String? = null,
     val activeTitle: String? = null,
     val lastError: String? = null,
@@ -88,6 +91,8 @@ class RemoteClient(
     private val mutableState = MutableStateFlow(RemoteClientState())
     val state: StateFlow<RemoteClientState> = mutableState.asStateFlow()
     val screen = screenStore.screen
+    private val mutableScrollback = MutableStateFlow<List<ScreenRow>>(emptyList())
+    val scrollback: StateFlow<List<ScreenRow>> = mutableScrollback.asStateFlow()
     private val nextRequestId = AtomicLong(1)
     private val transfers = linkedSetOf<String>()
     private val terminalAssembler = TerminalTransferAssembler()
@@ -117,6 +122,8 @@ class RemoteClient(
             candidate.connect()
             mutableState.value = mutableState.value.copy(connection = ConnectionState.Connected)
             eventJob = scope.launch(dispatcher) { candidate.events.collect(::accept) }
+            mutableState.value.activeTabId?.let(::selectTab)
+            if (mutableState.value.sessions.isNotEmpty()) refreshSessions()
             true
         } catch (error: Exception) {
             candidate.close()
@@ -149,6 +156,7 @@ class RemoteClient(
         if (tabId == mutableState.value.activeTabId && activeAttachmentId != null) return
         launchRequest("terminal.attach", RemoteCommands.tab(tabId)) { payload ->
             val attached = RemoteCommands.attached(payload)
+            if (attached.tabId != mutableState.value.activeTabId) mutableScrollback.value = emptyList()
             activeAttachmentId = attached.attachmentId
             mutableState.value = mutableState.value.copy(
                 activeTabId = attached.tabId,
@@ -183,9 +191,25 @@ class RemoteClient(
         return true
     }
 
+    fun requestNextScrollbackPage(count: Int = 128): Boolean =
+        requestScrollback(mutableScrollback.value.size, count)
+
     fun refreshSessions() {
         launchRequest("session.list", byteArrayOf()) { payload ->
             mutableState.value = mutableState.value.copy(sessions = RemoteCommands.sessions(payload))
+        }
+    }
+
+    fun refreshTabs() {
+        launchRequest("tab.list", byteArrayOf()) { payload ->
+            mutableState.value = mutableState.value.copy(tabs = RemoteCommands.tabs(payload))
+        }
+    }
+
+    fun refreshAgents() {
+        launchRequest("agent.list", byteArrayOf()) { payload ->
+            val roster = RemoteCommands.agents(payload)
+            mutableState.value = mutableState.value.copy(agents = roster.agents, agentCaps = roster.caps)
         }
     }
 
@@ -209,6 +233,21 @@ class RemoteClient(
         }
     }
 
+    fun startAgent(agent: RemoteAgentChoice, cwd: String, size: TerminalSize) {
+        val model = agent.models.firstOrNull()
+        launchRequest(
+            "agent.action",
+            RemoteCommands.startAgent(
+                agentId = agent.id,
+                model = model?.id,
+                effort = model?.defaultEffort,
+                cwd = cwd,
+                title = agent.displayName,
+                size = size,
+            ),
+        ) { payload -> selectTab(RemoteCommands.startedAgentTab(payload)) }
+    }
+
     private fun sessionMutation(kind: String, sessionId: String) {
         launchRequest(kind, RemoteCommands.session(sessionId)) { refreshSessions() }
     }
@@ -223,6 +262,7 @@ class RemoteClient(
         recoveryRequested = false
         activeAttachmentId = null
         screenStore.clear()
+        mutableScrollback.value = emptyList()
         mutableState.value = RemoteClientState(connection = ConnectionState.Locked)
     }
 
@@ -290,6 +330,7 @@ class RemoteClient(
                 recoveryRequested = false
                 activeAttachmentId = null
                 screenStore.clear()
+                mutableScrollback.value = emptyList()
                 mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
             }
         }
@@ -304,6 +345,14 @@ class RemoteClient(
                 }
             }
             "session.changed" -> refreshSessions()
+            "agent.changed" -> refreshAgents()
+            "tab.changed" -> refreshTabs()
+            "terminal.title" -> {
+                val title = RemoteCommands.title(event.payload)
+                if (title.attachmentId == activeAttachmentId && title.tabId == mutableState.value.activeTabId) {
+                    mutableState.value = mutableState.value.copy(activeTitle = title.title)
+                }
+            }
             else -> Unit
         }
     }
@@ -343,6 +392,9 @@ class RemoteClient(
             TerminalTransferResult.Recover -> requestRecovery(chunk.tabId, chunk.attachmentId)
             is TerminalTransferResult.Snapshot -> {
                 try {
+                    if (screenStore.screen.value?.tabId != result.snapshot.tabId) {
+                        mutableScrollback.value = emptyList()
+                    }
                     screenStore.replace(result.snapshot)
                     recoveryRequested = false
                     mutableState.value = mutableState.value.copy(pendingTransfers = 0)
@@ -358,6 +410,9 @@ class RemoteClient(
             }
             is TerminalTransferResult.Scrollback -> {
                 mutableState.value = mutableState.value.copy(pendingTransfers = 0)
+                if (result.tabId == screenStore.screen.value?.tabId) {
+                    mutableScrollback.value = (mutableScrollback.value + result.rows).take(MAX_SCROLLBACK_ROWS)
+                }
             }
         }
     }
@@ -396,6 +451,7 @@ class RemoteClient(
     private companion object {
         const val MAX_PENDING_TRANSFERS = 4
         const val MAX_INPUT_BYTES = 64 * 1_024
+        const val MAX_SCROLLBACK_ROWS = 5_000
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }
