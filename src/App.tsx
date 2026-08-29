@@ -2019,6 +2019,7 @@ export default function App() {
           <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
           <Clock />
         </div>
+        <div className="topbar-spacer" />
         <div className="topbar-right">
           <button className="icon-btn" title="Smaller fonts (Ctrl+-)" onClick={() => bumpFont(-1)}>A−</button>
           <button

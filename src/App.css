@@ -78,6 +78,9 @@ body.dragging * { pointer-events: none; }
 /* The panel toggles share the line with the usage strip and were a size down
    from its numbers; glyphs like ⎇ and ☑ need the extra pixels to read. */
 .topbar-left .icon-btn { font-size: 15px; }
+/* Takes all the free width, so the right-hand group is at the right edge
+   whatever the left one holds. */
+.topbar-spacer { flex: 1; min-width: 8px; }
 .topbar-right { display: flex; gap: 2px; align-items: center; margin-left: auto; }
 .topbar-right .icon-btn { font-size: 11px; }
 
