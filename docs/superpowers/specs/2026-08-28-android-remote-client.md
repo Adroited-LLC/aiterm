@@ -5,7 +5,7 @@
 Add a native Android companion app that lets a paired phone securely use the
 same AITerm desktop instance over a LAN or user-provided VPN. The phone is a
 full interactive client: it can inspect and manage sessions and agents, open
-and close terminal tabs, and send and receive terminal bytes.
+and close terminal tabs, and interact with the desktop-owned terminal screen.
 
 ## Scope
 
@@ -27,18 +27,64 @@ Android AITerm (Kotlin / Compose)
         v
 AITerm desktop gateway (Rust, loopback disabled, LAN/VPN listener)
         |  one internal command/service API
-        +------------------------------+
-        | existing session/agent/PTTY  |
-        | implementation               |
-        +------------------------------+
+        +----------------------------------+
+        | Rust tab registry + screen model |
+        | session / agent / PTY services   |
+        +----------------------------------+
 ```
 
 The desktop gateway is an adapter over service functions extracted from the
 current Tauri commands. Tauri commands and remote RPC handlers must call the
 same service functions; neither client may reach the other's transport layer.
-PTYs remain owned by the desktop process. A terminal subscription has an
-independent server-generated stream id and does not expose the internal PTY id
-to Android.
+PTYs remain owned by the desktop process.
+
+Rust, rather than the React renderer, is authoritative for terminal-tab
+identity, lifecycle, metadata, PTY mapping, input ownership, canonical terminal
+dimensions, and terminal screen state. The desktop renderer keeps only
+presentation state such as the selected tab, open file views, badges, and panel
+visibility. It obtains the authoritative tab list and tab changes from Rust.
+Android addresses a random, stable `TabId`; neither client sees the internal
+numeric PTY id.
+
+## Rust-owned tabs and terminal state
+
+Every terminal starts through a `TabRegistry`. A tab record contains its
+`TabId`, title, working directory, launch/session/agent metadata, process state,
+canonical rows and columns, input owner, PTY mapping, and terminal screen. The
+registry creates and closes PTYs, accepts metadata changes from session hooks,
+and broadcasts typed tab events. Existing `pty_*` Tauri commands become thin
+adapters during migration and are removed once every desktop call site uses the
+registry.
+
+The registry parses every PTY output byte from the moment the PTY starts,
+whether Remote Access is enabled or a phone is connected. Parsing on demand is
+not sufficient: escape sequences that established the current screen may have
+occurred long before a phone attaches. The Rust screen model is bounded by the
+configured viewport and scrollback limits and supports the normal and alternate
+screen, Unicode wide and combining cells, indexed and RGB colors, text
+attributes, cursor state, input modes, title changes, and terminal replies.
+
+The implementation uses an exact, reviewed `alacritty_terminal` version behind
+an AITerm-owned adapter and uses only its parser, terminal, grid, damage, and
+event interfaces; AITerm keeps its existing `portable-pty` process lifecycle.
+This boundary keeps a future emulator upgrade out of the tab, gateway, and wire
+protocol APIs.
+
+The desktop continues to render raw PTY bytes with xterm.js so this change does
+not replace its mature renderer. Android never receives those bytes. Rust
+serializes its canonical screen into snapshots and diffs for the Compose
+renderer. Terminal-query replies have one source: xterm.js replies while a
+desktop attachment owns input; Rust replies while a remote attachment owns
+input or no renderer is attached. Losing focus also disables that attachment's
+writes and resizes, so the discarded xterm.js reply cannot race the Rust reply.
+
+Only one attachment may own input and size at a time. The owner selects the
+canonical PTY dimensions. Other clients render that grid read-only without
+resizing it underneath the owner. Taking focus is explicit and broadcasts the
+new owner and dimensions to all attachments. A `TabId` is stable for the life
+of its tab but is not persisted across a desktop restart, because the PTY it
+identifies does not survive that restart. Conversation session ids remain the
+persistent identity used to resume work.
 
 ## Pairing and trust
 
@@ -55,11 +101,12 @@ to Android.
    P-256 public key and requested device name with the enrollment secret.
 5. Desktop displays the request and requires explicit approval. On approval it
    assigns a random device id, persists the Android public key and metadata,
-   and returns a signed device certificate / refresh credential restricted to
-   that device. The enrollment secret is consumed whether approval succeeds or
-   fails.
-6. Android stores the device credential and private key in Android Keystore;
-   keys require `BIOMETRIC_STRONG | DEVICE_CREDENTIAL` user authentication.
+   and returns that non-secret device id. Future authentication requires a
+   signature from the enrolled private key; there is no bearer refresh token.
+   The enrollment secret is consumed whether approval succeeds or fails.
+6. Android stores the private key in Android Keystore and stores the device id
+   and desktop metadata in private application storage; key use requires
+   `BIOMETRIC_STRONG | DEVICE_CREDENTIAL` user authentication.
    The app locks after five minutes in the background and requires biometric or
    device-PIN authentication before reconnecting or displaying terminal data.
 
@@ -129,26 +176,41 @@ binary CBOR envelopes:
 ```
 
 Client requests include `session.list`, `session.preview`, `session.open`,
-`session.close`, `session.delete`, `session.fork`, `session.stop`,
-`agent.list`, `agent.action`, `terminal.attach`, `terminal.input`,
-`terminal.resize`, and `terminal.detach`. The exact first-release command set
-is constrained to actions already exposed by AITerm desktop; sensitive
+`session.delete`, `session.fork`, `session.stop`, `agent.list`, `agent.action`,
+`tab.list`, `tab.open`, `tab.close`, `terminal.attach`, `terminal.input`,
+`terminal.resize`, `terminal.focus`, `terminal.scrollback`, and
+`terminal.detach`. Opening or resuming a session creates or selects a Rust tab;
+session ids and tab ids remain different types. The exact first-release command
+set is constrained to actions already exposed by AITerm desktop; sensitive
 desktop-only actions (settings-file writes, font installation, arbitrary file
 system writes, and diagnostic toggles) stay local until their permissions and
 UX are separately designed.
 
-Server events include `snapshot`, `session.changed`, `agent.changed`,
-`terminal.output`, `terminal.exited`, `terminal.title`, and `error`. Terminal
-output contains raw bytes. The server maintains a bounded per-stream replay
-buffer (1 MiB); an attach response includes a full terminal snapshot, then the
-stream sequence number. A reconnect asks for output after its last acknowledged
-sequence; if the buffer has rolled over, the server sends a fresh snapshot.
+Server events include `state.snapshot`, `session.changed`, `agent.changed`,
+`tab.changed`, `terminal.snapshot`, `terminal.diff`, `terminal.exited`,
+`terminal.title`, `terminal.focus_changed`, and `error`. Terminal frames contain
+screen cells, not PTY bytes.
 
-Only one client may hold input focus for a terminal at once. Attaching a second
-client remains read-capable but its input requests are rejected with
-`terminal.input_not_owned` until it explicitly takes focus. Taking focus emits
-an event to every attached client. This avoids accidental concurrent typing
-from desktop and phone while preserving visibility everywhere.
+A `terminal.snapshot` contains `tab_id`, monotonically increasing `revision`,
+rows, columns, the visible rows, cursor, terminal modes, and enough bounded
+scrollback to populate the initial phone view. Each cell contains its UTF-8
+grapheme, display width, foreground/background color, and attribute flags.
+Continuation cells for wide glyphs are explicit. Further scrollback is fetched
+in bounded pages without mutating the canonical live viewport.
+
+A `terminal.diff` contains `tab_id`, `base_revision`, `revision`, changed rows,
+and any changed cursor, mode, title, or focus data. Rust coalesces PTY damage to
+at most one event per display frame and initially transmits complete changed
+rows; run-level compression may be added without changing the envelope. The
+phone applies a diff only when `base_revision` equals its current revision. An
+attach, reconnect, unknown revision, dropped event, resize, or revision mismatch
+gets a new snapshot instead of replaying terminal bytes. This makes recovery
+independent of which historical escape sequences are still buffered.
+
+Attaching a second client remains read-capable but its input and resize requests
+are rejected with `terminal.input_not_owned` until it explicitly takes focus.
+Taking focus emits an event to every attached client. This avoids accidental
+concurrent typing while preserving visibility everywhere.
 
 All protocol parsers enforce maximum frame sizes, strict version checks,
 request rate limits, input and terminal-size bounds, and request-id replay
@@ -167,11 +229,13 @@ The app has four primary states:
 - **Connected:** a phone-optimized session drawer, active terminal, agent
   summary, and overflow actions.
 
-The terminal uses a native Kotlin terminal emulator component that consumes
-the raw byte stream, supports UTF-8 and standard VT/xterm control sequences,
-copy/paste, scrollback, selection, links, resize, soft keyboard input, and an
-extra-key row (Escape, Control, Alt, Tab, arrows, Page Up/Down, and common
-shell symbols). Its renderer must not use a WebView.
+The terminal is a native Compose grid that consumes Rust-produced screen
+snapshots and diffs. It is a renderer and input surface, not a second terminal
+emulator. It supports Unicode wide and combining glyphs, colors and attributes,
+cursor styles, copy/paste, paged scrollback, selection, validated links,
+canonical resize, soft keyboard input, mouse reporting when the current mode
+allows it, and an extra-key row (Escape, Control, Alt, Tab, arrows, Page
+Up/Down, and common shell symbols). It must not use a WebView.
 
 The session drawer shows the same session metadata the desktop exposes. The
 active terminal presents connection and focus ownership states prominently.
@@ -195,9 +259,39 @@ of a single terminal tab: desktop app restarts preserve trusted devices and
 regenerate only expired enrollment tokens. It does not attempt to start at OS
 login until that behavior is separately approved.
 
+Screen parsing is part of tab ownership, not listener ownership. Disabling
+Remote Access stops network and remote-subscriber work but does not discard tab
+state or alter desktop terminal behavior. Screen snapshots and diffs have
+explicit cell, row, scrollback, frame, and frequency bounds. Invalid terminal
+output must not panic the desktop process.
+
 Structured, redacted diagnostics record listener lifecycle, device id prefix,
 connection state, protocol version, and denial reason. They never record QR
 payloads, enrollment secrets, credentials, terminal input, or terminal output.
+
+## Testing strategy
+
+The tab registry is tested without Tauri using fake PTY and subscriber
+adapters. Tests cover spawn/list/update/close, session-hook rekeying, desktop
+and phone attachments, explicit focus transfer, owner-only input and resize,
+exit state, and cleanup when a renderer disconnects.
+
+The screen adapter is fed fixed byte fixtures covering split UTF-8, combining
+and wide glyphs, RGB and indexed colors, cursor and mode changes, normal and
+alternate screens, scrollback, resize, terminal queries, and malformed escape
+sequences. Snapshot/diff round-trip tests prove that applying every diff gives
+the same typed screen as a fresh snapshot. Random byte and resize sequences
+must not panic or exceed configured memory and frame limits.
+
+Desktop integration tests prove that opening, clearing, resuming, focusing,
+resizing, and closing a tab still use xterm.js correctly with Remote Access
+both off and on. Android JVM tests cover CBOR decoding, revision mismatch,
+snapshot replacement, changed-row application, and input encoding. Compose
+tests cover wide-cell layout, selection, scrollback, focus state, rotation, and
+the extra-key row. The final interoperability run pairs a phone, opens a tab
+that predates pairing, exercises a full-screen TUI, transfers focus in both
+directions, disconnects during output, reconnects by snapshot, and revokes the
+phone.
 
 ## Non-goals for the first release
 
@@ -207,6 +301,9 @@ payloads, enrollment secrets, credentials, terminal input, or terminal output.
 - Direct remote filesystem browsing/editing.
 - Background agent execution from Android after the desktop app exits.
 - Importing, exporting, or copying device credentials between phones.
+- Sixel, Kitty graphics, inline images, or arbitrary embedded terminal media on
+  Android. Unsupported graphics sequences do not bypass bounds or crash the
+  screen parser.
 
 ## Acceptance criteria
 
@@ -215,10 +312,16 @@ payloads, enrollment secrets, credentials, terminal input, or terminal output.
 2. A wrong/changed TLS public key, expired/consumed QR secret, unapproved
    device, or revoked device cannot connect.
 3. A paired and unlocked device can manage the agreed desktop sessions and
-   interact with terminal bytes without corruption.
-4. Desktop and Android receive coherent session/agent changes and terminal
-   output after reconnects.
+   interact with the canonical terminal screen without Unicode or style
+   corruption.
+4. Desktop and Android receive coherent tab/session/agent changes. Reconnects,
+   revision mismatches, and rolled event queues recover from a current screen
+   snapshot rather than historical PTY-byte replay.
 5. A second client cannot silently interleave terminal input with the current
-   input owner.
+   input owner or resize that owner's PTY.
 6. The Android app needs biometric/PIN after the configured lock timeout and
    stores private material only through Android Keystore.
+7. A terminal started before Remote Access is enabled can be opened on Android
+   with its current normal or alternate screen intact.
+8. The desktop remains usable with Remote Access disabled and preserves its
+   existing xterm.js rendering, input, selection, and scrollback behavior.
