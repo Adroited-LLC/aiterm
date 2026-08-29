@@ -141,11 +141,15 @@ function describeEnd(why: EndedWhy | undefined): string {
  *  spelling `undefined` three times to get to it. */
 /** A file open in the center strip, pinned to the terminal tab it was
  *  opened beside — switching sessions switches to that session's files. */
+/** The owner of a file tab: a terminal key, a preview, or home (null). */
+type FileScope = number | string | null;
+
 interface FileTab {
   key: number;
-  /** The terminal tab this file belongs to; null when it was opened with no
-   *  terminal on screen. */
-  termKey: number | null;
+  /** What this file belongs to — see `fileScope`: a terminal tab's key, a
+   *  `preview:<id>` string for a file opened off a session preview, or null
+   *  for one opened from the home view. */
+  termKey: FileScope;
   path: string;
 }
 
@@ -716,36 +720,49 @@ export default function App() {
 
   // Switching terminal, or picking a different session to preview, puts that
   // terminal or preview on screen — a file tab left selected would cover it.
-  // A preview replaces whatever file was up.
-  useEffect(() => { if (previewSession) setActiveFileTab(null); }, [previewSession?.id]);
-  /** Which file each session had on screen, so switching away and back finds
+  /** What is in front, for the purpose of owning files: the preview when one
+   *  is up (it covers the terminal, and the explorer shows *its* project),
+   *  else the active terminal, else home. A file opened now belongs to this,
+   *  and only files belonging to this are in the row. */
+  const fileScope: FileScope = previewSession ? `preview:${previewSession.id}` : activeTab;
+  const fileScopeRef = useRef<FileScope>(fileScope);
+  fileScopeRef.current = fileScope;
+  /** Which file each scope had on screen, so switching away and back finds
    *  it where it was left — the file row is part of the session, not a
-   *  shared strip. Keyed by terminal key; `null` is the home view's own set. */
-  const fileFor = useRef(new Map<number | null, number | null>());
-  const prevActiveTab = useRef(activeTab);
+   *  shared strip. */
+  const fileFor = useRef(new Map<FileScope, number | null>());
+  const prevScope = useRef(fileScope);
   useEffect(() => {
-    if (prevActiveTab.current !== activeTab) {
-      prevActiveTab.current = activeTab;
-      const k = fileFor.current.get(activeTab) ?? null;
+    if (prevScope.current !== fileScope) {
+      prevScope.current = fileScope;
+      const k = fileFor.current.get(fileScope) ?? null;
       setActiveFileTab(k !== null && fileTabs.some((f) => f.key === k) ? k : null);
     } else {
-      fileFor.current.set(activeTab, activeFileTab);
+      fileFor.current.set(fileScope, activeFileTab);
     }
-  }, [activeTab, activeFileTab]);
+  }, [fileScope, activeFileTab]);
+  // A preview is transient: the files opened off it go when it does, rather
+  // than lingering unreachable until the same session is previewed again.
+  useEffect(() => {
+    const keep = previewSession ? `preview:${previewSession.id}` : null;
+    setFileTabs((list) => list.some((f) => typeof f.termKey === "string" && f.termKey !== keep)
+      ? list.filter((f) => typeof f.termKey !== "string" || f.termKey === keep)
+      : list);
+  }, [previewSession?.id]);
 
-  /** Whether a file tab belongs to the session in front. Files open in the
-   *  session they were opened from and nowhere else; ones opened from the
-   *  home view belong to it, and the home tab is how they are reached. */
+  /** Whether a file tab belongs to what is in front. Files open where they
+   *  were opened from and nowhere else; ones opened from the home view belong
+   *  to it, and the home tab is how they are reached. */
   const showsFile = useCallback(
-    (f: FileTab) => f.termKey === activeTab,
-    [activeTab],
+    (f: FileTab) => f.termKey === fileScope,
+    [fileScope],
   );
   /** A file tab is the thing on screen in the center right now. */
   const fileOnScreen =
     activeFileTab !== null && fileTabs.some((f) => showsFile(f) && f.key === activeFileTab);
 
   const openFileTab = useCallback((path: string) => {
-    const term = activeTabRef.current;
+    const term = fileScopeRef.current;
     setFileTabs((list) => {
       const existing = list.find((f) => f.path === path && f.termKey === term);
       if (existing) {
@@ -2259,18 +2276,20 @@ export default function App() {
             <div className="center-tabs file-row">
               <button
                 className={"center-tab sub back" + (activeFileTab === null ? " on" : "")}
-                title={activeTabObj ? "Back to the terminal" : "Back to the start view"}
+                title={previewSession ? "Back to the preview" : activeTabObj ? "Back to the terminal" : "Back to the start view"}
                 onClick={() => {
                   setActiveFileTab(null);
                   if (activeTab !== null) handles.current.get(activeTab)?.focus();
                 }}
               >
-                {activeTabObj
+                {previewSession
+                  ? <AgentIcon agent={previewSession.agent} size={12} />
+                  : activeTabObj
                   ? (activeTabObj.agentId
                       ? <AgentIcon agent={activeTabObj.agentId} size={12} />
                       : <span className="center-tab-shell">❯</span>)
                   : <Icon of={Home} size="sm" />}
-                <span className="center-tab-name">{activeTabObj ? "Terminal" : "Home"}</span>
+                <span className="center-tab-name">{previewSession ? "Preview" : activeTabObj ? "Terminal" : "Home"}</span>
               </button>
               {fileTabs.filter(showsFile).map((f) => (
                 <button
