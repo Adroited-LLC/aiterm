@@ -1559,8 +1559,15 @@ pub fn backend_messages(agent_id: &str, session_id: &str) -> Option<Vec<(String,
 /// main thread and would freeze the window for every one of them. Same reason
 /// `usage.rs` and `fonts.rs` are `async`.
 #[tauri::command(async)]
-pub fn detect_agents() -> Vec<Detection> {
-    crate::services::agents::AgentService::desktop().detect()
+pub fn detect_agents(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+) -> Vec<Detection> {
+    detect_agents_from(services.inner())
+}
+
+#[doc(hidden)]
+pub fn detect_agents_from(services: &crate::services::ApplicationServices) -> Vec<Detection> {
+    services.agents.detect()
 }
 
 /// What every registered engine supports, keyed by id.
@@ -1578,8 +1585,17 @@ pub fn detect_agents() -> Vec<Detection> {
 /// appears, present or not — a row from an uninstalled engine still has to know
 /// what it can offer.
 #[tauri::command]
-pub fn agent_caps() -> std::collections::HashMap<String, Caps> {
-    crate::services::agents::AgentService::desktop().caps()
+pub fn agent_caps(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+) -> std::collections::HashMap<String, Caps> {
+    agent_caps_from(services.inner())
+}
+
+#[doc(hidden)]
+pub fn agent_caps_from(
+    services: &crate::services::ApplicationServices,
+) -> std::collections::HashMap<String, Caps> {
+    services.agents.caps()
 }
 
 /// What a new session can be started as: the agents that are actually here,
@@ -1596,8 +1612,17 @@ pub struct AgentChoice {
 /// `async` for the same reason as [`detect_agents`], plus `models()`, which for
 /// Codex shells out again to read its model list.
 #[tauri::command(async)]
-pub fn agent_choices() -> Vec<AgentChoice> {
-    crate::services::agents::AgentService::desktop().list()
+pub fn agent_choices(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+) -> Vec<AgentChoice> {
+    agent_choices_from(services.inner())
+}
+
+#[doc(hidden)]
+pub fn agent_choices_from(
+    services: &crate::services::ApplicationServices,
+) -> Vec<AgentChoice> {
+    services.agents.list()
 }
 
 /// The id of the session `agent_id` just started in `cwd`, once it exists.

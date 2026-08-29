@@ -6,6 +6,7 @@ use aiterm_lib::remote::model::TerminalSize;
 use aiterm_lib::remote::server::{RemoteGateway, RemoteServices, TlsIdentity};
 use aiterm_lib::services::agents::{AgentOperations, AgentService, AgentServiceError};
 use aiterm_lib::services::sessions::{SessionRoots, SessionService};
+use aiterm_lib::services::ApplicationServices;
 use aiterm_lib::tabs::{PtyBackend, TabLaunch, TabRegistry, TabState};
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -233,6 +234,11 @@ struct FixtureAgents;
 
 struct SlowFixtureAgents;
 
+struct SharedFixtureAgents {
+    generation: Arc<AtomicU32>,
+    resolves: Arc<AtomicU32>,
+}
+
 impl AgentOperations for FixtureAgents {
     fn detect(&self) -> Vec<Detection> {
         Vec::new()
@@ -297,6 +303,30 @@ impl AgentOperations for SlowFixtureAgents {
 
     fn resolve(&self, request: LaunchRequest) -> Result<LaunchPlan, AgentServiceError> {
         std::thread::sleep(Duration::from_millis(150));
+        FixtureAgents.resolve(request)
+    }
+}
+
+impl AgentOperations for SharedFixtureAgents {
+    fn detect(&self) -> Vec<Detection> {
+        Vec::new()
+    }
+
+    fn caps(&self) -> std::collections::HashMap<String, Caps> {
+        FixtureAgents.caps()
+    }
+
+    fn list(&self) -> Vec<AgentChoice> {
+        let mut choices = FixtureAgents.list();
+        choices[0].display_name = format!(
+            "Fixture Agent generation {}",
+            self.generation.load(Ordering::SeqCst)
+        );
+        choices
+    }
+
+    fn resolve(&self, request: LaunchRequest) -> Result<LaunchPlan, AgentServiceError> {
+        self.resolves.fetch_add(1, Ordering::SeqCst);
         FixtureAgents.resolve(request)
     }
 }
@@ -505,6 +535,87 @@ async fn remote_agent_list_matches_the_shared_agent_service() {
     assert_eq!(reply.agents[0].id, "fixture");
     assert_eq!(reply.agents[0].display_name, "Fixture Agent");
     assert!(reply.caps.contains_key("fixture"));
+    gateway.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn tauri_agent_adapters_and_remote_gateway_share_one_managed_agent_graph() {
+    let fixture = Fixture::new("shared-agent-graph");
+    fixture.write_session(
+        "abababab-abab-4bab-8bab-abababababab",
+        "Project anchor",
+        "/fixture/project",
+    );
+    let generation = Arc::new(AtomicU32::new(0));
+    let resolves = Arc::new(AtomicU32::new(0));
+    let application = ApplicationServices {
+        sessions: fixture.service.clone(),
+        agents: AgentService::from_operations(Arc::new(SharedFixtureAgents {
+            generation: generation.clone(),
+            resolves: resolves.clone(),
+        })),
+    };
+
+    let desktop_choices = aiterm_lib::agents::agent_choices_from(&application);
+    assert_eq!(
+        desktop_choices[0].display_name,
+        "Fixture Agent generation 0"
+    );
+    generation.store(7, Ordering::SeqCst);
+
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let (store, key, device_id) = paired_store(&fixture.root);
+    let identity =
+        TlsIdentity::load_or_create(fixture.root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::from_application_services(registry, &application),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    socket.send(empty_request(70, "agent.list")).await.unwrap();
+    let remote: AgentListReply = decode(&receive(&mut socket).await.payload);
+    assert_eq!(
+        remote.agents[0].display_name,
+        "Fixture Agent generation 7"
+    );
+
+    socket
+        .send(request(
+            71,
+            "agent.action",
+            &AgentStartRequest {
+                action: "start",
+                agent_id: "fixture",
+                model: Some("fixture-model"),
+                effort: Some("medium"),
+                cwd: "/fixture/project",
+                title: "Shared resolver",
+                size: TerminalSize::try_new(72, 20).unwrap(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut socket).await.kind, "agent.action");
+    assert_eq!(resolves.load(Ordering::SeqCst), 1);
+
+    let plan = aiterm_lib::launch::resolve_launch_from(
+        &application,
+        LaunchRequest::Agent {
+            agent_id: "fixture".into(),
+            model: Some("fixture-model".into()),
+            effort: Some("medium".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.command, "fixture-agent --safe");
+    assert_eq!(resolves.load(Ordering::SeqCst), 2);
     gateway.stop().await.unwrap();
 }
 

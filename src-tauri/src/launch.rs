@@ -297,13 +297,27 @@ fn explain(list: &[Box<dyn AgentBackend>], request: &LaunchRequest) -> String {
 /// store and probes PATH for the API case, and a plain `#[tauri::command]`
 /// would do all of that on the GTK main loop.
 #[tauri::command]
-pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String> {
-    let agents = crate::services::ApplicationServices::desktop().agents;
+pub async fn resolve_launch(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+    request: LaunchRequest,
+) -> Result<LaunchPlan, String> {
+    let agents = services.agents.clone();
     crate::run_blocking(move || {
         agents.resolve(request)
             .map_err(|error| error.message().to_owned())
     })
     .await
+}
+
+#[doc(hidden)]
+pub fn resolve_launch_from(
+    services: &crate::services::ApplicationServices,
+    request: LaunchRequest,
+) -> Result<LaunchPlan, String> {
+    services
+        .agents
+        .resolve(request)
+        .map_err(|error| error.message().to_owned())
 }
 
 #[cfg(test)]
