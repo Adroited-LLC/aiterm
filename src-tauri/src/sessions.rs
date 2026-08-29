@@ -1,17 +1,17 @@
 use serde::Serialize;
-use std::fs::File;
-use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
-use std::time::UNIX_EPOCH;
 #[cfg(unix)]
 use std::ffi::CString;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 pub(crate) const MAX_DISCOVERED_SESSION_FILES: usize = 4096;
 pub(crate) const MAX_SESSION_DISCOVERY_DEPTH: usize = 16;
@@ -70,7 +70,7 @@ impl PinnedDiscoveryDirectory {
         let pinned_metadata = self.file.metadata().ok()?;
         (proc_metadata.dev() == pinned_metadata.dev()
             && proc_metadata.ino() == pinned_metadata.ino())
-            .then_some(path)
+        .then_some(path)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -174,7 +174,9 @@ impl DiscoveryBudget {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let Ok(metadata) = file.metadata() else { return false };
+            let Ok(metadata) = file.metadata() else {
+                return false;
+            };
             metadata.file_type().is_dir() && self.visited.insert((metadata.dev(), metadata.ino()))
         }
         #[cfg(not(unix))]
@@ -314,7 +316,9 @@ fn scan_claude_root_bounded(
             }
             let name = entry.file_name();
             let path_name = Path::new(&name);
-            if path_name.extension().is_none_or(|extension| extension != "jsonl")
+            if path_name
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
                 || name.to_string_lossy().contains(".orphaned-")
             {
                 continue;
@@ -327,9 +331,9 @@ fn scan_claude_root_bounded(
             }
             files.push((project.child_path(&name), file));
         }
-        let dir_cwd = files.iter().find_map(|(_, file)| {
-            file.try_clone().ok().and_then(read_first_cwd_from)
-        });
+        let dir_cwd = files
+            .iter()
+            .find_map(|(_, file)| file.try_clone().ok().and_then(read_first_cwd_from));
         for (path, file) in files {
             if let Some(session) = parse_session_from(file, &path, dir_cwd.as_deref()) {
                 sessions.push((session, path));
@@ -409,8 +413,12 @@ fn read_aiterm_fork_map() -> std::collections::HashMap<String, String> {
     let Some(path) = aiterm_fork_map_path() else {
         return Default::default();
     };
-    let Some(parent) = path.parent() else { return Default::default() };
-    let Ok(directory) = VerifiedDirectory::open(parent) else { return Default::default() };
+    let Some(parent) = path.parent() else {
+        return Default::default();
+    };
+    let Ok(directory) = VerifiedDirectory::open(parent) else {
+        return Default::default();
+    };
     let Ok(mut file) = directory.open_file(path.file_name().unwrap_or_default()) else {
         return Default::default();
     };
@@ -431,7 +439,10 @@ fn record_aiterm_fork(branch: &str, parent: &str) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(text) = serde_json::to_string_pretty(&map) {
-        if let Some(dir) = path.parent().and_then(|dir| VerifiedDirectory::open(dir).ok()) {
+        if let Some(dir) = path
+            .parent()
+            .and_then(|dir| VerifiedDirectory::open(dir).ok())
+        {
             let _ = dir.write_atomic(path.file_name().unwrap_or_default(), text.as_bytes());
         }
     }
@@ -529,7 +540,6 @@ fn read_bridge_id(path: &Path) -> Option<String> {
     }
     found
 }
-
 
 /// System XML tags Claude Code injects into user messages (ported from
 /// claudeman's parser — keep the lists in sync).
@@ -673,7 +683,10 @@ fn parse_session_from(mut file: File, path: &Path, dir_cwd: Option<&str>) -> Opt
         }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("custom-title") => {
-                title = v.get("customTitle").and_then(|t| t.as_str()).map(String::from)
+                title = v
+                    .get("customTitle")
+                    .and_then(|t| t.as_str())
+                    .map(String::from)
             }
             Some("ai-title") if ai_title.is_none() => {
                 ai_title = v
@@ -792,7 +805,6 @@ fn worktree_repo_root(cwd: &str) -> Option<String> {
     Some(root.to_string())
 }
 
-
 #[derive(Serialize, Default)]
 pub struct SessionStatus {
     pub exists: bool,
@@ -837,9 +849,7 @@ fn session_status_sync(session_id: String) -> SessionStatus {
                     .and_then(|m| m.as_str())
                     .map(String::from)
             }
-            Some("mode") => {
-                status.mode = v.get("mode").and_then(|m| m.as_str()).map(String::from)
-            }
+            Some("mode") => status.mode = v.get("mode").and_then(|m| m.as_str()).map(String::from),
             _ => {}
         }
     }
@@ -890,8 +900,7 @@ fn deletable<'a>(
     list: &'a [Box<dyn crate::agents::AgentBackend>],
     session_id: &str,
 ) -> Result<(&'a dyn crate::agents::AgentBackend, std::path::PathBuf), String> {
-    let (backend, path) =
-        crate::agents::owner_in(list, session_id).ok_or("session not found")?;
+    let (backend, path) = crate::agents::owner_in(list, session_id).ok_or("session not found")?;
     if !backend.caps().delete {
         return Err(format!(
             "{} sessions cannot be deleted from aiterm — its store is not aiterm's to move.",
@@ -910,7 +919,8 @@ fn deletable<'a>(
 pub async fn session_delete(session_id: String) -> Result<(), String> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {
-        sessions.delete(&session_id)
+        sessions
+            .delete(&session_id)
             .map_err(|error| error.message().to_owned())
     })
     .await
@@ -937,7 +947,8 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     // Lazy purge of old trash entries through the already-pinned directory.
     // A pathname walk here would reopen a replaced ~/.claude/trash between
     // verification and deletion.
-    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(TRASH_KEEP_DAYS * 86400);
+    let cutoff =
+        std::time::SystemTime::now() - std::time::Duration::from_secs(TRASH_KEEP_DAYS * 86400);
     let _ = trash_dir.purge_older_than(cutoff);
 
     // OpenCode first, because for it `path` is the whole database and must
@@ -1033,11 +1044,11 @@ fn archive_generic_session_sources(
             destination_name: std::ffi::OsString::from(format!("{session_id}.origin")),
         });
         archive_verified_inputs_with_hooks(
-        trash_dir,
-        archive_inputs,
-        ArchiveLimits::default(),
-        || {},
-        || Ok(()),
+            trash_dir,
+            archive_inputs,
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
         )?;
     }
     #[cfg(not(target_os = "linux"))]
@@ -1123,7 +1134,10 @@ impl VerifiedDirectory {
     }
 
     fn open_parent(&self, relative: &Path) -> Result<(File, std::ffi::OsString), String> {
-        let name = relative.file_name().ok_or("session transcript has no filename")?.to_os_string();
+        let name = relative
+            .file_name()
+            .ok_or("session transcript has no filename")?
+            .to_os_string();
         let mut current = self.file.try_clone().map_err(|e| e.to_string())?;
         let parent = relative.parent().unwrap_or_else(|| Path::new(""));
         for component in parent.components() {
@@ -1160,7 +1174,12 @@ impl VerifiedDirectory {
             return Err(std::io::Error::last_os_error().to_string());
         }
         let file = unsafe { File::from_raw_fd(fd) };
-        if !file.metadata().map_err(|e| e.to_string())?.file_type().is_file() {
+        if !file
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_file()
+        {
             return Err("file is not regular".into());
         }
         Ok(file)
@@ -1206,7 +1225,9 @@ impl VerifiedDirectory {
     fn create_directory(&self, name: &OsStr) -> Result<Self, String> {
         let name = CString::new(name.as_bytes()).map_err(|_| "invalid directory name")?;
         let created = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) };
-        if created != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+        if created != 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+        {
             return Err(std::io::Error::last_os_error().to_string());
         }
         let fd = unsafe {
@@ -1219,7 +1240,9 @@ impl VerifiedDirectory {
         if fd < 0 {
             Err(std::io::Error::last_os_error().to_string())
         } else {
-            Ok(Self { file: unsafe { File::from_raw_fd(fd) } })
+            Ok(Self {
+                file: unsafe { File::from_raw_fd(fd) },
+            })
         }
     }
 
@@ -1279,9 +1302,8 @@ fn purge_directory_fd(directory: &File, cutoff: std::time::SystemTime) -> Result
             }
             let child = unsafe { File::from_raw_fd(child_fd) };
             let _ = purge_directory_fd(&child, std::time::SystemTime::now());
-            let _ = unsafe {
-                libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
-            };
+            let _ =
+                unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
         } else {
             let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
         }
@@ -1295,11 +1317,21 @@ struct VerifiedDirectory;
 
 #[cfg(not(unix))]
 impl VerifiedDirectory {
-    fn open(_path: &Path) -> Result<Self, String> { Err(unsupported_verified_operations()) }
-    fn open_file(&self, _name: &OsStr) -> Result<File, String> { Err(unsupported_verified_operations()) }
-    fn write_atomic(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> { Err(unsupported_verified_operations()) }
-    fn create_directory(&self, _name: &OsStr) -> Result<Self, String> { Err(unsupported_verified_operations()) }
-    fn purge_older_than(&self, _cutoff: std::time::SystemTime) -> Result<(), String> { Err(unsupported_verified_operations()) }
+    fn open(_path: &Path) -> Result<Self, String> {
+        Err(unsupported_verified_operations())
+    }
+    fn open_file(&self, _name: &OsStr) -> Result<File, String> {
+        Err(unsupported_verified_operations())
+    }
+    fn write_atomic(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> {
+        Err(unsupported_verified_operations())
+    }
+    fn create_directory(&self, _name: &OsStr) -> Result<Self, String> {
+        Err(unsupported_verified_operations())
+    }
+    fn purge_older_than(&self, _cutoff: std::time::SystemTime) -> Result<(), String> {
+        Err(unsupported_verified_operations())
+    }
 }
 
 #[cfg(unix)]
@@ -1323,8 +1355,12 @@ struct VerifiedSessionFile;
 
 #[cfg(not(unix))]
 impl VerifiedSessionFile {
-    fn open(&self) -> Result<File, String> { Err(unsupported_verified_operations()) }
-    fn create_sibling(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> { Err(unsupported_verified_operations()) }
+    fn open(&self) -> Result<File, String> {
+        Err(unsupported_verified_operations())
+    }
+    fn create_sibling(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> {
+        Err(unsupported_verified_operations())
+    }
 }
 
 #[cfg(unix)]
@@ -1389,7 +1425,6 @@ impl VerifiedSessionFile {
         file.write_all(bytes).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())
     }
-
 }
 
 #[cfg(target_os = "linux")]
@@ -1437,11 +1472,11 @@ struct HeldWriteLease {
 
 #[cfg(target_os = "linux")]
 impl HeldWriteLease {
+    fn existing(file: File) -> Result<Self, String> {
+        Self::install(file, "session source")
+    }
+
     fn anonymous_in(directory: &File) -> Result<Self, String> {
-        static IGNORE_SIGIO: std::sync::Once = std::sync::Once::new();
-        IGNORE_SIGIO.call_once(|| unsafe {
-            libc::signal(libc::SIGIO, libc::SIG_IGN);
-        });
         let dot = CString::new(".").unwrap();
         let descriptor = unsafe {
             libc::openat(
@@ -1458,13 +1493,35 @@ impl HeldWriteLease {
             ));
         }
         let file = unsafe { File::from_raw_fd(descriptor) };
+        Self::install(file, "session archive")
+    }
+
+    fn install(file: File, label: &str) -> Result<Self, String> {
+        static IGNORE_SIGIO: std::sync::Once = std::sync::Once::new();
+        IGNORE_SIGIO.call_once(|| unsafe {
+            libc::signal(libc::SIGIO, libc::SIG_IGN);
+        });
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) } != 0 {
             return Err(format!(
-                "exclusive session archive leases are unavailable: {}",
+                "exclusive {label} leases are unavailable: {}",
                 std::io::Error::last_os_error()
             ));
         }
         Ok(Self { file })
+    }
+
+    fn verify(&self, label: &str) -> Result<(), String> {
+        let lease = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETLEASE) };
+        if lease == libc::F_WRLCK {
+            Ok(())
+        } else if lease < 0 {
+            Err(format!(
+                "could not verify {label} lease: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Err(format!("{label} lease was lost before retirement"))
+        }
     }
 
     fn publish(&self, directory: &File, name: &CString) -> Result<(), String> {
@@ -1506,6 +1563,7 @@ struct PreparedLeasedArchive {
     archive_hash: [u8; 32],
     archive_size: u64,
     retirements: Vec<ExactFileRetirement>,
+    directories: Vec<ExactDirectoryRetirement>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1526,10 +1584,25 @@ enum VerifiedArchiveInput {
 
 #[cfg(target_os = "linux")]
 struct ExactFileRetirement {
-    source: File,
+    source: HeldWriteLease,
     size: u64,
     modified: std::time::SystemTime,
     hash: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryEntryIdentity {
+    name: std::ffi::OsString,
+    device: u64,
+    inode: u64,
+    mode: u32,
+}
+
+#[cfg(target_os = "linux")]
+struct ExactDirectoryRetirement {
+    source: File,
+    entries: Vec<DirectoryEntryIdentity>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1565,9 +1638,9 @@ fn hash_exact_file_bounded(file: &File, limit: u64) -> Result<([u8; 32], u64), S
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let remaining = limit.saturating_sub(offset);
-        let request = buffer.len().min(
-            usize::try_from(remaining.saturating_add(1)).unwrap_or(buffer.len()),
-        );
+        let request = buffer
+            .len()
+            .min(usize::try_from(remaining.saturating_add(1)).unwrap_or(buffer.len()));
         let read = file
             .read_at(&mut buffer[..request], offset)
             .map_err(|error| error.to_string())?;
@@ -1586,7 +1659,11 @@ fn hash_exact_file_bounded(file: &File, limit: u64) -> Result<([u8; 32], u64), S
 }
 
 #[cfg(target_os = "linux")]
-fn set_archive_metadata(file: &File, mode: u32, modified: std::time::SystemTime) -> Result<(), String> {
+fn set_archive_metadata(
+    file: &File,
+    mode: u32,
+    modified: std::time::SystemTime,
+) -> Result<(), String> {
     use std::time::Duration;
 
     if unsafe { libc::fchmod(file.as_raw_fd(), (mode & 0o7777) as libc::mode_t) } != 0 {
@@ -1597,11 +1674,17 @@ fn set_archive_metadata(file: &File, mode: u32, modified: std::time::SystemTime)
         .unwrap_or(Duration::ZERO);
     let times = [
         libc::timespec {
-            tv_sec: duration.as_secs().try_into().map_err(|_| "archive timestamp overflow")?,
+            tv_sec: duration
+                .as_secs()
+                .try_into()
+                .map_err(|_| "archive timestamp overflow")?,
             tv_nsec: duration.subsec_nanos().into(),
         },
         libc::timespec {
-            tv_sec: duration.as_secs().try_into().map_err(|_| "archive timestamp overflow")?,
+            tv_sec: duration
+                .as_secs()
+                .try_into()
+                .map_err(|_| "archive timestamp overflow")?,
             tv_nsec: duration.subsec_nanos().into(),
         },
     ];
@@ -1621,12 +1704,13 @@ fn copy_regular_into_anonymous_archive(
     use std::io::Write;
     use std::os::unix::fs::{FileExt, MetadataExt};
 
-    let before = source.metadata().map_err(|error| error.to_string())?;
+    let source = HeldWriteLease::existing(source.try_clone().map_err(|error| error.to_string())?)?;
+    let before = source.file.metadata().map_err(|error| error.to_string())?;
     if !before.is_file() {
         return Err("exact archive source is not a regular file".into());
     }
     let modified = before.modified().map_err(|error| error.to_string())?;
-    (limits.before_file_read)(source);
+    (limits.before_file_read)(&source.file);
     let mut destination = archive.try_clone().map_err(|error| error.to_string())?;
     destination.set_len(0).map_err(|error| error.to_string())?;
     destination
@@ -1637,10 +1721,11 @@ fn copy_regular_into_anonymous_archive(
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let remaining = limits.bytes.saturating_sub(offset);
-        let request = buffer.len().min(
-            usize::try_from(remaining.saturating_add(1)).unwrap_or(buffer.len()),
-        );
+        let request = buffer
+            .len()
+            .min(usize::try_from(remaining.saturating_add(1)).unwrap_or(buffer.len()));
         let read = source
+            .file
             .read_at(&mut buffer[..request], offset)
             .map_err(|error| error.to_string())?;
         if read == 0 {
@@ -1657,7 +1742,7 @@ fn copy_regular_into_anonymous_archive(
             .write_all(&buffer[..read])
             .map_err(|error| error.to_string())?;
     }
-    let after = source.metadata().map_err(|error| error.to_string())?;
+    let after = source.file.metadata().map_err(|error| error.to_string())?;
     if before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
         || offset != before.len()
@@ -1665,14 +1750,14 @@ fn copy_regular_into_anonymous_archive(
         return Err("session changed while its exact archive was copied".into());
     }
     let source_hash: [u8; 32] = digest.finalize().into();
-    let (fresh_hash, fresh_size) = hash_exact_file_bounded(source, limits.bytes)?;
+    let (fresh_hash, fresh_size) = hash_exact_file_bounded(&source.file, limits.bytes)?;
     if source_hash != fresh_hash || offset != fresh_size {
         return Err("session changed while its exact archive was verified".into());
     }
     set_archive_metadata(archive, before.mode(), std::time::SystemTime::now())?;
     archive.sync_all().map_err(|error| error.to_string())?;
     Ok(ExactFileRetirement {
-        source: source.try_clone().map_err(|error| error.to_string())?,
+        source,
         size: offset,
         modified,
         hash: source_hash,
@@ -1684,8 +1769,19 @@ fn for_each_directory_entry(
     directory: &File,
     mut visit: impl FnMut(&OsStr) -> Result<(), String>,
 ) -> Result<(), String> {
-    let cloned = directory.try_clone().map_err(|error| error.to_string())?;
-    let raw = std::os::fd::IntoRawFd::into_raw_fd(cloned);
+    // dup(2) shares the directory stream offset with the held descriptor. Open
+    // `.` relative to the held directory instead so every validation observes
+    // a complete, fresh enumeration of the same directory inode.
+    let raw = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
     let stream = unsafe { libc::fdopendir(raw) };
     if stream.is_null() {
         unsafe { libc::close(raw) };
@@ -1715,6 +1811,36 @@ fn for_each_directory_entry(
 }
 
 #[cfg(target_os = "linux")]
+fn snapshot_directory_entries(directory: &File) -> Result<Vec<DirectoryEntryIdentity>, String> {
+    let mut entries = Vec::new();
+    for_each_directory_entry(directory, |name| {
+        let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid sidecar entry name")?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let stat = unsafe { stat.assume_init() };
+        entries.push(DirectoryEntryIdentity {
+            name: name.to_os_string(),
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+            mode: stat.st_mode as u32,
+        });
+        Ok(())
+    })?;
+    entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
 fn write_sidecar_record_prefix(
     archive: &mut File,
     kind: u8,
@@ -1726,8 +1852,13 @@ fn write_sidecar_record_prefix(
 ) -> Result<(), String> {
     use std::io::Write;
 
-    let path_len: u16 = path.len().try_into().map_err(|_| "sidecar path is too long")?;
-    archive.write_all(&[kind]).map_err(|error| error.to_string())?;
+    let path_len: u16 = path
+        .len()
+        .try_into()
+        .map_err(|_| "sidecar path is too long")?;
+    archive
+        .write_all(&[kind])
+        .map_err(|error| error.to_string())?;
     archive
         .write_all(&path_len.to_le_bytes())
         .and_then(|_| archive.write_all(&mode.to_le_bytes()))
@@ -1748,17 +1879,22 @@ fn write_sidecar_tree(
     entries: &mut usize,
     bytes: &mut u64,
     retirements: &mut Vec<ExactFileRetirement>,
+    directories: &mut Vec<ExactDirectoryRetirement>,
 ) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     use std::io::Write;
-    use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
 
     if depth > limits.depth {
         return Err("session sidecar archive exceeds maximum depth".into());
     }
+    let before_entries = snapshot_directory_entries(source)?;
     for_each_directory_entry(source, |name| {
         let component = name.as_bytes();
-        if component.is_empty() || component.len() > limits.component_bytes || component.contains(&0) {
+        if component.is_empty()
+            || component.len() > limits.component_bytes
+            || component.contains(&0)
+        {
             return Err("session sidecar component exceeds name limit".into());
         }
         let previous_len = relative.len();
@@ -1794,29 +1930,30 @@ fn write_sidecar_tree(
         let stat = unsafe { stat.assume_init() };
         let result = match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR => {
-                write_sidecar_record_prefix(
-                    archive,
-                    2,
-                    relative,
-                    stat.st_mode as u32,
-                    stat.st_mtime,
-                    stat.st_mtime_nsec as u32,
-                    0,
-                )?;
                 let descriptor = unsafe {
                     libc::openat(
                         source.as_raw_fd(),
                         name_c.as_ptr(),
-                        libc::O_RDONLY
-                            | libc::O_DIRECTORY
-                            | libc::O_NOFOLLOW
-                            | libc::O_CLOEXEC,
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     )
                 };
                 if descriptor < 0 {
                     Err(std::io::Error::last_os_error().to_string())
                 } else {
                     let child = unsafe { File::from_raw_fd(descriptor) };
+                    if !directory_entry_is_exact_object(source, &name_c, &child)? {
+                        return Err("session sidecar entry changed while it was opened".into());
+                    }
+                    let metadata = child.metadata().map_err(|error| error.to_string())?;
+                    write_sidecar_record_prefix(
+                        archive,
+                        2,
+                        relative,
+                        metadata.mode(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec() as u32,
+                        0,
+                    )?;
                     write_sidecar_tree(
                         &child,
                         archive,
@@ -1826,6 +1963,7 @@ fn write_sidecar_tree(
                         entries,
                         bytes,
                         retirements,
+                        directories,
                     )
                 }
             }
@@ -1841,8 +1979,12 @@ fn write_sidecar_tree(
                     Err(std::io::Error::last_os_error().to_string())
                 } else {
                     let file = unsafe { File::from_raw_fd(descriptor) };
-                    let before = file.metadata().map_err(|error| error.to_string())?;
-                    (limits.before_file_read)(&file);
+                    if !directory_entry_is_exact_object(source, &name_c, &file)? {
+                        return Err("session sidecar entry changed while it was opened".into());
+                    }
+                    let file = HeldWriteLease::existing(file)?;
+                    let before = file.file.metadata().map_err(|error| error.to_string())?;
+                    (limits.before_file_read)(&file.file);
                     let declared = before.len();
                     let remaining = limits.bytes.saturating_sub(*bytes);
                     if declared > remaining {
@@ -1852,9 +1994,9 @@ fn write_sidecar_tree(
                             archive,
                             1,
                             relative,
-                            stat.st_mode as u32,
-                            stat.st_mtime,
-                            stat.st_mtime_nsec as u32,
+                            before.mode(),
+                            before.mtime(),
+                            before.mtime_nsec() as u32,
                             declared,
                         )?;
                         let mut digest = Sha256::new();
@@ -1863,10 +2005,10 @@ fn write_sidecar_tree(
                         loop {
                             let allowed = remaining.saturating_sub(copied);
                             let request = buffer.len().min(
-                                usize::try_from(allowed.saturating_add(1))
-                                    .unwrap_or(buffer.len()),
+                                usize::try_from(allowed.saturating_add(1)).unwrap_or(buffer.len()),
                             );
                             let read = file
+                                .file
                                 .read_at(&mut buffer[..request], copied)
                                 .map_err(|error| error.to_string())?;
                             if read == 0 {
@@ -1883,7 +2025,7 @@ fn write_sidecar_tree(
                                 .write_all(&buffer[..read])
                                 .map_err(|error| error.to_string())?;
                         }
-                        let after = file.metadata().map_err(|error| error.to_string())?;
+                        let after = file.file.metadata().map_err(|error| error.to_string())?;
                         if copied != declared
                             || before.len() != after.len()
                             || before.modified().ok() != after.modified().ok()
@@ -1909,7 +2051,16 @@ fn write_sidecar_tree(
         };
         relative.truncate(previous_len);
         result
-    })
+    })?;
+    let after_entries = snapshot_directory_entries(source)?;
+    if before_entries != after_entries {
+        return Err("session sidecar directory changed while it was archived".into());
+    }
+    directories.push(ExactDirectoryRetirement {
+        source: source.try_clone().map_err(|error| error.to_string())?,
+        entries: after_entries,
+    });
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1923,6 +2074,7 @@ fn prepare_leased_archive(
     use std::os::unix::fs::MetadataExt;
 
     let archive = HeldWriteLease::anonymous_in(&destination.file)?;
+    let mut directories = Vec::new();
     let retirements = match source.kind {
         VerifiedEntryKind::File => vec![copy_regular_into_anonymous_archive(
             &source.object,
@@ -1930,8 +2082,13 @@ fn prepare_leased_archive(
             limits,
         )?],
         VerifiedEntryKind::Directory => {
-            let mut writer = archive.file.try_clone().map_err(|error| error.to_string())?;
-            writer.write_all(SIDECAR_ARCHIVE_MAGIC).map_err(|error| error.to_string())?;
+            let mut writer = archive
+                .file
+                .try_clone()
+                .map_err(|error| error.to_string())?;
+            writer
+                .write_all(SIDECAR_ARCHIVE_MAGIC)
+                .map_err(|error| error.to_string())?;
             writer
                 .write_all(&SIDECAR_ARCHIVE_VERSION.to_le_bytes())
                 .and_then(|_| writer.write_all(&0u32.to_le_bytes()))
@@ -1948,14 +2105,21 @@ fn prepare_leased_archive(
                 &mut entries,
                 &mut bytes,
                 &mut retirements,
+                &mut directories,
             )?;
-            let count: u32 = entries.try_into().map_err(|_| "sidecar entry count overflow")?;
+            let count: u32 = entries
+                .try_into()
+                .map_err(|_| "sidecar entry count overflow")?;
             use std::os::unix::fs::FileExt;
             archive
                 .file
                 .write_all_at(&count.to_le_bytes(), SIDECAR_ARCHIVE_MAGIC.len() as u64 + 2)
                 .map_err(|error| error.to_string())?;
-            let mode = source.object.metadata().map_err(|error| error.to_string())?.mode();
+            let mode = source
+                .object
+                .metadata()
+                .map_err(|error| error.to_string())?
+                .mode();
             set_archive_metadata(&archive.file, mode, std::time::SystemTime::now())?;
             archive.file.sync_all().map_err(|error| error.to_string())?;
             retirements
@@ -1967,8 +2131,8 @@ fn prepare_leased_archive(
         .and_then(|overhead| limits.bytes.checked_add(overhead))
         .ok_or("archive bound overflow")?;
     let (archive_hash, archive_size) = hash_exact_file_bounded(&archive.file, archive_bound)?;
-    let destination_name = CString::new(destination_name.as_bytes())
-        .map_err(|_| "invalid trash destination name")?;
+    let destination_name =
+        CString::new(destination_name.as_bytes()).map_err(|_| "invalid trash destination name")?;
     Ok(PreparedLeasedArchive {
         sources: vec![source],
         destination_name,
@@ -1976,6 +2140,7 @@ fn prepare_leased_archive(
         archive_hash,
         archive_size,
         retirements,
+        directories,
     })
 }
 
@@ -2017,8 +2182,13 @@ fn prepare_leased_file_set_archive(
         return Err("session rollout archive exceeds entry limit".into());
     }
     let archive = HeldWriteLease::anonymous_in(&destination.file)?;
-    let mut writer = archive.file.try_clone().map_err(|error| error.to_string())?;
-    writer.write_all(SIDECAR_ARCHIVE_MAGIC).map_err(|error| error.to_string())?;
+    let mut writer = archive
+        .file
+        .try_clone()
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(SIDECAR_ARCHIVE_MAGIC)
+        .map_err(|error| error.to_string())?;
     writer
         .write_all(&SIDECAR_ARCHIVE_VERSION.to_le_bytes())
         .and_then(|_| {
@@ -2035,8 +2205,17 @@ fn prepare_leased_file_set_archive(
             return Err("session rollout archive source is not a regular file".into());
         }
         validate_archive_relative_path(relative, limits)?;
-        let before = source.object.metadata().map_err(|error| error.to_string())?;
-        (limits.before_file_read)(&source.object);
+        let held_source = HeldWriteLease::existing(
+            source
+                .object
+                .try_clone()
+                .map_err(|error| error.to_string())?,
+        )?;
+        let before = held_source
+            .file
+            .metadata()
+            .map_err(|error| error.to_string())?;
+        (limits.before_file_read)(&held_source.file);
         let remaining = limits.bytes.saturating_sub(total_bytes);
         if before.len() > remaining {
             return Err("session rollout archive exceeds byte limit".into());
@@ -2055,11 +2234,11 @@ fn prepare_leased_file_set_archive(
         let mut buffer = [0u8; 64 * 1024];
         loop {
             let allowed = remaining.saturating_sub(copied);
-            let request = buffer.len().min(
-                usize::try_from(allowed.saturating_add(1)).unwrap_or(buffer.len()),
-            );
-            let read = source
-                .object
+            let request = buffer
+                .len()
+                .min(usize::try_from(allowed.saturating_add(1)).unwrap_or(buffer.len()));
+            let read = held_source
+                .file
                 .read_at(&mut buffer[..request], copied)
                 .map_err(|error| error.to_string())?;
             if read == 0 {
@@ -2072,9 +2251,14 @@ fn prepare_leased_file_set_archive(
                 return Err("session rollout archive exceeds byte limit".into());
             }
             digest.update(&buffer[..read]);
-            writer.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+            writer
+                .write_all(&buffer[..read])
+                .map_err(|error| error.to_string())?;
         }
-        let after = source.object.metadata().map_err(|error| error.to_string())?;
+        let after = held_source
+            .file
+            .metadata()
+            .map_err(|error| error.to_string())?;
         if copied != before.len()
             || before.len() != after.len()
             || before.modified().ok() != after.modified().ok()
@@ -2085,7 +2269,7 @@ fn prepare_leased_file_set_archive(
             .checked_add(copied)
             .ok_or("session rollout byte count overflow")?;
         retirements.push(ExactFileRetirement {
-            source: source.object.try_clone().map_err(|error| error.to_string())?,
+            source: held_source,
             size: copied,
             modified: before.modified().map_err(|error| error.to_string())?,
             hash: digest.finalize().into(),
@@ -2101,8 +2285,8 @@ fn prepare_leased_file_set_archive(
         .and_then(|overhead| limits.bytes.checked_add(overhead))
         .ok_or("archive bound overflow")?;
     let (archive_hash, archive_size) = hash_exact_file_bounded(&archive.file, archive_bound)?;
-    let destination_name = CString::new(destination_name.as_bytes())
-        .map_err(|_| "invalid trash destination name")?;
+    let destination_name =
+        CString::new(destination_name.as_bytes()).map_err(|_| "invalid trash destination name")?;
     Ok(PreparedLeasedArchive {
         sources: sources.into_iter().map(|(source, _)| source).collect(),
         destination_name,
@@ -2110,6 +2294,7 @@ fn prepare_leased_file_set_archive(
         archive_hash,
         archive_size,
         retirements,
+        directories: Vec::new(),
     })
 }
 
@@ -2126,13 +2311,18 @@ fn prepare_generated_archive(
         return Err("generated session archive exceeds byte limit".into());
     }
     let archive = HeldWriteLease::anonymous_in(&destination.file)?;
-    let mut writer = archive.file.try_clone().map_err(|error| error.to_string())?;
-    writer.write_all(&bytes).map_err(|error| error.to_string())?;
+    let mut writer = archive
+        .file
+        .try_clone()
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(&bytes)
+        .map_err(|error| error.to_string())?;
     set_archive_metadata(&archive.file, 0o600, std::time::SystemTime::now())?;
     archive.file.sync_all().map_err(|error| error.to_string())?;
     let (archive_hash, archive_size) = hash_exact_file_bounded(&archive.file, limits.bytes)?;
-    let destination_name = CString::new(destination_name.as_bytes())
-        .map_err(|_| "invalid trash destination name")?;
+    let destination_name =
+        CString::new(destination_name.as_bytes()).map_err(|_| "invalid trash destination name")?;
     Ok(PreparedLeasedArchive {
         sources: Vec::new(),
         destination_name,
@@ -2140,16 +2330,23 @@ fn prepare_generated_archive(
         archive_hash,
         archive_size,
         retirements: Vec::new(),
+        directories: Vec::new(),
     })
 }
 
 #[cfg(target_os = "linux")]
 fn quarantine_prepared_source(source: &VerifiedSessionFile) -> Result<std::path::PathBuf, String> {
-    let source_name = CString::new(source.name.as_bytes())
-        .map_err(|_| "invalid session entry name")?;
+    let source_name =
+        CString::new(source.name.as_bytes()).map_err(|_| "invalid session entry name")?;
     let quarantine_name = format!(".aiterm-quarantine-{}", uuid::Uuid::new_v4());
     let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
     let quarantine_path = source.display_parent.join(&quarantine_name);
+    if !directory_entry_is_exact_object(&source.parent, &source_name, &source.object)? {
+        return Err(format!(
+            "source name changed before quarantine; exact source remains recoverable at {}",
+            source.display_parent.join(&source.name).display()
+        ));
+    }
     rename_noreplace(
         source.parent.as_raw_fd(),
         &source_name,
@@ -2162,7 +2359,97 @@ fn quarantine_prepared_source(source: &VerifiedSessionFile) -> Result<std::path:
             quarantine_path.display()
         )
     })?;
+    if !directory_entry_is_exact_object(&source.parent, &quarantine, &source.object)? {
+        let restore = rename_noreplace(
+            source.parent.as_raw_fd(),
+            &quarantine,
+            source.parent.as_raw_fd(),
+            &source_name,
+        );
+        return match restore {
+            Ok(()) => Err(format!(
+                "source name changed during quarantine; replacement was restored at {}",
+                source.display_parent.join(&source.name).display()
+            )),
+            Err(restore_error) => Err(format!(
+                "source name changed during quarantine; unretired entry remains recoverable at {} (restore failed: {restore_error})",
+                quarantine_path.display()
+            )),
+        };
+    }
     Ok(quarantine_path)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_directory_retirement(directory: &ExactDirectoryRetirement) -> Result<(), String> {
+    if snapshot_directory_entries(&directory.source)? != directory.entries {
+        Err("session sidecar directory changed after its durable archive".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_prepared_archives(
+    prepared: &[PreparedLeasedArchive],
+    destination: &VerifiedDirectory,
+    limits: ArchiveLimits,
+    verify_visible_sources: bool,
+    verify_unretired_files: bool,
+) -> Result<(), String> {
+    for archive in prepared {
+        archive.archive.verify("archive")?;
+        if !directory_entry_is_exact_object(
+            &destination.file,
+            &archive.destination_name,
+            &archive.archive.file,
+        )? {
+            let visible_source = archive
+                .sources
+                .first()
+                .map(|source| {
+                    source
+                        .display_parent
+                        .join(&source.name)
+                        .display()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "generated archive metadata".into());
+            return Err(format!(
+                "exact archive destination changed before source retirement; source remains recoverable at {visible_source}",
+            ));
+        }
+        let archive_bound = u64::try_from(limits.entries)
+            .ok()
+            .and_then(|entries| entries.checked_mul(8192))
+            .and_then(|overhead| limits.bytes.checked_add(overhead))
+            .ok_or("archive bound overflow")?;
+        let (hash, size) = hash_exact_file_bounded(&archive.archive.file, archive_bound)?;
+        if hash != archive.archive_hash || size != archive.archive_size {
+            return Err("held session archive changed before source retirement".into());
+        }
+        if verify_unretired_files {
+            for retirement in &archive.retirements {
+                verify_exact_file(retirement)?;
+            }
+        }
+        for directory in &archive.directories {
+            verify_directory_retirement(directory)?;
+        }
+        if verify_visible_sources {
+            for source in &archive.sources {
+                let source_name = CString::new(source.name.as_bytes())
+                    .map_err(|_| "invalid session entry name")?;
+                if !directory_entry_is_exact_object(&source.parent, &source_name, &source.object)? {
+                    return Err(format!(
+                        "source name changed before quarantine; exact source remains recoverable at {}",
+                        source.display_parent.join(&source.name).display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -2173,7 +2460,28 @@ fn archive_verified_entries_with_hooks(
     before_prepare: impl FnOnce(),
     after_publish: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    archive_verified_inputs_with_hooks(
+    archive_verified_entries_with_transaction_hooks(
+        destination,
+        entries,
+        limits,
+        before_prepare,
+        after_publish,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn archive_verified_entries_with_transaction_hooks(
+    destination: &VerifiedDirectory,
+    entries: Vec<(VerifiedSessionFile, std::ffi::OsString)>,
+    limits: ArchiveLimits,
+    before_prepare: impl FnOnce(),
+    after_publish: impl FnOnce() -> Result<(), String>,
+    before_quarantine: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
+    before_retirement: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
+) -> Result<(), String> {
+    archive_verified_inputs_with_transaction_hooks(
         destination,
         entries
             .into_iter()
@@ -2185,6 +2493,8 @@ fn archive_verified_entries_with_hooks(
         limits,
         before_prepare,
         after_publish,
+        before_quarantine,
+        before_retirement,
     )
 }
 
@@ -2195,6 +2505,27 @@ fn archive_verified_inputs_with_hooks(
     limits: ArchiveLimits,
     before_prepare: impl FnOnce(),
     after_publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    archive_verified_inputs_with_transaction_hooks(
+        destination,
+        inputs,
+        limits,
+        before_prepare,
+        after_publish,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn archive_verified_inputs_with_transaction_hooks(
+    destination: &VerifiedDirectory,
+    inputs: Vec<VerifiedArchiveInput>,
+    limits: ArchiveLimits,
+    before_prepare: impl FnOnce(),
+    after_publish: impl FnOnce() -> Result<(), String>,
+    before_quarantine: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
+    before_retirement: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
 ) -> Result<(), String> {
     if inputs.is_empty() {
         return Err("session delete has no verified archive source".into());
@@ -2239,34 +2570,9 @@ fn archive_verified_inputs_with_hooks(
         .sync_all()
         .map_err(|error| format!("could not make session archives durable: {error}"))?;
     after_publish()?;
-    for archive in &prepared {
-        if !directory_entry_is_exact_object(
-            &destination.file,
-            &archive.destination_name,
-            &archive.archive.file,
-        )? {
-            let visible_source = archive
-                .sources
-                .first()
-                .map(|source| source.display_parent.join(&source.name).display().to_string())
-                .unwrap_or_else(|| "generated archive metadata".into());
-            return Err(format!(
-                "exact archive destination changed before source retirement; source remains visible at {visible_source}",
-            ));
-        }
-        let archive_bound = u64::try_from(limits.entries)
-            .ok()
-            .and_then(|entries| entries.checked_mul(8192))
-            .and_then(|overhead| limits.bytes.checked_add(overhead))
-            .ok_or("archive bound overflow")?;
-        let (hash, size) = hash_exact_file_bounded(&archive.archive.file, archive_bound)?;
-        if hash != archive.archive_hash || size != archive.archive_size {
-            return Err("held session archive changed before source retirement".into());
-        }
-        for retirement in &archive.retirements {
-            verify_exact_file(retirement)?;
-        }
-    }
+    verify_prepared_archives(&prepared, destination, limits, true, true)?;
+    before_quarantine(&prepared)?;
+    verify_prepared_archives(&prepared, destination, limits, true, true)?;
     let mut recovery = Vec::new();
     for archive in &prepared {
         for source in &archive.sources {
@@ -2285,6 +2591,17 @@ fn archive_verified_inputs_with_hooks(
             }
         }
     }
+    before_retirement(&prepared)?;
+    verify_prepared_archives(&prepared, destination, limits, false, true).map_err(|error| {
+        let locations = recovery
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "durable session archives exist but final retirement validation failed; recoverable quarantines: {locations}: {error}"
+        )
+    })?;
     for archive in &prepared {
         if let Err(error) = retire_exact_files(&archive.retirements) {
             let locations = recovery
@@ -2297,6 +2614,16 @@ fn archive_verified_inputs_with_hooks(
             ));
         }
     }
+    verify_prepared_archives(&prepared, destination, limits, false, false).map_err(|error| {
+        let locations = recovery
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "durable session archives exist but post-retirement identity validation failed; recoverable quarantines: {locations}: {error}"
+        )
+    })?;
     Ok(())
 }
 
@@ -2314,7 +2641,8 @@ struct SidecarArchiveRecord {
 #[cfg(target_os = "linux")]
 fn read_archive_array<const N: usize>(file: &mut File) -> Result<[u8; N], String> {
     let mut value = [0u8; N];
-    file.read_exact(&mut value).map_err(|error| error.to_string())?;
+    file.read_exact(&mut value)
+        .map_err(|error| error.to_string())?;
     Ok(value)
 }
 
@@ -2324,7 +2652,9 @@ fn parse_sidecar_archive(
     limits: ArchiveLimits,
 ) -> Result<Vec<SidecarArchiveRecord>, String> {
     let mut reader = file.try_clone().map_err(|error| error.to_string())?;
-    reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
     if read_archive_array::<16>(&mut reader)? != *SIDECAR_ARCHIVE_MAGIC {
         return Err("sidecar archive has invalid magic".into());
     }
@@ -2360,7 +2690,9 @@ fn parse_sidecar_archive(
             return Err("sidecar directory record contains file bytes".into());
         }
         let mut path = vec![0u8; path_len];
-        reader.read_exact(&mut path).map_err(|error| error.to_string())?;
+        reader
+            .read_exact(&mut path)
+            .map_err(|error| error.to_string())?;
         validate_archive_relative_path(&path, limits)?;
         if !seen_paths.insert(path.clone()) {
             return Err("sidecar archive contains a duplicate path".into());
@@ -2380,7 +2712,9 @@ fn parse_sidecar_archive(
         if next > file_len {
             return Err("sidecar archive is truncated".into());
         }
-        reader.seek(SeekFrom::Start(next)).map_err(|error| error.to_string())?;
+        reader
+            .seek(SeekFrom::Start(next))
+            .map_err(|error| error.to_string())?;
         records.push(SidecarArchiveRecord {
             kind,
             path,
@@ -2391,7 +2725,11 @@ fn parse_sidecar_archive(
             content_len,
         });
     }
-    if reader.stream_position().map_err(|error| error.to_string())? != file_len {
+    if reader
+        .stream_position()
+        .map_err(|error| error.to_string())?
+        != file_len
+    {
         return Err("sidecar archive has trailing bytes".into());
     }
     Ok(records)
@@ -2500,9 +2838,9 @@ fn restore_sidecar_archive(
             let mut copied = 0u64;
             let mut buffer = [0u8; 64 * 1024];
             while copied < record.content_len {
-                let request = buffer.len().min(
-                    usize::try_from(record.content_len - copied).unwrap_or(buffer.len()),
-                );
+                let request = buffer
+                    .len()
+                    .min(usize::try_from(record.content_len - copied).unwrap_or(buffer.len()));
                 let offset = record
                     .content_offset
                     .checked_add(copied)
@@ -2513,7 +2851,9 @@ fn restore_sidecar_archive(
                 if read == 0 {
                     return Err("sidecar archive is truncated".into());
                 }
-                output.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+                output
+                    .write_all(&buffer[..read])
+                    .map_err(|error| error.to_string())?;
                 copied = copied
                     .checked_add(read as u64)
                     .ok_or("restored sidecar byte count overflow")?;
@@ -2531,8 +2871,13 @@ fn restore_sidecar_archive(
             output.sync_all().map_err(|error| error.to_string())?;
         }
     }
-    restored_root.sync_all().map_err(|error| error.to_string())?;
-    destination.file.sync_all().map_err(|error| error.to_string())
+    restored_root
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    destination
+        .file
+        .sync_all()
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -2572,10 +2917,7 @@ fn open_or_create_restored_parent(
                 libc::openat(
                     current.as_raw_fd(),
                     name.as_ptr(),
-                    libc::O_RDONLY
-                        | libc::O_DIRECTORY
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )
             };
             if opened < 0 {
@@ -2615,9 +2957,9 @@ fn existing_rollout_matches(
     let mut archived_bytes = [0u8; 64 * 1024];
     let mut existing_bytes = [0u8; 64 * 1024];
     while compared < record.content_len {
-        let request = archived_bytes.len().min(
-            usize::try_from(record.content_len - compared).unwrap_or(archived_bytes.len()),
-        );
+        let request = archived_bytes
+            .len()
+            .min(usize::try_from(record.content_len - compared).unwrap_or(archived_bytes.len()));
         let archive_offset = record
             .content_offset
             .checked_add(compared)
@@ -2663,11 +3005,7 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             )
         };
@@ -2688,9 +3026,9 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
         let mut copied = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         while copied < record.content_len {
-            let request = buffer.len().min(
-                usize::try_from(record.content_len - copied).unwrap_or(buffer.len()),
-            );
+            let request = buffer
+                .len()
+                .min(usize::try_from(record.content_len - copied).unwrap_or(buffer.len()));
             let offset = record
                 .content_offset
                 .checked_add(copied)
@@ -2701,7 +3039,9 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
             if read == 0 {
                 return Err("session rollout archive is truncated".into());
             }
-            output.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| error.to_string())?;
             copied = copied
                 .checked_add(read as u64)
                 .ok_or("restored rollout byte count overflow")?;
@@ -2719,7 +3059,10 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
         output.sync_all().map_err(|error| error.to_string())?;
         parent.sync_all().map_err(|error| error.to_string())?;
     }
-    destination.file.sync_all().map_err(|error| error.to_string())
+    destination
+        .file
+        .sync_all()
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -2749,11 +3092,13 @@ fn directory_entry_is_exact_object(
 
 #[cfg(target_os = "linux")]
 fn verify_exact_file(retirement: &ExactFileRetirement) -> Result<(), String> {
+    retirement.source.verify("source")?;
     let metadata = retirement
         .source
+        .file
         .metadata()
         .map_err(|error| error.to_string())?;
-    let (hash, size) = hash_exact_file(&retirement.source)?;
+    let (hash, size) = hash_exact_file(&retirement.source.file)?;
     if size != retirement.size
         || metadata.len() != retirement.size
         || metadata.modified().ok() != Some(retirement.modified)
@@ -2771,12 +3116,15 @@ fn retire_exact_files(retirements: &[ExactFileRetirement]) -> Result<(), String>
         verify_exact_file(retirement)?;
     }
     for retirement in retirements {
+        retirement.source.verify("source")?;
         retirement
             .source
+            .file
             .set_len(0)
             .map_err(|error| error.to_string())?;
         retirement
             .source
+            .file
             .sync_all()
             .map_err(|error| error.to_string())?;
     }
@@ -2808,7 +3156,9 @@ fn rename_noreplace(
 
 #[cfg(unix)]
 fn verified_directory_entry(root: &Path, path: &Path) -> Result<VerifiedSessionFile, String> {
-    let relative = path.strip_prefix(root).map_err(|_| "directory escapes its store")?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "directory escapes its store")?;
     let root = VerifiedDirectory::open(root)?;
     let (parent, name) = root.open_parent(relative)?;
     VerifiedSessionFile::from_entry(
@@ -2834,14 +3184,18 @@ fn verified_session_file(
         "api" => dirs::data_dir().ok_or("no data dir")?.join("aiterm/chats"),
         _ => return Err("session store is not approved for file mutation".into()),
     };
-    let relative = path.strip_prefix(&root).map_err(|_| "session transcript escapes its store")?;
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| "session transcript escapes its store")?;
     let root = VerifiedDirectory::open(&root)?;
     let (parent, name) = root.open_parent(relative)?;
     VerifiedSessionFile::from_entry(
         parent,
         name,
         VerifiedEntryKind::File,
-        path.parent().ok_or("session transcript has no parent")?.to_path_buf(),
+        path.parent()
+            .ok_or("session transcript has no parent")?
+            .to_path_buf(),
     )
 }
 
@@ -2896,13 +3250,7 @@ pub(crate) fn archive_rooted_session_sources(
         bytes: transcript_path.as_os_str().as_bytes().to_vec(),
         destination_name: std::ffi::OsString::from(format!("{session_id}.origin")),
     });
-    archive_verified_inputs_with_hooks(
-        &trash,
-        inputs,
-        ArchiveLimits::default(),
-        || {},
-        || Ok(()),
-    )
+    archive_verified_inputs_with_hooks(&trash, inputs, ArchiveLimits::default(), || {}, || Ok(()))
 }
 
 #[cfg(not(unix))]
@@ -2982,7 +3330,13 @@ fn job_dir_name(trashed: &Path, session_id: &str) -> String {
                 .and_then(|s| s.as_str())
                 .map(String::from)
         })
-        .unwrap_or_else(|| session_id.split('-').next().unwrap_or(session_id).to_string())
+        .unwrap_or_else(|| {
+            session_id
+                .split('-')
+                .next()
+                .unwrap_or(session_id)
+                .to_string()
+        })
 }
 
 #[derive(Serialize)]
@@ -3041,7 +3395,12 @@ fn trash_list_sync() -> Vec<TrashedSession> {
                     (format!("session {}", &id[..8.min(id.len())]), String::new())
                 }),
             };
-            Some(TrashedSession { id, title, project_path, deleted_at })
+            Some(TrashedSession {
+                id,
+                title,
+                project_path,
+                deleted_at,
+            })
         })
         .collect();
     out.sort_by(|a, b| b.deleted_at.cmp(&a.deleted_at));
@@ -3133,7 +3492,10 @@ fn trash_restore_sync(session_id: String) -> Result<(), String> {
         .into_iter()
         .find(|(s, _)| s.project_path == cwd)
         .and_then(|(_, p)| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| home.join(".claude/projects").join(flatten_project_dir(&cwd)));
+        .unwrap_or_else(|| {
+            home.join(".claude/projects")
+                .join(flatten_project_dir(&cwd))
+        });
     std::fs::create_dir_all(&proj_dir).map_err(|e| e.to_string())?;
     std::fs::rename(&src, proj_dir.join(format!("{session_id}.jsonl")))
         .map_err(|e| e.to_string())?;
@@ -3196,7 +3558,10 @@ fn stash_codex_rollouts(session_id: &str, trash: &Path) {
             continue;
         };
         if std::fs::rename(&from, dir.join(&name)).is_ok() {
-            origins.insert(name, serde_json::Value::String(from.to_string_lossy().into_owned()));
+            origins.insert(
+                name,
+                serde_json::Value::String(from.to_string_lossy().into_owned()),
+            );
         }
     }
     let _ = std::fs::write(
@@ -3414,10 +3779,7 @@ pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
 #[tauri::command]
 pub async fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
-    crate::run_blocking(move || {
-        sessions.preview(&session_id).unwrap_or_default()
-    })
-    .await
+    crate::run_blocking(move || sessions.preview(&session_id).unwrap_or_default()).await
 }
 
 /// How many messages the preview keeps, and how much of each.
@@ -3438,9 +3800,15 @@ fn session_preview_sync(session_id: String) -> Vec<PreviewMsg> {
     if let Some(msgs) = backend.sessions().messages(&session_id) {
         return preview_from_messages(msgs);
     }
-    let Some(home) = dirs::home_dir() else { return vec![] };
-    let Ok(verified) = verified_session_file(backend.id(), &path, &home) else { return vec![] };
-    let Ok(file) = verified.open() else { return vec![] };
+    let Some(home) = dirs::home_dir() else {
+        return vec![];
+    };
+    let Ok(verified) = verified_session_file(backend.id(), &path, &home) else {
+        return vec![];
+    };
+    let Ok(file) = verified.open() else {
+        return vec![];
+    };
     preview_reader(BufReader::new(file))
 }
 
@@ -3478,7 +3846,10 @@ fn preview_reader(reader: impl BufRead) -> Vec<PreviewMsg> {
         if truncated {
             text.push('…');
         }
-        let at = v.get("timestamp").and_then(|t| t.as_str()).map(String::from);
+        let at = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .map(String::from);
         out.push_back(PreviewMsg { role, text, at });
         if out.len() > PREVIEW_KEEP {
             out.pop_front();
@@ -3507,7 +3878,11 @@ fn preview_from_messages(msgs: Vec<(String, String)>) -> Vec<PreviewMsg> {
             if truncated {
                 text.push('…');
             }
-            Some(PreviewMsg { role, text, at: None })
+            Some(PreviewMsg {
+                role,
+                text,
+                at: None,
+            })
         })
         .collect();
     if out.len() > PREVIEW_KEEP {
@@ -3552,7 +3927,11 @@ fn session_tasks_sync(session_id: String) -> Vec<SessionTask> {
             let mut todo_at = 0usize;
             let mut created: Vec<SessionTask> = Vec::new();
             let mut task_at = 0usize;
-            for (n, line) in BufReader::new(file).lines().map_while(Result::ok).enumerate() {
+            for (n, line) in BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .enumerate()
+            {
                 if !line.contains("\"TodoWrite\"")
                     && !line.contains("\"TaskCreate\"")
                     && !line.contains("\"TaskUpdate\"")
@@ -3562,8 +3941,7 @@ fn session_tasks_sync(session_id: String) -> Vec<SessionTask> {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue;
                 };
-                let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array())
-                else {
+                let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
                     continue;
                 };
                 for b in blocks {
@@ -3589,10 +3967,7 @@ fn session_tasks_sync(session_id: String) -> Vec<SessionTask> {
                                         .filter_map(|(i, t)| {
                                             Some(SessionTask {
                                                 id: i.to_string(),
-                                                subject: t
-                                                    .get("content")?
-                                                    .as_str()?
-                                                    .to_string(),
+                                                subject: t.get("content")?.as_str()?.to_string(),
                                                 status: t
                                                     .get("status")
                                                     .and_then(|s| s.as_str())
@@ -3643,7 +4018,10 @@ fn session_tasks_sync(session_id: String) -> Vec<SessionTask> {
                 }
             }
             if !created.is_empty() && (todo.is_none() || task_at > todo_at) {
-                return created.into_iter().filter(|t| t.status != "deleted").collect();
+                return created
+                    .into_iter()
+                    .filter(|t| t.status != "deleted")
+                    .collect();
             }
             if let Some(tasks) = todo {
                 return tasks;
@@ -3887,7 +4265,9 @@ fn claude_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     let exact = format!("{session_id}.jsonl");
     if let Ok(projects) = std::fs::read_dir(&root) {
         for project in projects.flatten() {
-            let Ok(project_type) = project.file_type() else { continue };
+            let Ok(project_type) = project.file_type() else {
+                continue;
+            };
             if project_type.is_symlink() || !project_type.is_dir() {
                 continue;
             }
@@ -3903,7 +4283,9 @@ fn claude_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     let orphaned_prefix = format!("{session_id}.orphaned-");
     let mut best: Option<(std::path::PathBuf, u64)> = None;
     for project in std::fs::read_dir(&root).ok()?.flatten() {
-        let Ok(project_type) = project.file_type() else { continue };
+        let Ok(project_type) = project.file_type() else {
+            continue;
+        };
         if project_type.is_symlink() || !project_type.is_dir() {
             continue;
         }
@@ -3911,7 +4293,9 @@ fn claude_session_file(session_id: &str) -> Option<std::path::PathBuf> {
             continue;
         };
         for f in files.flatten() {
-            let Ok(file_type) = f.file_type() else { continue };
+            let Ok(file_type) = f.file_type() else {
+                continue;
+            };
             if file_type.is_symlink() || !file_type.is_file() {
                 continue;
             }
@@ -4310,7 +4694,11 @@ fn has_conversation(path: &Path) -> bool {
     BufReader::new(file).lines().map_while(Result::ok).any(|l| {
         serde_json::from_str::<serde_json::Value>(&l)
             .ok()
-            .and_then(|v| v.get("type")?.as_str().map(|t| t == "user" || t == "assistant"))
+            .and_then(|v| {
+                v.get("type")?
+                    .as_str()
+                    .map(|t| t == "user" || t == "assistant")
+            })
             .unwrap_or(false)
     })
 }
@@ -4476,8 +4864,7 @@ pub struct RosterEntry {
 /// through `read_roster_fresh` instead.
 const ROSTER_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
-static ROSTER: crate::cache::TtlCache<Vec<RosterEntry>> =
-    crate::cache::TtlCache::new(ROSTER_TTL);
+static ROSTER: crate::cache::TtlCache<Vec<RosterEntry>> = crate::cache::TtlCache::new(ROSTER_TTL);
 
 /// The roster, minus finished sessions. `claude agents --json` keeps reporting
 /// a session with `state: "done"`, so "appears in the roster" is not the same
@@ -4624,7 +5011,8 @@ fn roster_from_cli() -> Vec<RosterEntry> {
 pub async fn stop_session(session_id: String) -> Result<(), String> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     tauri::async_runtime::spawn_blocking(move || {
-        sessions.stop(&session_id)
+        sessions
+            .stop(&session_id)
             .map_err(|error| error.message().to_owned())
     })
     .await
@@ -4659,7 +5047,10 @@ fn stop_session_blocking(session_id: String) -> Result<(), String> {
     // a stop that didn't happen and then launch a `--resume` doomed to refuse.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if !read_roster_fresh().iter().any(|e| e.session_id == session_id) {
+        if !read_roster_fresh()
+            .iter()
+            .any(|e| e.session_id == session_id)
+        {
             return Ok(());
         }
         // Each pass already costs a process spawn of its own (~0.26s), so the
@@ -5023,8 +5414,10 @@ mod refusal_tests {
     #[test]
     fn a_soft_fallback_parses_and_finds_its_flagged_prompt() {
         let text = concat!(
-            r#"{"type":"user","uuid":"u-1","message":{"role":"user","content":"scan the firewall logs for lateral movement"}}"#, "\n",
-            r#"{"type":"system","subtype":"model_refusal_fallback","content":"Fable 5's safeguards flagged this message.","originalModel":"claude-fable-5","fallbackModel":"claude-opus-4-8","apiRefusalCategory":"cyber","refusedUserMessageUuid":"u-1","uuid":"r-1","timestamp":"2026-08-12T00:12:26.402Z"}"#, "\n",
+            r#"{"type":"user","uuid":"u-1","message":{"role":"user","content":"scan the firewall logs for lateral movement"}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"model_refusal_fallback","content":"Fable 5's safeguards flagged this message.","originalModel":"claude-fable-5","fallbackModel":"claude-opus-4-8","apiRefusalCategory":"cyber","refusedUserMessageUuid":"u-1","uuid":"r-1","timestamp":"2026-08-12T00:12:26.402Z"}"#,
+            "\n",
         );
         let r = parse_refusal(text).expect("a refusal");
         assert_eq!(r.uuid, "r-1");
@@ -5043,7 +5436,8 @@ mod refusal_tests {
     /// hypothetical third variant is still caught.
     #[test]
     fn a_hard_block_is_marked_hard_and_the_prefix_is_forgiving() {
-        let hard = r#"{"type":"system","subtype":"model_refusal_no_fallback","content":"","uuid":"r-2"}"#;
+        let hard =
+            r#"{"type":"system","subtype":"model_refusal_no_fallback","content":"","uuid":"r-2"}"#;
         assert!(parse_refusal(hard).unwrap().hard);
         let future = r#"{"type":"system","subtype":"model_refusal_future_variant","uuid":"r-3"}"#;
         assert_eq!(parse_refusal(future).unwrap().uuid, "r-3");
@@ -5070,18 +5464,21 @@ mod refusal_tests {
         std::env::set_var("HOME", &root);
 
         let sid = "01a00b9c-0011-7973-a7ac-759454839aaf";
-        let made: Vec<std::path::PathBuf> = ["rollout-1.jsonl", "rollout-2.jsonl", "rollout-3.jsonl"]
-            .iter()
-            .map(|n| {
-                let p = day.join(n);
-                std::fs::write(
-                    &p,
-                    format!("{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/p\"}}}}\n"),
-                )
-                .unwrap();
-                p
-            })
-            .collect();
+        let made: Vec<std::path::PathBuf> =
+            ["rollout-1.jsonl", "rollout-2.jsonl", "rollout-3.jsonl"]
+                .iter()
+                .map(|n| {
+                    let p = day.join(n);
+                    std::fs::write(
+                        &p,
+                        format!(
+                            "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/p\"}}}}\n"
+                        ),
+                    )
+                    .unwrap();
+                    p
+                })
+                .collect();
 
         stash_codex_rollouts(sid, &trash);
         let stashed = trash.join(format!("{sid}.rollouts"));
@@ -5089,7 +5486,10 @@ mod refusal_tests {
         for p in &made {
             assert!(!p.exists(), "{} should have left the store", p.display());
         }
-        assert!(stashed.join("origins.json").is_file(), "where they came from is recorded");
+        assert!(
+            stashed.join("origins.json").is_file(),
+            "where they came from is recorded"
+        );
 
         restore_codex_rollouts(&trash, sid).unwrap();
         for p in &made {
@@ -5103,9 +5503,12 @@ mod refusal_tests {
     #[test]
     fn the_latest_refusal_wins_and_a_clean_tail_is_none() {
         let two = concat!(
-            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"old"}"#, "\n",
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-8"}}"#, "\n",
-            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"new"}"#, "\n",
+            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"old"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-8"}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"new"}"#,
+            "\n",
         );
         assert_eq!(parse_refusal(two).unwrap().uuid, "new");
         assert_eq!(
@@ -5307,7 +5710,8 @@ fn rewrite_session_ids(text: &str, old: &str, new: &str) -> (String, usize) {
 pub async fn session_fork(session_id: String) -> Result<String, String> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {
-        sessions.fork(&session_id)
+        sessions
+            .fork(&session_id)
             .map_err(|error| error.message().to_owned())
     })
     .await
@@ -5337,9 +5741,12 @@ fn session_fork_sync(session_id: String) -> Result<String, String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
     let verified = verified_session_file(backend.id(), &src, &home)
         .map_err(|e| format!("couldn't verify transcript: {e}"))?;
-    let mut file = verified.open().map_err(|e| format!("couldn't read transcript: {e}"))?;
+    let mut file = verified
+        .open()
+        .map_err(|e| format!("couldn't read transcript: {e}"))?;
     let mut text = String::new();
-    file.read_to_string(&mut text).map_err(|e| format!("couldn't read transcript: {e}"))?;
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("couldn't read transcript: {e}"))?;
     let new_id = uuid_v4()?;
     let (out, replaced) = rewrite_session_ids(&text, &old_id, &new_id);
     // Zero replacements means the format moved out from under us (spacing, a
@@ -5422,8 +5829,8 @@ fn materialize_fork_sync(session_id: String) -> Result<(), String> {
     if has_conversation(&stub) {
         return Err("that session already has a conversation".into());
     }
-    let (parent_id, boundary) =
-        fork_promise(&session_id).ok_or_else(|| "not a /fork — nothing to rebuild from".to_string())?;
+    let (parent_id, boundary) = fork_promise(&session_id)
+        .ok_or_else(|| "not a /fork — nothing to rebuild from".to_string())?;
     let parent = find_session_file(&parent_id)
         .ok_or_else(|| format!("the session it forked from ({parent_id}) is gone"))?;
     let parent_text =
@@ -5515,11 +5922,7 @@ mod tests {
         let project = fixture.join("projects/project");
         std::fs::create_dir_all(&project).unwrap();
         for index in 0..=MAX_DISCOVERED_SESSION_FILES {
-            std::fs::write(
-                project.join(format!(".aiterm-quarantine-{index:08x}")),
-                b"",
-            )
-            .unwrap();
+            std::fs::write(project.join(format!(".aiterm-quarantine-{index:08x}")), b"").unwrap();
         }
         let id = "35353535-3535-4535-8535-353535353535";
         let transcript = project.join(format!("{id}.jsonl"));
@@ -5583,9 +5986,14 @@ mod tests {
             .set_modified(UNIX_EPOCH)
             .unwrap();
         symlink(&outside_trash, &trash_path).unwrap();
-        trash.purge_older_than(std::time::SystemTime::now()).unwrap();
+        trash
+            .purge_older_than(std::time::SystemTime::now())
+            .unwrap();
         assert!(!pinned_trash.join("stale-inside").exists());
-        assert_eq!(std::fs::read(&stale_outside).unwrap(), b"outside trash sentinel");
+        assert_eq!(
+            std::fs::read(&stale_outside).unwrap(),
+            b"outside trash sentinel"
+        );
 
         let pinned = home.join(".claude/projects-pinned");
         std::fs::rename(&projects, &pinned).unwrap();
@@ -5606,16 +6014,17 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside sentinel");
         assert!(!pinned.join("project").join(format!("{id}.jsonl")).exists());
-        assert_eq!(std::fs::read(pinned_trash.join(format!("{id}.jsonl"))).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(pinned_trash.join(format!("{id}.jsonl"))).unwrap(),
+            b"original"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn archive_transaction_holds_a_write_lease_through_source_retirement() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-lease-archive-{}",
-            uuid::Uuid::new_v4()
-        ));
+    fn archive_transaction_aborts_when_a_competing_writer_breaks_its_lease() {
+        let root =
+            std::env::temp_dir().join(format!("aiterm-lease-archive-{}", uuid::Uuid::new_v4()));
         let home = root.join("home");
         let project = home.join(".claude/projects/project");
         let trash_path = home.join(".claude/trash");
@@ -5628,7 +6037,7 @@ mod tests {
         let verified = verified_session_file("claude", &source, &home).unwrap();
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
 
-        archive_verified_entries_with_hooks(
+        let error = archive_verified_entries_with_hooks(
             &trash,
             vec![(verified, std::ffi::OsString::from(format!("{id}.jsonl")))],
             ArchiveLimits::default(),
@@ -5643,20 +6052,24 @@ mod tests {
                 Ok(())
             },
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(std::fs::read(destination).unwrap(), b"lease protected transcript");
-        assert!(!source.exists());
+        assert!(error.contains("archive lease"), "{error}");
+        assert_eq!(
+            std::fs::read(destination).unwrap(),
+            b"lease protected transcript"
+        );
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"lease protected transcript"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn sidecar_is_one_strict_archive_and_round_trips_through_held_fds() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-sidecar-v1-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = std::env::temp_dir().join(format!("aiterm-sidecar-v1-{}", uuid::Uuid::new_v4()));
         let sidecars = root.join("sidecars");
         let source = sidecars.join("session-sidecar");
         let trash_path = root.join("trash");
@@ -5679,12 +6092,16 @@ mod tests {
         .unwrap();
         let archive = trash_path.join("session.tasks");
         assert!(archive.is_file());
-        assert!(std::fs::read(&archive).unwrap().starts_with(SIDECAR_ARCHIVE_MAGIC));
+        assert!(std::fs::read(&archive)
+            .unwrap()
+            .starts_with(SIDECAR_ARCHIVE_MAGIC));
 
-        restore_sidecar_archive(&archive, &restored_root, OsStr::new("session-sidecar"))
-            .unwrap();
+        restore_sidecar_archive(&archive, &restored_root, OsStr::new("session-sidecar")).unwrap();
         let restored = restored_root.join("session-sidecar");
-        assert_eq!(std::fs::read(restored.join("state.json")).unwrap(), b"state");
+        assert_eq!(
+            std::fs::read(restored.join("state.json")).unwrap(),
+            b"state"
+        );
         assert_eq!(
             std::fs::read(restored.join("nested/output.txt")).unwrap(),
             b"output"
@@ -5741,11 +6158,7 @@ mod tests {
             std::fs::read(trash_path.join("session.origin")).unwrap(),
             main_path.as_os_str().as_bytes()
         );
-        restore_file_set_archive(
-            &trash_path.join("session.rollouts"),
-            &sessions,
-        )
-        .unwrap();
+        restore_file_set_archive(&trash_path.join("session.rollouts"), &sessions).unwrap();
         assert_eq!(std::fs::read(&extra_path).unwrap(), b"extra rollout");
         restore_file_set_archive(&trash_path.join("session.rollouts"), &sessions)
             .expect("an interrupted restore retries idempotently when the bytes already match");
@@ -5755,10 +6168,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sidecar_bounds_fail_before_publish_or_source_quarantine() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-sidecar-bounds-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-sidecar-bounds-{}", uuid::Uuid::new_v4()));
         let sidecars = root.join("sidecars");
         let source = sidecars.join("session-sidecar");
         let trash_path = root.join("trash");
@@ -5788,10 +6199,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn multi_artifact_failure_before_retirement_keeps_every_source_visible() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-archive-ordering-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-archive-ordering-{}", uuid::Uuid::new_v4()));
         let home = root.join("home");
         let project = home.join(".claude/projects/project");
         let sidecars = home.join(".claude/tasks");
@@ -5828,7 +6237,10 @@ mod tests {
         assert!(!std::fs::read_dir(&project)
             .unwrap()
             .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-")));
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".aiterm-quarantine-")));
 
         let retry_main = verified_session_file("claude", &transcript, &home).unwrap();
         let retry_sidecar = verified_directory_entry(&sidecars, &tasks).unwrap();
@@ -5836,7 +6248,10 @@ mod tests {
             &trash,
             vec![
                 (retry_main, std::ffi::OsString::from(format!("{id}.jsonl"))),
-                (retry_sidecar, std::ffi::OsString::from(format!("{id}.tasks"))),
+                (
+                    retry_sidecar,
+                    std::ffi::OsString::from(format!("{id}.tasks")),
+                ),
             ],
             ArchiveLimits::default(),
             || {},
@@ -5884,7 +6299,10 @@ mod tests {
         assert!(error.contains("destination changed"));
         assert_eq!(std::fs::read(&source).unwrap(), b"exact transcript");
         assert_eq!(std::fs::read(&displaced).unwrap(), b"exact transcript");
-        assert_eq!(std::fs::read(&destination).unwrap(), b"unverified replacement");
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"unverified replacement"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5928,7 +6346,10 @@ mod tests {
         assert!(!std::fs::read_dir(&project)
             .unwrap()
             .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-")));
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".aiterm-quarantine-")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5973,7 +6394,12 @@ mod tests {
         let quarantined = std::fs::read_dir(&project)
             .unwrap()
             .flatten()
-            .find(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-"))
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".aiterm-quarantine-")
+            })
             .expect("the exact original remains recoverable after quarantine")
             .path();
         assert_eq!(std::fs::read(quarantined).unwrap(), b"source bytes");
@@ -6006,8 +6432,11 @@ mod tests {
             || Ok(()),
             |_| Ok(()),
             |prepared| {
-                let descriptor = prepared[0].retirements[0].source.as_raw_fd();
-                assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_SETLEASE, libc::F_UNLCK) }, 0);
+                let descriptor = prepared[0].retirements[0].source.file.as_raw_fd();
+                assert_eq!(
+                    unsafe { libc::fcntl(descriptor, libc::F_SETLEASE, libc::F_UNLCK) },
+                    0
+                );
                 Ok(())
             },
         )
@@ -6016,7 +6445,12 @@ mod tests {
         let quarantined = std::fs::read_dir(&project)
             .unwrap()
             .flatten()
-            .find(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-"))
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".aiterm-quarantine-")
+            })
             .unwrap()
             .path();
         assert_eq!(std::fs::read(quarantined).unwrap(), b"lease bytes");
@@ -6061,10 +6495,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn leased_archive_sets_keep_timestamp_on_its_held_fd_and_collision_is_non_destructive() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-leased-timestamp-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-leased-timestamp-{}", uuid::Uuid::new_v4()));
         let home = root.join("home");
         let project = home.join(".claude/projects/project");
         let trash_path = home.join(".claude/trash");
@@ -6116,10 +6548,8 @@ mod tests {
             file.set_len(9).unwrap();
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-sidecar-growth-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-sidecar-growth-{}", uuid::Uuid::new_v4()));
         let sidecars = root.join("sidecars");
         let source = sidecars.join("session-sidecar");
         let trash_path = root.join("trash");
@@ -6176,15 +6606,9 @@ mod tests {
         let verified = verified_session_file("claude", &transcript, &home).unwrap();
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
 
-        let error = archive_generic_session_sources(
-            verified,
-            &transcript,
-            id,
-            &home,
-            &trash,
-            Vec::new(),
-        )
-        .unwrap_err();
+        let error =
+            archive_generic_session_sources(verified, &transcript, id, &home, &trash, Vec::new())
+                .unwrap_err();
         assert!(error.contains("symlink or special file"), "{error}");
         assert_eq!(std::fs::read(&transcript).unwrap(), b"visible transcript");
         assert!(tasks.is_dir());
@@ -6234,7 +6658,9 @@ mod tests {
         for suffix in ["tasks", "job"] {
             let archive = trash_path.join(format!("{id}.{suffix}"));
             assert!(archive.is_file());
-            assert!(std::fs::read(archive).unwrap().starts_with(SIDECAR_ARCHIVE_MAGIC));
+            assert!(std::fs::read(archive)
+                .unwrap()
+                .starts_with(SIDECAR_ARCHIVE_MAGIC));
         }
         assert!(!transcript.exists());
         assert!(!tasks.exists());
@@ -6257,7 +6683,10 @@ mod tests {
             OsStr::new("24242424"),
         )
         .unwrap();
-        assert_eq!(std::fs::read(tasks.join("task.json")).unwrap(), b"task data");
+        assert_eq!(
+            std::fs::read(tasks.join("task.json")).unwrap(),
+            b"task data"
+        );
         assert!(std::fs::read(job.join("state.json"))
             .unwrap()
             .windows(id.len())
@@ -6313,7 +6742,10 @@ mod tests {
             self
         }
         fn caps(&self) -> crate::agents::Caps {
-            crate::agents::Caps { delete: self.can_delete, ..Default::default() }
+            crate::agents::Caps {
+                delete: self.can_delete,
+                ..Default::default()
+            }
         }
         fn launch(&self, _spec: &crate::agents::LaunchSpec) -> String {
             String::new()
@@ -6321,7 +6753,10 @@ mod tests {
     }
 
     fn fake(can_delete: bool) -> Vec<Box<dyn crate::agents::AgentBackend>> {
-        vec![Box::new(FakeOwner { id: "fake", can_delete })]
+        vec![Box::new(FakeOwner {
+            id: "fake",
+            can_delete,
+        })]
     }
 
     /// The 🗑 is hidden for an engine that declares no delete, but hiding a
@@ -6330,15 +6765,24 @@ mod tests {
     /// to rename, so the destructive step is never reached.
     #[test]
     fn delete_refuses_for_an_engine_that_does_not_claim_it() {
-        let err = deletable(&fake(false), "owned").map(|_| ()).expect_err("must refuse");
-        assert!(err.contains("Fake Engine"), "the refusal should name the engine: {err}");
+        let err = deletable(&fake(false), "owned")
+            .map(|_| ())
+            .expect_err("must refuse");
+        assert!(
+            err.contains("Fake Engine"),
+            "the refusal should name the engine: {err}"
+        );
         assert_eq!(
-            deletable(&fake(true), "owned").ok().map(|(b, p)| (b.id(), p)),
+            deletable(&fake(true), "owned")
+                .ok()
+                .map(|(b, p)| (b.id(), p)),
             Some(("fake", std::path::PathBuf::from("/nonexistent/store.db"))),
             "an engine that claims the delete still gets its path",
         );
         assert_eq!(
-            deletable(&fake(true), "someone-elses").map(|_| ()).unwrap_err(),
+            deletable(&fake(true), "someone-elses")
+                .map(|_| ())
+                .unwrap_err(),
             "session not found",
         );
     }
@@ -6363,7 +6807,10 @@ mod tests {
         let last = out.last().unwrap();
         assert_eq!(last.text.chars().count(), PREVIEW_MAX_CHARS + 1);
         assert!(last.text.ends_with('…'));
-        assert!(last.at.is_none(), "(role, text) carries no timestamp to invent one from");
+        assert!(
+            last.at.is_none(),
+            "(role, text) carries no timestamp to invent one from"
+        );
     }
 
     /// The same two filters the file path applies: a message that is nothing
@@ -6371,7 +6818,10 @@ mod tests {
     #[test]
     fn a_supplied_conversation_drops_what_nobody_said() {
         let out = preview_from_messages(vec![
-            ("user".into(), "<system-reminder>be good</system-reminder>".into()),
+            (
+                "user".into(),
+                "<system-reminder>be good</system-reminder>".into(),
+            ),
             (
                 "user".into(),
                 "You are summarizing a Claude Code session and should…".into(),
@@ -6390,10 +6840,8 @@ mod tests {
             Some(("user".into(), "plain string".into()))
         );
         assert_eq!(
-            msg(
-                r#"{"type":"assistant","message":{"content":[
-                   {"type":"text","text":"first"},{"type":"text","text":"second"}]}}"#
-            ),
+            msg(r#"{"type":"assistant","message":{"content":[
+                   {"type":"text","text":"first"},{"type":"text","text":"second"}]}}"#),
             Some(("assistant".into(), "first\nsecond".into()))
         );
     }
@@ -6439,8 +6887,12 @@ mod tests {
             None
         );
         // And the cheap prefilter must not waste a parse on the rest.
-        assert!(!line_may_hold_message(r#"{"type":"event_msg","payload":{"type":"token_count"}}"#));
-        assert!(!line_may_hold_message(r#"{"type":"world_state","payload":{"full":true}}"#));
+        assert!(!line_may_hold_message(
+            r#"{"type":"event_msg","payload":{"type":"token_count"}}"#
+        ));
+        assert!(!line_may_hold_message(
+            r#"{"type":"world_state","payload":{"full":true}}"#
+        ));
     }
 
     #[test]
@@ -6605,7 +7057,10 @@ mod tests {
             "{\"permissions\":{\"defaultMode\":\"acceptEdits\"}}",
         )
         .unwrap();
-        assert_eq!(mode_from(&[proj.join(".claude/settings.json")]), Some("acceptEdits".into()));
+        assert_eq!(
+            mode_from(&[proj.join(".claude/settings.json")]),
+            Some("acceptEdits".into())
+        );
 
         // settings.local.json outranks it.
         std::fs::write(
@@ -6715,7 +7170,10 @@ mod tests {
         // Everything up to the boundary, including the untimestamped record
         // that sits between them; nothing from after it.
         assert_eq!(kept.len(), 3);
-        assert!(kept[1].contains("\"mode\""), "untimestamped records ride along");
+        assert!(
+            kept[1].contains("\"mode\""),
+            "untimestamped records ride along"
+        );
         assert!(!kept.iter().any(|l| l.contains("18:50")));
     }
 
@@ -6736,7 +7194,10 @@ mod tests {
              {\"type\":\"agent-name\",\"agentName\":\"aiterm ⑂\"}\n",
         )
         .unwrap();
-        assert!(!has_conversation(&stub), "a /fork stub has nothing to resume");
+        assert!(
+            !has_conversation(&stub),
+            "a /fork stub has nothing to resume"
+        );
         let real = dir.join("real.jsonl");
         std::fs::write(&real, "{\"type\":\"ai-title\"}\n{\"type\":\"user\"}\n").unwrap();
         assert!(has_conversation(&real), "one message record is enough");
@@ -6772,8 +7233,13 @@ mod tests {
             "hi there"
         );
         // Unbalanced known system tag drops the rest.
-        assert_eq!(strip_system_tags("<local-command-caveat>Caveat: The mess"), "");
-        assert!(is_system_meta_prompt("You are summarizing a Claude Code session for a log"));
+        assert_eq!(
+            strip_system_tags("<local-command-caveat>Caveat: The mess"),
+            ""
+        );
+        assert!(is_system_meta_prompt(
+            "You are summarizing a Claude Code session for a log"
+        ));
         assert!(is_system_meta_prompt(
             "Caveat: The messages below were generated by the user while running local commands"
         ));
@@ -6786,14 +7252,23 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let tmp_session = dir.join("11111111-1111-1111-1111-111111111111.jsonl");
-        std::fs::write(&tmp_session,
-            r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":"real prompt"}}"#).unwrap();
-        assert!(parse_session(&tmp_session, None).is_none(), "/tmp session should be dropped");
+        std::fs::write(
+            &tmp_session,
+            r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":"real prompt"}}"#,
+        )
+        .unwrap();
+        assert!(
+            parse_session(&tmp_session, None).is_none(),
+            "/tmp session should be dropped"
+        );
 
         let meta_session = dir.join("22222222-2222-2222-2222-222222222222.jsonl");
         std::fs::write(&meta_session,
             r#"{"type":"user","cwd":"/home/x/proj","message":{"role":"user","content":"You are summarizing a Claude Code session for a daily memory log"}}"#).unwrap();
-        assert!(parse_session(&meta_session, None).is_none(), "meta-only session should be dropped");
+        assert!(
+            parse_session(&meta_session, None).is_none(),
+            "meta-only session should be dropped"
+        );
 
         let real_session = dir.join("33333333-3333-3333-3333-333333333333.jsonl");
         std::fs::write(&real_session, concat!(
@@ -6823,8 +7298,7 @@ mod tests {
         // No cwd anywhere → still dropped (can't place it in a project).
         assert!(parse_session(&stub, None).is_none(), "stub w/o cwd dropped");
         // With the project dir's cwd backfilled, it shows under its ai-title.
-        let s = parse_session(&stub, Some("/home/matt/Projects/headroom"))
-            .expect("fork stub kept");
+        let s = parse_session(&stub, Some("/home/matt/Projects/headroom")).expect("fork stub kept");
         assert_eq!(s.title, "headroom ⑂");
         assert_eq!(s.project_path, "/home/matt/Projects/headroom");
     }
@@ -6887,7 +7361,10 @@ mod tests {
         )).unwrap();
         let s = parse_session(&fork, None).expect("fork with only a last-prompt is kept");
         assert_eq!(s.title, "take this branch and try the other approach");
-        assert!(s.forked && s.background, "still recognised as a /fork child");
+        assert!(
+            s.forked && s.background,
+            "still recognised as a /fork child"
+        );
 
         // A last-prompt holding only injected system text is still not a human
         // prompt — that bookkeeping stays filtered out.
@@ -6896,7 +7373,10 @@ mod tests {
             r#"{"type":"bridge-session","sessionId":"y","bridgeSessionId":"cse_2"}"#, "\n",
             r#"{"type":"last-prompt","lastPrompt":"<system-reminder>be nice</system-reminder>","cwd":"/home/x/proj","sessionId":"y"}"#,
         )).unwrap();
-        assert!(parse_session(&noise, None).is_none(), "system-only prompt stays filtered");
+        assert!(
+            parse_session(&noise, None).is_none(),
+            "system-only prompt stays filtered"
+        );
     }
 
     #[test]
@@ -6909,25 +7389,38 @@ mod tests {
         let dir = std::env::temp_dir().join("aiterm-test-newborn-fork");
         std::fs::create_dir_all(&dir).unwrap();
         let stub = dir.join("1eeedeca-05a5-41f4-a2c6-dc791d1a2a61.jsonl");
-        std::fs::write(&stub, concat!(
-            r#"{"type":"ai-title","aiTitle":"aiterm ⑂","sessionId":"1eeedeca"}"#, "\n",
-            r#"{"type":"agent-name","agentName":"aiterm","sessionId":"1eeedeca"}"#,
-        )).unwrap();
+        std::fs::write(
+            &stub,
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"aiterm ⑂","sessionId":"1eeedeca"}"#,
+                "\n",
+                r#"{"type":"agent-name","agentName":"aiterm","sessionId":"1eeedeca"}"#,
+            ),
+        )
+        .unwrap();
         let s = parse_session(&stub, Some("/home/x/proj")).expect("stub is listed");
-        assert!(!s.forked, "no chain in the file yet — heuristic cannot tell");
+        assert!(
+            !s.forked,
+            "no chain in the file yet — heuristic cannot tell"
+        );
         assert_eq!(s.fork_parent, None, "parse_session never sets lineage");
 
         // Job state supplies what the transcript cannot.
         let jobs = std::env::temp_dir().join("aiterm-test-newborn-fork-jobs");
         let job = jobs.join("1eeedeca");
         std::fs::create_dir_all(&job).unwrap();
-        std::fs::write(job.join("state.json"), concat!(
-            r#"{"forkSessionId":"1eeedeca-05a5-41f4-a2c6-dc791d1a2a61","#,
-            r#""forkParentSessionId":"9c82d668-97de-469a-9cd4-ca25319bb145"}"#,
-        )).unwrap();
+        std::fs::write(
+            job.join("state.json"),
+            concat!(
+                r#"{"forkSessionId":"1eeedeca-05a5-41f4-a2c6-dc791d1a2a61","#,
+                r#""forkParentSessionId":"9c82d668-97de-469a-9cd4-ca25319bb145"}"#,
+            ),
+        )
+        .unwrap();
         let map = fork_parent_map(&jobs);
         assert_eq!(
-            map.get("1eeedeca-05a5-41f4-a2c6-dc791d1a2a61").map(String::as_str),
+            map.get("1eeedeca-05a5-41f4-a2c6-dc791d1a2a61")
+                .map(String::as_str),
             Some("9c82d668-97de-469a-9cd4-ca25319bb145"),
             "lineage is available before the fork writes any message",
         );
@@ -6937,14 +7430,19 @@ mod tests {
         // skipped entirely while the map demanded both keys.
         let nested = jobs.join("457d5d29");
         std::fs::create_dir_all(&nested).unwrap();
-        std::fs::write(nested.join("state.json"), concat!(
-            r#"{"sessionId":"457d5d29-1111-4111-8111-111111111111","#,
-            r#""forkParentSessionId":"1eeedeca-05a5-41f4-a2c6-dc791d1a2a61","#,
-            r#""forkSourceAlive":true}"#,
-        )).unwrap();
+        std::fs::write(
+            nested.join("state.json"),
+            concat!(
+                r#"{"sessionId":"457d5d29-1111-4111-8111-111111111111","#,
+                r#""forkParentSessionId":"1eeedeca-05a5-41f4-a2c6-dc791d1a2a61","#,
+                r#""forkSourceAlive":true}"#,
+            ),
+        )
+        .unwrap();
         let map = fork_parent_map(&jobs);
         assert_eq!(
-            map.get("457d5d29-1111-4111-8111-111111111111").map(String::as_str),
+            map.get("457d5d29-1111-4111-8111-111111111111")
+                .map(String::as_str),
             Some("1eeedeca-05a5-41f4-a2c6-dc791d1a2a61"),
             "a fork with no forkSessionId still resolves via sessionId",
         );
@@ -6953,8 +7451,11 @@ mod tests {
         // not lineage, or every session would claim a parent.
         let plain = jobs.join("4c8c8287");
         std::fs::create_dir_all(&plain).unwrap();
-        std::fs::write(plain.join("state.json"),
-            r#"{"sessionId":"4c8c8287-2222-4222-8222-222222222222"}"#).unwrap();
+        std::fs::write(
+            plain.join("state.json"),
+            r#"{"sessionId":"4c8c8287-2222-4222-8222-222222222222"}"#,
+        )
+        .unwrap();
         let map = fork_parent_map(&jobs);
         assert_eq!(map.len(), 2, "non-fork job must not appear");
 
@@ -6983,7 +7484,10 @@ mod tests {
         std::fs::write(&wt,
             r#"{"type":"user","uuid":"a","parentUuid":null,"cwd":"/home/x/proj/.claude/worktrees/wip/src-tauri","message":{"role":"user","content":"fork work"}}"#).unwrap();
         let s = parse_session(&wt, None).expect("worktree session kept");
-        assert_eq!(s.project_path, "/home/x/proj/.claude/worktrees/wip/src-tauri");
+        assert_eq!(
+            s.project_path,
+            "/home/x/proj/.claude/worktrees/wip/src-tauri"
+        );
         assert_eq!(s.group_path, "/home/x/proj");
     }
 }
@@ -7020,9 +7524,13 @@ mod migration_tests {
             "parent.jsonl",
             &[r#"{"type":"user","uuid":"AAA","sessionId":"parent"}"#],
         );
-        let child = write_jsonl(&tmp, "child.jsonl", &[
-            r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"AAA","uuid":"BBB","sessionKind":"bg"}"#,
-        ]);
+        let child = write_jsonl(
+            &tmp,
+            "child.jsonl",
+            &[
+                r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"AAA","uuid":"BBB","sessionKind":"bg"}"#,
+            ],
+        );
         // A plain --fork-session branch: shares ancestry, but is not a daemon
         // session. Re-keying a tab onto one of these would swap a running
         // conversation for a copy of it.
@@ -7033,7 +7541,10 @@ mod migration_tests {
         );
 
         let facts = read_head_facts(&child).unwrap();
-        assert!(facts.is_bg, "child should be recognised as a daemon session");
+        assert!(
+            facts.is_bg,
+            "child should be recognised as a daemon session"
+        );
         assert!(
             facts.links.contains("AAA"),
             "child should claim the parent's uuid"
@@ -7044,7 +7555,10 @@ mod migration_tests {
         );
 
         let bfacts = read_head_facts(&branch).unwrap();
-        assert!(!bfacts.is_bg, "a --fork-session branch is not a daemon session");
+        assert!(
+            !bfacts.is_bg,
+            "a --fork-session branch is not a daemon session"
+        );
         assert!(
             file_has_any_uuid(&parent, &bfacts.links),
             "the branch does share ancestry — which is exactly why bg is required too"
@@ -7108,18 +7622,26 @@ mod migration_tests {
         let tmp = temp_dir("clear-negative");
         // An ordinary session. It later *mentions* the command, which must not
         // count: only the opening turn says how a transcript began.
-        let plain = write_jsonl(&tmp, "plain.jsonl", &[
-            r#"{"type":"user","uuid":"p1","message":{"role":"user","content":"fix the build"}}"#,
-            r#"{"type":"assistant","uuid":"p2","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
-            r#"{"type":"user","uuid":"p3","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
-        ]);
+        let plain = write_jsonl(
+            &tmp,
+            "plain.jsonl",
+            &[
+                r#"{"type":"user","uuid":"p1","message":{"role":"user","content":"fix the build"}}"#,
+                r#"{"type":"assistant","uuid":"p2","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"user","uuid":"p3","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
+            ],
+        );
         assert!(!read_head_facts(&plain).unwrap().born_from_clear);
 
         // And a resumed session, which opens on an assistant record.
-        let resumed = write_jsonl(&tmp, "resumed.jsonl", &[
-            r#"{"type":"assistant","uuid":"r1","message":{"role":"assistant","content":[{"type":"text","text":"back"}]}}"#,
-            r#"{"type":"user","uuid":"r2","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
-        ]);
+        let resumed = write_jsonl(
+            &tmp,
+            "resumed.jsonl",
+            &[
+                r#"{"type":"assistant","uuid":"r1","message":{"role":"assistant","content":[{"type":"text","text":"back"}]}}"#,
+                r#"{"type":"user","uuid":"r2","message":{"role":"user","content":"<command-name>/clear</command-name>"}}"#,
+            ],
+        );
         assert!(!read_head_facts(&resumed).unwrap().born_from_clear);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -7127,9 +7649,11 @@ mod migration_tests {
     #[test]
     fn a_frozen_transcript_hands_its_tab_to_the_clear_child() {
         let tmp = temp_dir("clear-pair");
-        let parent = write_jsonl(&tmp, "parent.jsonl", &[
-            r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#,
-        ]);
+        let parent = write_jsonl(
+            &tmp,
+            "parent.jsonl",
+            &[r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#],
+        );
         let child = write_jsonl(&tmp, "child.jsonl", CLEAR_CHILD);
         touch_at(&parent, 1_000);
         touch_at(&child, 2_000);
@@ -7152,12 +7676,16 @@ mod migration_tests {
         // Two idle sessions in one project. `older` stopped long before the
         // clear happened, so the child is not its business — something else was
         // written in between.
-        let older = write_jsonl(&tmp, "older.jsonl", &[
-            r#"{"type":"user","uuid":"OLD","message":{"role":"user","content":"a"}}"#,
-        ]);
-        let newer = write_jsonl(&tmp, "newer.jsonl", &[
-            r#"{"type":"user","uuid":"NEW","message":{"role":"user","content":"b"}}"#,
-        ]);
+        let older = write_jsonl(
+            &tmp,
+            "older.jsonl",
+            &[r#"{"type":"user","uuid":"OLD","message":{"role":"user","content":"a"}}"#],
+        );
+        let newer = write_jsonl(
+            &tmp,
+            "newer.jsonl",
+            &[r#"{"type":"user","uuid":"NEW","message":{"role":"user","content":"b"}}"#],
+        );
         let child = write_jsonl(&tmp, "child.jsonl", CLEAR_CHILD);
         touch_at(&older, 1_000);
         touch_at(&newer, 2_000);
@@ -7183,13 +7711,19 @@ mod migration_tests {
     #[test]
     fn a_migrated_child_takes_the_tab() {
         let tmp = temp_dir("moved-bg");
-        let parent = write_jsonl(&tmp, "parent.jsonl", &[
-            r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#,
-        ]);
-        let child = write_jsonl(&tmp, "child.jsonl", &[
-            r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"AAA","uuid":"BBB","sessionKind":"bg"}"#,
-            r#"{"type":"user","uuid":"CCC","parentUuid":"BBB","sessionKind":"bg","message":{"role":"user","content":"carrying on"}}"#,
-        ]);
+        let parent = write_jsonl(
+            &tmp,
+            "parent.jsonl",
+            &[r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#],
+        );
+        let child = write_jsonl(
+            &tmp,
+            "child.jsonl",
+            &[
+                r#"{"type":"system","subtype":"compact_boundary","logicalParentUuid":"AAA","uuid":"BBB","sessionKind":"bg"}"#,
+                r#"{"type":"user","uuid":"CCC","parentUuid":"BBB","sessionKind":"bg","message":{"role":"user","content":"carrying on"}}"#,
+            ],
+        );
         touch_at(&parent, 1_000);
         touch_at(&child, 2_000);
         assert_eq!(
@@ -7205,14 +7739,20 @@ mod migration_tests {
     #[test]
     fn a_fork_sibling_never_takes_a_tab() {
         let tmp = temp_dir("clear-fork");
-        let parent = write_jsonl(&tmp, "parent.jsonl", &[
-            r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#,
-        ]);
+        let parent = write_jsonl(
+            &tmp,
+            "parent.jsonl",
+            &[r#"{"type":"user","uuid":"AAA","message":{"role":"user","content":"hello"}}"#],
+        );
         // A `--fork-session` branch is newer and shares ancestry, but the parent
         // is still running and still resumable at its own point.
-        let branch = write_jsonl(&tmp, "branch.jsonl", &[
-            r#"{"type":"user","uuid":"BBB","parentUuid":"AAA","message":{"role":"user","content":"branch"}}"#,
-        ]);
+        let branch = write_jsonl(
+            &tmp,
+            "branch.jsonl",
+            &[
+                r#"{"type":"user","uuid":"BBB","parentUuid":"AAA","message":{"role":"user","content":"branch"}}"#,
+            ],
+        );
         touch_at(&parent, 1_000);
         touch_at(&branch, 2_000);
         assert_eq!(moved_to_in_dir(&parent), None);
@@ -7262,8 +7802,8 @@ mod migration_tests {
     /// `"background"` the CLI normalizes it to — sets the background flag.
     #[test]
     fn roster_reads_live_entries_from_registry_files() {
-        let dir = std::env::temp_dir()
-            .join(format!("aiterm-test-roster-live-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aiterm-test-roster-live-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let me = std::process::id();
@@ -7274,7 +7814,9 @@ mod migration_tests {
         .unwrap();
         std::fs::write(
             dir.join("999999998.json"),
-            format!(r#"{{"pid":{me},"sessionId":"aaaaaaaa-0000-0000-0000-000000000002","kind":"bg"}}"#),
+            format!(
+                r#"{{"pid":{me},"sessionId":"aaaaaaaa-0000-0000-0000-000000000002","kind":"bg"}}"#
+            ),
         )
         .unwrap();
         std::fs::write(
@@ -7302,8 +7844,8 @@ mod migration_tests {
     /// procStart names a different incarnation of the same pid is dropped.
     #[test]
     fn roster_rejects_an_entry_whose_procstart_does_not_match() {
-        let dir = std::env::temp_dir()
-            .join(format!("aiterm-test-roster-stale-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("aiterm-test-roster-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let me = std::process::id();
@@ -7332,13 +7874,13 @@ mod migration_tests {
     /// different reading "the dir is there and empty, nothing is running".
     #[test]
     fn roster_missing_dir_is_none_but_empty_dir_is_empty() {
-        let missing = std::env::temp_dir()
-            .join(format!("aiterm-test-roster-missing-{}", std::process::id()));
+        let missing =
+            std::env::temp_dir().join(format!("aiterm-test-roster-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         assert!(roster_from_dir(&missing).is_none());
 
-        let empty = std::env::temp_dir()
-            .join(format!("aiterm-test-roster-empty-{}", std::process::id()));
+        let empty =
+            std::env::temp_dir().join(format!("aiterm-test-roster-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(roster_from_dir(&empty).unwrap().len(), 0);
