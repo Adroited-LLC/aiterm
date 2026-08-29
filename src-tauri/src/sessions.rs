@@ -1303,7 +1303,7 @@ impl VerifiedSessionFile {
     }
 
     fn rename_to(&self, destination: &VerifiedDirectory, name: &OsStr) -> Result<(), String> {
-        self.rename_to_with_hooks(destination, name, || {}, || {})
+        self.rename_to_with_hooks(destination, name, || {}, || {}, || {})
     }
 
     fn rename_to_with_hooks(
@@ -1312,10 +1312,17 @@ impl VerifiedSessionFile {
         name: &OsStr,
         before_quarantine: impl FnOnce(),
         after_quarantine: impl FnOnce(),
+        after_verification: impl FnOnce(),
     ) -> Result<(), String> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (destination, name, before_quarantine, after_quarantine);
+            let _ = (
+                destination,
+                name,
+                before_quarantine,
+                after_quarantine,
+                after_verification,
+            );
             return Err("exact-inode session moves require Linux renameat2".into());
         }
         #[cfg(target_os = "linux")]
@@ -1370,6 +1377,8 @@ impl VerifiedSessionFile {
                     )),
                 };
             }
+
+            after_verification();
 
             let destination_name = CString::new(name.as_bytes())
                 .map_err(|_| "invalid trash name")?;
@@ -4169,6 +4178,7 @@ mod tests {
                 std::fs::write(&source, b"unverified replacement").unwrap();
             },
             || {},
+            || {},
         );
 
         assert!(result.is_err());
@@ -4215,6 +4225,7 @@ mod tests {
                 || {
                     std::fs::write(&source, b"new source occupant").unwrap();
                 },
+                || {},
             )
             .unwrap_err();
 
@@ -4281,6 +4292,7 @@ mod tests {
                     symlink(&outside, &quarantine).unwrap();
                     quarantine_path.replace(Some(quarantine));
                 },
+                || {},
             )
             .unwrap_err();
 
@@ -4294,6 +4306,121 @@ mod tests {
         assert_eq!(std::fs::read(&held_original).unwrap(), b"verified original");
         assert!(!source.exists());
         assert!(!trash_path.join(format!("{id}.jsonl")).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_inode_trash_ignores_a_quarantine_aba_after_verification() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-session-post-verify-aba-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "16161616-1616-4616-8616-161616161616";
+        let source = project.join(format!("{id}.jsonl"));
+        let held_original = project.join("held-original.jsonl");
+        std::fs::write(&source, b"verified original transcript").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        verified
+            .rename_to_with_hooks(
+                &trash,
+                OsStr::new(&format!("{id}.jsonl")),
+                || {},
+                || {},
+                || {
+                    let quarantine = std::fs::read_dir(&project)
+                        .unwrap()
+                        .flatten()
+                        .find(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .contains(".aiterm-quarantine-")
+                        })
+                        .unwrap()
+                        .path();
+                    std::fs::rename(&quarantine, &held_original).unwrap();
+                    std::fs::write(&quarantine, b"unverified replacement").unwrap();
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
+            b"verified original transcript"
+        );
+        assert_eq!(std::fs::read(&held_original).unwrap(), b"");
+        let replacement = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".aiterm-quarantine-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(replacement).unwrap(), b"unverified replacement");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_directory_archive_round_trips_and_leaves_only_an_excluded_tombstone() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-sidecar-roundtrip-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sidecars = root.join("sidecars");
+        let source = sidecars.join("session-sidecar");
+        let trash_path = root.join("trash");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::write(source.join("state.json"), b"state").unwrap();
+        std::fs::write(source.join("nested/output.txt"), b"output").unwrap();
+        let verified = verified_directory_entry(&sidecars, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        verified
+            .rename_directory_to(&trash, OsStr::new("session.tasks"))
+            .unwrap();
+
+        assert_eq!(std::fs::read(trash_path.join("session.tasks/state.json")).unwrap(), b"state");
+        assert_eq!(
+            std::fs::read(trash_path.join("session.tasks/nested/output.txt")).unwrap(),
+            b"output"
+        );
+        let tombstone = std::fs::read_dir(&sidecars)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".aiterm-quarantine-")
+            })
+            .expect("the bounded zero-byte tombstone remains excluded")
+            .path();
+        assert_eq!(std::fs::metadata(tombstone.join("state.json")).unwrap().len(), 0);
+        assert_eq!(
+            std::fs::metadata(tombstone.join("nested/output.txt"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!source.exists());
+
+        std::fs::rename(trash_path.join("session.tasks"), &source).unwrap();
+        assert_eq!(std::fs::read(source.join("state.json")).unwrap(), b"state");
+        assert_eq!(std::fs::read(source.join("nested/output.txt")).unwrap(), b"output");
         std::fs::remove_dir_all(root).unwrap();
     }
 
