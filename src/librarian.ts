@@ -107,21 +107,25 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
   }, [ready, pending, engine, reload, cfg.tidyAfterRun, tidy]);
   const stop = useCallback(() => { stopRef.current = true; }, []);
 
-  // The auto run: once the list has been still for a while, catalogue what
-  // has been quiet for a while. Re-armed by every change to the list, so a
-  // busy afternoon is read in one go when it ends rather than piecemeal.
+  // The auto run: on a clock, catalogue whatever has been quiet for a
+  // while. A clock rather than a timer re-armed by list changes — the list
+  // changes every time any live session writes a line, so a timer that
+  // waited for it to hold still never fired while anything was running.
   const runRef = useRef(run);
   runRef.current = run;
   const pendingRef = useRef(pending);
   pendingRef.current = pending;
   useEffect(() => {
     if (!ready || !cfg.auto) return;
-    const t = window.setTimeout(() => {
+    const tick = () => {
+      if (runningRef.current) return;
       const quiet = pendingRef.current.filter((s) => Date.now() - s.last_active > QUIET_MS);
       if (quiet.length) void runRef.current(quiet);
-    }, SETTLE_MS);
-    return () => clearTimeout(t);
-  }, [ready, cfg.auto, sessions]);
+    };
+    const t = window.setInterval(tick, SETTLE_MS);
+    const first = window.setTimeout(tick, 5_000);
+    return () => { clearInterval(t); clearTimeout(first); };
+  }, [ready, cfg.auto]);
 
   // While a run is going, re-read the store on a clock too: a batch lands
   // every couple of minutes, and a run that overlapped from before a reload
