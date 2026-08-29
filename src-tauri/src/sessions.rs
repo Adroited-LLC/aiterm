@@ -2789,26 +2789,136 @@ fn create_directory_exclusive(parent: &File, name: &OsStr) -> Result<File, Strin
 }
 
 #[cfg(target_os = "linux")]
-fn open_restored_parent(root: &File, path: &[u8]) -> Result<(File, std::ffi::OsString), String> {
-    let mut components = path.split(|byte| *byte == b'/').peekable();
-    let mut current = root.try_clone().map_err(|error| error.to_string())?;
-    loop {
-        let component = components.next().ok_or("sidecar path is empty")?;
-        if components.peek().is_none() {
-            return Ok((current, OsStr::from_bytes(component).to_os_string()));
+struct RestoreBinding {
+    parent: File,
+    name: CString,
+    object: File,
+}
+
+#[cfg(target_os = "linux")]
+impl RestoreBinding {
+    fn new(parent: &File, name: CString, object: &File) -> Result<Self, String> {
+        if !directory_entry_is_exact_object(parent, &name, object)? {
+            return Err("restored entry changed while it was bound".into());
         }
-        let name = CString::new(component).map_err(|_| "invalid restored path component")?;
-        let descriptor = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
+        Ok(Self {
+            parent: parent.try_clone().map_err(|error| error.to_string())?,
+            name,
+            object: object.try_clone().map_err(|error| error.to_string())?,
+        })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        if directory_entry_is_exact_object(&self.parent, &self.name, &self.object)? {
+            Ok(())
+        } else {
+            Err("restored entry changed before strict restore completed".into())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct RestoreDirectoryTree {
+    directories: std::collections::BTreeMap<Vec<u8>, File>,
+    bindings: Vec<RestoreBinding>,
+}
+
+#[cfg(target_os = "linux")]
+impl RestoreDirectoryTree {
+    fn new(root: &File) -> Result<Self, String> {
+        let mut directories = std::collections::BTreeMap::new();
+        directories.insert(
+            Vec::new(),
+            root.try_clone().map_err(|error| error.to_string())?,
+        );
+        Ok(Self {
+            directories,
+            bindings: Vec::new(),
+        })
+    }
+
+    fn bind(&mut self, parent: &File, name: CString, object: &File) -> Result<(), String> {
+        self.bindings
+            .push(RestoreBinding::new(parent, name, object)?);
+        Ok(())
+    }
+
+    fn parent_for(&mut self, path: &[u8]) -> Result<(File, std::ffi::OsString), String> {
+        let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        let (leaf, parents) = components
+            .split_last()
+            .ok_or("sidecar path is empty")?;
+        let mut key = Vec::new();
+        for component in parents {
+            let parent = self
+                .directories
+                .get(&key)
+                .ok_or("restored parent handle is unavailable")?
+                .try_clone()
+                .map_err(|error| error.to_string())?;
+            if !key.is_empty() {
+                key.push(b'/');
+            }
+            key.extend_from_slice(component);
+            if self.directories.contains_key(&key) {
+                continue;
+            }
+            let name = CString::new(*component).map_err(|_| "invalid restored directory name")?;
+            let descriptor = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            let directory = if descriptor >= 0 {
+                unsafe { File::from_raw_fd(descriptor) }
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.to_string());
+                }
+                match create_directory_exclusive(&parent, OsStr::from_bytes(component)) {
+                    Ok(directory) => directory,
+                    Err(create_error) => {
+                        let retry = unsafe {
+                            libc::openat(
+                                parent.as_raw_fd(),
+                                name.as_ptr(),
+                                libc::O_RDONLY
+                                    | libc::O_DIRECTORY
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC,
+                            )
+                        };
+                        if retry < 0 {
+                            return Err(create_error);
+                        }
+                        unsafe { File::from_raw_fd(retry) }
+                    }
+                }
+            };
+            self.bind(&parent, name, &directory)?;
+            self.directories.insert(key.clone(), directory);
+        }
+        let parent_key = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(index) => &path[..index],
+            None => &[][..],
         };
-        if descriptor < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+        let parent = self
+            .directories
+            .get(parent_key)
+            .ok_or("restored parent handle is unavailable")?
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        Ok((parent, OsStr::from_bytes(leaf).to_os_string()))
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        for binding in &self.bindings {
+            binding.verify()?;
         }
-        current = unsafe { File::from_raw_fd(descriptor) };
+        Ok(())
     }
 }
 
@@ -2996,12 +3106,40 @@ fn restore_sidecar_archive_from_file(
     let records = parse_sidecar_archive(&archive, ArchiveLimits::default())?;
     let destination = VerifiedDirectory::open(destination_root)?;
     let restored_root = create_directory_exclusive(&destination.file, root_name)?;
+    let root_name_c = CString::new(root_name.as_bytes()).map_err(|_| "invalid restored root")?;
+    let mut bindings = vec![RestoreBinding::new(
+        &destination.file,
+        root_name_c,
+        &restored_root,
+    )?];
+    let mut directories = std::collections::BTreeMap::new();
+    directories.insert(
+        Vec::<u8>::new(),
+        restored_root.try_clone().map_err(|error| error.to_string())?,
+    );
+    let mut directory_metadata = Vec::new();
     for record in records {
-        let (parent, name) = open_restored_parent(&restored_root, &record.path)?;
+        let split = record.path.iter().rposition(|byte| *byte == b'/');
+        let (parent_path, name_bytes) = match split {
+            Some(index) => (&record.path[..index], &record.path[index + 1..]),
+            None => (&[][..], record.path.as_slice()),
+        };
+        let parent = directories
+            .get(parent_path)
+            .ok_or("sidecar archive lists a child before its directory")?
+            .try_clone()
+            .map_err(|error| error.to_string())?;
+        let name = OsStr::from_bytes(name_bytes).to_os_string();
         if record.kind == 2 {
             let directory = create_directory_exclusive(&parent, &name)?;
-            set_archive_metadata(
-                &directory,
+            let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid restored directory")?;
+            bindings.push(RestoreBinding::new(&parent, name_c, &directory)?);
+            directories.insert(
+                record.path.clone(),
+                directory.try_clone().map_err(|error| error.to_string())?,
+            );
+            directory_metadata.push((
+                directory,
                 record.mode,
                 UNIX_EPOCH
                     .checked_add(std::time::Duration::new(
@@ -3009,7 +3147,7 @@ fn restore_sidecar_archive_from_file(
                         record.mtime_nsec,
                     ))
                     .ok_or("restored sidecar timestamp overflow")?,
-            )?;
+            ));
         } else {
             let name = CString::new(name.as_bytes()).map_err(|_| "invalid restored filename")?;
             let descriptor = unsafe {
@@ -3028,6 +3166,10 @@ fn restore_sidecar_archive_from_file(
                 return Err(std::io::Error::last_os_error().to_string());
             }
             let mut output = unsafe { File::from_raw_fd(descriptor) };
+            if !directory_entry_is_exact_object(&parent, &name, &output)? {
+                return Err("restored file changed while it was opened".into());
+            }
+            bindings.push(RestoreBinding::new(&parent, name, &output)?);
             let mut copied = 0u64;
             let mut buffer = [0u8; 64 * 1024];
             while copied < record.content_len {
@@ -3064,6 +3206,13 @@ fn restore_sidecar_archive_from_file(
             output.sync_all().map_err(|error| error.to_string())?;
         }
     }
+    for (directory, mode, modified) in directory_metadata.into_iter().rev() {
+        set_archive_metadata(&directory, mode, modified)?;
+        directory.sync_all().map_err(|error| error.to_string())?;
+    }
+    for binding in &bindings {
+        binding.verify()?;
+    }
     restored_root
         .sync_all()
         .map_err(|error| error.to_string())?;
@@ -3073,7 +3222,7 @@ fn restore_sidecar_archive_from_file(
         .map_err(|error| error.to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn restore_sidecar_archive(
     archive_path: &Path,
     destination_root: &Path,
@@ -3098,61 +3247,12 @@ fn restore_sidecar_archive_and_remove_with_hook(
 }
 
 #[cfg(target_os = "linux")]
-fn open_or_create_restored_parent(
-    root: &File,
-    path: &[u8],
-) -> Result<(File, std::ffi::OsString), String> {
-    let mut components = path.split(|byte| *byte == b'/').peekable();
-    let mut current = root.try_clone().map_err(|error| error.to_string())?;
-    loop {
-        let component = components.next().ok_or("sidecar path is empty")?;
-        if components.peek().is_none() {
-            return Ok((current, OsStr::from_bytes(component).to_os_string()));
-        }
-        let name = CString::new(component).map_err(|_| "invalid restored path component")?;
-        let descriptor = unsafe {
-            libc::openat(
-                current.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        let descriptor = if descriptor >= 0 {
-            descriptor
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error.to_string());
-            }
-            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-                let create_error = std::io::Error::last_os_error();
-                if create_error.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(create_error.to_string());
-                }
-            }
-            let opened = unsafe {
-                libc::openat(
-                    current.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if opened < 0 {
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-            opened
-        };
-        current = unsafe { File::from_raw_fd(descriptor) };
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn existing_rollout_matches(
+fn open_matching_existing_rollout(
     archive: &File,
     record: &SidecarArchiveRecord,
     parent: &File,
     name: &CString,
-) -> Result<bool, String> {
+) -> Result<Option<File>, String> {
     use std::os::unix::fs::FileExt;
 
     let descriptor = unsafe {
@@ -3166,9 +3266,12 @@ fn existing_rollout_matches(
         return Err(std::io::Error::last_os_error().to_string());
     }
     let existing = unsafe { File::from_raw_fd(descriptor) };
+    if !directory_entry_is_exact_object(parent, name, &existing)? {
+        return Err("restored rollout changed while it was opened".into());
+    }
     let metadata = existing.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() || metadata.len() != record.content_len {
-        return Ok(false);
+        return Ok(None);
     }
     let mut compared = 0u64;
     let mut archived_bytes = [0u8; 64 * 1024];
@@ -3191,32 +3294,28 @@ fn existing_rollout_matches(
             || archived != present
             || archived_bytes[..archived] != existing_bytes[..present]
         {
-            return Ok(false);
+            return Ok(None);
         }
         compared = compared
             .checked_add(archived as u64)
             .ok_or("restored rollout byte count overflow")?;
     }
-    Ok(true)
+    Ok(Some(existing))
 }
 
 #[cfg(target_os = "linux")]
-fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Result<(), String> {
+fn restore_file_set_archive_from_file(archive: &File, destination_root: &Path) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::FileExt;
 
-    let archive = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(archive_path)
-        .map_err(|error| error.to_string())?;
     let records = parse_sidecar_archive(&archive, ArchiveLimits::default())?;
     if records.iter().any(|record| record.kind != 1) {
         return Err("session rollout archive contains an unexpected directory record".into());
     }
     let destination = VerifiedDirectory::open(destination_root)?;
+    let mut tree = RestoreDirectoryTree::new(&destination.file)?;
     for record in records {
-        let (parent, name) = open_or_create_restored_parent(&destination.file, &record.path)?;
+        let (parent, name) = tree.parent_for(&record.path)?;
         let name = CString::new(name.as_bytes()).map_err(|_| "invalid restored filename")?;
         let descriptor = unsafe {
             libc::openat(
@@ -3228,10 +3327,13 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
         };
         if descriptor < 0 {
             let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::AlreadyExists
-                && existing_rollout_matches(&archive, &record, &parent, &name)?
-            {
-                continue;
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                if let Some(existing) =
+                    open_matching_existing_rollout(&archive, &record, &parent, &name)?
+                {
+                    tree.bind(&parent, name, &existing)?;
+                    continue;
+                }
             }
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 "restored rollout destination already exists with different data".into()
@@ -3240,6 +3342,10 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
             });
         }
         let mut output = unsafe { File::from_raw_fd(descriptor) };
+        if !directory_entry_is_exact_object(&parent, &name, &output)? {
+            return Err("restored rollout changed while it was opened".into());
+        }
+        tree.bind(&parent, name, &output)?;
         let mut copied = 0u64;
         let mut buffer = [0u8; 64 * 1024];
         while copied < record.content_len {
@@ -3276,10 +3382,28 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
         output.sync_all().map_err(|error| error.to_string())?;
         parent.sync_all().map_err(|error| error.to_string())?;
     }
+    tree.verify()?;
     destination
         .file
         .sync_all()
         .map_err(|error| error.to_string())
+}
+
+#[cfg(all(target_os = "linux", test))]
+fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Result<(), String> {
+    let archive = StrictArchiveEntry::open(archive_path)?;
+    restore_file_set_archive_from_file(&archive.archive.file, destination_root)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_file_set_archive_and_remove(
+    archive_path: &Path,
+    destination_root: &Path,
+) -> Result<(), String> {
+    let archive = StrictArchiveEntry::open(archive_path)?;
+    restore_file_set_archive_from_file(&archive.archive.file, destination_root)?;
+    archive.verify()?;
+    archive.remove_exact()
 }
 
 #[cfg(target_os = "linux")]
@@ -3797,8 +3921,7 @@ fn restore_codex_rollouts(trash: &Path, session_id: &str) -> Result<(), String> 
     if dir.is_file() {
         let home = dirs::home_dir().ok_or("no home dir")?;
         let sessions = home.join(".codex/sessions");
-        restore_file_set_archive(&dir, &sessions)?;
-        std::fs::remove_file(&dir).map_err(|error| error.to_string())?;
+        restore_file_set_archive_and_remove(&dir, &sessions)?;
         return Ok(());
     }
     if !dir.is_dir() {
@@ -3837,12 +3960,12 @@ fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String>
         let home_directory = VerifiedDirectory::open(&home)?;
         let claude_directory = home_directory.create_directory(OsStr::new(".claude"))?;
         let _tasks_directory = claude_directory.create_directory(OsStr::new("tasks"))?;
-        restore_sidecar_archive(
+        restore_sidecar_archive_and_remove_with_hook(
             &tasks_src,
             &home.join(".claude/tasks"),
             OsStr::new(session_id),
+            || {},
         )?;
-        std::fs::remove_file(&tasks_src).map_err(|error| error.to_string())?;
     } else if tasks_src.is_dir() {
         let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(session_id));
     }
@@ -3853,8 +3976,12 @@ fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String>
         let claude_directory = home_directory.create_directory(OsStr::new(".claude"))?;
         let _jobs_directory = claude_directory.create_directory(OsStr::new("jobs"))?;
         let restored_name = session_id.split('-').next().unwrap_or(session_id);
-        restore_sidecar_archive(&job_src, &jobs, OsStr::new(restored_name))?;
-        std::fs::remove_file(&job_src).map_err(|error| error.to_string())?;
+        restore_sidecar_archive_and_remove_with_hook(
+            &job_src,
+            &jobs,
+            OsStr::new(restored_name),
+            || {},
+        )?;
     } else if job_src.is_dir() {
         let jobs = home.join(".claude/jobs");
         let _ = std::fs::create_dir_all(&jobs);
