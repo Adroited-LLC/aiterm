@@ -4,8 +4,9 @@ use crate::terminal::model::{ScreenDiff, ScreenRow, ScreenSnapshot};
 use crate::terminal::screen::ScreenModel;
 use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -395,6 +396,7 @@ struct MailboxState {
     screen: VecDeque<QueuedEvent>,
     raw: VecDeque<QueuedEvent>,
     controls: HashMap<ControlKind, QueuedEvent>,
+    raw_cancelled: bool,
     receiver_closed: bool,
     producer_closed: bool,
 }
@@ -406,6 +408,7 @@ impl Default for MailboxState {
             screen: VecDeque::new(),
             raw: VecDeque::new(),
             controls: HashMap::new(),
+            raw_cancelled: false,
             receiver_closed: false,
             producer_closed: false,
         }
@@ -483,10 +486,14 @@ impl EventMailbox {
     fn push_raw(&self, bytes: Vec<u8>) -> bool {
         debug_assert_eq!(self.kind, AttachmentKind::Desktop);
         let mut state = self.state.lock().unwrap();
-        while state.raw.len() >= self.capacity && !state.receiver_closed && !state.producer_closed {
+        while state.raw.len() >= self.capacity
+            && !state.raw_cancelled
+            && !state.receiver_closed
+            && !state.producer_closed
+        {
             state = self.changed.wait(state).unwrap();
         }
-        if state.receiver_closed || state.producer_closed {
+        if state.raw_cancelled || state.receiver_closed || state.producer_closed {
             return false;
         }
         let sequence = take_sequence(&mut state);
@@ -496,6 +503,12 @@ impl EventMailbox {
         });
         self.changed.notify_one();
         true
+    }
+
+    fn cancel_raw(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.raw_cancelled = true;
+        self.changed.notify_all();
     }
 
     fn push_control(&self, event: TabEvent) {
@@ -741,13 +754,13 @@ impl TabRegistry {
         let slot_id = launch.slot_id.clone();
         {
             let mut maps = self.inner.maps.lock().unwrap();
-            if maps.by_slot.contains_key(&slot_id) || maps.pending_slots.contains(&slot_id) {
+            if maps.by_slot.contains_key(&slot_id) || maps.pending_slots.contains_key(&slot_id) {
                 return Err(TabError::new(
                     "tab.slot_in_use",
                     "another tab already owns this slot",
                 ));
             }
-            maps.pending_slots.insert(slot_id.clone());
+            maps.pending_slots.insert(slot_id.clone(), id.clone());
         }
         let descriptor = TabDescriptor {
             id: id.clone(),
@@ -778,14 +791,17 @@ impl TabRegistry {
             env_provider: descriptor.env_provider.clone(),
             env_model: descriptor.env_model.clone(),
         };
-        let tab = Arc::new(Mutex::new(LiveTab {
-            descriptor,
-            screen: ScreenModel::new(launch.size),
-            pty: PtyBinding::Pending,
-            attachments: HashMap::new(),
-            pending_replies: VecDeque::new(),
-            exit_notified: false,
-        }));
+        let tab = Arc::new(TabCell {
+            live: Mutex::new(LiveTab {
+                descriptor,
+                screen: ScreenModel::new(launch.size),
+                pty: PtyBinding::Pending,
+                attachments: HashMap::new(),
+                pending_replies: VecDeque::new(),
+                exit_notified: false,
+            }),
+            raw: RawDispatch::default(),
+        });
 
         let sink = Arc::new(TabSink {
             registry: Arc::downgrade(&self.inner),
@@ -794,45 +810,67 @@ impl TabRegistry {
         let pty_id = match self.inner.backend.spawn(spec, sink) {
             Ok(pty_id) => pty_id,
             Err(error) => {
-                self.inner.release_pending_slot(&slot_id);
+                self.inner.release_pending_slot(&slot_id, &id);
                 return Err(TabError::new("tab.spawn_failed", error));
             }
         };
 
-        {
-            let mut live = tab.lock().unwrap();
+        let exited_publication = {
+            let mut live = tab.live.lock().unwrap();
             if live.descriptor.state == TabState::Exited {
-                self.inner.publish_locked(&id, &tab, &live, None);
-                return Ok(id);
+                Some(self.inner.publish_locked(&id, &tab, &live, None))
+            } else {
+                live.pty = PtyBinding::Flushing(pty_id);
+                None
             }
-            live.pty = PtyBinding::Flushing(pty_id);
+        };
+        if let Some(publication) = exited_publication {
+            if let Err(error) = publication {
+                self.inner.release_pending_slot(&slot_id, &id);
+                self.inner.backend.kill(pty_id);
+                return Err(error);
+            }
+            return Ok(id);
         }
 
         loop {
-            let reply = {
-                let mut live = tab.lock().unwrap();
+            let (reply, publication) = {
+                let mut live = tab.live.lock().unwrap();
                 if live.descriptor.state == TabState::Exited {
-                    self.inner.publish_locked(&id, &tab, &live, None);
-                    return Ok(id);
-                }
-                match live.pending_replies.pop_front() {
-                    Some(reply) => Some(reply),
-                    None => {
-                        live.pty = PtyBinding::Ready(pty_id);
-                        self.inner.publish_locked(&id, &tab, &live, Some(pty_id));
-                        None
+                    (
+                        None,
+                        Some(self.inner.publish_locked(&id, &tab, &live, None)),
+                    )
+                } else {
+                    match live.pending_replies.pop_front() {
+                        Some(reply) => (Some(reply), None),
+                        None => {
+                            live.pty = PtyBinding::Ready(pty_id);
+                            (
+                                None,
+                                Some(self.inner.publish_locked(&id, &tab, &live, Some(pty_id))),
+                            )
+                        }
                     }
                 }
             };
-            let Some(reply) = reply else {
+            if let Some(publication) = publication {
+                if let Err(error) = publication {
+                    self.inner.release_pending_slot(&slot_id, &id);
+                    self.inner.backend.kill(pty_id);
+                    return Err(error);
+                }
                 return Ok(id);
+            }
+            let Some(reply) = reply else {
+                unreachable!("binding either writes a reply or publishes the tab");
             };
             if let Err(error) = self.inner.backend.write(pty_id, &reply) {
-                let exited = tab.lock().unwrap().descriptor.state == TabState::Exited;
+                let exited = tab.live.lock().unwrap().descriptor.state == TabState::Exited;
                 if exited {
                     continue;
                 }
-                self.inner.release_pending_slot(&slot_id);
+                self.inner.release_pending_slot(&slot_id, &id);
                 self.inner.backend.kill(pty_id);
                 return Err(TabError::new("tab.reply_failed", error));
             }
@@ -848,26 +886,31 @@ impl TabRegistry {
                 .collect::<Vec<_>>()
         };
         tabs.into_iter()
-            .map(|tab| tab.lock().unwrap().descriptor.clone())
+            .map(|tab| tab.live.lock().unwrap().descriptor.clone())
             .collect()
     }
 
     pub fn get(&self, id: &TabId) -> Result<TabDescriptor, TabError> {
         let tab = self.inner.tab(id)?;
-        let descriptor = tab.lock().unwrap().descriptor.clone();
+        let descriptor = tab.live.lock().unwrap().descriptor.clone();
         Ok(descriptor)
     }
 
     pub fn update(&self, id: &TabId, update: TabUpdate) -> Result<TabDescriptor, TabError> {
         let tab = self.inner.tab(id)?;
         let descriptor = {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return Err(TabError::new("tab.closed", "the tab has exited"));
             }
             if let Some(slot) = update.slot_id {
                 let mut maps = self.inner.maps.lock().unwrap();
-                if maps.by_slot.get(&slot).is_some_and(|owner| owner != id) {
+                if maps.by_slot.get(&slot).is_some_and(|owner| owner != id)
+                    || maps
+                        .pending_slots
+                        .get(&slot)
+                        .is_some_and(|owner| owner != id)
+                {
                     return Err(TabError::new(
                         "tab.slot_in_use",
                         "another tab already owns this slot",
@@ -918,7 +961,7 @@ impl TabRegistry {
         let attachment_id = AttachmentId::new();
         let mailbox = Arc::new(EventMailbox::new(kind, self.inner.queue_capacity));
         {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return Err(TabError::new("tab.closed", "the tab has exited"));
             }
@@ -927,6 +970,10 @@ impl TabRegistry {
             // enqueue a diff ahead of its initial state.
             if kind == AttachmentKind::Remote {
                 mailbox.push_initial_snapshot(live.screen.snapshot(id.as_str()));
+            }
+            if kind == AttachmentKind::Desktop && !tab.raw.register(attachment_id.clone(), &mailbox)
+            {
+                return Err(TabError::new("tab.closed", "the tab is closing"));
             }
             live.attachments.insert(
                 attachment_id.clone(),
@@ -956,7 +1003,7 @@ impl TabRegistry {
 
     pub fn snapshot(&self, id: &TabId) -> Result<ScreenSnapshot, TabError> {
         let tab = self.inner.tab(id)?;
-        let snapshot = tab.lock().unwrap().screen.snapshot(id.as_str());
+        let snapshot = tab.live.lock().unwrap().screen.snapshot(id.as_str());
         Ok(snapshot)
     }
 
@@ -967,7 +1014,12 @@ impl TabRegistry {
         count: usize,
     ) -> Result<Vec<ScreenRow>, TabError> {
         let tab = self.inner.tab(id)?;
-        let page = tab.lock().unwrap().screen.scrollback_page(offset, count);
+        let page = tab
+            .live
+            .lock()
+            .unwrap()
+            .screen
+            .scrollback_page(offset, count);
         Ok(page)
     }
 
@@ -978,7 +1030,7 @@ impl TabRegistry {
         bytes: &[u8],
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
-        let live = tab.lock().unwrap();
+        let live = tab.live.lock().unwrap();
         live.authorize_owner(attachment)?;
         let pty_id = live.live_pty()?;
         self.inner
@@ -995,7 +1047,7 @@ impl TabRegistry {
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
         {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             live.authorize_owner(attachment)?;
             let pty_id = live.live_pty()?;
             self.inner
@@ -1015,7 +1067,7 @@ impl TabRegistry {
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
         {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             if !live.attachments.contains_key(attachment) {
                 return Err(TabError::new(
                     "terminal.attachment_not_found",
@@ -1039,8 +1091,12 @@ impl TabRegistry {
 
     pub fn close(&self, id: &TabId) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
+        // Cancellation is independent of the live state lock. A raw producer
+        // may be asleep on a full desktop mailbox, but it never owns `live`,
+        // and this wakeup happens before close needs that lock.
+        tab.raw.cancel();
         let (pty_id, slot_id) = {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             let pty_id = live.pty.id();
             live.pty = PtyBinding::Exited;
             let slot_id = live.descriptor.slot_id.clone();
@@ -1068,15 +1124,63 @@ struct RegistryInner {
 
 #[derive(Default)]
 struct RegistryMaps {
-    by_id: HashMap<TabId, Arc<Mutex<LiveTab>>>,
+    by_id: HashMap<TabId, Arc<TabCell>>,
     by_slot: HashMap<String, TabId>,
     by_pty: HashMap<u32, TabId>,
-    pending_slots: HashSet<String>,
+    pending_slots: HashMap<String, TabId>,
     order: Vec<TabId>,
 }
 
+struct TabCell {
+    live: Mutex<LiveTab>,
+    raw: RawDispatch,
+}
+
+#[derive(Default)]
+struct RawDispatch {
+    closing: AtomicBool,
+    mailboxes: Mutex<HashMap<AttachmentId, Weak<EventMailbox>>>,
+    send_order: Mutex<()>,
+}
+
+impl RawDispatch {
+    fn register(&self, id: AttachmentId, mailbox: &Arc<EventMailbox>) -> bool {
+        if self.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut mailboxes = self.mailboxes.lock().unwrap();
+        if self.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        mailboxes.insert(id, Arc::downgrade(mailbox));
+        true
+    }
+
+    fn unregister(&self, id: &AttachmentId) {
+        self.mailboxes.lock().unwrap().remove(id);
+    }
+
+    fn cancel_waits(&self) {
+        let mailboxes = self
+            .mailboxes
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for mailbox in mailboxes {
+            mailbox.cancel_raw();
+        }
+    }
+
+    fn cancel(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.cancel_waits();
+    }
+}
+
 impl RegistryInner {
-    fn tab(&self, id: &TabId) -> Result<Arc<Mutex<LiveTab>>, TabError> {
+    fn tab(&self, id: &TabId) -> Result<Arc<TabCell>, TabError> {
         self.maps
             .lock()
             .unwrap()
@@ -1099,8 +1203,11 @@ impl RegistryInner {
         maps.by_pty.retain(|_, tab_id| tab_id != id);
     }
 
-    fn release_pending_slot(&self, slot_id: &str) {
-        self.maps.lock().unwrap().pending_slots.remove(slot_id);
+    fn release_pending_slot(&self, slot_id: &str, id: &TabId) {
+        let mut maps = self.maps.lock().unwrap();
+        if maps.pending_slots.get(slot_id) == Some(id) {
+            maps.pending_slots.remove(slot_id);
+        }
     }
 
     /// Publish only while the caller holds this tab's lock. This makes the
@@ -1108,11 +1215,27 @@ impl RegistryInner {
     fn publish_locked(
         &self,
         id: &TabId,
-        tab: &Arc<Mutex<LiveTab>>,
+        tab: &Arc<TabCell>,
         live: &LiveTab,
         pty_id: Option<u32>,
-    ) {
+    ) -> Result<(), TabError> {
         let mut maps = self.maps.lock().unwrap();
+        if maps.pending_slots.get(&live.descriptor.slot_id) != Some(id) {
+            return Err(TabError::new(
+                "tab.slot_reservation_lost",
+                "the opening tab no longer owns its slot reservation",
+            ));
+        }
+        if maps
+            .by_slot
+            .get(&live.descriptor.slot_id)
+            .is_some_and(|owner| owner != id)
+        {
+            return Err(TabError::new(
+                "tab.slot_in_use",
+                "another tab already owns this slot",
+            ));
+        }
         maps.pending_slots.remove(&live.descriptor.slot_id);
         maps.by_slot
             .insert(live.descriptor.slot_id.clone(), id.clone());
@@ -1121,22 +1244,29 @@ impl RegistryInner {
         if let Some(pty_id) = pty_id {
             maps.by_pty.insert(pty_id, id.clone());
         }
+        Ok(())
     }
 
     fn detach(&self, tab_id: &TabId, attachment_id: &AttachmentId) {
         let Ok(tab) = self.tab(tab_id) else {
             return;
         };
-        let mut live = tab.lock().unwrap();
-        if live.attachments.remove(attachment_id).is_none() {
-            return;
-        }
-        if live.descriptor.input_owner.as_ref() == Some(attachment_id) {
-            live.descriptor.input_owner = None;
-            live.enqueue_control_all(TabEvent::FocusChanged {
-                owner: None,
-                size: live.descriptor.size,
-            });
+        let removed = {
+            let mut live = tab.live.lock().unwrap();
+            let Some(attachment) = live.attachments.remove(attachment_id) else {
+                return;
+            };
+            if live.descriptor.input_owner.as_ref() == Some(attachment_id) {
+                live.descriptor.input_owner = None;
+                live.enqueue_control_all(TabEvent::FocusChanged {
+                    owner: None,
+                    size: live.descriptor.size,
+                });
+            }
+            attachment.kind
+        };
+        if removed == AttachmentKind::Desktop {
+            tab.raw.unregister(attachment_id);
         }
     }
 }
@@ -1199,14 +1329,12 @@ impl LiveTab {
         }
     }
 
-    fn enqueue_desktop_raw(&self, bytes: &[u8]) {
-        for attachment in self
-            .attachments
+    fn desktop_mailboxes(&self) -> Vec<Arc<EventMailbox>> {
+        self.attachments
             .values()
             .filter(|attachment| attachment.kind == AttachmentKind::Desktop)
-        {
-            attachment.mailbox.push_raw(bytes.to_vec());
-        }
+            .map(|attachment| attachment.mailbox.clone())
+            .collect()
     }
 
     fn enqueue_remote_diff(&self, id: &TabId, diff: ScreenDiff) {
@@ -1280,7 +1408,7 @@ struct AttachmentState {
 
 struct TabSink {
     registry: Weak<RegistryInner>,
-    tab: Weak<Mutex<LiveTab>>,
+    tab: Weak<TabCell>,
 }
 
 impl PtySink for TabSink {
@@ -1288,12 +1416,34 @@ impl PtySink for TabSink {
         let (Some(registry), Some(tab)) = (self.registry.upgrade(), self.tab.upgrade()) else {
             return;
         };
-        let flush = {
-            let mut live = tab.lock().unwrap();
+        // The PTY reader is normally the only producer, but keep raw chunks
+        // ordered even for controlled/concurrent sinks. Close never takes this
+        // guard: it flips cancellation and wakes any mailbox wait directly.
+        let _send_order = tab.raw.send_order.lock().unwrap();
+        if tab.raw.closing.load(Ordering::Acquire) {
+            return;
+        }
+        let desktop_mailboxes = {
+            let live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return;
             }
-            live.enqueue_desktop_raw(bytes);
+            live.desktop_mailboxes()
+        };
+        for mailbox in desktop_mailboxes {
+            let _ = mailbox.push_raw(bytes.to_vec());
+            if tab.raw.closing.load(Ordering::Acquire) {
+                return;
+            }
+        }
+        if tab.raw.closing.load(Ordering::Acquire) {
+            return;
+        }
+        let flush = {
+            let mut live = tab.live.lock().unwrap();
+            if live.descriptor.state != TabState::Running {
+                return;
+            }
             let damage = live.screen.process(bytes);
             if let Some(diff) = damage.diff {
                 live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
@@ -1312,12 +1462,19 @@ impl PtySink for TabSink {
         }
     }
 
+    fn preparing_exit(&self, _pty_id: u32) {
+        if let Some(tab) = self.tab.upgrade() {
+            tab.raw.cancel_waits();
+        }
+    }
+
     fn exited(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>) {
         let (Some(registry), Some(tab)) = (self.registry.upgrade(), self.tab.upgrade()) else {
             return;
         };
+        tab.raw.cancel();
         {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             live.pty = PtyBinding::Exited;
             live.pending_replies.clear();
             live.mark_exited(code, signal.map(str::to_owned), false);
@@ -1326,10 +1483,10 @@ impl PtySink for TabSink {
     }
 }
 
-fn flush_replies(registry: &RegistryInner, tab: &Arc<Mutex<LiveTab>>, pty_id: u32) {
+fn flush_replies(registry: &RegistryInner, tab: &Arc<TabCell>, pty_id: u32) {
     loop {
         let reply = {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running
                 || live.pty != PtyBinding::Flushing(pty_id)
             {
@@ -1344,7 +1501,7 @@ fn flush_replies(registry: &RegistryInner, tab: &Arc<Mutex<LiveTab>>, pty_id: u3
             }
         };
         if registry.backend.write(pty_id, &reply).is_err() {
-            let mut live = tab.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             if live.pty == PtyBinding::Flushing(pty_id) {
                 live.pty = PtyBinding::Ready(pty_id);
             }

@@ -11,8 +11,12 @@ pub struct PtyInstance {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
-    /// The pty's direct child — the login shell, not the command it runs.
-    /// Killing only this leaves the real process orphaned; see `pty_kill`.
+}
+
+struct PtyEntry<T> {
+    instance: Arc<Mutex<T>>,
+    /// Immutable process identity is deliberately outside the instance lock.
+    /// Descendant lookup never waits behind a blocked write or resize.
     child_pid: Option<u32>,
 }
 
@@ -20,7 +24,7 @@ pub struct PtyInstance {
 /// has its own lock, so a blocked write/resize/kill for one PTY cannot retain
 /// the map guard and stall unrelated terminals.
 struct PtyTable<T> {
-    entries: Arc<Mutex<HashMap<u32, Arc<Mutex<T>>>>>,
+    entries: Arc<Mutex<HashMap<u32, PtyEntry<T>>>>,
 }
 
 impl<T> Clone for PtyTable<T> {
@@ -40,28 +44,35 @@ impl<T> Default for PtyTable<T> {
 }
 
 impl<T> PtyTable<T> {
-    fn insert(&self, id: u32, value: T) {
-        self.entries
-            .lock()
-            .unwrap()
-            .insert(id, Arc::new(Mutex::new(value)));
+    fn insert(&self, id: u32, value: T, child_pid: Option<u32>) {
+        self.entries.lock().unwrap().insert(
+            id,
+            PtyEntry {
+                instance: Arc::new(Mutex::new(value)),
+                child_pid,
+            },
+        );
     }
 
     fn get(&self, id: u32) -> Option<Arc<Mutex<T>>> {
-        self.entries.lock().ok()?.get(&id).cloned()
+        self.entries
+            .lock()
+            .ok()?
+            .get(&id)
+            .map(|entry| entry.instance.clone())
     }
 
-    fn remove(&self, id: u32) -> Option<Arc<Mutex<T>>> {
+    fn remove(&self, id: u32) -> Option<PtyEntry<T>> {
         self.entries.lock().ok()?.remove(&id)
     }
 
-    fn snapshot(&self) -> Vec<(u32, Arc<Mutex<T>>)> {
+    fn child_roots(&self) -> HashMap<u32, u32> {
         self.entries
             .lock()
             .map(|entries| {
                 entries
                     .iter()
-                    .map(|(id, value)| (*id, value.clone()))
+                    .filter_map(|(id, entry)| entry.child_pid.map(|pid| (pid, *id)))
                     .collect()
             })
             .unwrap_or_default()
@@ -111,6 +122,10 @@ struct PtyExit {
 /// of tabs, screens, or transports.
 pub trait PtySink: Send + Sync + 'static {
     fn output(&self, pty_id: u32, bytes: &[u8]);
+    /// The child has exited, so a sink may cancel output backpressure. The
+    /// reader still drains to EOF before [`PtySink::exited`] establishes the
+    /// final lifecycle event, preserving output-before-exit ordering.
+    fn preparing_exit(&self, _pty_id: u32) {}
     fn exited(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>);
 }
 
@@ -387,9 +402,19 @@ impl PtyManager {
                 master: pair.master,
                 writer,
                 killer,
-                child_pid,
             },
+            child_pid,
         );
+
+        let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
+        let exit_sink = sink.clone();
+        std::thread::spawn(move || {
+            let status = child.wait().ok();
+            // Wake a losslessly backpressured output call without declaring
+            // the tab exited ahead of bytes the reader has already observed.
+            exit_sink.preparing_exit(id);
+            let _ = status_tx.send(status);
+        });
 
         let ptys = self.ptys.clone();
         std::thread::spawn(move || {
@@ -409,12 +434,10 @@ impl PtyManager {
                     }
                 }
             }
-            // Reap the child before announcing the exit. The read loop ends when
-            // the pty closes, which says nothing about *why* — so wait for the
-            // real status. This blocks only this pty's reader thread, and the
-            // child is already gone by the time we get here in every path but a
-            // detaching one, so the wait returns immediately.
-            let status = child.wait().ok();
+            // The child waiter can cancel sink backpressure independently, but
+            // this reader remains the single final-exit publisher. Therefore
+            // every output callback returns before Exited is observable.
+            let status = status_rx.recv().ok().flatten();
             let code = status.as_ref().map(|s| s.exit_code());
             let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
             // A concurrent `kill` may already have removed this entry. In
@@ -588,14 +611,14 @@ impl PtyManager {
         // can block for over a second, and holding the map would stall every
         // other PTY's writes and resizes for that whole time.
         let taken = self.ptys.remove(id);
-        if let Some(pty) = taken {
-            let mut pty = pty.lock().unwrap();
+        if let Some(entry) = taken {
+            let mut pty = entry.instance.lock().unwrap();
             // `killer.kill()` only reaches the pty's direct child — the login
             // shell. zsh forks the command rather than exec'ing it, so killing the
             // shell orphaned every `claude` aiterm ever launched: they stayed in
             // `claude agents` forever, which made their rows permanently "running"
             // and left fork-a-copy as the only action the UI would offer.
-            if let Some(pid) = pty.child_pid {
+            if let Some(pid) = entry.child_pid {
                 kill_tree(pid, std::time::Duration::from_millis(1500));
             }
             let _ = pty.killer.kill();
@@ -614,12 +637,7 @@ impl PtyManager {
     /// walk answers for all of them. This is how a `SessionStart` hook's
     /// claude pid becomes a tab — see `hooklink.rs`.
     pub fn pty_for_descendant(&self, pid: u32) -> Option<u32> {
-        let roots: HashMap<u32, u32> = self
-            .ptys
-            .snapshot()
-            .into_iter()
-            .filter_map(|(id, pty)| pty.lock().ok()?.child_pid.map(|child| (child, id)))
-            .collect();
+        let roots = self.ptys.child_roots();
         let mut cur = pid;
         for _ in 0..64 {
             if let Some(&id) = roots.get(&cur) {
@@ -734,8 +752,8 @@ mod tests {
     #[test]
     fn a_blocked_instance_does_not_hold_the_pty_table_lock() {
         let table = PtyTable::default();
-        table.insert(1, "first");
-        table.insert(2, "second");
+        table.insert(1, "first", Some(101));
+        table.insert(2, "second", Some(202));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocked = table.clone();
@@ -764,6 +782,39 @@ mod tests {
         release_tx.send(()).unwrap();
         worker.join().unwrap();
         independent_worker.join().unwrap();
+    }
+
+    #[test]
+    fn descendant_roots_do_not_wait_behind_a_blocked_pty_writer() {
+        let table = PtyTable::default();
+        table.insert(1, "blocked", Some(101));
+        table.insert(2, "lookup", Some(202));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocked = table.clone();
+        let writer = std::thread::spawn(move || {
+            blocked
+                .with(1, |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let lookup = table.clone();
+        let descendant_lookup = std::thread::spawn(move || {
+            done_tx.send(lookup.child_roots()).unwrap();
+        });
+        let roots = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("descendant roots waited behind another PTY's blocked writer");
+        assert_eq!(roots.get(&202), Some(&2));
+
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        descendant_lookup.join().unwrap();
     }
 
     /// The regression that started all of this: killing a shell does not kill

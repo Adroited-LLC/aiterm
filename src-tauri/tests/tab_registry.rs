@@ -79,6 +79,57 @@ impl PtyObserver for RecordingSink {
     }
 }
 
+#[derive(Default)]
+struct ExitOrderingState {
+    preparing: bool,
+    events: Vec<&'static str>,
+}
+
+#[derive(Default)]
+struct BackpressuredExitSink {
+    state: Mutex<ExitOrderingState>,
+    changed: Condvar,
+}
+
+impl BackpressuredExitSink {
+    fn wait_for_exit(&self) -> Vec<&'static str> {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                !state.events.contains(&"exited")
+            })
+            .unwrap();
+        assert!(!timeout.timed_out(), "final PTY exit was never delivered");
+        state.events.clone()
+    }
+}
+
+impl PtySink for BackpressuredExitSink {
+    fn output(&self, _pty_id: u32, _bytes: &[u8]) {
+        let mut state = self.state.lock().unwrap();
+        state.events.push("output-started");
+        self.changed.notify_all();
+        while !state.preparing {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.events.push("output-finished");
+    }
+
+    fn preparing_exit(&self, _pty_id: u32) {
+        let mut state = self.state.lock().unwrap();
+        state.preparing = true;
+        state.events.push("preparing-exit");
+        self.changed.notify_all();
+    }
+
+    fn exited(&self, _pty_id: u32, _code: Option<u32>, _signal: Option<&str>) {
+        let mut state = self.state.lock().unwrap();
+        state.events.push("exited");
+        self.changed.notify_all();
+    }
+}
+
 struct ObserverReset;
 
 impl Drop for ObserverReset {
@@ -107,6 +158,34 @@ fn spawn_delivers_output_and_exactly_one_exit_to_its_sink() {
             signal: None,
         }],
         "a PTY must report exactly one terminal exit to its own sink"
+    );
+}
+
+#[test]
+fn child_exit_cancels_output_backpressure_before_ordered_final_exit() {
+    let _pty_test_lock = PTY_TEST_LOCK.lock().unwrap();
+    let manager = PtyManager::default();
+    let sink = Arc::new(BackpressuredExitSink::default());
+
+    manager
+        .spawn(
+            PtySpawnSpec::command("printf output-before-exit; sleep 0.1"),
+            sink.clone(),
+        )
+        .expect("spawn PTY");
+    let events = sink.wait_for_exit();
+
+    let output_finished = events
+        .iter()
+        .position(|event| *event == "output-finished")
+        .expect("output callback never finished");
+    let exited = events
+        .iter()
+        .position(|event| *event == "exited")
+        .expect("final exit was not delivered");
+    assert!(
+        output_finished < exited,
+        "final exit overtook output delivery: {events:?}"
     );
 }
 
@@ -191,12 +270,14 @@ impl FakePty {
     }
 
     fn emit_output(&self, id: u32, bytes: &[u8]) {
-        self.sinks
+        let sink = self
+            .sinks
             .lock()
             .unwrap()
             .get(&id)
             .expect("fake PTY has a registered sink")
-            .output(id, bytes);
+            .clone();
+        sink.output(id, bytes);
     }
 
     fn exit(&self, id: u32, code: Option<u32>, signal: Option<&str>) {
@@ -648,6 +729,7 @@ fn registry_rejects_unknown_tab_and_attachment_ids_consistently() {
 
 #[derive(Default)]
 struct BlockingSpawnPty {
+    next_id: AtomicU32,
     state: Mutex<BlockingSpawnState>,
     changed: Condvar,
 }
@@ -678,7 +760,11 @@ impl BlockingSpawnPty {
 }
 
 impl PtyBackend for BlockingSpawnPty {
-    fn spawn(&self, _spec: PtySpawnSpec, sink: Arc<dyn PtySink>) -> Result<u32, String> {
+    fn spawn(&self, spec: PtySpawnSpec, sink: Arc<dyn PtySink>) -> Result<u32, String> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        if spec.command.as_deref() != Some("block-spawn") {
+            return Ok(id);
+        }
         let mut state = self.state.lock().unwrap();
         state.entered = true;
         state.sink = Some(sink);
@@ -686,7 +772,7 @@ impl PtyBackend for BlockingSpawnPty {
         while !state.released {
             state = self.changed.wait(state).unwrap();
         }
-        Ok(41)
+        Ok(id)
     }
 
     fn write(&self, _id: u32, _bytes: &[u8]) -> Result<(), String> {
@@ -709,7 +795,9 @@ fn a_blocked_spawn_is_unpublished_so_close_cannot_find_a_phantom_tab() {
     let pty = Arc::new(BlockingSpawnPty::default());
     let registry = TabRegistry::with_backend(pty.clone());
     let opener = registry.clone();
-    let open = thread::spawn(move || opener.open(shell_launch("slot:blocked-spawn")));
+    let open = thread::spawn(move || {
+        opener.open(shell_launch("slot:blocked-spawn").with_command("block-spawn"))
+    });
     pty.wait_until_entered();
 
     assert!(registry.list().is_empty());
@@ -721,6 +809,39 @@ fn a_blocked_spawn_is_unpublished_so_close_cannot_find_a_phantom_tab() {
     pty.release();
     let id = open.join().unwrap().unwrap();
     assert_eq!(registry.list()[0].id(), &id);
+}
+
+#[test]
+fn a_pending_open_reservation_blocks_live_rekey_and_keeps_one_slot_owner() {
+    let pty = Arc::new(BlockingSpawnPty::default());
+    let registry = TabRegistry::with_backend(pty.clone());
+    let live = registry.open(shell_launch("slot:live")).unwrap();
+    let opener = registry.clone();
+    let open = thread::spawn(move || {
+        opener.open(shell_launch("slot:reserved").with_command("block-spawn"))
+    });
+    pty.wait_until_entered();
+
+    assert_eq!(
+        registry
+            .update(&live, TabUpdate::new().slot_id("slot:reserved"))
+            .unwrap_err()
+            .code(),
+        "tab.slot_in_use"
+    );
+
+    pty.release();
+    let opened = open.join().unwrap().unwrap();
+    let descriptors = registry.list();
+    assert_eq!(
+        descriptors
+            .iter()
+            .filter(|descriptor| descriptor.slot_id() == "slot:reserved")
+            .count(),
+        1
+    );
+    assert_eq!(registry.get(&opened).unwrap().slot_id(), "slot:reserved");
+    assert_eq!(registry.get(&live).unwrap().slot_id(), "slot:live");
 }
 
 #[test]
@@ -886,6 +1007,108 @@ fn dropping_a_full_desktop_receiver_unblocks_the_output_producer() {
     drop(desktop);
     done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     writer.join().unwrap();
+}
+
+#[test]
+fn explicit_close_cancels_blocked_raw_output_and_retains_one_exit() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry.open(shell_launch("slot:close-raw-block")).unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let _focus = desktop.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    pty.emit_output(pty.last_id(), b"first");
+
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+    let output = pty.clone();
+    let pty_id = pty.last_id();
+    let writer = thread::spawn(move || {
+        output.emit_output(pty_id, b"cancelled-second");
+        writer_done_tx.send(()).unwrap();
+    });
+    assert!(writer_done_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+
+    let (close_done_tx, close_done_rx) = mpsc::channel();
+    let closer = registry.clone();
+    let closing_tab = tab.clone();
+    let close = thread::spawn(move || {
+        let result = closer.close(&closing_tab);
+        close_done_tx.send(result).unwrap();
+    });
+    close_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close stayed blocked behind a full desktop raw queue")
+        .unwrap();
+    writer_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close did not wake the blocked raw producer");
+
+    assert_eq!(
+        desktop.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabEvent::Raw(b"first".to_vec())
+    );
+    assert!(matches!(
+        desktop.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabEvent::Exited(_)
+    ));
+    assert_eq!(
+        desktop.events.recv_timeout(Duration::from_secs(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    writer.join().unwrap();
+    close.join().unwrap();
+}
+
+#[test]
+fn natural_exit_cancels_blocked_raw_output_after_queued_output() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry
+        .open(shell_launch("slot:natural-exit-raw-block"))
+        .unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let _focus = desktop.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    let pty_id = pty.last_id();
+    pty.emit_output(pty_id, b"before-exit");
+
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+    let output = pty.clone();
+    let writer = thread::spawn(move || {
+        output.emit_output(pty_id, b"blocked-at-exit");
+        writer_done_tx.send(()).unwrap();
+    });
+    assert!(writer_done_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+
+    let (exit_done_tx, exit_done_rx) = mpsc::channel();
+    let exiting = pty.clone();
+    let exit = thread::spawn(move || {
+        exiting.exit(pty_id, Some(0), None);
+        exit_done_tx.send(()).unwrap();
+    });
+    exit_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("natural exit stayed blocked behind raw output");
+    writer_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("natural exit did not wake the raw producer");
+
+    assert_eq!(
+        desktop.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabEvent::Raw(b"before-exit".to_vec())
+    );
+    assert!(matches!(
+        desktop.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabEvent::Exited(_)
+    ));
+    assert_eq!(
+        desktop.events.recv_timeout(Duration::from_secs(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    writer.join().unwrap();
+    exit.join().unwrap();
 }
 
 #[derive(Default)]
