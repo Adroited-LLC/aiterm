@@ -2017,10 +2017,10 @@ export default function App() {
             onClick={() => setShowComposer(!showComposer)}
           ><Icon of={Keyboard} /></button>
           <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
-          <Clock />
         </div>
         <div className="topbar-spacer" />
         <div className="topbar-right">
+          <Clock />
           <button className="icon-btn" title="Smaller fonts (Ctrl+-)" onClick={() => bumpFont(-1)}>A−</button>
           <button
             className="icon-btn"

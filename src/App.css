@@ -334,6 +334,8 @@ body.dragging * { pointer-events: none; }
   padding: 4px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
 }
+/* At the right end of the bar the menu hangs left, so it stays on screen. */
+.topbar-right .clock-menu { left: auto; right: 0; }
 .clock-menu button {
   background: none;
   border: none;
