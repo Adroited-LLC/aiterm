@@ -594,3 +594,17 @@ fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)
     out.extend(tail);
     out
 }
+
+#[cfg(test)]
+mod conversation_tests {
+    /// Print a real session's conversation as the relay would hand it over.
+    /// `AITERM_SESSION=<id> cargo test --lib conversation_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn conversation_live() {
+        let id = std::env::var("AITERM_SESSION").expect("AITERM_SESSION");
+        for (role, text) in super::conversation_sync(&id, 24_000) {
+            println!("[{role}] {}", if text.len() > 300 { format!("{}…", &text[..300]) } else { text });
+        }
+    }
+}
