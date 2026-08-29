@@ -498,24 +498,28 @@ impl EventMailbox {
         self.push_screen(TabEvent::Snapshot(snapshot.clone()), || snapshot);
     }
 
-    fn push_shared_snapshot(&self, snapshot: Arc<ScreenSnapshot>) {
+    fn finish_with_shared_snapshot(&self, snapshot: Arc<ScreenSnapshot>, exit: TabExit) {
         debug_assert_eq!(self.kind, AttachmentKind::Remote);
         let mut state = self.state.lock().unwrap();
         if state.receiver_closed || state.producer_closed {
             return;
         }
-        let event_sequence = take_sequence(&mut state);
-        let sequence = state
-            .screen
-            .front()
-            .map(|queued| queued.sequence)
-            .unwrap_or(event_sequence);
         state.screen.clear();
+        let snapshot_sequence = take_sequence(&mut state);
         state.screen.push_back(QueuedEvent {
-            sequence,
+            sequence: snapshot_sequence,
             event: TabEvent::SharedSnapshot(snapshot),
         });
-        self.changed.notify_one();
+        let exit_sequence = take_sequence(&mut state);
+        state.controls.insert(
+            ControlKind::Exited,
+            QueuedEvent {
+                sequence: exit_sequence,
+                event: TabEvent::Exited(exit),
+            },
+        );
+        state.producer_closed = true;
+        self.changed.notify_all();
         self.async_changed.notify_one();
     }
 
@@ -2105,17 +2109,14 @@ impl LiveTab {
         };
         self.descriptor.exit = Some(exit.clone());
         let final_snapshot = Arc::new(self.screen.snapshot(self.descriptor.id.as_str()));
-        for attachment in self
-            .attachments
-            .values()
-            .filter(|attachment| attachment.kind == AttachmentKind::Remote)
-        {
-            attachment
-                .mailbox
-                .push_shared_snapshot(final_snapshot.clone());
-        }
         for attachment in self.attachments.values() {
-            attachment.mailbox.finish(exit.clone());
+            if attachment.kind == AttachmentKind::Remote {
+                attachment
+                    .mailbox
+                    .finish_with_shared_snapshot(final_snapshot.clone(), exit.clone());
+            } else {
+                attachment.mailbox.finish(exit.clone());
+            }
         }
         Some(exit)
     }

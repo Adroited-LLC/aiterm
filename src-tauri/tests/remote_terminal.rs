@@ -247,25 +247,28 @@ async fn natural_exit_publishes_final_snapshot_before_one_exit_and_nothing_after
     exiting.exit(pty_id, Some(0), None);
 
     let events = collected.await.unwrap();
-    let exit_index = events
+    let finalized_index = events
         .iter()
-        .position(|event| matches!(event, TerminalEvent::Exited(_)))
+        .position(|event| matches!(event, TerminalEvent::Finalized { .. }))
         .expect("natural exit must be published");
-    assert!(matches!(
-        events.get(exit_index.wrapping_sub(1)),
-        Some(TerminalEvent::Snapshot(_) | TerminalEvent::SharedSnapshot(_))
-    ));
+    let TerminalEvent::Finalized { snapshot, exit } = &events[finalized_index] else {
+        unreachable!()
+    };
+    assert_eq!(exit.code(), Some(0));
+    assert!(snapshot
+        .visible()
+        .iter()
+        .any(|row| row_text(row).contains("final")));
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, TerminalEvent::Exited(_)))
+            .filter(|event| matches!(event, TerminalEvent::Finalized { .. }))
             .count(),
         1
     );
-    assert!(!events[exit_index + 1..].iter().any(|event| matches!(
-        event,
-        TerminalEvent::Snapshot(_) | TerminalEvent::SharedSnapshot(_) | TerminalEvent::Diff(_)
-    )));
+    assert!(!events[finalized_index + 1..]
+        .iter()
+        .any(|event| matches!(event, TerminalEvent::Snapshot(_) | TerminalEvent::Diff(_))));
 }
 
 #[test]

@@ -89,7 +89,10 @@ impl std::error::Error for TerminalError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     Snapshot(ScreenSnapshot),
-    SharedSnapshot(Arc<ScreenSnapshot>),
+    Finalized {
+        snapshot: Arc<ScreenSnapshot>,
+        exit: TabExit,
+    },
     Diff(ScreenDiff),
     FocusChanged {
         owner: Option<AttachmentId>,
@@ -103,7 +106,7 @@ pub enum TerminalEvent {
 fn project_event(event: TabEvent) -> Option<TerminalEvent> {
     match event {
         TabEvent::Snapshot(snapshot) => Some(TerminalEvent::Snapshot(snapshot)),
-        TabEvent::SharedSnapshot(snapshot) => Some(TerminalEvent::SharedSnapshot(snapshot)),
+        TabEvent::SharedSnapshot(_) => None,
         TabEvent::Diff(diff) => Some(TerminalEvent::Diff(diff)),
         TabEvent::FocusChanged { owner, size } => Some(TerminalEvent::FocusChanged { owner, size }),
         TabEvent::Metadata(_) | TabEvent::Title(_) => None,
@@ -245,7 +248,12 @@ impl RemoteTerminalEvents {
                 TabEvent::SharedSnapshot(snapshot) => {
                     self.diff_started = None;
                     self.coalescer.clear();
-                    return Some(TerminalEvent::SharedSnapshot(snapshot));
+                    return match self.receiver.recv_async().await {
+                        Ok(TabEvent::Exited(exit)) => {
+                            Some(TerminalEvent::Finalized { snapshot, exit })
+                        }
+                        _ => None,
+                    };
                 }
                 TabEvent::Metadata(descriptor) => {
                     if descriptor.title() != self.last_title {

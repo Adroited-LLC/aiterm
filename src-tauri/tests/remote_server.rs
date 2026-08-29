@@ -51,6 +51,10 @@ impl TestPty {
         *self.kill_state.lock().unwrap() = true;
         self.kill_changed.notify_all();
     }
+
+    fn exit(&self, id: u32, code: Option<u32>, signal: Option<&str>) {
+        self.sinks.lock().unwrap()[&id].exited(id, code, signal);
+    }
 }
 
 impl PtyBackend for TestPty {
@@ -176,6 +180,11 @@ struct SnapshotChunkReply {
     kind: String,
     index: u32,
     total: u32,
+}
+
+#[derive(Deserialize)]
+struct ExitReply {
+    attachment_id: String,
 }
 
 #[derive(Serialize)]
@@ -908,7 +917,7 @@ async fn idle_detach_and_connection_teardown_remove_registry_attachments() {
     let mut socket = connect(&gateway).await;
     authenticate(&mut socket, &key, &device_id).await;
 
-    for request_id in 1..=3 {
+    for request_id in 1..=24 {
         socket
             .send(request(
                 request_id * 2 - 1,
@@ -937,7 +946,7 @@ async fn idle_detach_and_connection_teardown_remove_registry_attachments() {
 
     socket
         .send(request(
-            7,
+            49,
             "terminal.attach",
             &encode(&TabRequest { tab_id: &tab }),
         ))
@@ -1392,6 +1401,8 @@ async fn connection_egress_keeps_competing_transfers_contiguous_and_controls_pro
     let mut completed = HashMap::<String, u32>::new();
     let mut title_requested = false;
     let mut title_prompt = false;
+    let stop_controls = Arc::new(AtomicBool::new(false));
+    let mut control_producer = None;
     while attached < 2 || completed.len() < 2 {
         let event = tokio::time::timeout(Duration::from_secs(5), response(&mut socket))
             .await
@@ -1414,9 +1425,21 @@ async fn connection_egress_keeps_competing_transfers_contiguous_and_controls_pro
                 );
                 completed.insert(chunk.transfer_id.clone(), chunk.index + 1);
                 if !title_requested && chunk.index == 0 && chunk.total > 1 {
-                    registry
-                        .update(&tab, TabUpdate::new().title("prompt between chunks"))
-                        .unwrap();
+                    let updating_registry = registry.clone();
+                    let updating_tab = tab.clone();
+                    let stop = stop_controls.clone();
+                    control_producer = Some(tokio::task::spawn_blocking(move || {
+                        let mut generation = 0u64;
+                        while !stop.load(Ordering::Acquire) {
+                            updating_registry
+                                .update(
+                                    &updating_tab,
+                                    TabUpdate::new().title(format!("control-{generation}")),
+                                )
+                                .unwrap();
+                            generation = generation.saturating_add(1);
+                        }
+                    }));
                     title_requested = true;
                 }
                 if chunk.index + 1 == chunk.total {
@@ -1431,11 +1454,299 @@ async fn connection_egress_keeps_competing_transfers_contiguous_and_controls_pro
             other => panic!("unexpected egress event {other}"),
         }
     }
+    stop_controls.store(true, Ordering::Release);
+    if let Some(producer) = control_producer {
+        producer.await.unwrap();
+    }
     assert!(title_requested && title_prompt);
     assert_eq!(transfer_order.len(), 2);
 
     socket.close(None).await.ok();
     registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn multi_chunk_final_snapshot_completes_before_exactly_one_exit_trailer() {
+    let root = private_test_dir("final-snapshot-trailer");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Final",
+            "final-snapshot-trailer",
+            TerminalSize::try_new(512, 48).unwrap(),
+        ))
+        .unwrap();
+    let cell = format!("x{}", "\u{301}".repeat(32));
+    let row = cell.repeat(512);
+    pty.emit(
+        pty.last_id(),
+        (0..48)
+            .map(|_| row.as_str())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .as_bytes(),
+    );
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(request(
+            2,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let mut attachment_ids = Vec::new();
+    let mut initial_completed = HashMap::<String, u32>::new();
+    while attachment_ids.len() < 2 || initial_completed.len() < 2 {
+        let event = response(&mut socket).await;
+        match event.kind.as_str() {
+            "terminal.attach" => {
+                let attached: AttachedReply = decode(&event.payload);
+                attachment_ids.push(attached.attachment_id);
+            }
+            "terminal.snapshot" => {
+                let chunk: SnapshotChunkReply = decode(&event.payload);
+                if chunk.index + 1 == chunk.total {
+                    initial_completed.insert(chunk.transfer_id, chunk.total);
+                }
+            }
+            other => panic!("unexpected initial event {other}"),
+        }
+    }
+
+    pty.exit(pty.last_id(), Some(0), None);
+    let mut current_transfer = None::<String>;
+    let mut transfer_attachment = HashMap::<String, String>::new();
+    let mut next_index = HashMap::<String, u32>::new();
+    let mut totals = HashMap::<String, u32>::new();
+    let mut exited = Vec::<String>::new();
+    while exited.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), response(&mut socket))
+            .await
+            .expect("final transfer must make progress");
+        match event.kind.as_str() {
+            "terminal.snapshot" => {
+                let chunk: SnapshotChunkReply = decode(&event.payload);
+                let attachment_id = chunk.attachment_id.expect("final snapshots are attached");
+                assert!(attachment_ids.contains(&attachment_id));
+                if let Some(id) = &current_transfer {
+                    assert_eq!(id, &chunk.transfer_id, "final transfers interleaved");
+                } else {
+                    current_transfer = Some(chunk.transfer_id.clone());
+                    transfer_attachment.insert(chunk.transfer_id.clone(), attachment_id.clone());
+                    totals.insert(attachment_id.clone(), chunk.total);
+                    assert!(chunk.total > 1);
+                }
+                let expected = next_index.entry(attachment_id).or_default();
+                assert_eq!(chunk.index, *expected);
+                *expected += 1;
+                if chunk.index + 1 == chunk.total {
+                    current_transfer = None;
+                }
+            }
+            "terminal.exited" => {
+                let exit: ExitReply = decode(&event.payload);
+                assert!(attachment_ids.contains(&exit.attachment_id));
+                assert!(!exited.contains(&exit.attachment_id), "duplicate exit");
+                assert_eq!(
+                    next_index.get(&exit.attachment_id),
+                    totals.get(&exit.attachment_id),
+                    "exit preceded its final snapshot"
+                );
+                exited.push(exit.attachment_id);
+            }
+            other => panic!("unexpected finalization event {other}"),
+        }
+    }
+    assert_eq!(transfer_attachment.len(), 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), socket.next())
+            .await
+            .is_err()
+    );
+
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn peer_close_cancels_a_blocked_dispatch_and_detaches_other_attachments() {
+    let root = private_test_dir("cancel-blocked-dispatch");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let attached_tab = registry
+        .open(TabLaunch::new(
+            "Attached",
+            "cancel-attached",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    let blocked_tab = registry
+        .open(TabLaunch::new(
+            "Blocked",
+            "cancel-blocked",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    pty.block_kill(2);
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest {
+                tab_id: &attached_tab,
+            }),
+        ))
+        .await
+        .unwrap();
+    let _attached = response(&mut socket).await;
+    let _snapshot = response(&mut socket).await;
+    assert_eq!(registry.attachment_count(&attached_tab).unwrap(), 1);
+    socket
+        .send(request(
+            2,
+            "tab.close",
+            &encode(&TabRequest {
+                tab_id: &blocked_tab,
+            }),
+        ))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !pty.kill_entered.load(Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    drop(socket);
+    let detached = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            if registry.attachment_count(&attached_tab).unwrap() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    pty.release_kill();
+    assert!(
+        detached.is_ok(),
+        "peer close did not cancel blocked dispatch"
+    );
+
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn peer_close_cancels_dense_recovery_planning_and_detaches_promptly() {
+    let root = private_test_dir("cancel-recovery-planning");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Recovery",
+            "cancel-recovery-planning",
+            TerminalSize::try_new(512, 48).unwrap(),
+        ))
+        .unwrap();
+    let cell = format!("x{}", "\u{301}".repeat(32));
+    let row = cell.repeat(512);
+    pty.emit(
+        pty.last_id(),
+        (0..48)
+            .map(|_| row.as_str())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .as_bytes(),
+    );
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached = response(&mut socket).await;
+    let attached: AttachedReply = decode(&attached.payload);
+    loop {
+        let event = response(&mut socket).await;
+        let chunk: SnapshotChunkReply = decode(&event.payload);
+        if chunk.index + 1 == chunk.total {
+            break;
+        }
+    }
+    socket
+        .send(request(
+            2,
+            "terminal.resume",
+            &encode(&ResumeRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                revision: u64::MAX,
+            }),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    drop(socket);
+    tokio::time::timeout(Duration::from_millis(300), async {
+        while registry.attachment_count(&tab).unwrap() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer close must cancel recovery planning");
+
     gateway.stop().await.unwrap();
     std::fs::remove_dir_all(root).ok();
 }

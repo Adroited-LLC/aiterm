@@ -1035,9 +1035,13 @@ fn full_remote_screen_queue_retains_control_events_and_exit_exactly_once() {
         }
     }
 
+    let final_snapshot = events
+        .iter()
+        .position(|event| matches!(event, TabEvent::SharedSnapshot(_)))
+        .expect("final shared snapshot must be retained");
     assert!(matches!(
-        events.first(),
-        Some(TabEvent::Snapshot(_) | TabEvent::SharedSnapshot(_))
+        events.get(final_snapshot + 1),
+        Some(TabEvent::Exited(_))
     ));
     assert!(events.iter().any(|event| matches!(
         event,
