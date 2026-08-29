@@ -45,6 +45,10 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty::PtyManager::default())
         .manage(watcher::WatchState::default())
+        // Off until the user turns it on, and it opens nothing on disk until
+        // then: a desktop that never pairs a phone never grows a
+        // trusted-device file.
+        .manage(remote::RemoteState::default())
         // Wrapped so a debug build logs every IPC call before it dispatches.
         // In release `log_invokes` is the identity function and the generated
         // handler is passed straight through — see `trace.rs`.
@@ -138,6 +142,16 @@ pub fn run() {
             git::git_log,
             git::git_diff_file,
             git::git_commit_diff,
+            remote::remote_status,
+            remote::remote_interfaces,
+            remote::remote_start,
+            remote::remote_stop,
+            remote::remote_begin_pairing,
+            remote::remote_pending_pairings,
+            remote::remote_approve_device,
+            remote::remote_deny_device,
+            remote::remote_devices,
+            remote::remote_revoke_device,
         ]))
         .setup(|app| {
             // First line of every log: which build this is and what launched
