@@ -259,18 +259,10 @@ struct TitleChangedReply {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct OpenRequest {
-    title: String,
-    cwd: Option<String>,
-    command: Option<String>,
-    session_id: Option<String>,
-    resumed_id: Option<String>,
-    agent_id: Option<String>,
-    slot_id: String,
-    fresh: bool,
-    env_provider: Option<String>,
-    env_model: Option<String>,
+    kind: &'static str,
+    project_path: Option<String>,
+    title: Option<String>,
     size: TerminalSize,
 }
 
@@ -674,16 +666,9 @@ async fn remote_open_and_close_drive_the_desktop_registry_projection() {
             1,
             "tab.open",
             &encode(&OpenRequest {
-                title: "Phone tab".to_string(),
-                cwd: None,
-                command: None,
-                session_id: None,
-                resumed_id: None,
-                agent_id: None,
-                slot_id: "phone-tab".to_string(),
-                fresh: false,
-                env_provider: None,
-                env_model: None,
+                kind: "shell",
+                project_path: None,
+                title: Some("Phone tab".to_string()),
                 size: TerminalSize::try_new(30, 6).unwrap(),
             }),
         ))
@@ -2624,25 +2609,18 @@ async fn attachment_input_scrollback_command_and_path_limits_are_enforced() {
         "terminal.invalid_scrollback_page"
     );
 
-    for (request_id, cwd, command) in [
+    for (request_id, project_path, title) in [
         (4, Some("x".repeat(4 * 1024 + 1)), None),
-        (5, None, Some("x".repeat(32 * 1024 + 1))),
+        (5, None, Some("x".repeat(4 * 1024 + 1))),
     ] {
         socket
             .send(request(
                 request_id,
                 "tab.open",
                 &encode(&OpenRequest {
-                    title: "bounded".to_string(),
-                    cwd,
-                    command,
-                    session_id: None,
-                    resumed_id: None,
-                    agent_id: None,
-                    slot_id: format!("bounded-{request_id}"),
-                    fresh: false,
-                    env_provider: None,
-                    env_model: None,
+                    kind: "shell",
+                    project_path,
+                    title,
                     size: TerminalSize::try_new(20, 2).unwrap(),
                 }),
             ))

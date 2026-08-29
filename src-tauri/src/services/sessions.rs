@@ -5,15 +5,20 @@
 //! an explicit fixture tree without consulting the process home directory.
 
 use crate::sessions::{PreviewMsg, Session};
+use std::collections::HashSet;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_SESSION_ID_BYTES: usize = 256;
 const MAX_ROOTED_FILES: usize = 4096;
+const MAX_DISCOVERY_DEPTH: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct SessionRoots {
     sessions: PathBuf,
+    pinned_sessions: Option<Arc<std::fs::File>>,
     trash: PathBuf,
     tasks: PathBuf,
     jobs: PathBuf,
@@ -29,6 +34,7 @@ impl SessionRoots {
         forks: PathBuf,
     ) -> Self {
         Self {
+            pinned_sessions: pin_directory(&sessions),
             sessions,
             trash,
             tasks,
@@ -36,17 +42,53 @@ impl SessionRoots {
             forks,
         }
     }
+
+    fn sessions_path(&self) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        if let Some(directory) = &self.pinned_sessions {
+            use std::os::fd::AsRawFd;
+            return PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        }
+        self.sessions.clone()
+    }
+}
+
+fn pin_directory(path: &Path) -> Option<Arc<std::fs::File>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .ok()
+            .map(Arc::new)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 #[derive(Clone)]
 pub struct SessionService {
-    source: Arc<SessionSource>,
+    catalog: Arc<dyn SessionCatalog>,
 }
 
-enum SessionSource {
-    Desktop,
-    Rooted(SessionRoots),
+trait SessionCatalog: Send + Sync {
+    // Provider adapters supply storage-specific I/O only. SessionService owns
+    // id validation, existence checks, discovery bounds, stable errors and
+    // operation ordering for every transport and every catalog.
+    fn list(&self) -> Result<Vec<Session>, SessionServiceError>;
+    fn preview(&self, session_id: &str) -> Result<Vec<PreviewMsg>, SessionServiceError>;
+    fn delete(&self, session_id: &str) -> Result<(), SessionServiceError>;
+    fn fork(&self, session_id: &str) -> Result<String, SessionServiceError>;
+    fn stop(&self, session_id: &str) -> Result<(), SessionServiceError>;
 }
+
+struct DesktopCatalog;
+struct FilesystemCatalog(SessionRoots);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionServiceError {
@@ -88,24 +130,18 @@ impl Default for SessionService {
 impl SessionService {
     pub fn desktop() -> Self {
         Self {
-            source: Arc::new(SessionSource::Desktop),
+            catalog: Arc::new(DesktopCatalog),
         }
     }
 
     pub fn from_roots(roots: SessionRoots) -> Self {
         Self {
-            source: Arc::new(SessionSource::Rooted(roots)),
+            catalog: Arc::new(FilesystemCatalog(roots)),
         }
     }
 
     pub fn list(&self) -> Result<Vec<Session>, SessionServiceError> {
-        match &*self.source {
-            SessionSource::Desktop => Ok(crate::agents::scan_all_with_paths()
-                .into_iter()
-                .map(|(session, _)| session)
-                .collect()),
-            SessionSource::Rooted(roots) => Ok(scan_rooted(roots)),
-        }
+        self.catalog.list()
     }
 
     pub fn find(&self, session_id: &str) -> Result<Session, SessionServiceError> {
@@ -122,43 +158,83 @@ impl SessionService {
 
     pub fn preview(&self, session_id: &str) -> Result<Vec<PreviewMsg>, SessionServiceError> {
         validate_session_id(session_id)?;
-        match &*self.source {
-            SessionSource::Desktop => Ok(crate::sessions::session_preview_service(session_id)),
-            SessionSource::Rooted(roots) => {
-                let path = rooted_path(roots, session_id)?;
-                Ok(crate::sessions::preview_file_service(&path))
-            }
-        }
+        self.find(session_id)?;
+        self.catalog.preview(session_id)
     }
 
     pub fn delete(&self, session_id: &str) -> Result<(), SessionServiceError> {
         validate_session_id(session_id)?;
-        match &*self.source {
-            SessionSource::Desktop => crate::sessions::session_delete_service(session_id)
-                .map_err(|message| SessionServiceError::new(delete_code(&message), message)),
-            SessionSource::Rooted(roots) => delete_rooted(roots, session_id),
-        }
+        // Resolve through the same bounded catalog before any provider hook is
+        // allowed to create trash or mutate storage. This is the common
+        // unknown-delete no-side-effect boundary.
+        self.find(session_id)?;
+        self.catalog.delete(session_id)
     }
 
     pub fn fork(&self, session_id: &str) -> Result<String, SessionServiceError> {
         validate_session_id(session_id)?;
-        match &*self.source {
-            SessionSource::Desktop => crate::sessions::session_fork_service(session_id)
-                .map_err(|message| SessionServiceError::new(fork_code(&message), message)),
-            SessionSource::Rooted(roots) => fork_rooted(roots, session_id),
-        }
+        self.find(session_id)?;
+        self.catalog.fork(session_id)
     }
 
     pub fn stop(&self, session_id: &str) -> Result<(), SessionServiceError> {
         validate_session_id(session_id)?;
-        match &*self.source {
-            SessionSource::Desktop => crate::sessions::stop_session_service(session_id)
-                .map_err(|message| SessionServiceError::new("session.stop_failed", message)),
-            // A rooted service has no process roster. A fixture transcript is
-            // therefore already stopped, matching the desktop command's
-            // idempotent "not in roster" behavior.
-            SessionSource::Rooted(_) => Ok(()),
-        }
+        self.catalog.stop(session_id)
+    }
+}
+
+impl SessionCatalog for DesktopCatalog {
+    fn list(&self) -> Result<Vec<Session>, SessionServiceError> {
+        Ok(crate::agents::scan_all_with_paths()
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect())
+    }
+
+    fn preview(&self, session_id: &str) -> Result<Vec<PreviewMsg>, SessionServiceError> {
+        Ok(crate::sessions::session_preview_service(session_id))
+    }
+
+    fn delete(&self, session_id: &str) -> Result<(), SessionServiceError> {
+        crate::sessions::session_delete_service(session_id)
+            .map_err(|message| SessionServiceError::new(delete_code(&message), message))
+    }
+
+    fn fork(&self, session_id: &str) -> Result<String, SessionServiceError> {
+        crate::sessions::session_fork_service(session_id)
+            .map_err(|message| SessionServiceError::new(fork_code(&message), message))
+    }
+
+    fn stop(&self, session_id: &str) -> Result<(), SessionServiceError> {
+        crate::sessions::stop_session_service(session_id)
+            .map_err(|message| SessionServiceError::new("session.stop_failed", message))
+    }
+}
+
+impl SessionCatalog for FilesystemCatalog {
+    fn list(&self) -> Result<Vec<Session>, SessionServiceError> {
+        Ok(scan_rooted(&self.0))
+    }
+
+    fn preview(&self, session_id: &str) -> Result<Vec<PreviewMsg>, SessionServiceError> {
+        let path = rooted_path(&self.0, session_id)?;
+        let file = open_regular_nofollow(&path)
+            .map_err(|_| SessionServiceError::new("session.not_found", "session not found"))?;
+        Ok(crate::sessions::preview_open_file_service(file))
+    }
+
+    fn delete(&self, session_id: &str) -> Result<(), SessionServiceError> {
+        delete_rooted(&self.0, session_id)
+    }
+
+    fn fork(&self, session_id: &str) -> Result<String, SessionServiceError> {
+        fork_rooted(&self.0, session_id)
+    }
+
+    fn stop(&self, _session_id: &str) -> Result<(), SessionServiceError> {
+        // A fixture catalog has no process roster. An absent process is an
+        // idempotent success, matching the desktop roster operation.
+        Ok(())
     }
 }
 
@@ -179,7 +255,8 @@ fn validate_session_id(session_id: &str) -> Result<(), SessionServiceError> {
 
 fn scan_rooted(roots: &SessionRoots) -> Vec<Session> {
     let mut files = Vec::new();
-    collect_jsonl(&roots.sessions, &mut files);
+    let mut visited = HashSet::new();
+    collect_jsonl(&roots.sessions_path(), 0, &mut visited, &mut files);
     files.sort();
     let mut sessions: Vec<_> = files
         .into_iter()
@@ -196,9 +273,28 @@ fn scan_rooted(roots: &SessionRoots) -> Vec<Session> {
     sessions
 }
 
-fn collect_jsonl(path: &Path, out: &mut Vec<PathBuf>) {
-    if out.len() >= MAX_ROOTED_FILES {
+fn collect_jsonl(
+    path: &Path,
+    depth: usize,
+    visited: &mut HashSet<(u64, u64)>,
+    out: &mut Vec<PathBuf>,
+) {
+    if out.len() >= MAX_ROOTED_FILES || depth > MAX_DISCOVERY_DEPTH {
         return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // `path` may be Linux's `/proc/self/fd/<pinned-root>` handle. The
+        // entries below are still classified with no-follow `DirEntry`
+        // metadata; following this one procfs link is what retains the pinned
+        // directory inode after its original pathname is replaced.
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return;
+        };
+        if !metadata.file_type().is_dir() || !visited.insert((metadata.dev(), metadata.ino())) {
+            return;
+        }
     }
     let Ok(entries) = std::fs::read_dir(path) else {
         return;
@@ -215,7 +311,7 @@ fn collect_jsonl(path: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         if file_type.is_dir() {
-            collect_jsonl(&path, out);
+            collect_jsonl(&path, depth + 1, visited, out);
         } else if file_type.is_file()
             && path
                 .extension()
@@ -231,7 +327,9 @@ fn collect_jsonl(path: &Path, out: &mut Vec<PathBuf>) {
 
 fn rooted_path(roots: &SessionRoots, session_id: &str) -> Result<PathBuf, SessionServiceError> {
     let mut files = Vec::new();
-    collect_jsonl(&roots.sessions, &mut files);
+    let root_path = roots.sessions_path();
+    let mut visited = HashSet::new();
+    collect_jsonl(&root_path, 0, &mut visited, &mut files);
     let candidate = files
         .into_iter()
         .find(|path| {
@@ -239,7 +337,7 @@ fn rooted_path(roots: &SessionRoots, session_id: &str) -> Result<PathBuf, Sessio
                 .is_some_and(|stem| stem.to_string_lossy() == session_id)
         })
         .ok_or_else(|| SessionServiceError::new("session.not_found", "session not found"))?;
-    let root = std::fs::canonicalize(&roots.sessions)
+    let root = std::fs::canonicalize(&root_path)
         .map_err(|_| SessionServiceError::new("session.not_found", "session not found"))?;
     let candidate = std::fs::canonicalize(candidate)
         .map_err(|_| SessionServiceError::new("session.not_found", "session not found"))?;
@@ -256,6 +354,8 @@ fn delete_rooted(roots: &SessionRoots, session_id: &str) -> Result<(), SessionSe
     // Resolve before creating or purging anything. This ordering is the
     // destructive-operation boundary: an unknown id has no disk side effect.
     let path = rooted_path(roots, session_id)?;
+    let _verified = open_regular_nofollow(&path)
+        .map_err(|_| SessionServiceError::new("session.not_found", "session not found"))?;
     std::fs::create_dir_all(&roots.trash)
         .map_err(|error| SessionServiceError::new("session.delete_failed", error.to_string()))?;
     let destination = roots.trash.join(format!("{session_id}.jsonl"));
@@ -290,7 +390,12 @@ fn rooted_job(jobs: &Path, session_id: &str) -> Option<PathBuf> {
 
 fn fork_rooted(roots: &SessionRoots, session_id: &str) -> Result<String, SessionServiceError> {
     let source = rooted_path(roots, session_id)?;
-    let text = std::fs::read_to_string(&source)
+    let mut source_file = open_regular_nofollow(&source)
+        .map_err(|error| SessionServiceError::new("session.fork_failed", error.to_string()))?;
+    let mut text = String::new();
+    use std::io::{Read, Write};
+    source_file
+        .read_to_string(&mut text)
         .map_err(|error| SessionServiceError::new("session.fork_failed", error.to_string()))?;
     let new_id = uuid::Uuid::new_v4().to_string();
     let (rewritten, replacements) = rewrite_ids(&text, session_id, &new_id);
@@ -301,13 +406,11 @@ fn fork_rooted(roots: &SessionRoots, session_id: &str) -> Result<String, Session
         ));
     }
     let destination = source.with_file_name(format!("{new_id}.jsonl"));
-    std::fs::write(&destination, rewritten)
+    let mut destination_file = create_private_new_nofollow(&destination)
         .map_err(|error| SessionServiceError::new("session.fork_failed", error.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600));
-    }
+    destination_file
+        .write_all(rewritten.as_bytes())
+        .map_err(|error| SessionServiceError::new("session.fork_failed", error.to_string()))?;
     let mut forks = read_forks(&roots.forks);
     forks.insert(new_id.clone(), session_id.to_owned());
     if let Some(parent) = roots.forks.parent() {
@@ -317,6 +420,51 @@ fn fork_rooted(roots: &SessionRoots, session_id: &str) -> Result<String, Session
         let _ = std::fs::write(&roots.forks, encoded);
     }
     Ok(new_id)
+}
+
+fn create_private_new_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no-follow session operations are unsupported",
+        ))
+    }
+}
+
+fn open_regular_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::other(
+                "session location is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no-follow session operations are unsupported",
+        ))
+    }
 }
 
 fn rewrite_ids(text: &str, old: &str, new: &str) -> (String, usize) {

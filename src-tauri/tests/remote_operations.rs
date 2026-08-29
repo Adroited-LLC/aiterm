@@ -195,6 +195,22 @@ struct AgentStartRequest<'a> {
     size: TerminalSize,
 }
 
+#[derive(Serialize)]
+struct ShellOpenRequest<'a> {
+    kind: &'static str,
+    project_path: Option<&'a str>,
+    title: Option<&'a str>,
+    size: TerminalSize,
+}
+
+#[derive(Serialize)]
+struct LegacyTabOpenRequest<'a> {
+    kind: &'static str,
+    project_path: Option<&'a str>,
+    command: &'a str,
+    size: TerminalSize,
+}
+
 #[derive(Deserialize)]
 struct AgentListReply {
     agents: Vec<AgentChoiceReply>,
@@ -214,6 +230,8 @@ struct AgentStartedReply {
 }
 
 struct FixtureAgents;
+
+struct SlowFixtureAgents;
 
 impl AgentOperations for FixtureAgents {
     fn detect(&self) -> Vec<Detection> {
@@ -256,8 +274,30 @@ impl AgentOperations for FixtureAgents {
                 agent_id: "fixture".into(),
                 caps: Caps::default(),
             }),
-            _ => panic!("fixture received an unexpected launch request"),
+            _ => Err(AgentServiceError::new(
+                "agent.unavailable",
+                "fixture received an unexpected launch request",
+            )),
         }
+    }
+}
+
+impl AgentOperations for SlowFixtureAgents {
+    fn detect(&self) -> Vec<Detection> {
+        FixtureAgents.detect()
+    }
+
+    fn caps(&self) -> std::collections::HashMap<String, Caps> {
+        FixtureAgents.caps()
+    }
+
+    fn list(&self) -> Vec<AgentChoice> {
+        FixtureAgents.list()
+    }
+
+    fn resolve(&self, request: LaunchRequest) -> Result<LaunchPlan, AgentServiceError> {
+        std::thread::sleep(Duration::from_millis(150));
+        FixtureAgents.resolve(request)
     }
 }
 
@@ -550,6 +590,141 @@ async fn remote_agent_start_rejects_a_cwd_not_exposed_by_the_session_service() {
 }
 
 #[tokio::test]
+async fn remote_agent_start_rejects_agents_models_and_efforts_not_returned_by_agent_list() {
+    let fixture = Fixture::new("agent-selections");
+    fixture.write_session(
+        "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1",
+        "Allowed project",
+        "/fixture/project",
+    );
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let agents = AgentService::from_operations(Arc::new(FixtureAgents));
+    let (gateway, mut socket) = start_with_services(&fixture, registry, agents).await;
+
+    for (request_id, agent_id, model, effort, expected) in [
+        (44, "missing", None, None, "agent.unavailable"),
+        (
+            45,
+            "fixture",
+            Some("not-listed"),
+            None,
+            "agent.invalid_selection",
+        ),
+        (
+            46,
+            "fixture",
+            Some("fixture-model"),
+            Some("ultra"),
+            "agent.invalid_selection",
+        ),
+    ] {
+        socket
+            .send(request(
+                request_id,
+                "agent.action",
+                &AgentStartRequest {
+                    action: "start",
+                    agent_id,
+                    model,
+                    effort,
+                    cwd: "/fixture/project",
+                    title: "Invalid selection",
+                    size: TerminalSize::try_new(80, 24).unwrap(),
+                },
+            ))
+            .await
+            .unwrap();
+        let error: ErrorReply = decode(&receive(&mut socket).await.payload);
+        assert_eq!(error.code, expected);
+    }
+    assert_eq!(pty.next_id.load(Ordering::SeqCst), 0);
+    gateway.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_tab_open_accepts_only_a_server_owned_shell_intent() {
+    let fixture = Fixture::new("typed-shell-open");
+    fixture.write_session(
+        "f0f0f0f0-f0f0-40f0-80f0-f0f0f0f0f0f0",
+        "Allowed project",
+        "/fixture/project",
+    );
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let (gateway, mut socket) = start_with_registry(&fixture, registry.clone()).await;
+
+    socket
+        .send(request(
+            40,
+            "tab.open",
+            &ShellOpenRequest {
+                kind: "shell",
+                project_path: None,
+                title: Some("Phone shell"),
+                size: TerminalSize::try_new(80, 24).unwrap(),
+            },
+        ))
+        .await
+        .unwrap();
+    let opened = receive(&mut socket).await;
+    assert_eq!(opened.kind, "tab.open");
+    assert_eq!(registry.list().len(), 1);
+    assert_eq!(registry.list()[0].command(), None);
+    assert_eq!(registry.list()[0].cwd(), None);
+
+    socket
+        .send(request(
+            41,
+            "tab.open",
+            &ShellOpenRequest {
+                kind: "shell",
+                project_path: Some("/fixture/project"),
+                title: None,
+                size: TerminalSize::try_new(80, 24).unwrap(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receive_correlated(&mut socket, 41).await.kind, "tab.open");
+    assert_eq!(registry.list()[1].cwd(), Some("/fixture/project"));
+
+    socket
+        .send(request(
+            42,
+            "tab.open",
+            &ShellOpenRequest {
+                kind: "shell",
+                project_path: Some("/etc"),
+                title: None,
+                size: TerminalSize::try_new(80, 24).unwrap(),
+            },
+        ))
+        .await
+        .unwrap();
+    let error: ErrorReply = decode(&receive_correlated(&mut socket, 42).await.payload);
+    assert_eq!(error.code, "remote.path_not_allowed");
+
+    socket
+        .send(request(
+            43,
+            "tab.open",
+            &LegacyTabOpenRequest {
+                kind: "shell",
+                project_path: None,
+                command: "rm -rf /",
+                size: TerminalSize::try_new(80, 24).unwrap(),
+            },
+        ))
+        .await
+        .unwrap();
+    let error: ErrorReply = decode(&receive_correlated(&mut socket, 43).await.payload);
+    assert_eq!(error.code, "protocol.invalid_payload");
+    assert_eq!(pty.next_id.load(Ordering::SeqCst), 2);
+    gateway.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn remote_session_open_selects_a_live_tab_before_its_transcript_exists() {
     let fixture = Fixture::new("open-live-tab");
     let pty = Arc::new(TestPty::default());
@@ -717,6 +892,65 @@ async fn remote_session_open_validates_an_id_before_matching_a_running_tab() {
 
     assert_eq!(envelope.kind, "error");
     assert_eq!(error.code, "session.invalid_id");
+    gateway.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_authenticated_session_open_creates_one_resume_and_selects_it_once() {
+    let fixture = Fixture::new("open-race");
+    let session_id = "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1";
+    fixture.write_session(session_id, "Race resume", "/fixture/project");
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let (store, key, device_id) = paired_store(&fixture.root);
+    let identity =
+        TlsIdentity::load_or_create(fixture.root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            .unwrap();
+    let services = RemoteServices::with_application_services(
+        registry.clone(),
+        fixture.service.clone(),
+        AgentService::from_operations(Arc::new(SlowFixtureAgents)),
+    );
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services,
+    )
+    .await
+    .unwrap();
+    let mut first = connect(&gateway).await;
+    authenticate(&mut first, &key, &device_id).await;
+    let mut second = connect(&gateway).await;
+    authenticate(&mut second, &key, &device_id).await;
+    let payload = SessionOpenRequest {
+        session_id,
+        size: TerminalSize::try_new(80, 24).unwrap(),
+    };
+
+    first
+        .send(request(47, "session.open", &payload))
+        .await
+        .unwrap();
+    second
+        .send(request(48, "session.open", &payload))
+        .await
+        .unwrap();
+    let (one, two) = tokio::join!(receive(&mut first), receive(&mut second));
+    let one: SessionOpenReply = decode(&one.payload);
+    let two: SessionOpenReply = decode(&two.payload);
+
+    assert_eq!(one.tab_id, two.tab_id);
+    assert_ne!(one.selected_existing, two.selected_existing);
+    assert_eq!(
+        registry
+            .list()
+            .iter()
+            .filter(|tab| tab.state() == &TabState::Running)
+            .count(),
+        1
+    );
+    assert_eq!(pty.next_id.load(Ordering::SeqCst), 1);
     gateway.stop().await.unwrap();
 }
 
@@ -1169,6 +1403,58 @@ fn rooted_session_service_rejects_file_and_directory_symlink_escapes() {
     );
     assert_eq!(std::fs::read(&external_file).unwrap(), before_file);
     assert_eq!(std::fs::read(&external_nested).unwrap(), before_nested);
+}
+
+#[cfg(unix)]
+#[test]
+fn rooted_session_service_is_pinned_against_root_replacement_and_bounds_depth() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::new("root-replacement");
+    let original_id = "c1c1c1c1-c1c1-41c1-81c1-c1c1c1c1c1c1";
+    fixture.write_session(original_id, "Original", "/fixture/original");
+    assert!(fixture.service.find(original_id).is_ok());
+
+    let pinned = fixture.root.join("pinned-sessions");
+    std::fs::rename(&fixture.sessions, &pinned).unwrap();
+    let outside = fixture.root.join("outside-root");
+    std::fs::create_dir_all(outside.join("project")).unwrap();
+    let outside_id = "d1d1d1d1-d1d1-41d1-81d1-d1d1d1d1d1d1";
+    let outside_file = outside.join("project").join(format!("{outside_id}.jsonl"));
+    std::fs::write(
+        &outside_file,
+        format!("{{\"sessionId\":\"{outside_id}\",\"cwd\":\"/outside\"}}\n"),
+    )
+    .unwrap();
+    let sentinel = std::fs::read(&outside_file).unwrap();
+    symlink(&outside, &fixture.sessions).unwrap();
+
+    assert!(fixture.service.find(original_id).is_ok());
+    assert_eq!(
+        fixture.service.find(outside_id).err().unwrap().code(),
+        "session.not_found"
+    );
+    assert_eq!(
+        fixture.service.delete(outside_id).unwrap_err().code(),
+        "session.not_found"
+    );
+    assert_eq!(std::fs::read(&outside_file).unwrap(), sentinel);
+
+    let mut deep = pinned.join("deep");
+    for _ in 0..20 {
+        deep = deep.join("d");
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    let deep_id = "e1e1e1e1-e1e1-41e1-81e1-e1e1e1e1e1e1";
+    std::fs::write(
+        deep.join(format!("{deep_id}.jsonl")),
+        format!("{{\"sessionId\":\"{deep_id}\",\"cwd\":\"/deep\"}}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        fixture.service.find(deep_id).err().unwrap().code(),
+        "session.not_found"
+    );
 }
 
 #[tokio::test]

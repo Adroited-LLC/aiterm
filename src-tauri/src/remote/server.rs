@@ -46,8 +46,8 @@ pub const MAX_SCROLLBACK_PAGE_ROWS: usize = 256;
 pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TITLE_BYTES: usize = 4 * 1024;
 const MAX_PATH_BYTES: usize = 4 * 1024;
-const MAX_COMMAND_BYTES: usize = 32 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
+const SESSION_OPEN_LOCK_STRIPES: usize = 64;
 const ATTACHMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ATTACHMENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const ATTACHMENT_REAP_INTERVAL: Duration = Duration::from_millis(100);
@@ -171,6 +171,7 @@ pub struct RemoteServices {
     sessions: SessionService,
     agents: AgentService,
     blocking_operations: Arc<tokio::sync::Semaphore>,
+    session_open_locks: Arc<Vec<Mutex<()>>>,
 }
 
 impl RemoteServices {
@@ -184,6 +185,11 @@ impl RemoteServices {
             blocking_operations: BLOCKING_OPERATIONS
                 .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(REMOTE_BLOCKING_OPERATIONS)))
                 .clone(),
+            session_open_locks: Arc::new(
+                (0..SESSION_OPEN_LOCK_STRIPES)
+                    .map(|_| Mutex::new(()))
+                    .collect(),
+            ),
         }
     }
 
@@ -196,6 +202,17 @@ impl RemoteServices {
         services.sessions = sessions;
         services.agents = agents;
         services
+    }
+
+    pub fn from_application_services(
+        registry: Arc<TabRegistry>,
+        services: &crate::services::ApplicationServices,
+    ) -> Self {
+        Self::with_application_services(
+            registry,
+            services.sessions.clone(),
+            services.agents.clone(),
+        )
     }
 
     pub fn registry(&self) -> &Arc<TabRegistry> {
@@ -787,20 +804,15 @@ enum AgentActionPayload {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct TabOpenPayload {
-    title: String,
-    cwd: Option<String>,
-    command: Option<String>,
-    session_id: Option<String>,
-    resumed_id: Option<String>,
-    agent_id: Option<String>,
-    slot_id: String,
-    #[serde(default)]
-    fresh: bool,
-    env_provider: Option<String>,
-    env_model: Option<String>,
-    size: TerminalSize,
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TabOpenPayload {
+    Shell {
+        #[serde(default)]
+        project_path: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        size: TerminalSize,
+    },
 }
 
 #[derive(Serialize)]
@@ -1135,47 +1147,10 @@ fn bounded(value: &str, max: usize) -> Result<(), &'static str> {
     }
 }
 
-fn launch_from_wire(wire: TabOpenPayload) -> Result<TabLaunch, &'static str> {
-    bounded(&wire.title, MAX_TITLE_BYTES)?;
-    bounded(&wire.slot_id, MAX_IDENTIFIER_BYTES)?;
-    if let Some(value) = wire.cwd.as_deref() {
-        bounded(value, MAX_PATH_BYTES)?;
-    }
-    if let Some(value) = wire.command.as_deref() {
-        bounded(value, MAX_COMMAND_BYTES)?;
-    }
-    for value in [
-        wire.session_id.as_deref(),
-        wire.resumed_id.as_deref(),
-        wire.agent_id.as_deref(),
-        wire.env_provider.as_deref(),
-        wire.env_model.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        bounded(value, MAX_IDENTIFIER_BYTES)?;
-    }
-    let mut launch = TabLaunch::new(wire.title, wire.slot_id, wire.size).with_fresh(wire.fresh);
-    if let Some(value) = wire.cwd {
-        launch = launch.with_cwd(value);
-    }
-    if let Some(value) = wire.command {
-        launch = launch.with_command(value);
-    }
-    if let Some(value) = wire.session_id {
-        launch = launch.with_session_id(value);
-    }
-    if let Some(value) = wire.resumed_id {
-        launch = launch.with_resumed_id(value);
-    }
-    if let Some(value) = wire.agent_id {
-        launch = launch.with_agent_id(value);
-    }
-    if let (Some(provider), Some(model)) = (wire.env_provider, wire.env_model) {
-        launch = launch.with_environment(provider, model);
-    }
-    Ok(launch)
+fn session_open_lock_index(session_id: &str) -> usize {
+    session_id.bytes().fold(0usize, |hash, byte| {
+        hash.wrapping_mul(16777619) ^ usize::from(byte)
+    }) % SESSION_OPEN_LOCK_STRIPES
 }
 
 fn tab_matches_session(tab: &TabDescriptor, session_id: &str) -> bool {
@@ -1258,6 +1233,10 @@ impl RemoteServices {
                 self.sessions
                     .validate_id(&payload.session_id)
                     .map_err(|error| error.code())?;
+                let stripe = session_open_lock_index(&payload.session_id);
+                let _open_guard = self.session_open_locks[stripe]
+                    .lock()
+                    .map_err(|_| "remote.operation_failed")?;
                 let matches: Vec<_> = self
                     .registry
                     .list()
@@ -1469,7 +1448,39 @@ impl RemoteServices {
                 )?]))
             }
             "tab.open" => {
-                let launch = launch_from_wire(decode_payload::<TabOpenPayload>(request)?)?;
+                let payload = decode_payload::<TabOpenPayload>(request)?;
+                let (project_path, title, size) = match payload {
+                    TabOpenPayload::Shell {
+                        project_path,
+                        title,
+                        size,
+                    } => (
+                        project_path,
+                        title.unwrap_or_else(|| "Terminal".to_owned()),
+                        size,
+                    ),
+                };
+                bounded(&title, MAX_TITLE_BYTES)?;
+                if let Some(path) = project_path.as_deref() {
+                    bounded(path, MAX_PATH_BYTES)?;
+                    let exposed = self
+                        .sessions
+                        .list()
+                        .map_err(|error| error.code())?
+                        .iter()
+                        .any(|session| session.project_path == path);
+                    if !exposed {
+                        return Err("remote.path_not_allowed");
+                    }
+                }
+                let mut launch = TabLaunch::new(
+                    title,
+                    format!("remote-shell:{}", uuid::Uuid::new_v4()),
+                    size,
+                );
+                if let Some(project_path) = project_path {
+                    launch = launch.with_cwd(project_path);
+                }
                 let tab_id = self.terminal.open(launch).map_err(|error| error.code())?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,

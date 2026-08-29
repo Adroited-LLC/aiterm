@@ -298,6 +298,7 @@ pub async fn remote_interfaces(
 pub async fn remote_start(
     state: tauri::State<'_, RemoteState>,
     tabs: tauri::State<'_, Arc<crate::tabs::TabRegistry>>,
+    services: tauri::State<'_, crate::services::ApplicationServices>,
     address: String,
     port: u16,
 ) -> Result<RemoteStatusView, String> {
@@ -337,7 +338,7 @@ pub async fn remote_start(
         SocketAddr::new(ip, port),
         devices,
         identity,
-        RemoteServices::new(tabs.inner().clone()),
+        RemoteServices::from_application_services(tabs.inner().clone(), services.inner()),
     )
     .await;
     let mut inner = state.inner.lock().await;

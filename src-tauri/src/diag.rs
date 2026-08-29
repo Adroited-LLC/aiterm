@@ -125,7 +125,10 @@ pub fn diag_environment() -> Vec<(String, String)> {
     ];
     // Which agents aiterm can actually see, which is the answer to most
     // "why is it not offering X" questions.
-    for d in crate::agents::detect_agents() {
+    for d in crate::services::ApplicationServices::desktop()
+        .agents
+        .detect()
+    {
         out.push((
             format!("agent: {}", d.display_name),
             match (d.available, d.version.as_deref()) {

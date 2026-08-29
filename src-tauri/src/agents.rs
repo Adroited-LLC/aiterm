@@ -565,18 +565,41 @@ fn codex_root() -> Option<std::path::PathBuf> {
 /// Codex files them by date, so the depth is fixed at three today — but a
 /// walk costs the same as three nested reads and does not break the day that
 /// changes.
-fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+fn codex_rollouts_bounded(
+    dir: &std::path::Path,
+    depth: usize,
+    budget: &mut crate::sessions::DiscoveryBudget,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    if budget.remaining() == 0 || !budget.enter_directory(dir, depth) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for e in entries.flatten() {
+        if budget.remaining() == 0 {
+            break;
+        }
         let path = e.path();
-        if path.is_dir() {
-            codex_rollouts(&path, out);
-        } else if path.extension().is_some_and(|x| x == "jsonl") {
+        let Ok(file_type) = e.file_type() else { continue };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            codex_rollouts_bounded(&path, depth + 1, budget, out);
+        } else if file_type.is_file()
+            && path.extension().is_some_and(|x| x == "jsonl")
+            && budget.claim_file()
+        {
             out.push(path);
         }
     }
+}
+
+fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let mut budget = crate::sessions::DiscoveryBudget::new();
+    codex_rollouts_bounded(dir, 0, &mut budget, out);
 }
 
 /// The body of [`CodexSessions::scan_with_paths`], over an explicit root.
@@ -586,8 +609,16 @@ fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// `~/.codex/sessions`, which makes the test say different things on different
 /// machines — and pass vacuously on any machine that has never run Codex.
 fn scan_codex_dir(root: &std::path::Path) -> Vec<(Session, std::path::PathBuf)> {
+    let mut budget = crate::sessions::DiscoveryBudget::new();
+    scan_codex_dir_bounded(root, &mut budget)
+}
+
+fn scan_codex_dir_bounded(
+    root: &std::path::Path,
+    budget: &mut crate::sessions::DiscoveryBudget,
+) -> Vec<(Session, std::path::PathBuf)> {
     let mut files = Vec::new();
-    codex_rollouts(root, &mut files);
+    codex_rollouts_bounded(root, 0, budget, &mut files);
     // Newer Codex writes MANY rollout files per conversation — one per turn or
     // thread, each with its own `id` in the filename, all sharing the original
     // conversation's `session_id` (and `parent_thread_id`) in their headers. A
@@ -980,6 +1011,15 @@ impl SessionProvider for CodexSessions {
         codex_root().map(|r| scan_codex_dir(&r)).unwrap_or_default()
     }
 
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut crate::sessions::DiscoveryBudget,
+    ) -> Vec<(Session, std::path::PathBuf)> {
+        codex_root()
+            .map(|root| scan_codex_dir_bounded(&root, budget))
+            .unwrap_or_default()
+    }
+
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
         // The id lives in the filename, but only for a conversation's ROOT
         // rollout — the per-turn files that share its session_id carry their own
@@ -1205,6 +1245,12 @@ pub struct ChatSessions;
 impl SessionProvider for ChatSessions {
     fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
         crate::chat::scan_chats()
+    }
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut crate::sessions::DiscoveryBudget,
+    ) -> Vec<(Session, std::path::PathBuf)> {
+        crate::chat::scan_chats_bounded(budget)
     }
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
         crate::chat::chat_file_if_exists(session_id)
@@ -1434,12 +1480,13 @@ pub fn scan_all_with_paths() -> Vec<(Session, std::path::PathBuf)> {
 /// otherwise nothing to compose, and the interesting behaviour would go
 /// unexercised until the day a second one is added.
 fn scan_backends(list: &[Box<dyn AgentBackend>]) -> Vec<(Session, std::path::PathBuf)> {
+    let mut budget = crate::sessions::DiscoveryBudget::new();
     let mut all: Vec<(Session, std::path::PathBuf)> = list
         .iter()
         .flat_map(|b| {
             let id = b.id();
             b.sessions()
-                .scan_with_paths()
+                .scan_with_paths_bounded(&mut budget)
                 .into_iter()
                 .map(move |(mut s, path)| {
                     s.agent = id.to_string();
@@ -1874,6 +1921,37 @@ mod tests {
                 .any(|(id, _)| *id == session_id)
                 .then(|| std::path::PathBuf::from(format!("/fake/{session_id}")))
         }
+
+        fn scan_with_paths_bounded(
+            &self,
+            budget: &mut crate::sessions::DiscoveryBudget,
+        ) -> Vec<(Session, std::path::PathBuf)> {
+            let take = budget.remaining().min(self.rows.len());
+            let rows = self.rows[..take]
+                .iter()
+                .map(|(id, at)| {
+                    (
+                        Session {
+                            id: (*id).to_string(),
+                            agent: "WRONG".into(),
+                            title: (*id).to_string(),
+                            project_path: "/p".into(),
+                            group_path: "/p".into(),
+                            branch: None,
+                            forked: false,
+                            background: false,
+                            fork_parent: None,
+                            last_active: *at,
+                        },
+                        std::path::PathBuf::from(format!("/fake/{id}")),
+                    )
+                })
+                .collect();
+            for _ in 0..take {
+                let _ = budget.claim_file();
+            }
+            rows
+        }
     }
 
     struct FakeBackend {
@@ -1908,6 +1986,18 @@ mod tests {
 
     fn fake(id: &'static str, rows: Vec<(&'static str, u64)>) -> Box<dyn AgentBackend> {
         Box::new(FakeBackend { id, provider: FakeProvider { rows } })
+    }
+
+    #[test]
+    fn production_composition_applies_one_global_discovery_budget_across_providers() {
+        let list = vec![
+            fake("first", vec![("a", 1); 3_000]),
+            fake("second", vec![("b", 2); 3_000]),
+        ];
+        let rows = scan_backends(&list);
+        assert_eq!(rows.len(), crate::sessions::MAX_DISCOVERED_SESSION_FILES);
+        assert_eq!(rows.iter().filter(|(session, _)| session.agent == "first").count(), 3_000);
+        assert_eq!(rows.iter().filter(|(session, _)| session.agent == "second").count(), 1_096);
     }
 
     /// The whole point of the registry: two agents, one list.

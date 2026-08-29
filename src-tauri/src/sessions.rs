@@ -1,8 +1,63 @@
 use serde::Serialize;
 use std::fs::File;
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
+pub(crate) const MAX_DISCOVERED_SESSION_FILES: usize = 4096;
+pub(crate) const MAX_SESSION_DISCOVERY_DEPTH: usize = 16;
+
+pub struct DiscoveryBudget {
+    remaining: usize,
+    #[cfg(unix)]
+    visited: std::collections::HashSet<(u64, u64)>,
+}
+
+impl DiscoveryBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            remaining: MAX_DISCOVERED_SESSION_FILES,
+            #[cfg(unix)]
+            visited: Default::default(),
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    pub(crate) fn claim_file(&mut self) -> bool {
+        if self.remaining == 0 {
+            false
+        } else {
+            self.remaining -= 1;
+            true
+        }
+    }
+
+    pub(crate) fn enter_directory(&mut self, path: &Path, depth: usize) -> bool {
+        if depth > MAX_SESSION_DISCOVERY_DEPTH {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Ok(metadata) = std::fs::metadata(path) else { return false };
+            metadata.file_type().is_dir() && self.visited.insert((metadata.dev(), metadata.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_dir()
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct Session {
@@ -46,6 +101,19 @@ pub trait SessionProvider: Send + Sync {
     /// Sessions along with their transcript paths. The one method a backend
     /// must write; the rest are derived from it.
     fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)>;
+
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut DiscoveryBudget,
+    ) -> Vec<(Session, std::path::PathBuf)> {
+        let take = budget.remaining();
+        let rows = self.scan_with_paths();
+        let kept: Vec<_> = rows.into_iter().take(take).collect();
+        for _ in 0..kept.len() {
+            let _ = budget.claim_file();
+        }
+        kept
+    }
 
     /// The transcript for `session_id`, or `None` if this provider does not
     /// own that id. Returning `None` for another agent's session is what lets
@@ -94,6 +162,14 @@ impl SessionProvider for ClaudeProvider {
 
     /// Scan sessions along with their jsonl paths (needed by the indexer).
     fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
+        let mut budget = DiscoveryBudget::new();
+        self.scan_with_paths_bounded(&mut budget)
+    }
+
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut DiscoveryBudget,
+    ) -> Vec<(Session, std::path::PathBuf)> {
         let Some(home) = dirs::home_dir() else {
             return vec![];
         };
@@ -104,12 +180,19 @@ impl SessionProvider for ClaudeProvider {
 
         let mut sessions = Vec::new();
         for project in projects.flatten() {
+            let Ok(project_type) = project.file_type() else { continue };
+            if project_type.is_symlink() || !project_type.is_dir() {
+                continue;
+            }
             let Ok(files) = std::fs::read_dir(project.path()) else {
                 continue;
             };
             let paths: Vec<std::path::PathBuf> = files
                 .flatten()
-                .map(|f| f.path())
+                .filter_map(|f| {
+                    let file_type = f.file_type().ok()?;
+                    (!file_type.is_symlink() && file_type.is_file()).then(|| f.path())
+                })
                 .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
                 // Claude Code renames superseded transcripts to
                 // <id>.orphaned-<ts>-<hash>.jsonl — not resumable sessions.
@@ -117,6 +200,7 @@ impl SessionProvider for ClaudeProvider {
                     !p.file_name()
                         .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
                 })
+                .take_while(|_| budget.claim_file())
                 .collect();
             // Every real session in a project dir records the same cwd; find it
             // once so /fork stub files (title-only, no cwd) can borrow it.
@@ -125,6 +209,9 @@ impl SessionProvider for ClaudeProvider {
                 if let Some(s) = parse_session(&path, dir_cwd.as_deref()) {
                     sessions.push((s, path));
                 }
+            }
+            if budget.remaining() == 0 {
+                break;
             }
         }
         // Attach fork lineage from Claude Code's job state. This has to come
@@ -174,10 +261,14 @@ fn read_aiterm_fork_map() -> std::collections::HashMap<String, String> {
     let Some(path) = aiterm_fork_map_path() else {
         return Default::default();
     };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(parent) = path.parent() else { return Default::default() };
+    let Ok(directory) = VerifiedDirectory::open(parent) else { return Default::default() };
+    let Ok(mut file) = directory.open_file(path.file_name().unwrap_or_default()) else {
+        return Default::default();
+    };
+    let mut raw = String::new();
+    let _ = file.read_to_string(&mut raw);
+    serde_json::from_str(&raw).ok().unwrap_or_default()
 }
 
 /// Record a branch's parent. Best-effort: a fork whose lineage fails to save
@@ -192,7 +283,9 @@ fn record_aiterm_fork(branch: &str, parent: &str) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(text) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(path, text);
+        if let Some(dir) = path.parent().and_then(|dir| VerifiedDirectory::open(dir).ok()) {
+            let _ = dir.write_atomic(path.file_name().unwrap_or_default(), text.as_bytes());
+        }
     }
 }
 
@@ -659,9 +752,9 @@ fn deletable<'a>(
 /// `opencode.db` instead.
 #[tauri::command]
 pub async fn session_delete(session_id: String) -> Result<(), String> {
+    let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {
-        crate::services::sessions::SessionService::desktop()
-            .delete(&session_id)
+        sessions.delete(&session_id)
             .map_err(|error| error.message().to_owned())
     })
     .await
@@ -678,48 +771,44 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     let backends = crate::agents::backends();
     let (backend, path) = deletable(&backends, &session_id)?;
     let home = dirs::home_dir().ok_or("no home dir")?;
-    let trash = home.join(".claude/trash");
-    std::fs::create_dir_all(&trash).map_err(|e| e.to_string())?;
+    let verified = (backend.id() != "opencode")
+        .then(|| verified_session_file(backend.id(), &path, &home))
+        .transpose()?;
+    let home_dir = VerifiedDirectory::open(&home)?;
+    let claude_dir = home_dir.create_directory(OsStr::new(".claude"))?;
+    let trash_dir = claude_dir.create_directory(OsStr::new("trash"))?;
 
-    // Lazy purge of old trash entries.
+    // Lazy purge of old trash entries through the already-pinned directory.
+    // A pathname walk here would reopen a replaced ~/.claude/trash between
+    // verification and deletion.
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(TRASH_KEEP_DAYS * 86400);
-    if let Ok(entries) = std::fs::read_dir(&trash) {
-        for e in entries.flatten() {
-            let old = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .map(|m| m < cutoff)
-                .unwrap_or(false);
-            if old {
-                let p = e.path();
-                let _ = if p.is_dir() {
-                    std::fs::remove_dir_all(&p)
-                } else {
-                    std::fs::remove_file(&p)
-                };
-            }
-        }
-    }
+    let _ = trash_dir.purge_older_than(cutoff);
 
     // OpenCode first, because for it `path` is the whole database and must
     // never meet the rename below. Its delete dumps the session's rows to
     // `<id>.jsonl` in the trash — readable for the keep window like any other
     // trashed session — then removes exactly those rows.
     if backend.id() == "opencode" {
-        return crate::opencode::delete_to_trash(&session_id, &trash);
+        #[cfg(unix)]
+        return crate::opencode::delete_to_trash_at(&session_id, &trash_dir.file);
+        #[cfg(not(unix))]
+        return Err("verified OpenCode dump operations are unsupported on this platform".into());
     }
 
     // Same filesystem (~/.claude), so rename is atomic and cheap. Rename
     // keeps the old mtime, which the purge above reads as age — reset it so
     // the entry gets its full keep window.
-    let touch = |p: &std::path::Path| {
-        if let Ok(f) = File::open(p) {
+    let touch = |name: &OsStr| {
+        if let Ok(f) = trash_dir.open_file(name) {
             let _ = f.set_modified(std::time::SystemTime::now());
         }
     };
-    let dest = trash.join(format!("{session_id}.jsonl"));
-    std::fs::rename(&path, &dest).map_err(|e| e.to_string())?;
-    touch(&dest);
+    let dest_name = format!("{session_id}.jsonl");
+    verified
+        .as_ref()
+        .ok_or("session transcript was not verified")?
+        .rename_to(&trash_dir, OsStr::new(&dest_name))?;
+    touch(OsStr::new(&dest_name));
     // Where it came from, so restore can put it back rather than deduce a
     // destination. Deducing worked while every session was claude's and the
     // convention was known; a Codex rollout lives at
@@ -729,9 +818,12 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     //
     // Best-effort: a missing sidecar falls back to the old behaviour, which is
     // still right for everything trashed before this existed.
-    let origin = trash.join(format!("{session_id}.origin"));
-    if std::fs::write(&origin, path.to_string_lossy().as_bytes()).is_ok() {
-        touch(&origin);
+    let origin_name = format!("{session_id}.origin");
+    if trash_dir
+        .write_atomic(OsStr::new(&origin_name), path.to_string_lossy().as_bytes())
+        .is_ok()
+    {
+        touch(OsStr::new(&origin_name));
     }
     // A Codex conversation is spread across every rollout that shares its
     // session id, and the rename above only took the newest. Leaving the rest
@@ -740,14 +832,14 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     // whole set. Runs after the rename, so the file already moved is not in
     // the list this finds.
     if backend.id() == "codex" {
-        stash_codex_rollouts(&session_id, &trash);
+        stash_codex_rollouts_verified(&session_id, &trash_dir, &home);
     }
     let tasks = home.join(".claude/tasks").join(&session_id);
-    if tasks.is_dir() {
-        let tasks_dest = trash.join(format!("{session_id}.tasks"));
-        if std::fs::rename(&tasks, &tasks_dest).is_ok() {
-            touch(&tasks_dest);
-        }
+    if let Ok(tasks_entry) = verified_directory_entry(&home.join(".claude/tasks"), &tasks) {
+        let _ = tasks_entry.rename_directory_to(
+            &trash_dir,
+            OsStr::new(&format!("{session_id}.tasks")),
+        );
     }
     // Claude Code keeps a second, independent record of a session under
     // `~/.claude/jobs/<short>/`, and nothing there follows the transcript. Left
@@ -758,12 +850,381 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     // It goes to the trash like everything else rather than being removed, so
     // a restore puts it back and nothing here is one-way.
     if let Some(job) = find_job_dir(&home.join(".claude/jobs"), &session_id) {
-        let job_dest = trash.join(format!("{session_id}.job"));
-        if std::fs::rename(&job, &job_dest).is_ok() {
-            touch(&job_dest);
+        if let Ok(job_entry) = verified_directory_entry(&home.join(".claude/jobs"), &job) {
+            let _ = job_entry.rename_directory_to(
+                &trash_dir,
+                OsStr::new(&format!("{session_id}.job")),
+            );
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+struct VerifiedDirectory {
+    file: File,
+}
+
+#[cfg(unix)]
+impl VerifiedDirectory {
+    fn open(path: &Path) -> Result<Self, String> {
+        let root_fd = unsafe {
+            libc::open(
+                b"/\0".as_ptr().cast(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if root_fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut current = unsafe { File::from_raw_fd(root_fd) };
+        for component in path.components() {
+            use std::path::Component;
+            let name = match component {
+                Component::RootDir => continue,
+                Component::Normal(name) => name,
+                _ => return Err("session store path contains a non-normal component".into()),
+            };
+            let name = CString::new(name.as_bytes()).map_err(|_| "invalid path component")?;
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            current = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok(Self { file: current })
+    }
+
+    fn open_parent(&self, relative: &Path) -> Result<(File, std::ffi::OsString), String> {
+        let name = relative.file_name().ok_or("session transcript has no filename")?.to_os_string();
+        let mut current = self.file.try_clone().map_err(|e| e.to_string())?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        for component in parent.components() {
+            use std::path::Component;
+            let Component::Normal(part) = component else {
+                return Err("session path contains a non-normal component".into());
+            };
+            let part = CString::new(part.as_bytes()).map_err(|_| "invalid path component")?;
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    part.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            current = unsafe { File::from_raw_fd(fd) };
+        }
+        Ok((current, name))
+    }
+
+    fn open_file(&self, name: &OsStr) -> Result<File, String> {
+        let name = CString::new(name.as_bytes()).map_err(|_| "invalid filename")?;
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata().map_err(|e| e.to_string())?.file_type().is_file() {
+            return Err("file is not regular".into());
+        }
+        Ok(file)
+    }
+
+    fn write_atomic(&self, name: &OsStr, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let temporary = format!(".aiterm-write-{}", uuid::Uuid::new_v4());
+        let temporary_c = CString::new(temporary.as_bytes()).unwrap();
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                temporary_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            unsafe { libc::unlinkat(self.file.as_raw_fd(), temporary_c.as_ptr(), 0) };
+            return Err(error.to_string());
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| "invalid filename")?;
+        let result = unsafe {
+            libc::renameat(
+                self.file.as_raw_fd(),
+                temporary_c.as_ptr(),
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            unsafe { libc::unlinkat(self.file.as_raw_fd(), temporary_c.as_ptr(), 0) };
+            Err(std::io::Error::last_os_error().to_string())
+        }
+    }
+
+    fn create_directory(&self, name: &OsStr) -> Result<Self, String> {
+        let name = CString::new(name.as_bytes()).map_err(|_| "invalid directory name")?;
+        let created = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) };
+        if created != 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let fd = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error().to_string())
+        } else {
+            Ok(Self { file: unsafe { File::from_raw_fd(fd) } })
+        }
+    }
+
+    fn purge_older_than(&self, cutoff: std::time::SystemTime) -> Result<(), String> {
+        purge_directory_fd(&self.file, cutoff)
+    }
+}
+
+#[cfg(unix)]
+fn purge_directory_fd(directory: &File, cutoff: std::time::SystemTime) -> Result<(), String> {
+    let cloned = directory.try_clone().map_err(|e| e.to_string())?;
+    let raw = std::os::fd::IntoRawFd::into_raw_fd(cloned);
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        unsafe { libc::close(raw) };
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            continue;
+        }
+        let modified = if stat.st_mtime >= 0 {
+            UNIX_EPOCH.checked_add(std::time::Duration::from_secs(stat.st_mtime as u64))
+        } else {
+            None
+        };
+        if modified.is_none_or(|modified| modified >= cutoff) {
+            continue;
+        }
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child_fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if child_fd < 0 {
+                continue;
+            }
+            let child = unsafe { File::from_raw_fd(child_fd) };
+            let _ = purge_directory_fd(&child, std::time::SystemTime::now());
+            let _ = unsafe {
+                libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR)
+            };
+        } else {
+            let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    Ok(())
+}
+
+#[cfg(not(unix))]
+struct VerifiedDirectory;
+
+#[cfg(not(unix))]
+impl VerifiedDirectory {
+    fn open(_path: &Path) -> Result<Self, String> { Err(unsupported_verified_operations()) }
+    fn open_file(&self, _name: &OsStr) -> Result<File, String> { Err(unsupported_verified_operations()) }
+    fn write_atomic(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> { Err(unsupported_verified_operations()) }
+    fn create_directory(&self, _name: &OsStr) -> Result<Self, String> { Err(unsupported_verified_operations()) }
+    fn purge_older_than(&self, _cutoff: std::time::SystemTime) -> Result<(), String> { Err(unsupported_verified_operations()) }
+}
+
+#[cfg(unix)]
+struct VerifiedSessionFile {
+    parent: File,
+    name: std::ffi::OsString,
+}
+
+#[cfg(not(unix))]
+struct VerifiedSessionFile;
+
+#[cfg(not(unix))]
+impl VerifiedSessionFile {
+    fn open(&self) -> Result<File, String> { Err(unsupported_verified_operations()) }
+    fn rename_to(&self, _destination: &VerifiedDirectory, _name: &OsStr) -> Result<(), String> { Err(unsupported_verified_operations()) }
+    fn create_sibling(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> { Err(unsupported_verified_operations()) }
+    fn rename_directory_to(&self, _destination: &VerifiedDirectory, _name: &OsStr) -> Result<(), String> { Err(unsupported_verified_operations()) }
+}
+
+#[cfg(unix)]
+impl VerifiedSessionFile {
+    fn open(&self) -> Result<File, String> {
+        let name = CString::new(self.name.as_bytes()).map_err(|_| "invalid transcript name")?;
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file.metadata().map_err(|e| e.to_string())?.file_type().is_file() {
+            return Err("session transcript is not a regular file".into());
+        }
+        Ok(file)
+    }
+
+    fn rename_to(&self, destination: &VerifiedDirectory, name: &OsStr) -> Result<(), String> {
+        let _open = self.open()?;
+        let source = CString::new(self.name.as_bytes()).map_err(|_| "invalid transcript name")?;
+        let destination_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash name")?;
+        let result = unsafe {
+            libc::renameat(
+                self.parent.as_raw_fd(),
+                source.as_ptr(),
+                destination.file.as_raw_fd(),
+                destination_name.as_ptr(),
+            )
+        };
+        if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error().to_string()) }
+    }
+
+    fn create_sibling(&self, name: &OsStr, bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        let name = CString::new(name.as_bytes()).map_err(|_| "invalid transcript name")?;
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(bytes).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())
+    }
+
+    fn rename_directory_to(&self, destination: &VerifiedDirectory, name: &OsStr) -> Result<(), String> {
+        let source = CString::new(self.name.as_bytes()).map_err(|_| "invalid directory name")?;
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                source.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let _verified = unsafe { File::from_raw_fd(fd) };
+        let destination_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash name")?;
+        let result = unsafe {
+            libc::renameat(
+                self.parent.as_raw_fd(),
+                source.as_ptr(),
+                destination.file.as_raw_fd(),
+                destination_name.as_ptr(),
+            )
+        };
+        if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error().to_string()) }
+    }
+}
+
+#[cfg(unix)]
+fn verified_directory_entry(root: &Path, path: &Path) -> Result<VerifiedSessionFile, String> {
+    let relative = path.strip_prefix(root).map_err(|_| "directory escapes its store")?;
+    let root = VerifiedDirectory::open(root)?;
+    let (parent, name) = root.open_parent(relative)?;
+    Ok(VerifiedSessionFile { parent, name })
+}
+
+#[cfg(unix)]
+fn verified_session_file(
+    backend_id: &str,
+    path: &Path,
+    home: &Path,
+) -> Result<VerifiedSessionFile, String> {
+    let root = match backend_id {
+        "claude" => home.join(".claude/projects"),
+        "codex" => home.join(".codex/sessions"),
+        "grok" => home.join(".grok/sessions"),
+        "api" => dirs::data_dir().ok_or("no data dir")?.join("aiterm/chats"),
+        _ => return Err("session store is not approved for file mutation".into()),
+    };
+    let relative = path.strip_prefix(&root).map_err(|_| "session transcript escapes its store")?;
+    let root = VerifiedDirectory::open(&root)?;
+    let (parent, name) = root.open_parent(relative)?;
+    let verified = VerifiedSessionFile { parent, name };
+    let _ = verified.open()?;
+    Ok(verified)
+}
+
+#[cfg(not(unix))]
+fn verified_directory_entry(_root: &Path, _path: &Path) -> Result<VerifiedSessionFile, String> {
+    Err(unsupported_verified_operations())
+}
+
+#[cfg(not(unix))]
+fn verified_session_file(
+    _backend_id: &str,
+    _path: &Path,
+    _home: &Path,
+) -> Result<VerifiedSessionFile, String> {
+    Err(unsupported_verified_operations())
+}
+
+#[cfg(not(unix))]
+fn unsupported_verified_operations() -> String {
+    "verified session filesystem operations are unsupported on this platform".into()
 }
 
 /// The job directory belonging to exactly this session, found by reading each
@@ -774,7 +1235,16 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
 /// the `sessionId` inside is the only claim we can actually stand behind.
 fn find_job_dir(jobs_root: &Path, session_id: &str) -> Option<std::path::PathBuf> {
     for job in std::fs::read_dir(jobs_root).ok()?.flatten() {
-        let Ok(raw) = std::fs::read_to_string(job.path().join("state.json")) else {
+        let Ok(file_type) = job.file_type() else { continue };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let state = job.path().join("state.json");
+        let Ok(metadata) = std::fs::symlink_metadata(&state) else { continue };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(state) else {
             continue;
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -996,6 +1466,7 @@ fn is_claude_transcript(path: &Path, home: &Path) -> bool {
 ///
 /// Best-effort throughout: a rollout that will not move is left where it is
 /// rather than failing a delete that has already happened.
+#[cfg(test)]
 fn stash_codex_rollouts(session_id: &str, trash: &Path) {
     let extras = crate::agents::codex_session_files(session_id);
     if extras.is_empty() {
@@ -1017,6 +1488,28 @@ fn stash_codex_rollouts(session_id: &str, trash: &Path) {
     let _ = std::fs::write(
         dir.join("origins.json"),
         serde_json::Value::Object(origins).to_string(),
+    );
+}
+
+fn stash_codex_rollouts_verified(session_id: &str, trash: &VerifiedDirectory, home: &Path) {
+    let extras = crate::agents::codex_session_files(session_id);
+    let directory_name = format!("{session_id}.rollouts");
+    let Ok(directory) = trash.create_directory(OsStr::new(&directory_name)) else { return };
+    let mut origins = serde_json::Map::new();
+    for from in extras {
+        let Some(name) = from.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if verified_session_file("codex", &from, home)
+            .and_then(|source| source.rename_to(&directory, OsStr::new(&name)))
+            .is_ok()
+        {
+            origins.insert(name, serde_json::Value::String(from.to_string_lossy().into_owned()));
+        }
+    }
+    let _ = directory.write_atomic(
+        OsStr::new("origins.json"),
+        serde_json::Value::Object(origins).to_string().as_bytes(),
     );
 }
 
@@ -1198,10 +1691,9 @@ pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
 
 #[tauri::command]
 pub async fn session_preview(session_id: String) -> Vec<PreviewMsg> {
+    let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {
-        crate::services::sessions::SessionService::desktop()
-            .preview(&session_id)
-            .unwrap_or_default()
+        sessions.preview(&session_id).unwrap_or_default()
     })
     .await
 }
@@ -1224,23 +1716,23 @@ fn session_preview_sync(session_id: String) -> Vec<PreviewMsg> {
     if let Some(msgs) = backend.sessions().messages(&session_id) {
         return preview_from_messages(msgs);
     }
-    preview_file(&path)
+    let Some(home) = dirs::home_dir() else { return vec![] };
+    let Ok(verified) = verified_session_file(backend.id(), &path, &home) else { return vec![] };
+    let Ok(file) = verified.open() else { return vec![] };
+    preview_reader(BufReader::new(file))
 }
 
 pub(crate) fn session_preview_service(session_id: &str) -> Vec<PreviewMsg> {
     session_preview_sync(session_id.to_owned())
 }
 
-pub(crate) fn preview_file_service(path: &Path) -> Vec<PreviewMsg> {
-    preview_file(path)
+pub(crate) fn preview_open_file_service(file: File) -> Vec<PreviewMsg> {
+    preview_reader(BufReader::new(file))
 }
 
-fn preview_file(path: &Path) -> Vec<PreviewMsg> {
-    let Ok(file) = File::open(path) else {
-        return vec![];
-    };
+fn preview_reader(reader: impl BufRead) -> Vec<PreviewMsg> {
     let mut out: std::collections::VecDeque<PreviewMsg> = std::collections::VecDeque::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    for line in reader.lines().map_while(Result::ok) {
         // Cheap substring filter before JSON parsing.
         if !line_may_hold_message(&line) {
             continue;
@@ -1673,8 +2165,15 @@ fn claude_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     let exact = format!("{session_id}.jsonl");
     if let Ok(projects) = std::fs::read_dir(&root) {
         for project in projects.flatten() {
+            let Ok(project_type) = project.file_type() else { continue };
+            if project_type.is_symlink() || !project_type.is_dir() {
+                continue;
+            }
             let p = project.path().join(&exact);
-            if p.exists() {
+            if std::fs::symlink_metadata(&p)
+                .ok()
+                .is_some_and(|metadata| metadata.file_type().is_file())
+            {
                 return Some(p);
             }
         }
@@ -1682,10 +2181,18 @@ fn claude_session_file(session_id: &str) -> Option<std::path::PathBuf> {
     let orphaned_prefix = format!("{session_id}.orphaned-");
     let mut best: Option<(std::path::PathBuf, u64)> = None;
     for project in std::fs::read_dir(&root).ok()?.flatten() {
+        let Ok(project_type) = project.file_type() else { continue };
+        if project_type.is_symlink() || !project_type.is_dir() {
+            continue;
+        }
         let Ok(files) = std::fs::read_dir(project.path()) else {
             continue;
         };
         for f in files.flatten() {
+            let Ok(file_type) = f.file_type() else { continue };
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
             let p = f.path();
             let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
@@ -2393,9 +2900,9 @@ fn roster_from_cli() -> Vec<RosterEntry> {
 /// seconds. Run inline it would freeze the window for that whole time.
 #[tauri::command]
 pub async fn stop_session(session_id: String) -> Result<(), String> {
+    let sessions = crate::services::ApplicationServices::desktop().sessions;
     tauri::async_runtime::spawn_blocking(move || {
-        crate::services::sessions::SessionService::desktop()
-            .stop(&session_id)
+        sessions.stop(&session_id)
             .map_err(|error| error.message().to_owned())
     })
     .await
@@ -3076,9 +3583,9 @@ fn rewrite_session_ids(text: &str, old: &str, new: &str) -> (String, usize) {
 /// unresumable.)
 #[tauri::command]
 pub async fn session_fork(session_id: String) -> Result<String, String> {
+    let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {
-        crate::services::sessions::SessionService::desktop()
-            .fork(&session_id)
+        sessions.fork(&session_id)
             .map_err(|error| error.message().to_owned())
     })
     .await
@@ -3101,7 +3608,16 @@ fn session_fork_sync(session_id: String) -> Result<String, String> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or_else(|| "unreadable transcript name".to_string())?;
-    let text = std::fs::read_to_string(&src).map_err(|e| format!("couldn't read transcript: {e}"))?;
+    let list = crate::agents::backends();
+    let backend = crate::agents::owner_in(&list, &session_id)
+        .map(|(backend, _)| backend)
+        .ok_or_else(|| "that session has no transcript left to fork".to_string())?;
+    let home = dirs::home_dir().ok_or("no home dir")?;
+    let verified = verified_session_file(backend.id(), &src, &home)
+        .map_err(|e| format!("couldn't verify transcript: {e}"))?;
+    let mut file = verified.open().map_err(|e| format!("couldn't read transcript: {e}"))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|e| format!("couldn't read transcript: {e}"))?;
     let new_id = uuid_v4()?;
     let (out, replaced) = rewrite_session_ids(&text, &old_id, &new_id);
     // Zero replacements means the format moved out from under us (spacing, a
@@ -3110,11 +3626,9 @@ fn session_fork_sync(session_id: String) -> Result<String, String> {
     if replaced == 0 {
         return Err("transcript has no session id fields to rewrite — not forking".into());
     }
-    let dst = src.with_file_name(format!("{new_id}.jsonl"));
-    std::fs::write(&dst, out).map_err(|e| format!("couldn't write the branch: {e}"))?;
-    // Transcripts are private (0600); a fork must not be looser than its parent.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600));
+    verified
+        .create_sibling(OsStr::new(&format!("{new_id}.jsonl")), out.as_bytes())
+        .map_err(|e| format!("couldn't write the branch: {e}"))?;
     // Record the lineage rather than leaving the scanner to infer it. A clean
     // copy has an intact `parentUuid` chain, so the in-file heuristic reads it
     // as an ordinary session and the ⑂ badge never appears — the branch looks
@@ -3237,6 +3751,64 @@ fn materialize_fork_sync(session_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn production_file_operation_is_fd_relative_across_store_root_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-session-root-replacement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let projects = home.join(".claude/projects");
+        let project = projects.join("project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "12121212-1212-4212-8212-121212121212";
+        let discovered = project.join(format!("{id}.jsonl"));
+        std::fs::write(&discovered, b"original").unwrap();
+        let verified = verified_session_file("claude", &discovered, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let stale_inside = trash_path.join("stale-inside");
+        std::fs::write(&stale_inside, b"inside").unwrap();
+        File::open(&stale_inside)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
+        let pinned_trash = home.join(".claude/trash-pinned");
+        std::fs::rename(&trash_path, &pinned_trash).unwrap();
+        let outside_trash = root.join("outside-trash");
+        std::fs::create_dir_all(&outside_trash).unwrap();
+        let stale_outside = outside_trash.join("stale-outside");
+        std::fs::write(&stale_outside, b"outside trash sentinel").unwrap();
+        File::open(&stale_outside)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
+        symlink(&outside_trash, &trash_path).unwrap();
+        trash.purge_older_than(std::time::SystemTime::now()).unwrap();
+        assert!(!pinned_trash.join("stale-inside").exists());
+        assert_eq!(std::fs::read(&stale_outside).unwrap(), b"outside trash sentinel");
+
+        let pinned = home.join(".claude/projects-pinned");
+        std::fs::rename(&projects, &pinned).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("project")).unwrap();
+        let outside_file = outside.join("project").join(format!("{id}.jsonl"));
+        std::fs::write(&outside_file, b"outside sentinel").unwrap();
+        symlink(&outside, &projects).unwrap();
+
+        assert!(verified_session_file("claude", &discovered, &home).is_err());
+        verified.rename_to(&trash, OsStr::new(&format!("{id}.jsonl"))).unwrap();
+        assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside sentinel");
+        assert!(!pinned.join("project").join(format!("{id}.jsonl")).exists());
+        assert_eq!(std::fs::read(pinned_trash.join(format!("{id}.jsonl"))).unwrap(), b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn msg(line: &str) -> Option<(String, String)> {
         assert!(
@@ -3959,12 +4531,8 @@ mod tests {
 
 #[tauri::command]
 pub async fn list_sessions() -> Vec<Session> {
-    crate::run_blocking(|| {
-        crate::services::sessions::SessionService::desktop()
-            .list()
-            .unwrap_or_default()
-    })
-    .await
+    let sessions = crate::services::ApplicationServices::desktop().sessions;
+    crate::run_blocking(move || sessions.list().unwrap_or_default()).await
 }
 
 #[cfg(test)]

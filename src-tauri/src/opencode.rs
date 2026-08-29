@@ -43,6 +43,12 @@
 //! cannot leave the string literal it is written into; anything else never
 //! reaches the database at all.
 
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -110,6 +116,14 @@ const SESSIONS_SQL: &str = "select id, title, directory, time_updated, parent_id
 /// Sidebar rows for every top-level OpenCode session, newest first.
 pub fn sessions() -> Vec<Session> {
     query(SESSIONS_SQL).map(|json| parse_sessions(&json)).unwrap_or_default()
+}
+
+fn sessions_bounded(limit: usize) -> Vec<Session> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let sql = format!("{SESSIONS_SQL} limit {limit}");
+    query(&sql).map(|json| parse_sessions(&json)).unwrap_or_default()
 }
 
 /// sqlite3's JSON for [`SESSIONS_SQL`] → session rows.
@@ -392,6 +406,30 @@ pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), 
     if !valid_id(session_id) {
         return Err("invalid session id".into());
     }
+    #[cfg(unix)]
+    {
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(trash)
+            .map_err(|e| e.to_string())?;
+        delete_to_trash_at(session_id, &directory)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (session_id, trash);
+        Err("verified OpenCode dump operations are unsupported on this platform".into())
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn delete_to_trash_at(
+    session_id: &str,
+    trash: &std::fs::File,
+) -> Result<(), String> {
+    if !valid_id(session_id) {
+        return Err("invalid session id".into());
+    }
     let tree = tree_sql(session_id);
     let sessions = rows(&format!("select * from session where id in ({tree})"))?;
     if sessions.is_empty() {
@@ -428,10 +466,22 @@ pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), 
         "parts": parts.len(),
     });
 
-    let dest = trash.join(format!("{session_id}.jsonl"));
+    let dest_name = format!("{session_id}.jsonl");
+    let dest = CString::new(dest_name.as_bytes()).map_err(|_| "invalid session dump name")?;
     let write = || -> std::io::Result<()> {
         use std::io::Write;
-        let mut out = std::io::BufWriter::new(std::fs::File::create(&dest)?);
+        let fd = unsafe {
+            libc::openat(
+                trash.as_raw_fd(),
+                dest.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut out = std::io::BufWriter::new(unsafe { std::fs::File::from_raw_fd(fd) });
         writeln!(out, "{header}")?;
         for (table, rows) in
             [("session", &sessions), ("message", &messages), ("part", &parts)]
@@ -443,7 +493,7 @@ pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), 
         out.into_inner()?.sync_all()
     };
     if let Err(e) = write() {
-        let _ = std::fs::remove_file(&dest);
+        unsafe { libc::unlinkat(trash.as_raw_fd(), dest.as_ptr(), 0) };
         return Err(format!("could not write the trash dump: {e}"));
     }
 
@@ -458,7 +508,7 @@ pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), 
          commit;"
     );
     if let Err(e) = execute(&sql) {
-        let _ = std::fs::remove_file(&dest);
+        unsafe { libc::unlinkat(trash.as_raw_fd(), dest.as_ptr(), 0) };
         return Err(e);
     }
     Ok(())
@@ -498,6 +548,20 @@ impl SessionProvider for OpencodeSessions {
             return vec![];
         };
         sessions().into_iter().map(|s| (s, db.clone())).collect()
+    }
+
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut crate::sessions::DiscoveryBudget,
+    ) -> Vec<(Session, PathBuf)> {
+        let Some(db) = db_path() else {
+            return vec![];
+        };
+        let rows = sessions_bounded(budget.remaining());
+        rows.into_iter()
+            .take_while(|_| budget.claim_file())
+            .map(|session| (session, db.clone()))
+            .collect()
     }
 
     fn find_session_file(&self, session_id: &str) -> Option<PathBuf> {
@@ -859,4 +923,3 @@ mod tests {
         assert_eq!(dump_meta(std::path::Path::new("/nonexistent.jsonl")), None);
     }
 }
-

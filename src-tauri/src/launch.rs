@@ -73,14 +73,7 @@ pub struct LaunchPlan {
 /// commands; this thin wrapper is where the machine's stored choice enters, so
 /// it is deliberately the untested half, exactly like it was before.
 pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
-    let list = crate::agents::backends();
-    let plan = resolve_in(&list, &crate::providers::load_providers(), request)?;
-    let flags = list
-        .iter()
-        .find(|b| b.id() == plan.agent_id)
-        .map(|b| crate::permissions::flags_for(&**b))
-        .unwrap_or_default();
-    Some(with_permission(plan, &flags))
+    resolve_result(request).ok()
 }
 
 /// Resolve a desktop launch with the same detailed error the existing Tauri
@@ -89,7 +82,24 @@ pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
 pub fn resolve_result(request: LaunchRequest) -> Result<LaunchPlan, String> {
     let list = crate::agents::backends();
     let providers = crate::providers::load_providers();
-    resolve_in(&list, &providers, request.clone()).ok_or_else(|| explain(&list, &request))
+    resolve_result_with(&list, &providers, request, |backend| {
+        crate::permissions::flags_for(backend)
+    })
+}
+
+fn resolve_result_with(
+    list: &[Box<dyn AgentBackend>],
+    providers: &[Provider],
+    request: LaunchRequest,
+    permission_flags: impl Fn(&dyn AgentBackend) -> String,
+) -> Result<LaunchPlan, String> {
+    let plan = resolve_in(list, providers, request.clone()).ok_or_else(|| explain(list, &request))?;
+    let flags = list
+        .iter()
+        .find(|backend| backend.id() == plan.agent_id)
+        .map(|backend| permission_flags(&**backend))
+        .unwrap_or_default();
+    Ok(with_permission(plan, &flags))
 }
 
 /// Append an engine's permission flags to a resolved command. The single point
@@ -288,9 +298,9 @@ fn explain(list: &[Box<dyn AgentBackend>], request: &LaunchRequest) -> String {
 /// would do all of that on the GTK main loop.
 #[tauri::command]
 pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String> {
+    let agents = crate::services::ApplicationServices::desktop().agents;
     crate::run_blocking(move || {
-        crate::services::agents::AgentService::desktop()
-            .resolve(request)
+        agents.resolve(request)
             .map_err(|error| error.message().to_owned())
     })
     .await
@@ -321,6 +331,21 @@ mod tests {
         // not disturb it.
         assert!(stamped.command.contains("--resume 'abc'"));
         assert_eq!(with_permission(plan.clone(), "").command, plan.command);
+    }
+
+    #[test]
+    fn detailed_resolver_applies_the_same_permission_stamp() {
+        let list = vec![claude_like(vec!["abc"])];
+        let plan = resolve_result_with(
+            &list,
+            &[],
+            LaunchRequest::Resume {
+                session_id: "abc".into(),
+            },
+            |_| "--permission-mode plan".into(),
+        )
+        .unwrap();
+        assert_eq!(plan.command, "claude --resume abc --permission-mode plan");
     }
 
     /* ---- fakes, in the shape agents.rs already uses ---------------------- */

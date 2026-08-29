@@ -45,12 +45,14 @@ pub fn run() {
     trace::init();
     let pty = pty::PtyManager::default();
     let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
+    let application_services = services::ApplicationServices::default();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty)
         .manage(tabs.clone())
+        .manage(application_services)
         .manage(watcher::WatchState::default())
         // Off until the user turns it on, and it opens nothing on disk until
         // then: a desktop that never pairs a phone never grows a

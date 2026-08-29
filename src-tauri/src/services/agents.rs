@@ -80,6 +80,52 @@ impl AgentService {
     }
 
     pub fn resolve(&self, request: LaunchRequest) -> Result<LaunchPlan, AgentServiceError> {
+        if let LaunchRequest::Agent {
+            agent_id,
+            model,
+            effort,
+        } = &request
+        {
+            let choices = self.operations.list();
+            let choice = choices
+                .iter()
+                .find(|choice| choice.id == *agent_id)
+                .ok_or_else(|| {
+                    AgentServiceError::new(
+                        "agent.unavailable",
+                        "the requested agent is not offered and available",
+                    )
+                })?;
+            let selected_model = match model {
+                Some(model_id) => Some(
+                    choice
+                        .models
+                        .iter()
+                        .find(|candidate| candidate.id == *model_id)
+                        .ok_or_else(|| {
+                            AgentServiceError::new(
+                                "agent.invalid_selection",
+                                "the requested model is not offered for this agent",
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            if let Some(effort) = effort {
+                let model = selected_model.ok_or_else(|| {
+                    AgentServiceError::new(
+                        "agent.invalid_selection",
+                        "an effort requires an explicitly offered model",
+                    )
+                })?;
+                if !model.efforts.iter().any(|candidate| candidate == effort) {
+                    return Err(AgentServiceError::new(
+                        "agent.invalid_selection",
+                        "the requested effort is not offered for this model",
+                    ));
+                }
+            }
+        }
         self.operations.resolve(request)
     }
 }
