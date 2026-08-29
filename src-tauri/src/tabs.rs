@@ -467,6 +467,7 @@ struct EventMailbox {
     state: Mutex<MailboxState>,
     changed: Condvar,
     async_changed: Notify,
+    finalized_changed: Notify,
 }
 
 impl EventMailbox {
@@ -477,6 +478,7 @@ impl EventMailbox {
             state: Mutex::new(MailboxState::default()),
             changed: Condvar::new(),
             async_changed: Notify::new(),
+            finalized_changed: Notify::new(),
         }
     }
 
@@ -521,6 +523,7 @@ impl EventMailbox {
         state.producer_closed = true;
         self.changed.notify_all();
         self.async_changed.notify_one();
+        self.finalized_changed.notify_waiters();
     }
 
     fn push_diff(&self, diff: ScreenDiff, recovery: impl FnOnce() -> ScreenSnapshot) {
@@ -633,6 +636,23 @@ impl EventMailbox {
         state.controls.clear();
         self.changed.notify_all();
         self.async_changed.notify_one();
+        self.finalized_changed.notify_waiters();
+    }
+
+    async fn wait_finalized(&self) -> bool {
+        loop {
+            let notified = self.finalized_changed.notified();
+            {
+                let state = self.state.lock().unwrap();
+                if state.producer_closed {
+                    return true;
+                }
+                if state.receiver_closed {
+                    return false;
+                }
+            }
+            notified.await;
+        }
     }
 
     fn recv(&self) -> Result<TabEvent, RecvError> {
@@ -867,6 +887,17 @@ pub struct TabEventReceiver {
     cancellation: TabAttachmentCancellation,
 }
 
+#[derive(Clone)]
+pub struct TabFinalizationSignal {
+    mailbox: Arc<EventMailbox>,
+}
+
+impl TabFinalizationSignal {
+    pub async fn wait(&self) -> bool {
+        self.mailbox.wait_finalized().await
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabReceiveError {
     Cancelled,
@@ -886,6 +917,11 @@ impl fmt::Debug for TabEventReceiver {
 }
 
 impl TabEventReceiver {
+    pub fn finalization_signal(&self) -> TabFinalizationSignal {
+        TabFinalizationSignal {
+            mailbox: self.mailbox.clone(),
+        }
+    }
     pub fn recv(&self) -> Result<TabEvent, RecvError> {
         self.mailbox.recv()
     }

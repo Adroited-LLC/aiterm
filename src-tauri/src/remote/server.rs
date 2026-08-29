@@ -11,7 +11,7 @@ use crate::tabs::{
     AttachmentId, RecoveryBoundary, TabAttachmentCancellation, TabDescriptor, TabId, TabLaunch,
     TabRegistry, TabState,
 };
-use crate::terminal::model::Revision;
+use crate::terminal::model::{Revision, ScreenDiff, ScreenSnapshot};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::routing::get;
@@ -24,11 +24,11 @@ use rcgen::PublicKeyData;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -46,6 +46,7 @@ const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_COMMAND_BYTES: usize = 32 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const ATTACHMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const ATTACHMENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const ATTACHMENT_REAP_INTERVAL: Duration = Duration::from_millis(100);
 const EGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const EGRESS_CONTROL_QUEUE: usize = 64;
@@ -54,6 +55,7 @@ const EGRESS_CONTROL_BURST: usize = 16;
 const REMOTE_BLOCKING_OPERATIONS: usize = 32;
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const INBOUND_QUEUE: usize = 16;
+const CLOSED_ATTACHMENT_CACHE: usize = 16;
 
 #[derive(Clone)]
 pub struct TlsIdentity {
@@ -437,6 +439,7 @@ struct ConnectionAttachment {
     commands: tokio::sync::mpsc::Sender<AttachmentCommand>,
     task: tokio::task::JoinHandle<()>,
     transfers: AttachmentTransferState,
+    lifecycle: AttachmentLifecycle,
 }
 
 struct StartedAttachment {
@@ -446,22 +449,102 @@ struct StartedAttachment {
     cancellation: TabAttachmentCancellation,
     revision: Revision,
     transfers: AttachmentTransferState,
+    lifecycle: AttachmentLifecycle,
+}
+
+const ATTACHMENT_ACTIVE: u8 = 0;
+const ATTACHMENT_FINALIZING: u8 = 1;
+const ATTACHMENT_FINALIZED: u8 = 2;
+
+#[derive(Clone)]
+struct AttachmentLifecycle(Arc<AtomicU8>);
+
+impl AttachmentLifecycle {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(ATTACHMENT_ACTIVE)))
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire) == ATTACHMENT_ACTIVE
+    }
+
+    fn begin_finalizing(&self) {
+        let _ = self.0.compare_exchange(
+            ATTACHMENT_ACTIVE,
+            ATTACHMENT_FINALIZING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn finish(&self) {
+        self.0.store(ATTACHMENT_FINALIZED, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
-struct TransferToken(Arc<AtomicBool>);
+struct OwnedAttachment {
+    tab_id: TabId,
+    lifecycle: AttachmentLifecycle,
+}
+
+#[derive(Default)]
+struct ClosedAttachments {
+    order: VecDeque<AttachmentId>,
+    entries: HashMap<AttachmentId, OwnedAttachment>,
+}
+
+impl ClosedAttachments {
+    fn insert(&mut self, id: AttachmentId, tab_id: TabId, lifecycle: AttachmentLifecycle) {
+        lifecycle.finish();
+        if !self.entries.contains_key(&id) {
+            self.order.push_back(id.clone());
+        }
+        self.entries
+            .insert(id, OwnedAttachment { tab_id, lifecycle });
+        while self.entries.len() > CLOSED_ATTACHMENT_CACHE {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+}
+
+const TRANSFER_ACTIVE: u8 = 0;
+const TRANSFER_CANCELLED: u8 = 1;
+const TRANSFER_ATTACHMENT_CLOSED: u8 = 2;
+
+#[derive(Clone)]
+struct TransferToken(Arc<AtomicU8>);
 
 impl TransferToken {
     fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(AtomicU8::new(TRANSFER_ACTIVE)))
     }
 
     fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        let _ = self.0.compare_exchange(
+            TRANSFER_ACTIVE,
+            TRANSFER_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn close_attachment(&self) {
+        self.0.store(TRANSFER_ATTACHMENT_CLOSED, Ordering::Release);
     }
 
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::Acquire) != TRANSFER_ACTIVE
+    }
+
+    fn error_code(&self) -> &'static str {
+        if self.0.load(Ordering::Acquire) == TRANSFER_ATTACHMENT_CLOSED {
+            "terminal.attachment_closed"
+        } else {
+            "terminal.transfer_cancelled"
+        }
     }
 }
 
@@ -484,8 +567,19 @@ impl AttachmentTransferState {
         current.clone()
     }
 
+    fn replace_for_close(&self) -> TransferToken {
+        let mut current = self.0.lock().unwrap();
+        current.close_attachment();
+        *current = TransferToken::new();
+        current.clone()
+    }
+
     fn cancel(&self) {
         self.0.lock().unwrap().cancel();
+    }
+
+    fn close_attachment(&self) {
+        self.0.lock().unwrap().close_attachment();
     }
 }
 
@@ -547,6 +641,7 @@ enum SequencedAction {
         requested_revision: Revision,
     },
     Detach {
+        request_id: u64,
         attachment_id: AttachmentId,
     },
 }
@@ -787,12 +882,12 @@ fn remote_focus(
 
 fn remote_descriptor(
     descriptor: TabDescriptor,
-    attachments: &HashMap<AttachmentId, TabId>,
+    attachments: &HashMap<AttachmentId, OwnedAttachment>,
 ) -> RemoteTabDescriptor {
     let own_attachment = descriptor.input_owner().filter(|owner| {
-        attachments
-            .get(*owner)
-            .is_some_and(|tab_id| tab_id == descriptor.id())
+        attachments.get(*owner).is_some_and(|attachment| {
+            attachment.lifecycle.is_active() && &attachment.tab_id == descriptor.id()
+        })
     });
     RemoteTabDescriptor {
         id: descriptor.id().clone(),
@@ -868,7 +963,7 @@ impl RemoteServices {
     fn dispatch(
         &self,
         request: &RemoteRequest,
-        attachments: &HashMap<AttachmentId, TabId>,
+        attachments: &HashMap<AttachmentId, OwnedAttachment>,
     ) -> DispatchOutcome {
         let result = self.dispatch_authorized(request, attachments);
         match result {
@@ -884,7 +979,7 @@ impl RemoteServices {
     fn dispatch_authorized(
         &self,
         request: &RemoteRequest,
-        attachments: &HashMap<AttachmentId, TabId>,
+        attachments: &HashMap<AttachmentId, OwnedAttachment>,
     ) -> Result<DispatchOutcome, &'static str> {
         let request_id = request.request_id();
         match request.kind() {
@@ -972,6 +1067,7 @@ impl RemoteServices {
                         revision,
                         events,
                         transfers: AttachmentTransferState::new(),
+                        lifecycle: AttachmentLifecycle::new(),
                     }),
                     sequenced: None,
                 })
@@ -982,9 +1078,11 @@ impl RemoteServices {
                 if request.data.len() > MAX_TERMINAL_INPUT_BYTES {
                     return Err("terminal.input_too_large");
                 }
-                self.terminal
-                    .input(&request.tab_id, &request.attachment_id, &request.data)
-                    .map_err(|error| error.code())?;
+                let result =
+                    self.terminal
+                        .input(&request.tab_id, &request.attachment_id, &request.data);
+                authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
+                result.map_err(|error| error.code())?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "terminal.input",
@@ -1002,6 +1100,7 @@ impl RemoteServices {
                     self.terminal
                         .resize(&body.tab_id, &body.attachment_id, body.size)
                 };
+                authorize_attachment(attachments, &body.tab_id, &body.attachment_id)?;
                 result.map_err(|error| error.code())?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
@@ -1022,6 +1121,7 @@ impl RemoteServices {
                     started: None,
                     tab_id: None,
                     sequenced: Some(SequencedAction::Detach {
+                        request_id,
                         attachment_id: request.attachment_id,
                     }),
                 })
@@ -1035,10 +1135,11 @@ impl RemoteServices {
                 {
                     return Err("terminal.invalid_scrollback_page");
                 }
-                let page = self
-                    .registry
-                    .scrollback_page(&request.tab_id, request.offset, request.count)
-                    .map_err(|error| error.code())?;
+                let page =
+                    self.registry
+                        .scrollback_page(&request.tab_id, request.offset, request.count);
+                authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
+                let page = page.map_err(|error| error.code())?;
                 let transfer = plan_scrollback_for_attachment(
                     request_id,
                     &request.tab_id,
@@ -1047,6 +1148,7 @@ impl RemoteServices {
                     page.into_rows(),
                 )
                 .map_err(|error| error.code())?;
+                authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
                 let mut outcome = DispatchOutcome::frames(Vec::new());
                 outcome.transfers.push(transfer);
                 Ok(outcome)
@@ -1069,17 +1171,15 @@ impl RemoteServices {
 }
 
 fn authorize_attachment(
-    attachments: &HashMap<AttachmentId, TabId>,
+    attachments: &HashMap<AttachmentId, OwnedAttachment>,
     tab_id: &TabId,
     attachment_id: &AttachmentId,
 ) -> Result<(), &'static str> {
-    if attachments
-        .get(attachment_id)
-        .is_some_and(|attachment_tab| attachment_tab == tab_id)
-    {
-        Ok(())
-    } else {
-        Err("terminal.attachment_not_found")
+    match attachments.get(attachment_id) {
+        Some(attachment) if &attachment.tab_id != tab_id => Err("terminal.attachment_not_found"),
+        Some(attachment) if !attachment.lifecycle.is_active() => Err("terminal.attachment_closed"),
+        Some(_) => Ok(()),
+        None => Err("terminal.attachment_not_found"),
     }
 }
 
@@ -1184,20 +1284,24 @@ fn cancel_attachment_transfers(
     ingress: &mut tokio::sync::mpsc::Receiver<TaggedTransfer>,
     ingress_sender: &tokio::sync::mpsc::Sender<TaggedTransfer>,
     attachment_id: &AttachmentId,
-) {
+) -> Vec<TaggedTransfer> {
+    let mut cancelled = Vec::new();
     if active
         .as_ref()
         .and_then(|current| current.attachment_id.as_ref())
         == Some(attachment_id)
     {
-        *active = None;
+        cancelled.extend(active.take());
     }
     if pending
         .as_ref()
         .and_then(|current| current.attachment_id.as_ref())
         == Some(attachment_id)
     {
-        *pending = None;
+        cancelled.extend(pending.take());
+    }
+    if active.is_none() {
+        *active = pending.take();
     }
 
     // A producer can have one already-cancelled plan sitting in the
@@ -1211,7 +1315,8 @@ fn cancel_attachment_transfers(
             .as_ref()
             .is_some_and(TransferToken::is_cancelled)
         {
-            return;
+            cancelled.push(transfer);
+            return cancelled;
         }
         if active.is_none() {
             transfer.ingress_permit.take();
@@ -1225,6 +1330,33 @@ fn cancel_attachment_transfers(
                 .expect("the retained ingress permit keeps its slot vacant");
         }
     }
+    cancelled
+}
+
+async fn report_cancelled_transfers(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    transfers: Vec<TaggedTransfer>,
+) -> Result<(), ()> {
+    for transfer in transfers {
+        if transfer.plan.request_id() != 0 {
+            let code = transfer
+                .token
+                .as_ref()
+                .map(TransferToken::error_code)
+                .unwrap_or("terminal.transfer_cancelled");
+            let event = error_response(
+                transfer.plan.request_id(),
+                code,
+                "the correlated terminal transfer was cancelled",
+            );
+            let bytes = encode_event(event).await?;
+            send_egress(sink, Message::Binary(bytes.into())).await?;
+        }
+        if let Some(completion) = transfer.completion {
+            let _ = completion.send(Err(()));
+        }
+    }
+    Ok(())
 }
 
 async fn egress_arbiter(
@@ -1249,13 +1381,14 @@ async fn egress_arbiter(
                         reply,
                         done,
                     } => {
-                        cancel_attachment_transfers(
+                        let cancelled = cancel_attachment_transfers(
                             &mut active,
                             &mut pending,
                             &mut transfers,
                             &transfer_sender,
                             &attachment_id,
                         );
+                        report_cancelled_transfers(&mut sink, cancelled).await?;
                         let sent = send_egress(&mut sink, Message::Binary(reply.into())).await;
                         let send_failed = sent.is_err();
                         let _ = done.send(sent);
@@ -1267,13 +1400,14 @@ async fn egress_arbiter(
                         attachment_id,
                         done,
                     } => {
-                        cancel_attachment_transfers(
+                        let cancelled = cancel_attachment_transfers(
                             &mut active,
                             &mut pending,
                             &mut transfers,
                             &transfer_sender,
                             &attachment_id,
                         );
+                        report_cancelled_transfers(&mut sink, cancelled).await?;
                         let _ = done.send(Ok(()));
                     }
                     EgressControl::Detach {
@@ -1281,13 +1415,14 @@ async fn egress_arbiter(
                         reply,
                         done,
                     } => {
-                        cancel_attachment_transfers(
+                        let cancelled = cancel_attachment_transfers(
                             &mut active,
                             &mut pending,
                             &mut transfers,
                             &transfer_sender,
                             &attachment_id,
                         );
+                        report_cancelled_transfers(&mut sink, cancelled).await?;
                         let sent = send_egress(&mut sink, Message::Binary(reply.into())).await;
                         let send_failed = sent.is_err();
                         let _ = done.send(sent);
@@ -1307,6 +1442,7 @@ async fn egress_arbiter(
             if pending.is_none() {
                 while let Ok(mut transfer) = transfers.try_recv() {
                     if transfer.token.as_ref().is_some_and(TransferToken::is_cancelled) {
+                        report_cancelled_transfers(&mut sink, vec![transfer]).await?;
                         continue;
                     }
                     transfer.ingress_permit.take();
@@ -1324,6 +1460,7 @@ async fn egress_arbiter(
                     .as_ref()
                     .is_some_and(TransferToken::is_cancelled)
                 {
+                    report_cancelled_transfers(&mut sink, vec![current]).await?;
                     continue;
                 }
                 let (returned, encoded) = tokio::task::spawn_blocking(move || {
@@ -1373,36 +1510,39 @@ async fn egress_arbiter(
                                 // the next iteration.
                                 match command {
                                     EgressControl::Resume { attachment_id, reply, done } => {
-                                        cancel_attachment_transfers(
+                                        let cancelled = cancel_attachment_transfers(
                                             &mut active,
                                             &mut pending,
                                             &mut transfers,
                                             &transfer_sender,
                                             &attachment_id,
                                         );
+                                        report_cancelled_transfers(&mut sink, cancelled).await?;
                                         let sent = send_egress(&mut sink, Message::Binary(reply.into())).await;
                                         let failed = sent.is_err();
                                         let _ = done.send(sent);
                                         if failed { return Err(()); }
                                     }
                                     EgressControl::Finalize { attachment_id, done } => {
-                                        cancel_attachment_transfers(
+                                        let cancelled = cancel_attachment_transfers(
                                             &mut active,
                                             &mut pending,
                                             &mut transfers,
                                             &transfer_sender,
                                             &attachment_id,
                                         );
+                                        report_cancelled_transfers(&mut sink, cancelled).await?;
                                         let _ = done.send(Ok(()));
                                     }
                                     EgressControl::Detach { attachment_id, reply, done } => {
-                                        cancel_attachment_transfers(
+                                        let cancelled = cancel_attachment_transfers(
                                             &mut active,
                                             &mut pending,
                                             &mut transfers,
                                             &transfer_sender,
                                             &attachment_id,
                                         );
+                                        report_cancelled_transfers(&mut sink, cancelled).await?;
                                         let sent = send_egress(&mut sink, Message::Binary(reply.into())).await;
                                         let failed = sent.is_err();
                                         let _ = done.send(sent);
@@ -1417,7 +1557,9 @@ async fn egress_arbiter(
                     None => {}
                 },
                 transfer = transfers.recv(), if pending.is_none() => match transfer {
-                    Some(transfer) if transfer.token.as_ref().is_some_and(TransferToken::is_cancelled) => {},
+                    Some(transfer) if transfer.token.as_ref().is_some_and(TransferToken::is_cancelled) => {
+                        report_cancelled_transfers(&mut sink, vec![transfer]).await?;
+                    },
                     Some(mut transfer) => {
                         transfer.ingress_permit.take();
                         active = Some(transfer);
@@ -1490,6 +1632,67 @@ struct ResumeEmission {
     transfers: Vec<TransferPlan>,
 }
 
+enum ActorWorkCompletion {
+    Screen {
+        revision: Revision,
+        result: Result<(), ()>,
+    },
+    ResumePlanned {
+        emission: Result<ResumeEmission, RemoteEvent>,
+        token: TransferToken,
+        done: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+    ResumeFinished {
+        revision: Revision,
+        result: Result<(), ()>,
+    },
+    DetachFinished,
+    Finalized,
+}
+
+enum ScreenWork {
+    Snapshot(ScreenSnapshot),
+    Diff(ScreenDiff),
+}
+
+fn spawn_screen_work(
+    work: ScreenWork,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    token: TransferToken,
+    outbound: EgressHandle,
+    services: RemoteServices,
+    mut cancellation: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<ActorWorkCompletion> {
+    tokio::spawn(async move {
+        let revision = match &work {
+            ScreenWork::Snapshot(snapshot) => snapshot.revision(),
+            ScreenWork::Diff(diff) => diff.revision(),
+        };
+        let planned = remote_blocking(&services, &mut cancellation, move || match work {
+            ScreenWork::Snapshot(snapshot) => {
+                plan_snapshot_for_attachment(0, &tab_id, Some(&attachment_id), snapshot)
+            }
+            ScreenWork::Diff(diff) => {
+                plan_diff_for_attachment(0, &tab_id, Some(&attachment_id), diff)
+            }
+        })
+        .await;
+        let result = match planned {
+            Ok(Ok(transfer)) => enqueue_transfer(&outbound, transfer, Some(token)).await,
+            _ => Err(()),
+        };
+        ActorWorkCompletion::Screen { revision, result }
+    })
+}
+
+async fn abort_actor_work(pending: &mut Option<tokio::task::JoinHandle<ActorWorkCompletion>>) {
+    if let Some(task) = pending.take() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
 fn build_resume_emission(
     terminal: RemoteTerminal,
     request_id: u64,
@@ -1553,16 +1756,86 @@ async fn attachment_actor(
     outbound: EgressHandle,
     services: RemoteServices,
     mut cancellation: tokio::sync::watch::Receiver<bool>,
+    completed_attachments: tokio::sync::mpsc::Sender<AttachmentId>,
 ) {
     let mut live_revision = Some(attachment.revision);
+    let finalization_signal = attachment.events.finalization_signal();
+    let mut finalization_announced = false;
+    let mut pending = None::<tokio::task::JoinHandle<ActorWorkCompletion>>;
+    let mut pending_blocks_events = false;
+    let mut deferred_screen = None::<TerminalEvent>;
+    let mut recovery_needed = false;
+    let mut events_closed = false;
+
     loop {
+        if pending.is_none() {
+            if recovery_needed {
+                live_revision = None;
+                deferred_screen = None;
+                recovery_needed = false;
+                if enqueue_event(&outbound, recovery_error()).await.is_err() {
+                    return;
+                }
+            } else if let Some(event) = deferred_screen.take() {
+                match event {
+                    TerminalEvent::Snapshot(snapshot) => {
+                        pending = Some(spawn_screen_work(
+                            ScreenWork::Snapshot(snapshot),
+                            attachment.tab_id.clone(),
+                            attachment.attachment_id.clone(),
+                            attachment.transfers.current(),
+                            outbound.clone(),
+                            services.clone(),
+                            cancellation.clone(),
+                        ));
+                        pending_blocks_events = false;
+                    }
+                    TerminalEvent::Diff(diff) if live_revision == Some(diff.base_revision()) => {
+                        pending = Some(spawn_screen_work(
+                            ScreenWork::Diff(diff),
+                            attachment.tab_id.clone(),
+                            attachment.attachment_id.clone(),
+                            attachment.transfers.current(),
+                            outbound.clone(),
+                            services.clone(),
+                            cancellation.clone(),
+                        ));
+                        pending_blocks_events = false;
+                    }
+                    TerminalEvent::Diff(_) => {
+                        recovery_needed = true;
+                        continue;
+                    }
+                    _ => unreachable!("only screen events are deferred"),
+                }
+            }
+        }
+
         tokio::select! {
             biased;
             changed = cancellation.changed() => {
                 let _ = changed;
+                abort_actor_work(&mut pending).await;
                 attachment.events.cancellation().close_mailbox();
                 attachment.transfers.cancel();
+                attachment.lifecycle.finish();
                 return;
+            }
+            finalized = finalization_signal.wait(), if !finalization_announced && !events_closed => {
+                if finalized {
+                    attachment.lifecycle.begin_finalizing();
+                    attachment.transfers.close_attachment();
+                    abort_actor_work(&mut pending).await;
+                    pending_blocks_events = false;
+                    deferred_screen = None;
+                    recovery_needed = false;
+                    finalization_announced = true;
+                } else {
+                    // An explicit mailbox close is not a natural exit and has
+                    // no final snapshot to drain. Stop polling the permanently
+                    // ready signal so Shutdown or pending cleanup can run.
+                    events_closed = true;
+                }
             }
             command = commands.recv() => match command {
                 Some(AttachmentCommand::Resume {
@@ -1572,198 +1845,208 @@ async fn attachment_actor(
                     requested_revision,
                     done,
                 }) => {
+                    if !attachment.lifecycle.is_active() {
+                        let _ = done.send(Err(()));
+                        continue;
+                    }
+                    abort_actor_work(&mut pending).await;
+                    deferred_screen = None;
+                    recovery_needed = false;
+                    let token = attachment.transfers.replace();
                     let resume_terminal = services.terminal.clone();
-                    let emission = remote_blocking(&services, &mut cancellation, move || {
-                        build_resume_emission(
-                            resume_terminal,
-                            request_id,
-                            tab_id,
-                            attachment_id,
-                            requested_revision,
+                    let planning_services = services.clone();
+                    let mut planning_cancellation = cancellation.clone();
+                    pending = Some(tokio::spawn(async move {
+                        let emission = remote_blocking(
+                            &planning_services,
+                            &mut planning_cancellation,
+                            move || build_resume_emission(
+                                resume_terminal,
+                                request_id,
+                                tab_id,
+                                attachment_id,
+                                requested_revision,
+                            ),
                         )
-                    }).await;
-                    let result = match emission {
-                        Ok(Ok(emission)) => {
-                            attachment.events.apply_recovery_boundary(emission.boundary);
-                            live_revision = Some(emission.revision);
-                            let mut frames = emission.frames;
-                            let mut transfers = emission.transfers;
-                            let encoded = match (frames.pop(), transfers.pop()) {
-                                (Some(frame), Some(transfer)) => encode_event(frame)
-                                    .await
-                                    .map(|reply| (reply, transfer)),
-                                _ => Err(()),
-                            };
-                            match encoded {
-                                Ok((reply, transfer)) => {
-                                    let token = attachment.transfers.replace();
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(error_response(
+                                request_id,
+                                "terminal.transfer_cancelled",
+                                "terminal recovery planning was cancelled",
+                            ))
+                        });
+                        ActorWorkCompletion::ResumePlanned {
+                            emission,
+                            token,
+                            done,
+                        }
+                    }));
+                    pending_blocks_events = true;
+                }
+                Some(AttachmentCommand::Detach { frames, done }) => {
+                    if !attachment.lifecycle.is_active() {
+                        let _ = done.send(Err(()));
+                        continue;
+                    }
+                    abort_actor_work(&mut pending).await;
+                    deferred_screen = None;
+                    recovery_needed = false;
+                    events_closed = true;
+                    attachment.lifecycle.begin_finalizing();
+                    attachment.transfers.close_attachment();
+                    let registry_cancellation = attachment.events.cancellation();
+                    registry_cancellation.close_mailbox();
+                    let detach_outbound = outbound.clone();
+                    let detach_id = attachment.attachment_id.clone();
+                    let lifecycle = attachment.lifecycle.clone();
+                    pending = Some(tokio::spawn(async move {
+                        detach_attachment_bounded(registry_cancellation).await;
+                        let result = match frames.into_iter().next() {
+                            Some(frame) => match encode_event(frame).await {
+                                Ok(reply) => {
                                     let (sent, completed) = tokio::sync::oneshot::channel();
-                                    if outbound.controls.send(EgressControl::Resume {
-                                        attachment_id: attachment.attachment_id.clone(),
+                                    if detach_outbound.controls.send(EgressControl::Detach {
+                                        attachment_id: detach_id,
                                         reply,
                                         done: sent,
                                     }).await.is_err() {
                                         Err(())
                                     } else {
-                                        match completed.await.unwrap_or(Err(())) {
-                                            Ok(()) => enqueue_transfer(
-                                                &outbound,
-                                                transfer,
-                                                Some(token),
-                                            )
-                                            .await,
-                                            Err(()) => Err(()),
-                                        }
+                                        completed.await.unwrap_or(Err(()))
                                     }
                                 }
                                 Err(()) => Err(()),
-                            }
-                        }
-                        Ok(Err(error)) => enqueue_event(&outbound, error).await,
-                        Err(_) => Err(()),
-                    };
-                    let failed = result.is_err();
-                    let _ = done.send(result);
-                    if failed { return; }
-                }
-                Some(AttachmentCommand::Detach { frames, done }) => {
-                    let cancellation = attachment.events.cancellation();
-                    cancellation.close_mailbox();
-                    attachment.transfers.cancel();
-                    // Release registry ownership before the terminal wire
-                    // barrier when the ordered detach completes promptly.
-                    // If an unrelated backend operation holds send_order,
-                    // the bounded helper returns and the idempotent blocking
-                    // job completes the release eventually.
-                    detach_attachment_bounded(cancellation).await;
-                    let result = match frames.into_iter().next() {
-                        Some(frame) => match encode_event(frame).await {
-                            Ok(reply) => {
-                                let (sent, completed) = tokio::sync::oneshot::channel();
-                                if outbound.controls.send(EgressControl::Detach {
-                                    attachment_id: attachment.attachment_id.clone(),
-                                    reply,
-                                    done: sent,
-                                }).await.is_err() {
-                                    Err(())
-                                } else {
-                                    completed.await.unwrap_or(Err(()))
-                                }
-                            }
-                            Err(()) => Err(()),
-                        },
-                        None => Err(()),
-                    };
-                    let _ = done.send(result);
-                    return;
+                            },
+                            None => Err(()),
+                        };
+                        lifecycle.finish();
+                        let failed = result.is_err();
+                        let _ = done.send(result);
+                        let _ = failed;
+                        ActorWorkCompletion::DetachFinished
+                    }));
+                    pending_blocks_events = true;
                 }
                 Some(AttachmentCommand::Shutdown) | None => {
-                    let cancellation = attachment.events.cancellation();
-                    cancellation.close_mailbox();
+                    abort_actor_work(&mut pending).await;
+                    let registry_cancellation = attachment.events.cancellation();
+                    registry_cancellation.close_mailbox();
                     attachment.transfers.cancel();
-                    detach_attachment_bounded(cancellation).await;
+                    attachment.lifecycle.finish();
+                    detach_attachment_bounded(registry_cancellation).await;
                     return;
                 }
             },
-            event = attachment.events.next() => {
-                let Some(event) = event else { return; };
-                let result = match event {
-                    TerminalEvent::Snapshot(snapshot) => {
-                        live_revision = Some(snapshot.revision());
-                        let tab_id = attachment.tab_id.clone();
-                        let attachment_id = attachment.attachment_id.clone();
-                        match remote_blocking(&services, &mut cancellation, move || {
-                            plan_snapshot_for_attachment(0, &tab_id, Some(&attachment_id), snapshot)
-                        }).await {
-                            Ok(Ok(transfer)) => enqueue_transfer(
-                                &outbound,
-                                transfer,
-                                Some(attachment.transfers.current()),
-                            ).await,
-                            _ => enqueue_event(&outbound, recovery_error()).await,
-                        }
-                    }
+            event = attachment.events.next(), if !events_closed && !pending_blocks_events => {
+                let Some(event) = event else {
+                    events_closed = true;
+                    if pending.is_none() { return; }
+                    continue;
+                };
+                match event {
                     TerminalEvent::Finalized { snapshot, exit } => {
-                        live_revision = Some(snapshot.revision());
-                        let tab_id = attachment.tab_id.clone();
-                        let attachment_id = attachment.attachment_id.clone();
-                        let planned = remote_blocking(&services, &mut cancellation, move || {
-                            plan_shared_snapshot_for_attachment(
-                                0,
-                                &tab_id,
-                                Some(&attachment_id),
-                                snapshot,
-                            )
-                        }).await;
-                        match planned {
-                            Ok(Ok(transfer)) => {
-                                async {
+                        abort_actor_work(&mut pending).await;
+                        deferred_screen = None;
+                        recovery_needed = false;
+                        events_closed = true;
+                        attachment.lifecycle.begin_finalizing();
+                        let token = attachment.transfers.replace_for_close();
+                        let final_tab = attachment.tab_id.clone();
+                        let final_attachment = attachment.attachment_id.clone();
+                        let final_outbound = outbound.clone();
+                        let final_services = services.clone();
+                        let lifecycle = attachment.lifecycle.clone();
+                        let actor_completed = completed_attachments.clone();
+                        let completion_id = final_attachment.clone();
+                        let mut final_cancellation = cancellation.clone();
+                        pending = Some(tokio::spawn(async move {
+                            let plan_tab = final_tab.clone();
+                            let plan_attachment = final_attachment.clone();
+                            let planned = remote_blocking(
+                                &final_services,
+                                &mut final_cancellation,
+                                move || plan_shared_snapshot_for_attachment(
+                                    0,
+                                    &plan_tab,
+                                    Some(&plan_attachment),
+                                    snapshot,
+                                ),
+                            ).await;
+                            let result = match planned {
+                                Ok(Ok(transfer)) => async {
                                     let trailer = encode_control_event(
-                                        attachment.tab_id.clone(),
-                                        attachment.attachment_id.clone(),
+                                        final_tab,
+                                        final_attachment.clone(),
                                         TerminalEvent::Exited(exit),
-                                    )
-                                    .await?
-                                    .ok_or(())?;
+                                    ).await?.ok_or(())?;
                                     let trailer = encode_event(trailer).await?;
-                                    let token = attachment.transfers.replace();
                                     let (done, completed) = tokio::sync::oneshot::channel();
-                                    outbound
-                                        .controls
-                                        .send(EgressControl::Finalize {
-                                            attachment_id: attachment.attachment_id.clone(),
-                                            done,
-                                        })
-                                        .await
-                                        .map_err(|_| ())?;
+                                    final_outbound.controls.send(EgressControl::Finalize {
+                                        attachment_id: final_attachment.clone(),
+                                        done,
+                                    }).await.map_err(|_| ())?;
                                     completed.await.unwrap_or(Err(()))?;
+                                    let ingress_permit = final_outbound.transfer_slots.clone()
+                                        .acquire_owned().await.map_err(|_| ())?;
                                     let (trailer_done, trailer_completed) =
                                         tokio::sync::oneshot::channel();
-                                    let ingress_permit = outbound
-                                        .transfer_slots
-                                        .clone()
-                                        .acquire_owned()
-                                        .await
-                                        .map_err(|_| ())?;
-                                    outbound
-                                        .transfers
-                                        .send(TaggedTransfer {
-                                            attachment_id: Some(
-                                                attachment.attachment_id.clone(),
-                                            ),
-                                            plan: transfer,
-                                            token: Some(token),
-                                            trailer: Some(trailer),
-                                            completion: Some(trailer_done),
-                                            ingress_permit: Some(ingress_permit),
-                                        })
-                                        .await
-                                        .map_err(|_| ())?;
+                                    final_outbound.transfers.send(TaggedTransfer {
+                                        attachment_id: Some(final_attachment),
+                                        plan: transfer,
+                                        token: Some(token),
+                                        trailer: Some(trailer),
+                                        completion: Some(trailer_done),
+                                        ingress_permit: Some(ingress_permit),
+                                    }).await.map_err(|_| ())?;
                                     trailer_completed.await.unwrap_or(Err(()))
-                                }
-                                .await
+                                }.await,
+                                _ => Err(()),
+                            };
+                            lifecycle.finish();
+                            if result.is_ok() {
+                                let _ = actor_completed.try_send(completion_id);
                             }
-                            _ => enqueue_event(&outbound, recovery_error()).await,
+                            let _ = result;
+                            ActorWorkCompletion::Finalized
+                        }));
+                        pending_blocks_events = true;
+                    }
+                    TerminalEvent::Snapshot(_) | TerminalEvent::Diff(_) if pending.is_some() => {
+                        if deferred_screen.is_none() && !recovery_needed {
+                            deferred_screen = Some(event);
+                        } else {
+                            deferred_screen = None;
+                            recovery_needed = true;
                         }
+                    }
+                    TerminalEvent::Snapshot(snapshot) => {
+                        pending = Some(spawn_screen_work(
+                            ScreenWork::Snapshot(snapshot),
+                            attachment.tab_id.clone(),
+                            attachment.attachment_id.clone(),
+                            attachment.transfers.current(),
+                            outbound.clone(),
+                            services.clone(),
+                            cancellation.clone(),
+                        ));
+                        pending_blocks_events = false;
                     }
                     TerminalEvent::Diff(diff) => {
                         if live_revision != Some(diff.base_revision()) {
                             live_revision = None;
-                            enqueue_event(&outbound, recovery_error()).await
+                            if enqueue_event(&outbound, recovery_error()).await.is_err() { return; }
                         } else {
-                            live_revision = Some(diff.revision());
-                            let tab_id = attachment.tab_id.clone();
-                            let attachment_id = attachment.attachment_id.clone();
-                            match remote_blocking(&services, &mut cancellation, move || {
-                                plan_diff_for_attachment(0, &tab_id, Some(&attachment_id), diff)
-                            }).await {
-                                Ok(Ok(transfer)) => enqueue_transfer(
-                                    &outbound,
-                                    transfer,
-                                    Some(attachment.transfers.current()),
-                                ).await,
-                                _ => enqueue_event(&outbound, recovery_error()).await,
-                            }
+                            pending = Some(spawn_screen_work(
+                                ScreenWork::Diff(diff),
+                                attachment.tab_id.clone(),
+                                attachment.attachment_id.clone(),
+                                attachment.transfers.current(),
+                                outbound.clone(),
+                                services.clone(),
+                                cancellation.clone(),
+                            ));
+                            pending_blocks_events = false;
                         }
                     }
                     control => match encode_control_event(
@@ -1771,12 +2054,91 @@ async fn attachment_actor(
                         attachment.attachment_id.clone(),
                         control,
                     ).await {
-                        Ok(Some(event)) => enqueue_event(&outbound, event).await,
-                        Ok(None) => Ok(()),
-                        Err(()) => Err(()),
+                        Ok(Some(event)) => {
+                            if enqueue_event(&outbound, event).await.is_err() { return; }
+                        }
+                        Ok(None) => {}
+                        Err(()) => return,
                     },
+                }
+            }
+            completed = async {
+                pending.as_mut().expect("guarded pending actor work").await
+            }, if pending.is_some() => {
+                pending = None;
+                pending_blocks_events = false;
+                let Ok(completed) = completed else {
+                    recovery_needed = true;
+                    continue;
                 };
-                if result.is_err() { return; }
+                match completed {
+                    ActorWorkCompletion::Screen { revision, result } => {
+                        if result.is_ok() {
+                            live_revision = Some(revision);
+                        } else {
+                            recovery_needed = true;
+                        }
+                    }
+                    ActorWorkCompletion::ResumePlanned { emission, token, done } => {
+                        match emission {
+                            Ok(emission) => {
+                                attachment.events.apply_recovery_boundary(emission.boundary);
+                                live_revision = Some(emission.revision);
+                                deferred_screen = None;
+                                recovery_needed = false;
+                                let revision = emission.revision;
+                                let mut frames = emission.frames;
+                                let mut transfers = emission.transfers;
+                                let resume_outbound = outbound.clone();
+                                let resume_id = attachment.attachment_id.clone();
+                                pending = Some(tokio::spawn(async move {
+                                    let result = match (frames.pop(), transfers.pop()) {
+                                        (Some(frame), Some(transfer)) => match encode_event(frame).await {
+                                            Ok(reply) => {
+                                                let (sent, completed) = tokio::sync::oneshot::channel();
+                                                if resume_outbound.controls.send(EgressControl::Resume {
+                                                    attachment_id: resume_id,
+                                                    reply,
+                                                    done: sent,
+                                                }).await.is_err() {
+                                                    Err(())
+                                                } else if completed.await.unwrap_or(Err(())).is_err() {
+                                                    Err(())
+                                                } else {
+                                                    enqueue_transfer(&resume_outbound, transfer, Some(token)).await
+                                                }
+                                            }
+                                            Err(()) => Err(()),
+                                        },
+                                        _ => Err(()),
+                                    };
+                                    let failed = result.is_err();
+                                    let _ = done.send(result);
+                                    ActorWorkCompletion::ResumeFinished {
+                                        revision,
+                                        result: if failed { Err(()) } else { Ok(()) },
+                                    }
+                                }));
+                                pending_blocks_events = true;
+                            }
+                            Err(error) => {
+                                let result = enqueue_event(&outbound, error).await;
+                                let failed = result.is_err();
+                                let _ = done.send(result);
+                                if failed { return; }
+                            }
+                        }
+                    }
+                    ActorWorkCompletion::ResumeFinished { revision, result } => {
+                        if result.is_ok() {
+                            live_revision = Some(revision);
+                        } else {
+                            recovery_needed = true;
+                        }
+                    }
+                    ActorWorkCompletion::DetachFinished => return,
+                    ActorWorkCompletion::Finalized => return,
+                }
             }
         }
     }
@@ -1794,6 +2156,60 @@ enum InboundMessage {
     Binary(Vec<u8>),
     Ping(Vec<u8>),
     Pong,
+}
+
+enum AttachmentCommandOutcome {
+    Completed(Result<(), ()>),
+    ConnectionCancelled,
+    Unavailable,
+}
+
+async fn run_attachment_command(
+    commands: &tokio::sync::mpsc::Sender<AttachmentCommand>,
+    command: AttachmentCommand,
+    completed: tokio::sync::oneshot::Receiver<Result<(), ()>>,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+) -> AttachmentCommandOutcome {
+    if *cancellation.borrow() {
+        return AttachmentCommandOutcome::ConnectionCancelled;
+    }
+    let send_deadline = tokio::time::sleep(ATTACHMENT_COMMAND_TIMEOUT);
+    tokio::pin!(send_deadline);
+    tokio::select! {
+        biased;
+        changed = cancellation.changed() => {
+            let _ = changed;
+            return AttachmentCommandOutcome::ConnectionCancelled;
+        }
+        result = commands.send(command) => {
+            if result.is_err() {
+                return AttachmentCommandOutcome::Unavailable;
+            }
+        }
+        _ = &mut send_deadline => return AttachmentCommandOutcome::Unavailable,
+    }
+
+    let completion_deadline = tokio::time::sleep(ATTACHMENT_COMMAND_TIMEOUT);
+    tokio::pin!(completion_deadline);
+    tokio::select! {
+        biased;
+        changed = cancellation.changed() => {
+            let _ = changed;
+            AttachmentCommandOutcome::ConnectionCancelled
+        }
+        result = completed => match result {
+            Ok(result) => AttachmentCommandOutcome::Completed(result),
+            Err(_) => AttachmentCommandOutcome::Unavailable,
+        },
+        _ = &mut completion_deadline => AttachmentCommandOutcome::Unavailable,
+    }
+}
+
+fn close_unavailable_attachment(attachment: &ConnectionAttachment) {
+    attachment.lifecycle.begin_finalizing();
+    attachment.transfers.close_attachment();
+    attachment.cancellation.close_mailbox();
+    let _ = attachment.commands.try_send(AttachmentCommand::Shutdown);
 }
 
 async fn socket_reader(
@@ -1903,11 +2319,26 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
         cancelled.clone(),
     ));
     let mut attachments = HashMap::<AttachmentId, ConnectionAttachment>::new();
+    let mut closed_attachments = ClosedAttachments::default();
+    let (attachment_completed, mut completed_attachments) =
+        tokio::sync::mpsc::channel(MAX_ATTACHMENTS_PER_CONNECTION);
     let mut reap_tick = tokio::time::interval(ATTACHMENT_REAP_INTERVAL);
     reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     'socket: loop {
-        reap_finished_attachments(&mut attachments).await;
+        reap_finished_attachments(&mut attachments, &mut closed_attachments).await;
         let message = tokio::select! {
+            biased;
+            completed = completed_attachments.recv() => {
+                if let Some(id) = completed {
+                    if let Some(attachment) = attachments.remove(&id) {
+                        let tab_id = attachment.tab_id.clone();
+                        let lifecycle = attachment.lifecycle.clone();
+                        shutdown_attachment(attachment).await;
+                        closed_attachments.insert(id, tab_id, lifecycle);
+                    }
+                }
+                continue;
+            }
             message = inbound_messages.recv() => message,
             changed = cancellation.changed() => {
                 if changed.is_err() || *cancellation.borrow() { break; }
@@ -1968,10 +2399,16 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                     }
                     continue;
                 }
-                let owned = attachments
-                    .iter()
-                    .map(|(id, attachment)| (id.clone(), attachment.tab_id.clone()))
-                    .collect::<HashMap<_, _>>();
+                let mut owned = closed_attachments.entries.clone();
+                owned.extend(attachments.iter().map(|(id, attachment)| {
+                    (
+                        id.clone(),
+                        OwnedAttachment {
+                            tab_id: attachment.tab_id.clone(),
+                            lifecycle: attachment.lifecycle.clone(),
+                        },
+                    )
+                }));
                 let dispatch_services = services.clone();
                 let dispatch_request = request.clone();
                 let outcome = match remote_blocking(&services, &mut cancellation, move || {
@@ -2001,41 +2438,125 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                         requested_revision,
                     }) => {
                         let Some(attachment) = attachments.get(&attachment_id) else {
-                            break 'socket;
+                            if enqueue_event(
+                                &outbound,
+                                error_response(
+                                    request_id,
+                                    "terminal.attachment_closed",
+                                    "the terminal attachment is no longer active",
+                                ),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                break 'socket;
+                            }
+                            continue;
                         };
                         let (done, completed) = tokio::sync::oneshot::channel();
-                        if attachment
-                            .commands
-                            .send(AttachmentCommand::Resume {
+                        let outcome = run_attachment_command(
+                            &attachment.commands,
+                            AttachmentCommand::Resume {
                                 request_id,
                                 tab_id,
-                                attachment_id,
+                                attachment_id: attachment_id.clone(),
                                 requested_revision,
                                 done,
-                            })
-                            .await
-                            .is_err()
-                            || completed.await.ok() != Some(Ok(()))
-                        {
-                            break 'socket;
+                            },
+                            completed,
+                            &mut cancellation,
+                        )
+                        .await;
+                        match outcome {
+                            AttachmentCommandOutcome::Completed(Ok(())) => {}
+                            AttachmentCommandOutcome::ConnectionCancelled => break 'socket,
+                            AttachmentCommandOutcome::Completed(Err(()))
+                            | AttachmentCommandOutcome::Unavailable => {
+                                if let Some(attachment) = attachments.get(&attachment_id) {
+                                    if attachment.lifecycle.is_active() {
+                                        close_unavailable_attachment(attachment);
+                                    }
+                                }
+                                if enqueue_event(
+                                    &outbound,
+                                    error_response(
+                                        request_id,
+                                        "terminal.attachment_closed",
+                                        "the terminal attachment closed during recovery",
+                                    ),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break 'socket;
+                                }
+                            }
                         }
                     }
-                    Some(SequencedAction::Detach { attachment_id }) => {
-                        let Some(attachment) = attachments.remove(&attachment_id) else {
-                            break 'socket;
-                        };
-                        let (done, completed) = tokio::sync::oneshot::channel();
-                        if attachment
-                            .commands
-                            .send(AttachmentCommand::Detach { frames, done })
+                    Some(SequencedAction::Detach {
+                        request_id,
+                        attachment_id,
+                    }) => {
+                        let Some(attachment) = attachments.get(&attachment_id) else {
+                            if enqueue_event(
+                                &outbound,
+                                error_response(
+                                    request_id,
+                                    "terminal.attachment_closed",
+                                    "the terminal attachment is no longer active",
+                                ),
+                            )
                             .await
                             .is_err()
-                            || completed.await.ok() != Some(Ok(()))
-                        {
-                            shutdown_attachment(attachment).await;
-                            break 'socket;
+                            {
+                                break 'socket;
+                            }
+                            continue;
+                        };
+                        let closed_tab = attachment.tab_id.clone();
+                        let closed_lifecycle = attachment.lifecycle.clone();
+                        let (done, completed) = tokio::sync::oneshot::channel();
+                        let outcome = run_attachment_command(
+                            &attachment.commands,
+                            AttachmentCommand::Detach { frames, done },
+                            completed,
+                            &mut cancellation,
+                        )
+                        .await;
+                        match outcome {
+                            AttachmentCommandOutcome::Completed(Ok(())) => {
+                                if let Some(attachment) = attachments.remove(&attachment_id) {
+                                    shutdown_attachment(attachment).await;
+                                }
+                                closed_attachments.insert(
+                                    attachment_id,
+                                    closed_tab,
+                                    closed_lifecycle,
+                                );
+                            }
+                            AttachmentCommandOutcome::ConnectionCancelled => break 'socket,
+                            AttachmentCommandOutcome::Completed(Err(()))
+                            | AttachmentCommandOutcome::Unavailable => {
+                                if let Some(attachment) = attachments.get(&attachment_id) {
+                                    if attachment.lifecycle.is_active() {
+                                        close_unavailable_attachment(attachment);
+                                    }
+                                }
+                                if enqueue_event(
+                                    &outbound,
+                                    error_response(
+                                        request_id,
+                                        "terminal.attachment_closed",
+                                        "the terminal attachment closed during detach",
+                                    ),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break 'socket;
+                                }
+                            }
                         }
-                        shutdown_attachment(attachment).await;
                     }
                     None => {
                         let transfer_token = transfers
@@ -2064,6 +2585,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                     let id = started.attachment_id.clone();
                     let cancellation = started.cancellation.clone();
                     let transfer_state = started.transfers.clone();
+                    let lifecycle = started.lifecycle.clone();
                     let (commands, command_receiver) = tokio::sync::mpsc::channel(8);
                     let task = tokio::spawn(attachment_actor(
                         started,
@@ -2071,6 +2593,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                         outbound.clone(),
                         services.clone(),
                         cancelled.subscribe(),
+                        attachment_completed.clone(),
                     ));
                     attachments.insert(
                         id,
@@ -2080,6 +2603,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                             commands,
                             task,
                             transfers: transfer_state,
+                            lifecycle,
                         },
                     );
                 }
@@ -2151,14 +2675,20 @@ async fn detach_attachment_bounded(cancellation: TabAttachmentCancellation) {
     }
 }
 
-async fn reap_finished_attachments(attachments: &mut HashMap<AttachmentId, ConnectionAttachment>) {
+async fn reap_finished_attachments(
+    attachments: &mut HashMap<AttachmentId, ConnectionAttachment>,
+    closed: &mut ClosedAttachments,
+) {
     let finished = attachments
         .iter()
         .filter_map(|(id, attachment)| attachment.task.is_finished().then(|| id.clone()))
         .collect::<Vec<_>>();
     for id in finished {
         if let Some(attachment) = attachments.remove(&id) {
+            let tab_id = attachment.tab_id.clone();
+            let lifecycle = attachment.lifecycle.clone();
             shutdown_attachment(attachment).await;
+            closed.insert(id, tab_id, lifecycle);
         }
     }
 }
@@ -2166,8 +2696,105 @@ async fn reap_finished_attachments(attachments: &mut HashMap<AttachmentId, Conne
 #[cfg(test)]
 mod request_guard_tests {
     use super::*;
+    use crate::terminal::model::{CursorState, ScreenSnapshot, TerminalModes};
     use std::sync::atomic::AtomicUsize;
     use std::sync::Condvar;
+
+    fn tagged_test_transfer(
+        request_id: u64,
+        attachment_id: &AttachmentId,
+        token: TransferToken,
+    ) -> TaggedTransfer {
+        let tab_id = TabId::new();
+        let snapshot = ScreenSnapshot::new(
+            tab_id.as_str(),
+            Revision(1),
+            TerminalSize::try_new(1, 1).unwrap(),
+            Vec::new(),
+            Vec::new(),
+            CursorState::new(0, 0, true),
+            TerminalModes::new(false, false, false),
+        );
+        TaggedTransfer {
+            attachment_id: Some(attachment_id.clone()),
+            plan: plan_snapshot_for_attachment(request_id, &tab_id, Some(attachment_id), snapshot)
+                .unwrap(),
+            token: Some(token),
+            trailer: None,
+            completion: None,
+            ingress_permit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_any_queue_position_preserves_sibling_transfer_fifo() {
+        enum TargetPosition {
+            Active,
+            Pending,
+            Ingress,
+        }
+
+        for target_position in [
+            TargetPosition::Active,
+            TargetPosition::Pending,
+            TargetPosition::Ingress,
+        ] {
+            let target_id = AttachmentId::new();
+            let sibling_id = AttachmentId::new();
+            let target_token = TransferToken::new();
+            target_token.cancel();
+            let sibling_token = TransferToken::new();
+            let target = tagged_test_transfer(10, &target_id, target_token);
+            let sibling_one = tagged_test_transfer(11, &sibling_id, sibling_token.clone());
+            let sibling_two = tagged_test_transfer(12, &sibling_id, sibling_token.clone());
+            let (mut active, mut pending, ingress_item) = match target_position {
+                TargetPosition::Active => (Some(target), Some(sibling_one), sibling_two),
+                TargetPosition::Pending => (Some(sibling_one), Some(target), sibling_two),
+                TargetPosition::Ingress => (Some(sibling_one), Some(sibling_two), target),
+            };
+            let (ingress_sender, mut ingress) = tokio::sync::mpsc::channel(1);
+            ingress_sender.send(ingress_item).await.unwrap();
+
+            let _ = cancel_attachment_transfers(
+                &mut active,
+                &mut pending,
+                &mut ingress,
+                &ingress_sender,
+                &target_id,
+            );
+
+            let mut order = Vec::new();
+            if let Some(transfer) = active {
+                order.push(transfer.plan.request_id());
+            }
+            if let Some(transfer) = pending {
+                order.push(transfer.plan.request_id());
+            }
+            if let Ok(transfer) = ingress.try_recv() {
+                order.push(transfer.plan.request_id());
+            }
+            assert_eq!(order, vec![11, 12]);
+        }
+    }
+
+    #[test]
+    fn closed_attachment_cache_is_strictly_bounded() {
+        let tab_id = TabId::new();
+        let mut cache = ClosedAttachments::default();
+        let mut ids = Vec::new();
+        for _ in 0..=CLOSED_ATTACHMENT_CACHE {
+            let id = AttachmentId::new();
+            cache.insert(id.clone(), tab_id.clone(), AttachmentLifecycle::new());
+            ids.push(id);
+        }
+
+        assert_eq!(cache.entries.len(), CLOSED_ATTACHMENT_CACHE);
+        assert!(!cache.entries.contains_key(&ids[0]));
+        assert_eq!(
+            authorize_attachment(&cache.entries, &tab_id, ids.last().unwrap()),
+            Err("terminal.attachment_closed")
+        );
+    }
 
     #[test]
     fn a_repeated_request_id_is_refused() {

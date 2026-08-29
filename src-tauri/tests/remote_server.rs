@@ -1593,6 +1593,574 @@ async fn multi_chunk_final_snapshot_completes_before_exactly_one_exit_trailer() 
 }
 
 #[tokio::test]
+async fn every_post_exit_attachment_operation_gets_one_correlated_closed_error() {
+    let root = private_test_dir("post-exit-errors");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Exited",
+            "post-exit-errors",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply = decode(&response(&mut socket).await.payload);
+    while response(&mut socket).await.kind != "terminal.snapshot" {}
+
+    pty.exit(pty.last_id(), Some(0), None);
+    loop {
+        if response(&mut socket).await.kind == "terminal.exited" {
+            break;
+        }
+    }
+
+    let requests = [
+        request(
+            2,
+            "terminal.input",
+            &encode(&InputRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                data: b"x".to_vec(),
+            }),
+        ),
+        request(
+            3,
+            "terminal.resize",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ),
+        request(
+            4,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ),
+        request(
+            5,
+            "terminal.scrollback",
+            &encode(&ScrollbackRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                offset: 0,
+                count: 1,
+            }),
+        ),
+        request(
+            6,
+            "terminal.resume",
+            &encode(&ResumeRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                revision: 0,
+            }),
+        ),
+        request(
+            7,
+            "terminal.detach",
+            &encode(&AttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+            }),
+        ),
+    ];
+    for (request_id, operation) in (2u64..=7).zip(requests) {
+        socket.send(operation).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), response(&mut socket))
+            .await
+            .expect("post-exit operation must receive a correlated response");
+        assert_eq!(reply.request_id, request_id);
+        assert_eq!(reply.kind, "error");
+        assert_eq!(
+            decode::<ErrorReply>(&reply.payload).code,
+            "terminal.attachment_closed"
+        );
+    }
+
+    socket.send(request(8, "tab.list", &[])).await.unwrap();
+    assert_eq!(response(&mut socket).await.kind, "tab.list");
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn resume_cancelling_a_scrollback_transfer_returns_a_correlated_outcome() {
+    let root = private_test_dir("cancelled-scrollback-outcome");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Scrollback",
+            "cancelled-scrollback-outcome",
+            TerminalSize::try_new(512, 48).unwrap(),
+        ))
+        .unwrap();
+    let cell = format!("x{}", "\u{301}".repeat(32));
+    let row = cell.repeat(512);
+    pty.emit(
+        pty.last_id(),
+        (0..300)
+            .map(|_| row.as_str())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .as_bytes(),
+    );
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply = decode(&response(&mut socket).await.payload);
+    loop {
+        let event = response(&mut socket).await;
+        if event.kind == "terminal.snapshot" {
+            let chunk: SnapshotChunkReply = decode(&event.payload);
+            if chunk.index + 1 == chunk.total {
+                break;
+            }
+        }
+    }
+
+    socket
+        .send(request(
+            2,
+            "terminal.scrollback",
+            &encode(&ScrollbackRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                offset: 0,
+                count: 256,
+            }),
+        ))
+        .await
+        .unwrap();
+    let first = response_kind(&mut socket, "terminal.scrollback").await;
+    let first: SnapshotChunkReply = decode(&first.payload);
+    assert!(first.total > 1);
+    socket
+        .send(request(
+            3,
+            "terminal.resume",
+            &encode(&ResumeRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                revision: 0,
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let mut scrollback_error = None;
+    let mut scrollback_chunks = 1;
+    let mut resume_reply = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline
+        && (!resume_reply || (scrollback_error.is_none() && scrollback_chunks < first.total))
+    {
+        let event = tokio::time::timeout(Duration::from_millis(500), response(&mut socket)).await;
+        let Ok(event) = event else { continue };
+        match (event.request_id, event.kind.as_str()) {
+            (2, "terminal.scrollback") => scrollback_chunks += 1,
+            (2, "error") => scrollback_error = Some(decode::<ErrorReply>(&event.payload).code),
+            (3, "terminal.resume") => resume_reply = true,
+            _ => {}
+        }
+    }
+    assert!(resume_reply);
+    assert!(
+        scrollback_chunks == first.total
+            || scrollback_error.as_deref() == Some("terminal.transfer_cancelled"),
+        "a correlated transfer must complete or report cancellation"
+    );
+
+    socket.close(None).await.ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn finalization_preempts_backpressured_live_transfer_admission() {
+    let root = private_test_dir("finalize-preempts-admission");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Preempt",
+            "finalize-preempts-admission",
+            TerminalSize::try_new(512, 48).unwrap(),
+        ))
+        .unwrap();
+    let cell = format!("x{}", "\u{301}".repeat(32));
+    let row = cell.repeat(512);
+    pty.emit(
+        pty.last_id(),
+        (0..48)
+            .map(|_| row.as_str())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .as_bytes(),
+    );
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    for request_id in 1..=3 {
+        socket
+            .send(request(
+                request_id,
+                "terminal.attach",
+                &encode(&TabRequest { tab_id: &tab }),
+            ))
+            .await
+            .unwrap();
+    }
+    let mut attachment_ids = Vec::new();
+    while attachment_ids.len() < 3 {
+        let event = response(&mut socket).await;
+        if event.kind == "terminal.attach" {
+            attachment_ids.push(decode::<AttachedReply>(&event.payload).attachment_id);
+        }
+    }
+
+    pty.emit(pty.last_id(), format!("\r\n{row}").as_bytes());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    socket
+        .send(request(
+            4,
+            "terminal.resume",
+            &encode(&ResumeRequest {
+                tab_id: &tab,
+                attachment_id: &attachment_ids[0],
+                revision: 0,
+            }),
+        ))
+        .await
+        .unwrap();
+    let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(tokio::time::Instant::now() < resume_deadline);
+        let event = response(&mut socket).await;
+        if event.request_id == 4 && event.kind == "terminal.resume" {
+            break;
+        }
+    }
+    socket
+        .send(request(
+            5,
+            "terminal.detach",
+            &encode(&AttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attachment_ids[1],
+            }),
+        ))
+        .await
+        .unwrap();
+    let detach_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(tokio::time::Instant::now() < detach_deadline);
+        let event = response(&mut socket).await;
+        if event.request_id == 5 && event.kind == "terminal.detach" {
+            break;
+        }
+    }
+    pty.exit(pty.last_id(), Some(0), None);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_final_snapshot = false;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(event) =
+            tokio::time::timeout(Duration::from_millis(500), response(&mut socket)).await
+        else {
+            continue;
+        };
+        if event.request_id == 0 && event.kind == "terminal.snapshot" {
+            saw_final_snapshot = true;
+            break;
+        }
+    }
+    assert!(
+        saw_final_snapshot,
+        "Finalized must cancel blocked live admission instead of waiting behind it"
+    );
+
+    socket.close(None).await.ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn operations_during_final_transfer_are_correlated_and_a_sibling_stays_usable() {
+    let root = private_test_dir("during-final-operations");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let exiting_tab = registry
+        .open(TabLaunch::new(
+            "Exiting",
+            "during-final-operations",
+            TerminalSize::try_new(512, 16).unwrap(),
+        ))
+        .unwrap();
+    let exiting_pty = pty.last_id();
+    let cell = format!("x{}", "\u{301}".repeat(32));
+    let row = cell.repeat(512);
+    pty.emit(
+        exiting_pty,
+        (0..16)
+            .map(|_| row.as_str())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .as_bytes(),
+    );
+    let sibling_tab = registry
+        .open(TabLaunch::new(
+            "Sibling",
+            "during-final-sibling",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest {
+                tab_id: &exiting_tab,
+            }),
+        ))
+        .await
+        .unwrap();
+    let exiting: AttachedReply = decode(&response(&mut socket).await.payload);
+    loop {
+        let event = response(&mut socket).await;
+        if event.kind == "terminal.snapshot" {
+            let chunk: SnapshotChunkReply = decode(&event.payload);
+            if chunk.index + 1 == chunk.total {
+                break;
+            }
+        }
+    }
+    socket
+        .send(request(
+            2,
+            "terminal.attach",
+            &encode(&TabRequest {
+                tab_id: &sibling_tab,
+            }),
+        ))
+        .await
+        .unwrap();
+    let sibling: AttachedReply = decode(&response(&mut socket).await.payload);
+    let _sibling_snapshot = response_kind(&mut socket, "terminal.snapshot").await;
+
+    pty.exit(exiting_pty, Some(0), None);
+    loop {
+        let event = response(&mut socket).await;
+        if event.request_id == 0 && event.kind == "terminal.snapshot" {
+            let chunk: SnapshotChunkReply = decode(&event.payload);
+            if chunk.attachment_id.as_deref() == Some(exiting.attachment_id.as_str()) {
+                assert!(chunk.total > 1);
+                break;
+            }
+        }
+    }
+
+    let operations = [
+        request(
+            3,
+            "terminal.input",
+            &encode(&InputRequest {
+                tab_id: &exiting_tab,
+                attachment_id: &exiting.attachment_id,
+                data: b"x".to_vec(),
+            }),
+        ),
+        request(
+            4,
+            "terminal.resize",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &exiting_tab,
+                attachment_id: &exiting.attachment_id,
+                size: TerminalSize::try_new(512, 16).unwrap(),
+            }),
+        ),
+        request(
+            5,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &exiting_tab,
+                attachment_id: &exiting.attachment_id,
+                size: TerminalSize::try_new(512, 16).unwrap(),
+            }),
+        ),
+        request(
+            6,
+            "terminal.scrollback",
+            &encode(&ScrollbackRequest {
+                tab_id: &exiting_tab,
+                attachment_id: &exiting.attachment_id,
+                offset: 0,
+                count: 1,
+            }),
+        ),
+        request(
+            7,
+            "terminal.resume",
+            &encode(&ResumeRequest {
+                tab_id: &exiting_tab,
+                attachment_id: &exiting.attachment_id,
+                revision: 0,
+            }),
+        ),
+        request(
+            8,
+            "terminal.detach",
+            &encode(&AttachmentRequest {
+                tab_id: &exiting_tab,
+                attachment_id: &exiting.attachment_id,
+            }),
+        ),
+    ];
+    let mut saw_exit = false;
+    for (request_id, operation) in (3u64..=8).zip(operations) {
+        socket.send(operation).await.unwrap();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), response(&mut socket))
+                .await
+                .expect("finalizing requests must remain responsive");
+            if event.kind == "terminal.exited" {
+                saw_exit = true;
+            }
+            if event.request_id == request_id {
+                assert_eq!(event.kind, "error");
+                assert_eq!(
+                    decode::<ErrorReply>(&event.payload).code,
+                    "terminal.attachment_closed"
+                );
+                break;
+            }
+        }
+    }
+
+    socket
+        .send(request(
+            9,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &sibling_tab,
+                attachment_id: &sibling.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    loop {
+        let event = response(&mut socket).await;
+        if event.kind == "terminal.exited" {
+            saw_exit = true;
+        }
+        if event.request_id == 9 {
+            if event.kind == "error" {
+                let error: ErrorReply = decode(&event.payload);
+                panic!("sibling focus failed: {}", error.code);
+            }
+            assert_eq!(event.kind, "terminal.focus");
+            break;
+        }
+    }
+    socket
+        .send(request(
+            10,
+            "terminal.resize",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &sibling_tab,
+                attachment_id: &sibling.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_kind(&mut socket, "terminal.resize")
+            .await
+            .request_id,
+        10
+    );
+    while !saw_exit {
+        if response(&mut socket).await.kind == "terminal.exited" {
+            saw_exit = true;
+        }
+    }
+
+    socket.close(None).await.ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn peer_close_cancels_a_blocked_dispatch_and_detaches_other_attachments() {
     let root = private_test_dir("cancel-blocked-dispatch");
     let (store, key, device_id) = paired_store(&root);

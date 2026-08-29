@@ -5,8 +5,8 @@ use super::model::{
 };
 use crate::tabs::{
     AttachmentId, AttachmentKind, RecoveryBoundary, TabAttachment, TabAttachmentCancellation,
-    TabDescriptor, TabError, TabEvent, TabEventReceiver, TabExit, TabId, TabLaunch,
-    TabReceiveError, TabRegistry,
+    TabDescriptor, TabError, TabEvent, TabEventReceiver, TabExit, TabFinalizationSignal, TabId,
+    TabLaunch, TabReceiveError, TabRegistry,
 };
 use crate::terminal::model::{
     CursorState, Revision, RowPatch, ScreenDiff, ScreenRow, ScreenSnapshot, TerminalModes,
@@ -169,6 +169,9 @@ impl fmt::Debug for RemoteTerminalEvents {
 }
 
 impl RemoteTerminalEvents {
+    pub fn finalization_signal(&self) -> TabFinalizationSignal {
+        self.receiver.finalization_signal()
+    }
     fn new(
         receiver: TabEventReceiver,
         cancellation: TabAttachmentCancellation,
