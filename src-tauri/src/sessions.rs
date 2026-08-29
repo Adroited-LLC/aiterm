@@ -5712,6 +5712,64 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn codex_rollout_set_uses_the_same_leased_transaction_and_strict_archive() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-codex-leased-rollouts-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions = root.join("sessions");
+        let dated = sessions.join("2026/08/29");
+        let trash_path = root.join("trash");
+        let main_path = dated.join("rollout-main.jsonl");
+        let extra_path = dated.join("rollout-extra.jsonl");
+        std::fs::create_dir_all(&dated).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::write(&main_path, b"main rollout").unwrap();
+        std::fs::write(&extra_path, b"extra rollout").unwrap();
+        let main = verified_directory_entry(&dated, &main_path).unwrap();
+        let extra = verified_directory_entry(&dated, &extra_path).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        archive_verified_inputs_with_hooks(
+            &trash,
+            vec![
+                VerifiedArchiveInput::Entry {
+                    source: main,
+                    destination_name: "session.jsonl".into(),
+                },
+                VerifiedArchiveInput::FileSet {
+                    sources: vec![(extra, b"2026/08/29/rollout-extra.jsonl".to_vec())],
+                    destination_name: "session.rollouts".into(),
+                },
+                VerifiedArchiveInput::Generated {
+                    bytes: main_path.as_os_str().as_bytes().to_vec(),
+                    destination_name: "session.origin".into(),
+                },
+            ],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(!main_path.exists());
+        assert!(!extra_path.exists());
+        assert!(trash_path.join("session.rollouts").is_file());
+        assert_eq!(
+            std::fs::read(trash_path.join("session.origin")).unwrap(),
+            main_path.as_os_str().as_bytes()
+        );
+        restore_file_set_archive(
+            &trash_path.join("session.rollouts"),
+            &sessions,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&extra_path).unwrap(), b"extra rollout");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sidecar_bounds_fail_before_publish_or_source_quarantine() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-sidecar-bounds-{}",
