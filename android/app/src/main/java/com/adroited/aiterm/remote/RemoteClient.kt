@@ -159,6 +159,10 @@ class RemoteClient(
             synchronized(lifecycleLock) { isCurrent(generation, candidate) }
         } catch (error: Exception) {
             candidate.close()
+            if (error is RemoteAccessRevokedException) {
+                accept(generation, RemoteServerEvent.Revoked)
+                return false
+            }
             synchronized(lifecycleLock) {
                 if (isCurrent(generation, candidate)) {
                     transport = null

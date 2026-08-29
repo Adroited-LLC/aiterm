@@ -180,6 +180,11 @@ class AuthenticatedRemoteTransport(
                 if (event.requestId != 0L) protocolFailure()
                 emitOrClose(RemoteServerEvent.RosterChunk(RemoteWireCodec.decodeStateSnapshot(event.payload)))
             }
+            "auth.revoked" -> {
+                if (event.requestId != 0L) protocolFailure()
+                emitOrClose(RemoteServerEvent.Revoked)
+                close()
+            }
             "error" -> acceptError(event)
             "session.changed", "agent.changed", "tab.changed", "terminal.exited",
             "terminal.title", "terminal.focus_changed" -> {

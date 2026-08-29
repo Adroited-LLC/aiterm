@@ -406,11 +406,15 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
         }
     };
     if proof.kind != "auth.proof"
-        || state
-            .devices
-            .verify_proof(&proof.device_id, &nonce, &proof.signature_der)
-            .is_err()
+        || state.devices.verify_proof(&proof.device_id, &nonce, &proof.signature_der).is_err()
     {
+        let _ = send_cbor(&mut socket, &AuthReply { kind: "auth.denied" }).await;
+        close_socket(&mut socket).await;
+        return;
+    }
+    let revocations = state.devices.subscribe_revocations();
+    if !state.devices.is_trusted(&proof.device_id) {
+        let _ = send_cbor(&mut socket, &AuthReply { kind: "auth.denied" }).await;
         close_socket(&mut socket).await;
         return;
     }
@@ -421,7 +425,14 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
         return;
     }
 
-    run_authenticated_socket(socket, state.services).await;
+    run_authenticated_socket(
+        socket,
+        state.services,
+        state.devices,
+        proof.device_id,
+        revocations,
+    )
+    .await;
 }
 
 /// Per-connection admission control for authenticated requests.
@@ -2857,7 +2868,13 @@ where
     }
 }
 
-async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
+async fn run_authenticated_socket(
+    socket: WebSocket,
+    services: RemoteServices,
+    devices: Arc<DeviceStore>,
+    device_id: String,
+    mut revocations: tokio::sync::watch::Receiver<u64>,
+) {
     let mut guard = RequestGuard::new(Instant::now());
     let (socket_sink, socket_stream) = socket.split();
     let (cancelled, mut cancellation) = tokio::sync::watch::channel(false);
@@ -2890,6 +2907,15 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
         reap_finished_attachments(&mut attachments, &mut closed_attachments).await;
         let message = tokio::select! {
             biased;
+            changed = revocations.changed() => {
+                if changed.is_err() || !devices.is_trusted(&device_id) {
+                    if let Ok(event) = response(0, "auth.revoked", &()) {
+                        let _ = enqueue_event(&outbound, event).await;
+                    }
+                    break;
+                }
+                continue;
+            }
             completed = completed_attachments.recv() => {
                 if let Some(id) = completed {
                     if let Some(attachment) = attachments.remove(&id) {

@@ -550,6 +550,35 @@ async fn authenticated_device_completes_a_real_tls_websocket_handshake() {
 }
 
 #[tokio::test]
+async fn revocation_notifies_and_closes_a_live_authenticated_connection() {
+    let root = private_test_dir("live-revocation");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store.clone(),
+        identity,
+        services(),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    assert!(store.revoke(&device_id).unwrap());
+    let revoked = tokio::time::timeout(Duration::from_secs(1), response(&mut socket))
+        .await
+        .expect("live revocation should be delivered before close");
+    assert_eq!(revoked.request_id, 0);
+    assert_eq!(revoked.kind, "auth.revoked");
+    assert_closed(&mut socket).await;
+
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn authenticated_connection_starts_with_a_recoverable_tab_state_snapshot() {
     let root = private_test_dir("initial-tab-state");
     let (store, key, device_id) = paired_store(&root);

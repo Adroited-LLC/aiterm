@@ -122,6 +122,27 @@ class AuthenticatedRemoteTransportTest {
     }
 
     @Test
+    fun explicitAuthenticationDenialIsReportedAsRevocation() = runTest {
+        val socket = FakeBinarySocket().apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 8 })))
+            incoming.trySend(hex("a1646b696e646b617574682e64656e696564"))
+        }
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(),
+            deviceKeys = RecordingDeviceKeys(),
+            isUnlocked = { true },
+            dialer = FakeDialer(socket),
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        val result = runCatching { transport.connect() }
+
+        assertTrue(result.exceptionOrNull() is RemoteAccessRevokedException)
+        assertTrue(socket.closed)
+    }
+
+    @Test
     fun responsesCompleteOnlyTheirCorrelatedPendingRequest() = runTest {
         val socket = FakeBinarySocket().apply {
             incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))

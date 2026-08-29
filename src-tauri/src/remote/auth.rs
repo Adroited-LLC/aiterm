@@ -78,6 +78,7 @@ struct StoreState {
 pub struct DeviceStore {
     root: PathBuf,
     state: Mutex<StoreState>,
+    revocations: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +98,7 @@ impl DeviceStore {
         std::fs::create_dir_all(&root).map_err(AuthError::storage)?;
         set_private_permissions(&root, 0o700).map_err(AuthError::storage)?;
         let devices = load_devices(&root.join(DEVICES_FILE))?;
+        let (revocations, _) = tokio::sync::watch::channel(0);
         Ok(Self {
             root,
             state: Mutex::new(StoreState {
@@ -105,6 +107,7 @@ impl DeviceStore {
                 pending_pairings: Vec::new(),
                 pairing_outcomes: HashMap::new(),
             }),
+            revocations,
         })
     }
 
@@ -360,7 +363,22 @@ impl DeviceStore {
         }
         persist_devices(&self.root.join(DEVICES_FILE), &devices)?;
         state.devices = devices;
+        drop(state);
+        self.revocations.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
         Ok(true)
+    }
+
+    pub(crate) fn subscribe_revocations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revocations.subscribe()
+    }
+
+    pub(crate) fn is_trusted(&self, device_id: &str) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.devices.iter().any(|device| device.view.id == device_id))
+            .unwrap_or(false)
     }
 }
 

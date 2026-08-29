@@ -8,6 +8,7 @@ import kotlinx.serialization.cbor.ByteString
 import kotlinx.serialization.cbor.Cbor
 
 class RemoteProtocolException(message: String, cause: Throwable? = null) : Exception(message, cause)
+class RemoteAccessRevokedException : Exception("remote access was revoked")
 
 data class RemoteEventEnvelope(
     val requestId: Long,
@@ -67,6 +68,7 @@ object RemoteWireCodec {
     fun decodeAuthOk(payload: ByteArray) {
         validate(payload)
         val reply = decode(AuthReplyWire.serializer(), payload)
+        if (reply.kind == "auth.denied") throw RemoteAccessRevokedException()
         if (reply.kind != "auth.ok") throw RemoteProtocolException("authentication was not accepted")
     }
 

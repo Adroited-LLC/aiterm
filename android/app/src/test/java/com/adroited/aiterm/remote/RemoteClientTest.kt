@@ -94,6 +94,29 @@ class RemoteClientTest {
     }
 
     @Test
+    fun explicitAuthenticationRevocationStopsReconnectAndPurgesState() = runTest {
+        val transport = object : RemoteTransport {
+            override val events = MutableSharedFlow<RemoteServerEvent>()
+            override suspend fun connect() = throw RemoteAccessRevokedException()
+            override suspend fun request(request: RemoteRequest): RemoteResponse = error("not connected")
+            override fun close() = Unit
+        }
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        assertFalse(client.connect())
+        assertEquals(ConnectionState.Revoked, client.state.value.connection)
+        advanceTimeBy(32_000)
+        runCurrent()
+        assertEquals(ConnectionState.Revoked, client.state.value.connection)
+    }
+
+    @Test
     fun rapidTabSelectionDetachesStaleAttachmentAndRejectsItsChunks() = runTest {
         val transport = DeferredRemoteTransport()
         val store = DefaultTerminalScreenStore()
