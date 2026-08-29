@@ -152,8 +152,11 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
               onClick={() => void lib.run()}
               title={!lib.ready ? "Turn it on and choose how it runs first" : undefined}
             >
-              {lib.running ? <><Icon of={Loader2} size="sm" className="spin" /> Reading…</> : `Catalogue now${lib.pending.length ? ` (${lib.pending.length})` : ""}`}
+              {lib.running
+                ? <><Icon of={Loader2} size="sm" className="spin" /> {lib.progress ? `${lib.progress.done} of ${lib.progress.total}` : "Reading…"}</>
+                : `Catalogue now${lib.pending.length ? ` (${lib.pending.length})` : ""}`}
             </button>
+            {lib.running && <button className="tui-plain" onClick={lib.stop} title="Stop after this batch">Stop</button>}
           </Row>
           {lib.report && (
             <div className="sgroup-foot">

@@ -3876,3 +3876,7 @@ input[type="range"]::-webkit-slider-thumb {
 .lib-error { color: var(--red); margin-top: 4px; }
 .lib-engines { display: flex; gap: 4px; flex-wrap: wrap; }
 .lib-engines .ns-agent-tab { flex: none; font-size: 12px; padding: 5px 9px; }
+.thr-stop { background: none; border: 1px solid transparent; border-radius: 4px; color: var(--text-faint); padding: 1px 3px; cursor: pointer; display: inline-flex; margin-left: 2px; }
+.thr-stop:hover { color: var(--red); border-color: var(--border); }
+.thr-bar { height: 3px; margin: -4px 6px 0; border-radius: 2px; background: var(--bg-raised); overflow: hidden; }
+.thr-bar > span { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.4s; }

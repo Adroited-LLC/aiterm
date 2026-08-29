@@ -19,9 +19,10 @@ import { LibrarianSettings } from "./settings";
 const QUIET_MS = 3 * 60_000;
 /** How long after the session list last changed the auto run waits. */
 const SETTLE_MS = 45_000;
-/** Sessions per run: enough to clear a backlog in a few runs, few enough
- *  that a bad model choice does not spend much before it is noticed. */
-const RUN_MAX = 40;
+/** Sessions per model call — one batch. A run is a loop of these, and the
+ *  store is re-read after each, so threads appear as they are written rather
+ *  than after the whole backlog; a stop lands between batches. */
+const BATCH = 8;
 
 /** Whether an entry still describes the session, or activity has moved on. */
 export function isCurrent(store: LibStore, s: Session): boolean {
@@ -33,7 +34,11 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
   const [store, setStore] = useState<LibStore>(EMPTY_LIB);
   const [running, setRunning] = useState(false);
   const [report, setReport] = useState<LibRunReport | null>(null);
+  /** How far the current run has got: sessions written so far, of those it
+   *  set out to read. */
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const runningRef = useRef(false);
+  const stopRef = useRef(false);
 
   const reload = useCallback(() => librarianState().then(setStore).catch(() => {}), []);
   useEffect(() => { void reload(); }, [reload]);
@@ -49,18 +54,37 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     const list = (only ?? pending).map((s) => ({ id: s.id, lastActive: s.last_active }));
     if (list.length === 0) return;
     runningRef.current = true;
+    stopRef.current = false;
     setRunning(true);
+    setProgress({ done: 0, total: list.length });
+    const total: LibRunReport = { done: 0, remaining: list.length, cost: 0, errors: [] };
+    setReport(null);
     try {
-      const r = await librarianRun(engine, list, RUN_MAX);
-      setReport(r);
+      // Batch by batch, so what is read shows up while the rest is being read.
+      // The backend picks the next unread ones each time; a batch that reads
+      // nothing means it is stuck, and the loop stops rather than spins.
+      for (;;) {
+        if (stopRef.current) break;
+        const r = await librarianRun(engine, list, BATCH);
+        total.done += r.done;
+        total.cost += r.cost;
+        total.errors.push(...r.errors);
+        total.remaining = r.remaining;
+        setProgress({ done: total.done, total: list.length });
+        await reload();
+        if (r.remaining === 0 || r.done === 0) break;
+      }
+      setReport(total);
     } catch (e) {
-      setReport({ done: 0, remaining: list.length, cost: 0, errors: [String(e)] });
+      setReport({ ...total, errors: [...total.errors, String(e)] });
     } finally {
       runningRef.current = false;
       setRunning(false);
+      setProgress(null);
       await reload();
     }
-  }, [ready, pending, cfg.engine, cfg.providerId, cfg.model, reload]);
+  }, [ready, pending, engine, reload]);
+  const stop = useCallback(() => { stopRef.current = true; }, []);
 
   // The auto run: once the list has been still for a while, catalogue what
   // has been quiet for a while. Re-armed by every change to the list, so a
@@ -89,7 +113,7 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     await reload();
   }, [reload]);
 
-  return { store, running, report, pending, ready, run, forget, renameThread };
+  return { store, running, report, progress, pending, ready, run, stop, forget, renameThread, reload };
 }
 
 export type LibrarianCtl = ReturnType<typeof useLibrarian>;

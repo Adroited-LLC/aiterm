@@ -8,14 +8,14 @@
  * and engines they span, the most recent one (whose summary is "where it
  * left off"), and when that was.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { LibStore, Session, homeAbbrev } from "../ipc";
 import { LibrarianCtl } from "../librarian";
 import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import { agentTint } from "../brand";
-import { BookOpen, ChevronRight, Loader2, Pencil, Play, Sparkles } from "lucide-react";
+import { BookOpen, ChevronRight, Loader2, Pencil, Play, Sparkles, Square } from "lucide-react";
 
 interface ThreadCard {
   id: string;
@@ -84,6 +84,9 @@ export default function ThreadsView({
   const { format: timeFormat } = useTimeFormat();
   const when = (ms: number) => fmtTimeShort(ms, timeFormat);
   const { threads, loose, uncatalogued } = useMemo(() => buildThreads(lib.store, sessions), [lib.store, sessions]);
+  // Opening the tab re-reads the store: a run started elsewhere — or a test
+  // from a shell — may have written since it was last loaded.
+  useEffect(() => { void lib.reload(); }, []);
   const [open, setOpen] = useState<Set<string>>(() => new Set());
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -141,20 +144,27 @@ export default function ThreadsView({
           {uncatalogued > 0 && <> · {uncatalogued} not yet read</>}
         </span>
         {lib.running ? (
-          <span className="thr-running"><Icon of={Loader2} size="sm" className="spin" /> reading…</span>
+          <span className="thr-running">
+            <Icon of={Loader2} size="sm" className="spin" />
+            {lib.progress ? `${lib.progress.done} of ${lib.progress.total}` : "reading…"}
+            <button className="thr-stop" title="Stop after this batch" onClick={lib.stop}><Icon of={Square} size="sm" /></button>
+          </span>
         ) : lib.pending.length > 0 ? (
           <button className="thr-run" onClick={() => void lib.run()} title="Read the sessions the librarian has not seen yet">
             <Icon of={Sparkles} size="sm" /> Catalogue {lib.pending.length}
           </button>
         ) : null}
       </div>
+      {lib.running && lib.progress && (
+        <div className="thr-bar"><span style={{ width: `${Math.max(3, (100 * lib.progress.done) / Math.max(1, lib.progress.total))}%` }} /></div>
+      )}
       {lib.report?.errors.length ? (
         <div className="thr-error">{lib.report.errors[0]}</div>
       ) : null}
 
       {threads.length === 0 && loose.length === 0 && (
         <div className="thr-empty-text">
-          {lib.running ? "The first threads will appear as soon as the first batch is read." : "Nothing catalogued yet — press Catalogue above."}
+          {lib.running ? "Reading the first batch — about eight sessions at a time; the first threads land in a minute or two." : "Nothing catalogued yet — press Catalogue above."}
         </div>
       )}
 
