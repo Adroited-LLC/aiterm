@@ -50,20 +50,22 @@ export function absTime(ms: number): string {
   if (d.getFullYear() === new Date().getFullYear()) {
     return `${d.toLocaleDateString([], { month: "short", day: "numeric" })}, ${clock(d)}`;
   }
-  return d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+  return `${d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}, ${clock(d)}`;
 }
 
-/** The same, squeezed for a row corner: "10:31p", "Tue 10:31p", "Aug 21", "Jul 2025". */
+/** The same, squeezed for a row corner: "10:31p", "Tue 10:31p",
+ *  "Aug 21 10:31p", "Jul 24 '25 10:31p". The clock time is always there —
+ *  the point of the setting is telling two sessions apart, and a bare date
+ *  cannot. */
 export function absTimeShort(ms: number): string {
   const d = new Date(ms);
   const today = startOfToday();
   const c = clock(d).replace(/\s?AM$/i, "a").replace(/\s?PM$/i, "p");
   if (ms >= today) return c;
   if (ms >= today - 6 * DAY) return `${d.toLocaleDateString([], { weekday: "short" })} ${c}`;
-  if (d.getFullYear() === new Date().getFullYear()) {
-    return d.toLocaleDateString([], { month: "short", day: "numeric" });
-  }
-  return d.toLocaleDateString([], { month: "short", year: "numeric" });
+  const day = d.toLocaleDateString([], { month: "short", day: "numeric" });
+  if (d.getFullYear() === new Date().getFullYear()) return `${day} ${c}`;
+  return `${day} '${String(d.getFullYear()).slice(-2)} ${c}`;
 }
 
 /** "5m ago" / "3h ago" / "2d ago". */
