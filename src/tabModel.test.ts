@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  applyTabRegistryEvent, createTabExitCatchUp, reconcileTabs,
+  applyTabRegistryEvent, createTabExitCatchUp, createTabRegistryRecovery, reconcileTabs,
 } from "./tabModel.ts";
 
 test("remote open and requested close reconcile the desktop roster without an ended tab", () => {
@@ -44,6 +44,66 @@ test("a desktop registry revision gap requests snapshot recovery without applyin
 
   assert.equal(applied.needsSnapshot, true);
   assert.deepEqual(applied.projection, before);
+});
+
+test("registry recovery replays the event after an in-flight snapshot revision", async () => {
+  let resolveSnapshot!: (snapshot: { revision: number; tabs: Array<{ id: string; title: string }> }) => void;
+  const snapshot = new Promise<{ revision: number; tabs: Array<{ id: string; title: string }> }>(
+    (resolve) => { resolveSnapshot = resolve; },
+  );
+  const applied: number[] = [];
+  const recovery = createTabRegistryRecovery<{ id: string; title: string }>(
+    { revision: null, tabs: [] },
+    () => snapshot,
+    (projection) => applied.push(projection.revision ?? -1),
+  );
+
+  const recovering = recovery.recover();
+  recovery.accept({
+    change: "opened",
+    revision: 8,
+    tabId: "tab-8",
+    tab: { id: "tab-8", title: "arrived during recovery" },
+  });
+  resolveSnapshot({ revision: 7, tabs: [{ id: "tab-7", title: "snapshot" }] });
+  await recovering;
+
+  assert.deepEqual(applied, [7, 8]);
+  assert.equal(recovery.projection().revision, 8);
+  assert.deepEqual(recovery.projection().tabs.map((tab) => tab.id), ["tab-7", "tab-8"]);
+});
+
+test("registry recovery refetches when queued post-snapshot revisions have a gap", async () => {
+  const snapshots = [
+    { revision: 4, tabs: [{ id: "tab-4", title: "old" }] },
+    { revision: 6, tabs: [{ id: "tab-6", title: "current" }] },
+  ];
+  let loads = 0;
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const recovery = createTabRegistryRecovery<{ id: string; title: string }>(
+    { revision: null, tabs: [] },
+    async () => {
+      const index = loads++;
+      if (index === 0) await firstGate;
+      return snapshots[index];
+    },
+    () => {},
+  );
+
+  const recovering = recovery.recover();
+  recovery.accept({
+    change: "opened",
+    revision: 6,
+    tabId: "tab-6",
+    tab: { id: "tab-6", title: "gap" },
+  });
+  releaseFirst();
+  await recovering;
+
+  assert.equal(loads, 2);
+  assert.equal(recovery.projection().revision, 6);
+  assert.deepEqual(recovery.projection().tabs, snapshots[1].tabs);
 });
 
 test("Rust descriptors replace metadata without changing active tab identity", () => {
