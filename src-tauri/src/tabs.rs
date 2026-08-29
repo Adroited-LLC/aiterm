@@ -246,6 +246,14 @@ pub enum TabState {
     Exited,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TabFocus {
+    Desktop,
+    Remote,
+    Unowned,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabExit {
@@ -283,7 +291,9 @@ pub struct TabDescriptor {
     env_provider: Option<String>,
     env_model: Option<String>,
     size: TerminalSize,
+    #[serde(skip)]
     input_owner: Option<AttachmentId>,
+    focus: TabFocus,
     state: TabState,
     exit: Option<TabExit>,
 }
@@ -341,6 +351,10 @@ impl TabDescriptor {
         self.input_owner.as_ref()
     }
 
+    pub fn focus(&self) -> TabFocus {
+        self.focus
+    }
+
     pub fn state(&self) -> &TabState {
         &self.state
     }
@@ -364,6 +378,55 @@ pub enum TabEvent {
     Title(String),
     Bell,
     Exited(TabExit),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabRegistryEvent {
+    Snapshot {
+        revision: u64,
+        tabs: Vec<TabDescriptor>,
+    },
+    Opened {
+        revision: u64,
+        tab: TabDescriptor,
+    },
+    Changed {
+        revision: u64,
+        tab: TabDescriptor,
+    },
+    Removed {
+        revision: u64,
+        tab_id: TabId,
+        requested: bool,
+    },
+}
+
+impl TabRegistryEvent {
+    pub fn revision(&self) -> u64 {
+        match self {
+            Self::Snapshot { revision, .. }
+            | Self::Opened { revision, .. }
+            | Self::Changed { revision, .. }
+            | Self::Removed { revision, .. } => *revision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabRegistrySnapshot {
+    revision: u64,
+    tabs: Vec<TabDescriptor>,
+}
+
+impl TabRegistrySnapshot {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn tabs(&self) -> &[TabDescriptor] {
+        &self.tabs
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -802,6 +865,158 @@ fn pop_next(state: &mut MailboxState) -> Option<TabEvent> {
     }
 }
 
+#[derive(Default)]
+struct RegistryMailboxState {
+    queue: VecDeque<TabRegistryEvent>,
+    receiver_closed: bool,
+    producer_closed: bool,
+}
+
+struct RegistryMailbox {
+    capacity: usize,
+    state: Mutex<RegistryMailboxState>,
+    changed: Condvar,
+    async_changed: Notify,
+}
+
+impl RegistryMailbox {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(RegistryMailboxState::default()),
+            changed: Condvar::new(),
+            async_changed: Notify::new(),
+        }
+    }
+
+    fn push_initial(&self, snapshot: TabRegistryEvent) {
+        let mut state = self.state.lock().unwrap();
+        if state.receiver_closed || state.producer_closed {
+            return;
+        }
+        state.queue.push_back(snapshot);
+        self.changed.notify_one();
+        self.async_changed.notify_one();
+    }
+
+    fn push(&self, event: TabRegistryEvent, recovery: &TabRegistryEvent) {
+        let mut state = self.state.lock().unwrap();
+        if state.receiver_closed || state.producer_closed {
+            return;
+        }
+        if state.queue.len() >= self.capacity {
+            state.queue.clear();
+            state.queue.push_back(recovery.clone());
+        } else {
+            state.queue.push_back(event);
+        }
+        self.changed.notify_one();
+        self.async_changed.notify_one();
+    }
+
+    fn recv(&self) -> Result<TabRegistryEvent, RecvError> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(event) = state.queue.pop_front() {
+                return Ok(event);
+            }
+            if state.receiver_closed || state.producer_closed {
+                return Err(RecvError);
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<TabRegistryEvent, RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(event) = state.queue.pop_front() {
+                return Ok(event);
+            }
+            if state.receiver_closed || state.producer_closed {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let (next, timeout_result) = self.changed.wait_timeout(state, deadline - now).unwrap();
+            state = next;
+            if timeout_result.timed_out() && state.queue.is_empty() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+        }
+    }
+
+    async fn recv_async(&self) -> Option<TabRegistryEvent> {
+        loop {
+            let notified = self.async_changed.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(event) = state.queue.pop_front() {
+                    return Some(event);
+                }
+                if state.receiver_closed || state.producer_closed {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn close_receiver(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.receiver_closed = true;
+        state.queue.clear();
+        self.changed.notify_all();
+        self.async_changed.notify_one();
+    }
+
+    fn close_producer(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.producer_closed = true;
+        self.changed.notify_all();
+        self.async_changed.notify_one();
+    }
+}
+
+pub struct TabRegistryEventReceiver {
+    mailbox: Arc<RegistryMailbox>,
+    registry: Weak<RegistryInner>,
+}
+
+impl TabRegistryEventReceiver {
+    pub fn recv(&self) -> Result<TabRegistryEvent, RecvError> {
+        self.mailbox.recv()
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<TabRegistryEvent, RecvTimeoutError> {
+        self.mailbox.recv_timeout(timeout)
+    }
+
+    pub async fn recv_async(&self) -> Option<TabRegistryEvent> {
+        self.mailbox.recv_async().await
+    }
+}
+
+impl Drop for TabRegistryEventReceiver {
+    fn drop(&mut self) {
+        self.mailbox.close_receiver();
+        let target = Arc::as_ptr(&self.mailbox);
+        if let Some(registry) = self.registry.upgrade() {
+            registry
+                .maps
+                .lock()
+                .unwrap()
+                .subscribers
+                .retain(|subscriber| {
+                    subscriber.strong_count() > 0 && subscriber.as_ptr() != target
+                });
+        }
+    }
+}
+
 pub struct TabAttachment {
     pub id: AttachmentId,
     pub events: TabEventReceiver,
@@ -1012,6 +1227,21 @@ impl TabRegistry {
         receiver
     }
 
+    pub fn subscribe_changes(&self) -> TabRegistryEventReceiver {
+        let mailbox = Arc::new(RegistryMailbox::new(self.inner.queue_capacity));
+        let mut maps = self.inner.maps.lock().unwrap();
+        mailbox.push_initial(maps.snapshot_event());
+        maps.subscribers.push(Arc::downgrade(&mailbox));
+        TabRegistryEventReceiver {
+            mailbox,
+            registry: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub fn roster_snapshot(&self) -> TabRegistrySnapshot {
+        self.inner.maps.lock().unwrap().snapshot()
+    }
+
     pub fn open_desktop(&self, mut launch: TabLaunch) -> Result<TabId, TabError> {
         launch.desktop_pending = true;
         self.open(launch)
@@ -1045,6 +1275,7 @@ impl TabRegistry {
             env_model: launch.env_model,
             size: launch.size,
             input_owner: None,
+            focus: TabFocus::Unowned,
             state: TabState::Running,
             exit: None,
         };
@@ -1210,6 +1441,11 @@ impl TabRegistry {
             }
             let descriptor = live.descriptor.clone();
             live.enqueue_control_all(TabEvent::Metadata(descriptor.clone()));
+            self.inner
+                .maps
+                .lock()
+                .unwrap()
+                .publish_changed(descriptor.clone());
             descriptor
         };
         Ok(descriptor)
@@ -1235,7 +1471,7 @@ impl TabRegistry {
         let mailbox = Arc::new(EventMailbox::new(kind, self.inner.queue_capacity));
         let _output_order = tab.raw.send_order.lock().unwrap();
         tab.raw.require_open()?;
-        let descriptor = {
+        let (descriptor, focus_changed) = {
             let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return Err(TabError::new("tab.closed", "the tab has exited"));
@@ -1257,15 +1493,21 @@ impl TabRegistry {
                     mailbox: mailbox.clone(),
                 },
             );
-            if kind == AttachmentKind::Desktop && live.descriptor.input_owner.is_none() {
+            let focus_changed =
+                kind == AttachmentKind::Desktop && live.descriptor.input_owner.is_none();
+            if focus_changed {
                 live.descriptor.input_owner = Some(attachment_id.clone());
+                live.descriptor.focus = TabFocus::Desktop;
                 live.enqueue_control_all(TabEvent::FocusChanged {
                     owner: Some(attachment_id.clone()),
                     size: live.descriptor.size,
                 });
             }
-            live.descriptor.clone()
+            (live.descriptor.clone(), focus_changed)
         };
+        if focus_changed {
+            self.inner.publish_changed(descriptor.clone());
+        }
         if kind == AttachmentKind::Desktop {
             // Replay is asynchronous: a backlog larger than the downstream
             // mailbox cannot deadlock this attach before JS receives its
@@ -1393,7 +1635,7 @@ impl TabRegistry {
         let tab = self.inner.tab(id)?;
         let _output_order = tab.raw.send_order.lock().unwrap();
         tab.raw.require_open()?;
-        {
+        let descriptor = {
             let mut live = tab.live.lock().unwrap();
             live.authorize_owner(attachment)?;
             let pty_id = live.live_pty()?;
@@ -1402,7 +1644,9 @@ impl TabRegistry {
                 .resize(pty_id, size.cols(), size.rows())
                 .map_err(|error| TabError::new("terminal.resize_failed", error))?;
             live.resize(id, size);
-        }
+            live.descriptor.clone()
+        };
+        self.inner.publish_changed(descriptor);
         Ok(())
     }
 
@@ -1415,7 +1659,7 @@ impl TabRegistry {
         let tab = self.inner.tab(id)?;
         let _output_order = tab.raw.send_order.lock().unwrap();
         tab.raw.require_open()?;
-        {
+        let descriptor = {
             let mut live = tab.live.lock().unwrap();
             if !live.attachments.contains_key(attachment) {
                 return Err(TabError::new(
@@ -1429,12 +1673,18 @@ impl TabRegistry {
                 .resize(pty_id, size.cols(), size.rows())
                 .map_err(|error| TabError::new("terminal.resize_failed", error))?;
             live.descriptor.input_owner = Some(attachment.clone());
+            live.descriptor.focus = match live.attachments[attachment].kind {
+                AttachmentKind::Desktop => TabFocus::Desktop,
+                AttachmentKind::Remote => TabFocus::Remote,
+            };
             live.resize(id, size);
             live.enqueue_control_all(TabEvent::FocusChanged {
                 owner: Some(attachment.clone()),
                 size,
             });
-        }
+            live.descriptor.clone()
+        };
+        self.inner.publish_changed(descriptor);
         Ok(())
     }
 
@@ -1456,7 +1706,7 @@ impl TabRegistry {
         if let Some(exit) = exit {
             self.inner.publish_exit(id, &exit);
         }
-        self.inner.remove_tab(id, &slot_id, pty_id);
+        self.inner.remove_tab(id, &slot_id, pty_id, true);
         if let Some(pty_id) = pty_id {
             self.inner.backend.kill(pty_id);
         }
@@ -1489,6 +1739,61 @@ struct DesktopTabExit {
     signal: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(
+    tag = "change",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
+enum DesktopTabRegistryEvent {
+    Snapshot {
+        revision: u64,
+        tabs: Vec<TabDescriptor>,
+    },
+    Opened {
+        revision: u64,
+        tab_id: TabId,
+        tab: TabDescriptor,
+    },
+    Changed {
+        revision: u64,
+        tab_id: TabId,
+        tab: TabDescriptor,
+    },
+    Removed {
+        revision: u64,
+        tab_id: TabId,
+        requested: bool,
+    },
+}
+
+impl From<TabRegistryEvent> for DesktopTabRegistryEvent {
+    fn from(event: TabRegistryEvent) -> Self {
+        match event {
+            TabRegistryEvent::Snapshot { revision, tabs } => Self::Snapshot { revision, tabs },
+            TabRegistryEvent::Opened { revision, tab } => Self::Opened {
+                revision,
+                tab_id: tab.id().clone(),
+                tab,
+            },
+            TabRegistryEvent::Changed { revision, tab } => Self::Changed {
+                revision,
+                tab_id: tab.id().clone(),
+                tab,
+            },
+            TabRegistryEvent::Removed {
+                revision,
+                tab_id,
+                requested,
+            } => Self::Removed {
+                revision,
+                tab_id,
+                requested,
+            },
+        }
+    }
+}
+
 fn command_error(error: TabError) -> String {
     error.to_string()
 }
@@ -1504,16 +1809,40 @@ fn emit_desktop_exit(app: &AppHandle, tab_id: &TabId, exit: &TabExit) {
     );
 }
 
-/// Start the one process-wide projection from registry exits to Tauri events.
-/// Setup installs it before the webview can open a tab, so the channel needs
-/// no replay lane and attachment workers never duplicate lifecycle events.
-pub fn start_desktop_exit_bridge(app: AppHandle, registry: Arc<TabRegistry>) -> Result<(), String> {
-    let exits = registry.subscribe_exits();
+fn unexpected_desktop_exits(change: &TabRegistryEvent) -> Vec<(TabId, TabExit)> {
+    fn unexpected(tab: &TabDescriptor) -> Option<(TabId, TabExit)> {
+        tab.exit()
+            .filter(|exit| !exit.requested())
+            .map(|exit| (tab.id().clone(), exit.clone()))
+    }
+
+    match change {
+        TabRegistryEvent::Snapshot { tabs, .. } => tabs.iter().filter_map(unexpected).collect(),
+        TabRegistryEvent::Opened { tab, .. } | TabRegistryEvent::Changed { tab, .. } => {
+            unexpected(tab).into_iter().collect()
+        }
+        TabRegistryEvent::Removed { .. } => Vec::new(),
+    }
+}
+
+/// Project the bounded, recoverable process-wide registry stream into the
+/// desktop renderer. Attachment workers remain raw-byte-only, so tabs opened
+/// or closed by another transport are visible even when no desktop terminal
+/// is attached.
+pub fn start_desktop_registry_bridge(
+    app: AppHandle,
+    registry: Arc<TabRegistry>,
+) -> Result<(), String> {
+    let changes = registry.subscribe_changes();
     std::thread::Builder::new()
-        .name("desktop-tab-exits".to_string())
+        .name("desktop-tab-registry".to_string())
         .spawn(move || {
-            while let Ok((tab_id, exit)) = exits.recv() {
-                emit_desktop_exit(&app, &tab_id, &exit);
+            while let Ok(change) = changes.recv() {
+                let unexpected_exits = unexpected_desktop_exits(&change);
+                let _ = app.emit("tab://registry", DesktopTabRegistryEvent::from(change));
+                for (tab_id, exit) in unexpected_exits {
+                    emit_desktop_exit(&app, &tab_id, &exit);
+                }
             }
         })
         .map(|_| ())
@@ -1539,6 +1868,11 @@ pub fn tab_list(state: State<'_, Arc<TabRegistry>>) -> Vec<TabDescriptor> {
 }
 
 #[tauri::command]
+pub fn tab_registry_snapshot(state: State<'_, Arc<TabRegistry>>) -> TabRegistrySnapshot {
+    state.roster_snapshot()
+}
+
+#[tauri::command]
 pub fn tab_update(
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
@@ -1547,9 +1881,26 @@ pub fn tab_update(
     state.update(&tab_id, update).map_err(command_error)
 }
 
+fn forward_desktop_events(events: TabEventReceiver, mut send_raw: impl FnMut(Vec<u8>) -> bool) {
+    while let Ok(event) = events.recv() {
+        match event {
+            TabEvent::Raw(bytes) => {
+                if !send_raw(bytes) {
+                    break;
+                }
+            }
+            TabEvent::Metadata(_) | TabEvent::Title(_) | TabEvent::Exited(_) => {}
+            TabEvent::Snapshot(_)
+            | TabEvent::SharedSnapshot(_)
+            | TabEvent::Diff(_)
+            | TabEvent::FocusChanged { .. }
+            | TabEvent::Bell => {}
+        }
+    }
+}
+
 #[tauri::command]
 pub fn tab_attach_desktop(
-    app: AppHandle,
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
     on_output: Channel<InvokeResponseBody>,
@@ -1563,27 +1914,9 @@ pub fn tab_attach_desktop(
     std::thread::Builder::new()
         .name(format!("desktop-tab-{}", tab_id.as_str()))
         .spawn(move || {
-            while let Ok(event) = events.recv() {
-                match event {
-                    TabEvent::Raw(bytes) => {
-                        let _ = on_output.send(InvokeResponseBody::Raw(bytes));
-                    }
-                    TabEvent::Metadata(descriptor) => {
-                        let _ = app.emit("tab://changed", descriptor);
-                    }
-                    TabEvent::Title(_) => {
-                        if let Ok(descriptor) = registry.get(&tab_id) {
-                            let _ = app.emit("tab://changed", descriptor);
-                        }
-                    }
-                    TabEvent::Exited(_) => {}
-                    TabEvent::Snapshot(_)
-                    | TabEvent::SharedSnapshot(_)
-                    | TabEvent::Diff(_)
-                    | TabEvent::FocusChanged { .. }
-                    | TabEvent::Bell => {}
-                }
-            }
+            forward_desktop_events(events, |bytes| {
+                on_output.send(InvokeResponseBody::Raw(bytes)).is_ok()
+            });
         })
         .map_err(|error| error.to_string())?;
     Ok(attachment_id)
@@ -1673,6 +2006,16 @@ struct RegistryInner {
     exit_subscribers: Mutex<Vec<mpsc::Sender<(TabId, TabExit)>>>,
 }
 
+impl Drop for RegistryInner {
+    fn drop(&mut self) {
+        if let Ok(maps) = self.maps.get_mut() {
+            for subscriber in maps.subscribers.iter().filter_map(Weak::upgrade) {
+                subscriber.close_producer();
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct RegistryMaps {
     by_id: HashMap<TabId, Arc<TabCell>>,
@@ -1680,6 +2023,71 @@ struct RegistryMaps {
     by_pty: HashMap<u32, TabId>,
     pending_slots: HashMap<String, TabId>,
     order: Vec<TabId>,
+    roster: HashMap<TabId, TabDescriptor>,
+    revision: u64,
+    subscribers: Vec<Weak<RegistryMailbox>>,
+}
+
+impl RegistryMaps {
+    fn snapshot(&self) -> TabRegistrySnapshot {
+        TabRegistrySnapshot {
+            revision: self.revision,
+            tabs: self
+                .order
+                .iter()
+                .filter_map(|id| self.roster.get(id).cloned())
+                .collect(),
+        }
+    }
+
+    fn snapshot_event(&self) -> TabRegistryEvent {
+        let snapshot = self.snapshot();
+        TabRegistryEvent::Snapshot {
+            revision: snapshot.revision,
+            tabs: snapshot.tabs,
+        }
+    }
+
+    fn publish_opened(&mut self, descriptor: TabDescriptor) {
+        self.roster
+            .insert(descriptor.id().clone(), descriptor.clone());
+        self.revision = self.revision.saturating_add(1);
+        self.publish(TabRegistryEvent::Opened {
+            revision: self.revision,
+            tab: descriptor,
+        });
+    }
+
+    fn publish_changed(&mut self, descriptor: TabDescriptor) {
+        self.roster
+            .insert(descriptor.id().clone(), descriptor.clone());
+        self.revision = self.revision.saturating_add(1);
+        self.publish(TabRegistryEvent::Changed {
+            revision: self.revision,
+            tab: descriptor,
+        });
+    }
+
+    fn publish_removed(&mut self, tab_id: TabId, requested: bool) {
+        self.roster.remove(&tab_id);
+        self.revision = self.revision.saturating_add(1);
+        self.publish(TabRegistryEvent::Removed {
+            revision: self.revision,
+            tab_id,
+            requested,
+        });
+    }
+
+    fn publish(&mut self, event: TabRegistryEvent) {
+        let recovery = self.snapshot_event();
+        self.subscribers.retain(|subscriber| {
+            let Some(subscriber) = subscriber.upgrade() else {
+                return false;
+            };
+            subscriber.push(event.clone(), &recovery);
+            true
+        });
+    }
 }
 
 struct TabCell {
@@ -1952,7 +2360,14 @@ impl RegistryInner {
             .ok_or_else(|| TabError::new("tab.not_found", "unknown tab id"))
     }
 
-    fn remove_tab(&self, id: &TabId, slot_id: &str, pty_id: Option<u32>) {
+    fn publish_changed(&self, descriptor: TabDescriptor) {
+        let mut maps = self.maps.lock().unwrap();
+        if maps.by_id.contains_key(descriptor.id()) {
+            maps.publish_changed(descriptor);
+        }
+    }
+
+    fn remove_tab(&self, id: &TabId, slot_id: &str, pty_id: Option<u32>, requested: bool) {
         let mut maps = self.maps.lock().unwrap();
         maps.by_id.remove(id);
         if maps.by_slot.get(slot_id) == Some(id) {
@@ -1963,6 +2378,7 @@ impl RegistryInner {
         }
         maps.order.retain(|candidate| candidate != id);
         maps.by_pty.retain(|_, tab_id| tab_id != id);
+        maps.publish_removed(id.clone(), requested);
     }
 
     fn release_pending_slot(&self, slot_id: &str, id: &TabId) {
@@ -2006,6 +2422,7 @@ impl RegistryInner {
         if let Some(pty_id) = pty_id {
             maps.by_pty.insert(pty_id, id.clone());
         }
+        maps.publish_opened(live.descriptor.clone());
         Ok(())
     }
 
@@ -2014,20 +2431,26 @@ impl RegistryInner {
             return false;
         };
         let _output_order = tab.raw.send_order.lock().unwrap();
-        let removed = {
+        let (removed, changed) = {
             let mut live = tab.live.lock().unwrap();
             let Some(attachment) = live.attachments.remove(attachment_id) else {
                 return false;
             };
+            let mut changed = None;
             if live.descriptor.input_owner.as_ref() == Some(attachment_id) {
                 live.descriptor.input_owner = None;
+                live.descriptor.focus = TabFocus::Unowned;
                 live.enqueue_control_all(TabEvent::FocusChanged {
                     owner: None,
                     size: live.descriptor.size,
                 });
+                changed = Some(live.descriptor.clone());
             }
-            attachment.kind
+            (attachment.kind, changed)
         };
+        if let Some(descriptor) = changed {
+            self.publish_changed(descriptor);
+        }
         if removed == AttachmentKind::Desktop {
             tab.raw.unregister(attachment_id);
         }
@@ -2138,6 +2561,7 @@ impl LiveTab {
         self.exit_notified = true;
         self.descriptor.state = TabState::Exited;
         self.descriptor.input_owner = None;
+        self.descriptor.focus = TabFocus::Unowned;
         let exit = TabExit {
             code,
             signal,
@@ -2231,7 +2655,7 @@ impl PtySink for TabSink {
             if tab.raw.is_closing() {
                 return;
             }
-            let flush = {
+            let (flush, changed) = {
                 let mut live = tab.live.lock().unwrap();
                 if live.descriptor.state != TabState::Running {
                     return;
@@ -2240,15 +2664,24 @@ impl PtySink for TabSink {
                 if let Some(diff) = damage.diff {
                     live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
                 }
-                if let Some(title) = damage.title {
+                let changed = if let Some(title) = damage.title {
                     live.descriptor.title = title.clone();
                     live.enqueue_control_all(TabEvent::Title(title));
-                }
+                    Some(live.descriptor.clone())
+                } else {
+                    None
+                };
                 if damage.bell {
                     live.enqueue_control_all(TabEvent::Bell);
                 }
-                live.queue_replies(damage.replies, desktop_opening_owns)
+                (
+                    live.queue_replies(damage.replies, desktop_opening_owns),
+                    changed,
+                )
             };
+            if let Some(descriptor) = changed {
+                registry.publish_changed(descriptor);
+            }
             if let Some(pty_id) = flush {
                 flush_replies(&registry, &tab, pty_id);
             }
@@ -2273,9 +2706,10 @@ impl PtySink for TabSink {
             live.pending_replies.clear();
             let id = live.descriptor.id.clone();
             let exit = live.mark_exited(code, signal.map(str::to_owned), false);
-            exit.map(|exit| (id, exit))
+            exit.map(|exit| (id, exit, live.descriptor.clone()))
         };
-        if let Some((id, exit)) = exit {
+        if let Some((id, exit, descriptor)) = exit {
+            registry.publish_changed(descriptor);
             registry.publish_exit(&id, &exit);
         }
         registry.maps.lock().unwrap().by_pty.remove(&pty_id);
@@ -2306,5 +2740,109 @@ fn flush_replies(registry: &RegistryInner, tab: &Arc<TabCell>, pty_id: u32) {
             }
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_desktop_channel_send_closes_the_attachment_receiver() {
+        let mailbox = Arc::new(EventMailbox::new(AttachmentKind::Desktop, 1));
+        let tab_id = TabId::new();
+        let attachment_id = AttachmentId::new();
+        let cancellation = TabAttachmentCancellation {
+            mailbox: mailbox.clone(),
+            registry: Weak::new(),
+            tab_id: tab_id.clone(),
+            attachment_id: attachment_id.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        let events = TabEventReceiver {
+            mailbox: mailbox.clone(),
+            tab_id,
+            attachment_id,
+            cancellation,
+        };
+        assert!(mailbox.push_raw(vec![1, 2, 3]));
+
+        let mut sends = 0;
+        forward_desktop_events(events, |_| {
+            sends += 1;
+            false
+        });
+
+        assert_eq!(sends, 1);
+        assert!(!mailbox.push_raw(vec![4]));
+    }
+
+    #[test]
+    fn desktop_snapshot_recovery_restores_an_unexpected_exit_notice() {
+        let tab_id = TabId::new();
+        let exit = TabExit {
+            code: Some(19),
+            signal: None,
+            requested: false,
+        };
+        let descriptor = TabDescriptor {
+            id: tab_id.clone(),
+            title: "ended".to_string(),
+            cwd: None,
+            command: None,
+            session_id: None,
+            resumed_id: None,
+            agent_id: None,
+            slot_id: "ended".to_string(),
+            fresh: false,
+            env_provider: None,
+            env_model: None,
+            size: TerminalSize::try_new(80, 24).unwrap(),
+            input_owner: None,
+            focus: TabFocus::Unowned,
+            state: TabState::Exited,
+            exit: Some(exit.clone()),
+        };
+
+        assert_eq!(
+            unexpected_desktop_exits(&TabRegistryEvent::Snapshot {
+                revision: 4,
+                tabs: vec![descriptor],
+            }),
+            vec![(tab_id, exit)]
+        );
+    }
+
+    #[test]
+    fn dropping_a_registry_change_receiver_removes_its_idle_subscriber_entry() {
+        struct NeverSpawn;
+
+        impl PtyBackend for NeverSpawn {
+            fn spawn(&self, _spec: PtySpawnSpec, _sink: Arc<dyn PtySink>) -> Result<u32, String> {
+                Err("unused".to_string())
+            }
+
+            fn write(&self, _id: u32, _bytes: &[u8]) -> Result<(), String> {
+                Err("unused".to_string())
+            }
+
+            fn resize(&self, _id: u32, _cols: u16, _rows: u16) -> Result<(), String> {
+                Err("unused".to_string())
+            }
+
+            fn kill(&self, _id: u32) {}
+
+            fn pty_for_descendant(&self, _pid: u32) -> Option<u32> {
+                None
+            }
+        }
+
+        let registry = TabRegistry::with_backend(Arc::new(NeverSpawn));
+        let changes = registry.subscribe_changes();
+        assert_eq!(registry.inner.maps.lock().unwrap().subscribers.len(), 1);
+
+        drop(changes);
+
+        assert!(registry.inner.maps.lock().unwrap().subscribers.is_empty());
     }
 }

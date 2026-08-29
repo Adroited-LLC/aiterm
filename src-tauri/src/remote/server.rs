@@ -9,7 +9,7 @@ use super::terminal::{
 };
 use crate::tabs::{
     AttachmentId, RecoveryBoundary, TabAttachmentCancellation, TabDescriptor, TabId, TabLaunch,
-    TabRegistry, TabState,
+    TabRegistry, TabRegistryEvent, TabState,
 };
 use crate::terminal::model::{Revision, ScreenDiff, ScreenSnapshot};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -758,6 +758,21 @@ struct TabListPayload {
 }
 
 #[derive(Serialize)]
+struct StateSnapshotPayload {
+    revision: u64,
+    tabs: Vec<RemoteTabDescriptor>,
+}
+
+#[derive(Serialize)]
+struct TabChangedPayload {
+    revision: u64,
+    change: &'static str,
+    tab_id: TabId,
+    tab: Option<RemoteTabDescriptor>,
+    requested: Option<bool>,
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteTabDescriptor {
     id: TabId,
@@ -907,11 +922,32 @@ fn remote_descriptor(
     descriptor: TabDescriptor,
     attachments: &HashMap<AttachmentId, OwnedAttachment>,
 ) -> RemoteTabDescriptor {
-    let own_attachment = descriptor.input_owner().filter(|owner| {
-        attachments.get(*owner).is_some_and(|attachment| {
+    let owns_input = descriptor.input_owner().is_some_and(|owner| {
+        attachments.get(owner).is_some_and(|attachment| {
             attachment.lifecycle.is_active() && &attachment.tab_id == descriptor.id()
         })
     });
+    project_remote_descriptor(descriptor, owns_input)
+}
+
+fn live_remote_descriptor(
+    descriptor: TabDescriptor,
+    attachments: &HashMap<AttachmentId, ConnectionAttachment>,
+) -> RemoteTabDescriptor {
+    let owns_input = descriptor.input_owner().is_some_and(|owner| {
+        attachments.get(owner).is_some_and(|attachment| {
+            attachment.lifecycle.is_active() && &attachment.tab_id == descriptor.id()
+        })
+    });
+    project_remote_descriptor(descriptor, owns_input)
+}
+
+fn project_remote_descriptor(descriptor: TabDescriptor, owns_input: bool) -> RemoteTabDescriptor {
+    let focus = match descriptor.input_owner() {
+        None => RemoteFocusState::Unowned,
+        Some(_) if owns_input => RemoteFocusState::Self_,
+        Some(_) => RemoteFocusState::Other,
+    };
     RemoteTabDescriptor {
         id: descriptor.id().clone(),
         title: descriptor.title().to_owned(),
@@ -925,9 +961,71 @@ fn remote_descriptor(
         env_provider: descriptor.env_provider().map(str::to_owned),
         env_model: descriptor.env_model().map(str::to_owned),
         size: descriptor.size(),
-        focus: remote_focus(descriptor.input_owner(), own_attachment),
+        focus,
         state: descriptor.state().clone(),
         exit: descriptor.exit().cloned(),
+    }
+}
+
+fn registry_event_response(
+    event: TabRegistryEvent,
+    attachments: &HashMap<AttachmentId, ConnectionAttachment>,
+) -> Result<RemoteEvent, &'static str> {
+    match event {
+        TabRegistryEvent::Snapshot { revision, tabs } => response(
+            0,
+            "state.snapshot",
+            &StateSnapshotPayload {
+                revision,
+                tabs: tabs
+                    .into_iter()
+                    .map(|tab| live_remote_descriptor(tab, attachments))
+                    .collect(),
+            },
+        ),
+        TabRegistryEvent::Opened { revision, tab } => {
+            let tab_id = tab.id().clone();
+            response(
+                0,
+                "tab.changed",
+                &TabChangedPayload {
+                    revision,
+                    change: "opened",
+                    tab_id,
+                    tab: Some(live_remote_descriptor(tab, attachments)),
+                    requested: None,
+                },
+            )
+        }
+        TabRegistryEvent::Changed { revision, tab } => {
+            let tab_id = tab.id().clone();
+            response(
+                0,
+                "tab.changed",
+                &TabChangedPayload {
+                    revision,
+                    change: "changed",
+                    tab_id,
+                    tab: Some(live_remote_descriptor(tab, attachments)),
+                    requested: None,
+                },
+            )
+        }
+        TabRegistryEvent::Removed {
+            revision,
+            tab_id,
+            requested,
+        } => response(
+            0,
+            "tab.changed",
+            &TabChangedPayload {
+                revision,
+                change: "removed",
+                tab_id,
+                tab: None,
+                requested: Some(requested),
+            },
+        ),
     }
 }
 
@@ -2350,6 +2448,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
         cancelled.clone(),
     ));
     let mut attachments = HashMap::<AttachmentId, ConnectionAttachment>::new();
+    let registry_events = services.registry.subscribe_changes();
     let mut closed_attachments = ClosedAttachments::default();
     let (attachment_completed, mut completed_attachments) =
         tokio::sync::mpsc::channel(MAX_ATTACHMENTS_PER_CONNECTION);
@@ -2368,6 +2467,18 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                         shutdown_attachment(attachment).await;
                         closed_attachments.insert(id, tab_id, lifecycle, transfers);
                     }
+                }
+                continue;
+            }
+            registry_event = registry_events.recv_async() => {
+                let Some(registry_event) = registry_event else { break; };
+                let Ok(event) = registry_event_response(registry_event, &attachments) else {
+                    let _ = cancelled.send(true);
+                    let _ = outbound.controls.try_send(EgressControl::Close);
+                    break;
+                };
+                if enqueue_event(&outbound, event).await.is_err() {
+                    break;
                 }
                 continue;
             }

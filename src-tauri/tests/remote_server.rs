@@ -5,7 +5,7 @@ use aiterm_lib::remote::server::{
     RemoteGateway, RemoteServices, TlsIdentity, MAX_SCROLLBACK_PAGE_ROWS, MAX_TERMINAL_INPUT_BYTES,
 };
 use aiterm_lib::tabs::{
-    AttachmentId, AttachmentKind, PtyBackend, TabLaunch, TabRegistry, TabUpdate,
+    AttachmentId, AttachmentKind, PtyBackend, TabLaunch, TabRegistry, TabRegistryEvent, TabUpdate,
 };
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -149,6 +149,29 @@ struct TabListReply {
 }
 
 #[derive(Deserialize)]
+struct RemoteRosterTab {
+    id: String,
+    title: String,
+    size: TerminalSize,
+    focus: String,
+}
+
+#[derive(Deserialize)]
+struct StateSnapshotReply {
+    revision: u64,
+    tabs: Vec<RemoteRosterTab>,
+}
+
+#[derive(Deserialize)]
+struct TabChangedReply {
+    revision: u64,
+    change: String,
+    tab_id: String,
+    tab: Option<RemoteRosterTab>,
+    requested: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct ErrorReply {
     code: String,
 }
@@ -250,6 +273,11 @@ struct OpenRequest {
 }
 
 #[derive(Deserialize)]
+struct TabOpenedReply {
+    tab_id: String,
+}
+
+#[derive(Deserialize)]
 struct ResumeReply {
     tab_id: String,
     attachment_id: String,
@@ -319,7 +347,11 @@ async fn challenge(socket: &mut TestSocket) -> Challenge {
     decode(&bytes)
 }
 
-async fn authenticate(socket: &mut TestSocket, key: &SigningKey, device_id: &str) {
+async fn authenticate(
+    socket: &mut TestSocket,
+    key: &SigningKey,
+    device_id: &str,
+) -> ResponseEnvelope {
     let challenge = challenge(socket).await;
     let signature: Signature = key.sign(&challenge.nonce);
     socket
@@ -338,6 +370,12 @@ async fn authenticate(socket: &mut TestSocket, key: &SigningKey, device_id: &str
     };
     let reply: AuthReply = decode(&bytes);
     assert_eq!(reply.kind, "auth.ok");
+    let state = tokio::time::timeout(Duration::from_secs(1), response(socket))
+        .await
+        .expect("authenticated connection did not publish a state snapshot");
+    assert_eq!(state.request_id, 0);
+    assert_eq!(state.kind, "state.snapshot");
+    state
 }
 
 #[tokio::test]
@@ -509,6 +547,171 @@ async fn authenticated_device_completes_a_real_tls_websocket_handshake() {
     };
     let reply: AuthReply = decode(&bytes);
     assert_eq!(reply.kind, "auth.ok");
+
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn authenticated_connection_starts_with_a_recoverable_tab_state_snapshot() {
+    let root = private_test_dir("initial-tab-state");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let tab = registry
+        .open_desktop(TabLaunch::new(
+            "Before auth",
+            "before-auth",
+            TerminalSize::try_new(34, 7).unwrap(),
+        ))
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+
+    let state = authenticate(&mut socket, &key, &device_id).await;
+    let state: StateSnapshotReply = decode(&state.payload);
+    assert_eq!(state.revision, 1);
+    assert_eq!(state.tabs.len(), 1);
+    assert_eq!(state.tabs[0].id, tab.as_str());
+    assert_eq!(state.tabs[0].title, "Before auth");
+    assert_eq!(state.tabs[0].size, TerminalSize::try_new(34, 7).unwrap());
+    assert_eq!(state.tabs[0].focus, "unowned");
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn desktop_open_and_update_emit_authenticated_remote_tab_changes() {
+    let root = private_test_dir("desktop-tab-changes");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    let initial: StateSnapshotReply =
+        decode(&authenticate(&mut socket, &key, &device_id).await.payload);
+    assert!(initial.tabs.is_empty());
+
+    let tab = registry
+        .open_desktop(TabLaunch::new(
+            "Desktop",
+            "desktop-change",
+            TerminalSize::try_new(40, 8).unwrap(),
+        ))
+        .unwrap();
+    let opened = response_kind(&mut socket, "tab.changed").await;
+    let opened: TabChangedReply = decode(&opened.payload);
+    assert_eq!(opened.change, "opened");
+    assert_eq!(opened.tab_id, tab.as_str());
+    assert_eq!(opened.tab.as_ref().unwrap().title, "Desktop");
+
+    registry
+        .update(&tab, TabUpdate::new().title("Updated on desktop"))
+        .unwrap();
+    let changed_event = response_kind(&mut socket, "tab.changed").await;
+    assert!(!changed_event
+        .payload
+        .windows("attachmentId".len())
+        .any(|window| window == b"attachmentId"));
+    assert!(!changed_event
+        .payload
+        .windows("inputOwner".len())
+        .any(|window| window == b"inputOwner"));
+    let changed: TabChangedReply = decode(&changed_event.payload);
+    assert!(changed.revision > opened.revision);
+    assert_eq!(changed.change, "changed");
+    assert_eq!(changed.tab_id, tab.as_str());
+    assert_eq!(changed.tab.unwrap().title, "Updated on desktop");
+    assert!(changed.requested.is_none());
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn remote_open_and_close_drive_the_desktop_registry_projection() {
+    let root = private_test_dir("remote-desktop-projection");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let desktop = registry.subscribe_changes();
+    let _initial = desktop.recv_timeout(Duration::from_secs(1)).unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    let _state = authenticate(&mut socket, &key, &device_id).await;
+
+    socket
+        .send(request(
+            1,
+            "tab.open",
+            &encode(&OpenRequest {
+                title: "Phone tab".to_string(),
+                cwd: None,
+                command: None,
+                session_id: None,
+                resumed_id: None,
+                agent_id: None,
+                slot_id: "phone-tab".to_string(),
+                fresh: false,
+                env_provider: None,
+                env_model: None,
+                size: TerminalSize::try_new(30, 6).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let opened_reply = response_kind(&mut socket, "tab.open").await;
+    let opened: TabOpenedReply = decode(&opened_reply.payload);
+    let desktop_open = desktop.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(matches!(
+        desktop_open,
+        TabRegistryEvent::Opened { tab, .. } if tab.id().as_str() == opened.tab_id
+    ));
+
+    let tab = registry.list()[0].id().clone();
+    socket
+        .send(request(
+            2,
+            "tab.close",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_kind(&mut socket, "tab.close").await.request_id, 2);
+    assert!(matches!(
+        desktop.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Removed {
+            requested: true,
+            ..
+        }
+    ));
 
     gateway.stop().await.unwrap();
     std::fs::remove_dir_all(root).ok();
@@ -703,7 +906,7 @@ async fn terminal_resume_is_authorized_and_returns_correlated_snapshot_recovery(
         assert_eq!(event.request_id, 0);
         assert!(matches!(
             event.kind.as_str(),
-            "terminal.title" | "terminal.focus_changed"
+            "tab.changed" | "terminal.snapshot" | "terminal.title" | "terminal.focus_changed"
         ));
     };
     assert_eq!(resumed.request_id, 2);
@@ -754,6 +957,9 @@ async fn terminal_resume_is_authorized_and_returns_correlated_snapshot_recovery(
                 saw_focus = true;
             }
             "terminal.snapshot" => {
+                assert_eq!(event.request_id, 0);
+            }
+            "tab.changed" => {
                 assert_eq!(event.request_id, 0);
             }
             other => panic!(
@@ -1251,10 +1457,13 @@ async fn a_slow_close_does_not_stall_an_unrelated_authenticated_connection() {
         tokio::task::yield_now().await;
     }
     unrelated.send(request(1, "tab.list", b"")).await.unwrap();
-    let unrelated_reply =
-        tokio::time::timeout(Duration::from_millis(250), response(&mut unrelated)).await;
+    let unrelated_reply = tokio::time::timeout(
+        Duration::from_millis(250),
+        response_kind(&mut unrelated, "tab.list"),
+    )
+    .await;
     pty.release_kill();
-    let closing_reply = response(&mut closing).await;
+    let closing_reply = response_kind(&mut closing, "tab.close").await;
 
     assert_eq!(unrelated_reply.unwrap().kind, "tab.list");
     assert_eq!(closing_reply.kind, "tab.close");
@@ -1543,6 +1752,7 @@ async fn multi_chunk_final_snapshot_completes_before_exactly_one_exit_trailer() 
     let mut next_index = HashMap::<String, u32>::new();
     let mut totals = HashMap::<String, u32>::new();
     let mut exited = Vec::<String>::new();
+    let mut roster_changes = 0;
     while exited.len() < 2 {
         let event = tokio::time::timeout(Duration::from_secs(5), response(&mut socket))
             .await
@@ -1578,10 +1788,18 @@ async fn multi_chunk_final_snapshot_completes_before_exactly_one_exit_trailer() 
                 );
                 exited.push(exit.attachment_id);
             }
+            "tab.changed" => {
+                assert_eq!(event.request_id, 0);
+                let change: TabChangedReply = decode(&event.payload);
+                assert_eq!(change.change, "changed");
+                assert_eq!(change.tab_id, tab.as_str());
+                roster_changes += 1;
+            }
             other => panic!("unexpected finalization event {other}"),
         }
     }
     assert_eq!(transfer_attachment.len(), 2);
+    assert_eq!(roster_changes, 1);
     assert!(
         tokio::time::timeout(Duration::from_millis(50), socket.next())
             .await

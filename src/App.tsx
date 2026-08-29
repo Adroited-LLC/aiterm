@@ -51,9 +51,10 @@ import {
   desktopNotify, desktopNotifyClose,
   Refusal, sessionRefusal, opencodeDispatch, opencodeDefaultTarget,
   claudeModelDefault, restoreClaudeModelDefault, sessionPreview,
-  TabDescriptor, TabId, tabClose, tabList, tabOpen, tabUpdate,
+  TabDescriptor, TabId, TabRegistryEvent, tabClose, tabList, tabOpen,
+  tabRegistrySnapshot, tabUpdate,
 } from "./ipc";
-import { reconcileTabs } from "./tabModel";
+import { applyTabRegistryEvent, reconcileTabs } from "./tabModel";
 import RefusalBanner from "./components/RefusalBanner";
 import { nextAdoptionDelay } from "./adoption";
 import "./App.css";
@@ -244,6 +245,10 @@ export default function App() {
   // re-run it on every tab change).
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
+  const tabRegistryProjection = useRef<{
+    revision: number | null;
+    tabs: TabDescriptor[];
+  }>({ revision: null, tabs: [] });
   const appAlive = useRef(true);
   const pendingOpens = useRef(new Map<string, { cancelled: boolean }>());
   useEffect(() => () => {
@@ -704,31 +709,98 @@ export default function App() {
   // and Tasks panels already follow without anything rewriting the tab.
 
   const applyTabDescriptor = useCallback((descriptor: TabDescriptor) => {
-    setTabs((current) => current.map((tab) =>
-      tab.key === descriptor.id ? { ...tab, ...descriptor, key: descriptor.id } : tab));
+    setTabs((current) => {
+      const next = current.map((tab) =>
+        tab.key === descriptor.id ? { ...tab, ...descriptor, key: descriptor.id } : tab);
+      tabsRef.current = next;
+      return next;
+    });
   }, []);
 
   useEffect(() => {
     let stopped = false;
-    tabList().then((authoritative) => {
+    let unlisten: (() => void) | null = null;
+    let recovering = false;
+    let recoveryTimer: number | null = null;
+
+    const applyRegistryChange = (change: TabRegistryEvent) => {
       if (stopped) return;
+      const before = tabsRef.current;
+      const applied = applyTabRegistryEvent(tabRegistryProjection.current, change);
+      if (applied.needsSnapshot) {
+        void recover();
+        return;
+      }
+
+      tabRegistryProjection.current = applied.projection;
       setTabs((current) => {
-        const next = reconcileTermTabs(current, authoritative);
+        const next = reconcileTermTabs(current, applied.projection.tabs);
+        tabsRef.current = next;
         setActiveTab((active) =>
           active !== null && next.some((tab) => tab.key === active)
             ? active
             : next[next.length - 1]?.key ?? null);
         return next;
       });
-    }).catch(() => {});
-    const unlisten = listen<TabDescriptor>("tab://changed", (event) => {
-      if (!stopped) applyTabDescriptor(event.payload);
-    });
+
+      const live = new Set(applied.projection.tabs.map((tab) => tab.id));
+      const removed = new Set(before.filter((tab) => !live.has(tab.key)).map((tab) => tab.key));
+      if (removed.size === 0) return;
+      setFileTabs((files) => {
+        const dropped = files.filter((file) => file.termKey !== null && removed.has(file.termKey));
+        if (dropped.length === 0) return files;
+        const droppedKeys = new Set(dropped.map((file) => file.key));
+        setDirtyFiles((dirty) => {
+          const clean = new Set(dirty);
+          droppedKeys.forEach((key) => clean.delete(key));
+          return clean;
+        });
+        setActiveFileTab((active) =>
+          active !== null && droppedKeys.has(active) ? null : active);
+        return files.filter((file) => file.termKey === null || !removed.has(file.termKey));
+      });
+      setEnded((endedTabs) => {
+        const remaining = new Map(endedTabs);
+        removed.forEach((key) => remaining.delete(key));
+        return remaining;
+      });
+    };
+
+    const recover = async () => {
+      if (stopped || recovering) return;
+      recovering = true;
+      try {
+        const snapshot = await tabRegistrySnapshot();
+        applyRegistryChange({ change: "snapshot", ...snapshot });
+      } catch {
+        if (!stopped && recoveryTimer === null) {
+          recoveryTimer = window.setTimeout(() => {
+            recoveryTimer = null;
+            void recover();
+          }, 250);
+        }
+      } finally {
+        recovering = false;
+      }
+    };
+
+    void (async () => {
+      const stop = await listen<TabRegistryEvent>("tab://registry", (event) => {
+        applyRegistryChange(event.payload);
+      });
+      if (stopped) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      await recover();
+    })();
     return () => {
       stopped = true;
-      unlisten.then((stop) => stop());
+      if (recoveryTimer !== null) clearTimeout(recoveryTimer);
+      unlisten?.();
     };
-  }, [applyTabDescriptor]);
+  }, []);
 
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,

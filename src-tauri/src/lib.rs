@@ -62,6 +62,7 @@ pub fn run() {
         .invoke_handler(trace::log_invokes(tauri::generate_handler![
             tabs::tab_open,
             tabs::tab_list,
+            tabs::tab_registry_snapshot,
             tabs::tab_update,
             tabs::tab_attach_desktop,
             tabs::tab_detach,
@@ -170,9 +171,9 @@ pub fn run() {
         ]))
         .setup(move |app| {
             if let Err(e) =
-                crate::tabs::start_desktop_exit_bridge(app.handle().clone(), tabs.clone())
+                crate::tabs::start_desktop_registry_bridge(app.handle().clone(), tabs.clone())
             {
-                crate::diag!("tabs", "desktop exit bridge not running: {e}");
+                crate::diag!("tabs", "desktop registry bridge not running: {e}");
             }
             // First line of every log: which build this is and what launched
             // it. The crash that took an hour to pin down last night was an

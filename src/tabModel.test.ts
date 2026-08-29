@@ -1,6 +1,50 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createTabExitCatchUp, reconcileTabs } from "./tabModel.ts";
+import {
+  applyTabRegistryEvent, createTabExitCatchUp, reconcileTabs,
+} from "./tabModel.ts";
+
+test("remote open and requested close reconcile the desktop roster without an ended tab", () => {
+  let projection = {
+    revision: 0 as number | null,
+    tabs: [] as Array<{ id: string; title: string }>,
+  };
+  let applied = applyTabRegistryEvent(projection, {
+    change: "opened",
+    revision: 1,
+    tabId: "tab-phone",
+    tab: { id: "tab-phone", title: "Phone tab" },
+  });
+  assert.equal(applied.needsSnapshot, false);
+  assert.deepEqual(applied.projection.tabs, [{ id: "tab-phone", title: "Phone tab" }]);
+
+  projection = applied.projection;
+  applied = applyTabRegistryEvent(projection, {
+    change: "removed",
+    revision: 2,
+    tabId: "tab-phone",
+    requested: true,
+  });
+  assert.equal(applied.needsSnapshot, false);
+  assert.deepEqual(applied.projection.tabs, []);
+  assert.deepEqual(applied.removed, { tabId: "tab-phone", requested: true });
+});
+
+test("a desktop registry revision gap requests snapshot recovery without applying partial state", () => {
+  const before = {
+    revision: 4 as number | null,
+    tabs: [{ id: "tab-a", title: "before", local: "keep" }],
+  };
+  const applied = applyTabRegistryEvent(before, {
+    change: "changed",
+    revision: 6,
+    tabId: "tab-a",
+    tab: { id: "tab-a", title: "after" },
+  });
+
+  assert.equal(applied.needsSnapshot, true);
+  assert.deepEqual(applied.projection, before);
+});
 
 test("Rust descriptors replace metadata without changing active tab identity", () => {
   const before = [{ id: "tab-a", title: "repo", slotId: "old" }];

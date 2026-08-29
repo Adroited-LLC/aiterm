@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -11,6 +11,7 @@ import {
 import { boldWeightFor } from "../settings";
 import { createTabExitCatchUp } from "../tabModel";
 import { TerminalInputLine } from "../terminalInput";
+import { projectTerminalGrid } from "../terminalSizing";
 import "@xterm/xterm/css/xterm.css";
 
 /** Attach the GPU WebGL renderer. It owns its own surface and clears+repaints
@@ -79,6 +80,9 @@ export interface TermTab {
    *  transcript lands; what retires the placeholder is the real session
    *  appearing under the same id, not this flag being cleared. */
   fresh?: boolean;
+  /** Rust's canonical grid and safe focus-owner projection. */
+  size?: { cols: number; rows: number };
+  focus?: "desktop" | "remote" | "unowned";
   /** Set while this tab is still waiting to learn its session id.
    *
    *  Only agents that have no `--session-id` — Codex — get one of these. They
@@ -171,6 +175,9 @@ export default function TerminalView({
   const termRef = useRef<Terminal | null>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const focusRef = useRef(tab.focus ?? "desktop");
+  const canonicalSizeRef = useRef(tab.size);
+  const takeFocusRef = useRef<(() => void) | null>(null);
   /** The live WebGL addon, when one is attached. Held because switching back to
    *  the DOM renderer is done by disposing it. */
   const webglRef = useRef<WebglAddon | null>(null);
@@ -179,6 +186,25 @@ export default function TerminalView({
    *  the renderer under the terminal that already exists. */
   const rendererRef = useRef(renderer);
   rendererRef.current = renderer;
+
+  const projectGrid = useCallback(() => {
+    const term = termRef.current;
+    const fit = fitRef.current;
+    if (!term || !fit) return;
+    const fitted = fit.proposeDimensions();
+    if (!fitted && focusRef.current === "desktop") return;
+    if (!canonicalSizeRef.current && focusRef.current !== "desktop") return;
+    const projected = projectTerminalGrid(
+      focusRef.current,
+      canonicalSizeRef.current,
+      fitted ?? { cols: term.cols, rows: term.rows },
+    );
+    if (projected.resizeBackend) {
+      fit.fit();
+    } else if (term.cols !== projected.size.cols || term.rows !== projected.size.rows) {
+      term.resize(projected.size.cols, projected.size.rows);
+    }
+  }, []);
 
   useEffect(() => {
     if (!elRef.current || started.current) return;
@@ -206,7 +232,7 @@ export default function TerminalView({
     if (rendererRef.current === "gpu") {
       webglRef.current = attachRenderer(term);
     }
-    fit.fit();
+    projectGrid();
 
     let unlistenExit: UnlistenFn | null = null;
     let disposed = false;
@@ -216,7 +242,7 @@ export default function TerminalView({
     // re-render. With an accelerated renderer this is rarely needed — no
     // window/grid jiggle, no SIGWINCH storm.
     const redraw = () => {
-      fit.fit();
+      projectGrid();
       term.refresh(0, term.rows - 1);
     };
 
@@ -319,12 +345,35 @@ export default function TerminalView({
         }
         tabWrite(tab.key, attachmentId, data);
       });
-      term.onResize(({ cols, rows }) =>
-        tabResize(tab.key, attachmentId, cols, rows).catch(() => {}));
+      term.onResize(({ cols, rows }) => {
+        if (focusRef.current === "desktop") {
+          tabResize(tab.key, attachmentId, cols, rows).catch(() => {});
+        }
+      });
 
-      const takeFocus = () =>
-        tabTakeFocus(tab.key, attachmentId, term.cols, term.rows).catch(() => {});
-      term.textarea?.addEventListener("focus", takeFocus);
+      let focusPending = false;
+      const takeFocus = async () => {
+        if (focusPending) return;
+        const proposed = fit.proposeDimensions();
+        const requested = proposed
+          ?? canonicalSizeRef.current
+          ?? { cols: term.cols, rows: term.rows };
+        focusPending = true;
+        try {
+          await tabTakeFocus(tab.key, attachmentId, requested.cols, requested.rows);
+          if (disposed) return;
+          focusRef.current = "desktop";
+          canonicalSizeRef.current = requested;
+          projectGrid();
+        } catch {
+          // The registry projection keeps xterm canonical if focus was denied.
+        } finally {
+          focusPending = false;
+        }
+      };
+      const requestFocus = () => { void takeFocus(); };
+      takeFocusRef.current = requestFocus;
+      term.textarea?.addEventListener("focus", requestFocus);
 
       onRegister(tab.key, {
         write: (data) => tabWrite(tab.key, attachmentId, data),
@@ -363,7 +412,7 @@ export default function TerminalView({
           return rows;
         },
       });
-      if (activeRef.current) takeFocus();
+      if (activeRef.current) requestFocus();
     })().catch(() => {});
 
     // Debounce resize→fit: splitter drags fire the observer continuously, and
@@ -374,7 +423,7 @@ export default function TerminalView({
       if (fitTimer !== null) clearTimeout(fitTimer);
       fitTimer = window.setTimeout(() => {
         fitTimer = null;
-        if (elRef.current && elRef.current.offsetWidth > 0) fit.fit();
+        if (elRef.current && elRef.current.offsetWidth > 0) projectGrid();
       }, 120);
     });
     ro.observe(elRef.current);
@@ -386,6 +435,7 @@ export default function TerminalView({
       ro.disconnect();
       unlistenExit?.();
       onRegister(tab.key, null);
+      takeFocusRef.current = null;
       const attachmentId = attachmentIdRef.current;
       attachmentIdRef.current = null;
       if (attachmentId !== null) tabDetach(tab.key, attachmentId).catch(() => {});
@@ -397,22 +447,29 @@ export default function TerminalView({
 
   useEffect(() => {
     if (active) {
-      fitRef.current?.fit();
-      const attachmentId = attachmentIdRef.current;
-      const term = termRef.current;
-      if (attachmentId && term) {
-        tabTakeFocus(tab.key, attachmentId, term.cols, term.rows).catch(() => {});
-      }
+      takeFocusRef.current?.();
       if (autoFocus) termRef.current?.focus();
     }
-  }, [active, autoFocus, tab.key]);
+  }, [active, autoFocus]);
+
+  useEffect(() => {
+    focusRef.current = tab.focus ?? "desktop";
+    canonicalSizeRef.current = tab.size;
+    if (focusRef.current !== "desktop") {
+      // A phone can take focus while xterm's hidden textarea is still focused.
+      // Blur it so the next deliberate click produces a fresh focus event and
+      // an explicit desktop focus request instead of silently dropping input.
+      termRef.current?.blur();
+      projectGrid();
+    }
+  }, [projectGrid, tab.focus, tab.size?.cols, tab.size?.rows]);
 
   useEffect(() => {
     if (termRef.current && termRef.current.options.fontSize !== fontSize) {
       termRef.current.options.fontSize = fontSize;
-      fitRef.current?.fit();
+      projectGrid();
     }
-  }, [fontSize]);
+  }, [fontSize, projectGrid]);
 
   /** Swap the renderer under a running terminal.
    *
@@ -433,17 +490,17 @@ export default function TerminalView({
     } else {
       return;
     }
-    fitRef.current?.fit();
+    projectGrid();
     term.refresh(0, term.rows - 1);
-  }, [renderer]);
+  }, [projectGrid, renderer]);
 
   useEffect(() => {
     const term = termRef.current;
     if (term && term.options.fontFamily !== fontFamily) {
       term.options.fontFamily = fontFamily;
-      fitRef.current?.fit();
+      projectGrid();
     }
-  }, [fontFamily]);
+  }, [fontFamily, projectGrid]);
 
   // Refit, because row spacing changes how many rows fit — without it the
   // terminal keeps its old row count and the child is told a size that is no
@@ -452,9 +509,9 @@ export default function TerminalView({
     const term = termRef.current;
     if (term && term.options.lineHeight !== lineHeight) {
       term.options.lineHeight = lineHeight;
-      fitRef.current?.fit();
+      projectGrid();
     }
-  }, [lineHeight]);
+  }, [lineHeight, projectGrid]);
 
   // Refit too: a heavier face can be wider, so the columns that fit change
   // with it.
@@ -463,9 +520,9 @@ export default function TerminalView({
     if (term && term.options.fontWeight !== fontWeight) {
       term.options.fontWeight = fontWeight;
       term.options.fontWeightBold = boldWeightFor(fontWeight);
-      fitRef.current?.fit();
+      projectGrid();
     }
-  }, [fontWeight]);
+  }, [fontWeight, projectGrid]);
 
   useEffect(() => {
     if (termRef.current) termRef.current.options.theme = theme;

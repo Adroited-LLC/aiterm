@@ -78,7 +78,7 @@ impl Dimensions for ScreenDimensions {
 }
 
 pub struct ScreenModel {
-    processor: Processor,
+    processor: BoundedProcessor,
     term: Term<ScreenEvents>,
     events: ScreenEvents,
     size: TerminalSize,
@@ -97,7 +97,7 @@ impl ScreenModel {
         term.reset_damage();
 
         Self {
-            processor: Processor::new(),
+            processor: BoundedProcessor::new(),
             term,
             events,
             size,
@@ -214,6 +214,75 @@ impl ScreenModel {
             .map(|row| row_from_grid(&self.term, Line(i32::from(row))))
             .collect()
     }
+}
+
+/// Exact-version adapter around Alacritty's parser. Alacritty 0.26 stores
+/// zero-width input in an unrestricted `Vec<char>` on the preceding cell.
+/// Feeding non-ASCII bytes one at a time lets us bound that cell immediately
+/// after a decoded Unicode scalar without interpreting or rewriting any
+/// escape/parser input ourselves. ASCII terminal traffic remains a single
+/// parser call.
+struct BoundedProcessor(Processor);
+
+impl BoundedProcessor {
+    fn new() -> Self {
+        Self(Processor::new())
+    }
+
+    fn advance(&mut self, term: &mut Term<ScreenEvents>, bytes: &[u8]) {
+        let mut run_start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if byte.is_ascii() {
+                continue;
+            }
+            if run_start < index {
+                self.0.advance(term, &bytes[run_start..index]);
+            }
+            self.0.advance(term, &bytes[index..=index]);
+            bound_cursor_cell_combining_storage(term);
+            run_start = index + 1;
+        }
+        if run_start < bytes.len() {
+            self.0.advance(term, &bytes[run_start..]);
+        }
+    }
+}
+
+fn bound_cursor_cell_combining_storage(term: &mut Term<ScreenEvents>) {
+    let grid = term.grid();
+    let line = grid.cursor.point.line;
+    let mut column = grid.cursor.point.column;
+    if !grid.cursor.input_needs_wrap {
+        column.0 = column.saturating_sub(1);
+    }
+    if grid[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+        column.0 = column.saturating_sub(1);
+    }
+
+    let cell = &mut term.grid_mut()[line][column];
+    let Some(zerowidth) = cell.zerowidth() else {
+        return;
+    };
+    if zerowidth.len() <= MAX_COMBINING_SCALARS_PER_CELL {
+        return;
+    }
+
+    let retained = zerowidth[..MAX_COMBINING_SCALARS_PER_CELL].to_vec();
+    let underline_color = cell.underline_color();
+    let hyperlink = cell.hyperlink();
+    let mut bounded = Cell {
+        c: cell.c,
+        fg: cell.fg,
+        bg: cell.bg,
+        flags: cell.flags,
+        extra: None,
+    };
+    for scalar in retained {
+        bounded.push_zerowidth(scalar);
+    }
+    bounded.set_underline_color(underline_color);
+    bounded.set_hyperlink(hyperlink);
+    *cell = bounded;
 }
 
 fn row_from_grid(term: &Term<ScreenEvents>, line: Line) -> ScreenRow {
@@ -351,4 +420,23 @@ fn terminal_modes(term: &Term<ScreenEvents>) -> TerminalModes {
         mode.contains(TermMode::LINE_WRAP),
     )
     .with_alternate_screen(mode.contains(TermMode::ALT_SCREEN))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processor_bounds_resident_combining_storage_per_cell() {
+        let mut screen = ScreenModel::new(TerminalSize::try_new(8, 2).unwrap());
+        let mut output = String::from("x");
+        output.extend(std::iter::repeat_n('\u{301}', 4_096));
+
+        screen.process(output.as_bytes());
+
+        let resident = screen.term.grid()[Line(0)][Column(0)]
+            .zerowidth()
+            .expect("combining scalars are stored on the base cell");
+        assert_eq!(resident.len(), MAX_COMBINING_SCALARS_PER_CELL);
+    }
 }

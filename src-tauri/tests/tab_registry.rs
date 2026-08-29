@@ -2,9 +2,10 @@
 
 use aiterm_lib::pty::{PtyManager, PtySink, PtySpawnSpec};
 use aiterm_lib::remote::model::TerminalSize;
+use aiterm_lib::remote::terminal::RemoteTerminal;
 use aiterm_lib::tabs::{
-    AttachmentId, AttachmentKind, PtyBackend, TabEvent, TabId, TabLaunch, TabRegistry, TabState,
-    TabUpdate,
+    AttachmentId, AttachmentKind, PtyBackend, TabEvent, TabId, TabLaunch, TabRegistry,
+    TabRegistryEvent, TabState, TabUpdate,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -336,6 +337,115 @@ fn shell_launch(slot: &str) -> TabLaunch {
 fn registry() -> (TabRegistry, Arc<FakePty>) {
     let pty = Arc::new(FakePty::default());
     (TabRegistry::with_backend(pty.clone()), pty)
+}
+
+#[test]
+fn registry_change_stream_recovers_overflow_with_a_current_snapshot() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty, 1);
+    let changes = registry.subscribe_changes();
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Snapshot { revision: 0, tabs } if tabs.is_empty()
+    ));
+
+    let tab = registry.open(shell_launch("stream-overflow")).unwrap();
+    registry
+        .update(&tab, TabUpdate::new().title("latest title"))
+        .unwrap();
+
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Snapshot { revision: 2, tabs }
+            if tabs.len() == 1
+                && tabs[0].id() == &tab
+                && tabs[0].title() == "latest title"
+    ));
+}
+
+#[test]
+fn remote_open_and_close_are_process_wide_requested_roster_changes() {
+    let (registry, _) = registry();
+    let registry = Arc::new(registry);
+    let changes = registry.subscribe_changes();
+    let _initial = changes.recv_timeout(Duration::from_secs(1)).unwrap();
+    let remote = RemoteTerminal::new(registry);
+
+    let tab = remote.open(shell_launch("remote-roster")).unwrap();
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Opened { tab: descriptor, .. } if descriptor.id() == &tab
+    ));
+
+    remote.close(&tab).unwrap();
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Removed { tab_id, requested: true, .. } if tab_id == tab
+    ));
+}
+
+#[test]
+fn desktop_descriptor_projects_safe_focus_owner_and_canonical_dimensions() {
+    let (registry, _) = registry();
+    let tab = registry
+        .open(shell_launch("safe-focus-projection"))
+        .unwrap();
+    let _desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let phone = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let canonical = size(47, 11);
+    registry.take_focus(&tab, &phone.id, canonical).unwrap();
+
+    let encoded = serde_json::to_value(registry.get(&tab).unwrap()).unwrap();
+    assert_eq!(encoded["focus"], "remote");
+    assert_eq!(encoded["size"]["cols"], 47);
+    assert_eq!(encoded["size"]["rows"], 11);
+    assert!(encoded.get("inputOwner").is_none());
+    assert!(!encoded.to_string().contains(phone.id.as_str()));
+}
+
+#[test]
+fn registry_stream_projects_focus_size_title_and_unexpected_exit_as_changes() {
+    let (registry, pty) = registry();
+    let changes = registry.subscribe_changes();
+    let _initial = changes.recv_timeout(Duration::from_secs(1)).unwrap();
+    let tab = registry.open(shell_launch("registry-controls")).unwrap();
+    let _opened = changes.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Changed { tab: descriptor, .. }
+            if descriptor.focus() == aiterm_lib::tabs::TabFocus::Desktop
+    ));
+    let phone = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    registry.take_focus(&tab, &phone.id, size(53, 13)).unwrap();
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Changed { tab: descriptor, .. }
+            if descriptor.focus() == aiterm_lib::tabs::TabFocus::Remote
+                && descriptor.size() == size(53, 13)
+    ));
+
+    pty.emit_output(pty.last_id(), b"\x1b]2;registry title\x07");
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Changed { tab: descriptor, .. }
+            if descriptor.title() == "registry title"
+    ));
+
+    pty.exit(pty.last_id(), Some(17), None);
+    assert!(matches!(
+        changes.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabRegistryEvent::Changed { tab: descriptor, .. }
+            if descriptor.state() == &TabState::Exited
+                && descriptor.exit().is_some_and(|exit| !exit.requested())
+    ));
+    assert_eq!(
+        registry.list().len(),
+        1,
+        "unexpected exits stay recoverable in the roster"
+    );
+    drop(desktop);
 }
 
 fn text(snapshot: &aiterm_lib::terminal::model::ScreenSnapshot) -> Vec<String> {

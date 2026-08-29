@@ -423,10 +423,21 @@ export interface TabDescriptor {
   envProvider?: string;
   envModel?: string;
   size?: { cols: number; rows: number };
-  inputOwner?: AttachmentId;
+  /** Safe process-wide focus projection; never contains an attachment id. */
+  focus?: "desktop" | "remote" | "unowned";
   state?: "running" | "exited";
   exit?: { code: number | null; signal: string | null; requested: boolean };
 }
+
+export interface TabRegistrySnapshot {
+  revision: number;
+  tabs: TabDescriptor[];
+}
+
+export type TabRegistryEvent =
+  | { change: "snapshot"; revision: number; tabs: TabDescriptor[] }
+  | { change: "opened" | "changed"; revision: number; tabId: TabId; tab: TabDescriptor }
+  | { change: "removed"; revision: number; tabId: TabId; requested: boolean };
 
 export interface TabLaunch {
   title: string;
@@ -454,6 +465,8 @@ export interface TabUpdate {
 export const tabOpen = (launch: TabLaunch) =>
   invoke<TabDescriptor>("tab_open", { launch });
 export const tabList = () => invoke<TabDescriptor[]>("tab_list");
+export const tabRegistrySnapshot = () =>
+  invoke<TabRegistrySnapshot>("tab_registry_snapshot");
 export const tabUpdate = (tabId: TabId, update: TabUpdate) =>
   invoke<TabDescriptor>("tab_update", { tabId, update });
 export const tabAttachDesktop = (
