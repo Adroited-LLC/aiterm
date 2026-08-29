@@ -6,6 +6,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import okhttp3.Response
@@ -334,6 +335,85 @@ class PairingRepositoryTest {
         assertEquals(server.hostName, store.all().single().hosts.first())
     }
 
+    @Test
+    fun stalledFirstCandidate_timesOutBeforeChallengeThenFallsThroughWithOriginalSecret() =
+        runBlocking {
+            val secret = ByteArray(32) { (it + 41).toByte() }
+            val payload = parsedPayload(
+                pairingUri(
+                    hosts = listOf("LOCALHOST", "localhost"),
+                    port = server.port,
+                    fingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+                    secret = secret,
+                ),
+                scannedAt,
+            )
+            val stalled = StalledOpeningServer()
+            val live = RecordingServer()
+            server.enqueue(MockResponse.Builder().webSocketUpgrade(stalled).build())
+            server.enqueue(MockResponse.Builder().webSocketUpgrade(live).build())
+            val transport = OkHttpPairingTransport(
+                openingChallengeTimeoutMillis = 500,
+                approvalTimeoutMillis = 5_000,
+            )
+
+            val result = withTimeoutOrNull(2_500) {
+                repositoryWith(transport).pair(payload, deviceName, scannedAt)
+            }
+
+            assertTrue("expected fallback pairing, got $result", result is PairingResult.Paired)
+            assertTrue(stalled.awaitOpen())
+            assertFalse(
+                "the stalled candidate received enrollment material",
+                stalled.awaitRequest(100, TimeUnit.MILLISECONDS),
+            )
+            assertTrue(live.awaitRequestFrame())
+            assertArrayEqualsBytes(secret, live.pairRequest!!.enrollmentSecret)
+            assertEquals(2, server.requestCount)
+            assertEquals("localhost", store.all().single().hosts.first())
+        }
+
+    @Test
+    fun openingChallengeTimeout_isFallbackSafeOnlyWhileSecretRemainsUnclaimed() = runBlocking {
+        val payload = parsedPayload(
+            pairingUri(
+                hosts = listOf(server.hostName),
+                port = server.port,
+                fingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+            ),
+            scannedAt,
+        )
+        val stalled = StalledOpeningServer()
+        server.enqueue(MockResponse.Builder().webSocketUpgrade(stalled).build())
+        val transport = OkHttpPairingTransport(
+            openingChallengeTimeoutMillis = 250,
+            approvalTimeoutMillis = 5_000,
+        )
+
+        try {
+            val outcome = withTimeoutOrNull(1_500) {
+                transport.enroll(
+                    endpoint = PairingEndpoint(server.hostName, server.port),
+                    serverSpkiFingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+                    enrollmentSecret = payload.secret,
+                    deviceName = deviceName,
+                    devicePublicKey = deviceKeys.devicePublicKey(),
+                    onPending = {},
+                )
+            }
+
+            assertTrue(
+                "expected fallback-safe timeout, got $outcome",
+                outcome is EnrollmentOutcome.Unreachable,
+            )
+            assertTrue(stalled.awaitOpen())
+            assertFalse(stalled.awaitRequest(100, TimeUnit.MILLISECONDS))
+            assertTrue("timeout claimed the enrollment secret", payload.secret.isAvailable())
+        } finally {
+            payload.discard()
+        }
+    }
+
     // ---- Opening authentication challenge ----
 
     @Test
@@ -494,6 +574,32 @@ class PairingRepositoryTest {
         assertEquals(PairingResult.Rejected(PairingFailure.EXPIRED_PAYLOAD), result)
         assertTrue(expiredServer.awaitRequest())
         assertEquals(emptyList<PairedDesktop>(), store.all())
+    }
+
+    @Test
+    fun approvalDeadline_startsWhenPairRequestMayHaveBeenSent() = runBlocking {
+        val payload = parsedPayload(
+            pairingUri(
+                hosts = listOf(server.hostName),
+                port = server.port,
+                fingerprint = SpkiFingerprint.of(serverCertificate.certificate),
+            ),
+            scannedAt,
+        )
+        val delayed = DelayedApprovalServer(
+            challengeDelayMillis = 250,
+            decisionDelayMillis = 250,
+        )
+        server.enqueue(MockResponse.Builder().webSocketUpgrade(delayed).build())
+        val transport = OkHttpPairingTransport(
+            openingChallengeTimeoutMillis = 500,
+            approvalTimeoutMillis = 400,
+        )
+
+        val result = repositoryWith(transport).pair(payload, deviceName, scannedAt)
+
+        assertTrue("expected approved pairing, got $result", result is PairingResult.Paired)
+        assertTrue(delayed.awaitRequest())
     }
 
     @Test
@@ -659,6 +765,47 @@ class PairingRepositoryTest {
             check(opened.count == 0L)
             check(socket.send(validChallengeBytes().toByteString()))
         }
+    }
+
+    private class StalledOpeningServer : WebSocketListener() {
+        private val opened = CountDownLatch(1)
+        private val received = CountDownLatch(1)
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            opened.countDown()
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            received.countDown()
+        }
+
+        fun awaitOpen(): Boolean = opened.await(5, TimeUnit.SECONDS)
+
+        fun awaitRequest(timeout: Long, unit: TimeUnit): Boolean = received.await(timeout, unit)
+    }
+
+    private class DelayedApprovalServer(
+        private val challengeDelayMillis: Long,
+        private val decisionDelayMillis: Long,
+    ) : WebSocketListener() {
+        private val received = CountDownLatch(1)
+
+        override fun onOpen(webSocket: WebSocket, response: Response) {
+            Thread.sleep(challengeDelayMillis)
+            webSocket.send(validChallengeBytes().toByteString())
+        }
+
+        override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            val frame = PairingFrames.decode(bytes.toByteArray())
+            if (frame is PairRequestFrame) {
+                received.countDown()
+                webSocket.send(pendingFixtureBytes().toByteString())
+                Thread.sleep(decisionDelayMillis)
+                webSocket.send(approvedFixtureBytes().toByteString())
+            }
+        }
+
+        fun awaitRequest(): Boolean = received.await(5, TimeUnit.SECONDS)
     }
 
     private class OpeningFrameServer(private val openingFrame: ByteString) : WebSocketListener() {

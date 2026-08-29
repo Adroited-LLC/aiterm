@@ -11,7 +11,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLPeerUnverifiedException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.ConnectionSpec
@@ -175,7 +181,10 @@ class PairingRepository(
     }
 }
 
-class OkHttpPairingTransport : PairingTransport {
+class OkHttpPairingTransport internal constructor(
+    private val openingChallengeTimeoutMillis: Long = OPENING_CHALLENGE_TIMEOUT_MILLIS,
+    private val approvalTimeoutMillis: Long = APPROVAL_TIMEOUT_MILLIS,
+) : PairingTransport {
 
     private val baseClient = OkHttpClient.Builder()
         .connectTimeout(5, TimeUnit.SECONDS)
@@ -200,21 +209,57 @@ class OkHttpPairingTransport : PairingTransport {
             return EnrollmentOutcome.Unreachable("invalid candidate endpoint")
         }
 
-        val outcome = withTimeoutOrNull(APPROVAL_TIMEOUT_MILLIS) {
-            awaitEnrollment(
-                client = pinnedClient.client,
-                pinMismatchObserved = pinnedClient.trustManager::didObserveMismatch,
-                request = request,
-                enrollmentSecret = enrollmentSecret,
-                deviceName = deviceName,
-                devicePublicKey = devicePublicKey,
-                onPending = onPending,
-            )
-        }
-        return outcome ?: if (enrollmentSecret.isAvailable()) {
-            EnrollmentOutcome.Unreachable("opening challenge timed out")
-        } else {
-            EnrollmentOutcome.Indeterminate("approval timed out")
+        return coroutineScope {
+            val requestMayHaveBeenSent = CompletableDeferred<Unit>()
+            val attempt = async(start = CoroutineStart.UNDISPATCHED) {
+                awaitEnrollment(
+                    client = pinnedClient.client,
+                    pinMismatchObserved = pinnedClient.trustManager::didObserveMismatch,
+                    request = request,
+                    enrollmentSecret = enrollmentSecret,
+                    deviceName = deviceName,
+                    devicePublicKey = devicePublicKey,
+                    onPending = onPending,
+                    onRequestMayHaveBeenSent = { requestMayHaveBeenSent.complete(Unit) },
+                )
+            }
+            val opening = withTimeoutOrNull(openingChallengeTimeoutMillis) {
+                select<OpeningPhase> {
+                    requestMayHaveBeenSent.onAwait {
+                        OpeningPhase.RequestMayHaveBeenSent
+                    }
+                    attempt.onAwait { outcome ->
+                        OpeningPhase.Completed(outcome)
+                    }
+                }
+            }
+
+            when (opening) {
+                is OpeningPhase.Completed -> opening.outcome
+                OpeningPhase.RequestMayHaveBeenSent -> {
+                    val outcome = withTimeoutOrNull(approvalTimeoutMillis) {
+                        attempt.await()
+                    }
+                    if (outcome != null) {
+                        outcome
+                    } else {
+                        attempt.cancelAndJoin()
+                        EnrollmentOutcome.Indeterminate("approval timed out")
+                    }
+                }
+                null -> {
+                    // Cancellation closes the socket and synchronizes with the
+                    // secret-claim/send critical section before join returns.
+                    attempt.cancelAndJoin()
+                    if (enrollmentSecret.isAvailable()) {
+                        EnrollmentOutcome.Unreachable("opening challenge timed out")
+                    } else {
+                        EnrollmentOutcome.Indeterminate(
+                            "opening challenge deadline raced with enrollment send",
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -252,11 +297,15 @@ class OkHttpPairingTransport : PairingTransport {
         deviceName: String,
         devicePublicKey: ByteArray,
         onPending: () -> Unit,
+        onRequestMayHaveBeenSent: () -> Unit,
     ): EnrollmentOutcome = suspendCancellableCoroutine { continuation ->
         val completed = AtomicBoolean(false)
         val secretSent = AtomicBoolean(false)
         val state = AtomicReference(State.WAITING_FOR_OPEN)
         val socket = AtomicReference<WebSocket?>(null)
+        // Cancellation and the only secret-claim/send path share this lock.
+        // Therefore a fallback-safe return cannot race a late claim.
+        val secretSendLock = Any()
 
         fun finish(outcome: EnrollmentOutcome, closeSocket: Boolean = true) {
             if (completed.compareAndSet(false, true)) {
@@ -293,7 +342,8 @@ class OkHttpPairingTransport : PairingTransport {
                             // The Rust gateway's nonce is only signed by an
                             // already-enrolled auth.proof. A pair.request does
                             // not echo or sign it; validation gates secret use.
-                            val sendFailure = when (
+                            val sendFailure = synchronized(secretSendLock) {
+                                if (completed.get()) return
                                 val consumption = enrollmentSecret.consume { secret ->
                                     val encoded = try {
                                         PairingFrames.encode(
@@ -311,10 +361,10 @@ class OkHttpPairingTransport : PairingTransport {
                                     val message = encoded.toByteString()
                                     encoded.fill(0)
                                     state.set(State.WAITING_FOR_PENDING)
-                                    // Conservatively classify any teardown
-                                    // from this point as indeterminate: send()
-                                    // may have queued enrollment material.
+                                    // From this exact point the immutable
+                                    // WebSocket message may be queued to the peer.
                                     secretSent.set(true)
+                                    onRequestMayHaveBeenSent()
                                     val sent = runCatching { webSocket.send(message) }
                                         .getOrDefault(false)
                                     if (sent) {
@@ -323,10 +373,11 @@ class OkHttpPairingTransport : PairingTransport {
                                         EnrollmentOutcome.Indeterminate("enrollment send failed")
                                     }
                                 }
-                            ) {
-                                is EnrollmentSecret.Consumption.Used -> consumption.value
-                                EnrollmentSecret.Consumption.AlreadyConsumed ->
-                                    EnrollmentOutcome.ConsumedPayload
+                                when (consumption) {
+                                    is EnrollmentSecret.Consumption.Used -> consumption.value
+                                    EnrollmentSecret.Consumption.AlreadyConsumed ->
+                                        EnrollmentOutcome.ConsumedPayload
+                                }
                             }
                             if (sendFailure != null) finish(sendFailure)
                         }
@@ -370,7 +421,13 @@ class OkHttpPairingTransport : PairingTransport {
         val webSocket = client.newWebSocket(request, listener)
         socket.compareAndSet(null, webSocket)
         if (completed.get()) webSocket.cancel()
-        continuation.invokeOnCancellation { webSocket.cancel() }
+        continuation.invokeOnCancellation {
+            synchronized(secretSendLock) {
+                completed.set(true)
+                state.set(State.FINISHED)
+            }
+            webSocket.cancel()
+        }
     }
 
     private fun failureOutcome(
@@ -411,12 +468,20 @@ class OkHttpPairingTransport : PairingTransport {
         FINISHED,
     }
 
+    private sealed interface OpeningPhase {
+        data object RequestMayHaveBeenSent : OpeningPhase
+        data class Completed(val outcome: EnrollmentOutcome) : OpeningPhase
+    }
+
     private data class PinnedClient(
         val client: OkHttpClient,
         val trustManager: PinnedSpkiTrustManager,
     )
 
     companion object {
+        // Match the desktop gateway's AUTH_TIMEOUT for the complete pre-auth
+        // candidate attempt (connect, TLS, WebSocket open, and challenge).
+        private const val OPENING_CHALLENGE_TIMEOUT_MILLIS = 10 * 1_000L
         // Rust starts its 300-second approval timer only after TLS, the opening
         // challenge, and pair.request. Keep a small transport grace period so
         // its terminal pair.expired frame wins the boundary race.
