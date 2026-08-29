@@ -3891,6 +3891,36 @@ fn materialize_fork_sync(session_id: String) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_claude_discovery_rejects_a_symlink_provider_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = std::env::temp_dir().join(format!(
+            "aiterm-claude-discovery-root-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = fixture.join("outside");
+        let project = outside.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "34343434-3434-4434-8434-343434343434";
+        std::fs::write(
+            project.join(format!("{id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"first\",\"sessionId\":\"{id}\",\"cwd\":\"/workspace/project\",\"message\":{{\"content\":\"outside sentinel\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let linked_root = fixture.join("projects");
+        symlink(&outside, &linked_root).unwrap();
+
+        let mut budget = DiscoveryBudget::new();
+        assert!(scan_claude_root_bounded(&linked_root, &mut budget).is_empty());
+        assert_eq!(budget.remaining(), MAX_DISCOVERED_SESSION_FILES);
+        assert!(project.join(format!("{id}.jsonl")).exists());
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn production_file_operation_is_fd_relative_across_store_root_replacement() {

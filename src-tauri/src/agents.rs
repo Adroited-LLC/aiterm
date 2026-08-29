@@ -2321,6 +2321,31 @@ mod tests {
         assert!(scan_codex_dir(std::path::Path::new("/nonexistent/codex")).is_empty());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_codex_discovery_rejects_a_symlink_provider_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = std::env::temp_dir().join(format!(
+            "aiterm-codex-discovery-root-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = fixture.join("outside");
+        std::fs::create_dir_all(outside.join("2026/08/29")).unwrap();
+        let sentinel = outside.join("2026/08/29/rollout-sentinel.jsonl");
+        std::fs::write(
+            &sentinel,
+            "{\"payload\":{\"session_id\":\"outside\",\"cwd\":\"/outside\"}}\n",
+        )
+        .unwrap();
+        let linked_root = fixture.join("sessions");
+        symlink(&outside, &linked_root).unwrap();
+
+        assert!(scan_codex_dir(&linked_root).is_empty());
+        assert!(sentinel.exists());
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
     /// The registry must report agents that are absent, not omit them — the
     /// settings panel exists to say "not installed".
     #[test]
