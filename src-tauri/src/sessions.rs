@@ -4908,6 +4908,169 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_transaction_holds_a_write_lease_through_source_retirement() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-lease-archive-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "18181818-1818-4818-8818-181818181818";
+        let source = project.join(format!("{id}.jsonl"));
+        let destination = trash_path.join(format!("{id}.jsonl"));
+        std::fs::write(&source, b"lease protected transcript").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, std::ffi::OsString::from(format!("{id}.jsonl")))],
+            ArchiveLimits::default(),
+            || {},
+            || {
+                let error = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&destination)
+                    .expect_err("the held write lease must reject a competing writer");
+                assert!(matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK | libc::EAGAIN)));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(destination).unwrap(), b"lease protected transcript");
+        assert!(!source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_is_one_strict_archive_and_round_trips_through_held_fds() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-sidecar-v1-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sidecars = root.join("sidecars");
+        let source = sidecars.join("session-sidecar");
+        let trash_path = root.join("trash");
+        let restored_root = root.join("restored");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::create_dir_all(&restored_root).unwrap();
+        std::fs::write(source.join("state.json"), b"state").unwrap();
+        std::fs::write(source.join("nested/output.txt"), b"output").unwrap();
+        let verified = verified_directory_entry(&sidecars, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, std::ffi::OsString::from("session.tasks"))],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        let archive = trash_path.join("session.tasks");
+        assert!(archive.is_file());
+        assert!(std::fs::read(&archive).unwrap().starts_with(SIDECAR_ARCHIVE_MAGIC));
+
+        restore_sidecar_archive(&archive, &restored_root, OsStr::new("session-sidecar"))
+            .unwrap();
+        let restored = restored_root.join("session-sidecar");
+        assert_eq!(std::fs::read(restored.join("state.json")).unwrap(), b"state");
+        assert_eq!(
+            std::fs::read(restored.join("nested/output.txt")).unwrap(),
+            b"output"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_bounds_fail_before_publish_or_source_quarantine() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-sidecar-bounds-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sidecars = root.join("sidecars");
+        let source = sidecars.join("session-sidecar");
+        let trash_path = root.join("trash");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        for index in 0..513 {
+            std::fs::write(source.join(format!("entry-{index}")), b"x").unwrap();
+        }
+        let verified = verified_directory_entry(&sidecars, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, std::ffi::OsString::from("session.tasks"))],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("entry limit"));
+        assert!(source.is_dir());
+        assert!(!trash_path.join("session.tasks").exists());
+        assert_eq!(std::fs::read_dir(&trash_path).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multi_artifact_failure_before_retirement_keeps_every_source_visible() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-archive-ordering-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let sidecars = home.join(".claude/tasks");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&sidecars).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "19191919-1919-4919-8919-191919191919";
+        let transcript = project.join(format!("{id}.jsonl"));
+        let tasks = sidecars.join(id);
+        std::fs::write(&transcript, b"transcript").unwrap();
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("task.json"), b"task").unwrap();
+        let main = verified_session_file("claude", &transcript, &home).unwrap();
+        let sidecar = verified_directory_entry(&sidecars, &tasks).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_hooks(
+            &trash,
+            vec![
+                (main, std::ffi::OsString::from(format!("{id}.jsonl"))),
+                (sidecar, std::ffi::OsString::from(format!("{id}.tasks"))),
+            ],
+            ArchiveLimits::default(),
+            || {},
+            || Err("injected post-publish failure".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected post-publish failure"));
+        assert_eq!(std::fs::read(&transcript).unwrap(), b"transcript");
+        assert_eq!(std::fs::read(tasks.join("task.json")).unwrap(), b"task");
+        assert!(trash_path.join(format!("{id}.jsonl")).is_file());
+        assert!(trash_path.join(format!("{id}.tasks")).is_file());
+        assert!(!std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn msg(line: &str) -> Option<(String, String)> {
         assert!(
             line_may_hold_message(line),
