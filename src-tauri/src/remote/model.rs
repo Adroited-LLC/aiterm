@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::terminal::MAX_SCREEN_FRAME_BYTES;
+
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_TERMINAL_DIMENSION: u16 = 512;
 
@@ -14,10 +16,14 @@ const KNOWN_REQUESTS: &[&str] = &[
     "session.stop",
     "agent.list",
     "agent.action",
+    "tab.list",
+    "tab.open",
+    "tab.close",
     "terminal.attach",
     "terminal.input",
     "terminal.resize",
     "terminal.detach",
+    "terminal.scrollback",
     // Taking input ownership is its own request because it is a deliberate act.
     // Attaching gives a second client a read-only view; only this says "I am
     // typing now", and the broker announces it to everyone else on the stream.
@@ -102,9 +108,35 @@ impl ProtocolError {
         )
     }
 
+    pub fn frame_too_large() -> Self {
+        Self::new(
+            "protocol.frame_too_large",
+            "terminal frame exceeds the one mebibyte limit",
+        )
+    }
+
     pub fn code(&self) -> &'static str {
         self.code
     }
+}
+
+/// Reject a serialized terminal frame before it reaches a remote transport.
+pub fn validate_terminal_frame(frame: &[u8]) -> Result<(), ProtocolError> {
+    if frame.len() > MAX_SCREEN_FRAME_BYTES {
+        return Err(ProtocolError::frame_too_large());
+    }
+    Ok(())
+}
+
+/// Serialize a typed terminal frame and enforce its wire-size limit before it
+/// can be handed to a remote sender.
+pub fn encode_terminal_frame<T: Serialize>(frame: &T) -> Result<Vec<u8>, ProtocolError> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(frame, &mut bytes).map_err(|_| {
+        ProtocolError::new("protocol.invalid_frame", "unable to encode terminal frame")
+    })?;
+    validate_terminal_frame(&bytes)?;
+    Ok(bytes)
 }
 
 impl fmt::Display for ProtocolError {

@@ -1,4 +1,6 @@
-use aiterm_lib::remote::model::{ProtocolError, RemoteRequest, TerminalSize};
+use aiterm_lib::remote::model::{
+    validate_terminal_frame, ProtocolError, RemoteRequest, TerminalSize,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -87,4 +89,24 @@ fn accepts_an_explicit_take_focus_request() {
         .expect("taking input ownership is part of the terminal protocol");
 
     assert_eq!(request.kind(), "terminal.focus");
+}
+
+#[test]
+fn accepts_tab_and_scrollback_requests() {
+    for kind in ["tab.list", "tab.open", "tab.close", "terminal.scrollback"] {
+        let request = RemoteRequest::decode(&cbor_request(1, kind, b""))
+            .expect("the typed terminal protocol should define this request");
+
+        assert_eq!(request.kind(), kind);
+    }
+}
+
+#[test]
+fn terminal_frames_larger_than_one_mebibyte_are_rejected() {
+    assert_eq!(
+        validate_terminal_frame(&vec![0; 1024 * 1024 + 1])
+            .unwrap_err()
+            .code(),
+        "protocol.frame_too_large"
+    );
 }
