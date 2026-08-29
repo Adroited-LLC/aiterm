@@ -10,6 +10,7 @@ pub mod grok;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;
+pub mod librarian;
 pub mod mcp;
 pub mod notify;
 pub mod opencode;
@@ -49,6 +50,11 @@ pub fn run() {
         // In release `log_invokes` is the identity function and the generated
         // handler is passed straight through — see `trace.rs`.
         .invoke_handler(trace::log_invokes(tauri::generate_handler![
+            librarian::librarian_state,
+            librarian::librarian_run,
+            librarian::librarian_pending,
+            librarian::librarian_forget,
+            librarian::librarian_rename_thread,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,

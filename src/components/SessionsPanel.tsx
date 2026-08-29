@@ -14,10 +14,12 @@ import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
 import { followRekey } from "../selection";
+import ThreadsView from "./ThreadsView";
+import { LibrarianCtl } from "../librarian";
 
 import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 
-type ViewMode = "recent" | "project" | "date";
+type ViewMode = "recent" | "project" | "date" | "threads";
 
 function dateBucket(ms: number): string {
   const now = new Date();
@@ -180,6 +182,11 @@ interface Props {
    *  project or group header. The panel has already excluded anything a per-row
    *  🗑 would refuse. */
   onTrashSessions: (sessions: Session[]) => void;
+  /** The librarian's store and controls — the Threads tab, and the names it
+   *  has written where `renameRows` says to use them. */
+  librarian: LibrarianCtl;
+  renameRows: boolean;
+  onOpenLibrarian: () => void;
 }
 
 export default function SessionsPanel({
@@ -189,6 +196,7 @@ export default function SessionsPanel({
   onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
+  librarian, renameRows, onOpenLibrarian,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
@@ -870,7 +878,9 @@ export default function SessionsPanel({
                 <Icon of={GitFork} size="sm" />
               </span>
             )}
-            <span className="session-title">{s.title}</span>
+            <span className="session-title" title={renameRows && librarian.store.sessions[s.id] ? s.title : undefined}>
+              {(renameRows && librarian.store.sessions[s.id]?.name) || s.title}
+            </span>
             {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
           {(opts.showPath || (opts.showBranch && s.branch)) && (
@@ -1203,16 +1213,29 @@ export default function SessionsPanel({
         />
       )}
       <div className="view-tabs">
-        {(["recent", "project", "date"] as ViewMode[]).map((m) => (
+        {(["recent", "project", "date", "threads"] as ViewMode[]).map((m) => (
           <button
             key={m}
             className={"view-tab" + (viewMode === m ? " on" : "")}
             onClick={() => setViewMode(m)}
           >
-            {m === "recent" ? "Recent" : m === "project" ? "Project" : "Date"}
+            {m === "recent" ? "Recent" : m === "project" ? "Project" : m === "date" ? "Date" : "Threads"}
           </button>
         ))}
       </div>
+      {viewMode === "threads" && !searchList ? (
+        <div className="sessions-list">
+          <ThreadsView
+            lib={librarian}
+            sessions={sessions}
+            liveIds={liveSlots}
+            onSelect={onSelect}
+            onResume={onResume}
+            onOpenSettings={onOpenLibrarian}
+            canResume={(s) => capsOf(s.agent).resume}
+          />
+        </div>
+      ) : (
       <div className="sessions-list">
         {/* Above every view and outside the search filter: a session you just
             started is the one row you are certainly looking for, and it has no
@@ -1445,6 +1468,7 @@ export default function SessionsPanel({
           </div>
         )}
       </div>
+      )}
       {menu && (
         // The backdrop is what closes it on a click anywhere else, including a
         // right-click somewhere new.

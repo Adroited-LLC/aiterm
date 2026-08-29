@@ -954,3 +954,53 @@ export const diagLogTail = (lines: number) => invoke<string>("diag_log_tail", { 
 /** Build, desktop and which agents aiterm can see — the first questions of any
  *  "it is behaving oddly" conversation, answered without a scavenger hunt. */
 export const diagEnvironment = () => invoke<[string, string][]>("diag_environment");
+
+/* ---- the librarian: names, tags and threads written by a small model ---- */
+
+/** What the librarian wrote about one session — see `librarian.rs`. */
+export interface LibEntry {
+  name: string;
+  tags: string[];
+  /** Id into `LibStore.threads`; "" for a session filed under no thread. */
+  thread: string;
+  summary: string;
+  next: string;
+  /** The session's `last_active` when this was written. */
+  seen: number;
+  at: number;
+  model: string;
+}
+export interface LibThread {
+  name: string;
+  description: string;
+  tags: string[];
+  created: number;
+}
+export interface LibStore {
+  sessions: Record<string, LibEntry>;
+  threads: Record<string, LibThread>;
+  spent: number;
+}
+export interface LibRunReport {
+  done: number;
+  remaining: number;
+  cost: number;
+  errors: string[];
+}
+export const EMPTY_LIB: LibStore = { sessions: {}, threads: {}, spent: 0 };
+
+export const librarianState = () => invoke<LibStore>("librarian_state");
+/** Mirrors `librarian::Engine`. */
+export type LibEngine =
+  | { kind: "api"; providerId: string; model: string }
+  | { kind: "cli"; agent: string; model: string | null };
+export const librarianRun = (
+  engine: LibEngine, sessions: { id: string; lastActive: number }[], max: number,
+) => invoke<LibRunReport>("librarian_run", { engine, sessions, max });
+/** Where the librarian runs the CLIs — a transcript one of them keeps in
+ *  print mode lands here, and the session list skips it. Kept in step with
+ *  `lib_dir()` in `librarian.rs`. */
+export const LIBRARIAN_DIR_SUFFIX = "/.config/aiterm/librarian";
+export const librarianForget = () => invoke<void>("librarian_forget");
+export const librarianRenameThread = (id: string, name: string) =>
+  invoke<void>("librarian_rename_thread", { id, name });
