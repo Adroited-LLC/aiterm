@@ -1166,6 +1166,205 @@ fn preparing_exit_persists_and_rejects_a_late_desktop_attachment() {
 }
 
 #[test]
+fn rejected_attach_during_prepare_still_publishes_one_final_tab_exit() {
+    let (registry, pty) = registry();
+    let exits = registry.subscribe_exits();
+    let tab = registry
+        .open(shell_launch("slot:prepare-exit-observed"))
+        .unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let _snapshot = remote.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    let pty_id = pty.last_id();
+
+    pty.prepare_exit(pty_id);
+    assert_eq!(
+        registry
+            .attach(&tab, AttachmentKind::Desktop)
+            .unwrap_err()
+            .code(),
+        "tab.closed"
+    );
+    pty.exit(pty_id, Some(17), Some("Terminated"));
+
+    let (observed_tab, observed_exit) = exits.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(observed_tab, tab);
+    assert_eq!(observed_exit.code(), Some(17));
+    assert_eq!(observed_exit.signal(), Some("Terminated"));
+    assert!(!observed_exit.requested());
+    assert!(
+        exits.try_recv().is_err(),
+        "the final exit was published twice"
+    );
+    assert!(matches!(
+        recv_matching(&remote.events, |event| matches!(event, TabEvent::Exited(_))),
+        TabEvent::Exited(exit) if exit.code() == Some(17)
+    ));
+}
+
+#[test]
+fn explicit_close_publishes_one_final_tab_exit() {
+    let (registry, _) = registry();
+    let exits = registry.subscribe_exits();
+    let tab = registry.open(shell_launch("slot:close-observed")).unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let _snapshot = remote.events.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    registry.close(&tab).unwrap();
+
+    let (observed_tab, observed_exit) = exits.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(observed_tab, tab);
+    assert!(observed_exit.requested());
+    assert!(
+        exits.try_recv().is_err(),
+        "explicit close was published twice"
+    );
+    assert!(matches!(
+        recv_matching(&remote.events, |event| matches!(event, TabEvent::Exited(_))),
+        TabEvent::Exited(exit) if exit.requested()
+    ));
+}
+
+#[test]
+fn desktop_opening_backlog_backpressures_then_replays_ordered_bounded_chunks() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry
+        .open_desktop(shell_launch("slot:bounded-opening"))
+        .unwrap();
+    let pty_id = pty.last_id();
+    let first = vec![b'a'; 800 * 1024];
+    let second = vec![b'b'; 800 * 1024];
+    let third = vec![b'c'; 800 * 1024];
+    let (first_done_tx, first_done_rx) = mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+    let output = pty.clone();
+    let first_for_writer = first.clone();
+    let second_for_writer = second.clone();
+    let writer = thread::spawn(move || {
+        output.emit_output(pty_id, &first_for_writer);
+        first_done_tx.send(()).unwrap();
+        output.emit_output(pty_id, &second_for_writer);
+        writer_done_tx.send(()).unwrap();
+    });
+
+    first_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        writer_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "a full pre-attach backlog did not apply bounded backpressure"
+    );
+
+    let (attach_tx, attach_rx) = mpsc::channel();
+    let attaching = registry.clone();
+    let attaching_tab = tab.clone();
+    let attach = thread::spawn(move || {
+        attach_tx
+            .send(attaching.attach(&attaching_tab, AttachmentKind::Desktop))
+            .unwrap();
+    });
+    let desktop = attach_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first attach deadlocked behind a full backlog")
+        .unwrap();
+
+    let (third_done_tx, third_done_rx) = mpsc::channel();
+    let output = pty.clone();
+    let third_for_writer = third.clone();
+    let live_writer = thread::spawn(move || {
+        output.emit_output(pty_id, &third_for_writer);
+        third_done_tx.send(()).unwrap();
+    });
+
+    let mut replayed = Vec::new();
+    while replayed.len() < first.len() + second.len() + third.len() {
+        match desktop.events.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TabEvent::Raw(bytes) => {
+                assert!(
+                    bytes.len() < 1024 * 1024,
+                    "desktop raw chunk was {} bytes",
+                    bytes.len()
+                );
+                replayed.extend(bytes);
+            }
+            _ => {}
+        }
+    }
+    let expected = [first, second, third].concat();
+    assert_eq!(
+        replayed, expected,
+        "opening and live output reordered or dropped bytes"
+    );
+    writer_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    third_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    writer.join().unwrap();
+    live_writer.join().unwrap();
+    attach.join().unwrap();
+}
+
+#[test]
+fn close_cancels_a_producer_blocked_on_the_desktop_opening_backlog() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry
+        .open_desktop(shell_launch("slot:close-opening"))
+        .unwrap();
+    let pty_id = pty.last_id();
+    let chunk = vec![b'x'; 800 * 1024];
+    let (first_done_tx, first_done_rx) = mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+    let output = pty.clone();
+    let writer = thread::spawn(move || {
+        output.emit_output(pty_id, &chunk);
+        first_done_tx.send(()).unwrap();
+        output.emit_output(pty_id, &chunk);
+        writer_done_tx.send(()).unwrap();
+    });
+
+    first_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(writer_done_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    registry.close(&tab).unwrap();
+    writer_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close did not wake the blocked pre-attach producer");
+    writer.join().unwrap();
+}
+
+#[test]
+fn prepare_exit_cancels_a_producer_blocked_on_the_desktop_opening_backlog() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry
+        .open_desktop(shell_launch("slot:prepare-opening"))
+        .unwrap();
+    let pty_id = pty.last_id();
+    let chunk = vec![b'x'; 800 * 1024];
+    let (first_done_tx, first_done_rx) = mpsc::channel();
+    let (writer_done_tx, writer_done_rx) = mpsc::channel();
+    let output = pty.clone();
+    let writer = thread::spawn(move || {
+        output.emit_output(pty_id, &chunk);
+        first_done_tx.send(()).unwrap();
+        output.emit_output(pty_id, &chunk);
+        writer_done_tx.send(()).unwrap();
+    });
+
+    first_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(writer_done_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    pty.prepare_exit(pty_id);
+    writer_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("prepare-exit did not wake the blocked pre-attach producer");
+    pty.exit(pty_id, Some(0), None);
+    assert_eq!(registry.get(&tab).unwrap().state(), &TabState::Exited);
+    writer.join().unwrap();
+}
+
+#[test]
 fn natural_exit_cancels_blocked_raw_output_after_queued_output() {
     let pty = Arc::new(FakePty::default());
     let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);

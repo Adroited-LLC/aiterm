@@ -50,7 +50,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty)
-        .manage(tabs)
+        .manage(tabs.clone())
         .manage(watcher::WatchState::default())
         // Off until the user turns it on, and it opens nothing on disk until
         // then: a desktop that never pairs a phone never grows a
@@ -168,7 +168,12 @@ pub fn run() {
             remote::remote_devices,
             remote::remote_revoke_device,
         ]))
-        .setup(|app| {
+        .setup(move |app| {
+            if let Err(e) =
+                crate::tabs::start_desktop_exit_bridge(app.handle().clone(), tabs.clone())
+            {
+                crate::diag!("tabs", "desktop exit bridge not running: {e}");
+            }
             // First line of every log: which build this is and what launched
             // it. The crash that took an hour to pin down last night was an
             // aiterm started from inside another one's process tree, and the

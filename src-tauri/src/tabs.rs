@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -15,6 +15,10 @@ use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
+/// Tauri raw frames must stay comfortably below the remote protocol's 1 MiB
+/// ceiling too. PTY reads are normally 8 KiB; this also bounds adversarial or
+/// test sinks that deliver a much larger slice in one callback.
+const MAX_DESKTOP_RAW_CHUNK: usize = 1024 * 1024 - 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -751,8 +755,18 @@ impl TabRegistry {
                 backend,
                 maps: Mutex::new(RegistryMaps::default()),
                 queue_capacity: queue_capacity.max(1),
+                exit_subscribers: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Subscribe to the one final exit each tab publishes. The desktop bridge
+    /// installs this before the webview can invoke `tab_open`; remote callers
+    /// continue to receive the same exit through their attachment mailbox.
+    pub fn subscribe_exits(&self) -> Receiver<(TabId, TabExit)> {
+        let (sender, receiver) = mpsc::channel();
+        self.inner.exit_subscribers.lock().unwrap().push(sender);
+        receiver
     }
 
     pub fn open_desktop(&self, mut launch: TabLaunch) -> Result<TabId, TabError> {
@@ -763,7 +777,7 @@ impl TabRegistry {
     pub fn open(&self, launch: TabLaunch) -> Result<TabId, TabError> {
         let id = TabId::new();
         let slot_id = launch.slot_id.clone();
-        let pending_desktop_raw = launch.desktop_pending.then(Vec::new);
+        let desktop_authoritative = launch.desktop_pending;
         {
             let mut maps = self.inner.maps.lock().unwrap();
             if maps.by_slot.contains_key(&slot_id) || maps.pending_slots.contains_key(&slot_id) {
@@ -809,11 +823,11 @@ impl TabRegistry {
                 screen: ScreenModel::new(launch.size),
                 pty: PtyBinding::Pending,
                 attachments: HashMap::new(),
-                pending_desktop_raw,
+                desktop_authoritative,
                 pending_replies: VecDeque::new(),
                 exit_notified: false,
             }),
-            raw: RawDispatch::default(),
+            raw: RawDispatch::new(desktop_authoritative, self.inner.queue_capacity),
         });
 
         let sink = Arc::new(TabSink {
@@ -994,13 +1008,6 @@ impl TabRegistry {
             {
                 return Err(TabError::new("tab.closed", "the tab is closing"));
             }
-            if kind == AttachmentKind::Desktop {
-                if let Some(pending) = live.pending_desktop_raw.take() {
-                    if !pending.is_empty() {
-                        let _ = mailbox.push_raw(pending);
-                    }
-                }
-            }
             live.attachments.insert(
                 attachment_id.clone(),
                 AttachmentState {
@@ -1015,6 +1022,14 @@ impl TabRegistry {
                     size: live.descriptor.size,
                 });
             }
+        }
+        if kind == AttachmentKind::Desktop {
+            // Replay is asynchronous: a backlog larger than the downstream
+            // mailbox cannot deadlock this attach before JS receives its
+            // channel. The opening queue remains in Replaying until every
+            // reserved/queued chunk is handed over, so live bytes stay behind
+            // the backlog even after this method returns.
+            tab.raw.start_opening_replay(mailbox.clone());
         }
         Ok(TabAttachment {
             id: attachment_id.clone(),
@@ -1129,15 +1144,18 @@ impl TabRegistry {
         // state. Wake a bounded raw producer first, then join its transaction
         // before publishing Exited.
         tab.raw.close();
-        let (pty_id, slot_id) = {
+        let (pty_id, slot_id, exit) = {
             let _output_order = tab.raw.send_order.lock().unwrap();
             let mut live = tab.live.lock().unwrap();
             let pty_id = live.pty.id();
             live.pty = PtyBinding::Exited;
             let slot_id = live.descriptor.slot_id.clone();
-            live.mark_exited(None, None, true);
-            (pty_id, slot_id)
+            let exit = live.mark_exited(None, None, true);
+            (pty_id, slot_id, exit)
         };
+        if let Some(exit) = exit {
+            self.inner.publish_exit(id, &exit);
+        }
         self.inner.remove_tab(id, &slot_id, pty_id);
         if let Some(pty_id) = pty_id {
             self.inner.backend.kill(pty_id);
@@ -1186,6 +1204,22 @@ fn emit_desktop_exit(app: &AppHandle, tab_id: &TabId, exit: &TabExit) {
     );
 }
 
+/// Start the one process-wide projection from registry exits to Tauri events.
+/// Setup installs it before the webview can open a tab, so the channel needs
+/// no replay lane and attachment workers never duplicate lifecycle events.
+pub fn start_desktop_exit_bridge(app: AppHandle, registry: TabRegistry) -> Result<(), String> {
+    let exits = registry.subscribe_exits();
+    std::thread::Builder::new()
+        .name("desktop-tab-exits".to_string())
+        .spawn(move || {
+            while let Ok((tab_id, exit)) = exits.recv() {
+                emit_desktop_exit(&app, &tab_id, &exit);
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn tab_open(
     state: State<'_, TabRegistry>,
@@ -1221,17 +1255,9 @@ pub fn tab_attach_desktop(
     on_output: Channel<InvokeResponseBody>,
 ) -> Result<AttachmentId, String> {
     let registry = (*state).clone();
-    let attachment = match registry.attach(&tab_id, AttachmentKind::Desktop) {
-        Ok(attachment) => attachment,
-        Err(error) => {
-            if let Ok(descriptor) = registry.get(&tab_id) {
-                if let Some(exit) = descriptor.exit() {
-                    emit_desktop_exit(&app, &tab_id, exit);
-                }
-            }
-            return Err(command_error(error));
-        }
-    };
+    let attachment = registry
+        .attach(&tab_id, AttachmentKind::Desktop)
+        .map_err(command_error)?;
     let attachment_id = attachment.id.clone();
     let events = attachment.events;
     std::thread::Builder::new()
@@ -1250,9 +1276,7 @@ pub fn tab_attach_desktop(
                             let _ = app.emit("tab://changed", descriptor);
                         }
                     }
-                    TabEvent::Exited(exit) => {
-                        emit_desktop_exit(&app, &tab_id, &exit);
-                    }
+                    TabEvent::Exited(_) => {}
                     TabEvent::Snapshot(_)
                     | TabEvent::Diff(_)
                     | TabEvent::FocusChanged { .. }
@@ -1345,6 +1369,7 @@ struct RegistryInner {
     backend: Arc<dyn PtyBackend>,
     maps: Mutex<RegistryMaps>,
     queue_capacity: usize,
+    exit_subscribers: Mutex<Vec<mpsc::Sender<(TabId, TabExit)>>>,
 }
 
 #[derive(Default)]
@@ -1361,14 +1386,189 @@ struct TabCell {
     raw: RawDispatch,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpeningRawPhase {
+    Pending,
+    Replaying,
+    Attached,
+    Closed,
+}
+
+struct OpeningRawState {
+    phase: OpeningRawPhase,
+    queue: VecDeque<Vec<u8>>,
+    reserved: usize,
+}
+
+struct OpeningRaw {
+    capacity: usize,
+    state: Mutex<OpeningRawState>,
+    changed: Condvar,
+}
+
+enum OpeningRoute {
+    Reserved(OpeningReservation),
+    Attached,
+    Closed,
+}
+
+struct OpeningReservation {
+    opening: Arc<OpeningRaw>,
+    resolved: bool,
+}
+
+impl OpeningRaw {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(OpeningRawState {
+                phase: OpeningRawPhase::Pending,
+                queue: VecDeque::new(),
+                reserved: 0,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// Reserve one bounded chunk before taking the Task 4 output-order gate.
+    /// Attach and close never need this reservation, so either can make
+    /// progress while a producer waits for replay capacity.
+    fn reserve(self: &Arc<Self>) -> OpeningRoute {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            match state.phase {
+                OpeningRawPhase::Attached => return OpeningRoute::Attached,
+                OpeningRawPhase::Closed => return OpeningRoute::Closed,
+                OpeningRawPhase::Pending | OpeningRawPhase::Replaying => {
+                    if state.queue.len() + state.reserved < self.capacity {
+                        state.reserved += 1;
+                        return OpeningRoute::Reserved(OpeningReservation {
+                            opening: self.clone(),
+                            resolved: false,
+                        });
+                    }
+                    state = self.changed.wait(state).unwrap();
+                }
+            }
+        }
+    }
+
+    fn start_replay(self: &Arc<Self>, mailbox: Arc<EventMailbox>) {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.phase != OpeningRawPhase::Pending {
+                return;
+            }
+            state.phase = OpeningRawPhase::Replaying;
+            self.changed.notify_all();
+        }
+        let opening = self.clone();
+        std::thread::Builder::new()
+            .name("desktop-opening-replay".to_string())
+            .spawn(move || opening.replay(mailbox))
+            .expect("desktop opening replay thread");
+    }
+
+    fn replay(&self, mailbox: Arc<EventMailbox>) {
+        loop {
+            let chunk = {
+                let mut state = self.state.lock().unwrap();
+                loop {
+                    match state.phase {
+                        OpeningRawPhase::Closed => return,
+                        OpeningRawPhase::Replaying => {
+                            if let Some(chunk) = state.queue.pop_front() {
+                                self.changed.notify_all();
+                                break chunk;
+                            }
+                            if state.reserved == 0 {
+                                state.phase = OpeningRawPhase::Attached;
+                                self.changed.notify_all();
+                                return;
+                            }
+                            state = self.changed.wait(state).unwrap();
+                        }
+                        OpeningRawPhase::Pending | OpeningRawPhase::Attached => return,
+                    }
+                }
+            };
+            if !mailbox.push_raw(chunk) {
+                self.close();
+                return;
+            }
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.phase = OpeningRawPhase::Closed;
+        state.queue.clear();
+        self.changed.notify_all();
+    }
+}
+
+impl OpeningReservation {
+    /// Commit under the output-order gate. The replay worker cannot switch to
+    /// live delivery while any reservation exists, so later raw bytes cannot
+    /// overtake this chunk.
+    fn enqueue(mut self, bytes: Vec<u8>) -> bool {
+        let mut state = self.opening.state.lock().unwrap();
+        debug_assert!(state.reserved > 0);
+        state.reserved -= 1;
+        let accepted = state.phase != OpeningRawPhase::Closed;
+        if accepted {
+            state.queue.push_back(bytes);
+        }
+        self.resolved = true;
+        self.opening.changed.notify_all();
+        accepted
+    }
+}
+
+impl Drop for OpeningReservation {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let mut state = self.opening.state.lock().unwrap();
+        debug_assert!(state.reserved > 0);
+        state.reserved -= 1;
+        self.opening.changed.notify_all();
+    }
+}
+
 struct RawDispatch {
     phase: AtomicU8,
     mailboxes: Mutex<HashMap<AttachmentId, Weak<EventMailbox>>>,
+    opening: Option<Arc<OpeningRaw>>,
+    producer_order: Mutex<()>,
     send_order: Mutex<()>,
 }
 
 impl RawDispatch {
+    fn new(desktop_open: bool, capacity: usize) -> Self {
+        Self {
+            phase: AtomicU8::new(RAW_OPEN),
+            mailboxes: Mutex::new(HashMap::new()),
+            opening: desktop_open.then(|| OpeningRaw::new(capacity)),
+            producer_order: Mutex::new(()),
+            send_order: Mutex::new(()),
+        }
+    }
+
+    fn reserve_opening(&self) -> OpeningRoute {
+        self.opening
+            .as_ref()
+            .map(OpeningRaw::reserve)
+            .unwrap_or(OpeningRoute::Attached)
+    }
+
+    fn start_opening_replay(&self, mailbox: Arc<EventMailbox>) {
+        if let Some(opening) = &self.opening {
+            opening.start_replay(mailbox);
+        }
+    }
+
     fn register(&self, id: AttachmentId, mailbox: &Arc<EventMailbox>) -> bool {
         if self.phase.load(Ordering::Acquire) != RAW_OPEN {
             return false;
@@ -1386,6 +1586,9 @@ impl RawDispatch {
     }
 
     fn cancel_waits(&self) {
+        if let Some(opening) = &self.opening {
+            opening.close();
+        }
         let mailboxes = self
             .mailboxes
             .lock()
@@ -1414,7 +1617,7 @@ impl RawDispatch {
     }
 
     fn is_closing(&self) -> bool {
-        self.phase.load(Ordering::Acquire) == RAW_CLOSING
+        self.phase.load(Ordering::Acquire) != RAW_OPEN
     }
 
     fn require_open(&self) -> Result<(), TabError> {
@@ -1431,6 +1634,13 @@ const RAW_PREPARING_EXIT: u8 = 1;
 const RAW_CLOSING: u8 = 2;
 
 impl RegistryInner {
+    fn publish_exit(&self, id: &TabId, exit: &TabExit) {
+        self.exit_subscribers
+            .lock()
+            .unwrap()
+            .retain(|subscriber| subscriber.send((id.clone(), exit.clone())).is_ok());
+    }
+
     fn tab(&self, id: &TabId) -> Result<Arc<TabCell>, TabError> {
         self.maps
             .lock()
@@ -1546,9 +1756,9 @@ struct LiveTab {
     screen: ScreenModel,
     pty: PtyBinding,
     attachments: HashMap<AttachmentId, AttachmentState>,
-    /// Lossless bytes emitted between `tab_open` and the first desktop attach.
-    /// Once taken, later desktop attachments observe only live output.
-    pending_desktop_raw: Option<Vec<u8>>,
+    /// A Tauri desktop open leaves terminal-query replies to xterm even before
+    /// its first attachment has reached React.
+    desktop_authoritative: bool,
     pending_replies: VecDeque<Vec<u8>>,
     exit_notified: bool,
 }
@@ -1618,9 +1828,14 @@ impl LiveTab {
         }
     }
 
-    fn mark_exited(&mut self, code: Option<u32>, signal: Option<String>, requested: bool) {
+    fn mark_exited(
+        &mut self,
+        code: Option<u32>,
+        signal: Option<String>,
+        requested: bool,
+    ) -> Option<TabExit> {
         if self.exit_notified {
-            return;
+            return None;
         }
         self.exit_notified = true;
         self.descriptor.state = TabState::Exited;
@@ -1634,10 +1849,11 @@ impl LiveTab {
         for attachment in self.attachments.values() {
             attachment.mailbox.finish(exit.clone());
         }
+        Some(exit)
     }
 
     fn queue_replies(&mut self, replies: Vec<Vec<u8>>) -> Option<u32> {
-        let desktop_owns = self.pending_desktop_raw.is_some()
+        let desktop_owns = self.desktop_authoritative
             || self
                 .descriptor
                 .input_owner
@@ -1673,55 +1889,62 @@ impl PtySink for TabSink {
         let (Some(registry), Some(tab)) = (self.registry.upgrade(), self.tab.upgrade()) else {
             return;
         };
-        // The PTY reader is normally the only producer, but keep raw chunks
-        // ordered even for controlled/concurrent sinks. Close flips persistent
-        // cancellation without this guard, then joins it after raw push wakes.
-        let _send_order = tab.raw.send_order.lock().unwrap();
-        if tab.raw.is_closing() {
-            return;
-        }
-        let desktop_mailboxes = {
-            let mut live = tab.live.lock().unwrap();
-            if live.descriptor.state != TabState::Running {
-                return;
-            }
-            let mailboxes = live.desktop_mailboxes();
-            if mailboxes.is_empty() {
-                if let Some(pending) = &mut live.pending_desktop_raw {
-                    pending.extend_from_slice(bytes);
-                }
-            }
-            mailboxes
-        };
-        for mailbox in desktop_mailboxes {
-            let _ = mailbox.push_raw(bytes.to_vec());
+        // Controlled/fake sinks may call output concurrently. Keep whole
+        // callbacks ordered while allowing a capacity wait to happen before
+        // the Task 4 transaction gate that attach/focus/close need.
+        let _producer_order = tab.raw.producer_order.lock().unwrap();
+        for bytes in bytes.chunks(MAX_DESKTOP_RAW_CHUNK) {
+            let route = tab.raw.reserve_opening();
+            let _send_order = tab.raw.send_order.lock().unwrap();
             if tab.raw.is_closing() {
                 return;
             }
-        }
-        if tab.raw.is_closing() {
-            return;
-        }
-        let flush = {
-            let mut live = tab.live.lock().unwrap();
-            if live.descriptor.state != TabState::Running {
+
+            if tab.live.lock().unwrap().descriptor.state != TabState::Running {
+                return; // dropping a reservation refunds it
+            }
+
+            match route {
+                OpeningRoute::Reserved(reservation) => {
+                    if !reservation.enqueue(bytes.to_vec()) {
+                        return;
+                    }
+                }
+                OpeningRoute::Attached => {
+                    let desktop_mailboxes = tab.live.lock().unwrap().desktop_mailboxes();
+                    for mailbox in desktop_mailboxes {
+                        if !mailbox.push_raw(bytes.to_vec()) || tab.raw.is_closing() {
+                            return;
+                        }
+                    }
+                }
+                OpeningRoute::Closed => return,
+            }
+
+            if tab.raw.is_closing() {
                 return;
             }
-            let damage = live.screen.process(bytes);
-            if let Some(diff) = damage.diff {
-                live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
+            let flush = {
+                let mut live = tab.live.lock().unwrap();
+                if live.descriptor.state != TabState::Running {
+                    return;
+                }
+                let damage = live.screen.process(bytes);
+                if let Some(diff) = damage.diff {
+                    live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
+                }
+                if let Some(title) = damage.title {
+                    live.descriptor.title = title.clone();
+                    live.enqueue_control_all(TabEvent::Title(title));
+                }
+                if damage.bell {
+                    live.enqueue_control_all(TabEvent::Bell);
+                }
+                live.queue_replies(damage.replies)
+            };
+            if let Some(pty_id) = flush {
+                flush_replies(&registry, &tab, pty_id);
             }
-            if let Some(title) = damage.title {
-                live.descriptor.title = title.clone();
-                live.enqueue_control_all(TabEvent::Title(title));
-            }
-            if damage.bell {
-                live.enqueue_control_all(TabEvent::Bell);
-            }
-            live.queue_replies(damage.replies)
-        };
-        if let Some(pty_id) = flush {
-            flush_replies(&registry, &tab, pty_id);
         }
     }
 
@@ -1737,11 +1960,16 @@ impl PtySink for TabSink {
         };
         tab.raw.close();
         let _output_order = tab.raw.send_order.lock().unwrap();
-        {
+        let exit = {
             let mut live = tab.live.lock().unwrap();
             live.pty = PtyBinding::Exited;
             live.pending_replies.clear();
-            live.mark_exited(code, signal.map(str::to_owned), false);
+            let id = live.descriptor.id.clone();
+            let exit = live.mark_exited(code, signal.map(str::to_owned), false);
+            exit.map(|exit| (id, exit))
+        };
+        if let Some((id, exit)) = exit {
+            registry.publish_exit(&id, &exit);
         }
         registry.maps.lock().unwrap().by_pty.remove(&pty_id);
     }
