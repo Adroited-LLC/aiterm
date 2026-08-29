@@ -65,11 +65,16 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
       <div className="sgroup">
         <div className="sgroup-rows">
           <Row
-            label="Let a model catalogue sessions"
-            desc="Reads each session once — the opening prompt, the last exchange, the files touched — and writes a short name, a few tags, the thread of work it belongs to, and where it left off. That feeds the Threads tab and, if you like, the names in the session list."
+            label="Librarian"
+            desc="A small model reads each session once — the opening prompt, the last exchange, the files touched — and writes a short name, a few tags, the thread of work it belongs to, and where it left off. That feeds the Threads tab in the sidebar and, if you like, the names in the session list. Off: no tab, no runs; what it has written is kept for when it is on again."
           >
             <Switch checked={cfg.enabled} onChange={(on) => set({ enabled: on })} label="Librarian on" />
           </Row>
+        </div>
+      </div>
+      {cfg.enabled && <>
+      <div className="sgroup">
+        <div className="sgroup-rows">
           <Row label="Runs through" desc="An installed CLI in its print mode uses the plan you already pay for. An API provider is for a model none of them serve.">
             <div className="lib-engines">
               {agents.map((a) => (
@@ -134,9 +139,7 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
           <Row label="Use its names in the session list" desc="In place of the raw first prompt. The original stays in the tooltip.">
             <Switch checked={cfg.renameRows} onChange={(on) => set({ renameRows: on })} label="Rename rows" />
           </Row>
-          <Row label="Show the Threads tab" desc="The fourth tab in the sidebar. Off hides the tab; the librarian still runs and its names still show in the list.">
-            <Switch checked={cfg.showThreadsTab} onChange={(on) => set({ showThreadsTab: on })} label="Threads tab" />
-          </Row>
+
         </div>
       </div>
 
@@ -236,6 +239,7 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
           </Row>
         </div>
       </div>
+      </>}
     </>
   );
 }
