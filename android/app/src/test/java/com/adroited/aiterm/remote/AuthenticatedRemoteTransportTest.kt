@@ -6,6 +6,7 @@ import com.adroited.aiterm.pairing.PairingFrames
 import com.adroited.aiterm.security.DeviceKeys
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
@@ -68,6 +69,59 @@ class AuthenticatedRemoteTransportTest {
     }
 
     @Test
+    fun closeWhileDialingPreventsTheLateSocketFromSigningOrPublishing() = runTest {
+        val socket = FakeBinarySocket().apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 5 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+        }
+        val dialer = DeferredDialer()
+        val keys = RecordingDeviceKeys()
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(),
+            deviceKeys = keys,
+            isUnlocked = { true },
+            dialer = dialer,
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        val connecting = async { runCatching { transport.connect() } }
+        runCurrent()
+        transport.close()
+        dialer.socket.complete(socket)
+        runCurrent()
+
+        assertTrue(connecting.await().isFailure)
+        assertEquals(0, keys.signCount)
+        assertTrue(socket.closed)
+    }
+
+    @Test
+    fun lockDuringKeystoreSignatureDiscardsProofAndClosesCandidate() = runTest {
+        val socket = FakeBinarySocket().apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 6 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+        }
+        var unlocked = true
+        val keys = RecordingDeviceKeys { unlocked = false }
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(),
+            deviceKeys = keys,
+            isUnlocked = { unlocked },
+            dialer = FakeDialer(socket),
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        val result = runCatching { transport.connect() }
+
+        assertTrue(result.isFailure)
+        assertEquals(1, keys.signCount)
+        assertEquals(0, socket.sent.size)
+        assertTrue(socket.closed)
+    }
+
+    @Test
     fun responsesCompleteOnlyTheirCorrelatedPendingRequest() = runTest {
         val socket = FakeBinarySocket().apply {
             incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
@@ -115,13 +169,19 @@ class AuthenticatedRemoteTransportTest {
         value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }
 
-private class RecordingDeviceKeys : DeviceKeys {
+private class RecordingDeviceKeys(private val afterSign: () -> Unit = {}) : DeviceKeys {
     var signCount = 0
     override fun devicePublicKey(): ByteArray = ByteArray(33)
     override fun signChallenge(nonce: ByteArray): ByteArray {
         signCount++
+        afterSign()
         return byteArrayOf(1, 2, 3)
     }
+}
+
+private class DeferredDialer : RemoteSocketDialer {
+    val socket = CompletableDeferred<RemoteBinarySocket>()
+    override suspend fun open(desktop: PairedDesktop): RemoteBinarySocket = socket.await()
 }
 
 private class FakeDialer(private val socket: RemoteBinarySocket) : RemoteSocketDialer {

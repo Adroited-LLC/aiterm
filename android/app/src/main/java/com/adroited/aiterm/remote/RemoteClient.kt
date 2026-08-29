@@ -5,6 +5,7 @@ import com.adroited.aiterm.terminal.ApplyResult
 import com.adroited.aiterm.terminal.ScreenRow
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -15,6 +16,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -94,6 +97,8 @@ class RemoteClient(
     private val mutableScrollback = MutableStateFlow<List<ScreenRow>>(emptyList())
     val scrollback: StateFlow<List<ScreenRow>> = mutableScrollback.asStateFlow()
     private val nextRequestId = AtomicLong(1)
+    private val lifecycleLock = Any()
+    private val selectionMutex = Mutex()
     private val transfers = linkedSetOf<String>()
     private val terminalAssembler = TerminalTransferAssembler()
     private val rosterAssembler = RosterTransferAssembler()
@@ -102,10 +107,16 @@ class RemoteClient(
     private var reconnectJob: Job? = null
     private var recoveryRequested = false
     private var activeAttachmentId: String? = null
+    private var activeAttachmentTabId: String? = null
+    private var lifecycleGeneration = 0L
+    private var selectionGeneration = 0L
+    private val ownedJobs = linkedSetOf<Job>()
 
     suspend fun connect(): Boolean {
-        reconnectJob?.cancel()
-        reconnectJob = null
+        synchronized(lifecycleLock) {
+            reconnectJob?.cancel()
+            reconnectJob = null
+        }
         return connectOnce(ConnectionState.Connecting)
     }
 
@@ -114,79 +125,114 @@ class RemoteClient(
             lock()
             return false
         }
-        closeTransport()
         val candidate = transportFactory()
-        transport = candidate
-        mutableState.value = mutableState.value.copy(connection = connectingState)
+        val generation = beginConnection(candidate, connectingState)
         return try {
             candidate.connect()
-            mutableState.value = mutableState.value.copy(connection = ConnectionState.Connected)
-            eventJob = scope.launch(dispatcher) { candidate.events.collect(::accept) }
-            mutableState.value.activeTabId?.let(::selectTab)
-            if (mutableState.value.sessions.isNotEmpty()) refreshSessions()
-            true
+            val selectedTab = synchronized(lifecycleLock) {
+                if (!isCurrent(generation, candidate) || !isUnlocked()) return@synchronized null
+                mutableState.value = mutableState.value.copy(connection = ConnectionState.Connected)
+                mutableState.value.activeTabId
+            }
+            if (!isCurrent(generation, candidate) || !isUnlocked()) {
+                candidate.close()
+                return false
+            }
+            val collector = scope.launch(dispatcher, start = CoroutineStart.LAZY) {
+                candidate.events.collect { event -> accept(generation, event) }
+            }
+            val published = synchronized(lifecycleLock) {
+                if (!isCurrent(generation, candidate)) {
+                    collector.cancel()
+                    false
+                } else {
+                    eventJob = collector
+                    ownedJobs += collector
+                    collector.invokeOnCompletion { synchronized(lifecycleLock) { ownedJobs -= collector } }
+                    collector.start()
+                    true
+                }
+            }
+            if (!published) return false
+            selectedTab?.let(::selectTab)
+            if (synchronized(lifecycleLock) { mutableState.value.sessions.isNotEmpty() }) refreshSessions()
+            synchronized(lifecycleLock) { isCurrent(generation, candidate) }
         } catch (error: Exception) {
             candidate.close()
-            transport = null
-            mutableState.value = mutableState.value.copy(
-                connection = ConnectionState.Disconnected,
-                lastError = error.message ?: "Connection failed",
-            )
+            synchronized(lifecycleLock) {
+                if (isCurrent(generation, candidate)) {
+                    transport = null
+                    mutableState.value = mutableState.value.copy(
+                        connection = ConnectionState.Disconnected,
+                        lastError = error.message ?: "Connection failed",
+                    )
+                }
+            }
             false
         }
     }
 
     fun sendInput(text: String): Boolean {
-        if (text.isEmpty() || mutableState.value.focus != FocusOwner.Self) {
-            mutableState.value = mutableState.value.copy(
-                readOnly = true,
-                showTakeFocus = true,
-            )
-            return false
+        val target = synchronized(lifecycleLock) {
+            if (text.isEmpty() || mutableState.value.focus != FocusOwner.Self) {
+                mutableState.value = mutableState.value.copy(readOnly = true, showTakeFocus = true)
+                return false
+            }
+            val tabId = mutableState.value.activeTabId ?: return false
+            val attachmentId = activeAttachmentId ?: return false
+            if (activeAttachmentTabId != tabId) return false
+            tabId to attachmentId
         }
-        val tabId = mutableState.value.activeTabId ?: return false
-        val attachmentId = activeAttachmentId ?: return false
         val data = text.encodeToByteArray()
         if (data.size > MAX_INPUT_BYTES) return false
-        launchRequest("terminal.input", RemoteCommands.input(tabId, attachmentId, data))
+        launchRequest("terminal.input", RemoteCommands.input(target.first, target.second, data))
         return true
     }
 
     fun selectTab(tabId: String) {
-        if (tabId == mutableState.value.activeTabId && activeAttachmentId != null) return
-        launchRequest("terminal.attach", RemoteCommands.tab(tabId)) { payload ->
-            val attached = RemoteCommands.attached(payload)
-            if (attached.tabId != mutableState.value.activeTabId) mutableScrollback.value = emptyList()
-            activeAttachmentId = attached.attachmentId
+        val selection = synchronized(lifecycleLock) {
+            if (tabId == mutableState.value.activeTabId && activeAttachmentId != null &&
+                activeAttachmentTabId == tabId
+            ) return
+            val active = transport ?: return
+            selectionGeneration += 1
+            screenStore.clear()
+            mutableScrollback.value = emptyList()
+            terminalAssembler.clear()
+            recoveryRequested = false
             mutableState.value = mutableState.value.copy(
-                activeTabId = attached.tabId,
-                activeTitle = attached.title,
-                focus = if (attached.hasFocus) FocusOwner.Self else FocusOwner.Other,
-                readOnly = !attached.hasFocus,
-                showTakeFocus = !attached.hasFocus,
+                activeTabId = tabId,
+                activeTitle = null,
+                focus = FocusOwner.Unowned,
+                readOnly = true,
+                showTakeFocus = false,
+                pendingTransfers = 0,
             )
+            Selection(lifecycleGeneration, selectionGeneration, tabId, active)
+        }
+        launchOwned(selection.lifecycleGeneration) {
+            selectionMutex.withLock { runSelection(selection) }
         }
     }
 
     fun takeFocus(size: TerminalSize): Boolean {
-        val tabId = mutableState.value.activeTabId ?: return false
-        val attachmentId = activeAttachmentId ?: return false
+        val (tabId, attachmentId) = synchronized(lifecycleLock) { activeTarget() } ?: return false
         launchRequest("terminal.focus", RemoteCommands.sized(tabId, attachmentId, size))
         return true
     }
 
     fun resize(size: TerminalSize): Boolean {
-        if (mutableState.value.focus != FocusOwner.Self) return false
-        val tabId = mutableState.value.activeTabId ?: return false
-        val attachmentId = activeAttachmentId ?: return false
+        val (tabId, attachmentId) = synchronized(lifecycleLock) {
+            if (mutableState.value.focus != FocusOwner.Self) return false
+            activeTarget()
+        } ?: return false
         launchRequest("terminal.resize", RemoteCommands.sized(tabId, attachmentId, size))
         return true
     }
 
     fun requestScrollback(offset: Int, count: Int): Boolean {
         if (offset < 0 || count !in 1..512) return false
-        val tabId = mutableState.value.activeTabId ?: return false
-        val attachmentId = activeAttachmentId ?: return false
+        val (tabId, attachmentId) = synchronized(lifecycleLock) { activeTarget() } ?: return false
         launchRequest("terminal.scrollback", RemoteCommands.scrollback(tabId, attachmentId, offset, count))
         return true
     }
@@ -253,23 +299,28 @@ class RemoteClient(
     }
 
     fun lock() {
-        reconnectJob?.cancel()
-        reconnectJob = null
+        synchronized(lifecycleLock) {
+            reconnectJob?.cancel()
+            reconnectJob = null
+        }
         closeTransport()
-        transfers.clear()
-        terminalAssembler.clear()
-        rosterAssembler.clear()
-        recoveryRequested = false
-        activeAttachmentId = null
-        screenStore.clear()
-        mutableScrollback.value = emptyList()
-        mutableState.value = RemoteClientState(connection = ConnectionState.Locked)
+        synchronized(lifecycleLock) {
+            transfers.clear()
+            terminalAssembler.clear()
+            rosterAssembler.clear()
+            recoveryRequested = false
+            activeAttachmentId = null
+            activeAttachmentTabId = null
+            screenStore.clear()
+            mutableScrollback.value = emptyList()
+            mutableState.value = RemoteClientState(connection = ConnectionState.Locked)
+        }
     }
 
-    internal fun acceptForTest(event: RemoteServerEvent) = accept(event)
+    internal fun acceptForTest(event: RemoteServerEvent) = accept(null, event)
 
-    @Synchronized
-    private fun accept(event: RemoteServerEvent) {
+    private fun accept(expectedGeneration: Long?, event: RemoteServerEvent) = synchronized(lifecycleLock) {
+        if (expectedGeneration != null && expectedGeneration != lifecycleGeneration) return@synchronized
         when (event) {
             is RemoteServerEvent.FocusChanged -> mutableState.value = mutableState.value.copy(
                 focus = event.focus,
@@ -329,6 +380,7 @@ class RemoteClient(
                 rosterAssembler.clear()
                 recoveryRequested = false
                 activeAttachmentId = null
+                activeAttachmentTabId = null
                 screenStore.clear()
                 mutableScrollback.value = emptyList()
                 mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
@@ -341,7 +393,7 @@ class RemoteClient(
             "terminal.focus_changed" -> {
                 val focus = RemoteCommands.focus(event.payload)
                 if (focus.attachmentId == activeAttachmentId && focus.tabId == mutableState.value.activeTabId) {
-                    accept(RemoteServerEvent.FocusChanged(focus.tabId, focus.attachmentId, focus.focus, focus.size))
+                    accept(null, RemoteServerEvent.FocusChanged(focus.tabId, focus.attachmentId, focus.focus, focus.size))
                 }
             }
             "session.changed" -> refreshSessions()
@@ -353,21 +405,54 @@ class RemoteClient(
                     mutableState.value = mutableState.value.copy(activeTitle = title.title)
                 }
             }
+            "terminal.exited" -> {
+                val exited = RemoteCommands.terminalExited(event.payload)
+                if (exited.tabId == activeAttachmentTabId && exited.attachmentId == activeAttachmentId) {
+                    activeAttachmentId = null
+                    activeAttachmentTabId = null
+                    terminalAssembler.clear()
+                    screenStore.clear()
+                    mutableScrollback.value = emptyList()
+                    mutableState.value = mutableState.value.copy(
+                        focus = FocusOwner.Unowned,
+                        readOnly = true,
+                        showTakeFocus = false,
+                        pendingTransfers = 0,
+                        lastError = "Terminal exited",
+                    )
+                    refreshTabs()
+                }
+            }
             else -> Unit
         }
     }
 
     private fun launchRequest(kind: String, payload: ByteArray, onSuccess: (ByteArray) -> Unit = {}) {
-        val active = transport ?: return
+        val requestContext = synchronized(lifecycleLock) {
+            val active = transport ?: return
+            RequestContext(lifecycleGeneration, active)
+        }
         val request = RemoteRequest(nextRequestId.getAndIncrement(), kind, payload)
-        scope.launch(dispatcher) {
+        launchOwned(requestContext.lifecycleGeneration) {
             try {
-                when (val response = active.request(request)) {
-                    is RemoteResponse.Error -> accept(RemoteServerEvent.Failure(response.code, response.message))
-                    is RemoteResponse.Success -> onSuccess(response.payload)
+                when (val response = requestContext.transport.request(request)) {
+                    is RemoteResponse.Error -> accept(
+                        requestContext.lifecycleGeneration,
+                        RemoteServerEvent.Failure(response.code, response.message),
+                    )
+                    is RemoteResponse.Success -> synchronized(lifecycleLock) {
+                        if (isCurrent(requestContext.lifecycleGeneration, requestContext.transport)) {
+                            onSuccess(response.payload)
+                        }
+                    }
                 }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                throw kotlinx.coroutines.CancellationException("remote request canceled")
             } catch (error: Exception) {
-                accept(RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"))
+                accept(
+                    requestContext.lifecycleGeneration,
+                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                )
             }
         }
     }
@@ -387,6 +472,7 @@ class RemoteClient(
     }
 
     private fun acceptTerminalChunk(chunk: TerminalTransferChunk) {
+        if (chunk.tabId != activeAttachmentTabId || chunk.attachmentId != activeAttachmentId) return
         when (val result = terminalAssembler.accept(chunk)) {
             TerminalTransferResult.Pending -> mutableState.value = mutableState.value.copy(pendingTransfers = 1)
             TerminalTransferResult.Recover -> requestRecovery(chunk.tabId, chunk.attachmentId)
@@ -429,29 +515,158 @@ class RemoteClient(
             "terminal.resume",
             RemoteWireCodec.encodeTerminalResumePayload(tabId, attachmentId, revision),
         )
-        scope.launch(dispatcher) {
+        val generation = lifecycleGeneration
+        launchOwned(generation) {
             when (val response = active.request(request)) {
-                is RemoteResponse.Error -> accept(RemoteServerEvent.Failure(response.code, response.message))
+                is RemoteResponse.Error -> accept(generation, RemoteServerEvent.Failure(response.code, response.message))
                 is RemoteResponse.Success -> Unit
             }
         }
     }
 
     private fun closeTransport() {
-        eventJob?.cancel()
-        eventJob = null
-        transport?.close()
-        transport = null
-        terminalAssembler.clear()
-        rosterAssembler.clear()
-        recoveryRequested = false
-        activeAttachmentId = null
+        val closing = synchronized(lifecycleLock) {
+            lifecycleGeneration += 1
+            selectionGeneration += 1
+            val jobs = ownedJobs.toList()
+            ownedJobs.clear()
+            val active = transport
+            eventJob = null
+            transport = null
+            terminalAssembler.clear()
+            rosterAssembler.clear()
+            recoveryRequested = false
+            activeAttachmentId = null
+            activeAttachmentTabId = null
+            active to jobs
+        }
+        closing.second.forEach(Job::cancel)
+        closing.first?.close()
     }
+
+    private fun beginConnection(candidate: RemoteTransport, connectingState: ConnectionState): Long {
+        val closing = synchronized(lifecycleLock) {
+            lifecycleGeneration += 1
+            selectionGeneration += 1
+            val jobs = ownedJobs.toList()
+            ownedJobs.clear()
+            val previous = transport
+            eventJob = null
+            transport = candidate
+            activeAttachmentId = null
+            activeAttachmentTabId = null
+            terminalAssembler.clear()
+            rosterAssembler.clear()
+            recoveryRequested = false
+            mutableState.value = mutableState.value.copy(connection = connectingState)
+            Triple(previous, jobs, lifecycleGeneration)
+        }
+        closing.second.forEach(Job::cancel)
+        closing.first?.close()
+        return closing.third
+    }
+
+    private fun launchOwned(generation: Long, block: suspend () -> Unit): Boolean {
+        lateinit var job: Job
+        job = scope.launch(dispatcher, start = CoroutineStart.LAZY) { block() }
+        val accepted = synchronized(lifecycleLock) {
+            if (generation != lifecycleGeneration || ownedJobs.size >= MAX_OWNED_JOBS) false
+            else {
+                ownedJobs += job
+                job.invokeOnCompletion { synchronized(lifecycleLock) { ownedJobs -= job } }
+                true
+            }
+        }
+        if (accepted) job.start() else job.cancel()
+        return accepted
+    }
+
+    private suspend fun runSelection(selection: Selection) {
+        if (!isSelectionCurrent(selection)) return
+        val previous = synchronized(lifecycleLock) {
+            val value = activeAttachmentTabId?.let { tab -> activeAttachmentId?.let { tab to it } }
+            activeAttachmentId = null
+            activeAttachmentTabId = null
+            value
+        }
+        if (previous != null) {
+            requestIgnoringError(
+                selection.transport,
+                "terminal.detach",
+                RemoteCommands.attachment(previous.first, previous.second),
+            )
+        }
+        if (!isSelectionCurrent(selection)) return
+        val response = selection.transport.request(
+            RemoteRequest(nextRequestId.getAndIncrement(), "terminal.attach", RemoteCommands.tab(selection.tabId)),
+        )
+        if (response is RemoteResponse.Error) {
+            accept(
+                selection.lifecycleGeneration,
+                RemoteServerEvent.Failure(response.code, response.message),
+            )
+            return
+        }
+        val attached = RemoteCommands.attached((response as RemoteResponse.Success).payload)
+        if (!isSelectionCurrent(selection) || attached.tabId != selection.tabId) {
+            requestIgnoringError(
+                selection.transport,
+                "terminal.detach",
+                RemoteCommands.attachment(attached.tabId, attached.attachmentId),
+            )
+            return
+        }
+        synchronized(lifecycleLock) {
+            if (!isSelectionCurrent(selection)) return@synchronized
+            activeAttachmentId = attached.attachmentId
+            activeAttachmentTabId = attached.tabId
+            mutableState.value = mutableState.value.copy(
+                activeTabId = attached.tabId,
+                activeTitle = attached.title,
+                focus = if (attached.hasFocus) FocusOwner.Self else FocusOwner.Other,
+                readOnly = !attached.hasFocus,
+                showTakeFocus = !attached.hasFocus,
+            )
+        }
+    }
+
+    private suspend fun requestIgnoringError(transport: RemoteTransport, kind: String, payload: ByteArray) {
+        try {
+            transport.request(RemoteRequest(nextRequestId.getAndIncrement(), kind, payload))
+        } catch (_: Exception) {
+            // Connection teardown owns cleanup when the detach cannot be delivered.
+        }
+    }
+
+    private fun activeTarget(): Pair<String, String>? {
+        val tabId = mutableState.value.activeTabId ?: return null
+        if (activeAttachmentTabId != tabId) return null
+        return tabId to (activeAttachmentId ?: return null)
+    }
+
+    private fun isCurrent(generation: Long, candidate: RemoteTransport): Boolean =
+        generation == lifecycleGeneration && transport === candidate
+
+    private fun isSelectionCurrent(selection: Selection): Boolean = synchronized(lifecycleLock) {
+        isCurrent(selection.lifecycleGeneration, selection.transport) &&
+            selection.selectionGeneration == selectionGeneration &&
+            mutableState.value.activeTabId == selection.tabId &&
+            mutableState.value.connection == ConnectionState.Connected
+    }
+
+    private data class RequestContext(val lifecycleGeneration: Long, val transport: RemoteTransport)
+    private data class Selection(
+        val lifecycleGeneration: Long,
+        val selectionGeneration: Long,
+        val tabId: String,
+        val transport: RemoteTransport,
+    )
 
     private companion object {
         const val MAX_PENDING_TRANSFERS = 4
         const val MAX_INPUT_BYTES = 64 * 1_024
         const val MAX_SCROLLBACK_ROWS = 5_000
+        const val MAX_OWNED_JOBS = 64
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }

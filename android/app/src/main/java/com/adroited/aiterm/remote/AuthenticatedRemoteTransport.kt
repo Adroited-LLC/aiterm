@@ -47,12 +47,25 @@ class AuthenticatedRemoteTransport(
     private val pending = LinkedHashMap<Long, PendingRequest>()
     private val completed = LinkedHashSet<Long>()
     private var socket: RemoteBinarySocket? = null
+    private var connectingSocket: RemoteBinarySocket? = null
     private var readerJob: Job? = null
+    private var started = false
+    private var closed = false
 
     override suspend fun connect() {
-        close()
+        synchronized(stateLock) {
+            if (started || closed) throw RemoteProtocolException("remote transport is closed")
+            started = true
+        }
         val candidate = dialer.open(desktop)
         try {
+            synchronized(stateLock) {
+                if (closed) {
+                    candidate.close()
+                    throw RemoteProtocolException("remote transport is closed")
+                }
+                connectingSocket = candidate
+            }
             val challengeBytes = withTimeout(AUTH_TIMEOUT_MILLIS) { candidate.receive() }
             val challenge = try {
                 PairingFrames.decode(challengeBytes) as? AuthChallengeFrame
@@ -63,6 +76,7 @@ class AuthenticatedRemoteTransport(
             // A socket opening while locked must never cause a signature prompt.
             if (!isUnlocked()) throw RemoteProtocolException("unlock is required before authentication")
             val signature = deviceKeys.signChallenge(challenge.nonce)
+            ensureOpenAndUnlocked(candidate)
             val proof = RemoteWireCodec.encodeAuthProof(desktop.deviceId, signature)
             try {
                 if (!candidate.send(proof)) throw RemoteProtocolException("authentication proof send failed")
@@ -72,9 +86,20 @@ class AuthenticatedRemoteTransport(
                 challenge.nonce.fill(0)
             }
             RemoteWireCodec.decodeAuthOk(withTimeout(AUTH_TIMEOUT_MILLIS) { candidate.receive() })
-            synchronized(stateLock) { socket = candidate }
+            ensureOpenAndUnlocked(candidate)
+            synchronized(stateLock) {
+                if (closed || connectingSocket !== candidate) {
+                    throw RemoteProtocolException("remote transport is closed")
+                }
+                connectingSocket = null
+                socket = candidate
+            }
             readerJob = scope.launch(dispatcher) { readLoop(candidate) }
         } catch (error: Exception) {
+            synchronized(stateLock) {
+                if (connectingSocket === candidate) connectingSocket = null
+                if (socket === candidate) socket = null
+            }
             candidate.close()
             throw error
         }
@@ -105,7 +130,8 @@ class AuthenticatedRemoteTransport(
         return try {
             withTimeout(REQUEST_TIMEOUT_MILLIS) { deferred.await() }
         } finally {
-            synchronized(stateLock) { pending.remove(request.requestId) }
+            val abandoned = synchronized(stateLock) { pending.remove(request.requestId) != null }
+            if (abandoned) rememberCompleted(request.requestId)
         }
     }
 
@@ -113,8 +139,11 @@ class AuthenticatedRemoteTransport(
         val failure = RemoteProtocolException("remote transport disconnected")
         val toFail: List<CompletableDeferred<RemoteResponse>>
         synchronized(stateLock) {
+            closed = true
             readerJob?.cancel()
             readerJob = null
+            connectingSocket?.close()
+            connectingSocket = null
             socket?.close()
             socket = null
             toFail = pending.values.map(PendingRequest::deferred)
@@ -163,14 +192,22 @@ class AuthenticatedRemoteTransport(
 
     private fun acceptResponse(event: RemoteEventEnvelope) {
         if (event.requestId <= 0) protocolFailure()
-        val request = synchronized(stateLock) { pending.remove(event.requestId) } ?: protocolFailure()
+        val request = synchronized(stateLock) { pending.remove(event.requestId) }
+        if (request == null) {
+            if (synchronized(stateLock) { completed.contains(event.requestId) }) return
+            protocolFailure()
+        }
         if (event.kind != request.kind) protocolFailure()
         rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Success(event.requestId, event.kind, event.payload))
     }
 
     private fun completeTransferOnlyRequest(event: RemoteEventEnvelope) {
-        val request = synchronized(stateLock) { pending.remove(event.requestId) } ?: protocolFailure()
+        val request = synchronized(stateLock) { pending.remove(event.requestId) }
+        if (request == null) {
+            if (synchronized(stateLock) { completed.contains(event.requestId) }) return
+            protocolFailure()
+        }
         if (request.kind != "terminal.scrollback") protocolFailure()
         rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Success(event.requestId, request.kind, event.payload))
@@ -182,7 +219,11 @@ class AuthenticatedRemoteTransport(
             emitOrClose(RemoteServerEvent.Failure(error.code, error.message))
             return
         }
-        val request = synchronized(stateLock) { pending.remove(event.requestId) } ?: protocolFailure()
+        val request = synchronized(stateLock) { pending.remove(event.requestId) }
+        if (request == null) {
+            if (synchronized(stateLock) { completed.contains(event.requestId) }) return
+            protocolFailure()
+        }
         rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Error(event.requestId, error.code, error.message))
     }
@@ -203,6 +244,12 @@ class AuthenticatedRemoteTransport(
     private fun emitOrClose(event: RemoteServerEvent) {
         if (eventChannel.trySend(event).isFailure) {
             throw RemoteProtocolException("remote event queue overflow")
+        }
+    }
+
+    private fun ensureOpenAndUnlocked(candidate: RemoteBinarySocket) {
+        if (!isUnlocked() || synchronized(stateLock) { closed || connectingSocket !== candidate }) {
+            throw RemoteProtocolException("unlock is required before authentication")
         }
     }
 

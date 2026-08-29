@@ -35,6 +35,7 @@ data class RemoteFocusEvent(
 )
 
 data class RemoteTitleEvent(val tabId: String, val attachmentId: String, val title: String)
+data class RemoteTerminalExitEvent(val tabId: String, val attachmentId: String, val exit: RemoteTabExit)
 
 @Serializable
 data class RemoteModelOption(
@@ -147,6 +148,12 @@ object RemoteCommands {
         RemoteTitleEvent(it.tabId, it.attachmentId, it.title)
     }
 
+    fun terminalExited(payload: ByteArray): RemoteTerminalExitEvent =
+        decode(TerminalExitedReply.serializer(), payload).let {
+            if (it.tabId.isBlank() || it.attachmentId.isBlank()) malformed()
+            RemoteTerminalExitEvent(it.tabId, it.attachmentId, it.exit)
+        }
+
     private fun <T> encode(serializer: kotlinx.serialization.KSerializer<T>, value: T): ByteArray =
         cbor.encodeToByteArray(serializer, value).also {
             if (it.isEmpty() || it.size >= RemoteWireCodec.MAX_FRAME_BYTES) malformed()
@@ -238,5 +245,10 @@ object RemoteCommands {
         @SerialName("tab_id") val tabId: String,
         @SerialName("attachment_id") val attachmentId: String,
         val title: String,
+    )
+    @Serializable private data class TerminalExitedReply(
+        @SerialName("tab_id") val tabId: String,
+        @SerialName("attachment_id") val attachmentId: String,
+        val exit: RemoteTabExit,
     )
 }

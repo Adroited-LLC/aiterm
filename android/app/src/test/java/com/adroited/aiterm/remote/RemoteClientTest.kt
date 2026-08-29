@@ -29,7 +29,7 @@ class RemoteClientTest {
             transportFactory = { transport },
             screenStore = DefaultTerminalScreenStore(),
             isUnlocked = { true },
-            scope = backgroundScope,
+            scope = this,
             dispatcher = StandardTestDispatcher(testScheduler),
         )
         client.acceptForTest(
@@ -131,6 +131,16 @@ class RemoteClientTest {
     fun revisionMismatchKeepsTheCurrentScreenAndRequestsAuthoritativeRecovery() = runTest {
         val transport = FakeRemoteTransport()
         val store = DefaultTerminalScreenStore()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
         store.replace(
             ScreenSnapshot(
                 tabId = "tab-1",
@@ -141,15 +151,6 @@ class RemoteClientTest {
                 cursor = CursorState(0, 0, true),
             ),
         )
-        val client = RemoteClient(
-            transportFactory = { transport },
-            screenStore = store,
-            isUnlocked = { true },
-            scope = this,
-            dispatcher = StandardTestDispatcher(testScheduler),
-        )
-        client.connect()
-
         client.acceptForTest(
             RemoteServerEvent.TerminalChunk(
                 TerminalTransferChunk(
@@ -175,7 +176,7 @@ class RemoteClientTest {
         advanceUntilIdle()
 
         assertEquals("old", store.screen.value?.visible?.single()?.plainText())
-        assertEquals(listOf("terminal.resume"), transport.requests.map(RemoteRequest::kind))
+        assertEquals("terminal.resume", transport.requests.last().kind)
         client.lock()
     }
 
@@ -218,8 +219,21 @@ class RemoteClientTest {
             transportFactory = { FakeRemoteTransport() },
             screenStore = store,
             isUnlocked = { true },
-            scope = backgroundScope,
+            scope = this,
             dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        store.replace(
+            ScreenSnapshot(
+                tabId = "tab-1",
+                revision = 5,
+                cols = 4,
+                rows = 1,
+                visible = listOf(ScreenRow(listOf(ScreenCell("live")))),
+                cursor = CursorState(0, 0, true),
+            ),
         )
 
         client.acceptForTest(
@@ -244,6 +258,7 @@ class RemoteClientTest {
         )
 
         assertEquals(listOf("old"), client.scrollback.value.map(ScreenRow::plainText))
+        client.lock()
     }
 }
 
@@ -284,7 +299,12 @@ private class FakeRemoteTransport : RemoteTransport {
 
     override suspend fun request(request: RemoteRequest): RemoteResponse {
         requests += request
-        return RemoteResponse.Success(request.requestId, request.kind, byteArrayOf())
+        val payload = if (request.kind == "terminal.attach") {
+            attachedPayload("tab-1", "attachment-1")
+        } else {
+            byteArrayOf()
+        }
+        return RemoteResponse.Success(request.requestId, request.kind, payload)
     }
 
     override fun close() {
@@ -324,17 +344,18 @@ private class DeferredRemoteTransport(connectImmediately: Boolean = true) : Remo
         closed = true
     }
 
-    private fun attachedPayload(tabId: String, attachmentId: String): ByteArray {
-        fun text(value: String): String {
-            val bytes = value.encodeToByteArray()
-            require(bytes.size < 24)
-            return (0x60 + bytes.size).toString(16).padStart(2, '0') + bytes.joinToString("") {
-                it.toUByte().toString(16).padStart(2, '0')
-            }
+}
+
+private fun attachedPayload(tabId: String, attachmentId: String): ByteArray {
+    fun text(value: String): String {
+        val bytes = value.encodeToByteArray()
+        require(bytes.size < 24)
+        return (0x60 + bytes.size).toString(16).padStart(2, '0') + bytes.joinToString("") {
+            it.toUByte().toString(16).padStart(2, '0')
         }
-        val encoded = "a4" + text("tab_id") + text(tabId) +
-            text("attachment_id") + text(attachmentId) +
-            text("has_focus") + "f4" + text("title") + text(tabId)
-        return encoded.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
+    val encoded = "a4" + text("tab_id") + text(tabId) +
+        text("attachment_id") + text(attachmentId) +
+        text("has_focus") + "f4" + text("title") + text(tabId)
+    return encoded.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }
