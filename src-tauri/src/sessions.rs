@@ -2924,7 +2924,7 @@ impl RestoreDirectoryTree {
 
 #[cfg(target_os = "linux")]
 struct StrictArchiveEntry {
-    parent: VerifiedDirectory,
+    parent: File,
     name: CString,
     display_path: std::path::PathBuf,
     archive: HeldWriteLease,
@@ -2937,11 +2937,15 @@ impl StrictArchiveEntry {
     fn open(path: &Path) -> Result<Self, String> {
         let parent_path = path.parent().ok_or("strict archive has no parent")?;
         let file_name = path.file_name().ok_or("strict archive has no name")?;
-        let name = CString::new(file_name.as_bytes()).map_err(|_| "invalid strict archive name")?;
         let parent = VerifiedDirectory::open(parent_path)?;
+        Self::open_in(&parent.file, parent_path, file_name)
+    }
+
+    fn open_in(parent: &File, display_parent: &Path, file_name: &OsStr) -> Result<Self, String> {
+        let name = CString::new(file_name.as_bytes()).map_err(|_| "invalid strict archive name")?;
         let descriptor = unsafe {
             libc::openat(
-                parent.file.as_raw_fd(),
+                parent.as_raw_fd(),
                 name.as_ptr(),
                 libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
@@ -2951,7 +2955,7 @@ impl StrictArchiveEntry {
         }
         let file = unsafe { File::from_raw_fd(descriptor) };
         let metadata = file.metadata().map_err(|error| error.to_string())?;
-        if !metadata.is_file() || !directory_entry_is_exact_object(&parent.file, &name, &file)? {
+        if !metadata.is_file() || !directory_entry_is_exact_object(parent, &name, &file)? {
             return Err("strict archive changed while it was opened".into());
         }
         let archive = HeldWriteLease::existing(file)?;
@@ -2962,9 +2966,9 @@ impl StrictArchiveEntry {
             .ok_or("archive bound overflow")?;
         let (hash, size) = hash_exact_file_bounded(&archive.file, archive_bound)?;
         Ok(Self {
-            parent,
+            parent: parent.try_clone().map_err(|error| error.to_string())?,
             name,
-            display_path: path.to_path_buf(),
+            display_path: display_parent.join(file_name),
             archive,
             hash,
             size,
@@ -2990,7 +2994,7 @@ impl StrictArchiveEntry {
             libc::linkat(
                 self.archive.file.as_raw_fd(),
                 c"".as_ptr(),
-                self.parent.file.as_raw_fd(),
+                self.parent.as_raw_fd(),
                 recovery.as_ptr(),
                 libc::AT_EMPTY_PATH,
             )
@@ -3002,7 +3006,6 @@ impl StrictArchiveEntry {
             ));
         }
         self.parent
-            .file
             .sync_all()
             .map_err(|error| error.to_string())?;
         Ok(self
@@ -3014,7 +3017,7 @@ impl StrictArchiveEntry {
 
     fn remove_exact(&self) -> Result<(), String> {
         self.verify()?;
-        if !directory_entry_is_exact_object(&self.parent.file, &self.name, &self.archive.file)? {
+        if !directory_entry_is_exact_object(&self.parent, &self.name, &self.archive.file)? {
             let recovery = self.publish_recovery_link()?;
             return Err(format!(
                 "archive name changed before removal; exact archive is recoverable at {}",
@@ -3029,13 +3032,13 @@ impl StrictArchiveEntry {
             .unwrap_or_else(|| Path::new("."))
             .join(&quarantine_name);
         rename_noreplace(
-            self.parent.file.as_raw_fd(),
+            self.parent.as_raw_fd(),
             &self.name,
-            self.parent.file.as_raw_fd(),
+            self.parent.as_raw_fd(),
             &quarantine,
         )?;
         if !directory_entry_is_exact_object(
-            &self.parent.file,
+            &self.parent,
             &quarantine,
             &self.archive.file,
         )? {
@@ -3057,7 +3060,7 @@ impl StrictArchiveEntry {
             .sync_all()
             .map_err(|error| error.to_string())?;
         if !directory_entry_is_exact_object(
-            &self.parent.file,
+            &self.parent,
             &quarantine,
             &self.archive.file,
         )? {
@@ -3068,7 +3071,7 @@ impl StrictArchiveEntry {
         }
         if unsafe {
             libc::unlinkat(
-                self.parent.file.as_raw_fd(),
+                self.parent.as_raw_fd(),
                 quarantine.as_ptr(),
                 0,
             )
@@ -3081,10 +3084,174 @@ impl StrictArchiveEntry {
             ));
         }
         self.parent
-            .file
             .sync_all()
             .map_err(|error| error.to_string())
     }
+}
+
+#[cfg(target_os = "linux")]
+enum PreparedTrashEntry {
+    File(StrictArchiveEntry),
+    Directory(PreparedTrashDirectory),
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedTrashDirectory {
+    parent: File,
+    name: CString,
+    directory: File,
+    display_path: std::path::PathBuf,
+    entries: Vec<PreparedTrashEntry>,
+    snapshot: Vec<DirectoryEntryIdentity>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedTrashEntry {
+    fn remove_exact(&self) -> Result<(), String> {
+        match self {
+            Self::File(file) => file.remove_exact(),
+            Self::Directory(directory) => directory.remove_exact(),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedTrashDirectory {
+    fn open_in(
+        parent: &File,
+        display_parent: &Path,
+        name: &OsStr,
+        budget: &mut usize,
+        depth: usize,
+    ) -> Result<Self, String> {
+        if depth > MAX_SESSION_DISCOVERY_DEPTH {
+            return Err("trash directory exceeds purge depth limit".into());
+        }
+        let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid trash entry name")?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let directory = unsafe { File::from_raw_fd(descriptor) };
+        if !directory_entry_is_exact_object(parent, &name_c, &directory)? {
+            return Err("trash directory changed while it was opened".into());
+        }
+        let snapshot = snapshot_directory_entries(&directory)?;
+        let mut entries = Vec::with_capacity(snapshot.len().min(16));
+        let display_path = display_parent.join(name);
+        for entry in &snapshot {
+            *budget = budget.checked_add(1).ok_or("trash purge budget overflow")?;
+            if *budget > MAX_EXACT_ARCHIVE_ENTRIES {
+                return Err("trash directory exceeds purge entry limit".into());
+            }
+            let entry_name = CString::new(entry.name.as_bytes())
+                .map_err(|_| "invalid trash child name")?;
+            let kind = entry.mode & libc::S_IFMT;
+            if kind == libc::S_IFREG as u32 {
+                entries.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
+                    &directory,
+                    &display_path,
+                    &entry.name,
+                )?));
+            } else if kind == libc::S_IFDIR as u32 {
+                entries.push(PreparedTrashEntry::Directory(Self::open_in(
+                    &directory,
+                    &display_path,
+                    &entry.name,
+                    budget,
+                    depth + 1,
+                )?));
+            } else {
+                return Err(format!(
+                    "trash purge rejects symlink or special entry at {}",
+                    display_path.join(&entry.name).display()
+                ));
+            }
+            if !directory_entry_matches_identity(&directory, &entry_name, entry)? {
+                return Err("trash child changed during purge preparation".into());
+            }
+        }
+        if snapshot_directory_entries(&directory)? != snapshot {
+            return Err("trash directory changed during purge preparation".into());
+        }
+        Ok(Self {
+            parent: parent.try_clone().map_err(|error| error.to_string())?,
+            name: name_c,
+            directory,
+            display_path,
+            entries,
+            snapshot,
+        })
+    }
+
+    fn remove_exact(&self) -> Result<(), String> {
+        if snapshot_directory_entries(&self.directory)? != self.snapshot
+            || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)?
+        {
+            return Err(format!(
+                "trash directory changed before permanent purge at {}",
+                self.display_path.display()
+            ));
+        }
+        for entry in &self.entries {
+            entry.remove_exact()?;
+        }
+        if !snapshot_directory_entries(&self.directory)?.is_empty()
+            || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)?
+        {
+            return Err(format!(
+                "trash directory changed during permanent purge at {}",
+                self.display_path.display()
+            ));
+        }
+        if unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "could not remove purged trash directory at {}: {}",
+                self.display_path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.parent
+            .sync_all()
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn directory_entry_matches_identity(
+    directory: &File,
+    name: &CString,
+    expected: &DirectoryEntryIdentity,
+) -> Result<bool, String> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Ok(false);
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.st_dev as u64 == expected.device
+        && stat.st_ino as u64 == expected.inode
+        && stat.st_mode as u32 == expected.mode)
 }
 
 #[cfg(target_os = "linux")]
@@ -3998,27 +4165,116 @@ pub async fn trash_delete(session_id: String) -> Result<(), String> {
 fn trash_delete_sync(session_id: String) -> Result<(), String> {
     valid_id(&session_id)?;
     let trash = trash_dir().ok_or("no home dir")?;
-    std::fs::remove_file(trash.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(trash.join(format!("{session_id}.origin")));
-    let tasks = trash.join(format!("{session_id}.tasks"));
-    if tasks.is_file() {
-        let _ = std::fs::remove_file(tasks);
-    } else if tasks.is_dir() {
-        let _ = std::fs::remove_dir_all(tasks);
+    #[cfg(target_os = "linux")]
+    {
+        trash_delete_in_directory(&trash, &session_id)
     }
-    let job = trash.join(format!("{session_id}.job"));
-    if job.is_file() {
-        let _ = std::fs::remove_file(job);
-    } else if job.is_dir() {
-        let _ = std::fs::remove_dir_all(job);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = trash;
+        Err("strict permanent session purge requires Linux".into())
     }
-    // The rest of a Codex conversation goes with it — the entry that named
-    // them is gone, so leaving them would be leaking a set nothing can restore.
-    let rollouts = trash.join(format!("{session_id}.rollouts"));
-    if rollouts.is_dir() {
-        let _ = std::fs::remove_dir_all(rollouts);
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_named_trash_entry(
+    trash: &VerifiedDirectory,
+    display_trash: &Path,
+    name: &OsStr,
+    allow_directory: bool,
+    required: bool,
+    budget: &mut usize,
+) -> Result<Option<PreparedTrashEntry>, String> {
+    let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid trash entry name")?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            trash.file.as_raw_fd(),
+            name_c.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        if !required && error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error.to_string());
     }
-    Ok(())
+    *budget = budget.checked_add(1).ok_or("trash purge budget overflow")?;
+    if *budget > MAX_EXACT_ARCHIVE_ENTRIES {
+        return Err("trash purge exceeds entry limit".into());
+    }
+    let stat = unsafe { stat.assume_init() };
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFREG => Ok(Some(PreparedTrashEntry::File(
+            StrictArchiveEntry::open_in(&trash.file, display_trash, name)?,
+        ))),
+        libc::S_IFDIR if allow_directory => Ok(Some(PreparedTrashEntry::Directory(
+            PreparedTrashDirectory::open_in(
+                &trash.file,
+                display_trash,
+                name,
+                budget,
+                0,
+            )?,
+        ))),
+        _ => Err(format!(
+            "trash purge rejects unexpected entry at {}",
+            display_trash.join(name).display()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn trash_delete_in_directory(trash_path: &Path, session_id: &str) -> Result<(), String> {
+    trash_delete_in_directory_with_hook(trash_path, session_id, || {})
+}
+
+#[cfg(target_os = "linux")]
+fn trash_delete_in_directory_with_hook(
+    trash_path: &Path,
+    session_id: &str,
+    before_purge: impl FnOnce(),
+) -> Result<(), String> {
+    valid_id(session_id)?;
+    let trash = VerifiedDirectory::open(trash_path)?;
+    let mut budget = 0usize;
+    let mut optional = Vec::new();
+    for (suffix, allow_directory) in [
+        ("origin", false),
+        ("tasks", true),
+        ("job", true),
+        ("rollouts", true),
+    ] {
+        let name = std::ffi::OsString::from(format!("{session_id}.{suffix}"));
+        if let Some(entry) = prepare_named_trash_entry(
+            &trash,
+            trash_path,
+            &name,
+            allow_directory,
+            false,
+            &mut budget,
+        )? {
+            optional.push(entry);
+        }
+    }
+    let main_name = std::ffi::OsString::from(format!("{session_id}.jsonl"));
+    let main = prepare_named_trash_entry(
+        &trash,
+        trash_path,
+        &main_name,
+        false,
+        true,
+        &mut budget,
+    )?
+    .ok_or("trash transcript is missing")?;
+    before_purge();
+    for entry in &optional {
+        entry.remove_exact()?;
+    }
+    main.remove_exact()
 }
 
 #[tauri::command]
@@ -4028,17 +4284,61 @@ pub async fn trash_empty() -> Result<(), String> {
 
 fn trash_empty_sync() -> Result<(), String> {
     let trash = trash_dir().ok_or("no home dir")?;
-    if let Ok(rd) = std::fs::read_dir(&trash) {
-        for e in rd.flatten() {
-            let p = e.path();
-            let _ = if p.is_dir() {
-                std::fs::remove_dir_all(&p)
-            } else {
-                std::fs::remove_file(&p)
-            };
+    #[cfg(target_os = "linux")]
+    {
+        trash_empty_in_directory(&trash)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = trash;
+        Err("strict permanent trash purge requires Linux".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn trash_empty_in_directory(trash_path: &Path) -> Result<(), String> {
+    let trash = VerifiedDirectory::open(trash_path)?;
+    let snapshot = snapshot_directory_entries(&trash.file)?;
+    let mut budget = snapshot.len();
+    if budget > MAX_EXACT_ARCHIVE_ENTRIES {
+        return Err("trash purge exceeds entry limit".into());
+    }
+    let mut prepared = Vec::with_capacity(snapshot.len().min(16));
+    for entry in &snapshot {
+        let kind = entry.mode & libc::S_IFMT as u32;
+        if kind == libc::S_IFREG as u32 {
+            prepared.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
+                &trash.file,
+                trash_path,
+                &entry.name,
+            )?));
+        } else if kind == libc::S_IFDIR as u32 {
+            prepared.push(PreparedTrashEntry::Directory(
+                PreparedTrashDirectory::open_in(
+                    &trash.file,
+                    trash_path,
+                    &entry.name,
+                    &mut budget,
+                    0,
+                )?,
+            ));
+        } else {
+            return Err(format!(
+                "trash purge rejects symlink or special entry at {}",
+                trash_path.join(&entry.name).display()
+            ));
         }
     }
-    Ok(())
+    if snapshot_directory_entries(&trash.file)? != snapshot {
+        return Err("trash directory changed during purge preparation".into());
+    }
+    for entry in &prepared {
+        entry.remove_exact()?;
+    }
+    if !snapshot_directory_entries(&trash.file)?.is_empty() {
+        return Err("trash directory changed during permanent purge".into());
+    }
+    trash.file.sync_all().map_err(|error| error.to_string())
 }
 
 #[derive(Serialize)]
@@ -6605,6 +6905,62 @@ mod tests {
         assert_eq!(std::fs::read(&main).unwrap(), b"main");
         assert_eq!(std::fs::read(&tasks).unwrap(), b"tasks");
         assert_eq!(std::fs::read(&rollouts).unwrap(), b"rollouts");
+        drop(competing_reader);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permanent_trash_delete_never_unlinks_a_rollout_name_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-strict-trash-swap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let trash = root.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let id = "30303030-3030-4030-8030-303030303030";
+        let main = trash.join(format!("{id}.jsonl"));
+        let rollout = trash.join(format!("{id}.rollouts"));
+        let displaced = trash.join("displaced-rollout");
+        std::fs::write(&main, b"main").unwrap();
+        std::fs::write(&rollout, b"exact rollout").unwrap();
+
+        let error = trash_delete_in_directory_with_hook(&trash, id, || {
+            std::fs::rename(&rollout, &displaced).unwrap();
+            std::fs::write(&rollout, b"replacement").unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.contains("archive name changed"), "{error}");
+        assert_eq!(std::fs::read(&rollout).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"exact rollout");
+        assert_eq!(std::fs::read(&main).unwrap(), b"main");
+        assert!(std::fs::read_dir(&trash).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aiterm-restore-recovery-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_trash_propagates_a_strict_archive_lease_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-strict-empty-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let trash = root.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let archive = trash.join("31313131-3131-4131-8131-313131313131.rollouts");
+        std::fs::write(&archive, b"rollout").unwrap();
+        let competing_reader = File::open(&archive).unwrap();
+
+        let error = trash_empty_in_directory(&trash).unwrap_err();
+
+        assert!(error.contains("lease"), "{error}");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"rollout");
         drop(competing_reader);
         std::fs::remove_dir_all(root).unwrap();
     }
