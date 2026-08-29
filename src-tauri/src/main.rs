@@ -18,6 +18,7 @@ fn main() {
         let mut model = None;
         let mut session_id = None;
         let mut resume = None;
+        let mut prompt = None;
         let mut args = std::env::args().skip(2);
         while let Some(a) = args.next() {
             match a.as_str() {
@@ -25,17 +26,18 @@ fn main() {
                 "--model" => model = args.next(),
                 "--session-id" => session_id = args.next(),
                 "--resume" => resume = args.next(),
+                "--prompt" => prompt = args.next(),
                 _ => {}
             }
         }
         let start = match (resume, provider, model) {
             (Some(session_id), _, _) => aiterm_lib::chat::Start::Resume { session_id },
             (None, Some(provider_id), Some(model)) => {
-                aiterm_lib::chat::Start::Fresh { provider_id, model, session_id }
+                aiterm_lib::chat::Start::Fresh { provider_id, model, session_id, prompt }
             }
             _ => {
                 eprintln!(
-                    "usage: aiterm chat --provider <id> --model <model-id> [--session-id <uuid>]\n       aiterm chat --resume <uuid>"
+                    "usage: aiterm chat --provider <id> --model <model-id> [--session-id <uuid>] [--prompt <text>]\n       aiterm chat --resume <uuid>"
                 );
                 std::process::exit(2);
             }

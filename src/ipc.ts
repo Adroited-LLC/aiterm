@@ -846,8 +846,8 @@ export const trayAlerts = (alerts: { key: number; title: string; message?: strin
  *  answers is `launch.rs`'s business — nothing here names one. Sent in
  *  camelCase, which is what `LaunchRequest` deserializes. */
 export type LaunchRequest =
-  | { kind: "agent"; agentId: string; model: string | null; effort: string | null }
-  | { kind: "apiModel"; providerId: string; modelId: string }
+  | { kind: "agent"; agentId: string; model: string | null; effort: string | null; prompt?: string | null }
+  | { kind: "apiModel"; providerId: string; modelId: string; prompt?: string | null }
   | { kind: "resume"; sessionId: string }
   | { kind: "restart"; sessionId: string }
   | { kind: "clear"; sessionId: string };

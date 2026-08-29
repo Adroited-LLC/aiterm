@@ -3678,8 +3678,8 @@ input[type="range"]::-webkit-slider-thumb {
 }
 .home-inner {
   margin: auto;
-  width: 100%; max-width: 880px;
-  display: flex; flex-direction: column; gap: 14px;
+  width: 100%; max-width: 640px;
+  display: flex; flex-direction: column; gap: 12px;
 }
 .home-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
 .home-greeting h1 { font-size: 30px; font-weight: 700; margin: 0 0 4px; letter-spacing: -0.02em; color: var(--text); }
@@ -3703,24 +3703,37 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* The start controls at their ordinary size — the page is a launcher, not
    a billboard. These outrank the `.empty-start-controls` size-ups. */
-.home-start { display: flex; flex-direction: column; align-items: center; padding: 12px 14px 14px; }
-.home-start .home-card-head { align-self: stretch; }
-.home-add { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
-.home-start .empty-start-controls { width: 100%; max-width: 520px; gap: 8px; }
+.home-start { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px 12px; }
+.home-start .empty-start-controls { width: 100%; gap: 8px; }
 .home-start .empty-start-controls .ns-agent-tab { font-size: 12px; padding: 6px 8px; gap: 6px; }
 .home-start .empty-start-controls .ns-agent-tab .agent-icon { font-size: 15px; }
 .home-start .empty-start-controls .ns-select { font-size: 12.5px; padding: 5px 24px 5px 8px; }
-.home-start .empty-start-controls .tui-pick { font-size: 13px; padding: 6px 12px; font-weight: 600; }
 
-.home-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
-  gap: 14px;
-  align-items: start;
+/* The prompt box: type, glance up at the pickers, Enter. */
+.home-prompt {
+  display: flex; flex-direction: column;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg);
 }
-.home-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
-.home-recent { grid-row: auto; }
-@media (max-width: 980px) { .home-grid { grid-template-columns: 1fr; } .home-recent { grid-row: auto; } }
+.home-prompt:focus-within { border-color: var(--accent); }
+.home-prompt-input {
+  width: 100%; box-sizing: border-box; resize: none;
+  background: transparent; border: none; outline: none;
+  color: var(--text); font: inherit; font-size: 13.5px; line-height: 1.45;
+  padding: 10px 12px 6px;
+}
+.home-prompt-input::placeholder { color: var(--text-faint); }
+.home-prompt-foot { display: flex; align-items: center; gap: 8px; padding: 4px 6px 6px 8px; }
+.home-cwd {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+  background: none; border: 1px solid transparent; border-radius: 5px;
+  color: var(--text-dim); font-size: 11.5px; padding: 3px 7px; cursor: pointer;
+}
+.home-cwd span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.home-cwd:hover { color: var(--text); border-color: var(--border); background: var(--bg-hover); }
+.home-go { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 5px 11px; }
+.home-go:disabled { opacity: 0.5; cursor: default; }
+
 
 .home-list { display: flex; flex-direction: column; }
 .home-row {

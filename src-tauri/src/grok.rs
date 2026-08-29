@@ -585,6 +585,9 @@ impl AgentBackend for GrokBackend {
         if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --session-id {}", q(id)));
         }
+        if let Some(p) = crate::agents::prompt_of(spec) {
+            cmd.push_str(&format!(" {}", q(p)));
+        }
         cmd
     }
 }
@@ -742,6 +745,7 @@ mod tests {
             effort: Some("xhigh".into()),
             session_id: Some("e63b0f22-7d69-4084-aaf3-733816255e8e".into()),
             provider: None,
+            prompt: None,
         });
         assert_eq!(
             cmd,

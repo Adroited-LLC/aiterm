@@ -1832,7 +1832,7 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback(async (cwd: string, choice: StartChoice) => {
+  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string) => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
     // the two are presented differently: a model tab is titled by its model
@@ -1852,6 +1852,7 @@ export default function App() {
             kind: "apiModel",
             providerId: choice.providerId,
             modelId: choice.modelId,
+            prompt: prompt || null,
           });
           setActiveProject(cwd);
           // A tab handle where the plan names no session: an engine that writes
@@ -1883,6 +1884,7 @@ export default function App() {
             agentId: choice.agentId,
             model: choice.model,
             effort: choice.effort,
+            prompt: prompt || null,
           });
           // No session id on the plan means the engine would not take one —
           // Codex has no `--session-id` — so the slot is a tab handle: the
@@ -1919,23 +1921,37 @@ export default function App() {
    *  its defaults — a different session from the one the menu offers, with
    *  nothing on the button to say so. */
   const emptyCtl = useStartChoice(settingsGen);
-  /** Same as the menu, but choose the directory first. The empty pane's copy is
-   *  the only instruction a first run gets, and it used to name two buttons
-   *  that live in a panel you can close — and that on a fresh machine has
-   *  nothing in it to press them on. */
-  const browseNewSession = useCallback(async () => {
+  /** Where the home screen's prompt box starts its session. The project the
+   *  sidebar has selected, or the one worked in most recently — the folder
+   *  chip on the box swaps it, and holds the swap until the next selection. */
+  const [homeCwdPick, setHomeCwdPick] = useState<string | null>(null);
+  useEffect(() => { setHomeCwdPick(null); }, [activeProject]);
+  const homeCwd = homeCwdPick ?? activeProject
+    ?? [...sessions].sort((a, b) => b.last_active - a.last_active)[0]?.project_path ?? null;
+  const pickHomeCwd = useCallback(async () => {
+    try {
+      const picked = await openDialog({ directory: true, title: "Start the session in…" });
+      if (typeof picked === "string") setHomeCwdPick(picked);
+    } catch { /* cancelled */ }
+  }, []);
+  /** The prompt box's submit: a session in `homeCwd` with the prompt as its
+   *  first message, or an empty one when nothing was typed. No folder known
+   *  yet means ask for one first. */
+  const launchFromHome = useCallback(async (prompt: string) => {
     if (!emptyCtl.ready) {
       setNotice("Nothing to start yet — set up the API tab, or install claude, codex or grok.");
       return;
     }
-    try {
-      const picked = await openDialog({ directory: true, title: "Start a session in…" });
-      if (typeof picked !== "string") return;
-      newSession(picked, emptyCtl.choice());
-    } catch {
-      /* cancelled, or no chooser available */
+    let cwd = homeCwd;
+    if (!cwd) {
+      try {
+        const picked = await openDialog({ directory: true, title: "Start the session in…" });
+        if (typeof picked !== "string") return;
+        cwd = picked;
+      } catch { return; }
     }
-  }, [newSession, emptyCtl]);
+    void newSession(cwd, emptyCtl.choice(), prompt.trim() || undefined);
+  }, [newSession, emptyCtl, homeCwd]);
 
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
@@ -2256,20 +2272,14 @@ export default function App() {
                 sessions={sessions}
                 liveIds={new Set(tabs.map((t) => t.slotId).filter((k): k is string => !!k))}
                 alerts={alerts}
-                projects={projects}
                 onSelect={selectSession}
                 onResume={(s) => { void resumeSession(s); }}
-                onProject={selectProject}
                 onGoTab={(key) => setActiveTab(key)}
-                onAddModel={() => openModelAccess()}
-                start={
-                  <div className="empty-start-controls">
-                    <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
-                    <button className="tui-pick" onClick={browseNewSession}>
-                      Start a new session…
-                    </button>
-                  </div>
-                }
+                controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />}
+                ready={emptyCtl.ready}
+                cwd={homeCwd}
+                onPickCwd={pickHomeCwd}
+                onLaunch={launchFromHome}
               />
             )}
             {previewSession && !fileOnScreen && (
