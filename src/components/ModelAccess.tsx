@@ -689,9 +689,11 @@ export default function ModelAccess({ focusProvider }: Props) {
   // user may have folded the browser on purpose.
   const focused = useRef(false);
   useEffect(() => {
-    if (focused.current || !focusProvider || !providers) return;
-    const p = providers.find((x) => x.id === focusProvider);
-    if (!p) return;
+    if (focused.current || !providers || providers.length === 0) return;
+    // The one asked for, else the first: the page opens with a catalogue
+    // showing. With it folded, everything below the provider rows is a
+    // button, and the page reads as having nothing in it.
+    const p = (focusProvider && providers.find((x) => x.id === focusProvider)) || providers[0];
     focused.current = true;
     browse(p);
   }, [providers, focusProvider]);   // eslint-disable-line react-hooks/exhaustive-deps
