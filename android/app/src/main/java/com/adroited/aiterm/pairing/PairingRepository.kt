@@ -489,7 +489,7 @@ class OkHttpPairingTransport internal constructor(
     }
 }
 
-private fun tls13Context(): SSLContext {
+internal fun tls13Context(): SSLContext {
     val useBundledProvider = shouldUseBundledTls13Provider(
         isAndroidRuntime = isAndroidRuntime(),
         sdkInt = Build.VERSION.SDK_INT,

@@ -64,6 +64,12 @@ object RemoteWireCodec {
         ).also { if (it.size >= MAX_FRAME_BYTES) throw RemoteProtocolException("resume payload is too large") }
     }
 
+    fun decodeAuthOk(payload: ByteArray) {
+        validate(payload)
+        val reply = decode(AuthReplyWire.serializer(), payload)
+        if (reply.kind != "auth.ok") throw RemoteProtocolException("authentication was not accepted")
+    }
+
     fun decodeStateSnapshot(payload: ByteArray): StateSnapshotChunk {
         validate(payload)
         return decode(StateSnapshotChunk.serializer(), payload).also { chunk ->
@@ -130,6 +136,9 @@ object RemoteWireCodec {
         @SerialName("attachment_id") val attachmentId: String,
         val revision: Long,
     )
+
+    @Serializable
+    private data class AuthReplyWire(val kind: String)
 }
 
 @Serializable
@@ -161,13 +170,13 @@ data class RemoteTab(
     val title: String,
     val cwd: String? = null,
     val command: String? = null,
-    @SerialName("session_id") val sessionId: String? = null,
-    @SerialName("resumed_id") val resumedId: String? = null,
-    @SerialName("agent_id") val agentId: String? = null,
-    @SerialName("slot_id") val slotId: String = "",
+    val sessionId: String? = null,
+    val resumedId: String? = null,
+    val agentId: String? = null,
+    val slotId: String = "",
     val fresh: Boolean = false,
-    @SerialName("env_provider") val envProvider: String? = null,
-    @SerialName("env_model") val envModel: String? = null,
+    val envProvider: String? = null,
+    val envModel: String? = null,
     val size: TerminalSize,
     val focus: WireFocusOwner = WireFocusOwner.Unowned,
     val state: RemoteTabState = RemoteTabState.Running,

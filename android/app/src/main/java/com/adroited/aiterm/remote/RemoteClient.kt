@@ -60,6 +60,8 @@ sealed interface RemoteServerEvent {
     data class TransferStarted(val transferId: String) : RemoteServerEvent
     data class TransferFinished(val transferId: String) : RemoteServerEvent
     data class TerminalChunk(val chunk: TerminalTransferChunk) : RemoteServerEvent
+    data class RosterChunk(val chunk: StateSnapshotChunk) : RemoteServerEvent
+    data class Raw(val kind: String, val payload: ByteArray) : RemoteServerEvent
     data class Failure(val code: String, val message: String) : RemoteServerEvent
     data object Revoked : RemoteServerEvent
 }
@@ -169,6 +171,8 @@ class RemoteClient(
                 mutableState.value = mutableState.value.copy(pendingTransfers = transfers.size)
             }
             is RemoteServerEvent.TerminalChunk -> acceptTerminalChunk(event.chunk)
+            is RemoteServerEvent.RosterChunk -> Unit
+            is RemoteServerEvent.Raw -> Unit
             is RemoteServerEvent.Failure -> {
                 val lostFocus = event.code == "terminal.input_not_owned"
                 mutableState.value = mutableState.value.copy(
