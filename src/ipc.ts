@@ -979,6 +979,8 @@ export interface LibThread {
   tags: string[];
   created: number;
   user_tags: string[];
+  /** Hidden from the Threads tab with its sessions; still catalogued. */
+  hidden: boolean;
 }
 export interface LibStore {
   sessions: Record<string, LibEntry>;
@@ -1008,8 +1010,8 @@ export type LibEngine =
   | { kind: "api"; providerId: string; model: string }
   | { kind: "cli"; agent: string; model: string | null };
 export const librarianRun = (
-  engine: LibEngine, sessions: { id: string; lastActive: number }[], max: number,
-) => invoke<LibRunReport>("librarian_run", { engine, sessions, max });
+  engine: LibEngine, sessions: { id: string; lastActive: number }[], max: number, prompt: string | null,
+) => invoke<LibRunReport>("librarian_run", { engine, sessions, max, prompt });
 /** Where the librarian runs the CLIs — a transcript one of them keeps in
  *  print mode lands here, and the session list skips it. Kept in step with
  *  `lib_dir()` in `librarian.rs`. */
@@ -1017,7 +1019,13 @@ export const LIBRARIAN_DIR_SUFFIX = "/.config/aiterm/librarian";
 /** The second pass: one look at every thread and session, and the final
  *  organisation — threads that are the same work merged, loose sessions
  *  filed. Run after a catalogue run, and on demand. */
-export const librarianTidy = (engine: LibEngine) => invoke<LibTidyReport>("librarian_tidy", { engine });
+export const librarianTidy = (engine: LibEngine, prompt: string | null) =>
+  invoke<LibTidyReport>("librarian_tidy", { engine, prompt });
+/** The system prompts as shipped — what the editor shows, and resets to. */
+export const librarianDefaultPrompts = () =>
+  invoke<{ catalogue: string; tidy: string }>("librarian_default_prompts");
+export const librarianHideThread = (id: string, hidden: boolean) =>
+  invoke<void>("librarian_hide_thread", { id, hidden });
 export const librarianForget = () => invoke<void>("librarian_forget");
 export const librarianRenameThread = (id: string, name: string) =>
   invoke<void>("librarian_rename_thread", { id, name });

@@ -3,7 +3,7 @@
  * whether it runs on its own, and what it has done so far.
  */
 import { useEffect, useState } from "react";
-import { AgentChoice, ProviderView, agentChoices, providersList } from "../ipc";
+import { AgentChoice, ProviderView, agentChoices, librarianDefaultPrompts, providerModels, providersList } from "../ipc";
 import { LibrarianCtl } from "../librarian";
 import { LibrarianSettings } from "../settings";
 import Row from "./SettingsRow";
@@ -11,14 +11,6 @@ import Icon from "./Icon";
 import AgentIcon from "./AgentIcon";
 import { Loader2 } from "lucide-react";
 
-/** Small, cheap API models worth suggesting, in OpenRouter's spelling. A
- *  text field, not a list: any id the provider serves works. */
-const SUGGESTED = [
-  "anthropic/claude-haiku-4.5",
-  "anthropic/claude-sonnet-5",
-  "google/gemini-3.5-flash-lite",
-  "openai/gpt-5.4-mini",
-];
 
 function Switch({ checked, onChange, label }: { checked: boolean; onChange: (on: boolean) => void; label: string }) {
   return (
@@ -37,10 +29,22 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
 }) {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [agents, setAgents] = useState<AgentChoice[]>([]);
+  /** The chosen API provider's whole catalogue, for the model select. */
+  const [catalogue, setCatalogue] = useState<string[] | null>(null);
+  const [defaults, setDefaults] = useState<{ catalogue: string; tidy: string } | null>(null);
+  const [showPrompts, setShowPrompts] = useState(false);
   useEffect(() => {
     providersList().then(setProviders).catch(() => {});
     agentChoices().then(setAgents).catch(() => {});
+    librarianDefaultPrompts().then(setDefaults).catch(() => {});
   }, []);
+  useEffect(() => {
+    setCatalogue(null);
+    if (cfg.engine !== "api" || !cfg.providerId) return;
+    let live = true;
+    providerModels(cfg.providerId).then((l) => { if (live) setCatalogue(l); }).catch(() => { if (live) setCatalogue([]); });
+    return () => { live = false; };
+  }, [cfg.engine, cfg.providerId]);
   const keyed = providers.filter((p) => p.has_key);
   const provider = keyed.find((p) => p.id === cfg.providerId) ?? null;
   const agent = agents.find((a) => a.id === cfg.engine) ?? null;
@@ -54,7 +58,10 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
   };
   const counted = Object.keys(lib.store.sessions).length;
   const threads = Object.keys(lib.store.threads).length;
-  const suggestions = [...new Set([...(provider?.startup_models ?? []), ...SUGGESTED])];
+  const starred = provider?.startup_models ?? [];
+  const small = (catalogue ?? []).filter((m) => /haiku|mini|flash|lite|fast|small|nano/i.test(m) && !/:batch|image|audio|tts|embed/i.test(m));
+  const rest = (catalogue ?? []).filter((m) => !small.includes(m) && !starred.includes(m));
+  const threadList = Object.entries(lib.store.threads).sort((a, b) => a[1].name.localeCompare(b[1].name));
 
   return (
     <>
@@ -99,19 +106,33 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
           )}
           <Row label="Model" desc="Something small is plenty — it is naming, not coding. Haiku does it well.">
             {cfg.engine === "api" ? (
-              <>
+              catalogue && catalogue.length > 0 ? (
+                <select className="ns-select" value={cfg.model} onChange={(e) => set({ model: e.target.value })}>
+                  {!catalogue.includes(cfg.model) && cfg.model && <option value={cfg.model}>{cfg.model}</option>}
+                  {starred.length > 0 && (
+                    <optgroup label="Starred in Model access">
+                      {starred.map((m) => <option key={"s:" + m} value={m}>{m}</option>)}
+                    </optgroup>
+                  )}
+                  {small.length > 0 && (
+                    <optgroup label="Small and cheap">
+                      {small.map((m) => <option key={"m:" + m} value={m}>{m}</option>)}
+                    </optgroup>
+                  )}
+                  <optgroup label={`Everything (${rest.length})`}>
+                    {rest.map((m) => <option key={"r:" + m} value={m}>{m}</option>)}
+                  </optgroup>
+                </select>
+              ) : (
                 <input
                   className="srow-input"
                   list="librarian-models"
                   value={cfg.model}
                   onChange={(e) => set({ model: e.target.value })}
-                  placeholder="provider/model-id"
+                  placeholder={catalogue === null && cfg.providerId ? "loading the catalogue…" : "provider/model-id"}
                   spellCheck={false}
                 />
-                <datalist id="librarian-models">
-                  {suggestions.map((m) => <option key={m} value={m} />)}
-                </datalist>
-              </>
+              )
             ) : agent && agent.models.length > 0 ? (
               <select className="ns-select" value={cfg.model} onChange={(e) => set({ model: e.target.value })}>
                 <option value="">{agent.display_name}'s default</option>
@@ -179,6 +200,80 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
               {lib.tidyReport.filed ? `, ${lib.tidyReport.filed} loose session${lib.tidyReport.filed === 1 ? "" : "s"} filed` : ""}.
             </div>
           )}
+        </div>
+      </div>
+
+      {threadList.length > 0 && (
+        <div className="sgroup">
+          <div className="sgroup-title">Threads</div>
+          <div className="sgroup-rows">
+            <div className="sgroup-foot" style={{ paddingTop: 0, paddingBottom: 6 }}>
+              A hidden thread leaves the Threads tab with its sessions. It is still catalogued, so new sessions of that work keep landing in it.
+            </div>
+            <div className="lib-threads">
+              {threadList.map(([id, t]) => {
+                const n = Object.values(lib.store.sessions).filter((e) => e.thread === id).length;
+                return (
+                  <label key={id} className={"lib-thread" + (t.hidden ? " hidden" : "")}>
+                    <input type="checkbox" checked={!t.hidden} onChange={(e) => void lib.hideThread(id, !e.target.checked)} />
+                    <span className="lib-thread-name">{t.name}</span>
+                    <span className="lib-thread-n">{n}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="sgroup">
+        <div className="sgroup-title">Prompts</div>
+        <div className="sgroup-rows">
+          <Row label="What the model is told" desc="The system prompts for the two passes. Edit them to change how sessions are named and grouped; what follows each — the session excerpts, the thread list — is built by aiterm and stays the same. Blank means the one shipped.">
+            <button className="tui-plain" onClick={() => setShowPrompts((v) => !v)}>{showPrompts ? "Hide" : "Edit"}</button>
+          </Row>
+          {showPrompts && defaults && (
+            <>
+              <div className="lib-prompt">
+                <div className="lib-prompt-head">
+                  <span>Reading sessions</span>
+                  {cfg.promptCatalogue.trim() && cfg.promptCatalogue.trim() !== defaults.catalogue
+                    ? <span className="lib-prompt-mod">edited</span> : null}
+                  <button className="linkish" onClick={() => set({ promptCatalogue: "" })} disabled={!cfg.promptCatalogue}>Reset</button>
+                </div>
+                <textarea
+                  className="lib-prompt-text"
+                  value={cfg.promptCatalogue || defaults.catalogue}
+                  onChange={(e) => set({ promptCatalogue: e.target.value === defaults.catalogue ? "" : e.target.value })}
+                  spellCheck={false}
+                  rows={12}
+                />
+              </div>
+              <div className="lib-prompt">
+                <div className="lib-prompt-head">
+                  <span>Tidying up</span>
+                  {cfg.promptTidy.trim() && cfg.promptTidy.trim() !== defaults.tidy
+                    ? <span className="lib-prompt-mod">edited</span> : null}
+                  <button className="linkish" onClick={() => set({ promptTidy: "" })} disabled={!cfg.promptTidy}>Reset</button>
+                </div>
+                <textarea
+                  className="lib-prompt-text"
+                  value={cfg.promptTidy || defaults.tidy}
+                  onChange={(e) => set({ promptTidy: e.target.value === defaults.tidy ? "" : e.target.value })}
+                  spellCheck={false}
+                  rows={12}
+                />
+              </div>
+              <div className="sgroup-foot">
+                Each must end by asking for JSON in the shape aiterm reads — an array of one object per session for reading, an object with a <code>threads</code> list for tidying — or nothing will be written.
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="sgroup">
+        <div className="sgroup-rows">
           <Row label="Start over" desc="Forget every name, tag and thread — for a different model, or a first pass that went wrong. Sessions themselves are untouched.">
             <button className="tui-plain" disabled={lib.running || counted === 0} onClick={() => void lib.forget()}>Forget everything</button>
           </Row>

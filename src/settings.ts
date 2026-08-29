@@ -28,6 +28,10 @@ export interface LibrarianSettings {
   /** Show the librarian's names in the session list, in place of the raw
    *  first prompt. The original stays in the tooltip. */
   renameRows: boolean;
+  /** The system prompt for reading sessions; "" means the one shipped. */
+  promptCatalogue: string;
+  /** The system prompt for the tidy pass; "" means the one shipped. */
+  promptTidy: string;
 }
 
 export interface AppSettings {
@@ -92,6 +96,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
     auto: true,
     tidyAfterRun: true,
     renameRows: true,
+    promptCatalogue: "",
+    promptTidy: "",
   },
 };
 

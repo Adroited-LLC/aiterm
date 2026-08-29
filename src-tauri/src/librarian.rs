@@ -65,6 +65,10 @@ pub struct Thread {
     /// Tags the person set by hand — see `Entry::user_tags`.
     #[serde(default)]
     pub user_tags: Vec<String>,
+    /// Hidden from the Threads tab, with its sessions. Kept, and still
+    /// shown to the model, so a hidden thread keeps collecting its sessions.
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -482,6 +486,7 @@ pub fn apply(store: &mut Store, reply: &[serde_json::Value], asked: &[String], s
                             tags: strings(nt.get("tags")),
                             created: now,
                             user_tags: Vec::new(),
+                            hidden: false,
                         });
                         by_name.insert(tname.to_lowercase(), tid.clone());
                         thread_id = tid;
@@ -594,6 +599,8 @@ pub fn apply_tidy(store: &mut Store, reply: &serde_json::Value) -> Result<(usize
             tags,
             created,
             user_tags,
+            // Hidden stays hidden through a merge if any part was.
+            hidden: merge.iter().filter_map(|m| store.threads.get(m)).any(|t| t.hidden),
         });
         for m in &merge {
             moved.insert(m.clone(), id.clone());
@@ -643,8 +650,9 @@ pub struct TidyReport {
     pub cost: f64,
 }
 
-fn tidy_sync(engine: Engine) -> Result<TidyReport, String> {
+fn tidy_sync(engine: Engine, prompt: Option<String>) -> Result<TidyReport, String> {
     let _one_at_a_time = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let system = prompt_or(&prompt, TIDY_SYSTEM);
     let providers = crate::providers::load_providers();
     let mut store = load_store();
     if store.threads.is_empty() {
@@ -656,7 +664,7 @@ fn tidy_sync(engine: Engine) -> Result<TidyReport, String> {
         let d = crate::detail::session_detail_sync(id.clone())?.cwd.unwrap_or_default();
         Some((id.clone(), d.rsplit('/').next().unwrap_or("").to_string()))
     }).collect();
-    let (text, cost) = ask(&engine, &providers, TIDY_SYSTEM, &tidy_prompt(&store, &dirs))?;
+    let (text, cost) = ask(&engine, &providers, &system, &tidy_prompt(&store, &dirs))?;
     let t = text.trim();
     let start = t.find('{').ok_or("no JSON object in the reply")?;
     let end = t.rfind('}').ok_or("no JSON object in the reply")?;
@@ -671,8 +679,30 @@ fn tidy_sync(engine: Engine) -> Result<TidyReport, String> {
 }
 
 #[tauri::command]
-pub async fn librarian_tidy(engine: Engine) -> Result<TidyReport, String> {
-    crate::run_blocking(move || tidy_sync(engine)).await
+pub async fn librarian_tidy(engine: Engine, prompt: Option<String>) -> Result<TidyReport, String> {
+    crate::run_blocking(move || tidy_sync(engine, prompt)).await
+}
+
+/// The prompts as shipped, for the editor to show and to reset to.
+#[derive(Serialize, Debug, Clone)]
+pub struct DefaultPrompts {
+    pub catalogue: &'static str,
+    pub tidy: &'static str,
+}
+
+#[tauri::command]
+pub fn librarian_default_prompts() -> DefaultPrompts {
+    DefaultPrompts { catalogue: SYSTEM, tidy: TIDY_SYSTEM }
+}
+
+#[tauri::command]
+pub async fn librarian_hide_thread(id: String, hidden: bool) -> Result<(), String> {
+    crate::run_blocking(move || {
+        let mut s = load_store();
+        s.threads.get_mut(&id).ok_or("no such thread")?.hidden = hidden;
+        save_store(&s)
+    })
+    .await
 }
 
 /// Sessions per model call. Several at once is what lets the model see that
@@ -684,8 +714,17 @@ const BATCH: usize = 8;
 /// saved it, and the second save dropped what the first had written.
 static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn run_sync(engine: Engine, cands: Vec<Candidate>, max: usize) -> Result<RunReport, String> {
+/// The prompt in force: the person's edit when they made one, else ours.
+fn prompt_or(custom: &Option<String>, default: &str) -> String {
+    match custom.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => default.to_string(),
+    }
+}
+
+fn run_sync(engine: Engine, cands: Vec<Candidate>, max: usize, prompt: Option<String>) -> Result<RunReport, String> {
     let _one_at_a_time = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let system = prompt_or(&prompt, SYSTEM);
     let providers = crate::providers::load_providers();
     let model = engine.label();
     let mut store = load_store();
@@ -707,7 +746,7 @@ fn run_sync(engine: Engine, cands: Vec<Candidate>, max: usize) -> Result<RunRepo
         if batch.is_empty() {
             continue;
         }
-        match ask(&engine, &providers, SYSTEM, &build_prompt(&store, &batch)) {
+        match ask(&engine, &providers, &system, &build_prompt(&store, &batch)) {
             Ok((text, cost)) => match parse_reply(&text) {
                 Ok(reply) => {
                     // Re-read before writing: the model took a minute, and
@@ -745,8 +784,8 @@ pub async fn librarian_state() -> Store {
 }
 
 #[tauri::command]
-pub async fn librarian_run(engine: Engine, sessions: Vec<Candidate>, max: usize) -> Result<RunReport, String> {
-    crate::run_blocking(move || run_sync(engine, sessions, max)).await
+pub async fn librarian_run(engine: Engine, sessions: Vec<Candidate>, max: usize, prompt: Option<String>) -> Result<RunReport, String> {
+    crate::run_blocking(move || run_sync(engine, sessions, max, prompt)).await
 }
 
 /// How many of these sessions a run would look at, without running.
@@ -833,7 +872,7 @@ mod tests {
             .map(|(t, id)| Candidate { id: id.clone(), last_active: t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 })
             .collect();
         let engine = Engine::Cli { agent: "claude".into(), model: Some("haiku".into()) };
-        let report = run_sync(engine, cands, 6).unwrap();
+        let report = run_sync(engine, cands, 6, None).unwrap();
         println!("{report:?}");
         let store = load_store();
         for (id, t) in &store.threads {
@@ -938,7 +977,7 @@ mod tests {
     #[test]
     #[ignore]
     fn tidy_live() {
-        let r = tidy_sync(Engine::Cli { agent: "claude".into(), model: Some("haiku".into()) }).unwrap();
+        let r = tidy_sync(Engine::Cli { agent: "claude".into(), model: Some("haiku".into()) }, None).unwrap();
         println!("{r:?}");
         let store = load_store();
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();

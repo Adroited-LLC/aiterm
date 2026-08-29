@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   EMPTY_LIB, LibEngine, LibRunReport, LibStore, LibTidyReport, Session, librarianForget,
-  librarianRenameThread, librarianRun, librarianState, librarianTag, librarianTidy,
+  librarianHideThread, librarianRenameThread, librarianRun, librarianState, librarianTag, librarianTidy,
 } from "./ipc";
 import { LibrarianSettings } from "./settings";
 
@@ -58,7 +58,7 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     runningRef.current = true;
     setTidying(true);
     try {
-      setTidyReport(await librarianTidy(engine));
+      setTidyReport(await librarianTidy(engine, cfg.promptTidy.trim() || null));
     } catch (e) {
       setTidyReport({ error: String(e) });
     } finally {
@@ -66,7 +66,7 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
       setTidying(false);
       await reload();
     }
-  }, [ready, engine, reload]);
+  }, [ready, engine, reload, cfg.promptTidy]);
 
   const run = useCallback(async (only?: Session[]) => {
     if (runningRef.current || !ready) return;
@@ -84,7 +84,7 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
       // nothing means it is stuck, and the loop stops rather than spins.
       for (;;) {
         if (stopRef.current) break;
-        const r = await librarianRun(engine, list, BATCH);
+        const r = await librarianRun(engine, list, BATCH, cfg.promptCatalogue.trim() || null);
         total.done += r.done;
         total.cost += r.cost;
         total.errors.push(...r.errors);
@@ -104,7 +104,7 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     }
     // Then the look at everything, if anything was read and it is wanted.
     if (total.done > 0 && cfg.tidyAfterRun && !stopRef.current) await tidy();
-  }, [ready, pending, engine, reload, cfg.tidyAfterRun, tidy]);
+  }, [ready, pending, engine, reload, cfg.tidyAfterRun, cfg.promptCatalogue, tidy]);
   const stop = useCallback(() => { stopRef.current = true; }, []);
 
   // The auto run: on a clock, catalogue whatever has been quiet for a
@@ -147,6 +147,11 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     await reload();
   }, [reload]);
 
+  const hideThread = useCallback(async (id: string, hidden: boolean) => {
+    await librarianHideThread(id, hidden);
+    await reload();
+  }, [reload]);
+
   const renameThread = useCallback(async (id: string, name: string) => {
     await librarianRenameThread(id, name);
     await reload();
@@ -158,7 +163,7 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
 
   return {
     store, running, report, progress, pending, ready, run, stop, forget, renameThread, reload,
-    tidy, tidying, tidyReport, tidyDue, tag,
+    tidy, tidying, tidyReport, tidyDue, tag, hideThread,
   };
 }
 

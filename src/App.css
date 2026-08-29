@@ -3898,3 +3898,15 @@ input[type="range"]::-webkit-slider-thumb {
 .thr-row-tags { padding: 0 4px 5px 32px; }
 .thr-row-go.stay { opacity: 1; color: var(--accent); }
 .thr-loose .thr-row-tags { padding-left: 32px; }
+.lib-threads { display: flex; flex-direction: column; gap: 2px; }
+.lib-thread { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 5px; font-size: 12.5px; color: var(--text); cursor: pointer; }
+.lib-thread:hover { background: var(--bg-hover); }
+.lib-thread.hidden .lib-thread-name { color: var(--text-faint); text-decoration: line-through; }
+.lib-thread-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lib-thread-n { font-size: 10.5px; color: var(--text-faint); }
+.lib-prompt { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; }
+.lib-prompt-head { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--text); }
+.lib-prompt-head .linkish { margin-left: auto; }
+.lib-prompt-mod { font-size: 10px; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 8px; padding: 0 6px; }
+.lib-prompt-text { width: 100%; box-sizing: border-box; resize: vertical; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.4; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px; outline: none; }
+.lib-prompt-text:focus { border-color: var(--accent); }
