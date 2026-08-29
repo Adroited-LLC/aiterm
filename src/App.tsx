@@ -23,8 +23,9 @@ import AgentPanel from "./components/AgentPanel";
 import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
+import HomeDashboard from "./components/HomeDashboard";
 import {
-  FolderOpen, GitBranch, Keyboard, ListChecks, PanelLeft, Play, Plus, RefreshCw, Settings as SettingsIcon, X,
+  FolderOpen, GitBranch, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -2244,15 +2245,25 @@ export default function App() {
                 would show through under it — neither is drawn while a file
                 tab is the one on screen. */}
             {tabs.length === 0 && !previewSession && !fileOnScreen && (
-              <div className="empty-note big empty-start">
-                <div>Pick a session on the left — <Icon of={Play} size="sm" /> resumes it, <Icon of={Plus} size="sm" /> opens a shell</div>
-                <div className="empty-start-controls">
-                  <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
-                  <button className="tui-pick" onClick={browseNewSession}>
-                    Start a new session…
-                  </button>
-                </div>
-              </div>
+              <HomeDashboard
+                sessions={sessions}
+                liveIds={new Set(tabs.map((t) => t.slotId).filter((k): k is string => !!k))}
+                usage={usageSources}
+                alerts={alerts}
+                projects={projects}
+                onSelect={selectSession}
+                onResume={(s) => { void resumeSession(s); }}
+                onProject={selectProject}
+                onGoTab={(key) => setActiveTab(key)}
+                start={
+                  <div className="empty-start-controls">
+                    <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
+                    <button className="tui-pick" onClick={browseNewSession}>
+                      Start a new session…
+                    </button>
+                  </div>
+                }
+              />
             )}
             {previewSession && !fileOnScreen && (
               <SessionPreview
