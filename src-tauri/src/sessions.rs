@@ -6111,6 +6111,89 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn strict_restore_rejects_directory_replacement_between_mkdir_and_open() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-restore-mkdir-open-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = VerifiedDirectory::open(&root).unwrap();
+        let replacement = root.join("restored");
+        let displaced = root.join("displaced");
+
+        let error = create_directory_exclusive_with_hook(
+            &destination.file,
+            OsStr::new("restored"),
+            || {
+                std::fs::rename(&replacement, &displaced).unwrap();
+                std::fs::create_dir(&replacement).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed while it was opened"), "{error}");
+        assert!(replacement.is_dir());
+        assert!(displaced.is_dir());
+        assert_eq!(std::fs::read_dir(&replacement).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_restore_never_removes_a_replacement_archive_name() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-restore-archive-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source_parent = root.join("sidecars");
+        let source = source_parent.join("session");
+        let trash_path = root.join("trash");
+        let restored = root.join("restored");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::create_dir_all(&restored).unwrap();
+        std::fs::write(source.join("entry"), b"archived bytes").unwrap();
+        let verified = verified_directory_entry(&source_parent, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, "session.tasks".into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        let archive = trash_path.join("session.tasks");
+        let displaced = trash_path.join("held-archive");
+
+        let error = restore_sidecar_archive_and_remove_with_hook(
+            &archive,
+            &restored,
+            OsStr::new("session"),
+            || {
+                std::fs::rename(&archive, &displaced).unwrap();
+                std::fs::write(&archive, b"replacement must survive").unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("archive name changed"), "{error}");
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            b"replacement must survive"
+        );
+        assert!(std::fs::read(&displaced)
+            .unwrap()
+            .starts_with(SIDECAR_ARCHIVE_MAGIC));
+        assert_eq!(
+            std::fs::read(restored.join("session/entry")).unwrap(),
+            b"archived bytes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn codex_rollout_set_uses_the_same_leased_transaction_and_strict_archive() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-codex-leased-rollouts-{}",
