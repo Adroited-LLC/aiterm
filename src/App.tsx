@@ -2326,19 +2326,22 @@ export default function App() {
                       <Icon of={Users} size="sm" /> Bring in…
                     </button>
                   )}
-                  {showBringIn && (
-                    <BringIn
-                      onClose={() => setShowBringIn(false)}
-                      onOpenModelAccess={openModelAccess}
-                      onGo={(choice, focus, rounds) => {
-                        setShowBringIn(false);
-                        if (activeTab !== null) void relayCtl.start({ aKey: activeTab, choice, focus, rounds });
-                      }}
-                    />
-                  )}
                 </div>
               )}
             </div>
+          )}
+          {/* The bring-in popover hangs off the strip but lives outside it:
+              the strip scrolls sideways, and a scroll container clips
+              anything positioned inside it. */}
+          {showBringIn && activeTabObj?.sessionId && (
+            <BringIn
+              onClose={() => setShowBringIn(false)}
+              onOpenModelAccess={openModelAccess}
+              onGo={(choice, focus, rounds) => {
+                setShowBringIn(false);
+                if (activeTab !== null) void relayCtl.start({ aKey: activeTab, choice, focus, rounds });
+              }}
+            />
           )}
           {/* The session's own files, in a row of their own under the strip:
               what this session opened travels with it, and the leftmost tab

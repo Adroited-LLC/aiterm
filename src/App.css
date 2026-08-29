@@ -984,6 +984,7 @@ body.dragging * { pointer-events: none; }
 .terminal-panel {
   flex: 1;
   background: var(--bg);
+  position: relative;
 }
 
 .term-stack {
@@ -3928,7 +3929,7 @@ input[type="range"]::-webkit-slider-thumb {
 .relay-x, .relay-jump { background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 0 2px; display: inline-flex; font: inherit; font-size: 11px; }
 .relay-x:hover { color: var(--red); }
 .relay-jump { color: var(--accent); text-decoration: underline; }
-.bringin { position: absolute; right: 0; top: calc(100% + 6px); z-index: 40; width: 460px; max-width: 90vw; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px #000a; }
+.bringin { position: absolute; right: 8px; top: 36px; z-index: 40; width: 460px; max-width: 90vw; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 10px 30px #000a; }
 .bringin-head { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 12.5px; font-weight: 600; color: var(--text); }
 .bringin-head .icon-btn { margin-left: auto; }
 .bringin-body { display: flex; flex-direction: column; gap: 8px; padding: 10px; }
