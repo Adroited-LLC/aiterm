@@ -2165,7 +2165,7 @@ fn quarantine_prepared_source(source: &VerifiedSessionFile) -> Result<std::path:
     Ok(quarantine_path)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn archive_verified_entries_with_hooks(
     destination: &VerifiedDirectory,
     entries: Vec<(VerifiedSessionFile, std::ffi::OsString)>,
