@@ -354,38 +354,50 @@ fn delete_rooted(roots: &SessionRoots, session_id: &str) -> Result<(), SessionSe
     // Resolve before creating or purging anything. This ordering is the
     // destructive-operation boundary: an unknown id has no disk side effect.
     let path = rooted_path(roots, session_id)?;
-    let _verified = open_regular_nofollow(&path)
-        .map_err(|_| SessionServiceError::new("session.not_found", "session not found"))?;
     std::fs::create_dir_all(&roots.trash)
         .map_err(|error| SessionServiceError::new("session.delete_failed", error.to_string()))?;
-    let destination = roots.trash.join(format!("{session_id}.jsonl"));
-    std::fs::rename(&path, &destination)
+    let job = rooted_job(&roots.jobs, session_id)
+        .map_err(|error| SessionServiceError::new("session.delete_failed", error))?;
+    let session_root = std::fs::canonicalize(roots.sessions_path())
         .map_err(|error| SessionServiceError::new("session.delete_failed", error.to_string()))?;
-    let origin = roots.trash.join(format!("{session_id}.origin"));
-    let _ = std::fs::write(origin, path.to_string_lossy().as_bytes());
-    let tasks = roots.tasks.join(session_id);
-    if tasks.is_dir() {
-        let _ = std::fs::rename(tasks, roots.trash.join(format!("{session_id}.tasks")));
-    }
-    if let Some(job) = rooted_job(&roots.jobs, session_id) {
-        let _ = std::fs::rename(job, roots.trash.join(format!("{session_id}.job")));
-    }
-    Ok(())
+    crate::sessions::archive_rooted_session_sources(
+        &session_root,
+        &path,
+        &roots.tasks,
+        &roots.jobs,
+        job.as_deref(),
+        &roots.trash,
+        session_id,
+    )
+    .map_err(|error| SessionServiceError::new("session.delete_failed", error))
 }
 
-fn rooted_job(jobs: &Path, session_id: &str) -> Option<PathBuf> {
-    for entry in std::fs::read_dir(jobs).ok()?.flatten() {
-        let Ok(raw) = std::fs::read_to_string(entry.path().join("state.json")) else {
-            continue;
+fn rooted_job(jobs: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
+    let entries = match std::fs::read_dir(jobs) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let state = entry.path().join("state.json");
+        let metadata = match std::fs::symlink_metadata(&state) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
         };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err("session job state is not a verified regular file".into());
+        }
+        let raw = std::fs::read_to_string(&state).map_err(|error| error.to_string())?;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
             continue;
         };
         if value.get("sessionId").and_then(|id| id.as_str()) == Some(session_id) {
-            return Some(entry.path());
+            return Ok(Some(entry.path()));
         }
     }
-    None
+    Ok(None)
 }
 
 fn fork_rooted(roots: &SessionRoots, session_id: &str) -> Result<String, SessionServiceError> {

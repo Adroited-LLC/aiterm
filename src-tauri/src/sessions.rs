@@ -1009,7 +1009,7 @@ fn archive_generic_session_sources(
         Err(error) => return Err(format!("could not inspect session task archive: {error}")),
     }
     let jobs_root = home.join(".claude/jobs");
-    if let Some(job) = find_job_dir(&jobs_root, session_id) {
+    if let Some(job) = find_job_dir_checked(&jobs_root, session_id)? {
         archive_entries.push((
             verified_directory_entry(&jobs_root, &job)?,
             std::ffi::OsString::from(format!("{session_id}.job")),
@@ -1279,7 +1279,6 @@ impl VerifiedSessionFile {
     fn open(&self) -> Result<File, String> { Err(unsupported_verified_operations()) }
     fn rename_to(&self, _destination: &VerifiedDirectory, _name: &OsStr) -> Result<(), String> { Err(unsupported_verified_operations()) }
     fn create_sibling(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> { Err(unsupported_verified_operations()) }
-    fn rename_directory_to(&self, _destination: &VerifiedDirectory, _name: &OsStr) -> Result<(), String> { Err(unsupported_verified_operations()) }
 }
 
 #[cfg(unix)]
@@ -1376,12 +1375,9 @@ impl VerifiedSessionFile {
                     &quarantine_path,
                     after_verification,
                 ),
-                VerifiedEntryKind::Directory => archive_exact_directory(
-                    &self.object,
-                    destination,
-                    name,
-                    &quarantine_path,
-                    after_verification,
+                VerifiedEntryKind::Directory => Err(
+                    "sidecar directories require a leased multi-artifact archive transaction"
+                        .into(),
                 ),
             }
         }
@@ -1406,12 +1402,6 @@ impl VerifiedSessionFile {
         file.sync_all().map_err(|e| e.to_string())
     }
 
-    fn rename_directory_to(&self, destination: &VerifiedDirectory, name: &OsStr) -> Result<(), String> {
-        if !matches!(self.kind, VerifiedEntryKind::Directory) {
-            return Err("session sidecar is not a directory".into());
-        }
-        self.rename_to(destination, name)
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2505,209 +2495,6 @@ fn archive_exact_file(
 }
 
 #[cfg(target_os = "linux")]
-fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>, String> {
-    let cloned = directory.try_clone().map_err(|error| error.to_string())?;
-    let raw = std::os::fd::IntoRawFd::into_raw_fd(cloned);
-    let stream = unsafe { libc::fdopendir(raw) };
-    if stream.is_null() {
-        unsafe { libc::close(raw) };
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let mut names = Vec::new();
-    loop {
-        let entry = unsafe { libc::readdir(stream) };
-        if entry.is_null() {
-            break;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-        if name.to_bytes() != b"." && name.to_bytes() != b".." {
-            names.push(OsStr::from_bytes(name.to_bytes()).to_os_string());
-        }
-    }
-    unsafe { libc::closedir(stream) };
-    Ok(names)
-}
-
-#[cfg(target_os = "linux")]
-fn create_exact_archive_directory(parent: &File, name: &CString) -> Result<File, String> {
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let descriptor = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        Err(std::io::Error::last_os_error().to_string())
-    } else {
-        Ok(unsafe { File::from_raw_fd(descriptor) })
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn copy_exact_directory_tree(
-    source: &File,
-    destination: &File,
-    depth: usize,
-    entries: &mut usize,
-    bytes: &mut u64,
-    retirements: &mut Vec<ExactFileRetirement>,
-) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    if depth > MAX_SESSION_DISCOVERY_DEPTH {
-        return Err("session sidecar archive exceeds maximum depth".into());
-    }
-    let source_metadata = source.metadata().map_err(|error| error.to_string())?;
-    for name in directory_entry_names(source)? {
-        *entries = entries
-            .checked_add(1)
-            .ok_or("session sidecar entry count overflow")?;
-        if *entries > MAX_EXACT_ARCHIVE_ENTRIES {
-            return Err("session sidecar archive exceeds entry limit".into());
-        }
-        let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid sidecar entry name")?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        if unsafe {
-            libc::fstatat(
-                source.as_raw_fd(),
-                name_c.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let stat = unsafe { stat.assume_init() };
-        match stat.st_mode & libc::S_IFMT {
-            libc::S_IFREG => {
-                let descriptor = unsafe {
-                    libc::openat(
-                        source.as_raw_fd(),
-                        name_c.as_ptr(),
-                        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if descriptor < 0 {
-                    return Err(std::io::Error::last_os_error().to_string());
-                }
-                let file = unsafe { File::from_raw_fd(descriptor) };
-                *bytes = bytes
-                    .checked_add(file.metadata().map_err(|error| error.to_string())?.len())
-                    .ok_or("session sidecar byte count overflow")?;
-                if *bytes > MAX_EXACT_ARCHIVE_BYTES {
-                    return Err("session sidecar archive exceeds byte limit".into());
-                }
-                retirements.push(copy_exact_file(&file, destination, &name_c)?);
-            }
-            libc::S_IFDIR => {
-                let descriptor = unsafe {
-                    libc::openat(
-                        source.as_raw_fd(),
-                        name_c.as_ptr(),
-                        libc::O_RDONLY
-                            | libc::O_DIRECTORY
-                            | libc::O_NOFOLLOW
-                            | libc::O_CLOEXEC,
-                    )
-                };
-                if descriptor < 0 {
-                    return Err(std::io::Error::last_os_error().to_string());
-                }
-                let child_source = unsafe { File::from_raw_fd(descriptor) };
-                let child_destination = create_exact_archive_directory(destination, &name_c)?;
-                copy_exact_directory_tree(
-                    &child_source,
-                    &child_destination,
-                    depth + 1,
-                    entries,
-                    bytes,
-                    retirements,
-                )?;
-                let child_metadata = child_source.metadata().map_err(|error| error.to_string())?;
-                child_destination
-                    .set_permissions(std::fs::Permissions::from_mode(
-                        child_metadata.mode() & 0o7777,
-                    ))
-                    .map_err(|error| error.to_string())?;
-                if let Ok(modified) = child_metadata.modified() {
-                    child_destination
-                        .set_modified(modified)
-                        .map_err(|error| error.to_string())?;
-                }
-                child_destination.sync_all().map_err(|error| error.to_string())?;
-            }
-            _ => return Err("session sidecar contains a symlink or special file".into()),
-        }
-    }
-    destination
-        .set_permissions(std::fs::Permissions::from_mode(
-            source_metadata.mode() & 0o7777,
-        ))
-        .map_err(|error| error.to_string())?;
-    if let Ok(modified) = source_metadata.modified() {
-        destination
-            .set_modified(modified)
-            .map_err(|error| error.to_string())?;
-    }
-    destination.sync_all().map_err(|error| error.to_string())
-}
-
-#[cfg(target_os = "linux")]
-fn archive_exact_directory(
-    source: &File,
-    destination: &VerifiedDirectory,
-    name: &OsStr,
-    quarantine_path: &Path,
-    after_verification: impl FnOnce(),
-) -> Result<(), String> {
-    let final_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash directory name")?;
-    let archive_directory = create_exact_archive_directory(&destination.file, &final_name)
-        .map_err(|error| format!("could not create sidecar archive: {error}"))?;
-    let mut entries = 0usize;
-    let mut bytes = 0u64;
-    let mut retirements = Vec::new();
-    copy_exact_directory_tree(
-        source,
-        &archive_directory,
-        0,
-        &mut entries,
-        &mut bytes,
-        &mut retirements,
-    )
-    .map_err(|error| {
-        format!(
-            "could not create bounded exact sidecar archive; source remains at {} and the exclusive destination contains the recoverable partial copy: {error}",
-            quarantine_path.display(),
-        )
-    })?;
-    for retirement in &retirements {
-        verify_exact_file(retirement)?;
-    }
-    after_verification();
-    if !directory_entry_is_exact_object(&destination.file, &final_name, &archive_directory)? {
-        return Err(format!(
-            "exact sidecar destination changed; source remains recoverable at {} and is not retired",
-            quarantine_path.display()
-        ));
-    }
-    destination
-        .file
-        .sync_all()
-        .map_err(|error| format!("could not make exact sidecar archive durable: {error}"))?;
-    retire_exact_files(&retirements).map_err(|error| {
-        format!(
-            "durable sidecar archive exists but exact source remains at {}: {error}",
-            quarantine_path.display()
-        )
-    })
-}
-
-#[cfg(target_os = "linux")]
 fn rename_noreplace(
     old_dir: std::os::fd::RawFd,
     old_name: &CString,
@@ -2769,6 +2556,67 @@ fn verified_session_file(
     )
 }
 
+#[cfg(unix)]
+fn verified_file_under(root: &Path, path: &Path) -> Result<VerifiedSessionFile, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "session transcript escapes its store")?;
+    let root = VerifiedDirectory::open(root)?;
+    let (parent, name) = root.open_parent(relative)?;
+    VerifiedSessionFile::from_entry(
+        parent,
+        name,
+        VerifiedEntryKind::File,
+        path.parent()
+            .ok_or("session transcript has no parent")?
+            .to_path_buf(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn archive_rooted_session_sources(
+    session_root: &Path,
+    transcript_path: &Path,
+    tasks_root: &Path,
+    jobs_root: &Path,
+    job_path: Option<&Path>,
+    trash_path: &Path,
+    session_id: &str,
+) -> Result<(), String> {
+    let trash = VerifiedDirectory::open(trash_path)?;
+    let mut entries = vec![(
+        verified_file_under(session_root, transcript_path)?,
+        std::ffi::OsString::from(format!("{session_id}.jsonl")),
+    )];
+    let tasks = tasks_root.join(session_id);
+    match std::fs::symlink_metadata(&tasks) {
+        Ok(_) => entries.push((
+            verified_directory_entry(tasks_root, &tasks)?,
+            std::ffi::OsString::from(format!("{session_id}.tasks")),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect session task archive: {error}")),
+    }
+    if let Some(job) = job_path {
+        entries.push((
+            verified_directory_entry(jobs_root, job)?,
+            std::ffi::OsString::from(format!("{session_id}.job")),
+        ));
+    }
+    archive_verified_entries_with_hooks(
+        &trash,
+        entries,
+        ArchiveLimits::default(),
+        || {},
+        || Ok(()),
+    )?;
+    let _ = trash.write_atomic(
+        OsStr::new(&format!("{session_id}.origin")),
+        transcript_path.to_string_lossy().as_bytes(),
+    );
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn verified_directory_entry(_root: &Path, _path: &Path) -> Result<VerifiedSessionFile, String> {
     Err(unsupported_verified_operations())
@@ -2794,28 +2642,45 @@ fn unsupported_verified_operations() -> String {
 /// The names happen to be the session's first uuid segment today, but matching
 /// on that would mean deleting Claude Code's records on a coincidence. Reading
 /// the `sessionId` inside is the only claim we can actually stand behind.
-fn find_job_dir(jobs_root: &Path, session_id: &str) -> Option<std::path::PathBuf> {
-    for job in std::fs::read_dir(jobs_root).ok()?.flatten() {
-        let Ok(file_type) = job.file_type() else { continue };
+fn find_job_dir_checked(
+    jobs_root: &Path,
+    session_id: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let jobs = match std::fs::read_dir(jobs_root) {
+        Ok(jobs) => jobs,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect session job store: {error}")),
+    };
+    for job in jobs {
+        let job = job.map_err(|error| format!("could not inspect session job entry: {error}"))?;
+        let file_type = job
+            .file_type()
+            .map_err(|error| format!("could not inspect session job type: {error}"))?;
         if file_type.is_symlink() || !file_type.is_dir() {
             continue;
         }
         let state = job.path().join("state.json");
-        let Ok(metadata) = std::fs::symlink_metadata(&state) else { continue };
+        let metadata = match std::fs::symlink_metadata(&state) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("could not inspect session job state: {error}")),
+        };
         if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            continue;
+            return Err(format!(
+                "session job state is not a verified regular file: {}",
+                state.display()
+            ));
         }
-        let Ok(raw) = std::fs::read_to_string(state) else {
+        let raw = std::fs::read_to_string(&state)
+            .map_err(|error| format!("could not read session job state: {error}"))?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
             continue;
         };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        if v.get("sessionId").and_then(|s| s.as_str()) == Some(session_id) {
-            return Some(job.path());
+        if value.get("sessionId").and_then(|id| id.as_str()) == Some(session_id) {
+            return Ok(Some(job.path()));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Where a trashed job directory belongs. Prefers the `daemonShort` recorded
@@ -5764,58 +5629,6 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exact_directory_archive_round_trips_and_leaves_only_an_excluded_tombstone() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-production-sidecar-roundtrip-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let sidecars = root.join("sidecars");
-        let source = sidecars.join("session-sidecar");
-        let trash_path = root.join("trash");
-        std::fs::create_dir_all(source.join("nested")).unwrap();
-        std::fs::create_dir_all(&trash_path).unwrap();
-        std::fs::write(source.join("state.json"), b"state").unwrap();
-        std::fs::write(source.join("nested/output.txt"), b"output").unwrap();
-        let verified = verified_directory_entry(&sidecars, &source).unwrap();
-        let trash = VerifiedDirectory::open(&trash_path).unwrap();
-
-        verified
-            .rename_directory_to(&trash, OsStr::new("session.tasks"))
-            .unwrap();
-
-        assert_eq!(std::fs::read(trash_path.join("session.tasks/state.json")).unwrap(), b"state");
-        assert_eq!(
-            std::fs::read(trash_path.join("session.tasks/nested/output.txt")).unwrap(),
-            b"output"
-        );
-        let tombstone = std::fs::read_dir(&sidecars)
-            .unwrap()
-            .flatten()
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".aiterm-quarantine-")
-            })
-            .expect("the bounded zero-byte tombstone remains excluded")
-            .path();
-        assert_eq!(std::fs::metadata(tombstone.join("state.json")).unwrap().len(), 0);
-        assert_eq!(
-            std::fs::metadata(tombstone.join("nested/output.txt"))
-                .unwrap()
-                .len(),
-            0
-        );
-        assert!(!source.exists());
-
-        std::fs::rename(trash_path.join("session.tasks"), &source).unwrap();
-        assert_eq!(std::fs::read(source.join("state.json")).unwrap(), b"state");
-        assert_eq!(std::fs::read(source.join("nested/output.txt")).unwrap(), b"output");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
     fn archive_transaction_holds_a_write_lease_through_source_retirement() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-lease-archive-{}",
@@ -6663,9 +6476,13 @@ mod tests {
         // A directory with no state.json at all must not blow up the scan.
         std::fs::create_dir_all(root.join("empty")).unwrap();
 
-        let found = find_job_dir(&root, want).expect("matches by recorded id");
+        let found = find_job_dir_checked(&root, want)
+            .unwrap()
+            .expect("matches by recorded id");
         assert!(found.ends_with("someotherdir"), "got {found:?}");
-        assert!(find_job_dir(&root, "nobody-has-this-id").is_none());
+        assert!(find_job_dir_checked(&root, "nobody-has-this-id")
+            .unwrap()
+            .is_none());
         // Restore prefers the recorded daemonShort over re-deriving a name.
         assert_eq!(job_dir_name(&found, want), "abcd1234");
         assert_eq!(job_dir_name(&root.join("empty"), want), "7f8edb5a");
