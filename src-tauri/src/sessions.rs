@@ -5917,6 +5917,153 @@ mod tests {
             .unwrap()
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-")));
+
+        let retry_main = verified_session_file("claude", &transcript, &home).unwrap();
+        let retry_sidecar = verified_directory_entry(&sidecars, &tasks).unwrap();
+        let retry = archive_verified_entries_with_hooks(
+            &trash,
+            vec![
+                (retry_main, std::ffi::OsString::from(format!("{id}.jsonl"))),
+                (retry_sidecar, std::ffi::OsString::from(format!("{id}.tasks"))),
+            ],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(retry.contains("without overwrite"));
+        assert_eq!(std::fs::read(&transcript).unwrap(), b"transcript");
+        assert_eq!(std::fs::read(tasks.join("task.json")).unwrap(), b"task");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leased_archive_detects_a_destination_name_swap_before_retirement() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-leased-destination-swap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "20202020-2020-4020-8020-202020202020";
+        let source = project.join(format!("{id}.jsonl"));
+        let destination = trash_path.join(format!("{id}.jsonl"));
+        let displaced = trash_path.join("displaced-exact-archive");
+        std::fs::write(&source, b"exact transcript").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, std::ffi::OsString::from(format!("{id}.jsonl")))],
+            ArchiveLimits::default(),
+            || {},
+            || {
+                std::fs::rename(&destination, &displaced).unwrap();
+                std::fs::write(&destination, b"unverified replacement").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("destination changed"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"exact transcript");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"exact transcript");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"unverified replacement");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leased_archive_sets_keep_timestamp_on_its_held_fd_and_collision_is_non_destructive() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-leased-timestamp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "21212121-2121-4121-8121-212121212121";
+        let source = project.join(format!("{id}.jsonl"));
+        let destination = trash_path.join(format!("{id}.jsonl"));
+        std::fs::write(&source, b"old transcript").unwrap();
+        let old = UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::open(&source).unwrap().set_modified(old).unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        let before = std::time::SystemTime::now();
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, std::ffi::OsString::from(format!("{id}.jsonl")))],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(destination.metadata().unwrap().modified().unwrap() >= before);
+
+        let id2 = "22222222-2222-4222-8222-222222222222";
+        let source2 = project.join(format!("{id2}.jsonl"));
+        let destination2 = trash_path.join(format!("{id2}.jsonl"));
+        std::fs::write(&source2, b"new source").unwrap();
+        std::fs::write(&destination2, b"existing trash").unwrap();
+        let verified2 = verified_session_file("claude", &source2, &home).unwrap();
+        let error = archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified2, std::ffi::OsString::from(format!("{id2}.jsonl")))],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("without overwrite"));
+        assert_eq!(std::fs::read(source2).unwrap(), b"new source");
+        assert_eq!(std::fs::read(destination2).unwrap(), b"existing trash");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_growing_sidecar_stops_at_remaining_plus_one_without_publish_or_quarantine() {
+        fn grow(file: &File) {
+            file.set_len(9).unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-sidecar-growth-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sidecars = root.join("sidecars");
+        let source = sidecars.join("session-sidecar");
+        let trash_path = root.join("trash");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::write(source.join("growing"), b"x").unwrap();
+        let verified = verified_directory_entry(&sidecars, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        let limits = ArchiveLimits {
+            bytes: 8,
+            before_file_read: grow,
+            ..ArchiveLimits::default()
+        };
+
+        let error = archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, std::ffi::OsString::from("session.tasks"))],
+            limits,
+            || {},
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+        assert!(source.is_dir());
+        assert_eq!(std::fs::metadata(source.join("growing")).unwrap().len(), 9);
+        assert_eq!(std::fs::read_dir(&trash_path).unwrap().count(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
