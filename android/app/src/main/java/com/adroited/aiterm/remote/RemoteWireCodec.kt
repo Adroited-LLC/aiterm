@@ -56,6 +56,14 @@ object RemoteWireCodec {
         return encoded
     }
 
+    fun encodeTerminalResumePayload(tabId: String, attachmentId: String, revision: Long): ByteArray {
+        require(tabId.isNotEmpty() && attachmentId.isNotEmpty() && revision >= 0)
+        return cbor.encodeToByteArray(
+            TerminalResumeWire.serializer(),
+            TerminalResumeWire(tabId, attachmentId, revision),
+        ).also { if (it.size >= MAX_FRAME_BYTES) throw RemoteProtocolException("resume payload is too large") }
+    }
+
     fun decodeStateSnapshot(payload: ByteArray): StateSnapshotChunk {
         validate(payload)
         return decode(StateSnapshotChunk.serializer(), payload).also { chunk ->
@@ -70,6 +78,11 @@ object RemoteWireCodec {
     fun decodeError(payload: ByteArray): RemoteErrorPayload {
         validate(payload)
         return decode(RemoteErrorPayload.serializer(), payload)
+    }
+
+    fun decodeTerminalChunk(payload: ByteArray, expectedRequestId: Long): TerminalTransferChunk {
+        validate(payload)
+        return TerminalWireDecoder.decode(payload, expectedRequestId)
     }
 
     private fun validate(bytes: ByteArray) {
@@ -109,6 +122,13 @@ object RemoteWireCodec {
         val kind: String = "auth.proof",
         @SerialName("device_id") val deviceId: String,
         @SerialName("signature_der") @ByteString val signatureDer: ByteArray,
+    )
+
+    @Serializable
+    private data class TerminalResumeWire(
+        @SerialName("tab_id") val tabId: String,
+        @SerialName("attachment_id") val attachmentId: String,
+        val revision: Long,
     )
 }
 

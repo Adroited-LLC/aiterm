@@ -1,6 +1,10 @@
 package com.adroited.aiterm.remote
 
 import com.adroited.aiterm.terminal.DefaultTerminalScreenStore
+import com.adroited.aiterm.terminal.CursorState
+import com.adroited.aiterm.terminal.ScreenCell
+import com.adroited.aiterm.terminal.ScreenRow
+import com.adroited.aiterm.terminal.ScreenSnapshot
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -59,6 +63,58 @@ class RemoteClientTest {
         assertEquals(ConnectionState.Locked, client.state.value.connection)
         assertEquals(0, client.state.value.pendingTransfers)
         assertTrue(transport.closed)
+    }
+
+    @Test
+    fun revisionMismatchKeepsTheCurrentScreenAndRequestsAuthoritativeRecovery() = runTest {
+        val transport = FakeRemoteTransport()
+        val store = DefaultTerminalScreenStore()
+        store.replace(
+            ScreenSnapshot(
+                tabId = "tab-1",
+                revision = 5,
+                cols = 1,
+                rows = 1,
+                visible = listOf(ScreenRow(listOf(ScreenCell("old")))),
+                cursor = CursorState(0, 0, true),
+            ),
+        )
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+
+        client.acceptForTest(
+            RemoteServerEvent.TerminalChunk(
+                TerminalTransferChunk(
+                    transferId = "transfer-1",
+                    tabId = "tab-1",
+                    attachmentId = "attachment-1",
+                    kind = TerminalTransferKind.Diff,
+                    baseRevision = 4,
+                    finalRevision = 6,
+                    rowStart = 0,
+                    rowEnd = 1,
+                    index = 0,
+                    total = 1,
+                    requestId = 0,
+                    part = TerminalTransferPart.Diff(
+                        patches = listOf(com.adroited.aiterm.terminal.RowPatch(0, ScreenRow(listOf(ScreenCell("new"))))),
+                        cursor = null,
+                        modes = null,
+                    ),
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals("old", store.screen.value?.visible?.single()?.plainText())
+        assertEquals(listOf("terminal.resume"), transport.requests.map(RemoteRequest::kind))
+        client.lock()
     }
 }
 
