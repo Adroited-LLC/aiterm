@@ -11,6 +11,7 @@ No Task 9 Android roster residual was changed in this task.
 ## Delivered behavior
 
 - One long-lived `ApplicationServices` graph owns `SessionService` and `AgentService`. The production Tauri adapters and `RemoteServices` receive clones of the same Arc-backed graph; fixture roots/providers are injected without changing the common validation, existence gates, discovery budget, error mapping, or operation ordering.
+- The Tauri `detect_agents`, `agent_caps`, `agent_choices`, and `resolve_launch` adapters now take managed `ApplicationServices` state rather than constructing desktop services per invocation. A production-wiring regression passes one mutable resolver fixture through both a Tauri adapter helper and an authenticated gateway and proves both observe the same Arc-backed agent graph.
 - `SessionService` provides list, find, preview, delete, fork, and stop operations. Typed provider adapters retain store-specific I/O (including OpenCode's database transaction/dump behavior); `SessionRoots` provides explicit fixture-owned roots for parity and destructive-operation tests without consulting process `HOME`.
 - `AgentService` owns installed-agent discovery, capabilities, choices, and launch resolution behind an injectable `AgentOperations` boundary.
 - Existing `list_sessions`, `session_preview`, `session_delete`, `session_fork`, `stop_session`, `detect_agents`, `agent_caps`, `agent_choices`, and `resolve_launch` Tauri commands retain their names and return behavior as service adapters.
@@ -22,6 +23,9 @@ No Task 9 Android roster residual was changed in this task.
 - Agent start accepts a working directory only when it exactly matches a `project_path` exposed by the session service. Settings, arbitrary filesystem operations, font installation, diagnostics, unknown requests, and arbitrary command fields are rejected.
 - Session identifiers are validated and production discovery uses one global per-request budget of 4,096 candidates across providers, with recursion depth 16, visited directory identities, symlink rejection, and SQL limits applied before allocation. Preview/message sizes retain the desktop bounds, terminal dimensions retain the protocol bounds, request fields are bounded, and every complete serialized response envelope remains under the existing terminal-frame limit. Oversized replies produce `protocol.response_too_large`.
 - Production generic preview/fork/delete I/O verifies the approved provider root and walks parents with no-follow directory FDs. Reads, sibling creation, transcript/sidecar moves, atomic fork-map writes, trash purge, and OpenCode dump creation remain relative to pinned directory FDs. Root replacement and file/directory symlinks fail closed or continue only against the already-verified inode; unsupported platforms reject destructive operations.
+- A generic transcript/sidecar delete first moves the current source name to an unguessable, no-overwrite quarantine name in the pinned parent, opens that quarantine without following links, and compares it to the originally pinned `(device, inode)` before moving it to trash. A mismatch is restored only with no-replace; if the original name is occupied, the quarantine remains recoverable and the desktop error names its exact internal location. An unopenable quarantine replacement is never moved or unlinked. The authenticated gateway continues to redact these details behind stable session error codes.
+- OpenCode deletion pins every database parent component and the database leaf without following links, opens SQLite through the pinned-parent `/proc/self/fd` path with `SQLITE_OPEN_NOFOLLOW`, and rechecks the database identity around one `rusqlite` connection. One immediate transaction supplies all dump rows and all deletes. A unique temporary dump is fsynced, published without overwrite, and the trash directory is synced before any row is deleted; injected dump/SQL failures roll back rows and clean up their unpublished/published dump. SQLite deliberately fails closed if a provider-root replacement makes its no-follow open reject the moved procfs ancestry, leaving both the pinned database and outside sentinel untouched.
+- Claude and Codex production discovery now open provider roots and every descendant directory/file with no-follow descriptor-relative operations. Enumeration uses only a verified `/proc/self/fd` view of the pinned directory and parsing reads the already-open regular-file descriptor. Root symlinks, descendant symlinks, unavailable procfs, recursion beyond depth 16, repeated directory identities, and candidates beyond the global 4,096-file budget all fail closed or stop discovery before unbounded allocation. Internal quarantine names have no transcript extension and are not discoverable sessions.
 - Rooted deletion resolves the requested transcript before creating or moving anything. Deleting an unknown session has no disk side effect.
 
 ## Android RPC contract
@@ -76,24 +80,28 @@ The completion review added five further RED regressions. Before their fixes, th
 
 The independent hardening review added RED coverage for the second wave: typed `tab.open` was unsupported while legacy command/cwd input was accepted; unavailable model/effort selections reached the resolver; two simultaneous session opens could launch twice; discovery materialized provider results without one global budget; and root replacement separated pathname validation from the later destructive operation. The final tests exercise two real authenticated sockets, the production-shaped common service path, depth/budget limits, file and directory symlinks, source and trash root replacement, pinned trash purge, and consolidated permission stamping.
 
+The scoped round-two review added RED coverage for the remaining shared-state and destructive-object gaps. Tauri agent adapters initially had no way to receive the gateway's managed service graph. Generic trash initially verified a leaf and later renamed its name, allowing a deterministic swap; the exact-inode tests now cover successful mismatch restoration, an occupied-original recoverable quarantine, and an unopenable symlink replacement that must remain untouched. OpenCode initially reacquired its database path across three dump reads and a separate write; root/leaf replacement plus dump/SQL failure fixtures now exercise one pinned connection/transaction. Claude's production-shaped root helper did not exist and Codex followed a symlink provider root; both now pass through the same pinned no-follow discovery abstraction.
+
+Storm/power-loss checkpoints were intentionally preserved instead of rewriting history. `ac380df`, `8000d6e`, and `fc36dab` are labeled WIP/RED checkpoints completed by later GREEN commits. The round-two sequence is: `7105c9d` managed Tauri agent state, `81f6f07` generic exact-inode quarantine, `8000d6e` OpenCode RED, `43717c0` pinned OpenCode transaction, `fc36dab` discovery RED, `fa039fc` pinned discovery, and `763d7ae` quarantine open-failure hardening.
+
 ## Verification
 
-All Rust commands used the isolated build directory `/tmp/aiterm-task5-target.rXGkuZ`; the ruled-unsafe real-`HOME` backend integration target was not run.
+The final fresh Rust commands used the isolated build directory `/tmp/aiterm-task5-final.ViquJ1`; the ruled-unsafe real-`HOME` backend integration target was not run.
 
 ```text
 cargo test --test remote_operations
-25 passed, 0 failed
+26 passed, 0 failed
 
 cargo test --test remote_server
 35 passed, 0 failed
 
 cargo test --lib
-397 passed, 0 failed, 7 ignored
+405 passed, 0 failed, 7 ignored
 
 cargo test --test remote_auth --test remote_desktop --test remote_operations \
   --test remote_protocol --test remote_server --test remote_terminal \
   --test tab_registry --test terminal_screen
-203 passed, 0 failed
+204 passed, 0 failed
 
 cargo check
 Finished dev profile successfully (isolated target)
@@ -111,6 +119,6 @@ The first post-review aggregate run exposed an order-sensitive assertion in `rem
 
 ## Self-review and concerns
 
-The final tracked diff was reviewed after reversing broad legacy-module rustfmt changes; only semantic Task 5 hunks remain. Fixture tests use unique explicit temporary roots and do not override `HOME`. Review findings for running-only close, exited-slot-safe open, early id validation, rooted symlink containment, complete-envelope bounds, strict server-owned launch input, common bounded services, production FD-relative I/O, concurrent resume coordination, offered-agent validation, and permission parity were reproduced and fixed. Remote handlers run through the gateway's existing bounded blocking-operation path, retain authenticated request correlation and attachment authorization, and do not change screen/focus/tab primitives.
+The final tracked diff was reviewed after reversing broad legacy-module rustfmt changes; only Task 5 files are changed. Fixture tests use unique explicit temporary roots and do not override `HOME`. Review findings for running-only close, exited-slot-safe open, early id validation, rooted symlink containment, complete-envelope bounds, strict server-owned launch input, common bounded services, production FD-relative I/O, concurrent resume coordination, offered-agent validation, permission parity, exact shared application state, exact-inode quarantine, one pinned OpenCode connection, and no-follow production discovery were reproduced and fixed. Remote handlers run through the gateway's existing bounded blocking-operation path, retain authenticated request correlation and attachment authorization, and do not change screen/focus/tab primitives.
 
 There is one intentional compatibility split to carry into Task 9: the direct protocol decoder preserves `protocol.unknown_request`, while authenticated clients see the public `remote.unsupported` code. Android should implement the public gateway contract above.
