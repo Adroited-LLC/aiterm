@@ -80,22 +80,13 @@ pub struct LaunchPlan {
 /// it is deliberately the untested half, exactly like it was before.
 pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
     let list = crate::agents::backends();
-    let plan = resolve_in(&list, &crate::providers::load_providers(), request)?;
-    Some(stamp(&list, plan))
+    resolve_with(&list, &crate::providers::load_providers(), request, stored_flags)
 }
 
-/// The stored permission mode for the engine that answered, onto the plan.
-/// Every path that hands a plan to a tab goes through here — `resolve` and
-/// the `resolve_launch` command alike. The command used to call `resolve_in`
-/// directly and so launched every session in the engine's own default,
-/// whatever Settings said.
-fn stamp(list: &[Box<dyn AgentBackend>], plan: LaunchPlan) -> LaunchPlan {
-    let flags = list
-        .iter()
-        .find(|b| b.id() == plan.agent_id)
-        .map(|b| crate::permissions::flags_for(&**b))
-        .unwrap_or_default();
-    with_permission(plan, &flags)
+/// The stored permission mode's flags for an engine — what `resolve_with`
+/// is handed outside of tests.
+fn stored_flags(b: &dyn AgentBackend) -> String {
+    crate::permissions::flags_for(b)
 }
 
 /// Append an engine's permission flags to a resolved command. The single point
@@ -120,6 +111,28 @@ pub fn resolve_in(
     providers: &[Provider],
     request: LaunchRequest,
 ) -> Option<LaunchPlan> {
+    resolve_with(list, providers, request, |_| String::new())
+}
+
+/// `resolve_in` with the permission flags supplied. The order on the line
+/// is the whole point: the engine's own flags, then the permission flags,
+/// then the first prompt last of all — claude stops reading options at its
+/// positional prompt, so a flag after it was silently part of nothing, and
+/// every session started from the home box asked before each write while
+/// Settings said auto.
+pub fn resolve_with(
+    list: &[Box<dyn AgentBackend>],
+    providers: &[Provider],
+    request: LaunchRequest,
+    flags: impl Fn(&dyn AgentBackend) -> String,
+) -> Option<LaunchPlan> {
+    let finish = |backend: &dyn AgentBackend, mut plan: LaunchPlan, prompt: Option<&str>| {
+        plan = with_permission(plan, &flags(backend));
+        if let Some(p) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
+            plan.command = format!("{} {}", plan.command, backend.prompt_arg(p));
+        }
+        plan
+    };
     match request {
         LaunchRequest::Agent { agent_id, model, effort, prompt } => {
             let backend = list.iter().find(|b| b.id() == agent_id)?;
@@ -128,16 +141,17 @@ pub fn resolve_in(
                 effort,
                 session_id: mint_for(&**backend),
                 provider: None,
-                prompt,
+                prompt: None,
             };
-            Some(LaunchPlan {
+            let plan = LaunchPlan {
                 command: backend.launch(&spec),
                 env_provider: None,
                 env_model: None,
                 session_id: spec.session_id.clone(),
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
-            })
+            };
+            Some(finish(&**backend, plan, prompt.as_deref()))
         }
 
         LaunchRequest::ApiModel { provider_id, model_id, prompt } => {
@@ -155,9 +169,9 @@ pub fn resolve_in(
                 effort: None,
                 session_id: mint_for(&**backend),
                 provider: Some(provider_id.clone()),
-                prompt,
+                prompt: None,
             };
-            Some(LaunchPlan {
+            let plan = LaunchPlan {
                 command: backend.launch(&spec),
                 // The security property the provider design rests on: a key
                 // reaches a tab's environment only for an engine that has said
@@ -170,13 +184,16 @@ pub fn resolve_in(
                 session_id: spec.session_id.clone(),
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
-            })
+            };
+            Some(finish(&**backend, plan, prompt.as_deref()))
         }
 
         // Restart is a resume: the tab ended, and continuing the conversation
         // is what "start it again" means for every engine here today.
         LaunchRequest::Resume { session_id } | LaunchRequest::Restart { session_id } => {
-            reopen(list, providers, &session_id, |b, id| b.resume(id))
+            let plan = reopen(list, providers, &session_id, |b, id| b.resume(id))?;
+            let backend = list.iter().find(|b| b.id() == plan.agent_id)?;
+            Some(finish(&**backend, plan, None))
         }
 
         // Clear is not a reopen, and the difference is the whole feature: the
@@ -188,14 +205,15 @@ pub fn resolve_in(
         LaunchRequest::Clear { session_id } => {
             let backend = owner(list, &session_id)?;
             let fresh = mint_for(backend)?;
-            Some(LaunchPlan {
+            let plan = LaunchPlan {
                 command: backend.clear(&fresh)?,
                 env_provider: None,
                 env_model: None,
                 session_id: Some(fresh),
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
-            })
+            };
+            Some(finish(backend, plan, None))
         }
     }
 }
@@ -302,8 +320,7 @@ pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String
         // The registry is built once and used for both the answer and, when
         // there is none, the explanation — otherwise the two could disagree
         // about which engines exist.
-        resolve_in(&list, &providers, request.clone())
-            .map(|plan| stamp(&list, plan))
+        resolve_with(&list, &providers, request.clone(), stored_flags)
             .ok_or_else(|| explain(&list, &request))
     })
     .await
@@ -312,6 +329,34 @@ pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line is engine flags, then permission flags, then the prompt —
+    /// and a resume or clear gets the flags too.
+    #[test]
+    fn permission_flags_come_before_the_prompt_on_every_path() {
+        let list = vec![claude_like(vec![])];
+        let flags = |_: &dyn AgentBackend| "--permission-mode auto".to_string();
+        let plan = resolve_with(&list, &[], LaunchRequest::Agent {
+            agent_id: "claude".into(), model: Some("haiku".into()), effort: None, prompt: Some("  write it  ".into()),
+        }, flags).unwrap();
+        assert!(plan.command.ends_with("--permission-mode auto 'write it'"), "{}", plan.command);
+        assert!(plan.command.contains("--model haiku"), "{}", plan.command);
+        let none = resolve_with(&list, &[], LaunchRequest::Agent {
+            agent_id: "claude".into(), model: None, effort: None, prompt: Some("   ".into()),
+        }, flags).unwrap();
+        assert!(none.command.ends_with("--permission-mode auto"), "{}", none.command);
+    }
+
+    /// Print the command a claude/haiku launch with a prompt resolves to on
+    /// this machine — stored mode and all. `cargo test --lib what_would_launch -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn what_would_launch() {
+        let plan = resolve(LaunchRequest::Agent {
+            agent_id: "claude".into(), model: Some("haiku".into()), effort: None, prompt: Some("hello there".into()),
+        }).expect("a plan");
+        println!("COMMAND: {}", plan.command);
+    }
     use crate::agents::{Detection, ModelOption};
     use crate::sessions::{Session, SessionProvider};
 

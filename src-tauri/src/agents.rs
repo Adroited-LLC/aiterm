@@ -229,6 +229,15 @@ pub trait AgentBackend: Send + Sync {
     /// adding one means editing the renderer.
     fn launch(&self, spec: &LaunchSpec) -> String;
 
+    /// The first message as this engine takes it on the command line — a
+    /// positional for most, `--prompt` for some. Kept apart from `launch`
+    /// because it must come *last*: claude stops reading options at its
+    /// positional prompt, so a permission flag after it is part of nothing.
+    /// The resolver appends this after every other flag.
+    fn prompt_arg(&self, prompt: &str) -> String {
+        q(prompt)
+    }
+
     /// Whether the new-session menu offers this agent as a source of its own.
     /// An engine that is reached some other way — OpenCode runs whatever the
     /// Model-access dropdown picks — says no, so the menu doesn't grow a
@@ -510,9 +519,6 @@ impl AgentBackend for ClaudeBackend {
         }
         if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --session-id {}", q(id)));
-        }
-        if let Some(p) = prompt_of(spec) {
-            cmd.push_str(&format!(" {}", q(p)));
         }
         cmd
     }
@@ -1096,9 +1102,6 @@ impl AgentBackend for CodexBackend {
             cmd.push_str(&format!(" -c model_reasoning_effort={}", q(e)));
         }
         // spec.session_id is deliberately dropped — see mints_session_id.
-        if let Some(p) = prompt_of(spec) {
-            cmd.push_str(&format!(" {}", q(p)));
-        }
         cmd
     }
 }
@@ -1177,10 +1180,11 @@ impl AgentBackend for OpenCodeBackend {
             cmd.push_str(&format!(" --model {}", q(m)));
         }
         // No effort concept, and no pre-minted id — see mints_session_id.
-        if let Some(p) = prompt_of(spec) {
-            cmd.push_str(&format!(" --prompt {}", q(p)));
-        }
         cmd
+    }
+
+    fn prompt_arg(&self, prompt: &str) -> String {
+        format!("--prompt {}", q(prompt))
     }
 
     /// Not a tab of its own: picking a Model-access model is how an OpenCode
@@ -1301,6 +1305,10 @@ impl AgentBackend for ChatBackend {
 
     /// The key is deliberately absent: this process reads the provider store
     /// itself, so nothing secret needs to cross the PTY environment.
+    fn prompt_arg(&self, prompt: &str) -> String {
+        format!("--prompt {}", q(prompt))
+    }
+
     fn launch(&self, spec: &LaunchSpec) -> String {
         let mut cmd = format!("{} chat", chat_exe());
         if let Some(p) = spec.provider.as_deref().filter(|s| !s.is_empty()) {
@@ -1311,9 +1319,6 @@ impl AgentBackend for ChatBackend {
         }
         if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --session-id {}", q(id)));
-        }
-        if let Some(p) = prompt_of(spec) {
-            cmd.push_str(&format!(" --prompt {}", q(p)));
         }
         cmd
     }
@@ -2352,26 +2357,17 @@ mod tests {
         assert!(!cmd.contains("abc-123"), "session id leaked into a codex launch: {cmd}");
     }
 
-    /// The home screen's first message rides on the command, in each engine's
-    /// spelling, shell-quoted, and after everything else — a blank one adds
-    /// nothing at all.
+    /// The first message is spelled per engine — positional, or `--prompt` —
+    /// and never by `launch` itself, which is why it can go last.
     #[test]
-    fn a_first_prompt_is_the_last_thing_on_the_line() {
-        let spec = LaunchSpec {
-            model: Some("opus".into()),
-            prompt: Some("fix the thing, it's broken".into()),
-            ..Default::default()
-        };
-        let claude = ClaudeBackend.launch(&spec);
-        assert!(claude.ends_with(" 'fix the thing, it'\\''s broken'"), "{claude}");
-        assert_eq!(CodexBackend.launch(&spec), "codex --model 'opus' 'fix the thing, it'\\''s broken'");
-        assert_eq!(
-            OpenCodeBackend.launch(&spec),
-            "opencode --model 'opus' --prompt 'fix the thing, it'\\''s broken'"
-        );
-        assert!(ChatBackend.launch(&spec).ends_with("--prompt 'fix the thing, it'\\''s broken'"));
-        let blank = LaunchSpec { prompt: Some("   ".into()), ..Default::default() };
-        assert_eq!(CodexBackend.launch(&blank), "codex");
+    fn the_prompt_argument_is_spelled_per_engine_and_launch_leaves_it_out() {
+        let spec = LaunchSpec { model: Some("opus".into()), prompt: Some("fix the thing, it's broken".into()), ..Default::default() };
+        assert!(!ClaudeBackend.launch(&spec).contains("fix the"));
+        assert!(!CodexBackend.launch(&spec).contains("fix the"));
+        assert_eq!(ClaudeBackend.prompt_arg("it's broken"), "'it'\\''s broken'");
+        assert_eq!(CodexBackend.prompt_arg("go"), "'go'");
+        assert_eq!(OpenCodeBackend.prompt_arg("go"), "--prompt 'go'");
+        assert_eq!(ChatBackend.prompt_arg("go"), "--prompt 'go'");
     }
 
     #[test]

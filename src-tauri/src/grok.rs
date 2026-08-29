@@ -585,9 +585,6 @@ impl AgentBackend for GrokBackend {
         if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --session-id {}", q(id)));
         }
-        if let Some(p) = crate::agents::prompt_of(spec) {
-            cmd.push_str(&format!(" {}", q(p)));
-        }
         cmd
     }
 }
