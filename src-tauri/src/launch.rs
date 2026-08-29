@@ -81,12 +81,21 @@ pub struct LaunchPlan {
 pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
     let list = crate::agents::backends();
     let plan = resolve_in(&list, &crate::providers::load_providers(), request)?;
+    Some(stamp(&list, plan))
+}
+
+/// The stored permission mode for the engine that answered, onto the plan.
+/// Every path that hands a plan to a tab goes through here — `resolve` and
+/// the `resolve_launch` command alike. The command used to call `resolve_in`
+/// directly and so launched every session in the engine's own default,
+/// whatever Settings said.
+fn stamp(list: &[Box<dyn AgentBackend>], plan: LaunchPlan) -> LaunchPlan {
     let flags = list
         .iter()
         .find(|b| b.id() == plan.agent_id)
         .map(|b| crate::permissions::flags_for(&**b))
         .unwrap_or_default();
-    Some(with_permission(plan, &flags))
+    with_permission(plan, &flags)
 }
 
 /// Append an engine's permission flags to a resolved command. The single point
@@ -294,6 +303,7 @@ pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String
         // there is none, the explanation — otherwise the two could disagree
         // about which engines exist.
         resolve_in(&list, &providers, request.clone())
+            .map(|plan| stamp(&list, plan))
             .ok_or_else(|| explain(&list, &request))
     })
     .await
