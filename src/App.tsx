@@ -716,14 +716,28 @@ export default function App() {
 
   // Switching terminal, or picking a different session to preview, puts that
   // terminal or preview on screen — a file tab left selected would cover it.
-  useEffect(() => setActiveFileTab(null), [activeTab, previewSession?.id]);
+  // A preview replaces whatever file was up.
+  useEffect(() => { if (previewSession) setActiveFileTab(null); }, [previewSession?.id]);
+  /** Which file each session had on screen, so switching away and back finds
+   *  it where it was left — the file row is part of the session, not a
+   *  shared strip. Keyed by terminal key; `null` is the home view's own set. */
+  const fileFor = useRef(new Map<number | null, number | null>());
+  const prevActiveTab = useRef(activeTab);
+  useEffect(() => {
+    if (prevActiveTab.current !== activeTab) {
+      prevActiveTab.current = activeTab;
+      const k = fileFor.current.get(activeTab) ?? null;
+      setActiveFileTab(k !== null && fileTabs.some((f) => f.key === k) ? k : null);
+    } else {
+      fileFor.current.set(activeTab, activeFileTab);
+    }
+  }, [activeTab, activeFileTab]);
 
-  /** Whether a file tab belongs on the strip right now. A file opened with no
-   *  terminal (from a preview, or the empty start view) has no terminal to
-   *  belong to, so it belongs to all of them: it stays reachable after a
-   *  session starts instead of vanishing until every tab is closed. */
+  /** Whether a file tab belongs to the session in front. Files open in the
+   *  session they were opened from and nowhere else; ones opened from the
+   *  home view belong to it, and the home tab is how they are reached. */
   const showsFile = useCallback(
-    (f: FileTab) => f.termKey === null || f.termKey === activeTab,
+    (f: FileTab) => f.termKey === activeTab,
     [activeTab],
   );
   /** A file tab is the thing on screen in the center right now. */
@@ -733,9 +747,7 @@ export default function App() {
   const openFileTab = useCallback((path: string) => {
     const term = activeTabRef.current;
     setFileTabs((list) => {
-      const existing = list.find(
-        (f) => f.path === path && (f.termKey === term || f.termKey === null),
-      );
+      const existing = list.find((f) => f.path === path && f.termKey === term);
       if (existing) {
         setActiveFileTab(existing.key);
         return list;
@@ -2181,8 +2193,7 @@ export default function App() {
                   never a dead end. */}
               {previewSession ? (
                 <button
-                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")
-                    + agentTint(previewSession.agent).className}
+                  className={"center-tab locked on" + agentTint(previewSession.agent).className}
                   style={agentTint(previewSession.agent).style}
                   title={previewSession.project_path}
                   onClick={() => setActiveFileTab(null)}
@@ -2192,7 +2203,7 @@ export default function App() {
                 </button>
               ) : (
                 <button
-                  className={"center-tab home-tab" + (activeTab === null && activeFileTab === null ? " on" : "")}
+                  className={"center-tab home-tab" + (activeTab === null ? " on" : "")}
                   title="Home — start a session"
                   onClick={goHome}
                 >
@@ -2203,7 +2214,7 @@ export default function App() {
                   it, middle-click or × to close (which ends its process; the
                   conversation stays on disk and in the sidebar). */}
               {tabs.map((t) => {
-                const on = t.key === activeTab && activeFileTab === null && !previewSession;
+                const on = t.key === activeTab && !previewSession;
                 const tint = agentTint(t.agentId);
                 return (
                   <button
@@ -2239,10 +2250,32 @@ export default function App() {
                   </button>
                 );
               })}
+            </div>
+          )}
+          {/* The session's own files, in a row of their own under the strip:
+              what this session opened travels with it, and the leftmost tab
+              is the way back to its terminal. */}
+          {fileTabs.some(showsFile) && (
+            <div className="center-tabs file-row">
+              <button
+                className={"center-tab sub back" + (activeFileTab === null ? " on" : "")}
+                title={activeTabObj ? "Back to the terminal" : "Back to the start view"}
+                onClick={() => {
+                  setActiveFileTab(null);
+                  if (activeTab !== null) handles.current.get(activeTab)?.focus();
+                }}
+              >
+                {activeTabObj
+                  ? (activeTabObj.agentId
+                      ? <AgentIcon agent={activeTabObj.agentId} size={12} />
+                      : <span className="center-tab-shell">❯</span>)
+                  : <Icon of={Home} size="sm" />}
+                <span className="center-tab-name">{activeTabObj ? "Terminal" : "Home"}</span>
+              </button>
               {fileTabs.filter(showsFile).map((f) => (
                 <button
                   key={f.key}
-                  className={"center-tab" + (activeFileTab === f.key ? " on" : "")}
+                  className={"center-tab sub" + (activeFileTab === f.key ? " on" : "")}
                   title={f.path}
                   onClick={() => setActiveFileTab(f.key)}
                 >

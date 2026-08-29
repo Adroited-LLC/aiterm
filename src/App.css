@@ -3391,6 +3391,13 @@ input[type="range"]::-webkit-slider-thumb {
 .center-tab.session.ended { color: var(--text-faint); font-style: italic; }
 .center-tab.session.drop { border-left: 2px solid var(--accent); }
 .center-tab.session[draggable] { user-select: none; }
+/* The file row: one step smaller and one step deeper than the session strip,
+   so it reads as belonging to the tab above it. */
+.center-tabs.file-row { padding: 3px 6px 0 14px; background: var(--bg); border-bottom: 1px solid var(--border); }
+.center-tab.sub { font-size: 11.5px; padding: 3px 9px 4px; border-radius: 6px 6px 0 0; }
+.center-tab.sub.on { background: var(--bg-panel); }
+.center-tab.sub.back { color: var(--text-dim); }
+.center-tab.sub.back.on { color: var(--text); }
 .center-tab-name { overflow: hidden; text-overflow: ellipsis; }
 .center-tab-shell { font-size: 11px; color: var(--accent); }
 .center-tab-dot {
