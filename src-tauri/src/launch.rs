@@ -301,12 +301,8 @@ pub async fn resolve_launch(
     services: tauri::State<'_, crate::services::ApplicationServices>,
     request: LaunchRequest,
 ) -> Result<LaunchPlan, String> {
-    let agents = services.agents.clone();
-    crate::run_blocking(move || {
-        agents.resolve(request)
-            .map_err(|error| error.message().to_owned())
-    })
-    .await
+    let services = services.inner().clone();
+    crate::run_blocking(move || resolve_launch_from(&services, request)).await
 }
 
 #[doc(hidden)]

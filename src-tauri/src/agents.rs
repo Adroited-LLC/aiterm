@@ -2325,7 +2325,7 @@ mod tests {
     /// settings panel exists to say "not installed".
     #[test]
     fn detection_covers_every_registered_backend() {
-        let found = detect_agents();
+        let found = detect_agents_from(&crate::services::ApplicationServices::desktop());
         assert_eq!(found.len(), backends().len(), "a backend went unreported");
         assert!(found.iter().any(|d| d.id == "claude"));
         assert!(found.iter().any(|d| d.id == "codex"));
@@ -2353,7 +2353,9 @@ mod tests {
     /// its door, so agent_choices must never offer it as a source.
     #[test]
     fn opencode_is_never_offered_as_a_source() {
-        assert!(agent_choices().iter().all(|c| c.id != "opencode"));
+        assert!(agent_choices_from(&crate::services::ApplicationServices::desktop())
+            .iter()
+            .all(|c| c.id != "opencode"));
     }
 
     /// OpenCode launches bare or with a model slug; a minted session id must
@@ -2557,7 +2559,9 @@ mod tests {
         assert!(d.available);
         assert_eq!(d.id, "api");
         assert!(!ChatBackend.offered());
-        assert!(agent_choices().iter().all(|c| c.id != "api"));
+        assert!(agent_choices_from(&crate::services::ApplicationServices::desktop())
+            .iter()
+            .all(|c| c.id != "api"));
     }
 
     /// Chats reach the sidebar through the registry now. They used to be
@@ -2660,7 +2664,7 @@ mod tests {
     /// exactly the half-added state the registry exists to prevent.
     #[test]
     fn every_backend_publishes_its_capabilities_to_the_ui() {
-        let map = agent_caps();
+        let map = agent_caps_from(&crate::services::ApplicationServices::desktop());
         for b in backends() {
             assert_eq!(
                 map.get(b.id()),
@@ -2806,7 +2810,7 @@ mod tests {
 
     #[test]
     fn agent_choices_only_offers_agents_that_are_here() {
-        for c in agent_choices() {
+        for c in agent_choices_from(&crate::services::ApplicationServices::desktop()) {
             let backend = backends().into_iter().find(|b| b.id() == c.id).unwrap();
             assert!(backend.detect().available, "{} offered but not installed", c.id);
         }
