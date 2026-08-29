@@ -4,7 +4,9 @@ use aiterm_lib::remote::model::TerminalSize;
 use aiterm_lib::remote::server::{
     RemoteGateway, RemoteServices, TlsIdentity, MAX_SCROLLBACK_PAGE_ROWS, MAX_TERMINAL_INPUT_BYTES,
 };
-use aiterm_lib::tabs::{AttachmentKind, PtyBackend, TabLaunch, TabRegistry};
+use aiterm_lib::tabs::{
+    AttachmentId, AttachmentKind, PtyBackend, TabLaunch, TabRegistry, TabUpdate,
+};
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand_core::OsRng;
@@ -168,6 +170,7 @@ struct AttachedReply {
 
 #[derive(Deserialize)]
 struct SnapshotChunkReply {
+    transfer_id: String,
     tab_id: String,
     attachment_id: Option<String>,
     kind: String,
@@ -216,6 +219,11 @@ struct FocusChangedReply {
     focus: String,
 }
 
+#[derive(Deserialize)]
+struct TitleChangedReply {
+    title: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OpenRequest {
@@ -239,6 +247,9 @@ struct ResumeReply {
     requested_revision: u64,
     current_revision: u64,
     recovery_required: bool,
+    title: String,
+    focus: String,
+    size: TerminalSize,
 }
 
 fn private_test_dir(name: &str) -> PathBuf {
@@ -654,6 +665,14 @@ async fn terminal_resume_is_authorized_and_returns_correlated_snapshot_recovery(
     let attached = response(&mut socket).await;
     let attached: AttachedReply = decode(&attached.payload);
     let _initial_snapshot = response(&mut socket).await;
+    let remote_attachment: AttachmentId = decode(&encode(&attached.attachment_id));
+    let recovery_size = TerminalSize::try_new(31, 4).unwrap();
+    registry
+        .update(&tab, TabUpdate::new().title("authoritative recovery title"))
+        .unwrap();
+    registry
+        .take_focus(&tab, &remote_attachment, recovery_size)
+        .unwrap();
 
     socket
         .send(request(
@@ -667,7 +686,17 @@ async fn terminal_resume_is_authorized_and_returns_correlated_snapshot_recovery(
         ))
         .await
         .unwrap();
-    let resumed = response(&mut socket).await;
+    let resumed = loop {
+        let event = response(&mut socket).await;
+        if event.request_id == 2 {
+            break event;
+        }
+        assert_eq!(event.request_id, 0);
+        assert!(matches!(
+            event.kind.as_str(),
+            "terminal.title" | "terminal.focus_changed"
+        ));
+    };
     assert_eq!(resumed.request_id, 2);
     assert_eq!(resumed.kind, "terminal.resume");
     let resumed: ResumeReply = decode(&resumed.payload);
@@ -676,9 +705,54 @@ async fn terminal_resume_is_authorized_and_returns_correlated_snapshot_recovery(
     assert_eq!(resumed.requested_revision, u64::MAX);
     assert!(resumed.recovery_required);
     assert_ne!(resumed.current_revision, u64::MAX);
+    assert_eq!(resumed.title, "authoritative recovery title");
+    assert_eq!(resumed.focus, "self");
+    assert_eq!(resumed.size, recovery_size);
     let recovery = response(&mut socket).await;
     assert_eq!(recovery.request_id, 2);
     assert_eq!(recovery.kind, "terminal.snapshot");
+    let recovery_chunk: SnapshotChunkReply = decode(&recovery.payload);
+    for expected in recovery_chunk.index + 1..recovery_chunk.total {
+        let next = response(&mut socket).await;
+        assert_eq!(next.request_id, 2);
+        assert_eq!(next.kind, "terminal.snapshot");
+        assert_eq!(decode::<SnapshotChunkReply>(&next.payload).index, expected);
+    }
+
+    registry
+        .update(&tab, TabUpdate::new().title("post recovery title"))
+        .unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    registry
+        .take_focus(&tab, &desktop.id, TerminalSize::try_new(42, 5).unwrap())
+        .unwrap();
+    let mut saw_title = false;
+    let mut saw_focus = false;
+    while !saw_title || !saw_focus {
+        let event = tokio::time::timeout(Duration::from_secs(1), response(&mut socket))
+            .await
+            .expect("post-boundary controls must follow recovery");
+        match event.kind.as_str() {
+            "terminal.title" => {
+                assert_eq!(
+                    decode::<TitleChangedReply>(&event.payload).title,
+                    "post recovery title"
+                );
+                saw_title = true;
+            }
+            "terminal.focus_changed" => {
+                assert_eq!(decode::<FocusChangedReply>(&event.payload).focus, "other");
+                saw_focus = true;
+            }
+            "terminal.snapshot" => {
+                assert_eq!(event.request_id, 0);
+            }
+            other => panic!(
+                "unexpected event after recovery: {other}, request_id={}",
+                event.request_id
+            ),
+        }
+    }
 
     let mut other = connect(&gateway).await;
     authenticate(&mut other, &key, &device_id).await;
@@ -1013,7 +1087,11 @@ async fn detach_ack_is_the_last_event_for_an_attachment_with_pending_damage() {
             break;
         }
     }
-    assert_eq!(registry.attachment_count(&tab).unwrap(), 0);
+    let detached_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while registry.attachment_count(&tab).unwrap() != 0 {
+        assert!(tokio::time::Instant::now() < detached_deadline);
+        tokio::task::yield_now().await;
+    }
     pty.emit(pty.last_id(), b"later");
     assert!(
         tokio::time::timeout(Duration::from_millis(40), socket.next())
@@ -1252,6 +1330,109 @@ async fn dense_snapshot_streams_multiple_sub_mebibyte_socket_frames_and_slow_rea
     .await
     .expect("slow reader must not block canonical PTY ingestion")
     .unwrap();
+
+    socket.close(None).await.ok();
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn connection_egress_keeps_competing_transfers_contiguous_and_controls_prompt() {
+    let root = private_test_dir("egress-arbiter");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Arbiter",
+            "egress-arbiter",
+            TerminalSize::try_new(512, 48).unwrap(),
+        ))
+        .unwrap();
+    let cell = format!("x{}", "\u{301}".repeat(32));
+    let row = cell.repeat(512);
+    let output = (0..48)
+        .map(|_| row.as_str())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    pty.emit(pty.last_id(), output.as_bytes());
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(request(
+            2,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+
+    let mut attached = 0;
+    let mut current_transfer = None::<String>;
+    let mut transfer_order = Vec::<String>::new();
+    let mut completed = HashMap::<String, u32>::new();
+    let mut title_requested = false;
+    let mut title_prompt = false;
+    while attached < 2 || completed.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), response(&mut socket))
+            .await
+            .expect("egress must continue making progress");
+        match event.kind.as_str() {
+            "terminal.attach" => attached += 1,
+            "terminal.snapshot" => {
+                let chunk: SnapshotChunkReply = decode(&event.payload);
+                if current_transfer.as_ref() != Some(&chunk.transfer_id) {
+                    assert!(
+                        !transfer_order.contains(&chunk.transfer_id),
+                        "transfer chunks interleaved"
+                    );
+                    transfer_order.push(chunk.transfer_id.clone());
+                    current_transfer = Some(chunk.transfer_id.clone());
+                }
+                assert_eq!(
+                    completed.get(&chunk.transfer_id).copied().unwrap_or(0),
+                    chunk.index
+                );
+                completed.insert(chunk.transfer_id.clone(), chunk.index + 1);
+                if !title_requested && chunk.index == 0 && chunk.total > 1 {
+                    registry
+                        .update(&tab, TabUpdate::new().title("prompt between chunks"))
+                        .unwrap();
+                    title_requested = true;
+                }
+                if chunk.index + 1 == chunk.total {
+                    current_transfer = None;
+                }
+            }
+            "terminal.title" => {
+                if title_requested && current_transfer.is_some() {
+                    title_prompt = true;
+                }
+            }
+            other => panic!("unexpected egress event {other}"),
+        }
+    }
+    assert!(title_requested && title_prompt);
+    assert_eq!(transfer_order.len(), 2);
 
     socket.close(None).await.ok();
     registry.close(&tab).ok();

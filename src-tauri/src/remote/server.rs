@@ -3,8 +3,9 @@ use super::model::{
     decode_exact, encode_terminal_frame, RemoteEvent, RemoteRequest, TerminalSize, PROTOCOL_VERSION,
 };
 use super::terminal::{
-    plan_diff_for_attachment, plan_scrollback_for_attachment, plan_snapshot_for_attachment,
-    RemoteTerminal, RemoteTerminalEvents, TerminalEvent, TransferChunk, TransferPlan,
+    plan_diff_for_attachment, plan_scrollback_for_attachment, plan_shared_snapshot_for_attachment,
+    plan_snapshot_for_attachment, RemoteTerminal, RemoteTerminalEvents, TerminalEvent,
+    TransferChunk, TransferPlan,
 };
 use crate::tabs::{
     AttachmentId, RecoveryBoundary, TabAttachmentCancellation, TabDescriptor, TabId, TabLaunch,
@@ -23,7 +24,7 @@ use rcgen::PublicKeyData;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -35,7 +36,6 @@ const KEY_FILE: &str = "gateway-key.der";
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUESTS_PER_SECOND: f64 = 120.0;
-const OUTBOUND_EVENT_QUEUE: usize = 64;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_ATTACHMENTS_PER_CONNECTION: usize = 8;
 pub const MAX_SCROLLBACK_PAGE_ROWS: usize = 256;
@@ -46,6 +46,9 @@ const MAX_COMMAND_BYTES: usize = 32 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
 const ATTACHMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ATTACHMENT_REAP_INTERVAL: Duration = Duration::from_millis(100);
+const EGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const EGRESS_CONTROL_QUEUE: usize = 64;
+const EGRESS_TRANSFER_QUEUE: usize = 1;
 
 #[derive(Clone)]
 pub struct TlsIdentity {
@@ -433,6 +436,33 @@ struct StartedAttachment {
     revision: Revision,
 }
 
+#[derive(Clone)]
+struct EgressHandle {
+    controls: tokio::sync::mpsc::Sender<EgressControl>,
+    transfers: tokio::sync::mpsc::Sender<TaggedTransfer>,
+}
+
+struct TaggedTransfer {
+    attachment_id: Option<AttachmentId>,
+    plan: TransferPlan,
+}
+
+enum EgressControl {
+    Message(Message),
+    Resume {
+        attachment_id: AttachmentId,
+        reply: Vec<u8>,
+        transfer: TransferPlan,
+        done: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+    Detach {
+        attachment_id: AttachmentId,
+        reply: Vec<u8>,
+        done: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+    Close,
+}
+
 enum AttachmentCommand {
     Resume {
         request_id: u64,
@@ -597,6 +627,9 @@ struct ResumeReplyPayload<'a> {
     requested_revision: Revision,
     current_revision: Revision,
     recovery_required: bool,
+    title: &'a str,
+    focus: RemoteFocusState,
+    size: TerminalSize,
 }
 
 #[derive(Serialize)]
@@ -988,50 +1021,32 @@ fn authorize_attachment(
     }
 }
 
-async fn enqueue_event(
-    outbound: &tokio::sync::mpsc::Sender<Message>,
-    event: RemoteEvent,
-) -> Result<(), ()> {
+async fn enqueue_event(outbound: &EgressHandle, event: RemoteEvent) -> Result<(), ()> {
     let bytes = tokio::task::spawn_blocking(move || encode_terminal_frame(&event))
         .await
         .map_err(|_| ())?
         .map_err(|_| ())?;
     outbound
-        .send(Message::Binary(bytes.into()))
+        .controls
+        .send(EgressControl::Message(Message::Binary(bytes.into())))
         .await
         .map_err(|_| ())
 }
 
-async fn enqueue_transfer(
-    outbound: &tokio::sync::mpsc::Sender<Message>,
-    mut transfer: TransferPlan,
-) -> Result<(), ()> {
-    loop {
-        let (returned, encoded) = tokio::task::spawn_blocking(move || {
-            let encoded = match transfer.next_chunk() {
-                Ok(Some(chunk)) => encode_terminal_frame(&chunk_event(chunk))
-                    .map(Some)
-                    .map_err(|_| ()),
-                Ok(None) => Ok(None),
-                Err(_) => Err(()),
-            };
-            (transfer, encoded)
+async fn enqueue_transfer(outbound: &EgressHandle, transfer: TransferPlan) -> Result<(), ()> {
+    let attachment_id = transfer.attachment_id().cloned();
+    outbound
+        .transfers
+        .send(TaggedTransfer {
+            attachment_id,
+            plan: transfer,
         })
         .await
-        .map_err(|_| ())?;
-        transfer = returned;
-        let Some(bytes) = encoded? else {
-            return Ok(());
-        };
-        outbound
-            .send(Message::Binary(bytes.into()))
-            .await
-            .map_err(|_| ())?;
-    }
+        .map_err(|_| ())
 }
 
 async fn enqueue_outcome(
-    outbound: &tokio::sync::mpsc::Sender<Message>,
+    outbound: &EgressHandle,
     frames: Vec<RemoteEvent>,
     transfers: Vec<TransferPlan>,
 ) -> Result<(), ()> {
@@ -1042,6 +1057,172 @@ async fn enqueue_outcome(
         enqueue_transfer(outbound, transfer).await?;
     }
     Ok(())
+}
+
+async fn encode_event(event: RemoteEvent) -> Result<Vec<u8>, ()> {
+    tokio::task::spawn_blocking(move || encode_terminal_frame(&event))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+async fn send_egress(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: Message,
+) -> Result<(), ()> {
+    tokio::time::timeout(EGRESS_SEND_TIMEOUT, sink.send(message))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())
+}
+
+async fn egress_arbiter(
+    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut controls: tokio::sync::mpsc::Receiver<EgressControl>,
+    mut transfers: tokio::sync::mpsc::Receiver<TaggedTransfer>,
+    failed: tokio::sync::watch::Sender<bool>,
+) {
+    let mut active: Option<TaggedTransfer> = None;
+    let mut queued = VecDeque::<TaggedTransfer>::new();
+    let mut detached = HashSet::<AttachmentId>::new();
+    let mut pending_control = None;
+    let result = async {
+        loop {
+            while let Some(command) = pending_control.take().or_else(|| controls.try_recv().ok()) {
+                match command {
+                    EgressControl::Message(message) => send_egress(&mut sink, message).await?,
+                    EgressControl::Resume {
+                        attachment_id,
+                        reply,
+                        transfer,
+                        done,
+                    } => {
+                        while let Ok(pending) = transfers.try_recv() {
+                            if pending.attachment_id.as_ref() != Some(&attachment_id) {
+                                queued.push_back(pending);
+                            }
+                        }
+                        if active
+                            .as_ref()
+                            .and_then(|current| current.attachment_id.as_ref())
+                            == Some(&attachment_id)
+                        {
+                            active = None;
+                        }
+                        queued.retain(|current| {
+                            current.attachment_id.as_ref() != Some(&attachment_id)
+                        });
+                        detached.remove(&attachment_id);
+                        let sent = send_egress(&mut sink, Message::Binary(reply.into())).await;
+                        let send_failed = sent.is_err();
+                        if sent.is_ok() {
+                            let replacement = TaggedTransfer {
+                                attachment_id: Some(attachment_id),
+                                plan: transfer,
+                            };
+                            if active.is_none() {
+                                active = Some(replacement);
+                            } else {
+                                queued.push_front(replacement);
+                            }
+                        }
+                        let _ = done.send(sent);
+                        if send_failed {
+                            return Err(());
+                        }
+                    }
+                    EgressControl::Detach {
+                        attachment_id,
+                        reply,
+                        done,
+                    } => {
+                        while let Ok(pending) = transfers.try_recv() {
+                            if pending.attachment_id.as_ref() != Some(&attachment_id) {
+                                queued.push_back(pending);
+                            }
+                        }
+                        if active
+                            .as_ref()
+                            .and_then(|current| current.attachment_id.as_ref())
+                            == Some(&attachment_id)
+                        {
+                            active = None;
+                        }
+                        queued.retain(|current| {
+                            current.attachment_id.as_ref() != Some(&attachment_id)
+                        });
+                        detached.insert(attachment_id);
+                        let sent = send_egress(&mut sink, Message::Binary(reply.into())).await;
+                        let send_failed = sent.is_err();
+                        let _ = done.send(sent);
+                        if send_failed {
+                            return Err(());
+                        }
+                    }
+                    EgressControl::Close => {
+                        let _ = send_egress(&mut sink, Message::Close(None)).await;
+                        return Ok::<(), ()>(());
+                    }
+                }
+            }
+            while let Ok(transfer) = transfers.try_recv() {
+                if transfer
+                    .attachment_id
+                    .as_ref()
+                    .is_some_and(|id| detached.contains(id))
+                {
+                    continue;
+                }
+                if active.is_none() {
+                    active = Some(transfer);
+                } else {
+                    queued.push_back(transfer);
+                }
+            }
+            if active.is_none() {
+                active = queued.pop_front();
+            }
+            if let Some(mut current) = active.take() {
+                let (returned, encoded) = tokio::task::spawn_blocking(move || {
+                    let encoded = match current.plan.next_chunk() {
+                        Ok(Some(chunk)) => encode_terminal_frame(&chunk_event(chunk))
+                            .map(Some)
+                            .map_err(|_| ()),
+                        Ok(None) => Ok(None),
+                        Err(_) => Err(()),
+                    };
+                    (current, encoded)
+                })
+                .await
+                .map_err(|_| ())?;
+                match encoded? {
+                    Some(bytes) => {
+                        send_egress(&mut sink, Message::Binary(bytes.into())).await?;
+                        active = Some(returned);
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            tokio::select! {
+                biased;
+                command = controls.recv() => match command {
+                    Some(command) => pending_control = Some(command),
+                    None if transfers.is_closed() => return Ok(()),
+                    None => {}
+                },
+                transfer = transfers.recv() => match transfer {
+                    Some(transfer) => active = Some(transfer),
+                    None if controls.is_closed() => return Ok(()),
+                    None => {}
+                },
+            }
+        }
+    }
+    .await;
+    if result.is_err() {
+        let _ = failed.send(true);
+    }
 }
 
 async fn encode_control_event(
@@ -1085,7 +1266,9 @@ async fn encode_control_event(
         .map(Some)
         .map_err(|_| ()),
         TerminalEvent::Bell => Ok(None),
-        TerminalEvent::Snapshot(_) | TerminalEvent::Diff(_) => Err(()),
+        TerminalEvent::Snapshot(_) | TerminalEvent::SharedSnapshot(_) | TerminalEvent::Diff(_) => {
+            Err(())
+        }
     })
     .await
     .map_err(|_| ())?
@@ -1114,7 +1297,7 @@ fn build_resume_emission(
                 "the authenticated recovery request could not be completed",
             )
         })?;
-    let (snapshot, boundary) = recovery.into_parts();
+    let (snapshot, boundary, title, owner, size) = recovery.into_parts();
     let revision = snapshot.revision();
     let frame = response(
         request_id,
@@ -1125,6 +1308,9 @@ fn build_resume_emission(
             requested_revision,
             current_revision: revision,
             recovery_required: requested_revision != revision,
+            title: &title,
+            focus: remote_focus(owner.as_ref(), Some(&attachment_id)),
+            size,
         },
     )
     .map_err(|code| {
@@ -1155,7 +1341,7 @@ fn build_resume_emission(
 async fn attachment_actor(
     mut attachment: StartedAttachment,
     mut commands: tokio::sync::mpsc::Receiver<AttachmentCommand>,
-    outbound: tokio::sync::mpsc::Sender<Message>,
+    outbound: EgressHandle,
     terminal: RemoteTerminal,
 ) {
     let mut live_revision = Some(attachment.revision);
@@ -1182,7 +1368,30 @@ async fn attachment_actor(
                         Ok(Ok(emission)) => {
                             attachment.events.apply_recovery_boundary(emission.boundary);
                             live_revision = Some(emission.revision);
-                            enqueue_outcome(&outbound, emission.frames, emission.transfers).await
+                            let mut frames = emission.frames;
+                            let mut transfers = emission.transfers;
+                            let encoded = match (frames.pop(), transfers.pop()) {
+                                (Some(frame), Some(transfer)) => encode_event(frame)
+                                    .await
+                                    .map(|reply| (reply, transfer)),
+                                _ => Err(()),
+                            };
+                            match encoded {
+                                Ok((reply, transfer)) => {
+                                    let (sent, completed) = tokio::sync::oneshot::channel();
+                                    if outbound.controls.send(EgressControl::Resume {
+                                        attachment_id: attachment.attachment_id.clone(),
+                                        reply,
+                                        transfer,
+                                        done: sent,
+                                    }).await.is_err() {
+                                        Err(())
+                                    } else {
+                                        completed.await.unwrap_or(Err(()))
+                                    }
+                                }
+                                Err(()) => Err(()),
+                            }
                         }
                         Ok(Err(error)) => enqueue_event(&outbound, error).await,
                         Err(_) => Err(()),
@@ -1192,13 +1401,34 @@ async fn attachment_actor(
                     if failed { return; }
                 }
                 Some(AttachmentCommand::Detach { frames, done }) => {
-                    attachment.events.cancel();
-                    let result = enqueue_outcome(&outbound, frames, Vec::new()).await;
+                    let cancellation = attachment.events.cancellation();
+                    cancellation.close_mailbox();
+                    let result = match frames.into_iter().next() {
+                        Some(frame) => match encode_event(frame).await {
+                            Ok(reply) => {
+                                let (sent, completed) = tokio::sync::oneshot::channel();
+                                if outbound.controls.send(EgressControl::Detach {
+                                    attachment_id: attachment.attachment_id.clone(),
+                                    reply,
+                                    done: sent,
+                                }).await.is_err() {
+                                    Err(())
+                                } else {
+                                    completed.await.unwrap_or(Err(()))
+                                }
+                            }
+                            Err(()) => Err(()),
+                        },
+                        None => Err(()),
+                    };
+                    detach_attachment_bounded(cancellation).await;
                     let _ = done.send(result);
                     return;
                 }
                 Some(AttachmentCommand::Shutdown) | None => {
-                    attachment.events.cancel();
+                    let cancellation = attachment.events.cancellation();
+                    cancellation.close_mailbox();
+                    detach_attachment_bounded(cancellation).await;
                     return;
                 }
             },
@@ -1211,6 +1441,22 @@ async fn attachment_actor(
                         let attachment_id = attachment.attachment_id.clone();
                         match tokio::task::spawn_blocking(move || {
                             plan_snapshot_for_attachment(0, &tab_id, Some(&attachment_id), snapshot)
+                        }).await {
+                            Ok(Ok(transfer)) => enqueue_transfer(&outbound, transfer).await,
+                            _ => enqueue_event(&outbound, recovery_error()).await,
+                        }
+                    }
+                    TerminalEvent::SharedSnapshot(snapshot) => {
+                        live_revision = Some(snapshot.revision());
+                        let tab_id = attachment.tab_id.clone();
+                        let attachment_id = attachment.attachment_id.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            plan_shared_snapshot_for_attachment(
+                                0,
+                                &tab_id,
+                                Some(&attachment_id),
+                                snapshot,
+                            )
                         }).await {
                             Ok(Ok(transfer)) => enqueue_transfer(&outbound, transfer).await,
                             _ => enqueue_event(&outbound, recovery_error()).await,
@@ -1258,17 +1504,20 @@ fn recovery_error() -> RemoteEvent {
 
 async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
     let mut guard = RequestGuard::new(Instant::now());
-    let (mut socket_sink, mut socket_stream) = socket.split();
-    let (outbound, mut outbound_messages) = tokio::sync::mpsc::channel(OUTBOUND_EVENT_QUEUE);
+    let (socket_sink, mut socket_stream) = socket.split();
+    let (controls, control_receiver) = tokio::sync::mpsc::channel(EGRESS_CONTROL_QUEUE);
+    let (transfers, transfer_receiver) = tokio::sync::mpsc::channel(EGRESS_TRANSFER_QUEUE);
+    let outbound = EgressHandle {
+        controls,
+        transfers,
+    };
     let (writer_failed, mut writer_failure) = tokio::sync::watch::channel(false);
-    let writer = tokio::spawn(async move {
-        while let Some(message) = outbound_messages.recv().await {
-            if socket_sink.send(message).await.is_err() {
-                let _ = writer_failed.send(true);
-                return;
-            }
-        }
-    });
+    let mut writer = tokio::spawn(egress_arbiter(
+        socket_sink,
+        control_receiver,
+        transfer_receiver,
+        writer_failed,
+    ));
     let mut attachments = HashMap::<AttachmentId, ConnectionAttachment>::new();
     let mut reap_tick = tokio::time::interval(ATTACHMENT_REAP_INTERVAL);
     reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1288,18 +1537,18 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
         match message {
             Ok(Message::Binary(bytes)) => {
                 if bytes.len() >= MAX_MESSAGE_SIZE {
-                    let _ = outbound.send(Message::Close(None)).await;
+                    let _ = outbound.controls.send(EgressControl::Close).await;
                     break;
                 }
                 let request = match RemoteRequest::decode(&bytes) {
                     Ok(request) => request,
                     Err(error) => {
                         let Some(request_id) = error.request_id() else {
-                            let _ = outbound.send(Message::Close(None)).await;
+                            let _ = outbound.controls.send(EgressControl::Close).await;
                             break;
                         };
                         if guard.admit(request_id, Instant::now()).is_err() {
-                            let _ = outbound.send(Message::Close(None)).await;
+                            let _ = outbound.controls.send(EgressControl::Close).await;
                             break;
                         }
                         if enqueue_event(
@@ -1315,7 +1564,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                     }
                 };
                 if guard.admit(request.request_id(), Instant::now()).is_err() {
-                    let _ = outbound.send(Message::Close(None)).await;
+                    let _ = outbound.controls.send(EgressControl::Close).await;
                     break;
                 }
                 if request.kind() == "terminal.attach"
@@ -1349,7 +1598,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                 {
                     Ok(outcome) => outcome,
                     Err(_) => {
-                        let _ = outbound.send(Message::Close(None)).await;
+                        let _ = outbound.controls.send(EgressControl::Close).await;
                         break;
                     }
                 };
@@ -1433,7 +1682,11 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
             }
             Ok(Message::Ping(bytes)) => {
                 if bytes.len() >= MAX_MESSAGE_SIZE
-                    || outbound.send(Message::Pong(bytes)).await.is_err()
+                    || outbound
+                        .controls
+                        .send(EgressControl::Message(Message::Pong(bytes)))
+                        .await
+                        .is_err()
                 {
                     break;
                 }
@@ -1441,7 +1694,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
             Ok(Message::Pong(_)) => {}
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {
-                let _ = outbound.send(Message::Close(None)).await;
+                let _ = outbound.controls.send(EgressControl::Close).await;
                 break;
             }
         }
@@ -1449,20 +1702,45 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
     for (_, attachment) in attachments {
         shutdown_attachment(attachment).await;
     }
-    let _ = outbound.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(
+        ATTACHMENT_SHUTDOWN_TIMEOUT,
+        outbound.controls.send(EgressControl::Close),
+    )
+    .await;
     drop(outbound);
-    let _ = writer.await;
+    if tokio::time::timeout(ATTACHMENT_SHUTDOWN_TIMEOUT, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
+    }
 }
 
 async fn shutdown_attachment(mut attachment: ConnectionAttachment) {
-    attachment.cancellation.cancel();
+    attachment.cancellation.close_mailbox();
     let _ = attachment.commands.try_send(AttachmentCommand::Shutdown);
+    detach_attachment_bounded(attachment.cancellation.clone()).await;
     if tokio::time::timeout(ATTACHMENT_SHUTDOWN_TIMEOUT, &mut attachment.task)
         .await
         .is_err()
     {
         attachment.task.abort();
         let _ = attachment.task.await;
+    }
+}
+
+async fn detach_attachment_bounded(cancellation: TabAttachmentCancellation) {
+    cancellation.close_mailbox();
+    let mut detach = tokio::task::spawn_blocking(move || cancellation.detach_registry());
+    if tokio::time::timeout(ATTACHMENT_SHUTDOWN_TIMEOUT, &mut detach)
+        .await
+        .is_err()
+    {
+        // spawn_blocking cannot be force-cancelled after it starts. Dropping
+        // the handle keeps connection teardown bounded; the idempotent detach
+        // completes once the ordered backend operation releases.
+        drop(detach);
     }
 }
 

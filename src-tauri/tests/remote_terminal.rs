@@ -1,9 +1,9 @@
 use aiterm_lib::pty::{PtySink, PtySpawnSpec};
 use aiterm_lib::remote::model::{RemoteEvent, TerminalSize, PROTOCOL_VERSION};
 use aiterm_lib::remote::terminal::{
-    chunk_diff, chunk_scrollback, chunk_snapshot, DiffCoalescer, RemoteTerminal, TerminalEvent,
-    TransferAssembler, TransferBudget, TransferKind, TransferPayload, TransferStatus,
-    MAX_WIRE_FRAME_BYTES,
+    chunk_diff, chunk_scrollback, chunk_snapshot, plan_snapshot_for_attachment, DiffCoalescer,
+    RemoteTerminal, TerminalEvent, TransferAssembler, TransferBudget, TransferKind,
+    TransferPayload, TransferStatus, MAX_WIRE_FRAME_BYTES,
 };
 use aiterm_lib::tabs::{PtyBackend, TabLaunch, TabRegistry, TabUpdate};
 use aiterm_lib::terminal::model::{
@@ -11,9 +11,9 @@ use aiterm_lib::terminal::model::{
     ScreenSnapshot, TerminalColor, TerminalModes,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -22,6 +22,10 @@ struct FakePty {
     sinks: Mutex<HashMap<u32, Arc<dyn PtySink>>>,
     writes: Mutex<Vec<Vec<u8>>>,
     resizes: Mutex<Vec<(u16, u16)>>,
+    block_write: AtomicBool,
+    write_entered: AtomicBool,
+    write_released: Mutex<bool>,
+    write_changed: Condvar,
 }
 
 impl FakePty {
@@ -40,6 +44,19 @@ impl FakePty {
     fn resizes(&self) -> Vec<(u16, u16)> {
         self.resizes.lock().unwrap().clone()
     }
+
+    fn exit(&self, id: u32, code: Option<u32>, signal: Option<&str>) {
+        self.sinks.lock().unwrap()[&id].exited(id, code, signal);
+    }
+
+    fn block_writes(&self) {
+        self.block_write.store(true, Ordering::SeqCst);
+    }
+
+    fn release_write(&self) {
+        *self.write_released.lock().unwrap() = true;
+        self.write_changed.notify_all();
+    }
 }
 
 impl PtyBackend for FakePty {
@@ -50,6 +67,13 @@ impl PtyBackend for FakePty {
     }
 
     fn write(&self, _id: u32, bytes: &[u8]) -> Result<(), String> {
+        if self.block_write.load(Ordering::SeqCst) {
+            self.write_entered.store(true, Ordering::SeqCst);
+            let mut released = self.write_released.lock().unwrap();
+            while !*released {
+                released = self.write_changed.wait(released).unwrap();
+            }
+        }
         self.writes.lock().unwrap().push(bytes.to_vec());
         Ok(())
     }
@@ -182,7 +206,11 @@ async fn cancelling_an_idle_remote_event_stream_wakes_it_and_detaches_promptly()
             .unwrap(),
         None
     );
-    assert_eq!(registry.attachment_count(&tab).unwrap(), 0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while registry.attachment_count(&tab).unwrap() != 0 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]
@@ -198,6 +226,46 @@ async fn explicit_cancellation_discards_pending_coalesced_damage() {
     cancellation.cancel();
 
     assert_eq!(pending.await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn natural_exit_publishes_final_snapshot_before_one_exit_and_nothing_after() {
+    let (registry, pty, tab) = setup(8, 2);
+    let remote = RemoteTerminal::new(registry);
+    let (_attached, mut events) = remote.attach(&tab).unwrap();
+    pty.emit(pty.last_id(), b"final");
+    let pty_id = pty.last_id();
+    let exiting = pty.clone();
+    let collected = tokio::spawn(async move {
+        let mut collected = Vec::new();
+        while let Some(event) = events.next().await {
+            collected.push(event);
+        }
+        collected
+    });
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    exiting.exit(pty_id, Some(0), None);
+
+    let events = collected.await.unwrap();
+    let exit_index = events
+        .iter()
+        .position(|event| matches!(event, TerminalEvent::Exited(_)))
+        .expect("natural exit must be published");
+    assert!(matches!(
+        events.get(exit_index.wrapping_sub(1)),
+        Some(TerminalEvent::Snapshot(_) | TerminalEvent::SharedSnapshot(_))
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TerminalEvent::Exited(_)))
+            .count(),
+        1
+    );
+    assert!(!events[exit_index + 1..].iter().any(|event| matches!(
+        event,
+        TerminalEvent::Snapshot(_) | TerminalEvent::SharedSnapshot(_) | TerminalEvent::Diff(_)
+    )));
 }
 
 #[test]
@@ -229,6 +297,49 @@ fn idle_remote_receive_does_not_depend_on_blocking_pool_capacity() {
         release_tx.send(()).unwrap();
         occupied.await.unwrap();
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn mailbox_cancellation_wakes_while_ordered_registry_detach_is_blocked() {
+    let (registry, pty, tab) = setup(20, 2);
+    let remote = RemoteTerminal::new(registry.clone());
+    let (attached, mut events) = remote.attach(&tab).unwrap();
+    remote
+        .focus(&tab, attached.attachment_id(), size(20, 2))
+        .unwrap();
+    let cancellation = events.cancellation();
+    pty.block_writes();
+    let writing_remote = remote.clone();
+    let writing_tab = tab.clone();
+    let writing_attachment = attached.attachment_id().clone();
+    let writer = std::thread::spawn(move || {
+        writing_remote.input(&writing_tab, &writing_attachment, b"blocked")
+    });
+    let entered_deadline = Instant::now() + Duration::from_secs(1);
+    while !pty.write_entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < entered_deadline);
+        tokio::task::yield_now().await;
+    }
+
+    cancellation.close_mailbox();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(100), events.next())
+            .await
+            .expect("mailbox wake must not wait for send_order"),
+        None
+    );
+    let detached = cancellation.clone();
+    let mut detaching = tokio::task::spawn_blocking(move || detached.detach_registry());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut detaching)
+            .await
+            .is_err()
+    );
+    pty.release_write();
+    writer.join().unwrap().unwrap();
+    detaching.await.unwrap();
+    assert_eq!(registry.attachment_count(&tab).unwrap(), 0);
+    assert!(registry.get(&tab).unwrap().input_owner().is_none());
 }
 
 #[test]
@@ -725,6 +836,85 @@ fn transfer_parts_reject_trailing_cbor_and_kind_specific_row_overflow() {
 }
 
 #[test]
+fn transfer_id_must_be_a_bounded_canonical_lowercase_hyphenated_uuid() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let snapshot = large_snapshot(&tab);
+    for invalid in [
+        "550E8400-E29B-41D4-A716-446655440000".to_owned(),
+        "550e8400e29b41d4a716446655440000".to_owned(),
+        "x".repeat(4096),
+    ] {
+        let mut chunk = chunk_snapshot(1, &tab, &snapshot).unwrap().remove(0);
+        chunk.transfer_id = invalid;
+        let mut assembler = TransferAssembler::new("connection-a", tab.clone());
+        assert_eq!(
+            assembler.accept("connection-a", chunk),
+            TransferStatus::Recover
+        );
+    }
+}
+
+#[test]
+fn legal_maximum_viewport_round_trips_through_sender_plan_and_receiver_budget() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let text = format!("\u{1f600}{}", "\u{1d167}".repeat(32));
+    let cell = ScreenCell::try_new(
+        text,
+        1,
+        TerminalColor::Rgb {
+            r: 255,
+            g: 254,
+            b: 253,
+        },
+        TerminalColor::Rgb { r: 1, g: 2, b: 3 },
+        CellAttributes::new(true, true, true, true, true, true, true),
+    )
+    .unwrap();
+    let row = ScreenRow::try_new(vec![cell; 512], false).unwrap();
+    let snapshot = ScreenSnapshot::new(
+        tab.as_str(),
+        Revision(9),
+        size(512, 512),
+        vec![row; 512],
+        Vec::new(),
+        CursorState::new(511, 511, true),
+        TerminalModes::new(true, true, true),
+    );
+    let mut plan = plan_snapshot_for_attachment(81, &tab, None, snapshot).unwrap();
+    let mut assembler = TransferAssembler::new("connection-max", tab);
+    let mut status = TransferStatus::Pending;
+    let mut chunks = 0;
+    while let Some(chunk) = plan.next_chunk().unwrap() {
+        let chunk_debug = (chunk.index, chunk.total, chunk.row_start, chunk.row_end);
+        let wire = RemoteEvent {
+            version: PROTOCOL_VERSION,
+            request_id: chunk.request_id,
+            kind: "terminal.snapshot".to_owned(),
+            payload: ciborium_bytes(&chunk),
+        };
+        assert!(ciborium_bytes(&wire).len() < MAX_WIRE_FRAME_BYTES);
+        status = assembler.accept("connection-max", chunk);
+        assert_ne!(
+            status,
+            TransferStatus::Recover,
+            "recovered at chunk {chunks}: {chunk_debug:?}"
+        );
+        chunks += 1;
+    }
+    let TransferStatus::Complete(completion) = status else {
+        panic!("maximum legal viewport must complete");
+    };
+    let token = completion.token();
+    let TransferPayload::Snapshot(received) = completion.into_payload() else {
+        panic!("maximum viewport completed with wrong transfer kind");
+    };
+    assert_eq!(received.visible().len(), 512);
+    assert!(chunks > 1);
+    assembler.commit_applied(token).unwrap();
+    assert_eq!(assembler.committed_size(), Some(size(512, 512)));
+}
+
+#[test]
 fn shared_connection_budget_allows_only_one_staged_transfer_and_releases_on_expiry() {
     let tab_a = aiterm_lib::tabs::TabId::new();
     let tab_b = aiterm_lib::tabs::TabId::new();
@@ -783,6 +973,36 @@ fn staged_transfer_exposes_an_active_expiration_deadline() {
     assembler.accept_at("connection-a", chunk, start);
 
     assert_eq!(assembler.deadline(), Some(start + Duration::from_millis(5)));
+}
+
+#[test]
+fn valid_chunk_progress_extends_inactivity_deadline_but_duplicate_does_not() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let chunks = chunk_snapshot(73, &tab, &large_snapshot(&tab)).unwrap();
+    assert!(chunks.len() > 2);
+    let start = Instant::now();
+    let idle = Duration::from_millis(20);
+    let mut assembler = TransferAssembler::with_timeout("connection-a", tab, idle);
+    assert_eq!(
+        assembler.accept_at("connection-a", chunks[0].clone(), start),
+        TransferStatus::Pending
+    );
+    assert_eq!(assembler.deadline(), Some(start + idle));
+    let progress = start + Duration::from_millis(15);
+    assert_eq!(
+        assembler.accept_at("connection-a", chunks[1].clone(), progress),
+        TransferStatus::Pending
+    );
+    assert_eq!(assembler.deadline(), Some(progress + idle));
+    assert_eq!(
+        assembler.accept_at(
+            "connection-a",
+            chunks[1].clone(),
+            progress + Duration::from_millis(1)
+        ),
+        TransferStatus::Recover
+    );
+    assert_eq!(assembler.deadline(), None);
 }
 
 fn ciborium_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {

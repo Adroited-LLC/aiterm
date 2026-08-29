@@ -20,8 +20,27 @@ use uuid::Uuid;
 
 pub const MAX_WIRE_FRAME_BYTES: usize = 1024 * 1024;
 pub const DIFF_INTERVAL: Duration = Duration::from_millis(16);
-const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_STAGED_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+// A worst-case legal viewport spans hundreds of sub-1MiB frames. Keep staged
+// state bounded, but allow a slow mobile receiver enough active assembly time.
+const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_TRANSFER_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const MAX_CELL_TEXT_BYTES: usize = 33 * 4;
+const ALLOCATOR_OVERHEAD_BYTES: usize = 32;
+const MAX_RESIDENT_CELL_BYTES: usize = std::mem::size_of::<crate::terminal::model::ScreenCell>()
+    + (2 * MAX_CELL_TEXT_BYTES)
+    + ALLOCATOR_OVERHEAD_BYTES;
+const MAX_RESIDENT_ROW_BYTES: usize = std::mem::size_of::<ScreenRow>() + ALLOCATOR_OVERHEAD_BYTES;
+// A legal 512x512 viewport can contain 262,144 cells, each with a four-byte
+// base scalar and 32 four-byte combining scalars. Account conservatively for
+// the cell struct, up to twice the UTF-8 allocation, allocator overhead, row
+// vectors/parts, a 2x container-capacity growth factor, and one transient
+// encoded wire frame. Only one transfer may reserve this connection-wide
+// budget at a time.
+const MAX_STAGED_SEMANTIC_BYTES: usize = 2
+    * ((512 * 512 * MAX_RESIDENT_CELL_BYTES)
+        + (512 * MAX_RESIDENT_ROW_BYTES)
+        + (512 * ALLOCATOR_OVERHEAD_BYTES));
+const MAX_CONNECTION_TRANSFER_BYTES: usize = MAX_STAGED_SEMANTIC_BYTES + MAX_WIRE_FRAME_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalError {
@@ -70,6 +89,7 @@ impl std::error::Error for TerminalError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     Snapshot(ScreenSnapshot),
+    SharedSnapshot(Arc<ScreenSnapshot>),
     Diff(ScreenDiff),
     FocusChanged {
         owner: Option<AttachmentId>,
@@ -83,6 +103,7 @@ pub enum TerminalEvent {
 fn project_event(event: TabEvent) -> Option<TerminalEvent> {
     match event {
         TabEvent::Snapshot(snapshot) => Some(TerminalEvent::Snapshot(snapshot)),
+        TabEvent::SharedSnapshot(snapshot) => Some(TerminalEvent::SharedSnapshot(snapshot)),
         TabEvent::Diff(diff) => Some(TerminalEvent::Diff(diff)),
         TabEvent::FocusChanged { owner, size } => Some(TerminalEvent::FocusChanged { owner, size }),
         TabEvent::Metadata(_) | TabEvent::Title(_) => None,
@@ -221,6 +242,11 @@ impl RemoteTerminalEvents {
                     self.coalescer.clear();
                     return Some(TerminalEvent::Snapshot(snapshot));
                 }
+                TabEvent::SharedSnapshot(snapshot) => {
+                    self.diff_started = None;
+                    self.coalescer.clear();
+                    return Some(TerminalEvent::SharedSnapshot(snapshot));
+                }
                 TabEvent::Metadata(descriptor) => {
                     if descriptor.title() != self.last_title {
                         self.last_title = descriptor.title().to_owned();
@@ -259,7 +285,7 @@ impl RemoteTerminalEvents {
 
 impl Drop for RemoteTerminalEvents {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.cancellation.cancel_deferred();
     }
 }
 
@@ -271,6 +297,9 @@ pub struct RemoteTerminal {
 pub struct RemoteRecovery {
     snapshot: ScreenSnapshot,
     boundary: RecoveryBoundary,
+    title: String,
+    input_owner: Option<AttachmentId>,
+    size: TerminalSize,
 }
 
 impl RemoteRecovery {
@@ -278,8 +307,22 @@ impl RemoteRecovery {
         &self.snapshot
     }
 
-    pub fn into_parts(self) -> (ScreenSnapshot, RecoveryBoundary) {
-        (self.snapshot, self.boundary)
+    pub fn into_parts(
+        self,
+    ) -> (
+        ScreenSnapshot,
+        RecoveryBoundary,
+        String,
+        Option<AttachmentId>,
+        TerminalSize,
+    ) {
+        (
+            self.snapshot,
+            self.boundary,
+            self.title,
+            self.input_owner,
+            self.size,
+        )
     }
 }
 
@@ -346,8 +389,15 @@ impl RemoteTerminal {
         revision: Revision,
     ) -> Result<RemoteRecovery, TerminalError> {
         let _ = revision;
-        let (snapshot, boundary) = self.registry.recovery_snapshot(tab_id, attachment_id)?;
-        Ok(RemoteRecovery { snapshot, boundary })
+        let (snapshot, boundary, descriptor) =
+            self.registry.recovery_snapshot(tab_id, attachment_id)?;
+        Ok(RemoteRecovery {
+            snapshot,
+            boundary,
+            title: descriptor.title().to_owned(),
+            input_owner: descriptor.input_owner().cloned(),
+            size: descriptor.size(),
+        })
     }
 
     pub fn list(&self) -> Vec<TabDescriptor> {
@@ -579,7 +629,7 @@ fn wire_len(chunk: &TransferChunk) -> Result<usize, TerminalError> {
 
 #[derive(Clone)]
 enum TransferSource {
-    Snapshot(ScreenSnapshot),
+    Snapshot(Arc<ScreenSnapshot>),
     Diff(ScreenDiff),
     Scrollback(Vec<ScreenRow>),
 }
@@ -698,6 +748,10 @@ impl TransferPlan {
         self.request_id
     }
 
+    pub fn attachment_id(&self) -> Option<&AttachmentId> {
+        self.attachment_id.as_ref()
+    }
+
     fn collect_chunks(mut self) -> Result<Vec<TransferChunk>, TerminalError> {
         let mut chunks = Vec::with_capacity(self.ranges.len());
         while let Some(chunk) = self.next_chunk()? {
@@ -744,7 +798,19 @@ fn plan_row_ranges(
     while start < row_count {
         let mut best: Option<usize> = None;
         let mut low = start + 1;
-        let mut high = row_count;
+        // Once the first bounded range is known, probe only one row beyond
+        // its span. This retains exact full-envelope sizing while avoiding
+        // repeatedly encoding capped near-1MiB rejected candidates for every
+        // subsequent dense chunk.
+        let mut high = ranges
+            .last()
+            .map(|previous: &std::ops::Range<usize>| {
+                start
+                    .saturating_add(previous.len())
+                    .saturating_add(1)
+                    .min(row_count)
+            })
+            .unwrap_or(row_count);
         while low <= high {
             let end = low + (high - low) / 2;
             let payload = match source.encode_range(start..end) {
@@ -795,6 +861,24 @@ pub fn plan_snapshot_for_attachment(
     tab: &TabId,
     attachment_id: Option<&AttachmentId>,
     snapshot: ScreenSnapshot,
+) -> Result<TransferPlan, TerminalError> {
+    let revision = snapshot.revision();
+    TransferPlan::new(
+        request_id,
+        tab,
+        attachment_id,
+        TransferKind::Snapshot,
+        revision,
+        revision,
+        TransferSource::Snapshot(Arc::new(snapshot)),
+    )
+}
+
+pub fn plan_shared_snapshot_for_attachment(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    snapshot: Arc<ScreenSnapshot>,
 ) -> Result<TransferPlan, TerminalError> {
     let revision = snapshot.revision();
     TransferPlan::new(
@@ -993,6 +1077,7 @@ struct StagedTransfer {
     bytes: usize,
     rows: usize,
     started: Instant,
+    last_progress: Instant,
     parts: Vec<ValidatedPart>,
     metadata: Option<PartMetadata>,
     _reservation: TransferReservation,
@@ -1131,10 +1216,10 @@ impl TransferAssembler {
     }
 
     pub fn expire_at(&mut self, now: Instant) -> bool {
-        let expired = self
-            .staged
-            .as_ref()
-            .is_some_and(|staged| now.saturating_duration_since(staged.started) >= self.timeout);
+        let expired = self.staged.as_ref().is_some_and(|staged| {
+            now.saturating_duration_since(staged.last_progress) >= self.timeout
+                || now.saturating_duration_since(staged.started) >= MAX_TRANSFER_LIFETIME
+        });
         if expired {
             self.staged = None;
         }
@@ -1144,9 +1229,9 @@ impl TransferAssembler {
     /// Exposed so a receiver can schedule reclamation even if no later chunk
     /// arrives to drive `accept_at`.
     pub fn deadline(&self) -> Option<Instant> {
-        self.staged
-            .as_ref()
-            .map(|staged| staged.started + self.timeout)
+        self.staged.as_ref().map(|staged| {
+            (staged.last_progress + self.timeout).min(staged.started + MAX_TRANSFER_LIFETIME)
+        })
     }
 
     pub fn accept(&mut self, connection_id: &str, chunk: TransferChunk) -> TransferStatus {
@@ -1167,6 +1252,7 @@ impl TransferAssembler {
             || connection_id != self.connection_id
             || chunk.tab_id != self.tab_id
             || chunk.attachment_id != self.attachment_id
+            || !canonical_transfer_id(&chunk.transfer_id)
             || chunk.total == 0
             || usize::try_from(chunk.total).map_or(true, |total| total > row_cap.max(1))
             || usize::try_from(chunk.row_end).map_or(true, |row_end| row_end > row_cap)
@@ -1197,6 +1283,7 @@ impl TransferAssembler {
                 bytes: 0,
                 rows: 0,
                 started: now,
+                last_progress: now,
                 parts: Vec::new(),
                 metadata: None,
                 _reservation: reservation,
@@ -1217,9 +1304,14 @@ impl TransferAssembler {
             && (chunk.row_end > chunk.row_start
                 || (chunk.total == 1 && chunk.index == 0 && chunk.row_start == 0))
             && chunk.index < chunk.total;
-        let bounded = staged.bytes.saturating_add(chunk.payload.len()) <= MAX_STAGED_TRANSFER_BYTES
-            && staged.rows.saturating_add(row_count) <= row_cap;
         let validated = validate_part(&chunk, row_count, self.committed_size);
+        let semantic_bytes = validated
+            .as_ref()
+            .map(|(_, part)| part.semantic_bytes())
+            .unwrap_or(usize::MAX);
+        let bounded = staged.bytes.saturating_add(semantic_bytes)
+            <= MAX_CONNECTION_TRANSFER_BYTES - MAX_WIRE_FRAME_BYTES
+            && staged.rows.saturating_add(row_count) <= row_cap;
         let metadata_consistent = validated.as_ref().is_ok_and(|(metadata, _)| {
             staged
                 .metadata
@@ -1237,10 +1329,11 @@ impl TransferAssembler {
                 .map(|(metadata, _)| metadata.clone());
         }
         let (_, part) = validated.expect("validated transfer part was checked above");
-        staged.bytes += chunk.payload.len();
+        staged.bytes += semantic_bytes;
         staged.rows += row_count;
         staged.next_index += 1;
         staged.next_row = chunk.row_end;
+        staged.last_progress = now;
         staged.parts.push(part);
         if staged.next_index != staged.total {
             return TransferStatus::Pending;
@@ -1269,6 +1362,11 @@ impl TransferAssembler {
     }
 }
 
+fn canonical_transfer_id(value: &str) -> bool {
+    value.len() == 36
+        && Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+}
+
 fn transfer_row_cap(kind: TransferKind) -> usize {
     match kind {
         TransferKind::Snapshot | TransferKind::Diff => 512,
@@ -1291,6 +1389,35 @@ enum ValidatedPart {
     Snapshot(SnapshotPart),
     Diff(DiffPart),
     Scrollback(ScrollbackPart),
+}
+
+impl ValidatedPart {
+    fn semantic_bytes(&self) -> usize {
+        let rows: &[ScreenRow] = match self {
+            Self::Snapshot(part) => &part.visible,
+            Self::Scrollback(part) => &part.rows,
+            Self::Diff(part) => {
+                return part
+                    .rows
+                    .iter()
+                    .map(|patch| {
+                        semantic_row_bytes(patch.content()) + std::mem::size_of::<RowPatch>()
+                    })
+                    .sum::<usize>()
+                    .saturating_add(std::mem::size_of::<DiffPart>());
+            }
+        };
+        rows.iter()
+            .map(semantic_row_bytes)
+            .sum::<usize>()
+            .saturating_add(
+                std::mem::size_of::<SnapshotPart>().max(std::mem::size_of::<ScrollbackPart>()),
+            )
+    }
+}
+
+fn semantic_row_bytes(row: &ScreenRow) -> usize {
+    MAX_RESIDENT_ROW_BYTES.saturating_add(row.cells().len().saturating_mul(MAX_RESIDENT_CELL_BYTES))
 }
 
 fn validate_part(

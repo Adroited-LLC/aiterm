@@ -1035,7 +1035,10 @@ fn full_remote_screen_queue_retains_control_events_and_exit_exactly_once() {
         }
     }
 
-    assert!(matches!(events.first(), Some(TabEvent::Snapshot(_))));
+    assert!(matches!(
+        events.first(),
+        Some(TabEvent::Snapshot(_) | TabEvent::SharedSnapshot(_))
+    ));
     assert!(events.iter().any(|event| matches!(
         event,
         TabEvent::Metadata(descriptor) if descriptor.title() == "metadata-title"

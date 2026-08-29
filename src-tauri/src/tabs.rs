@@ -354,6 +354,7 @@ impl TabDescriptor {
 pub enum TabEvent {
     Raw(Vec<u8>),
     Snapshot(ScreenSnapshot),
+    SharedSnapshot(Arc<ScreenSnapshot>),
     Diff(ScreenDiff),
     FocusChanged {
         owner: Option<AttachmentId>,
@@ -495,6 +496,27 @@ impl EventMailbox {
 
     fn push_snapshot(&self, snapshot: ScreenSnapshot) {
         self.push_screen(TabEvent::Snapshot(snapshot.clone()), || snapshot);
+    }
+
+    fn push_shared_snapshot(&self, snapshot: Arc<ScreenSnapshot>) {
+        debug_assert_eq!(self.kind, AttachmentKind::Remote);
+        let mut state = self.state.lock().unwrap();
+        if state.receiver_closed || state.producer_closed {
+            return;
+        }
+        let event_sequence = take_sequence(&mut state);
+        let sequence = state
+            .screen
+            .front()
+            .map(|queued| queued.sequence)
+            .unwrap_or(event_sequence);
+        state.screen.clear();
+        state.screen.push_back(QueuedEvent {
+            sequence,
+            event: TabEvent::SharedSnapshot(snapshot),
+        });
+        self.changed.notify_one();
+        self.async_changed.notify_one();
     }
 
     fn push_diff(&self, diff: ScreenDiff, recovery: impl FnOnce() -> ScreenSnapshot) {
@@ -714,7 +736,10 @@ fn control_kind(event: &TabEvent) -> Option<ControlKind> {
         TabEvent::Title(_) => Some(ControlKind::Title),
         TabEvent::Bell => Some(ControlKind::Bell),
         TabEvent::Exited(_) => Some(ControlKind::Exited),
-        TabEvent::Raw(_) | TabEvent::Snapshot(_) | TabEvent::Diff(_) => None,
+        TabEvent::Raw(_)
+        | TabEvent::Snapshot(_)
+        | TabEvent::SharedSnapshot(_)
+        | TabEvent::Diff(_) => None,
     }
 }
 
@@ -799,12 +824,34 @@ impl TabAttachmentCancellation {
     /// The registry mutation is performed at most once across explicit
     /// detach, task completion, connection teardown, and tab-exit races.
     pub fn cancel(&self) {
+        self.cancel_deferred();
+    }
+
+    /// Cancellation phase one: synchronously close and wake the exact
+    /// attachment mailbox without waiting for output-order/backend work.
+    pub fn close_mailbox(&self) {
         self.mailbox.close_receiver();
+    }
+
+    /// Cancellation phase two: remove registry ownership exactly once. This
+    /// may wait for an in-flight ordered backend operation and therefore must
+    /// be isolated by async callers.
+    pub fn detach_registry(&self) {
         if self.cancelled.swap(true, Ordering::AcqRel) {
             return;
         }
         if let Some(registry) = self.registry.upgrade() {
             registry.detach(&self.tab_id, &self.attachment_id);
+        }
+    }
+
+    pub fn cancel_deferred(&self) {
+        self.close_mailbox();
+        let cancellation = self.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || cancellation.detach_registry());
+        } else {
+            cancellation.detach_registry();
         }
     }
 }
@@ -858,7 +905,7 @@ impl TabEventReceiver {
 
 impl Drop for TabEventReceiver {
     fn drop(&mut self) {
-        self.cancellation.cancel();
+        self.cancellation.cancel_deferred();
     }
 }
 
@@ -1221,7 +1268,7 @@ impl TabRegistry {
         &self,
         id: &TabId,
         attachment: &AttachmentId,
-    ) -> Result<(ScreenSnapshot, RecoveryBoundary), TabError> {
+    ) -> Result<(ScreenSnapshot, RecoveryBoundary, TabDescriptor), TabError> {
         let tab = self.inner.tab(id)?;
         let _output_order = tab.raw.send_order.lock().unwrap();
         tab.raw.require_open()?;
@@ -1235,6 +1282,7 @@ impl TabRegistry {
         Ok((
             live.screen.snapshot(id.as_str()),
             RecoveryBoundary(state.mailbox.recovery_boundary()),
+            live.descriptor.clone(),
         ))
     }
 
@@ -1490,6 +1538,7 @@ pub fn tab_attach_desktop(
                     }
                     TabEvent::Exited(_) => {}
                     TabEvent::Snapshot(_)
+                    | TabEvent::SharedSnapshot(_)
                     | TabEvent::Diff(_)
                     | TabEvent::FocusChanged { .. }
                     | TabEvent::Bell => {}
@@ -2055,6 +2104,16 @@ impl LiveTab {
             requested,
         };
         self.descriptor.exit = Some(exit.clone());
+        let final_snapshot = Arc::new(self.screen.snapshot(self.descriptor.id.as_str()));
+        for attachment in self
+            .attachments
+            .values()
+            .filter(|attachment| attachment.kind == AttachmentKind::Remote)
+        {
+            attachment
+                .mailbox
+                .push_shared_snapshot(final_snapshot.clone());
+        }
         for attachment in self.attachments.values() {
             attachment.mailbox.finish(exit.clone());
         }
