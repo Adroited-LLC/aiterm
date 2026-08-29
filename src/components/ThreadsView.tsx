@@ -15,7 +15,7 @@ import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import { agentTint } from "../brand";
-import { BookOpen, ChevronRight, Loader2, Pencil, Play, Sparkles, Square } from "lucide-react";
+import { BookOpen, ChevronRight, Loader2, Pencil, Play, Sparkles, Square, Wand2 } from "lucide-react";
 
 interface ThreadCard {
   id: string;
@@ -150,9 +150,19 @@ export default function ThreadsView({
             <span className="thr-hint">· ~2 min per 8</span>
             <button className="thr-stop" title="Stop after this batch" onClick={lib.stop}><Icon of={Square} size="sm" /></button>
           </span>
+        ) : lib.tidying ? (
+          <span className="thr-running"><Icon of={Loader2} size="sm" className="spin" /> tidying up…</span>
         ) : lib.pending.length > 0 ? (
           <button className="thr-run" onClick={() => void lib.run()} title="Read the sessions the librarian has not seen yet">
             <Icon of={Sparkles} size="sm" /> Catalogue {lib.pending.length}
+          </button>
+        ) : lib.tidyDue ? (
+          <button className="thr-run" onClick={() => void lib.tidy()} title="One look at everything: merge threads that are the same work, file loose sessions">
+            <Icon of={Wand2} size="sm" /> Tidy up
+          </button>
+        ) : threads.length > 1 ? (
+          <button className="thr-run quiet" onClick={() => void lib.tidy()} title="One look at everything: merge threads that are the same work, file loose sessions">
+            <Icon of={Wand2} size="sm" />
           </button>
         ) : null}
       </div>
@@ -162,6 +172,9 @@ export default function ThreadsView({
       {lib.report?.errors.length ? (
         <div className="thr-error">{lib.report.errors[0]}</div>
       ) : null}
+      {lib.tidyReport && "error" in lib.tidyReport && (
+        <div className="thr-error">{lib.tidyReport.error}</div>
+      )}
 
       {threads.length === 0 && loose.length === 0 && (
         <div className="thr-empty-text">

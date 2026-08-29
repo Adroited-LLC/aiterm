@@ -69,6 +69,12 @@ pub struct Store {
     /// Total spend the providers have reported, in dollars, where they do.
     #[serde(default)]
     pub spent: f64,
+    /// How many sessions the store held when it was last tidied — the
+    /// second pass that merges threads. More than this now means it is due.
+    #[serde(default)]
+    pub tidied_sessions: usize,
+    #[serde(default)]
+    pub tidied_at: i64,
 }
 
 fn store_path() -> Option<std::path::PathBuf> {
@@ -213,7 +219,7 @@ work IS, not what the tool is.\n\n\
 For every session return one object, in the order given. Rules:\n\
 - id: the session id, copied exactly.\n\
 - name: 2–6 words, specific, sentence case, no trailing period. Never the raw prompt. A session that only says hi or tests the tool gets a plain name like \"Quick check\".\n\
-- tags: 2–4 lowercase single words or hyphenated words (technology, domain, activity). Reuse tags already in use where they fit.\n\
+- tags: 2–4 lowercase single words or hyphenated words naming the technology, product or domain (esp32, affiliate, real-estate, radarr, kalshi). Never generic words: automation, test, admin, development, setup, integration, tooling, research, ui. Reuse specific tags already in use where they fit.\n\
 - thread: EITHER {\"id\": \"<existing thread id>\"} to file it under an existing thread, OR {\"new\": {\"name\": \"2–4 words\", \"description\": \"one sentence\", \"tags\": [...]}} when nothing existing fits, OR null for a one-off or a throwaway (a greeting, a smoke test, a quick question). Prefer an existing thread when the work is plainly the same body of work, even across directories. Two sessions in this batch that are the same work share one new thread: name it in the first and refer to it by that same name in the others.\n\
 - summary: one sentence, ≤ 25 words, on where the session left off — what was done or decided last.\n\
 - next: ≤ 15 words on the obvious next step, or \"\" if the session is finished or it is not clear.\n\n\
@@ -489,6 +495,164 @@ pub fn apply(store: &mut Store, reply: &[serde_json::Value], asked: &[String], s
     n
 }
 
+/* ---- the second pass: one look at everything, and a final organisation --- */
+
+const TIDY_SYSTEM: &str = "You are finalising a catalogue of a developer's AI coding sessions. You are given every \
+thread so far, each with the sessions filed under it, and the sessions filed under none. The threads were named \
+a few sessions at a time, so the same body of work is often split across several — a device wired in one thread \
+and programmed in another, a product's build and its marketing apart, a server's media stack in two. Your job is \
+the organisation a person would recognise.\n\n\
+Rules:\n\
+- Merge threads that are the same body of work: the same project, device, product, site, campaign or bot — \
+including all its parts. Wiring, programming, peripherals (a camera, a display, buttons, a laser) and debugging of \
+one board or one physical rig are ONE thread. The build, the research and the marketing of one product or one \
+site are ONE thread. The download clients, indexers and webhooks of one home server are ONE thread. Sessions in \
+the same project directory almost always belong together. Keep apart only work on genuinely different things: two \
+different products, two different clients, two unrelated devices.\n\
+- name: 2–4 words naming what the work IS — the product, device, site or bot — sentence case.\n\
+- description: one sentence.\n\
+- tags: 2–4 lowercase words naming the technology, product or domain. Never generic words: automation, test, \
+admin, development, setup, integration, tooling, research, ui.\n\
+- add: file a loose session under a thread when it plainly belongs (a session about Radarr belongs with the \
+media server). Leave greetings, smoke tests and true one-offs loose — do not invent a thread for them.\n\
+- Every existing thread id must appear in exactly one merge list. A thread that stands alone is a merge list of \
+one.\n\n\
+Reply with a JSON object only — no prose, no code fence: \
+{\"threads\": [{\"name\": \"...\", \"description\": \"...\", \"tags\": [...], \"merge\": [\"thread-id\", ...], \"add\": [\"session-id\", ...]}]}";
+
+fn tidy_prompt(store: &Store, dirs: &BTreeMap<String, String>) -> String {
+    let brief = |id: &str, e: &Entry| serde_json::json!({
+        "id": id, "name": e.name, "summary": clip(&e.summary, 160),
+        "directory": dirs.get(id).cloned().unwrap_or_default(),
+    });
+    let threads: Vec<serde_json::Value> = store.threads.iter().map(|(id, t)| {
+        let ss: Vec<serde_json::Value> = store.sessions.iter().filter(|(_, e)| &e.thread == id).map(|(sid, e)| brief(sid, e)).collect();
+        serde_json::json!({"id": id, "name": t.name, "description": t.description, "tags": t.tags, "sessions": ss})
+    }).collect();
+    let loose: Vec<serde_json::Value> = store.sessions.iter().filter(|(_, e)| e.thread.is_empty() || !store.threads.contains_key(&e.thread)).map(|(sid, e)| brief(sid, e)).collect();
+    format!(
+        "Threads so far:\n{}\n\nSessions under no thread:\n{}",
+        serde_json::to_string_pretty(&threads).unwrap_or_default(),
+        serde_json::to_string_pretty(&loose).unwrap_or_default(),
+    )
+}
+
+/// Fold the tidy reply into the store. Pure. A thread the reply never
+/// mentions is kept as it was — a model that forgot one must not lose it.
+pub fn apply_tidy(store: &mut Store, reply: &serde_json::Value) -> Result<(usize, usize), String> {
+    let finals = reply.get("threads").and_then(|t| t.as_array()).ok_or("no threads in the reply")?;
+    let now = now_ms();
+    let before = store.threads.len();
+    let mut new_threads: BTreeMap<String, Thread> = BTreeMap::new();
+    // old thread id -> new thread id
+    let mut moved: BTreeMap<String, String> = BTreeMap::new();
+    let mut filed = 0usize;
+    for f in finals {
+        let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let merge: Vec<String> = strings_raw(f.get("merge")).into_iter().filter(|id| store.threads.contains_key(id) && !moved.contains_key(id)).collect();
+        let add: Vec<String> = strings_raw(f.get("add"));
+        if merge.is_empty() && add.is_empty() {
+            continue;
+        }
+        // Keep an id where one thread carries on — the card keeps its colour
+        // and its folds — and mint one where several become one.
+        let id = if merge.len() == 1 { merge[0].clone() } else { slug(&name) };
+        let id = if new_threads.contains_key(&id) { format!("{id}-{}", new_threads.len()) } else { id };
+        let created = merge.iter().filter_map(|m| store.threads.get(m)).map(|t| t.created).filter(|c| *c > 0).min().unwrap_or(now);
+        let mut tags = strings(f.get("tags"));
+        if tags.is_empty() {
+            tags = merge.iter().filter_map(|m| store.threads.get(m)).flat_map(|t| t.tags.clone()).collect();
+            tags.dedup();
+        }
+        new_threads.insert(id.clone(), Thread {
+            name,
+            description: f.get("description").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
+            tags,
+            created,
+        });
+        for m in &merge {
+            moved.insert(m.clone(), id.clone());
+        }
+        for sid in add {
+            if let Some(e) = store.sessions.get_mut(&sid) {
+                if e.thread.is_empty() || !store.threads.contains_key(&e.thread) {
+                    e.thread = id.clone();
+                    filed += 1;
+                }
+            }
+        }
+    }
+    // Threads the reply left out carry on untouched.
+    for (id, t) in &store.threads {
+        if !moved.contains_key(id) {
+            new_threads.entry(id.clone()).or_insert_with(|| t.clone());
+            moved.insert(id.clone(), id.clone());
+        }
+    }
+    for e in store.sessions.values_mut() {
+        if let Some(to) = moved.get(&e.thread) {
+            e.thread = to.clone();
+        }
+    }
+    // A thread with nothing under it is not a thread.
+    let used: std::collections::BTreeSet<&String> = store.sessions.values().map(|e| &e.thread).collect();
+    new_threads.retain(|id, _| used.contains(id));
+    store.threads = new_threads;
+    store.tidied_sessions = store.sessions.len();
+    store.tidied_at = now;
+    Ok((before, filed))
+}
+
+fn strings_raw(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct TidyReport {
+    pub threads_before: usize,
+    pub threads_after: usize,
+    /// Loose sessions filed under a thread.
+    pub filed: usize,
+    pub cost: f64,
+}
+
+fn tidy_sync(engine: Engine) -> Result<TidyReport, String> {
+    let _one_at_a_time = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let providers = crate::providers::load_providers();
+    let mut store = load_store();
+    if store.threads.is_empty() {
+        return Err("nothing to tidy yet".into());
+    }
+    // Directory names help the model tell a body of work apart — cheap to
+    // look up, and the store does not carry them.
+    let dirs: BTreeMap<String, String> = store.sessions.keys().filter_map(|id| {
+        let d = crate::detail::session_detail_sync(id.clone())?.cwd.unwrap_or_default();
+        Some((id.clone(), d.rsplit('/').next().unwrap_or("").to_string()))
+    }).collect();
+    let (text, cost) = ask(&engine, &providers, TIDY_SYSTEM, &tidy_prompt(&store, &dirs))?;
+    let t = text.trim();
+    let start = t.find('{').ok_or("no JSON object in the reply")?;
+    let end = t.rfind('}').ok_or("no JSON object in the reply")?;
+    let reply: serde_json::Value = serde_json::from_str(&t[start..=end]).map_err(|e| format!("reply is not valid JSON: {e}"))?;
+    store = load_store();
+    let (before, filed) = apply_tidy(&mut store, &reply)?;
+    if let Some(c) = cost {
+        store.spent += c;
+    }
+    save_store(&store)?;
+    Ok(TidyReport { threads_before: before, threads_after: store.threads.len(), filed, cost: cost.unwrap_or(0.0) })
+}
+
+#[tauri::command]
+pub async fn librarian_tidy(engine: Engine) -> Result<TidyReport, String> {
+    crate::run_blocking(move || tidy_sync(engine)).await
+}
+
 /// Sessions per model call. Several at once is what lets the model see that
 /// two sessions are the same work; too many and a small model loses the
 /// thread list.
@@ -674,6 +838,53 @@ mod tests {
         assert_eq!(store.sessions["s3"].thread, "");
         assert_eq!(store.sessions["s4"].thread, "aiterm-desktop-app");
         assert_eq!(store.threads.len(), 1);
+    }
+
+    /// The tidy pass: four ESP32 threads become one (a new id, the oldest
+    /// creation date), a lone thread keeps its id, a loose session is filed,
+    /// a thread the reply forgot survives, and an emptied thread is gone.
+    #[test]
+    fn tidy_merges_files_and_forgets_nothing() {
+        let mut store = Store::default();
+        for (id, name, created) in [("esp32-wiring", "ESP32 wiring", 5), ("esp32-camera", "ESP32 camera", 9), ("kalshi-bot", "Kalshi bot", 7), ("forgotten", "Forgotten", 3), ("empty", "Empty", 1)] {
+            store.threads.insert(id.into(), Thread { name: name.into(), created, tags: vec!["automation".into()], ..Default::default() });
+        }
+        for (sid, th) in [("a", "esp32-wiring"), ("b", "esp32-camera"), ("c", "kalshi-bot"), ("d", "forgotten"), ("loose", "")] {
+            store.sessions.insert(sid.into(), Entry { thread: th.into(), name: sid.into(), ..Default::default() });
+        }
+        let reply: serde_json::Value = serde_json::from_str(r#"{"threads":[
+          {"name":"ESP32 clock","description":"A clock on an ESP32-S3.","tags":["esp32","hardware"],"merge":["esp32-wiring","esp32-camera"],"add":["loose"]},
+          {"name":"Kalshi trading bot","description":"","tags":[],"merge":["kalshi-bot"],"add":[]},
+          {"name":"Ghost","description":"","tags":[],"merge":["empty"],"add":[]}
+        ]}"#).unwrap();
+        let (before, filed) = apply_tidy(&mut store, &reply).unwrap();
+        assert_eq!((before, filed), (5, 1));
+        assert_eq!(store.sessions["a"].thread, "esp32-clock");
+        assert_eq!(store.sessions["b"].thread, "esp32-clock");
+        assert_eq!(store.sessions["loose"].thread, "esp32-clock");
+        assert_eq!(store.threads["esp32-clock"].created, 5);
+        assert_eq!(store.threads["esp32-clock"].tags, vec!["esp32", "hardware"]);
+        assert_eq!(store.sessions["c"].thread, "kalshi-bot");
+        assert_eq!(store.threads["kalshi-bot"].tags, vec!["automation"], "empty tags keep the old ones");
+        assert_eq!(store.sessions["d"].thread, "forgotten");
+        assert!(store.threads.contains_key("forgotten"));
+        assert!(!store.threads.contains_key("empty"));
+        assert_eq!(store.threads.len(), 3);
+        assert_eq!(store.tidied_sessions, 5);
+    }
+
+    /// Against the real store, through claude -p on Haiku. Opt-in:
+    /// `cargo test --lib librarian::tests::tidy_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn tidy_live() {
+        let r = tidy_sync(Engine::Cli { agent: "claude".into(), model: Some("haiku".into()) }).unwrap();
+        println!("{r:?}");
+        let store = load_store();
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for e in store.sessions.values() { *counts.entry(e.thread.as_str()).or_default() += 1; }
+        for (id, t) in &store.threads { println!("  [{:2}] {id}: {} {:?} — {}", counts.get(id.as_str()).unwrap_or(&0), t.name, t.tags, t.description); }
+        println!("  loose: {}", counts.get("").unwrap_or(&0));
     }
 
     #[test]

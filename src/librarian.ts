@@ -9,8 +9,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  EMPTY_LIB, LibEngine, LibRunReport, LibStore, Session, librarianForget, librarianRenameThread,
-  librarianRun, librarianState,
+  EMPTY_LIB, LibEngine, LibRunReport, LibStore, LibTidyReport, Session, librarianForget,
+  librarianRenameThread, librarianRun, librarianState, librarianTidy,
 } from "./ipc";
 import { LibrarianSettings } from "./settings";
 
@@ -39,6 +39,8 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const runningRef = useRef(false);
   const stopRef = useRef(false);
+  const [tidying, setTidying] = useState(false);
+  const [tidyReport, setTidyReport] = useState<LibTidyReport | { error: string } | null>(null);
 
   const reload = useCallback(() => librarianState().then(setStore).catch(() => {}), []);
   useEffect(() => { void reload(); }, [reload]);
@@ -48,6 +50,23 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     : { kind: "cli", agent: cfg.engine, model: cfg.model.trim() || null };
   const ready = cfg.enabled && (cfg.engine !== "api" || (cfg.providerId !== "" && cfg.model.trim() !== ""));
   const pending = useMemo(() => sessions.filter((s) => !isCurrent(store, s)), [sessions, store]);
+
+  /** The second pass over everything. Serialised with runs in Rust; here
+   *  it just must not be started twice. */
+  const tidy = useCallback(async () => {
+    if (runningRef.current || !ready) return;
+    runningRef.current = true;
+    setTidying(true);
+    try {
+      setTidyReport(await librarianTidy(engine));
+    } catch (e) {
+      setTidyReport({ error: String(e) });
+    } finally {
+      runningRef.current = false;
+      setTidying(false);
+      await reload();
+    }
+  }, [ready, engine, reload]);
 
   const run = useCallback(async (only?: Session[]) => {
     if (runningRef.current || !ready) return;
@@ -83,7 +102,9 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
       setProgress(null);
       await reload();
     }
-  }, [ready, pending, engine, reload]);
+    // Then the look at everything, if anything was read and it is wanted.
+    if (total.done > 0 && cfg.tidyAfterRun && !stopRef.current) await tidy();
+  }, [ready, pending, engine, reload, cfg.tidyAfterRun, tidy]);
   const stop = useCallback(() => { stopRef.current = true; }, []);
 
   // The auto run: once the list has been still for a while, catalogue what
@@ -122,7 +143,14 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     await reload();
   }, [reload]);
 
-  return { store, running, report, progress, pending, ready, run, stop, forget, renameThread, reload };
+  /** Whether sessions have been read since the last tidy. */
+  const tidyDue = Object.keys(store.threads).length > 0
+    && Object.keys(store.sessions).length > store.tidied_sessions;
+
+  return {
+    store, running, report, progress, pending, ready, run, stop, forget, renameThread, reload,
+    tidy, tidying, tidyReport, tidyDue,
+  };
 }
 
 export type LibrarianCtl = ReturnType<typeof useLibrarian>;

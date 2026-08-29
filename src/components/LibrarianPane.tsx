@@ -130,6 +130,9 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
           <Row label="Run on its own" desc="A minute or so after sessions go quiet, read any it has not seen. Otherwise only when you press Catalogue.">
             <Switch checked={cfg.auto} onChange={(on) => set({ auto: on })} label="Automatic" />
           </Row>
+          <Row label="Tidy up after each run" desc="Sessions are read eight at a time, so the same project can end up in several threads. This takes one look at everything afterwards and merges them, and files loose sessions where they belong.">
+            <Switch checked={cfg.tidyAfterRun} onChange={(on) => set({ tidyAfterRun: on })} label="Tidy after run" />
+          </Row>
           <Row label="Use its names in the session list" desc="In place of the raw first prompt. The original stays in the tooltip.">
             <Switch checked={cfg.renameRows} onChange={(on) => set({ renameRows: on })} label="Rename rows" />
           </Row>
@@ -163,6 +166,17 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
               Last run: {lib.report.done} read{lib.report.remaining ? `, ${lib.report.remaining} still to go` : ""}
               {lib.report.cost > 0 ? `, $${lib.report.cost.toFixed(4)}` : ""}.
               {lib.report.errors.map((e, i) => <div key={i} className="lib-error">{e}</div>)}
+            </div>
+          )}
+          <Row label="Tidy up now" desc={lib.tidyDue ? "Sessions have been read since the last tidy." : threads > 0 ? "Merge threads that are the same work; file loose sessions." : "Nothing to tidy yet."}>
+            <button className="tui-plain" disabled={!lib.ready || lib.running || lib.tidying || threads === 0} onClick={() => void lib.tidy()}>
+              {lib.tidying ? <><Icon of={Loader2} size="sm" className="spin" /> Tidying…</> : "Tidy up"}
+            </button>
+          </Row>
+          {lib.tidyReport && !("error" in lib.tidyReport) && (
+            <div className="sgroup-foot">
+              Last tidy: {lib.tidyReport.threads_before} threads → {lib.tidyReport.threads_after}
+              {lib.tidyReport.filed ? `, ${lib.tidyReport.filed} loose session${lib.tidyReport.filed === 1 ? "" : "s"} filed` : ""}.
             </div>
           )}
           <Row label="Start over" desc="Forget every name, tag and thread — for a different model, or a first pass that went wrong. Sessions themselves are untouched.">

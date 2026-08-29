@@ -980,6 +980,15 @@ export interface LibStore {
   sessions: Record<string, LibEntry>;
   threads: Record<string, LibThread>;
   spent: number;
+  /** How many sessions the store held at the last tidy — see `librarianTidy`. */
+  tidied_sessions: number;
+  tidied_at: number;
+}
+export interface LibTidyReport {
+  threads_before: number;
+  threads_after: number;
+  filed: number;
+  cost: number;
 }
 export interface LibRunReport {
   done: number;
@@ -987,7 +996,7 @@ export interface LibRunReport {
   cost: number;
   errors: string[];
 }
-export const EMPTY_LIB: LibStore = { sessions: {}, threads: {}, spent: 0 };
+export const EMPTY_LIB: LibStore = { sessions: {}, threads: {}, spent: 0, tidied_sessions: 0, tidied_at: 0 };
 
 export const librarianState = () => invoke<LibStore>("librarian_state");
 /** Mirrors `librarian::Engine`. */
@@ -1001,6 +1010,10 @@ export const librarianRun = (
  *  print mode lands here, and the session list skips it. Kept in step with
  *  `lib_dir()` in `librarian.rs`. */
 export const LIBRARIAN_DIR_SUFFIX = "/.config/aiterm/librarian";
+/** The second pass: one look at every thread and session, and the final
+ *  organisation — threads that are the same work merged, loose sessions
+ *  filed. Run after a catalogue run, and on demand. */
+export const librarianTidy = (engine: LibEngine) => invoke<LibTidyReport>("librarian_tidy", { engine });
 export const librarianForget = () => invoke<void>("librarian_forget");
 export const librarianRenameThread = (id: string, name: string) =>
   invoke<void>("librarian_rename_thread", { id, name });
