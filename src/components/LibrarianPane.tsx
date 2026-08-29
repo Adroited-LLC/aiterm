@@ -9,6 +9,7 @@ import { LibrarianSettings } from "../settings";
 import Row from "./SettingsRow";
 import Icon from "./Icon";
 import AgentIcon from "./AgentIcon";
+import ModelPicker from "./ModelPicker";
 import { Loader2 } from "lucide-react";
 
 
@@ -58,9 +59,6 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
   };
   const counted = Object.keys(lib.store.sessions).length;
   const threads = Object.keys(lib.store.threads).length;
-  const starred = provider?.startup_models ?? [];
-  const small = (catalogue ?? []).filter((m) => /haiku|mini|flash|lite|fast|small|nano/i.test(m) && !/:batch|image|audio|tts|embed/i.test(m));
-  const rest = (catalogue ?? []).filter((m) => !small.includes(m) && !starred.includes(m));
   const threadList = Object.entries(lib.store.threads).sort((a, b) => a[1].name.localeCompare(b[1].name));
 
   return (
@@ -106,33 +104,13 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
           )}
           <Row label="Model" desc="Something small is plenty — it is naming, not coding. Haiku does it well.">
             {cfg.engine === "api" ? (
-              catalogue && catalogue.length > 0 ? (
-                <select className="ns-select" value={cfg.model} onChange={(e) => set({ model: e.target.value })}>
-                  {!catalogue.includes(cfg.model) && cfg.model && <option value={cfg.model}>{cfg.model}</option>}
-                  {starred.length > 0 && (
-                    <optgroup label="Starred in Model access">
-                      {starred.map((m) => <option key={"s:" + m} value={m}>{m}</option>)}
-                    </optgroup>
-                  )}
-                  {small.length > 0 && (
-                    <optgroup label="Small and cheap">
-                      {small.map((m) => <option key={"m:" + m} value={m}>{m}</option>)}
-                    </optgroup>
-                  )}
-                  <optgroup label={`Everything (${rest.length})`}>
-                    {rest.map((m) => <option key={"r:" + m} value={m}>{m}</option>)}
-                  </optgroup>
-                </select>
-              ) : (
-                <input
-                  className="srow-input"
-                  list="librarian-models"
-                  value={cfg.model}
-                  onChange={(e) => set({ model: e.target.value })}
-                  placeholder={catalogue === null && cfg.providerId ? "loading the catalogue…" : "provider/model-id"}
-                  spellCheck={false}
-                />
-              )
+              <ModelPicker
+                value={cfg.model}
+                models={catalogue ?? []}
+                loading={catalogue === null && !!cfg.providerId}
+                placeholder={provider ? "Choose a model" : "Choose a provider first"}
+                onPick={(m) => set({ model: m })}
+              />
             ) : agent && agent.models.length > 0 ? (
               <select className="ns-select" value={cfg.model} onChange={(e) => set({ model: e.target.value })}>
                 <option value="">{agent.display_name}'s default</option>
