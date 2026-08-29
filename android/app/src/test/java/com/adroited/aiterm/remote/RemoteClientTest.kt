@@ -177,7 +177,7 @@ class RemoteClientTest {
                     total = 1,
                     requestId = 3,
                     part = TerminalTransferPart.Scrollback(
-                        listOf(ScreenRow(listOf(ScreenCell("old")))),
+                        listOf(ScreenRow("old".map { ScreenCell(it.toString()) })),
                     ),
                 ),
             ),

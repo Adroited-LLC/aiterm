@@ -48,6 +48,22 @@ class TerminalTransferAssemblerTest {
         assertEquals(0, assembler.pendingCount)
     }
 
+    @Test
+    fun aCellCannotSmuggleMultipleBaseScalarsIntoOneGridColumn() {
+        val assembler = TerminalTransferAssembler()
+        val invalid = snapshotChunk(index = 0, row = 0, text = "one").copy(
+            part = TerminalTransferPart.Snapshot(
+                cols = 10,
+                rows = 2,
+                visible = listOf(ScreenRow(listOf(ScreenCell("ab")))),
+                cursor = CursorState(0, 0, true),
+                modes = TerminalModes(),
+            ),
+        )
+
+        assertTrue(assembler.accept(invalid) is TerminalTransferResult.Recover)
+    }
+
     private fun snapshotChunk(index: Int, row: Int, text: String) = TerminalTransferChunk(
         transferId = "11111111-1111-4111-8111-111111111111",
         tabId = "tab-1",
@@ -63,7 +79,7 @@ class TerminalTransferAssemblerTest {
         part = TerminalTransferPart.Snapshot(
             cols = 10,
             rows = 2,
-            visible = listOf(ScreenRow(listOf(ScreenCell(text)))),
+            visible = listOf(ScreenRow(text.map { ScreenCell(it.toString()) })),
             cursor = CursorState(0, 0, true),
             modes = TerminalModes(lineWrap = true),
         ),

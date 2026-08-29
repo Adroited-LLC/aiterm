@@ -230,6 +230,10 @@ class TerminalTransferAssembler(
             if (cell.continuation || cell.width !in 1..2 || cell.text.isEmpty() ||
                 cell.text.encodeToByteArray().size > 132
             ) invalid()
+            val codePoints = cell.text.codePoints().toArray()
+            if (codePoints.size !in 1..33 || isCombining(codePoints.first()) ||
+                codePoints.drop(1).any { !isCombining(it) }
+            ) invalid()
             if (cell.width == 2) {
                 val continuation = row.cells.getOrNull(index + 1) ?: invalid()
                 if (!continuation.continuation || continuation.width != 0 || continuation.text.isNotEmpty() ||
@@ -247,6 +251,13 @@ class TerminalTransferAssembler(
     }
 
     private fun invalid(): Nothing = throw RemoteProtocolException("invalid terminal transfer")
+
+    private fun isCombining(codePoint: Int): Boolean = when (Character.getType(codePoint)) {
+        Character.NON_SPACING_MARK.toInt(),
+        Character.COMBINING_SPACING_MARK.toInt(),
+        Character.ENCLOSING_MARK.toInt() -> true
+        else -> false
+    }
 
     private data class Header(
         val transferId: String,

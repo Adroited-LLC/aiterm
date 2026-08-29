@@ -91,6 +91,8 @@ object RemoteWireCodec {
         return TerminalWireDecoder.decode(payload, expectedRequestId)
     }
 
+    internal fun validateCborPayload(payload: ByteArray) = validate(payload)
+
     private fun validate(bytes: ByteArray) {
         if (bytes.isEmpty() || bytes.size >= MAX_FRAME_BYTES) {
             throw RemoteProtocolException("invalid remote frame size")

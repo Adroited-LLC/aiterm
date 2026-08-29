@@ -154,6 +154,7 @@ object RemoteCommands {
 
     private fun <T> decode(serializer: kotlinx.serialization.KSerializer<T>, payload: ByteArray): T =
         try {
+            RemoteWireCodec.validateCborPayload(payload)
             cbor.decodeFromByteArray(serializer, payload)
         } catch (error: Exception) {
             throw RemoteProtocolException("malformed remote operation payload", error)
