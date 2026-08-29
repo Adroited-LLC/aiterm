@@ -951,20 +951,13 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
         return Err("verified OpenCode dump operations are unsupported on this platform".into());
     }
 
-    // Same filesystem (~/.claude), so rename is atomic and cheap. Rename
-    // keeps the old mtime, which the purge above reads as age — reset it so
-    // the entry gets its full keep window.
-    let touch = |name: &OsStr| {
-        if let Ok(f) = trash_dir.open_file(name) {
-            let _ = f.set_modified(std::time::SystemTime::now());
-        }
-    };
-    let dest_name = format!("{session_id}.jsonl");
-    verified
-        .as_ref()
-        .ok_or("session transcript was not verified")?
-        .rename_to(&trash_dir, OsStr::new(&dest_name))?;
-    touch(OsStr::new(&dest_name));
+    archive_generic_session_sources(
+        verified.ok_or("session transcript was not verified")?,
+        &path,
+        &session_id,
+        &home,
+        &trash_dir,
+    )?;
     // Where it came from, so restore can put it back rather than deduce a
     // destination. Deducing worked while every session was claude's and the
     // convention was known; a Codex rollout lives at
@@ -974,13 +967,6 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     //
     // Best-effort: a missing sidecar falls back to the old behaviour, which is
     // still right for everything trashed before this existed.
-    let origin_name = format!("{session_id}.origin");
-    if trash_dir
-        .write_atomic(OsStr::new(&origin_name), path.to_string_lossy().as_bytes())
-        .is_ok()
-    {
-        touch(OsStr::new(&origin_name));
-    }
     // A Codex conversation is spread across every rollout that shares its
     // session id, and the rename above only took the newest. Leaving the rest
     // means the next scan collapses them straight back into a row: the delete
@@ -990,13 +976,6 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     if backend.id() == "codex" {
         stash_codex_rollouts_verified(&session_id, &trash_dir, &home);
     }
-    let tasks = home.join(".claude/tasks").join(&session_id);
-    if let Ok(tasks_entry) = verified_directory_entry(&home.join(".claude/tasks"), &tasks) {
-        let _ = tasks_entry.rename_directory_to(
-            &trash_dir,
-            OsStr::new(&format!("{session_id}.tasks")),
-        );
-    }
     // Claude Code keeps a second, independent record of a session under
     // `~/.claude/jobs/<short>/`, and nothing there follows the transcript. Left
     // behind, it is a ghost: `claude agents` goes on listing a session you
@@ -1005,14 +984,53 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     //
     // It goes to the trash like everything else rather than being removed, so
     // a restore puts it back and nothing here is one-way.
-    if let Some(job) = find_job_dir(&home.join(".claude/jobs"), &session_id) {
-        if let Ok(job_entry) = verified_directory_entry(&home.join(".claude/jobs"), &job) {
-            let _ = job_entry.rename_directory_to(
-                &trash_dir,
-                OsStr::new(&format!("{session_id}.job")),
-            );
-        }
+    Ok(())
+}
+
+fn archive_generic_session_sources(
+    transcript: VerifiedSessionFile,
+    transcript_path: &Path,
+    session_id: &str,
+    home: &Path,
+    trash_dir: &VerifiedDirectory,
+) -> Result<(), String> {
+    let mut archive_entries = vec![(
+        transcript,
+        std::ffi::OsString::from(format!("{session_id}.jsonl")),
+    )];
+    let tasks_root = home.join(".claude/tasks");
+    let tasks = tasks_root.join(session_id);
+    match std::fs::symlink_metadata(&tasks) {
+        Ok(_) => archive_entries.push((
+            verified_directory_entry(&tasks_root, &tasks)?,
+            std::ffi::OsString::from(format!("{session_id}.tasks")),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect session task archive: {error}")),
     }
+    let jobs_root = home.join(".claude/jobs");
+    if let Some(job) = find_job_dir(&jobs_root, session_id) {
+        archive_entries.push((
+            verified_directory_entry(&jobs_root, &job)?,
+            std::ffi::OsString::from(format!("{session_id}.job")),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    archive_verified_entries_with_hooks(
+        trash_dir,
+        archive_entries,
+        ArchiveLimits::default(),
+        || {},
+        || Ok(()),
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    return Err("leased session archive operations require Linux".into());
+
+    let origin_name = format!("{session_id}.origin");
+    let _ = trash_dir.write_atomic(
+        OsStr::new(&origin_name),
+        transcript_path.to_string_lossy().as_bytes(),
+    );
     Ok(())
 }
 
@@ -3094,11 +3112,29 @@ fn restore_codex_rollouts(trash: &Path, session_id: &str) {
 fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
     let tasks_src = trash.join(format!("{session_id}.tasks"));
-    if tasks_src.is_dir() {
+    if tasks_src.is_file() {
+        let home_directory = VerifiedDirectory::open(&home)?;
+        let claude_directory = home_directory.create_directory(OsStr::new(".claude"))?;
+        let _tasks_directory = claude_directory.create_directory(OsStr::new("tasks"))?;
+        restore_sidecar_archive(
+            &tasks_src,
+            &home.join(".claude/tasks"),
+            OsStr::new(session_id),
+        )?;
+        std::fs::remove_file(&tasks_src).map_err(|error| error.to_string())?;
+    } else if tasks_src.is_dir() {
         let _ = std::fs::rename(&tasks_src, home.join(".claude/tasks").join(session_id));
     }
     let job_src = trash.join(format!("{session_id}.job"));
-    if job_src.is_dir() {
+    if job_src.is_file() {
+        let jobs = home.join(".claude/jobs");
+        let home_directory = VerifiedDirectory::open(&home)?;
+        let claude_directory = home_directory.create_directory(OsStr::new(".claude"))?;
+        let _jobs_directory = claude_directory.create_directory(OsStr::new("jobs"))?;
+        let restored_name = session_id.split('-').next().unwrap_or(session_id);
+        restore_sidecar_archive(&job_src, &jobs, OsStr::new(restored_name))?;
+        std::fs::remove_file(&job_src).map_err(|error| error.to_string())?;
+    } else if job_src.is_dir() {
         let jobs = home.join(".claude/jobs");
         let _ = std::fs::create_dir_all(&jobs);
         let _ = std::fs::rename(&job_src, jobs.join(job_dir_name(&job_src, session_id)));
@@ -3117,11 +3153,15 @@ fn trash_delete_sync(session_id: String) -> Result<(), String> {
     std::fs::remove_file(trash.join(format!("{session_id}.jsonl"))).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(trash.join(format!("{session_id}.origin")));
     let tasks = trash.join(format!("{session_id}.tasks"));
-    if tasks.is_dir() {
+    if tasks.is_file() {
+        let _ = std::fs::remove_file(tasks);
+    } else if tasks.is_dir() {
         let _ = std::fs::remove_dir_all(tasks);
     }
     let job = trash.join(format!("{session_id}.job"));
-    if job.is_dir() {
+    if job.is_file() {
+        let _ = std::fs::remove_file(job);
+    } else if job.is_dir() {
         let _ = std::fs::remove_dir_all(job);
     }
     // The rest of a Codex conversation goes with it — the entry that named
@@ -6081,6 +6121,120 @@ mod tests {
         assert!(source.is_dir());
         assert_eq!(std::fs::metadata(source.join("growing")).unwrap().len(), 9);
         assert_eq!(std::fs::read_dir(&trash_path).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_composition_propagates_sidecar_failure_before_hiding_the_transcript() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-archive-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let tasks_root = home.join(".claude/tasks");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&tasks_root).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "23232323-2323-4323-8323-232323232323";
+        let transcript = project.join(format!("{id}.jsonl"));
+        let tasks = tasks_root.join(id);
+        let outside = root.join("outside");
+        std::fs::write(&transcript, b"visible transcript").unwrap();
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(&outside, b"outside sentinel").unwrap();
+        symlink(&outside, tasks.join("unsafe-link")).unwrap();
+        let verified = verified_session_file("claude", &transcript, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_generic_session_sources(
+            verified,
+            &transcript,
+            id,
+            &home,
+            &trash,
+        )
+        .unwrap_err();
+        assert!(error.contains("symlink or special file"), "{error}");
+        assert_eq!(std::fs::read(&transcript).unwrap(), b"visible transcript");
+        assert!(tasks.is_dir());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
+        assert_eq!(std::fs::read_dir(&trash_path).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_composition_round_trips_main_tasks_and_job_as_bounded_archives() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-archive-roundtrip-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let tasks_root = home.join(".claude/tasks");
+        let jobs_root = home.join(".claude/jobs");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&tasks_root).unwrap();
+        std::fs::create_dir_all(&jobs_root).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "24242424-2424-4424-8424-242424242424";
+        let transcript = project.join(format!("{id}.jsonl"));
+        let tasks = tasks_root.join(id);
+        let job = jobs_root.join("24242424");
+        std::fs::write(&transcript, b"roundtrip transcript").unwrap();
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("task.json"), b"task data").unwrap();
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::write(
+            job.join("state.json"),
+            format!(r#"{{"sessionId":"{id}","daemonShort":"24242424"}}"#),
+        )
+        .unwrap();
+        let verified = verified_session_file("claude", &transcript, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        archive_generic_session_sources(verified, &transcript, id, &home, &trash).unwrap();
+        assert_eq!(
+            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
+            b"roundtrip transcript"
+        );
+        for suffix in ["tasks", "job"] {
+            let archive = trash_path.join(format!("{id}.{suffix}"));
+            assert!(archive.is_file());
+            assert!(std::fs::read(archive).unwrap().starts_with(SIDECAR_ARCHIVE_MAGIC));
+        }
+        assert!(!transcript.exists());
+        assert!(!tasks.exists());
+        assert!(!job.exists());
+
+        std::fs::rename(
+            trash_path.join(format!("{id}.jsonl")),
+            project.join(format!("{id}.jsonl")),
+        )
+        .unwrap();
+        restore_sidecar_archive(
+            &trash_path.join(format!("{id}.tasks")),
+            &tasks_root,
+            OsStr::new(id),
+        )
+        .unwrap();
+        restore_sidecar_archive(
+            &trash_path.join(format!("{id}.job")),
+            &jobs_root,
+            OsStr::new("24242424"),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(tasks.join("task.json")).unwrap(), b"task data");
+        assert!(std::fs::read(job.join("state.json"))
+            .unwrap()
+            .windows(id.len())
+            .any(|window| window == id.as_bytes()));
         std::fs::remove_dir_all(root).unwrap();
     }
 
