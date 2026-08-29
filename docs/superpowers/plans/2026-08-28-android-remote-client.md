@@ -10,6 +10,22 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-28-android-remote-client.md`
 
+## Execution status
+
+- Task 1 is complete: `54d9b6e`.
+- Task 2 is complete: `0c29627`, hardened by `7ae5246`.
+- Task 3 is complete: `779cfa7`.
+- Task 4 is complete: `2fc0b9c`.
+- Task 6 is complete: `fa9c4e2`, completed by `5d1dda9`.
+- Task 7 is complete: `9a05126`.
+- The Rust-owned-tabs and screen-diffs subplan is complete: typed protocol
+  `f548773`/`50452d8`; canonical screen `9ecb344`/`5d8339f`; tab ownership
+  `00dae84`/`6376fd9`/`cc18cc6`/`95aa81e`; desktop migration
+  `e530e3d`/`7fb3fc3`/`bc48ce7`; and screen-diff transport
+  `7fc57c4`/`83eea25`/`6d484b3`/`4a8547f`/`e28a597`/`e47bcea`/`a2bb863`.
+- Task 8 is in progress. Its untracked Android files remain outside this
+  completed desktop/protocol subplan.
+
 ## Global Constraints
 
 - Bind Remote Access only to an explicitly selected LAN/VPN address; it is disabled by default.
@@ -38,7 +54,7 @@
 - `android/app/src/main/java/com/adroited/aiterm/...` — Compose UI, pairing camera, keystore, client, terminal and view models.
 - `android/app/src/test/...`, `android/app/src/androidTest/...` — Kotlin unit and Compose UI tests.
 
-### Task 1: Establish protocol types and Rust service boundaries
+### Task 1: Establish protocol types and Rust service boundaries (complete: `54d9b6e`)
 
 **Files:**
 - Create: `src-tauri/src/remote/model.rs`
@@ -97,7 +113,7 @@ git add src-tauri/src/remote src-tauri/src/services src-tauri/src/lib.rs src-tau
 git commit -m "feat(remote): add validated protocol foundation"
 ```
 
-### Task 2: Build device enrollment and mutual authentication
+### Task 2: Build device enrollment and mutual authentication (complete: `0c29627`, `7ae5246`)
 
 **Files:**
 - Create: `src-tauri/src/remote/auth.rs`
@@ -143,7 +159,7 @@ git add src-tauri/src/remote/auth.rs src-tauri/tests/remote_auth.rs src-tauri/Ca
 git commit -m "feat(remote): add device pairing and revocation"
 ```
 
-### Task 3: Add TLS gateway and safe WebSocket framing
+### Task 3: Add TLS gateway and safe WebSocket framing (complete: `779cfa7`)
 
 **Files:**
 - Create: `src-tauri/src/remote/server.rs`
@@ -187,7 +203,7 @@ git add src-tauri/src/remote src-tauri/tests/remote_server.rs src-tauri/Cargo.to
 git commit -m "feat(remote): add pinned TLS websocket gateway"
 ```
 
-### Task 4: Stream desktop PTYs with opaque ids and input ownership
+### Task 4: Stream desktop PTYs with opaque ids and input ownership (complete: `2fc0b9c`)
 
 **Files:**
 - Create: `src-tauri/src/remote/terminal.rs`
@@ -276,7 +292,7 @@ git add src-tauri/src/services src-tauri/src/sessions.rs src-tauri/src/agents.rs
 git commit -m "feat(remote): share desktop session services with gateway"
 ```
 
-### Task 6: Add desktop Remote Access settings and QR/device controls
+### Task 6: Add desktop Remote Access settings and QR/device controls (complete: `fa9c4e2`, `5d1dda9`)
 
 **Files:**
 - Create: `src/components/RemoteAccessSettings.tsx`
@@ -317,7 +333,7 @@ git add src/components/RemoteAccessSettings.tsx src/components/RemoteAccessSetti
 git commit -m "feat(remote): manage phone pairing from desktop settings"
 ```
 
-### Task 7: Scaffold the signed native Android application
+### Task 7: Scaffold the signed native Android application (complete: `9a05126`)
 
 **Files:**
 - Create: `android/settings.gradle.kts`, `android/build.gradle.kts`, `android/app/build.gradle.kts`
@@ -359,7 +375,7 @@ git add android
 git commit -m "feat(android): scaffold native companion app"
 ```
 
-### Task 8: Implement QR enrollment, pinning, and biometric lock
+### Task 8: Implement QR enrollment, pinning, and biometric lock (in progress)
 
 **Files:**
 - Create: `android/app/src/main/java/com/adroited/aiterm/pairing/PairingRepository.kt`
@@ -406,19 +422,32 @@ git commit -m "feat(android): pair desktops with pinned device keys"
 
 **Files:**
 - Create: `android/app/src/main/java/com/adroited/aiterm/remote/RemoteClient.kt`
-- Create: `android/app/src/main/java/com/adroited/aiterm/terminal/TerminalSession.kt`
+- Create: `android/app/src/main/java/com/adroited/aiterm/terminal/TerminalScreenStore.kt`
 - Create: `android/app/src/main/java/com/adroited/aiterm/ui/TerminalScreen.kt`
 - Test: `android/app/src/test/java/com/adroited/aiterm/remote/RemoteClientTest.kt`
 - Test: `android/app/src/androidTest/java/com/adroited/aiterm/ui/TerminalScreenTest.kt`
 
 **Interfaces:**
-- Consumes authenticated protocol envelopes.
-- Produces session drawer state, terminal byte rendering, input ownership handling, resize and reconnect.
+- Consumes authenticated protocol envelopes, `ScreenSnapshot`, and `ScreenDiff`.
+- Produces session drawer state, typed screen replacement/application, input ownership handling, resize and snapshot recovery.
+
+```kotlin
+interface TerminalScreenStore {
+    val screen: StateFlow<ScreenSnapshot?>
+    fun replace(snapshot: ScreenSnapshot)
+    fun apply(diff: ScreenDiff): ApplyResult
+}
+
+sealed interface ApplyResult {
+    data object Applied : ApplyResult
+    data object NeedsSnapshot : ApplyResult
+}
+```
 
 - [ ] **Step 1: Write failing reconnection and focus tests**
 
 ```kotlin
-@Test fun reconnectRequestsReplayAfterLastAcknowledgedSequence() { /* event stream */ }
+@Test fun revisionMismatchRequestsSnapshotInsteadOfByteReplay() { /* screen diff stream */ }
 @Test fun inputNotOwned_keepsTerminalReadOnlyAndShowsTakeFocusAction() { /* server error */ }
 ```
 
@@ -430,7 +459,14 @@ Expected: FAIL because the remote client is absent.
 
 - [ ] **Step 3: Implement the native client and terminal**
 
-Decode CBOR only after connection proof succeeds, acknowledge terminal sequences, request replay/snapshot after reconnect, render raw bytes with a native terminal emulator, send resize/input through the broker, and provide the extra-key row. Display focus ownership and connection state without hiding terminal output.
+Decode CBOR only after connection proof succeeds. Reassemble each ordered
+row-boundary screen transfer before changing local state, replace the store
+from a complete `ScreenSnapshot`, and apply a `ScreenDiff` only when its base
+revision matches. `NeedsSnapshot` requests recovery; neither an incomplete
+transfer nor a historical PTY-byte replay may advance the screen. Render the
+typed screen state, send resize/input through the broker, and provide the
+extra-key row. Display focus ownership and connection state without hiding
+terminal output.
 
 - [ ] **Step 4: Run Android tests and manual interoperability smoke test**
 

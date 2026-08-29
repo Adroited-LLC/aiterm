@@ -88,6 +88,50 @@ Not oversights; each is a decision:
   visible to everyone attached.
 - Keep an agent running after the desktop app exits.
 
+## Rust terminal-screen verification
+
+The desktop remains the only PTY and terminal-emulator owner. It parses the
+canonical screen from the first PTY byte; the desktop attachment still receives
+the raw stream used by xterm.js, so this work does not change the desktop CSS,
+renderer, selection, paste, scrollback, or TUI overlay path.
+
+The transport has explicit bounds: 1..=512 columns and rows, 5,000
+scrollback rows, sub-1 MiB serialized frames/chunks split only at row
+boundaries, at most one coalesced diff per 16 ms, and a cell with one base
+scalar plus at most 32 combining scalars. Remote attachments receive complete
+snapshots and revisioned changed-row diffs. A revision mismatch, dropped
+queue, invalid/incomplete transfer, or reconnect requests a fresh snapshot;
+it never reconstructs the screen from historical PTY bytes.
+
+On 2026-08-29 the following fresh checks completed successfully:
+
+```text
+git diff --check && npm run test:ui && npm run build
+# 68 UI tests passed; production build completed.
+
+CARGO_TARGET_DIR=/tmp/aiterm-android-rust-target cargo test --lib \\
+  --test remote_protocol --test remote_auth --test remote_server \\
+  --test remote_terminal --test remote_desktop --test tab_registry \\
+  --test terminal_screen
+# exited 0; 390 library tests passed, with the selected protocol, gateway,
+# desktop, registry, and screen suites also passing.
+```
+
+`cargo test --test backend` is intentionally not run here: its integration
+fixture uses the real HOME and was ruled unsafe after the obsolete test caused
+destructive external-state damage. This is one blocked verification item, not
+a pass; earlier committed evidence recorded the safe backend fixture result as
+13/13. No HOME override is used to evade that constraint.
+
+The native manual smoke was limited to read-only observation. An existing
+`/usr/bin/aiterm` process was present, but KWin 6.7.4 is running Wayland and
+the available X11 window queries exposed only the Xwayland bridge, not an
+AITerm window. KDE Remote Control approval had previously blocked synthetic
+pointer/keyboard input, so no typing, paste, resize, focus transfer, or close
+action is claimed here. The automated gateway, focus, alternate-screen, and
+screen-recovery tests above are supporting evidence only; a person must still
+perform the interaction checklist below on an approved desktop/client.
+
 ## Manual test
 
 Requires a desktop and a phone on the same LAN or VPN.
