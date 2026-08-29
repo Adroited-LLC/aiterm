@@ -613,7 +613,7 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
     parse_session_from(File::open(path).ok()?, path, dir_cwd)
 }
 
-fn parse_session_from(file: File, path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
+fn parse_session_from(mut file: File, path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
     let meta = file.metadata().ok()?;
     if meta.len() == 0 {
         return None;
@@ -626,6 +626,10 @@ fn parse_session_from(file: File, path: &Path, dir_cwd: Option<&str>) -> Option<
         .as_millis() as u64;
 
     let id = path.file_stem()?.to_string_lossy().to_string();
+    // `try_clone` shares the open-file-description offset. Discovery first
+    // borrows a clone to find a project's cwd, so rewind the held descriptor
+    // before parsing the same exact object into its row.
+    file.seek(SeekFrom::Start(0)).ok()?;
     let reader = BufReader::new(file);
 
     let mut title: Option<String> = None;
@@ -1269,8 +1273,10 @@ impl VerifiedSessionFile {
         display_parent: std::path::PathBuf,
     ) -> Result<Self, String> {
         let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid session entry name")?;
-        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         if matches!(kind, VerifiedEntryKind::Directory) {
+            flags &= !libc::O_RDWR;
+            flags |= libc::O_RDONLY;
             flags |= libc::O_DIRECTORY;
         }
         let fd = unsafe { libc::openat(parent.as_raw_fd(), name_c.as_ptr(), flags) };
@@ -1332,7 +1338,6 @@ impl VerifiedSessionFile {
             let quarantine_name = format!(".aiterm-quarantine-{}", uuid::Uuid::new_v4());
             let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
             let quarantine_path = self.display_parent.join(&quarantine_name);
-            let source_path = self.display_parent.join(&self.name);
             before_quarantine();
             rename_noreplace(
                 self.parent.as_raw_fd(),
@@ -1345,80 +1350,21 @@ impl VerifiedSessionFile {
                 quarantine_path.display()
             ))?;
             after_quarantine();
-
-            let quarantined = self.open_named(&quarantine).map_err(|error| {
-                format!(
-                    "could not verify quarantined session entry at {}; the replacement was not moved: {error}",
-                    quarantine_path.display()
-                )
-            })?;
-            let same_identity = same_file_identity(&self.object, &quarantined).map_err(|error| {
-                format!(
-                    "could not compare quarantined session entry identity; object remains recoverable at {}: {error}",
-                    quarantine_path.display()
-                )
-            })?;
-            if !same_identity {
-                return match rename_noreplace(
-                    self.parent.as_raw_fd(),
-                    &quarantine,
-                    self.parent.as_raw_fd(),
-                    &source,
-                ) {
-                    Ok(()) => Err(format!(
-                        "session entry identity changed; unverified object restored from {} to {}",
-                        quarantine_path.display(),
-                        source_path.display()
-                    )),
-                    Err(error) => Err(format!(
-                        "session entry identity changed; unverified object remains recoverable at {} because {} is occupied: {error}",
-                        quarantine_path.display(),
-                        source_path.display()
-                    )),
-                };
-            }
-
             after_verification();
-
-            let destination_name = CString::new(name.as_bytes())
-                .map_err(|_| "invalid trash name")?;
-            if let Err(error) = rename_noreplace(
-                self.parent.as_raw_fd(),
-                &quarantine,
-                destination.file.as_raw_fd(),
-                &destination_name,
-            ) {
-                return match rename_noreplace(
-                    self.parent.as_raw_fd(),
-                    &quarantine,
-                    self.parent.as_raw_fd(),
-                    &source,
-                ) {
-                    Ok(()) => Err(format!(
-                        "could not move verified session entry to trash; restored from {} to {}: {error}",
-                        quarantine_path.display(),
-                        source_path.display()
-                    )),
-                    Err(restore_error) => Err(format!(
-                        "could not move verified session entry to trash; exact object remains recoverable at {}: {error}; restore failed: {restore_error}",
-                        quarantine_path.display()
-                    )),
-                };
+            match self.kind {
+                VerifiedEntryKind::File => archive_exact_file(
+                    &self.object,
+                    destination,
+                    name,
+                    &quarantine_path,
+                ),
+                VerifiedEntryKind::Directory => archive_exact_directory(
+                    &self.object,
+                    destination,
+                    name,
+                    &quarantine_path,
+                ),
             }
-            Ok(())
-        }
-    }
-
-    fn open_named(&self, name: &CString) -> Result<File, String> {
-        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        if matches!(self.kind, VerifiedEntryKind::Directory) {
-            flags |= libc::O_DIRECTORY;
-        }
-        let fd = unsafe { libc::openat(self.parent.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            Err(std::io::Error::last_os_error().to_string())
-        } else {
-            Ok(unsafe { File::from_raw_fd(fd) })
         }
     }
 
@@ -1450,6 +1396,415 @@ impl VerifiedSessionFile {
 }
 
 #[cfg(target_os = "linux")]
+const MAX_EXACT_ARCHIVE_ENTRIES: usize = 512;
+#[cfg(target_os = "linux")]
+const MAX_EXACT_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+struct ExactFileRetirement {
+    source: File,
+    size: u64,
+    modified: std::time::SystemTime,
+    hash: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+fn hash_exact_file(file: &File) -> Result<([u8; 32], u64), String> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::FileExt;
+
+    let mut digest = Sha256::new();
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read_at(&mut buffer, offset)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or("session archive size overflow")?;
+    }
+    Ok((digest.finalize().into(), offset))
+}
+
+#[cfg(target_os = "linux")]
+fn create_exact_archive_file(
+    directory: &File,
+    name: &CString,
+    mode: u32,
+) -> Result<File, String> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC,
+            mode as libc::mode_t,
+        )
+    };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn copy_exact_file(
+    source: &File,
+    destination_directory: &File,
+    destination_name: &CString,
+) -> Result<ExactFileRetirement, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+
+    let before = source.metadata().map_err(|error| error.to_string())?;
+    if !before.is_file() {
+        return Err("exact archive source is not a regular file".into());
+    }
+    let modified = before.modified().map_err(|error| error.to_string())?;
+    let mut destination = create_exact_archive_file(
+        destination_directory,
+        destination_name,
+        before.mode() & 0o7777,
+    )?;
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source
+            .read_at(&mut buffer, offset)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or("session archive size overflow")?;
+    }
+    let after = source.metadata().map_err(|error| error.to_string())?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || offset != before.len()
+    {
+        return Err("session changed while its exact archive was copied".into());
+    }
+    destination
+        .set_permissions(std::fs::Permissions::from_mode(before.mode() & 0o7777))
+        .map_err(|error| error.to_string())?;
+    destination
+        .set_modified(modified)
+        .map_err(|error| error.to_string())?;
+    destination.sync_all().map_err(|error| error.to_string())?;
+    let (source_hash, source_size) = hash_exact_file(source)?;
+    let (destination_hash, destination_size) = hash_exact_file(&destination)?;
+    if source_hash != destination_hash
+        || source_size != destination_size
+        || source_size != before.len()
+    {
+        return Err("durable trash copy does not match the held session object".into());
+    }
+    Ok(ExactFileRetirement {
+        source: source.try_clone().map_err(|error| error.to_string())?,
+        size: source_size,
+        modified,
+        hash: source_hash,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn verify_exact_file(retirement: &ExactFileRetirement) -> Result<(), String> {
+    let metadata = retirement
+        .source
+        .metadata()
+        .map_err(|error| error.to_string())?;
+    let (hash, size) = hash_exact_file(&retirement.source)?;
+    if size != retirement.size
+        || metadata.len() != retirement.size
+        || metadata.modified().ok() != Some(retirement.modified)
+        || hash != retirement.hash
+    {
+        Err("held session object changed after its durable trash copy".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn retire_exact_files(retirements: &[ExactFileRetirement]) -> Result<(), String> {
+    for retirement in retirements {
+        verify_exact_file(retirement)?;
+    }
+    for retirement in retirements {
+        retirement
+            .source
+            .set_len(0)
+            .map_err(|error| error.to_string())?;
+        retirement
+            .source
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn archive_exact_file(
+    source: &File,
+    destination: &VerifiedDirectory,
+    name: &OsStr,
+    quarantine_path: &Path,
+) -> Result<(), String> {
+    let temporary_name = format!(".aiterm-exact-archive-{}", uuid::Uuid::new_v4());
+    let temporary = CString::new(temporary_name.as_bytes()).unwrap();
+    let final_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash name")?;
+    let retirement = copy_exact_file(source, &destination.file, &temporary).map_err(|error| {
+        format!(
+            "could not create exact trash copy; source remains recoverable at {}: {error}",
+            quarantine_path.display()
+        )
+    })?;
+    verify_exact_file(&retirement)?;
+    rename_noreplace(
+        destination.file.as_raw_fd(),
+        &temporary,
+        destination.file.as_raw_fd(),
+        &final_name,
+    )
+    .map_err(|error| {
+        format!(
+            "could not publish exact trash copy; source remains recoverable at {} and copy at {}: {error}",
+            quarantine_path.display(),
+            temporary_name
+        )
+    })?;
+    destination
+        .file
+        .sync_all()
+        .map_err(|error| format!("could not make exact trash copy durable: {error}"))?;
+    retire_exact_files(&[retirement]).map_err(|error| {
+        format!(
+            "durable trash copy exists but exact source remains at {}: {error}",
+            quarantine_path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn directory_entry_names(directory: &File) -> Result<Vec<std::ffi::OsString>, String> {
+    let cloned = directory.try_clone().map_err(|error| error.to_string())?;
+    let raw = std::os::fd::IntoRawFd::into_raw_fd(cloned);
+    let stream = unsafe { libc::fdopendir(raw) };
+    if stream.is_null() {
+        unsafe { libc::close(raw) };
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(OsStr::from_bytes(name.to_bytes()).to_os_string());
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
+fn create_exact_archive_directory(parent: &File, name: &CString) -> Result<File, String> {
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error().to_string())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn copy_exact_directory_tree(
+    source: &File,
+    destination: &File,
+    depth: usize,
+    entries: &mut usize,
+    bytes: &mut u64,
+    retirements: &mut Vec<ExactFileRetirement>,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if depth > MAX_SESSION_DISCOVERY_DEPTH {
+        return Err("session sidecar archive exceeds maximum depth".into());
+    }
+    let source_metadata = source.metadata().map_err(|error| error.to_string())?;
+    for name in directory_entry_names(source)? {
+        *entries = entries
+            .checked_add(1)
+            .ok_or("session sidecar entry count overflow")?;
+        if *entries > MAX_EXACT_ARCHIVE_ENTRIES {
+            return Err("session sidecar archive exceeds entry limit".into());
+        }
+        let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid sidecar entry name")?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                source.as_raw_fd(),
+                name_c.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let stat = unsafe { stat.assume_init() };
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                let descriptor = unsafe {
+                    libc::openat(
+                        source.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if descriptor < 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                let file = unsafe { File::from_raw_fd(descriptor) };
+                *bytes = bytes
+                    .checked_add(file.metadata().map_err(|error| error.to_string())?.len())
+                    .ok_or("session sidecar byte count overflow")?;
+                if *bytes > MAX_EXACT_ARCHIVE_BYTES {
+                    return Err("session sidecar archive exceeds byte limit".into());
+                }
+                retirements.push(copy_exact_file(&file, destination, &name_c)?);
+            }
+            libc::S_IFDIR => {
+                let descriptor = unsafe {
+                    libc::openat(
+                        source.as_raw_fd(),
+                        name_c.as_ptr(),
+                        libc::O_RDONLY
+                            | libc::O_DIRECTORY
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                    )
+                };
+                if descriptor < 0 {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                let child_source = unsafe { File::from_raw_fd(descriptor) };
+                let child_destination = create_exact_archive_directory(destination, &name_c)?;
+                copy_exact_directory_tree(
+                    &child_source,
+                    &child_destination,
+                    depth + 1,
+                    entries,
+                    bytes,
+                    retirements,
+                )?;
+                let child_metadata = child_source.metadata().map_err(|error| error.to_string())?;
+                child_destination
+                    .set_permissions(std::fs::Permissions::from_mode(
+                        child_metadata.mode() & 0o7777,
+                    ))
+                    .map_err(|error| error.to_string())?;
+                if let Ok(modified) = child_metadata.modified() {
+                    child_destination
+                        .set_modified(modified)
+                        .map_err(|error| error.to_string())?;
+                }
+                child_destination.sync_all().map_err(|error| error.to_string())?;
+            }
+            _ => return Err("session sidecar contains a symlink or special file".into()),
+        }
+    }
+    destination
+        .set_permissions(std::fs::Permissions::from_mode(
+            source_metadata.mode() & 0o7777,
+        ))
+        .map_err(|error| error.to_string())?;
+    if let Ok(modified) = source_metadata.modified() {
+        destination
+            .set_modified(modified)
+            .map_err(|error| error.to_string())?;
+    }
+    destination.sync_all().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn archive_exact_directory(
+    source: &File,
+    destination: &VerifiedDirectory,
+    name: &OsStr,
+    quarantine_path: &Path,
+) -> Result<(), String> {
+    let temporary_name = format!(".aiterm-exact-directory-{}", uuid::Uuid::new_v4());
+    let temporary = CString::new(temporary_name.as_bytes()).unwrap();
+    let final_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash directory name")?;
+    let temporary_directory = create_exact_archive_directory(&destination.file, &temporary)
+        .map_err(|error| format!("could not create sidecar archive: {error}"))?;
+    let mut entries = 0usize;
+    let mut bytes = 0u64;
+    let mut retirements = Vec::new();
+    copy_exact_directory_tree(
+        source,
+        &temporary_directory,
+        0,
+        &mut entries,
+        &mut bytes,
+        &mut retirements,
+    )
+    .map_err(|error| {
+        format!(
+            "could not create bounded exact sidecar archive; source remains at {} and partial copy at {}: {error}",
+            quarantine_path.display(),
+            temporary_name
+        )
+    })?;
+    for retirement in &retirements {
+        verify_exact_file(retirement)?;
+    }
+    rename_noreplace(
+        destination.file.as_raw_fd(),
+        &temporary,
+        destination.file.as_raw_fd(),
+        &final_name,
+    )
+    .map_err(|error| format!("could not publish exact sidecar archive: {error}"))?;
+    destination
+        .file
+        .sync_all()
+        .map_err(|error| format!("could not make exact sidecar archive durable: {error}"))?;
+    retire_exact_files(&retirements).map_err(|error| {
+        format!(
+            "durable sidecar archive exists but exact source remains at {}: {error}",
+            quarantine_path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn rename_noreplace(
     old_dir: std::os::fd::RawFd,
     old_name: &CString,
@@ -1470,14 +1825,6 @@ fn rename_noreplace(
     } else {
         Err(std::io::Error::last_os_error().to_string())
     }
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &File, right: &File) -> Result<bool, String> {
-    use std::os::unix::fs::MetadataExt;
-    let left = left.metadata().map_err(|e| e.to_string())?;
-    let right = right.metadata().map_err(|e| e.to_string())?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
 #[cfg(unix)]
@@ -4076,10 +4423,11 @@ mod tests {
         let project = outside.join("project");
         std::fs::create_dir_all(&project).unwrap();
         let id = "34343434-3434-4434-8434-343434343434";
+        let transcript = project.join(format!("{id}.jsonl"));
         std::fs::write(
-            project.join(format!("{id}.jsonl")),
+            &transcript,
             format!(
-                "{{\"type\":\"user\",\"uuid\":\"first\",\"sessionId\":\"{id}\",\"cwd\":\"/workspace/project\",\"message\":{{\"content\":\"outside sentinel\"}}}}\n"
+                "{{\"type\":\"user\",\"uuid\":\"first\",\"sessionId\":\"{id}\",\"cwd\":\"/workspace/project\",\"message\":{{\"role\":\"user\",\"content\":\"outside sentinel\"}}}}\n"
             ),
         )
         .unwrap();
@@ -4090,6 +4438,46 @@ mod tests {
         assert!(scan_claude_root_bounded(&linked_root, &mut budget).is_empty());
         assert_eq!(budget.remaining(), MAX_DISCOVERED_SESSION_FILES);
         assert!(project.join(format!("{id}.jsonl")).exists());
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_archive_tombstones_do_not_consume_the_discovery_file_budget() {
+        let fixture = std::env::temp_dir().join(format!(
+            "aiterm-claude-discovery-tombstone-budget-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let project = fixture.join("projects/project");
+        std::fs::create_dir_all(&project).unwrap();
+        for index in 0..=MAX_DISCOVERED_SESSION_FILES {
+            std::fs::write(
+                project.join(format!(".aiterm-quarantine-{index:08x}")),
+                b"",
+            )
+            .unwrap();
+        }
+        let id = "35353535-3535-4535-8535-353535353535";
+        let transcript = project.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"first\",\"sessionId\":\"{id}\",\"cwd\":\"/workspace/project\",\"message\":{{\"role\":\"user\",\"content\":\"real session\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        assert!(parse_session(&transcript, None).is_some());
+
+        let mut budget = DiscoveryBudget::new();
+        let sessions = scan_claude_root_bounded(&fixture.join("projects"), &mut budget);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "remaining discovery budget: {}",
+            budget.remaining()
+        );
+        assert_eq!(sessions[0].0.id, id);
+        assert_eq!(budget.remaining(), MAX_DISCOVERED_SESSION_FILES - 1);
         std::fs::remove_dir_all(fixture).unwrap();
     }
 
@@ -4153,7 +4541,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exact_inode_trash_refuses_and_restores_a_swapped_leaf() {
+    fn exact_inode_trash_archives_the_held_object_when_source_is_swapped() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-production-session-leaf-swap-{}",
             uuid::Uuid::new_v4()
@@ -4181,23 +4569,31 @@ mod tests {
             || {},
         );
 
-        assert!(result.is_err());
-        assert_eq!(std::fs::read(&source).unwrap(), b"unverified replacement");
+        result.unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&original_elsewhere).unwrap(), b"");
         assert_eq!(
-            std::fs::read(&original_elsewhere).unwrap(),
+            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
             b"verified original"
         );
-        assert!(!trash_path.join(format!("{id}.jsonl")).exists());
-        assert!(std::fs::read_dir(&project)
+        let quarantine = std::fs::read_dir(&project)
             .unwrap()
             .flatten()
-            .all(|entry| !entry.file_name().to_string_lossy().contains(".aiterm-quarantine-")));
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".aiterm-quarantine-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(quarantine).unwrap(), b"unverified replacement");
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn exact_inode_trash_keeps_a_mismatched_leaf_recoverable_when_restore_is_occupied() {
+    fn exact_inode_trash_never_mutates_a_swapped_leaf_or_new_source_occupant() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-production-session-quarantine-fallback-{}",
             uuid::Uuid::new_v4()
@@ -4214,7 +4610,7 @@ mod tests {
         let verified = verified_session_file("claude", &source, &home).unwrap();
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
 
-        let error = verified
+        verified
             .rename_to_with_hooks(
                 &trash,
                 OsStr::new(&format!("{id}.jsonl")),
@@ -4227,7 +4623,7 @@ mod tests {
                 },
                 || {},
             )
-            .unwrap_err();
+            .unwrap();
 
         let quarantine = std::fs::read_dir(&project)
             .unwrap()
@@ -4237,12 +4633,11 @@ mod tests {
             .path();
         assert_eq!(std::fs::read(&source).unwrap(), b"new source occupant");
         assert_eq!(std::fs::read(&quarantine).unwrap(), b"unverified replacement");
-        assert!(error.contains(&quarantine.to_string_lossy().to_string()));
-        assert!(!trash_path.join(format!("{id}.jsonl")).exists());
         assert_eq!(
-            std::fs::read(&original_elsewhere).unwrap(),
+            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
             b"verified original"
         );
+        assert_eq!(std::fs::read(&original_elsewhere).unwrap(), b"");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4271,7 +4666,7 @@ mod tests {
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
         let quarantine_path = RefCell::new(None);
 
-        let error = verified
+        verified
             .rename_to_with_hooks(
                 &trash,
                 OsStr::new(&format!("{id}.jsonl")),
@@ -4294,18 +4689,20 @@ mod tests {
                 },
                 || {},
             )
-            .unwrap_err();
+            .unwrap();
 
         let quarantine = quarantine_path.into_inner().unwrap();
-        assert!(error.contains(&quarantine.to_string_lossy().to_string()));
         assert!(std::fs::symlink_metadata(&quarantine)
             .unwrap()
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
-        assert_eq!(std::fs::read(&held_original).unwrap(), b"verified original");
+        assert_eq!(std::fs::read(&held_original).unwrap(), b"");
         assert!(!source.exists());
-        assert!(!trash_path.join(format!("{id}.jsonl")).exists());
+        assert_eq!(
+            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
+            b"verified original"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
