@@ -52,6 +52,7 @@ class RemoteClientTest {
             scope = backgroundScope,
             dispatcher = StandardTestDispatcher(testScheduler),
         )
+        client.connect()
         client.acceptForTest(RemoteServerEvent.TransferStarted("transfer-1"))
         client.lock()
 

@@ -41,7 +41,7 @@ class TerminalScreenStoreTest {
         )
 
         assertEquals(ApplyResult.Applied, result)
-        assertEquals(8, store.screen.value?.revision)
+        assertEquals(8L, store.screen.value?.revision)
         assertEquals("done", store.screen.value?.visible?.single()?.plainText())
         assertEquals(4, store.screen.value?.cursor?.col)
     }
