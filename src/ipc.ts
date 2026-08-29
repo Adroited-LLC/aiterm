@@ -954,3 +954,83 @@ export const diagLogTail = (lines: number) => invoke<string>("diag_log_tail", { 
 /** Build, desktop and which agents aiterm can see — the first questions of any
  *  "it is behaving oddly" conversation, answered without a scavenger hunt. */
 export const diagEnvironment = () => invoke<[string, string][]>("diag_environment");
+
+/* ---- the librarian: names, tags and threads written by a small model ---- */
+
+/** What the librarian wrote about one session — see `librarian.rs`. */
+export interface LibEntry {
+  name: string;
+  tags: string[];
+  /** Id into `LibStore.threads`; "" for a session filed under no thread. */
+  thread: string;
+  summary: string;
+  next: string;
+  /** The session's `last_active` when this was written. */
+  seen: number;
+  at: number;
+  model: string;
+  /** Tags the person set by hand — kept apart from the model's, and shown
+   *  to it as facts. */
+  user_tags: string[];
+}
+export interface LibThread {
+  name: string;
+  description: string;
+  tags: string[];
+  created: number;
+  user_tags: string[];
+}
+export interface LibStore {
+  sessions: Record<string, LibEntry>;
+  threads: Record<string, LibThread>;
+  spent: number;
+  /** How many sessions the store held at the last tidy — see `librarianTidy`. */
+  tidied_sessions: number;
+  tidied_at: number;
+}
+export interface LibTidyReport {
+  threads_before: number;
+  threads_after: number;
+  filed: number;
+  cost: number;
+}
+export interface LibRunReport {
+  done: number;
+  remaining: number;
+  cost: number;
+  errors: string[];
+}
+export const EMPTY_LIB: LibStore = { sessions: {}, threads: {}, spent: 0, tidied_sessions: 0, tidied_at: 0 };
+
+export const librarianState = () => invoke<LibStore>("librarian_state");
+/** Mirrors `librarian::Engine`. */
+export type LibEngine =
+  | { kind: "api"; providerId: string; model: string }
+  | { kind: "cli"; agent: string; model: string | null };
+export const librarianRun = (
+  engine: LibEngine, sessions: { id: string; lastActive: number }[], max: number, prompt: string | null,
+) => invoke<LibRunReport>("librarian_run", { engine, sessions, max, prompt });
+/** Where the librarian runs the CLIs — a transcript one of them keeps in
+ *  print mode lands here, and the session list skips it. Kept in step with
+ *  `lib_dir()` in `librarian.rs`. */
+export const LIBRARIAN_DIR_SUFFIX = "/.config/aiterm/librarian";
+/** The second pass: one look at every thread and session, and the final
+ *  organisation — threads that are the same work merged, loose sessions
+ *  filed. Run after a catalogue run, and on demand. */
+export const librarianTidy = (engine: LibEngine, prompt: string | null) =>
+  invoke<LibTidyReport>("librarian_tidy", { engine, prompt });
+/** The system prompts as shipped — what the editor shows, and resets to. */
+export const librarianDefaultPrompts = () =>
+  invoke<{ catalogue: string; tidy: string }>("librarian_default_prompts");
+export const librarianForget = () => invoke<void>("librarian_forget");
+export const librarianRenameThread = (id: string, name: string) =>
+  invoke<void>("librarian_rename_thread", { id, name });
+/** Set or clear one hand-set tag on a thread or a session. */
+export const librarianTag = (target: { kind: "thread" | "session"; id: string }, tag: string, on: boolean) =>
+  invoke<void>("librarian_tag", { target, tag, on });
+
+/** A session's conversation as ordered (role, text) turns — what a second
+ *  agent is handed when brought in. Trimmed from the front to `maxChars`,
+ *  the opening ask kept. */
+export const sessionConversation = (sessionId: string, maxChars: number) =>
+  invoke<[string, string][]>("session_conversation", { sessionId, maxChars });
