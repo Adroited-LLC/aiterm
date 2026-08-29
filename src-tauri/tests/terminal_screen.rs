@@ -1,4 +1,4 @@
-use aiterm_lib::remote::model::TerminalSize;
+use aiterm_lib::remote::model::{encode_terminal_frame, TerminalSize};
 use aiterm_lib::terminal::model::{
     CellAttributes, CursorState, Revision, RowPatch, ScreenApplyError, ScreenCell, ScreenDiff,
     ScreenRow, ScreenSnapshot, TerminalColor, TerminalModes,
@@ -245,6 +245,30 @@ fn screen_model_damage_applied_to_previous_snapshot_equals_a_fresh_snapshot() {
 }
 
 #[test]
+fn screen_model_scroll_damage_applied_to_a_client_equals_a_fresh_viewport() {
+    let mut screen = ScreenModel::new(size(8, 2));
+    screen.process(b"one\r\ntwo");
+    let mut client = screen.snapshot(tab());
+
+    let damage = screen.process(b"\r\nthree");
+    client
+        .apply(damage.diff.expect("scrolling damages the viewport"))
+        .expect("scroll damage follows the client's revision");
+
+    assert_eq!(client, screen.snapshot(tab()));
+    assert!(client.scrollback().is_empty());
+    assert_eq!(visible_text(&client), vec!["two", "three"]);
+    assert_eq!(
+        screen
+            .scrollback_page(0, 1)
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>(),
+        vec!["one"]
+    );
+}
+
+#[test]
 fn screen_model_preserves_rgb_and_indexed_colors() {
     let mut screen = ScreenModel::new(size(8, 2));
     screen.process(b"\x1b[38;2;1;2;3mR\x1b[0m\x1b[48;5;42mI");
@@ -256,6 +280,22 @@ fn screen_model_preserves_rgb_and_indexed_colors() {
         &TerminalColor::Rgb { r: 1, g: 2, b: 3 }
     );
     assert_eq!(cells[1].background(), &TerminalColor::Indexed(42));
+}
+
+#[test]
+fn screen_model_maps_adapter_level_attribute_flags() {
+    let mut screen = ScreenModel::new(size(8, 2));
+    screen.process(b"\x1b[1;2;3;4;7;8;9mX");
+    let snapshot = screen.snapshot(tab());
+    let attributes = snapshot.visible()[0].cells()[0].attributes();
+
+    assert!(attributes.bold());
+    assert!(attributes.faint());
+    assert!(attributes.italic());
+    assert!(attributes.underline());
+    assert!(attributes.inverse());
+    assert!(attributes.hidden());
+    assert!(attributes.strikethrough());
 }
 
 #[test]
@@ -305,15 +345,13 @@ fn screen_model_resize_reflows_wrapped_content() {
 
     assert_eq!((snapshot.cols(), snapshot.rows()), (4, 3));
     assert_eq!(visible_text(&snapshot), vec!["efgh", "i", ""]);
+    assert!(snapshot.scrollback().is_empty());
+    let history = screen.scrollback_page(0, 1);
     assert_eq!(
-        snapshot
-            .scrollback()
-            .iter()
-            .map(row_text)
-            .collect::<Vec<_>>(),
+        history.iter().map(row_text).collect::<Vec<_>>(),
         vec!["abcd"]
     );
-    assert!(snapshot.scrollback()[0].wrapped());
+    assert!(history[0].wrapped());
     assert!(snapshot.visible()[0].wrapped());
 }
 
@@ -324,6 +362,28 @@ fn screen_model_emits_title_and_bell_metadata() {
 
     assert_eq!(damage.title.as_deref(), Some("build log"));
     assert!(damage.bell);
+}
+
+#[test]
+fn screen_model_reset_title_is_an_explicit_empty_title_update() {
+    let mut screen = ScreenModel::new(size(8, 2));
+    screen.process(b"\x1b[22;0t\x1b]2;temporary\x07");
+    let damage = screen.process(b"\x1b[23;0t");
+
+    assert_eq!(damage.title.as_deref(), Some(""));
+}
+
+#[test]
+fn screen_model_rejects_clipboard_events_without_leaking_a_reply() {
+    let mut screen = ScreenModel::new(size(8, 2));
+    let clipboard = screen.process(b"\x1b]52;c;c2VjcmV0\x07");
+
+    assert!(clipboard.replies.is_empty());
+    assert!(clipboard.title.is_none());
+    assert!(!clipboard.bell);
+
+    let query = screen.process(b"\x1b[c");
+    assert_eq!(query.replies, vec![b"\x1b[?6c".to_vec()]);
 }
 
 #[test]
@@ -375,9 +435,63 @@ fn screen_model_collects_terminal_query_replies() {
 }
 
 #[test]
+fn screen_model_only_answers_queries_with_adapter_owned_data() {
+    let mut screen = ScreenModel::new(size(8, 2));
+    let damage = screen.process(b"\x1b]10;?\x07\x1b[14t\x1b[18t\x1b[c");
+
+    assert_eq!(
+        damage.replies,
+        vec![b"\x1b[8;2;8t".to_vec(), b"\x1b[?6c".to_vec()]
+    );
+}
+
+#[test]
+fn screen_model_bounds_combining_content_so_one_max_width_row_encodes() {
+    let mut screen = ScreenModel::new(size(512, 1));
+    let _client = screen.snapshot(tab());
+    let mut output = String::with_capacity(512 * 4_097);
+    for _ in 0..512 {
+        output.push('x');
+        for _ in 0..2_048 {
+            output.push('\u{e0100}');
+        }
+    }
+
+    let damage = screen.process(output.as_bytes());
+    let diff = damage.diff.expect("the populated row is damaged");
+    assert!(diff
+        .rows()
+        .iter()
+        .flat_map(|patch| patch.content().cells())
+        .all(|cell| cell.text().chars().count() <= 33));
+    encode_terminal_frame(&diff).expect("a row-granular diff must fit one typed frame");
+}
+
+#[test]
+fn screen_model_resize_advances_revision_and_requires_snapshot_recovery() {
+    let mut screen = ScreenModel::new(size(8, 2));
+    screen.process(b"before");
+    let before = screen.snapshot(tab());
+
+    let damage = screen.resize(size(4, 3));
+    assert!(damage.diff.is_none());
+    let mut recovered = screen.snapshot(tab());
+    assert!(recovered.revision().0 > before.revision().0);
+    assert_eq!((recovered.cols(), recovered.rows()), (4, 3));
+
+    let damage = screen.process(b"after");
+    recovered
+        .apply(damage.diff.expect("post-resize output produces a diff"))
+        .expect("post-resize diff follows the recovery snapshot");
+    assert_eq!(recovered, screen.snapshot(tab()));
+}
+
+#[test]
 fn screen_model_handles_ten_thousand_deterministic_byte_and_resize_operations() {
     let mut screen = ScreenModel::new(size(80, 24));
+    let mut client = screen.snapshot(tab());
     let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    let mut encoded_single_row_diffs = 0;
 
     for operation in 0..10_000 {
         state ^= state << 13;
@@ -386,16 +500,34 @@ fn screen_model_handles_ten_thousand_deterministic_byte_and_resize_operations() 
         if operation % 97 == 0 {
             let cols = ((state & 0x1ff) as u16).clamp(1, 512);
             let rows = (((state >> 9) & 0x1ff) as u16).clamp(1, 512);
-            screen.resize(size(cols, rows));
+            let damage = screen.resize(size(cols, rows));
+            assert!(damage.diff.is_none());
+            client = screen.snapshot(tab());
         } else {
-            screen.process(&[(state & 0xff) as u8]);
+            let damage = screen.process(&[(state & 0xff) as u8]);
+            if let Some(diff) = damage.diff {
+                if diff.rows().len() == 1 {
+                    encode_terminal_frame(&diff)
+                        .expect("a row-granular ordinary diff must fit one typed frame");
+                    encoded_single_row_diffs += 1;
+                }
+                client
+                    .apply(diff)
+                    .expect("live damage follows the client revision");
+            }
+        }
+
+        if operation % 211 == 0 {
+            assert_eq!(client, screen.snapshot(tab()));
         }
     }
 
     let snapshot = screen.snapshot(tab());
+    assert_eq!(client, snapshot);
     assert!((1..=512).contains(&snapshot.cols()));
     assert!((1..=512).contains(&snapshot.rows()));
-    assert!(snapshot.scrollback().len() <= 5_000);
+    assert!(snapshot.scrollback().is_empty());
+    assert!(encoded_single_row_diffs > 0);
 }
 
 #[test]

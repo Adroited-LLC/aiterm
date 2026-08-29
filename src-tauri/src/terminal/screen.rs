@@ -17,6 +17,8 @@ use crate::terminal::model::{
 };
 use crate::terminal::MAX_SCROLLBACK_ROWS;
 
+const MAX_COMBINING_SCALARS_PER_CELL: usize = 32;
+
 pub struct ScreenDamage {
     pub diff: Option<ScreenDiff>,
     pub replies: Vec<Vec<u8>>,
@@ -130,7 +132,7 @@ impl ScreenModel {
             self.revision,
             self.size,
             self.visible_rows(),
-            self.scrollback_page(0, MAX_SCROLLBACK_ROWS),
+            Vec::new(),
             cursor_state(&self.term),
             terminal_modes(&self.term),
         )
@@ -252,7 +254,9 @@ fn row_from_grid(term: &Term<ScreenEvents>, line: Line) -> ScreenRow {
 fn regular_cell(cell: &Cell, width: u8) -> ScreenCell {
     let mut text = cell.c.to_string();
     if let Some(zerowidth) = cell.zerowidth() {
-        text.extend(zerowidth);
+        for scalar in zerowidth.iter().take(MAX_COMBINING_SCALARS_PER_CELL) {
+            text.push(*scalar);
+        }
     }
 
     ScreenCell::try_new(
