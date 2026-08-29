@@ -2,7 +2,7 @@
  * The centre pane when nothing is open: a home screen, not a blank.
  *
  * What it answers, in the order someone arriving asks: what do I start
- * (the engine picker, centred and large, with the way to add a model beside
+ * (the engine picker, centred and compact, with the way to add a model beside
  * it); what was I doing (recent sessions, one click back in); is anything
  * waiting on me (sessions blocked on input); where do I work (projects by
  * activity, one click to a shell there). Usage is not here — the strip in
@@ -81,13 +81,13 @@ export default function HomeDashboard({
             <div className="home-empty">No sessions yet — start one above.</div>
           ) : (
             <div className="home-list">
-              {recent.slice(0, 8).map((s) => {
+              {recent.slice(0, 6).map((s) => {
                 const tint = agentTint(s.agent);
                 const live = liveIds.has(s.id);
                 return (
                   <div key={s.id} className="home-row" onClick={() => onSelect(s)} title={s.title}>
                     <span className={"home-badge" + tint.className} style={tint.style}>
-                      <AgentIcon agent={s.agent} size={15} />
+                      <AgentIcon agent={s.agent} size={13} />
                       {live && <span className="live-dot badge-dot" />}
                     </span>
                     <span className="home-row-text">
