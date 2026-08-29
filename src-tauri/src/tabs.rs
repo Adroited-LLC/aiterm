@@ -777,7 +777,7 @@ impl TabRegistry {
     pub fn open(&self, launch: TabLaunch) -> Result<TabId, TabError> {
         let id = TabId::new();
         let slot_id = launch.slot_id.clone();
-        let desktop_authoritative = launch.desktop_pending;
+        let desktop_open = launch.desktop_pending;
         {
             let mut maps = self.inner.maps.lock().unwrap();
             if maps.by_slot.contains_key(&slot_id) || maps.pending_slots.contains_key(&slot_id) {
@@ -823,11 +823,10 @@ impl TabRegistry {
                 screen: ScreenModel::new(launch.size),
                 pty: PtyBinding::Pending,
                 attachments: HashMap::new(),
-                desktop_authoritative,
                 pending_replies: VecDeque::new(),
                 exit_notified: false,
             }),
-            raw: RawDispatch::new(desktop_authoritative, self.inner.queue_capacity),
+            raw: RawDispatch::new(desktop_open, self.inner.queue_capacity),
         });
 
         let sink = Arc::new(TabSink {
@@ -1756,9 +1755,6 @@ struct LiveTab {
     screen: ScreenModel,
     pty: PtyBinding,
     attachments: HashMap<AttachmentId, AttachmentState>,
-    /// A Tauri desktop open leaves terminal-query replies to xterm even before
-    /// its first attachment has reached React.
-    desktop_authoritative: bool,
     pending_replies: VecDeque<Vec<u8>>,
     exit_notified: bool,
 }
@@ -1852,8 +1848,8 @@ impl LiveTab {
         Some(exit)
     }
 
-    fn queue_replies(&mut self, replies: Vec<Vec<u8>>) -> Option<u32> {
-        let desktop_owns = self.desktop_authoritative
+    fn queue_replies(&mut self, replies: Vec<Vec<u8>>, desktop_opening_owns: bool) -> Option<u32> {
+        let desktop_owns = desktop_opening_owns
             || self
                 .descriptor
                 .input_owner
@@ -1904,11 +1900,12 @@ impl PtySink for TabSink {
                 return; // dropping a reservation refunds it
             }
 
-            match route {
+            let desktop_opening_owns = match route {
                 OpeningRoute::Reserved(reservation) => {
                     if !reservation.enqueue(bytes.to_vec()) {
                         return;
                     }
+                    true
                 }
                 OpeningRoute::Attached => {
                     let desktop_mailboxes = tab.live.lock().unwrap().desktop_mailboxes();
@@ -1917,9 +1914,10 @@ impl PtySink for TabSink {
                             return;
                         }
                     }
+                    false
                 }
                 OpeningRoute::Closed => return,
-            }
+            };
 
             if tab.raw.is_closing() {
                 return;
@@ -1940,7 +1938,7 @@ impl PtySink for TabSink {
                 if damage.bell {
                     live.enqueue_control_all(TabEvent::Bell);
                 }
-                live.queue_replies(damage.replies)
+                live.queue_replies(damage.replies, desktop_opening_owns)
             };
             if let Some(pty_id) = flush {
                 flush_replies(&registry, &tab, pty_id);

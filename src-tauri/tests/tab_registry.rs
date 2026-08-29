@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // The compatibility observer is process-global until Task 6. Serialize PTY
 // tests so one test cannot intentionally observe another test's output.
@@ -308,6 +308,10 @@ impl FakePty {
             .iter()
             .map(|(_, bytes)| bytes.clone())
             .collect()
+    }
+
+    fn clear_writes(&self) {
+        self.writes.lock().unwrap().clear();
     }
 
     fn resizes(&self) -> Vec<(u16, u16)> {
@@ -650,6 +654,50 @@ fn remote_focus_suppresses_xterm_input_and_delivers_the_rust_reply() {
     pty.emit_output(pty.last_id(), b"\x1b[5n");
 
     assert_eq!(pty.writes(), vec![b"\x1b[0n".to_vec()]);
+}
+
+#[test]
+fn desktop_open_hands_terminal_query_replies_to_the_focused_remote() {
+    let (registry, pty) = registry();
+    let tab = registry
+        .open_desktop(shell_launch("slot:desktop-remote-reply"))
+        .unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    registry.take_focus(&tab, &remote.id, size(80, 24)).unwrap();
+
+    // Opening replay completes on its own worker. Poll the observable reply
+    // boundary rather than sleeping: before handoff xterm owns the query;
+    // afterwards the focused remote does and Rust answers it.
+    let handoff_deadline = Instant::now() + Duration::from_secs(1);
+    while pty.writes().is_empty() {
+        pty.emit_output(pty.last_id(), b"\x1b[5n");
+        while desktop.events.try_recv().is_ok() {}
+        assert!(
+            Instant::now() < handoff_deadline,
+            "desktop opening replay never completed"
+        );
+        thread::yield_now();
+    }
+    assert_eq!(
+        pty.writes(),
+        vec![b"\x1b[0n".to_vec()],
+        "a desktop-opened tab never handed query replies to its focused remote"
+    );
+
+    pty.clear_writes();
+    pty.emit_output(pty.last_id(), b"\x1b[5n");
+    assert_eq!(pty.writes(), vec![b"\x1b[0n".to_vec()]);
+
+    registry
+        .take_focus(&tab, &desktop.id, size(80, 24))
+        .unwrap();
+    pty.clear_writes();
+    pty.emit_output(pty.last_id(), b"\x1b[5n");
+    assert!(
+        pty.writes().is_empty(),
+        "Rust answered a terminal query while desktop xterm owned input"
+    );
 }
 
 #[test]

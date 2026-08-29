@@ -6,9 +6,10 @@ import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
-  AttachmentId, TabId, tabAttachDesktop, tabDetach, tabResize, tabTakeFocus, tabWrite,
+  AttachmentId, TabId, tabAttachDesktop, tabDetach, tabList, tabResize, tabTakeFocus, tabWrite,
 } from "../ipc";
 import { boldWeightFor } from "../settings";
+import { createTabExitCatchUp } from "../tabModel";
 import { TerminalInputLine } from "../terminalInput";
 import "@xterm/xterm/css/xterm.css";
 
@@ -209,6 +210,7 @@ export default function TerminalView({
 
     let unlistenExit: UnlistenFn | null = null;
     let disposed = false;
+    const exitCatchUp = createTabExitCatchUp(tab.key, onExit);
 
     // Manual repaint escape hatch (Ctrl+Shift+L): a clean refit + full
     // re-render. With an accelerated renderer this is rarely needed — no
@@ -237,15 +239,25 @@ export default function TerminalView({
         code: number | null;
         signal: string | null;
       }>("tab://exit", (e) => {
-        if (e.payload.tabId === tab.key) {
-          onExit(tab.key, e.payload.code ?? null, e.payload.signal ?? null);
-        }
+        exitCatchUp.event(e.payload);
       });
       if (disposed) {
         unlistenExit();
         return;
       }
-      const attachmentId = await tabAttachDesktop(tab.key, onOutput);
+      let attachmentId: AttachmentId;
+      try {
+        attachmentId = await tabAttachDesktop(tab.key, onOutput);
+      } catch {
+        // The bridge event may have preceded this component's listener. An
+        // exited descriptor closes that window through the same one-shot gate.
+        // A preparing-exit tab still reports Running, so keep the listener
+        // alive for its eventual final exit instead of treating rejection as
+        // final state by itself.
+        const authoritative = await tabList().catch(() => []);
+        if (!disposed) exitCatchUp.reconcile(authoritative);
+        return;
+      }
       if (disposed) {
         await tabDetach(tab.key, attachmentId).catch(() => {});
         return;
@@ -352,10 +364,7 @@ export default function TerminalView({
         },
       });
       if (activeRef.current) takeFocus();
-    })().catch(() => {
-      // A tab can exit between App's authoritative open and this attachment.
-      // Rust emits the TabId-keyed exit before rejecting that late attach.
-    });
+    })().catch(() => {});
 
     // Debounce resize→fit: splitter drags fire the observer continuously, and
     // a SIGWINCH storm makes TUIs (claude's input box) redraw over half-painted
@@ -372,6 +381,7 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
+      exitCatchUp.dispose();
       if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();
       unlistenExit?.();
