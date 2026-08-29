@@ -1,6 +1,6 @@
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use serde::{de::DeserializeOwned, de::Error as _, Deserialize, Deserializer, Serialize};
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 
 use crate::terminal::MAX_SCREEN_FRAME_BYTES;
 
@@ -60,7 +60,7 @@ impl RemoteRequest {
         let request_id = ciborium::from_reader::<RequestEnvelopeProbe, _>(bytes)
             .ok()
             .and_then(|probe| probe.request_id);
-        let envelope: RequestEnvelope = ciborium::from_reader(bytes).map_err(|_| {
+        let envelope: RequestEnvelope = decode_exact(bytes).map_err(|_| {
             ProtocolError::correlated(
                 request_id,
                 "protocol.invalid_cbor",
@@ -106,6 +106,17 @@ impl RemoteRequest {
     pub fn payload(&self) -> &[u8] {
         &self.payload
     }
+}
+
+/// Decode exactly one CBOR value. Ciborium intentionally accepts a valid
+/// prefix, so every authoritative wire decoder must also prove EOF.
+pub fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ()> {
+    let mut cursor = Cursor::new(bytes);
+    let value = ciborium::from_reader(&mut cursor).map_err(|_| ())?;
+    if usize::try_from(cursor.position()).ok() != Some(bytes.len()) {
+        return Err(());
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

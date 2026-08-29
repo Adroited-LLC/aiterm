@@ -1,6 +1,7 @@
 use aiterm_lib::remote::model::{
     encode_terminal_frame, validate_terminal_frame, ProtocolError, RemoteRequest, TerminalSize,
 };
+use aiterm_lib::tabs::{AttachmentId, TabId};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -135,6 +136,49 @@ fn strict_envelope_errors_retain_a_recoverable_request_id() {
 
     assert_eq!(error.code(), "protocol.invalid_cbor");
     assert_eq!(error.request_id(), Some(88));
+}
+
+#[test]
+fn request_envelope_rejects_trailing_cbor_and_garbage_with_correlation() {
+    for suffix in [vec![0xf6], b"garbage".to_vec()] {
+        let mut bytes = cbor_request(1, "tab.list", b"");
+        bytes.extend(suffix);
+        let error = RemoteRequest::decode(&bytes).unwrap_err();
+        assert_eq!(error.code(), "protocol.invalid_cbor");
+        assert_eq!(error.request_id(), Some(42));
+    }
+}
+
+#[test]
+fn wire_identifiers_require_canonical_lowercase_hyphenated_uuids() {
+    #[derive(serde::Deserialize)]
+    struct Ids {
+        tab: TabId,
+        attachment: AttachmentId,
+    }
+
+    for invalid in [
+        "550E8400-E29B-41D4-A716-446655440000".to_owned(),
+        "550e8400e29b41d4a716446655440000".to_owned(),
+        "x".repeat(4096),
+    ] {
+        let value = serde_json::json!({
+            "tab": invalid,
+            "attachment": "550e8400-e29b-41d4-a716-446655440000"
+        });
+        assert!(serde_json::from_value::<Ids>(value).is_err());
+    }
+
+    let ids: Ids = serde_json::from_value(serde_json::json!({
+        "tab": "550e8400-e29b-41d4-a716-446655440000",
+        "attachment": "550e8400-e29b-41d4-a716-446655440001"
+    }))
+    .unwrap();
+    assert_eq!(ids.tab.as_str(), "550e8400-e29b-41d4-a716-446655440000");
+    assert_eq!(
+        ids.attachment.as_str(),
+        "550e8400-e29b-41d4-a716-446655440001"
+    );
 }
 
 #[test]

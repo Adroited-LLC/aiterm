@@ -1614,6 +1614,21 @@ fn a_waiting_remote_receiver_has_no_event_notification_lost_wakeup() {
     ));
 }
 
+#[tokio::test]
+async fn async_remote_receiver_wakes_without_using_the_blocking_pool() {
+    let (registry, pty) = registry();
+    let tab = registry.open(shell_launch("slot:async-mailbox")).unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let _initial = remote.events.recv_async().await.unwrap();
+
+    pty.emit_output(pty.last_id(), b"wake");
+    let event = tokio::time::timeout(Duration::from_secs(1), remote.events.recv_async())
+        .await
+        .expect("async receive must wake")
+        .unwrap();
+    assert!(matches!(event, TabEvent::Diff(_)));
+}
+
 #[test]
 fn concurrent_remote_attach_and_output_always_expose_snapshot_before_diff() {
     let (registry, pty) = registry();

@@ -320,6 +320,71 @@ async fn authenticate(socket: &mut TestSocket, key: &SigningKey, device_id: &str
     assert_eq!(reply.kind, "auth.ok");
 }
 
+#[tokio::test]
+async fn authentication_proof_rejects_a_trailing_cbor_item() {
+    let root = private_test_dir("auth-trailing-cbor");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services(),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    let challenge = challenge(&mut socket).await;
+    let signature: Signature = key.sign(&challenge.nonce);
+    let mut proof = encode(&Proof {
+        kind: "auth.proof",
+        device_id: &device_id,
+        signature_der: signature.to_der().as_bytes(),
+    });
+    proof.push(0xf6);
+    socket.send(Message::Binary(proof.into())).await.unwrap();
+    assert_closed(&mut socket).await;
+
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn request_payload_rejects_trailing_cbor_with_request_id_preserved() {
+    let root = private_test_dir("payload-trailing-cbor");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services(),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    let mut payload = encode(&TabRequest {
+        tab_id: &aiterm_lib::tabs::TabId::new(),
+    });
+    payload.extend_from_slice(b"garbage");
+    socket
+        .send(request(41, "tab.close", &payload))
+        .await
+        .unwrap();
+    let error = response(&mut socket).await;
+    assert_eq!(error.request_id, 41);
+    assert_eq!(
+        decode::<ErrorReply>(&error.payload).code,
+        "protocol.invalid_payload"
+    );
+
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn valid_request(request_id: u64) -> Message {
     Message::Binary(
         encode(&RequestEnvelope {
@@ -813,6 +878,148 @@ async fn idle_detach_and_connection_teardown_remove_registry_attachments() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::task::yield_now().await;
     }
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn resume_is_a_barrier_against_pre_snapshot_live_events() {
+    let root = private_test_dir("resume-barrier");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Barrier",
+            "remote-resume-barrier",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply = decode(&response(&mut socket).await.payload);
+    let _initial = response(&mut socket).await;
+
+    pty.emit(pty.last_id(), b"before");
+    socket
+        .send(request(
+            2,
+            "terminal.resume",
+            &encode(&ResumeRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                revision: u64::MAX,
+            }),
+        ))
+        .await
+        .unwrap();
+    loop {
+        let event = response(&mut socket).await;
+        if event.request_id == 2 && event.kind == "terminal.snapshot" {
+            break;
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), socket.next())
+            .await
+            .is_err()
+    );
+
+    pty.emit(pty.last_id(), b"after");
+    let later = tokio::time::timeout(
+        Duration::from_secs(1),
+        response_kind(&mut socket, "terminal.diff"),
+    )
+    .await
+    .expect("post-recovery damage should remain live");
+    assert_eq!(later.request_id, 0);
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn detach_ack_is_the_last_event_for_an_attachment_with_pending_damage() {
+    let root = private_test_dir("detach-barrier");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let tab = registry
+        .open(TabLaunch::new(
+            "Barrier",
+            "remote-detach-barrier",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply = decode(&response(&mut socket).await.payload);
+    let _initial = response(&mut socket).await;
+
+    pty.emit(pty.last_id(), b"pending");
+    socket
+        .send(request(
+            2,
+            "terminal.detach",
+            &encode(&AttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    loop {
+        let event = response(&mut socket).await;
+        if event.request_id == 2 && event.kind == "terminal.detach" {
+            break;
+        }
+    }
+    assert_eq!(registry.attachment_count(&tab).unwrap(), 0);
+    pty.emit(pty.last_id(), b"later");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), socket.next())
+            .await
+            .is_err()
+    );
 
     registry.close(&tab).ok();
     gateway.stop().await.unwrap();

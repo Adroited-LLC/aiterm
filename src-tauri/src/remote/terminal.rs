@@ -1,9 +1,12 @@
 //! Transport-neutral remote projection of Rust-owned terminal tabs.
 
-use super::model::{encode_terminal_frame, RemoteEvent, TerminalSize, PROTOCOL_VERSION};
+use super::model::{
+    decode_exact, encode_terminal_frame, RemoteEvent, TerminalSize, PROTOCOL_VERSION,
+};
 use crate::tabs::{
-    AttachmentId, AttachmentKind, TabAttachment, TabAttachmentCancellation, TabDescriptor,
-    TabError, TabEvent, TabEventReceiver, TabExit, TabId, TabLaunch, TabRegistry,
+    AttachmentId, AttachmentKind, RecoveryBoundary, TabAttachment, TabAttachmentCancellation,
+    TabDescriptor, TabError, TabEvent, TabEventReceiver, TabExit, TabId, TabLaunch,
+    TabReceiveError, TabRegistry,
 };
 use crate::terminal::model::{
     CursorState, Revision, RowPatch, ScreenDiff, ScreenRow, ScreenSnapshot, TerminalModes,
@@ -11,23 +14,14 @@ use crate::terminal::model::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use unicode_normalization::char::is_combining_mark;
 use uuid::Uuid;
 
 pub const MAX_WIRE_FRAME_BYTES: usize = 1024 * 1024;
 pub const DIFF_INTERVAL: Duration = Duration::from_millis(16);
 const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_STAGED_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
-const MAX_STAGED_TRANSFER_ROWS: usize = 5_000;
-
-enum MailboxReceive {
-    Event(TabEvent),
-    Timeout,
-    Disconnected,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalError {
@@ -134,7 +128,7 @@ impl RemoteAttachment {
 }
 
 pub struct RemoteTerminalEvents {
-    receiver: Arc<Mutex<TabEventReceiver>>,
+    receiver: TabEventReceiver,
     cancellation: TabAttachmentCancellation,
     registry: Arc<TabRegistry>,
     tab_id: TabId,
@@ -159,7 +153,7 @@ impl RemoteTerminalEvents {
         title: String,
     ) -> Self {
         Self {
-            receiver: Arc::new(Mutex::new(receiver)),
+            receiver,
             cancellation,
             registry,
             tab_id,
@@ -182,26 +176,23 @@ impl RemoteTerminalEvents {
                     return Some(TerminalEvent::Diff(diff));
                 }
             }
-            let receiver = self.receiver.clone();
-            let received = tokio::task::spawn_blocking(move || {
-                let receiver = receiver.lock().unwrap();
-                match timeout {
-                    Some(timeout) => match receiver.recv_timeout(timeout) {
-                        Ok(event) => MailboxReceive::Event(event),
-                        Err(RecvTimeoutError::Timeout) => MailboxReceive::Timeout,
-                        Err(RecvTimeoutError::Disconnected) => MailboxReceive::Disconnected,
-                    },
-                    None => receiver
-                        .recv()
-                        .map(MailboxReceive::Event)
-                        .unwrap_or(MailboxReceive::Disconnected),
+            let received = match timeout {
+                Some(timeout) => {
+                    match tokio::time::timeout(timeout, self.receiver.recv_async()).await {
+                        Ok(result) => result,
+                        Err(_) => continue,
+                    }
                 }
-            })
-            .await;
+                None => self.receiver.recv_async().await,
+            };
             let event = match received {
-                Ok(MailboxReceive::Event(event)) => event,
-                Ok(MailboxReceive::Timeout) => continue,
-                Ok(MailboxReceive::Disconnected) | Err(_) => {
+                Ok(event) => event,
+                Err(TabReceiveError::Cancelled) => {
+                    self.diff_started = None;
+                    self.coalescer.clear();
+                    return None;
+                }
+                Err(TabReceiveError::Disconnected) => {
                     if self.diff_started.take().is_some() {
                         return self.coalescer.flush().map(TerminalEvent::Diff);
                     }
@@ -258,6 +249,12 @@ impl RemoteTerminalEvents {
     pub fn cancel(&self) {
         self.cancellation.cancel();
     }
+
+    pub fn apply_recovery_boundary(&mut self, boundary: RecoveryBoundary) {
+        self.diff_started = None;
+        self.coalescer.clear();
+        self.receiver.discard_before(boundary);
+    }
 }
 
 impl Drop for RemoteTerminalEvents {
@@ -269,6 +266,21 @@ impl Drop for RemoteTerminalEvents {
 #[derive(Clone)]
 pub struct RemoteTerminal {
     registry: Arc<TabRegistry>,
+}
+
+pub struct RemoteRecovery {
+    snapshot: ScreenSnapshot,
+    boundary: RecoveryBoundary,
+}
+
+impl RemoteRecovery {
+    pub fn snapshot(&self) -> &ScreenSnapshot {
+        &self.snapshot
+    }
+
+    pub fn into_parts(self) -> (ScreenSnapshot, RecoveryBoundary) {
+        (self.snapshot, self.boundary)
+    }
 }
 
 impl RemoteTerminal {
@@ -330,10 +342,12 @@ impl RemoteTerminal {
     pub fn resume(
         &self,
         tab_id: &TabId,
+        attachment_id: &AttachmentId,
         revision: Revision,
-    ) -> Result<TerminalEvent, TerminalError> {
+    ) -> Result<RemoteRecovery, TerminalError> {
         let _ = revision;
-        Ok(TerminalEvent::Snapshot(self.registry.snapshot(tab_id)?))
+        let (snapshot, boundary) = self.registry.recovery_snapshot(tab_id, attachment_id)?;
+        Ok(RemoteRecovery { snapshot, boundary })
     }
 
     pub fn list(&self) -> Vec<TabDescriptor> {
@@ -623,6 +637,11 @@ impl TransferPlan {
         final_revision: Revision,
         source: TransferSource,
     ) -> Result<Self, TerminalError> {
+        if source.row_count() > transfer_row_cap(kind) {
+            return Err(TerminalError::invalid_transfer(
+                "transfer exceeds the row limit for its kind",
+            ));
+        }
         let transfer_id = Uuid::new_v4().to_string();
         let ranges = plan_row_ranges(
             request_id,
@@ -671,9 +690,6 @@ impl TransferPlan {
             request_id: self.request_id,
             payload,
         };
-        if wire_len(&chunk)? >= MAX_WIRE_FRAME_BYTES {
-            return Err(TerminalError::semantic_row_too_large());
-        }
         self.next += 1;
         Ok(Some(chunk))
     }
@@ -889,11 +905,79 @@ pub enum TransferPayload {
     Scrollback(Vec<ScreenRow>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransferCommitToken(u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferCompletion {
+    token: TransferCommitToken,
+    payload: TransferPayload,
+}
+
+impl TransferCompletion {
+    pub fn token(&self) -> TransferCommitToken {
+        self.token
+    }
+
+    pub fn payload(&self) -> &TransferPayload {
+        &self.payload
+    }
+
+    pub fn into_payload(self) -> TransferPayload {
+        self.payload
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransferStatus {
     Pending,
-    Complete(TransferPayload),
+    Complete(TransferCompletion),
     Recover,
+}
+
+#[derive(Default)]
+struct TransferBudgetState {
+    next_id: u64,
+    active: Option<u64>,
+}
+
+/// A connection-scoped staging budget. Only one semantic transfer may be
+/// staged for a connection at a time, which gives a hard aggregate bound.
+#[derive(Clone, Default)]
+pub struct TransferBudget(Arc<Mutex<TransferBudgetState>>);
+
+impl TransferBudget {
+    pub fn single_active() -> Self {
+        Self::default()
+    }
+
+    fn reserve(&self) -> Option<TransferReservation> {
+        let mut state = self.0.lock().unwrap();
+        if state.active.is_some() {
+            return None;
+        }
+        state.next_id = state.next_id.saturating_add(1);
+        let id = state.next_id;
+        state.active = Some(id);
+        Some(TransferReservation {
+            budget: self.clone(),
+            id,
+        })
+    }
+}
+
+struct TransferReservation {
+    budget: TransferBudget,
+    id: u64,
+}
+
+impl Drop for TransferReservation {
+    fn drop(&mut self) {
+        let mut state = self.budget.0.lock().unwrap();
+        if state.active == Some(self.id) {
+            state.active = None;
+        }
+    }
 }
 
 struct StagedTransfer {
@@ -909,8 +993,26 @@ struct StagedTransfer {
     bytes: usize,
     rows: usize,
     started: Instant,
-    payloads: Vec<Vec<u8>>,
+    parts: Vec<ValidatedPart>,
     metadata: Option<PartMetadata>,
+    _reservation: TransferReservation,
+}
+
+#[derive(Clone, Copy)]
+enum PendingApplication {
+    Snapshot {
+        revision: Revision,
+        size: TerminalSize,
+    },
+    Diff {
+        revision: Revision,
+    },
+    Scrollback,
+}
+
+struct PendingCommit {
+    token: TransferCommitToken,
+    application: PendingApplication,
 }
 
 pub struct TransferAssembler {
@@ -918,8 +1020,12 @@ pub struct TransferAssembler {
     tab_id: TabId,
     attachment_id: Option<AttachmentId>,
     timeout: Duration,
-    revision_floor: Revision,
+    committed_revision: Revision,
+    committed_size: Option<TerminalSize>,
     staged: Option<StagedTransfer>,
+    pending_commit: Option<PendingCommit>,
+    next_commit_token: u64,
+    budget: TransferBudget,
 }
 
 impl TransferAssembler {
@@ -932,13 +1038,39 @@ impl TransferAssembler {
         tab_id: TabId,
         timeout: Duration,
     ) -> Self {
+        Self::with_timeout_and_budget(
+            connection_id,
+            tab_id,
+            timeout,
+            TransferBudget::single_active(),
+        )
+    }
+
+    pub fn with_budget(
+        connection_id: impl Into<String>,
+        tab_id: TabId,
+        budget: TransferBudget,
+    ) -> Self {
+        Self::with_timeout_and_budget(connection_id, tab_id, DEFAULT_TRANSFER_TIMEOUT, budget)
+    }
+
+    pub fn with_timeout_and_budget(
+        connection_id: impl Into<String>,
+        tab_id: TabId,
+        timeout: Duration,
+        budget: TransferBudget,
+    ) -> Self {
         Self {
             connection_id: connection_id.into(),
             tab_id,
             attachment_id: None,
             timeout,
-            revision_floor: Revision(0),
+            committed_revision: Revision(0),
+            committed_size: None,
             staged: None,
+            pending_commit: None,
+            next_commit_token: 0,
+            budget,
         }
     }
 
@@ -947,9 +1079,55 @@ impl TransferAssembler {
         self
     }
 
-    pub fn reset_for_snapshot(&mut self, revision: Revision) {
+    pub fn reset_for_snapshot(&mut self, revision: Revision, size: TerminalSize) {
         self.staged = None;
-        self.revision_floor = revision;
+        self.pending_commit = None;
+        self.committed_revision = revision;
+        self.committed_size = Some(size);
+    }
+
+    pub fn committed_revision(&self) -> Revision {
+        self.committed_revision
+    }
+
+    pub fn committed_size(&self) -> Option<TerminalSize> {
+        self.committed_size
+    }
+
+    pub fn commit_applied(&mut self, token: TransferCommitToken) -> Result<(), TerminalError> {
+        let pending = self.pending_commit.take().ok_or_else(|| {
+            TerminalError::invalid_transfer("no completed transfer is awaiting application")
+        })?;
+        if pending.token != token {
+            self.pending_commit = Some(pending);
+            return Err(TerminalError::invalid_transfer(
+                "transfer commit token does not match",
+            ));
+        }
+        match pending.application {
+            PendingApplication::Snapshot { revision, size } => {
+                self.committed_revision = revision;
+                self.committed_size = Some(size);
+            }
+            PendingApplication::Diff { revision } => {
+                self.committed_revision = revision;
+            }
+            PendingApplication::Scrollback => {}
+        }
+        Ok(())
+    }
+
+    pub fn reject_applied(&mut self, token: TransferCommitToken) -> Result<(), TerminalError> {
+        let pending = self.pending_commit.take().ok_or_else(|| {
+            TerminalError::invalid_transfer("no completed transfer is awaiting application")
+        })?;
+        if pending.token != token {
+            self.pending_commit = Some(pending);
+            return Err(TerminalError::invalid_transfer(
+                "transfer commit token does not match",
+            ));
+        }
+        Ok(())
     }
 
     pub fn expire_at(&mut self, now: Instant) -> bool {
@@ -981,15 +1159,18 @@ impl TransferAssembler {
         chunk: TransferChunk,
         now: Instant,
     ) -> TransferStatus {
+        if self.pending_commit.is_some() {
+            return TransferStatus::Recover;
+        }
+        let row_cap = transfer_row_cap(chunk.kind);
         if self.expire_at(now)
             || connection_id != self.connection_id
             || chunk.tab_id != self.tab_id
             || chunk.attachment_id != self.attachment_id
             || chunk.total == 0
-            || usize::try_from(chunk.total).map_or(true, |total| total > MAX_STAGED_TRANSFER_ROWS)
-            || usize::try_from(chunk.row_end)
-                .map_or(true, |row_end| row_end > MAX_STAGED_TRANSFER_ROWS)
-            || !revision_continues(self.revision_floor, &chunk)
+            || usize::try_from(chunk.total).map_or(true, |total| total > row_cap.max(1))
+            || usize::try_from(chunk.row_end).map_or(true, |row_end| row_end > row_cap)
+            || !revision_continues(self.committed_revision, &chunk)
             || !valid_revision_metadata(&chunk)
             || wire_len(&chunk).map_or(true, |size| size >= MAX_WIRE_FRAME_BYTES)
         {
@@ -1000,6 +1181,9 @@ impl TransferAssembler {
             if chunk.index != 0 || chunk.row_start != 0 {
                 return TransferStatus::Recover;
             }
+            let Some(reservation) = self.budget.reserve() else {
+                return TransferStatus::Recover;
+            };
             self.staged = Some(StagedTransfer {
                 transfer_id: chunk.transfer_id.clone(),
                 attachment_id: chunk.attachment_id.clone(),
@@ -1013,8 +1197,9 @@ impl TransferAssembler {
                 bytes: 0,
                 rows: 0,
                 started: now,
-                payloads: Vec::new(),
+                parts: Vec::new(),
                 metadata: None,
+                _reservation: reservation,
             });
         }
         let staged = self.staged.as_mut().unwrap();
@@ -1033,9 +1218,9 @@ impl TransferAssembler {
                 || (chunk.total == 1 && chunk.index == 0 && chunk.row_start == 0))
             && chunk.index < chunk.total;
         let bounded = staged.bytes.saturating_add(chunk.payload.len()) <= MAX_STAGED_TRANSFER_BYTES
-            && staged.rows.saturating_add(row_count) <= MAX_STAGED_TRANSFER_ROWS;
-        let metadata = validate_part(&chunk, row_count);
-        let metadata_consistent = metadata.as_ref().is_ok_and(|metadata| {
+            && staged.rows.saturating_add(row_count) <= row_cap;
+        let validated = validate_part(&chunk, row_count, self.committed_size);
+        let metadata_consistent = validated.as_ref().is_ok_and(|(metadata, _)| {
             staged
                 .metadata
                 .as_ref()
@@ -1046,34 +1231,53 @@ impl TransferAssembler {
             return TransferStatus::Recover;
         }
         if staged.metadata.is_none() {
-            staged.metadata = metadata.ok();
+            staged.metadata = validated
+                .as_ref()
+                .ok()
+                .map(|(metadata, _)| metadata.clone());
         }
+        let (_, part) = validated.expect("validated transfer part was checked above");
         staged.bytes += chunk.payload.len();
         staged.rows += row_count;
         staged.next_index += 1;
         staged.next_row = chunk.row_end;
-        staged.payloads.push(chunk.payload);
+        staged.parts.push(part);
         if staged.next_index != staged.total {
             return TransferStatus::Pending;
         }
         let staged = self.staged.take().unwrap();
         match assemble_payload(&self.tab_id, staged) {
             Ok(payload) => {
-                self.revision_floor = match &payload {
-                    TransferPayload::Snapshot(snapshot) => snapshot.revision(),
-                    TransferPayload::Diff(diff) => diff.revision(),
-                    TransferPayload::Scrollback(_) => self.revision_floor,
+                self.next_commit_token = self.next_commit_token.saturating_add(1);
+                let token = TransferCommitToken(self.next_commit_token);
+                let application = match &payload {
+                    TransferPayload::Snapshot(snapshot) => PendingApplication::Snapshot {
+                        revision: snapshot.revision(),
+                        size: TerminalSize::try_new(snapshot.cols(), snapshot.rows())
+                            .expect("assembled snapshot dimensions were validated"),
+                    },
+                    TransferPayload::Diff(diff) => PendingApplication::Diff {
+                        revision: diff.revision(),
+                    },
+                    TransferPayload::Scrollback(_) => PendingApplication::Scrollback,
                 };
-                TransferStatus::Complete(payload)
+                self.pending_commit = Some(PendingCommit { token, application });
+                TransferStatus::Complete(TransferCompletion { token, payload })
             }
             Err(_) => TransferStatus::Recover,
         }
     }
 }
 
+fn transfer_row_cap(kind: TransferKind) -> usize {
+    match kind {
+        TransferKind::Snapshot | TransferKind::Diff => 512,
+        TransferKind::Scrollback => 256,
+    }
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, TerminalError> {
-    ciborium::from_reader(bytes)
-        .map_err(|_| TerminalError::invalid_transfer("invalid transfer payload"))
+    decode_exact(bytes).map_err(|_| TerminalError::invalid_transfer("invalid transfer payload"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1083,11 +1287,18 @@ enum PartMetadata {
     Scrollback,
 }
 
+enum ValidatedPart {
+    Snapshot(SnapshotPart),
+    Diff(DiffPart),
+    Scrollback(ScrollbackPart),
+}
+
 fn validate_part(
     chunk: &TransferChunk,
     expected_rows: usize,
-) -> Result<PartMetadata, TerminalError> {
-    let metadata = match chunk.kind {
+    committed_size: Option<TerminalSize>,
+) -> Result<(PartMetadata, ValidatedPart), TerminalError> {
+    let validated = match chunk.kind {
         TransferKind::Snapshot => {
             let part = decode::<SnapshotPart>(&chunk.payload)?;
             if part.visible.len() != expected_rows
@@ -1095,31 +1306,46 @@ fn validate_part(
                 || !(1..=512).contains(&part.rows)
                 || part.cursor.col() >= part.cols
                 || part.cursor.row() >= part.rows
-                || part.visible.iter().any(|row| !valid_row(row))
+                || part
+                    .visible
+                    .iter()
+                    .any(|row| row.cells().len() > usize::from(part.cols) || !valid_row(row))
             {
                 return Err(TerminalError::invalid_transfer(
                     "snapshot part exceeds canonical bounds",
                 ));
             }
-            PartMetadata::Snapshot(part.cols, part.rows, part.cursor, part.modes)
+            let metadata = PartMetadata::Snapshot(
+                part.cols,
+                part.rows,
+                part.cursor.clone(),
+                part.modes.clone(),
+            );
+            (metadata, ValidatedPart::Snapshot(part))
         }
         TransferKind::Diff => {
             let part = decode::<DiffPart>(&chunk.payload)?;
+            let Some(size) = committed_size else {
+                return Err(TerminalError::invalid_transfer(
+                    "diff arrived before an applied snapshot",
+                ));
+            };
             if part.rows.len() != expected_rows
-                || part
-                    .rows
-                    .iter()
-                    .any(|patch| patch.row() >= 512 || !valid_row(patch.content()))
-                || part
-                    .cursor
-                    .as_ref()
-                    .is_some_and(|cursor| cursor.col() >= 512 || cursor.row() >= 512)
+                || part.rows.iter().any(|patch| {
+                    patch.row() >= size.rows()
+                        || patch.content().cells().len() > usize::from(size.cols())
+                        || !valid_row(patch.content())
+                })
+                || part.cursor.as_ref().is_some_and(|cursor| {
+                    cursor.col() >= size.cols() || cursor.row() >= size.rows()
+                })
             {
                 return Err(TerminalError::invalid_transfer(
                     "diff part exceeds canonical bounds",
                 ));
             }
-            PartMetadata::Diff(part.cursor, part.modes)
+            let metadata = PartMetadata::Diff(part.cursor.clone(), part.modes.clone());
+            (metadata, ValidatedPart::Diff(part))
         }
         TransferKind::Scrollback => {
             let part = decode::<ScrollbackPart>(&chunk.payload)?;
@@ -1128,10 +1354,10 @@ fn validate_part(
                     "scrollback row range does not match payload",
                 ));
             }
-            PartMetadata::Scrollback
+            (PartMetadata::Scrollback, ValidatedPart::Scrollback(part))
         }
     };
-    Ok(metadata)
+    Ok(validated)
 }
 
 fn valid_revision_metadata(chunk: &TransferChunk) -> bool {
@@ -1154,29 +1380,7 @@ fn revision_continues(current: Revision, chunk: &TransferChunk) -> bool {
 }
 
 fn valid_row(row: &ScreenRow) -> bool {
-    row.cells().len() <= 512
-        && row
-            .cells()
-            .iter()
-            .all(|cell| cell.is_continuation() || valid_cell_text(cell.text()))
-}
-
-fn valid_cell_text(text: &str) -> bool {
-    let mut scalars = text.chars();
-    let Some(base) = scalars.next() else {
-        return false;
-    };
-    if is_combining_mark(base) {
-        return false;
-    }
-    let mut combining = 0usize;
-    for scalar in scalars {
-        combining += 1;
-        if combining > 32 || !is_combining_mark(scalar) {
-            return false;
-        }
-    }
-    true
+    row.cells().len() <= 512 && row.has_valid_cell_text()
 }
 
 fn assemble_payload(
@@ -1187,8 +1391,12 @@ fn assemble_payload(
         TransferKind::Snapshot => {
             let mut visible = Vec::new();
             let mut header: Option<(u16, u16, CursorState, TerminalModes)> = None;
-            for payload in staged.payloads {
-                let part: SnapshotPart = decode(&payload)?;
+            for part in staged.parts {
+                let ValidatedPart::Snapshot(part) = part else {
+                    return Err(TerminalError::invalid_transfer(
+                        "mixed transfer payload kinds",
+                    ));
+                };
                 let current = (
                     part.cols,
                     part.rows,
@@ -1233,8 +1441,12 @@ fn assemble_payload(
             let mut rows = Vec::new();
             let mut cursor = None;
             let mut modes = None;
-            for payload in staged.payloads {
-                let part: DiffPart = decode(&payload)?;
+            for part in staged.parts {
+                let ValidatedPart::Diff(part) = part else {
+                    return Err(TerminalError::invalid_transfer(
+                        "mixed transfer payload kinds",
+                    ));
+                };
                 rows.extend(part.rows);
                 cursor = part.cursor;
                 modes = part.modes;
@@ -1261,8 +1473,13 @@ fn assemble_payload(
         }
         TransferKind::Scrollback => {
             let mut rows = Vec::new();
-            for payload in staged.payloads {
-                rows.extend(decode::<ScrollbackPart>(&payload)?.rows);
+            for part in staged.parts {
+                let ValidatedPart::Scrollback(part) = part else {
+                    return Err(TerminalError::invalid_transfer(
+                        "mixed transfer payload kinds",
+                    ));
+                };
+                rows.extend(part.rows);
             }
             Ok(TransferPayload::Scrollback(rows))
         }

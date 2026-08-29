@@ -195,6 +195,24 @@ fn snapshot_rejects_non_matching_diffs_without_partial_mutation() {
 }
 
 #[test]
+fn snapshot_rejects_rows_and_cursor_outside_its_applied_dimensions_atomically() {
+    let too_wide =
+        ScreenDiff::for_tab("tab-1", Revision(7), Revision(8), vec![row_patch(0, "xxx")]);
+    let cursor_outside = ScreenDiff::for_tab("tab-1", Revision(7), Revision(8), vec![])
+        .with_cursor(CursorState::new(2, 0, true));
+
+    for (diff, expected) in [
+        (too_wide, ScreenApplyError::RowTooWide),
+        (cursor_outside, ScreenApplyError::CursorOutOfBounds),
+    ] {
+        let mut snapshot = snapshot();
+        let before = snapshot.clone();
+        assert_eq!(snapshot.apply(diff), Err(expected));
+        assert_eq!(snapshot, before);
+    }
+}
+
+#[test]
 fn cursor_and_modes_are_constructed_without_exposing_fields() {
     let cursor = CursorState::new(4, 2, true);
     let modes = TerminalModes::new(true, true, false);

@@ -2,7 +2,8 @@ use aiterm_lib::pty::{PtySink, PtySpawnSpec};
 use aiterm_lib::remote::model::{RemoteEvent, TerminalSize, PROTOCOL_VERSION};
 use aiterm_lib::remote::terminal::{
     chunk_diff, chunk_scrollback, chunk_snapshot, DiffCoalescer, RemoteTerminal, TerminalEvent,
-    TransferAssembler, TransferKind, TransferPayload, TransferStatus, MAX_WIRE_FRAME_BYTES,
+    TransferAssembler, TransferBudget, TransferKind, TransferPayload, TransferStatus,
+    MAX_WIRE_FRAME_BYTES,
 };
 use aiterm_lib::tabs::{PtyBackend, TabLaunch, TabRegistry, TabUpdate};
 use aiterm_lib::terminal::model::{
@@ -11,6 +12,7 @@ use aiterm_lib::terminal::model::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -183,6 +185,52 @@ async fn cancelling_an_idle_remote_event_stream_wakes_it_and_detaches_promptly()
     assert_eq!(registry.attachment_count(&tab).unwrap(), 0);
 }
 
+#[tokio::test]
+async fn explicit_cancellation_discards_pending_coalesced_damage() {
+    let (registry, pty, tab) = setup(8, 2);
+    let remote = RemoteTerminal::new(registry);
+    let (_attached, mut events) = remote.attach(&tab).unwrap();
+    let cancellation = events.cancellation();
+
+    pty.emit(pty.last_id(), b"x");
+    let pending = tokio::spawn(async move { events.next().await });
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    cancellation.cancel();
+
+    assert_eq!(pending.await.unwrap(), None);
+}
+
+#[test]
+fn idle_remote_receive_does_not_depend_on_blocking_pool_capacity() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let occupied = tokio::task::spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (registry, pty, tab) = setup(8, 2);
+        let remote = RemoteTerminal::new(registry);
+        let (_attached, mut events) = remote.attach(&tab).unwrap();
+        pty.emit(pty.last_id(), b"x");
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .expect("async mailbox must not wait for a blocking worker");
+        assert!(matches!(event, Some(TerminalEvent::Diff(_))));
+
+        release_tx.send(()).unwrap();
+        occupied.await.unwrap();
+    });
+}
+
 #[test]
 fn a_revision_mismatch_is_recovered_by_snapshot_not_byte_replay() {
     let (registry, pty, tab) = setup(20, 2);
@@ -191,9 +239,14 @@ fn a_revision_mismatch_is_recovered_by_snapshot_not_byte_replay() {
     let (attached, _events) = remote.attach(&tab).unwrap();
     let wrong = Revision(attached.snapshot().revision().0.saturating_sub(1));
 
-    let recovered = remote.resume(&tab, wrong).unwrap();
+    let recovered = remote
+        .resume(&tab, attached.attachment_id(), wrong)
+        .unwrap();
 
-    assert!(matches!(recovered, TerminalEvent::Snapshot(_)));
+    assert_eq!(
+        recovered.snapshot().revision(),
+        attached.snapshot().revision()
+    );
 }
 
 #[test]
@@ -396,7 +449,7 @@ fn transfer_assembly_rejects_duplicate_out_of_order_mixed_and_stale_chunks() {
         stale.accept("connection-a", chunks[0].clone()),
         TransferStatus::Pending
     );
-    stale.reset_for_snapshot(Revision(snapshot.revision().0 + 1));
+    stale.reset_for_snapshot(Revision(snapshot.revision().0 + 1), size(512, 512));
     assert_eq!(
         stale.accept("connection-a", chunks[1].clone()),
         TransferStatus::Recover
@@ -415,11 +468,22 @@ fn a_complete_transfer_is_applied_only_after_every_chunk_validates() {
         status = assembler.accept("connection-a", chunk);
     }
 
-    let TransferStatus::Complete(TransferPayload::Snapshot(received)) = status else {
+    let TransferStatus::Complete(completion) = status else {
         panic!("complete ordered snapshot should apply atomically");
     };
+    let token = completion.token();
+    let TransferPayload::Snapshot(received) = completion.into_payload() else {
+        panic!("snapshot transfer returned the wrong payload kind");
+    };
+    assert_eq!(assembler.committed_revision(), Revision(0));
     assert_eq!(received.revision(), snapshot.revision());
     assert_eq!(received.visible().len(), snapshot.visible().len());
+    assembler.commit_applied(token).unwrap();
+    assert_eq!(assembler.committed_revision(), snapshot.revision());
+    assert_eq!(
+        assembler.committed_size(),
+        Some(size(snapshot.cols(), snapshot.rows()))
+    );
 }
 
 #[test]
@@ -441,17 +505,22 @@ fn a_real_sparse_registry_snapshot_round_trips_without_wire_padding() {
         status = assembler.accept("connection-a", chunk);
     }
 
-    let TransferStatus::Complete(TransferPayload::Snapshot(received)) = status else {
+    let TransferStatus::Complete(completion) = status else {
         panic!("canonical sparse snapshot should assemble");
     };
+    let token = completion.token();
+    let TransferPayload::Snapshot(received) = completion.into_payload() else {
+        panic!("snapshot transfer returned the wrong payload kind");
+    };
     assert_eq!(received, *attached.snapshot());
+    assembler.commit_applied(token).unwrap();
 }
 
 #[test]
 fn diff_transfer_requires_the_current_applied_revision_without_advancing_on_a_gap() {
     let tab = aiterm_lib::tabs::TabId::new();
     let mut assembler = TransferAssembler::new("connection-a", tab.clone());
-    assembler.reset_for_snapshot(Revision(5));
+    assembler.reset_for_snapshot(Revision(5), size(20, 2));
 
     let gap = ScreenDiff::for_tab(
         tab.as_str(),
@@ -472,10 +541,15 @@ fn diff_transfer_requires_the_current_applied_revision_without_advancing_on_a_ga
         vec![RowPatch::new(0, screen_row("current"))],
     );
     let current = chunk_diff(2, &tab, &current).unwrap().remove(0);
-    assert!(matches!(
-        assembler.accept("connection-a", current),
-        TransferStatus::Complete(TransferPayload::Diff(diff)) if diff.revision() == Revision(6)
-    ));
+    let TransferStatus::Complete(completion) = assembler.accept("connection-a", current) else {
+        panic!("current diff should complete");
+    };
+    assert!(
+        matches!(completion.payload(), TransferPayload::Diff(diff) if diff.revision() == Revision(6))
+    );
+    assert_eq!(assembler.committed_revision(), Revision(5));
+    assembler.commit_applied(completion.token()).unwrap();
+    assert_eq!(assembler.committed_revision(), Revision(6));
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -504,7 +578,7 @@ fn multi_chunk_diff_rejects_mismatched_cursor_or_mode_metadata() {
     second.cursor = Some(CursorState::new(2, 1, true));
     chunks[1].payload = ciborium_bytes(&second);
     let mut assembler = TransferAssembler::new("connection-a", tab);
-    assembler.reset_for_snapshot(Revision(7));
+    assembler.reset_for_snapshot(Revision(7), size(512, 512));
 
     assert_eq!(
         assembler.accept("connection-a", chunks.remove(0)),
@@ -554,11 +628,132 @@ fn diff_rows_and_cursor_are_bounded_to_the_canonical_viewport_limits() {
     .with_cursor(CursorState::new(999, 999, true));
     let chunk = chunk_diff(3, &tab, &diff).unwrap().remove(0);
     let mut assembler = TransferAssembler::new("connection-a", tab);
-    assembler.reset_for_snapshot(Revision(1));
+    assembler.reset_for_snapshot(Revision(1), size(20, 2));
 
     assert_eq!(
         assembler.accept("connection-a", chunk),
         TransferStatus::Recover
+    );
+}
+
+#[test]
+fn assembler_validates_diffs_against_committed_dimensions_and_never_advances_on_reject() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let mut assembler = TransferAssembler::new("connection-a", tab.clone());
+    assembler.reset_for_snapshot(Revision(9), size(20, 2));
+
+    let invalid = [
+        ScreenDiff::for_tab(
+            tab.as_str(),
+            Revision(9),
+            Revision(10),
+            vec![RowPatch::new(10, screen_row("x"))],
+        ),
+        ScreenDiff::for_tab(
+            tab.as_str(),
+            Revision(9),
+            Revision(10),
+            vec![RowPatch::new(0, screen_row(&"x".repeat(21)))],
+        ),
+        ScreenDiff::for_tab(tab.as_str(), Revision(9), Revision(10), vec![])
+            .with_cursor(CursorState::new(20, 0, true)),
+    ];
+    for diff in invalid {
+        let chunk = chunk_diff(1, &tab, &diff).unwrap().remove(0);
+        assert_eq!(
+            assembler.accept("connection-a", chunk),
+            TransferStatus::Recover
+        );
+        assert_eq!(assembler.committed_revision(), Revision(9));
+        assert_eq!(assembler.committed_size(), Some(size(20, 2)));
+    }
+}
+
+#[test]
+fn pending_application_blocks_later_diffs_until_commit_or_reject() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let mut assembler = TransferAssembler::new("connection-a", tab.clone());
+    assembler.reset_for_snapshot(Revision(1), size(20, 2));
+    let diff = ScreenDiff::for_tab(
+        tab.as_str(),
+        Revision(1),
+        Revision(2),
+        vec![RowPatch::new(0, screen_row("ok"))],
+    );
+    let chunk = chunk_diff(1, &tab, &diff).unwrap().remove(0);
+    let TransferStatus::Complete(completion) = assembler.accept("connection-a", chunk.clone())
+    else {
+        panic!("valid diff should complete");
+    };
+    assert_eq!(
+        assembler.accept("connection-a", chunk),
+        TransferStatus::Recover
+    );
+    assert_eq!(assembler.committed_revision(), Revision(1));
+    assembler.reject_applied(completion.token()).unwrap();
+    assert_eq!(assembler.committed_revision(), Revision(1));
+}
+
+#[test]
+fn transfer_parts_reject_trailing_cbor_and_kind_specific_row_overflow() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let snapshot = large_snapshot(&tab);
+    let mut trailing = chunk_snapshot(1, &tab, &snapshot).unwrap().remove(0);
+    trailing.payload.push(0xf6);
+    let mut assembler = TransferAssembler::new("connection-a", tab.clone());
+    assert_eq!(
+        assembler.accept("connection-a", trailing),
+        TransferStatus::Recover
+    );
+
+    let mut overflow = chunk_snapshot(2, &tab, &snapshot).unwrap().remove(0);
+    overflow.row_end = 513;
+    assert_eq!(
+        assembler.accept("connection-a", overflow),
+        TransferStatus::Recover
+    );
+
+    let rows = (0..256).map(|_| screen_row("x")).collect();
+    let mut scrollback = chunk_scrollback(3, &tab, Revision(1), rows)
+        .unwrap()
+        .remove(0);
+    scrollback.row_end = 257;
+    assert_eq!(
+        assembler.accept("connection-a", scrollback),
+        TransferStatus::Recover
+    );
+}
+
+#[test]
+fn shared_connection_budget_allows_only_one_staged_transfer_and_releases_on_expiry() {
+    let tab_a = aiterm_lib::tabs::TabId::new();
+    let tab_b = aiterm_lib::tabs::TabId::new();
+    let snapshot_a = large_snapshot(&tab_a);
+    let snapshot_b = large_snapshot(&tab_b);
+    let chunk_a = chunk_snapshot(1, &tab_a, &snapshot_a).unwrap().remove(0);
+    let chunk_b = chunk_snapshot(2, &tab_b, &snapshot_b).unwrap().remove(0);
+    let budget = TransferBudget::single_active();
+    let start = Instant::now();
+    let mut first = TransferAssembler::with_timeout_and_budget(
+        "connection-a",
+        tab_a,
+        Duration::from_millis(5),
+        budget.clone(),
+    );
+    let mut second = TransferAssembler::with_budget("connection-a", tab_b, budget);
+
+    assert_eq!(
+        first.accept_at("connection-a", chunk_a, start),
+        TransferStatus::Pending
+    );
+    assert_eq!(
+        second.accept("connection-a", chunk_b.clone()),
+        TransferStatus::Recover
+    );
+    assert!(first.expire_at(start + Duration::from_millis(6)));
+    assert_eq!(
+        second.accept("connection-a", chunk_b),
+        TransferStatus::Pending
     );
 }
 

@@ -3,7 +3,7 @@ use crate::remote::model::TerminalSize;
 use crate::terminal::model::{Revision, ScreenDiff, ScreenRow, ScreenSnapshot};
 use crate::terminal::screen::ScreenModel;
 use portable_pty::PtySize;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
@@ -20,7 +21,7 @@ const DEFAULT_QUEUE_CAPACITY: usize = 64;
 /// test sinks that deliver a much larger slice in one callback.
 const MAX_DESKTOP_RAW_CHUNK: usize = 1024 * 1024 - 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct TabId(String);
 
@@ -46,7 +47,16 @@ impl fmt::Display for TabId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for TabId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_wire_uuid(deserializer).map(Self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct AttachmentId(String);
 
@@ -70,6 +80,31 @@ impl fmt::Display for AttachmentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+impl<'de> Deserialize<'de> for AttachmentId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_wire_uuid(deserializer).map(Self)
+    }
+}
+
+fn deserialize_wire_uuid<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() != 36 {
+        return Err(D::Error::custom("identifier must be a canonical UUID"));
+    }
+    let parsed = Uuid::parse_str(&value)
+        .map_err(|_| D::Error::custom("identifier must be a canonical UUID"))?;
+    if parsed.hyphenated().to_string() != value {
+        return Err(D::Error::custom("identifier must be a canonical UUID"));
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,6 +465,7 @@ struct EventMailbox {
     capacity: usize,
     state: Mutex<MailboxState>,
     changed: Condvar,
+    async_changed: Notify,
 }
 
 impl EventMailbox {
@@ -439,6 +475,7 @@ impl EventMailbox {
             capacity: capacity.max(1),
             state: Mutex::new(MailboxState::default()),
             changed: Condvar::new(),
+            async_changed: Notify::new(),
         }
     }
 
@@ -453,6 +490,7 @@ impl EventMailbox {
             event: TabEvent::Snapshot(snapshot),
         });
         self.changed.notify_one();
+        self.async_changed.notify_one();
     }
 
     fn push_snapshot(&self, snapshot: ScreenSnapshot) {
@@ -491,6 +529,7 @@ impl EventMailbox {
             });
         }
         self.changed.notify_one();
+        self.async_changed.notify_one();
     }
 
     fn push_raw(&self, bytes: Vec<u8>) -> bool {
@@ -512,6 +551,7 @@ impl EventMailbox {
             event: TabEvent::Raw(bytes),
         });
         self.changed.notify_one();
+        self.async_changed.notify_one();
         true
     }
 
@@ -519,6 +559,7 @@ impl EventMailbox {
         let mut state = self.state.lock().unwrap();
         state.raw_cancelled = true;
         self.changed.notify_all();
+        self.async_changed.notify_one();
     }
 
     fn push_control(&self, event: TabEvent) {
@@ -535,6 +576,7 @@ impl EventMailbox {
         let sequence = take_sequence(&mut state);
         state.controls.insert(kind, QueuedEvent { sequence, event });
         self.changed.notify_one();
+        self.async_changed.notify_one();
     }
 
     fn finish(&self, exit: TabExit) {
@@ -554,6 +596,7 @@ impl EventMailbox {
         }
         state.producer_closed = true;
         self.changed.notify_all();
+        self.async_changed.notify_one();
     }
 
     fn close_receiver(&self) {
@@ -563,6 +606,7 @@ impl EventMailbox {
         state.raw.clear();
         state.controls.clear();
         self.changed.notify_all();
+        self.async_changed.notify_one();
     }
 
     fn recv(&self) -> Result<TabEvent, RecvError> {
@@ -617,6 +661,43 @@ impl EventMailbox {
         } else {
             Err(TryRecvError::Empty)
         }
+    }
+
+    async fn recv_async(&self) -> Result<TabEvent, TabReceiveError> {
+        loop {
+            // `notify_one` stores a permit when the future is not yet polled;
+            // creating it before inspecting state closes the check/await gap.
+            let notified = self.async_changed.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(event) = pop_next(&mut state) {
+                    self.changed.notify_all();
+                    return Ok(event);
+                }
+                if state.receiver_closed {
+                    return Err(TabReceiveError::Cancelled);
+                }
+                if state.producer_closed {
+                    return Err(TabReceiveError::Disconnected);
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn recovery_boundary(&self) -> u64 {
+        self.state.lock().unwrap().next_sequence
+    }
+
+    fn discard_before(&self, boundary: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.screen.retain(|queued| queued.sequence >= boundary);
+        state.raw.retain(|queued| queued.sequence >= boundary);
+        state
+            .controls
+            .retain(|_, queued| queued.sequence >= boundary);
+        self.changed.notify_all();
+        self.async_changed.notify_one();
     }
 }
 
@@ -735,6 +816,15 @@ pub struct TabEventReceiver {
     cancellation: TabAttachmentCancellation,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabReceiveError {
+    Cancelled,
+    Disconnected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryBoundary(u64);
+
 impl fmt::Debug for TabEventReceiver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TabEventReceiver")
@@ -755,6 +845,14 @@ impl TabEventReceiver {
 
     pub fn try_recv(&self) -> Result<TabEvent, TryRecvError> {
         self.mailbox.try_recv()
+    }
+
+    pub async fn recv_async(&self) -> Result<TabEvent, TabReceiveError> {
+        self.mailbox.recv_async().await
+    }
+
+    pub fn discard_before(&self, boundary: RecoveryBoundary) {
+        self.mailbox.discard_before(boundary.0);
     }
 }
 
@@ -1114,6 +1212,30 @@ impl TabRegistry {
         let _output_order = tab.raw.send_order.lock().unwrap();
         let snapshot = tab.live.lock().unwrap().screen.snapshot(id.as_str());
         Ok(snapshot)
+    }
+
+    /// Capture a recovery viewport and the exact subscriber sequence boundary
+    /// under the same output-order lock. A remote actor can discard only the
+    /// events made obsolete by this snapshot without losing later damage.
+    pub fn recovery_snapshot(
+        &self,
+        id: &TabId,
+        attachment: &AttachmentId,
+    ) -> Result<(ScreenSnapshot, RecoveryBoundary), TabError> {
+        let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open()?;
+        let live = tab.live.lock().unwrap();
+        let state = live.attachments.get(attachment).ok_or_else(|| {
+            TabError::new(
+                "terminal.attachment_not_found",
+                "unknown terminal attachment",
+            )
+        })?;
+        Ok((
+            live.screen.snapshot(id.as_str()),
+            RecoveryBoundary(state.mailbox.recovery_boundary()),
+        ))
     }
 
     pub fn scrollback(

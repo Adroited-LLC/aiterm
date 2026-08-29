@@ -2,6 +2,7 @@ use crate::remote::model::TerminalSize;
 use crate::terminal::MAX_SCROLLBACK_ROWS;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
+use unicode_normalization::char::is_combining_mark;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision(pub u64);
@@ -245,6 +246,25 @@ impl ScreenRow {
     pub fn wrapped(&self) -> bool {
         self.wrapped
     }
+
+    pub(crate) fn has_valid_cell_text(&self) -> bool {
+        self.cells.iter().all(|cell| {
+            if cell.is_continuation() {
+                return true;
+            }
+            let mut scalars = cell.text().chars();
+            let Some(base) = scalars.next() else {
+                return false;
+            };
+            if is_combining_mark(base) {
+                return false;
+            }
+            scalars
+                .take(33)
+                .enumerate()
+                .all(|(index, scalar)| index < 32 && is_combining_mark(scalar))
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -441,6 +461,16 @@ impl ScreenSnapshot {
             if !patched_rows.insert(row) {
                 return Err(ScreenApplyError::DuplicateRowPatch);
             }
+            if patch.content.cells().len() > usize::from(self.cols) {
+                return Err(ScreenApplyError::RowTooWide);
+            }
+        }
+        if diff
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.col() >= self.cols || cursor.row() >= self.rows)
+        {
+            return Err(ScreenApplyError::CursorOutOfBounds);
         }
 
         for patch in diff.rows {
@@ -464,6 +494,8 @@ pub enum ScreenApplyError {
     RevisionDidNotAdvance,
     RowOutOfBounds,
     DuplicateRowPatch,
+    RowTooWide,
+    CursorOutOfBounds,
 }
 
 impl std::fmt::Display for ScreenApplyError {
@@ -474,6 +506,8 @@ impl std::fmt::Display for ScreenApplyError {
             Self::RevisionDidNotAdvance => f.write_str("diff revision must advance the snapshot"),
             Self::RowOutOfBounds => f.write_str("diff row is outside the visible screen"),
             Self::DuplicateRowPatch => f.write_str("diff contains duplicate row patches"),
+            Self::RowTooWide => f.write_str("diff row exceeds the visible screen width"),
+            Self::CursorOutOfBounds => f.write_str("diff cursor is outside the visible screen"),
         }
     }
 }

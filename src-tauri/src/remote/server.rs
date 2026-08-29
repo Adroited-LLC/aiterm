@@ -1,13 +1,14 @@
 use super::auth::{set_private_permissions, write_private_file, DeviceStore, PairingOutcome};
 use super::model::{
-    encode_terminal_frame, RemoteEvent, RemoteRequest, TerminalSize, PROTOCOL_VERSION,
+    decode_exact, encode_terminal_frame, RemoteEvent, RemoteRequest, TerminalSize, PROTOCOL_VERSION,
 };
 use super::terminal::{
     plan_diff_for_attachment, plan_scrollback_for_attachment, plan_snapshot_for_attachment,
     RemoteTerminal, RemoteTerminalEvents, TerminalEvent, TransferChunk, TransferPlan,
 };
 use crate::tabs::{
-    AttachmentId, TabAttachmentCancellation, TabDescriptor, TabId, TabLaunch, TabRegistry, TabState,
+    AttachmentId, RecoveryBoundary, TabAttachmentCancellation, TabDescriptor, TabId, TabLaunch,
+    TabRegistry, TabState,
 };
 use crate::terminal::model::Revision;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -16,7 +17,7 @@ use axum::routing::get;
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use rand_core::{OsRng, RngCore};
 use rcgen::PublicKeyData;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -347,7 +348,7 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
         handle_pairing(socket, state, &message).await;
         return;
     }
-    let proof: AuthProof = match ciborium::from_reader(message.as_ref()) {
+    let proof: AuthProof = match decode_exact(message.as_ref()) {
         Ok(proof) => proof,
         Err(_) => {
             close_socket(&mut socket).await;
@@ -420,6 +421,7 @@ impl RequestGuard {
 struct ConnectionAttachment {
     tab_id: TabId,
     cancellation: TabAttachmentCancellation,
+    commands: tokio::sync::mpsc::Sender<AttachmentCommand>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -428,6 +430,34 @@ struct StartedAttachment {
     attachment_id: AttachmentId,
     events: RemoteTerminalEvents,
     cancellation: TabAttachmentCancellation,
+    revision: Revision,
+}
+
+enum AttachmentCommand {
+    Resume {
+        request_id: u64,
+        tab_id: TabId,
+        attachment_id: AttachmentId,
+        requested_revision: Revision,
+        done: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+    Detach {
+        frames: Vec<RemoteEvent>,
+        done: tokio::sync::oneshot::Sender<Result<(), ()>>,
+    },
+    Shutdown,
+}
+
+enum SequencedAction {
+    Resume {
+        request_id: u64,
+        tab_id: TabId,
+        attachment_id: AttachmentId,
+        requested_revision: Revision,
+    },
+    Detach {
+        attachment_id: AttachmentId,
+    },
 }
 
 struct DispatchOutcome {
@@ -435,7 +465,7 @@ struct DispatchOutcome {
     transfers: Vec<TransferPlan>,
     started: Option<StartedAttachment>,
     tab_id: Option<TabId>,
-    detached: Option<AttachmentId>,
+    sequenced: Option<SequencedAction>,
 }
 
 impl DispatchOutcome {
@@ -445,7 +475,7 @@ impl DispatchOutcome {
             transfers: Vec::new(),
             started: None,
             tab_id: None,
-            detached: None,
+            sequenced: None,
         }
     }
 }
@@ -605,7 +635,7 @@ struct ExitEventPayload<'a> {
 fn decode_payload<T: for<'de> Deserialize<'de>>(
     request: &RemoteRequest,
 ) -> Result<T, &'static str> {
-    ciborium::from_reader(request.payload()).map_err(|_| "protocol.invalid_payload")
+    decode_exact(request.payload()).map_err(|_| "protocol.invalid_payload")
 }
 
 fn payload<T: Serialize>(value: &T) -> Result<Vec<u8>, &'static str> {
@@ -819,6 +849,7 @@ impl RemoteServices {
                 let has_focus = attached.has_focus();
                 let title = attached.title().to_owned();
                 let snapshot = attached.into_snapshot();
+                let revision = snapshot.revision();
                 let frames = vec![response(
                     request_id,
                     "terminal.attach",
@@ -844,9 +875,10 @@ impl RemoteServices {
                         tab_id,
                         attachment_id,
                         cancellation: events.cancellation(),
+                        revision,
                         events,
                     }),
-                    detached: None,
+                    sequenced: None,
                 })
             }
             "terminal.input" => {
@@ -894,7 +926,9 @@ impl RemoteServices {
                     transfers: Vec::new(),
                     started: None,
                     tab_id: None,
-                    detached: Some(request.attachment_id),
+                    sequenced: Some(SequencedAction::Detach {
+                        attachment_id: request.attachment_id,
+                    }),
                 })
             }
             "terminal.scrollback" => {
@@ -925,33 +959,13 @@ impl RemoteServices {
             "terminal.resume" => {
                 let request: ResumePayload = decode_payload(request)?;
                 authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
-                let TerminalEvent::Snapshot(snapshot) = self
-                    .terminal
-                    .resume(&request.tab_id, request.revision)
-                    .map_err(|error| error.code())?
-                else {
-                    return Err("terminal.recovery_required");
-                };
-                let frames = vec![response(
+                let mut outcome = DispatchOutcome::frames(Vec::new());
+                outcome.sequenced = Some(SequencedAction::Resume {
                     request_id,
-                    "terminal.resume",
-                    &ResumeReplyPayload {
-                        tab_id: &request.tab_id,
-                        attachment_id: &request.attachment_id,
-                        requested_revision: request.revision,
-                        current_revision: snapshot.revision(),
-                        recovery_required: request.revision != snapshot.revision(),
-                    },
-                )?];
-                let transfer = plan_snapshot_for_attachment(
-                    request_id,
-                    &request.tab_id,
-                    Some(&request.attachment_id),
-                    snapshot,
-                )
-                .map_err(|error| error.code())?;
-                let mut outcome = DispatchOutcome::frames(frames);
-                outcome.transfers.push(transfer);
+                    tab_id: request.tab_id,
+                    attachment_id: request.attachment_id,
+                    requested_revision: request.revision,
+                });
                 Ok(outcome)
             }
             _ => Err("protocol.unsupported_request"),
@@ -974,152 +988,296 @@ fn authorize_attachment(
     }
 }
 
-async fn forward_attachment_events(
-    mut attachment: StartedAttachment,
-    outbound: tokio::sync::mpsc::Sender<RemoteEvent>,
-) {
-    while let Some(event) = attachment.events.next().await {
-        let transfer = match event {
-            TerminalEvent::Snapshot(snapshot) => {
-                let tab_id = attachment.tab_id.clone();
-                let attachment_id = attachment.attachment_id.clone();
-                Some(
-                    tokio::task::spawn_blocking(move || {
-                        plan_snapshot_for_attachment(0, &tab_id, Some(&attachment_id), snapshot)
-                    })
-                    .await
-                    .map_err(|_| ())
-                    .and_then(|result| result.map_err(|_| ())),
-                )
-            }
-            TerminalEvent::Diff(diff) => {
-                let tab_id = attachment.tab_id.clone();
-                let attachment_id = attachment.attachment_id.clone();
-                Some(
-                    tokio::task::spawn_blocking(move || {
-                        plan_diff_for_attachment(0, &tab_id, Some(&attachment_id), diff)
-                    })
-                    .await
-                    .map_err(|_| ())
-                    .and_then(|result| result.map_err(|_| ())),
-                )
-            }
-            TerminalEvent::FocusChanged { owner, size } => {
-                let event = response(
-                    0,
-                    "terminal.focus_changed",
-                    &FocusEventPayload {
-                        tab_id: &attachment.tab_id,
-                        attachment_id: &attachment.attachment_id,
-                        focus: remote_focus(owner.as_ref(), Some(&attachment.attachment_id)),
-                        size,
-                    },
-                );
-                if send_direct_event(&outbound, event).await.is_err() {
-                    return;
-                }
-                None
-            }
-            TerminalEvent::Title(title) => {
-                let event = response(
-                    0,
-                    "terminal.title",
-                    &TitleEventPayload {
-                        tab_id: &attachment.tab_id,
-                        attachment_id: &attachment.attachment_id,
-                        title: &title,
-                    },
-                );
-                if send_direct_event(&outbound, event).await.is_err() {
-                    return;
-                }
-                None
-            }
-            TerminalEvent::Exited(exit) => {
-                let event = response(
-                    0,
-                    "terminal.exited",
-                    &ExitEventPayload {
-                        tab_id: &attachment.tab_id,
-                        attachment_id: &attachment.attachment_id,
-                        exit: &exit,
-                    },
-                );
-                if send_direct_event(&outbound, event).await.is_err() {
-                    return;
-                }
-                None
-            }
-            TerminalEvent::Bell => continue,
+async fn enqueue_event(
+    outbound: &tokio::sync::mpsc::Sender<Message>,
+    event: RemoteEvent,
+) -> Result<(), ()> {
+    let bytes = tokio::task::spawn_blocking(move || encode_terminal_frame(&event))
+        .await
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
+    outbound
+        .send(Message::Binary(bytes.into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn enqueue_transfer(
+    outbound: &tokio::sync::mpsc::Sender<Message>,
+    mut transfer: TransferPlan,
+) -> Result<(), ()> {
+    loop {
+        let (returned, encoded) = tokio::task::spawn_blocking(move || {
+            let encoded = match transfer.next_chunk() {
+                Ok(Some(chunk)) => encode_terminal_frame(&chunk_event(chunk))
+                    .map(Some)
+                    .map_err(|_| ()),
+                Ok(None) => Ok(None),
+                Err(_) => Err(()),
+            };
+            (transfer, encoded)
+        })
+        .await
+        .map_err(|_| ())?;
+        transfer = returned;
+        let Some(bytes) = encoded? else {
+            return Ok(());
         };
-        if let Some(transfer) = transfer {
-            match transfer {
-                Ok(transfer) => {
-                    if send_transfer_to_queue(transfer, &outbound).await.is_err() {
-                        return;
-                    }
+        outbound
+            .send(Message::Binary(bytes.into()))
+            .await
+            .map_err(|_| ())?;
+    }
+}
+
+async fn enqueue_outcome(
+    outbound: &tokio::sync::mpsc::Sender<Message>,
+    frames: Vec<RemoteEvent>,
+    transfers: Vec<TransferPlan>,
+) -> Result<(), ()> {
+    for frame in frames {
+        enqueue_event(outbound, frame).await?;
+    }
+    for transfer in transfers {
+        enqueue_transfer(outbound, transfer).await?;
+    }
+    Ok(())
+}
+
+async fn encode_control_event(
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    event: TerminalEvent,
+) -> Result<Option<RemoteEvent>, ()> {
+    tokio::task::spawn_blocking(move || match event {
+        TerminalEvent::FocusChanged { owner, size } => response(
+            0,
+            "terminal.focus_changed",
+            &FocusEventPayload {
+                tab_id: &tab_id,
+                attachment_id: &attachment_id,
+                focus: remote_focus(owner.as_ref(), Some(&attachment_id)),
+                size,
+            },
+        )
+        .map(Some)
+        .map_err(|_| ()),
+        TerminalEvent::Title(title) => response(
+            0,
+            "terminal.title",
+            &TitleEventPayload {
+                tab_id: &tab_id,
+                attachment_id: &attachment_id,
+                title: &title,
+            },
+        )
+        .map(Some)
+        .map_err(|_| ()),
+        TerminalEvent::Exited(exit) => response(
+            0,
+            "terminal.exited",
+            &ExitEventPayload {
+                tab_id: &tab_id,
+                attachment_id: &attachment_id,
+                exit: &exit,
+            },
+        )
+        .map(Some)
+        .map_err(|_| ()),
+        TerminalEvent::Bell => Ok(None),
+        TerminalEvent::Snapshot(_) | TerminalEvent::Diff(_) => Err(()),
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+struct ResumeEmission {
+    boundary: RecoveryBoundary,
+    revision: Revision,
+    frames: Vec<RemoteEvent>,
+    transfers: Vec<TransferPlan>,
+}
+
+fn build_resume_emission(
+    terminal: RemoteTerminal,
+    request_id: u64,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    requested_revision: Revision,
+) -> Result<ResumeEmission, RemoteEvent> {
+    let recovery = terminal
+        .resume(&tab_id, &attachment_id, requested_revision)
+        .map_err(|error| {
+            error_response(
+                request_id,
+                error.code(),
+                "the authenticated recovery request could not be completed",
+            )
+        })?;
+    let (snapshot, boundary) = recovery.into_parts();
+    let revision = snapshot.revision();
+    let frame = response(
+        request_id,
+        "terminal.resume",
+        &ResumeReplyPayload {
+            tab_id: &tab_id,
+            attachment_id: &attachment_id,
+            requested_revision,
+            current_revision: revision,
+            recovery_required: requested_revision != revision,
+        },
+    )
+    .map_err(|code| {
+        error_response(
+            request_id,
+            code,
+            "the recovery reply could not be represented",
+        )
+    })?;
+    let transfer =
+        plan_snapshot_for_attachment(request_id, &tab_id, Some(&attachment_id), snapshot).map_err(
+            |error| {
+                error_response(
+                    request_id,
+                    error.code(),
+                    "the recovery snapshot could not be represented",
+                )
+            },
+        )?;
+    Ok(ResumeEmission {
+        boundary,
+        revision,
+        frames: vec![frame],
+        transfers: vec![transfer],
+    })
+}
+
+async fn attachment_actor(
+    mut attachment: StartedAttachment,
+    mut commands: tokio::sync::mpsc::Receiver<AttachmentCommand>,
+    outbound: tokio::sync::mpsc::Sender<Message>,
+    terminal: RemoteTerminal,
+) {
+    let mut live_revision = Some(attachment.revision);
+    loop {
+        tokio::select! {
+            biased;
+            command = commands.recv() => match command {
+                Some(AttachmentCommand::Resume {
+                    request_id,
+                    tab_id,
+                    attachment_id,
+                    requested_revision,
+                    done,
+                }) => {
+                    let resume_terminal = terminal.clone();
+                    let emission = tokio::task::spawn_blocking(move || build_resume_emission(
+                        resume_terminal,
+                        request_id,
+                        tab_id,
+                        attachment_id,
+                        requested_revision,
+                    )).await;
+                    let result = match emission {
+                        Ok(Ok(emission)) => {
+                            attachment.events.apply_recovery_boundary(emission.boundary);
+                            live_revision = Some(emission.revision);
+                            enqueue_outcome(&outbound, emission.frames, emission.transfers).await
+                        }
+                        Ok(Err(error)) => enqueue_event(&outbound, error).await,
+                        Err(_) => Err(()),
+                    };
+                    let failed = result.is_err();
+                    let _ = done.send(result);
+                    if failed { return; }
                 }
-                Err(_) => {
-                    if outbound
-                        .send(error_response(
-                            0,
-                            "terminal.recovery_required",
-                            "terminal state could not be represented; request a fresh snapshot",
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                Some(AttachmentCommand::Detach { frames, done }) => {
+                    attachment.events.cancel();
+                    let result = enqueue_outcome(&outbound, frames, Vec::new()).await;
+                    let _ = done.send(result);
+                    return;
                 }
+                Some(AttachmentCommand::Shutdown) | None => {
+                    attachment.events.cancel();
+                    return;
+                }
+            },
+            event = attachment.events.next() => {
+                let Some(event) = event else { return; };
+                let result = match event {
+                    TerminalEvent::Snapshot(snapshot) => {
+                        live_revision = Some(snapshot.revision());
+                        let tab_id = attachment.tab_id.clone();
+                        let attachment_id = attachment.attachment_id.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            plan_snapshot_for_attachment(0, &tab_id, Some(&attachment_id), snapshot)
+                        }).await {
+                            Ok(Ok(transfer)) => enqueue_transfer(&outbound, transfer).await,
+                            _ => enqueue_event(&outbound, recovery_error()).await,
+                        }
+                    }
+                    TerminalEvent::Diff(diff) => {
+                        if live_revision != Some(diff.base_revision()) {
+                            live_revision = None;
+                            enqueue_event(&outbound, recovery_error()).await
+                        } else {
+                            live_revision = Some(diff.revision());
+                            let tab_id = attachment.tab_id.clone();
+                            let attachment_id = attachment.attachment_id.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                plan_diff_for_attachment(0, &tab_id, Some(&attachment_id), diff)
+                            }).await {
+                                Ok(Ok(transfer)) => enqueue_transfer(&outbound, transfer).await,
+                                _ => enqueue_event(&outbound, recovery_error()).await,
+                            }
+                        }
+                    }
+                    control => match encode_control_event(
+                        attachment.tab_id.clone(),
+                        attachment.attachment_id.clone(),
+                        control,
+                    ).await {
+                        Ok(Some(event)) => enqueue_event(&outbound, event).await,
+                        Ok(None) => Ok(()),
+                        Err(()) => Err(()),
+                    },
+                };
+                if result.is_err() { return; }
             }
         }
     }
 }
 
-async fn send_direct_event(
-    outbound: &tokio::sync::mpsc::Sender<RemoteEvent>,
-    event: Result<RemoteEvent, &'static str>,
-) -> Result<(), ()> {
-    let event = event.map_err(|_| ())?;
-    outbound.send(event).await.map_err(|_| ())
+fn recovery_error() -> RemoteEvent {
+    error_response(
+        0,
+        "terminal.recovery_required",
+        "terminal revision gap; request a fresh snapshot",
+    )
 }
 
-async fn send_transfer_to_queue(
-    mut transfer: TransferPlan,
-    outbound: &tokio::sync::mpsc::Sender<RemoteEvent>,
-) -> Result<(), ()> {
-    while let Some(chunk) = transfer.next_chunk().map_err(|_| ())? {
-        outbound.send(chunk_event(chunk)).await.map_err(|_| ())?;
-    }
-    Ok(())
-}
-
-async fn send_transfer_to_socket(
-    socket: &mut WebSocket,
-    mut transfer: TransferPlan,
-) -> Result<(), ()> {
-    while let Some(chunk) = transfer.next_chunk().map_err(|_| ())? {
-        send_remote_event(socket, &chunk_event(chunk)).await?;
-    }
-    Ok(())
-}
-
-async fn run_authenticated_socket(mut socket: WebSocket, services: RemoteServices) {
+async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
     let mut guard = RequestGuard::new(Instant::now());
-    let (outbound, mut outbound_events) = tokio::sync::mpsc::channel(OUTBOUND_EVENT_QUEUE);
+    let (mut socket_sink, mut socket_stream) = socket.split();
+    let (outbound, mut outbound_messages) = tokio::sync::mpsc::channel(OUTBOUND_EVENT_QUEUE);
+    let (writer_failed, mut writer_failure) = tokio::sync::watch::channel(false);
+    let writer = tokio::spawn(async move {
+        while let Some(message) = outbound_messages.recv().await {
+            if socket_sink.send(message).await.is_err() {
+                let _ = writer_failed.send(true);
+                return;
+            }
+        }
+    });
     let mut attachments = HashMap::<AttachmentId, ConnectionAttachment>::new();
     let mut reap_tick = tokio::time::interval(ATTACHMENT_REAP_INTERVAL);
     reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     'socket: loop {
         reap_finished_attachments(&mut attachments).await;
         let message = tokio::select! {
-            message = socket.next() => message,
-            event = outbound_events.recv() => {
-                let Some(event) = event else { break; };
-                if send_remote_event(&mut socket, &event).await.is_err() {
-                    break;
-                }
+            message = socket_stream.next() => message,
+            changed = writer_failure.changed() => {
+                if changed.is_err() || *writer_failure.borrow() { break; }
                 continue;
             }
             _ = reap_tick.tick() => continue,
@@ -1130,40 +1288,50 @@ async fn run_authenticated_socket(mut socket: WebSocket, services: RemoteService
         match message {
             Ok(Message::Binary(bytes)) => {
                 if bytes.len() >= MAX_MESSAGE_SIZE {
-                    close_socket(&mut socket).await;
+                    let _ = outbound.send(Message::Close(None)).await;
                     break;
                 }
                 let request = match RemoteRequest::decode(&bytes) {
                     Ok(request) => request,
                     Err(error) => {
                         let Some(request_id) = error.request_id() else {
-                            close_socket(&mut socket).await;
+                            let _ = outbound.send(Message::Close(None)).await;
                             break;
                         };
                         if guard.admit(request_id, Instant::now()).is_err() {
-                            close_socket(&mut socket).await;
+                            let _ = outbound.send(Message::Close(None)).await;
                             break;
                         }
-                        let event = error_response(request_id, error.code(), error.message());
-                        if send_remote_event(&mut socket, &event).await.is_err() {
+                        if enqueue_event(
+                            &outbound,
+                            error_response(request_id, error.code(), error.message()),
+                        )
+                        .await
+                        .is_err()
+                        {
                             break;
                         }
                         continue;
                     }
                 };
                 if guard.admit(request.request_id(), Instant::now()).is_err() {
-                    close_socket(&mut socket).await;
+                    let _ = outbound.send(Message::Close(None)).await;
                     break;
                 }
                 if request.kind() == "terminal.attach"
                     && attachments.len() >= MAX_ATTACHMENTS_PER_CONNECTION
                 {
-                    let event = error_response(
-                        request.request_id(),
-                        "terminal.too_many_attachments",
-                        "the connection attachment limit was reached",
-                    );
-                    if send_remote_event(&mut socket, &event).await.is_err() {
+                    if enqueue_event(
+                        &outbound,
+                        error_response(
+                            request.request_id(),
+                            "terminal.too_many_attachments",
+                            "the connection attachment limit was reached",
+                        ),
+                    )
+                    .await
+                    .is_err()
+                    {
                         break;
                     }
                     continue;
@@ -1181,55 +1349,99 @@ async fn run_authenticated_socket(mut socket: WebSocket, services: RemoteService
                 {
                     Ok(outcome) => outcome,
                     Err(_) => {
-                        close_socket(&mut socket).await;
+                        let _ = outbound.send(Message::Close(None)).await;
                         break;
                     }
                 };
-                if let Some(detached) = outcome.detached.as_ref() {
-                    if let Some(attachment) = attachments.remove(detached) {
-                        shutdown_attachment(attachment).await;
+                let DispatchOutcome {
+                    frames,
+                    transfers,
+                    started,
+                    tab_id,
+                    sequenced,
+                } = outcome;
+                match sequenced {
+                    Some(SequencedAction::Resume {
+                        request_id,
+                        tab_id,
+                        attachment_id,
+                        requested_revision,
+                    }) => {
+                        let Some(attachment) = attachments.get(&attachment_id) else {
+                            break 'socket;
+                        };
+                        let (done, completed) = tokio::sync::oneshot::channel();
+                        if attachment
+                            .commands
+                            .send(AttachmentCommand::Resume {
+                                request_id,
+                                tab_id,
+                                attachment_id,
+                                requested_revision,
+                                done,
+                            })
+                            .await
+                            .is_err()
+                            || completed.await.ok() != Some(Ok(()))
+                        {
+                            break 'socket;
+                        }
+                    }
+                    Some(SequencedAction::Detach { attachment_id }) => {
+                        let Some(mut attachment) = attachments.remove(&attachment_id) else {
+                            break 'socket;
+                        };
+                        let (done, completed) = tokio::sync::oneshot::channel();
+                        if attachment
+                            .commands
+                            .send(AttachmentCommand::Detach { frames, done })
+                            .await
+                            .is_err()
+                            || completed.await.ok() != Some(Ok(()))
+                        {
+                            shutdown_attachment(attachment).await;
+                            break 'socket;
+                        }
+                        let _ = (&mut attachment.task).await;
+                    }
+                    None => {
+                        if enqueue_outcome(&outbound, frames, transfers).await.is_err() {
+                            break 'socket;
+                        }
                     }
                 }
-                for event in outcome.frames {
-                    if send_remote_event(&mut socket, &event).await.is_err() {
-                        break 'socket;
-                    }
-                }
-                for transfer in outcome.transfers {
-                    if send_transfer_to_socket(&mut socket, transfer)
-                        .await
-                        .is_err()
-                    {
-                        break 'socket;
-                    }
-                }
-                if let Some(started) = outcome.started {
+                if let Some(started) = started {
                     let id = started.attachment_id.clone();
                     let cancellation = started.cancellation.clone();
-                    let task = tokio::spawn(forward_attachment_events(started, outbound.clone()));
+                    let (commands, command_receiver) = tokio::sync::mpsc::channel(8);
+                    let task = tokio::spawn(attachment_actor(
+                        started,
+                        command_receiver,
+                        outbound.clone(),
+                        services.terminal.clone(),
+                    ));
                     attachments.insert(
                         id,
                         ConnectionAttachment {
-                            tab_id: outcome.tab_id.expect("started attachments name their tab"),
+                            tab_id: tab_id.expect("started attachments name their tab"),
                             cancellation,
+                            commands,
                             task,
                         },
                     );
                 }
             }
             Ok(Message::Ping(bytes)) => {
-                if bytes.len() >= MAX_MESSAGE_SIZE {
-                    close_socket(&mut socket).await;
-                    break;
-                }
-                if socket.send(Message::Pong(bytes)).await.is_err() {
+                if bytes.len() >= MAX_MESSAGE_SIZE
+                    || outbound.send(Message::Pong(bytes)).await.is_err()
+                {
                     break;
                 }
             }
             Ok(Message::Pong(_)) => {}
             Ok(Message::Close(_)) | Err(_) => break,
             _ => {
-                close_socket(&mut socket).await;
+                let _ = outbound.send(Message::Close(None)).await;
                 break;
             }
         }
@@ -1237,11 +1449,14 @@ async fn run_authenticated_socket(mut socket: WebSocket, services: RemoteService
     for (_, attachment) in attachments {
         shutdown_attachment(attachment).await;
     }
+    let _ = outbound.send(Message::Close(None)).await;
+    drop(outbound);
+    let _ = writer.await;
 }
 
 async fn shutdown_attachment(mut attachment: ConnectionAttachment) {
-    let cancellation = attachment.cancellation.clone();
-    let _ = tokio::task::spawn_blocking(move || cancellation.cancel()).await;
+    attachment.cancellation.cancel();
+    let _ = attachment.commands.try_send(AttachmentCommand::Shutdown);
     if tokio::time::timeout(ATTACHMENT_SHUTDOWN_TIMEOUT, &mut attachment.task)
         .await
         .is_err()
@@ -1309,7 +1524,7 @@ mod request_guard_tests {
 }
 
 async fn handle_pairing(mut socket: WebSocket, state: GatewayState, bytes: &[u8]) {
-    let request: PairRequest = match ciborium::from_reader::<PairRequest, _>(bytes) {
+    let request: PairRequest = match decode_exact::<PairRequest>(bytes) {
         Ok(request) if request.kind == "pair.request" => request,
         _ => {
             close_socket(&mut socket).await;
@@ -1389,14 +1604,6 @@ async fn handle_pairing(mut socket: WebSocket, state: GatewayState, bytes: &[u8]
 
 async fn send_cbor<T: Serialize>(socket: &mut WebSocket, value: &T) -> Result<(), ()> {
     let bytes = encode_terminal_frame(value).map_err(|_| ())?;
-    socket
-        .send(Message::Binary(bytes.into()))
-        .await
-        .map_err(|_| ())
-}
-
-async fn send_remote_event(socket: &mut WebSocket, event: &RemoteEvent) -> Result<(), ()> {
-    let bytes = encode_terminal_frame(event).map_err(|_| ())?;
     socket
         .send(Message::Binary(bytes.into()))
         .await
