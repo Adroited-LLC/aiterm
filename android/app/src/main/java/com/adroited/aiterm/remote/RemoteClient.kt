@@ -32,6 +32,10 @@ data class RemoteClientState(
     val readOnly: Boolean = true,
     val showTakeFocus: Boolean = false,
     val pendingTransfers: Int = 0,
+    val tabs: List<RemoteTab> = emptyList(),
+    val sessions: List<RemoteSession> = emptyList(),
+    val activeTabId: String? = null,
+    val activeTitle: String? = null,
     val lastError: String? = null,
 )
 
@@ -83,13 +87,16 @@ class RemoteClient(
 ) {
     private val mutableState = MutableStateFlow(RemoteClientState())
     val state: StateFlow<RemoteClientState> = mutableState.asStateFlow()
+    val screen = screenStore.screen
     private val nextRequestId = AtomicLong(1)
     private val transfers = linkedSetOf<String>()
     private val terminalAssembler = TerminalTransferAssembler()
+    private val rosterAssembler = RosterTransferAssembler()
     private var transport: RemoteTransport? = null
     private var eventJob: Job? = null
     private var reconnectJob: Job? = null
     private var recoveryRequested = false
+    private var activeAttachmentId: String? = null
 
     suspend fun connect(): Boolean {
         reconnectJob?.cancel()
@@ -130,15 +137,80 @@ class RemoteClient(
             )
             return false
         }
-        val active = transport ?: return false
-        val request = RemoteRequest(nextRequestId.getAndIncrement(), "terminal.input", text.encodeToByteArray())
-        scope.launch(dispatcher) {
-            when (val response = active.request(request)) {
-                is RemoteResponse.Error -> accept(RemoteServerEvent.Failure(response.code, response.message))
-                is RemoteResponse.Success -> Unit
-            }
-        }
+        val tabId = mutableState.value.activeTabId ?: return false
+        val attachmentId = activeAttachmentId ?: return false
+        val data = text.encodeToByteArray()
+        if (data.size > MAX_INPUT_BYTES) return false
+        launchRequest("terminal.input", RemoteCommands.input(tabId, attachmentId, data))
         return true
+    }
+
+    fun selectTab(tabId: String) {
+        if (tabId == mutableState.value.activeTabId && activeAttachmentId != null) return
+        launchRequest("terminal.attach", RemoteCommands.tab(tabId)) { payload ->
+            val attached = RemoteCommands.attached(payload)
+            activeAttachmentId = attached.attachmentId
+            mutableState.value = mutableState.value.copy(
+                activeTabId = attached.tabId,
+                activeTitle = attached.title,
+                focus = if (attached.hasFocus) FocusOwner.Self else FocusOwner.Other,
+                readOnly = !attached.hasFocus,
+                showTakeFocus = !attached.hasFocus,
+            )
+        }
+    }
+
+    fun takeFocus(size: TerminalSize): Boolean {
+        val tabId = mutableState.value.activeTabId ?: return false
+        val attachmentId = activeAttachmentId ?: return false
+        launchRequest("terminal.focus", RemoteCommands.sized(tabId, attachmentId, size))
+        return true
+    }
+
+    fun resize(size: TerminalSize): Boolean {
+        if (mutableState.value.focus != FocusOwner.Self) return false
+        val tabId = mutableState.value.activeTabId ?: return false
+        val attachmentId = activeAttachmentId ?: return false
+        launchRequest("terminal.resize", RemoteCommands.sized(tabId, attachmentId, size))
+        return true
+    }
+
+    fun requestScrollback(offset: Int, count: Int): Boolean {
+        if (offset < 0 || count !in 1..512) return false
+        val tabId = mutableState.value.activeTabId ?: return false
+        val attachmentId = activeAttachmentId ?: return false
+        launchRequest("terminal.scrollback", RemoteCommands.scrollback(tabId, attachmentId, offset, count))
+        return true
+    }
+
+    fun refreshSessions() {
+        launchRequest("session.list", byteArrayOf()) { payload ->
+            mutableState.value = mutableState.value.copy(sessions = RemoteCommands.sessions(payload))
+        }
+    }
+
+    fun openSession(sessionId: String, size: TerminalSize) {
+        launchRequest("session.open", RemoteCommands.openSession(sessionId, size)) { payload ->
+            selectTab(RemoteCommands.openedSessionTab(payload))
+        }
+    }
+
+    fun deleteSession(sessionId: String) = sessionMutation("session.delete", sessionId)
+    fun forkSession(sessionId: String) = sessionMutation("session.fork", sessionId)
+    fun stopSession(sessionId: String) = sessionMutation("session.stop", sessionId)
+
+    fun closeTab(tabId: String) {
+        launchRequest("tab.close", RemoteCommands.tab(tabId))
+    }
+
+    fun openShell(projectPath: String?, size: TerminalSize) {
+        launchRequest("tab.open", RemoteCommands.shell(projectPath, null, size)) { payload ->
+            selectTab(RemoteCommands.openedTab(payload))
+        }
+    }
+
+    private fun sessionMutation(kind: String, sessionId: String) {
+        launchRequest(kind, RemoteCommands.session(sessionId)) { refreshSessions() }
     }
 
     fun lock() {
@@ -147,7 +219,9 @@ class RemoteClient(
         closeTransport()
         transfers.clear()
         terminalAssembler.clear()
+        rosterAssembler.clear()
         recoveryRequested = false
+        activeAttachmentId = null
         screenStore.clear()
         mutableState.value = RemoteClientState(connection = ConnectionState.Locked)
     }
@@ -181,8 +255,16 @@ class RemoteClient(
                 mutableState.value = mutableState.value.copy(pendingTransfers = transfers.size)
             }
             is RemoteServerEvent.TerminalChunk -> acceptTerminalChunk(event.chunk)
-            is RemoteServerEvent.RosterChunk -> Unit
-            is RemoteServerEvent.Raw -> Unit
+            is RemoteServerEvent.RosterChunk -> {
+                val roster = try {
+                    rosterAssembler.accept(event.chunk)
+                } catch (error: RemoteProtocolException) {
+                    mutableState.value = mutableState.value.copy(lastError = error.message)
+                    null
+                }
+                if (roster != null) mutableState.value = mutableState.value.copy(tabs = roster.tabs)
+            }
+            is RemoteServerEvent.Raw -> acceptRaw(event)
             is RemoteServerEvent.Failure -> {
                 val lostFocus = event.code == "terminal.input_not_owned"
                 val disconnected = event.code == "transport.disconnected"
@@ -204,9 +286,39 @@ class RemoteClient(
                 closeTransport()
                 transfers.clear()
                 terminalAssembler.clear()
+                rosterAssembler.clear()
                 recoveryRequested = false
+                activeAttachmentId = null
                 screenStore.clear()
                 mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
+            }
+        }
+    }
+
+    private fun acceptRaw(event: RemoteServerEvent.Raw) {
+        when (event.kind) {
+            "terminal.focus_changed" -> {
+                val focus = RemoteCommands.focus(event.payload)
+                if (focus.attachmentId == activeAttachmentId && focus.tabId == mutableState.value.activeTabId) {
+                    accept(RemoteServerEvent.FocusChanged(focus.tabId, focus.attachmentId, focus.focus, focus.size))
+                }
+            }
+            "session.changed" -> refreshSessions()
+            else -> Unit
+        }
+    }
+
+    private fun launchRequest(kind: String, payload: ByteArray, onSuccess: (ByteArray) -> Unit = {}) {
+        val active = transport ?: return
+        val request = RemoteRequest(nextRequestId.getAndIncrement(), kind, payload)
+        scope.launch(dispatcher) {
+            try {
+                when (val response = active.request(request)) {
+                    is RemoteResponse.Error -> accept(RemoteServerEvent.Failure(response.code, response.message))
+                    is RemoteResponse.Success -> onSuccess(response.payload)
+                }
+            } catch (error: Exception) {
+                accept(RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"))
             }
         }
     }
@@ -276,11 +388,14 @@ class RemoteClient(
         transport?.close()
         transport = null
         terminalAssembler.clear()
+        rosterAssembler.clear()
         recoveryRequested = false
+        activeAttachmentId = null
     }
 
     private companion object {
         const val MAX_PENDING_TRANSFERS = 4
+        const val MAX_INPUT_BYTES = 64 * 1_024
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }

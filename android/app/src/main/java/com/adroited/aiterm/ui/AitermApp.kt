@@ -1,9 +1,11 @@
 package com.adroited.aiterm.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -12,6 +14,7 @@ import com.adroited.aiterm.ui.theme.AitermTheme
 import com.adroited.aiterm.AitermApplication
 import com.adroited.aiterm.AppContainer
 import kotlinx.serialization.Serializable
+import androidx.navigation.toRoute
 
 /** Type-safe navigation destinations. */
 @Serializable
@@ -19,6 +22,9 @@ object DesktopsRoute
 
 @Serializable
 object PairingRoute
+
+@Serializable
+data class TerminalRoute(val deviceId: String)
 
 /**
  * The navigation shell. The start destination is always the paired-desktop
@@ -45,6 +51,7 @@ fun AitermApp(
                     DesktopListScreen(
                         store = container.pairedDesktopStore,
                         onPairDesktop = { navController.navigate(PairingRoute) },
+                        onOpenDesktop = { navController.navigate(TerminalRoute(it.deviceId)) },
                     )
                 }
                 composable<PairingRoute> {
@@ -53,6 +60,28 @@ fun AitermApp(
                         onBack = { navController.popBackStack() },
                         onPaired = { navController.popBackStack() },
                     )
+                }
+                composable<TerminalRoute> { entry ->
+                    val route = entry.toRoute<TerminalRoute>()
+                    val desktop = runCatching { container.pairedDesktopStore.all() }
+                        .getOrDefault(emptyList())
+                        .firstOrNull { it.deviceId == route.deviceId }
+                    if (desktop == null) {
+                        LaunchedEffect(route.deviceId) { navController.popBackStack() }
+                    } else {
+                        val remoteViewModel: RemoteTerminalViewModel = viewModel(
+                            key = "remote-${desktop.deviceId}",
+                            factory = RemoteTerminalViewModel.factory(
+                                desktop,
+                                container.deviceKeys,
+                                container.appLock,
+                            ),
+                        )
+                        RemoteTerminalScreen(
+                            viewModel = remoteViewModel,
+                            onBack = { navController.popBackStack() },
+                        )
+                    }
                 }
             }
         }

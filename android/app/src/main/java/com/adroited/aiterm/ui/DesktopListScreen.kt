@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
@@ -36,6 +37,7 @@ import com.adroited.aiterm.pairing.PairedDesktopStore
 fun DesktopListScreen(
     store: PairedDesktopStore,
     onPairDesktop: () -> Unit,
+    onOpenDesktop: (PairedDesktop) -> Unit = {},
     viewModel: DesktopListViewModel = viewModel(factory = DesktopListViewModel.factory(store)),
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -65,6 +67,7 @@ fun DesktopListScreen(
             LazyColumn(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
                 items(uiState.desktops, key = PairedDesktop::deviceId) { desktop ->
                     ListItem(
+                        modifier = Modifier.clickable { onOpenDesktop(desktop) },
                         headlineContent = { Text(desktop.displayName) },
                         supportingContent = {
                             Text(
