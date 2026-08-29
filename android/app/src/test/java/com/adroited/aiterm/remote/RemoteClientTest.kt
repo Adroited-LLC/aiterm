@@ -9,6 +9,8 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -114,6 +116,28 @@ class RemoteClientTest {
 
         assertEquals("old", store.screen.value?.visible?.single()?.plainText())
         assertEquals(listOf("terminal.resume"), transport.requests.map(RemoteRequest::kind))
+        client.lock()
+    }
+
+    @Test
+    fun authenticatedDisconnectReconnectsWithoutChangingTransportSecurityPolicy() = runTest {
+        val transports = mutableListOf<FakeRemoteTransport>()
+        val client = RemoteClient(
+            transportFactory = { FakeRemoteTransport().also(transports::add) },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+
+        client.acceptForTest(RemoteServerEvent.Failure("transport.disconnected", "storm"))
+        assertEquals(ConnectionState.Reconnecting, client.state.value.connection)
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertEquals(2, transports.size)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
         client.lock()
     }
 }

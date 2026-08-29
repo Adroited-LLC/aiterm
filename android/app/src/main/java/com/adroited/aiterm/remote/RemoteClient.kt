@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -87,9 +88,16 @@ class RemoteClient(
     private val terminalAssembler = TerminalTransferAssembler()
     private var transport: RemoteTransport? = null
     private var eventJob: Job? = null
+    private var reconnectJob: Job? = null
     private var recoveryRequested = false
 
     suspend fun connect(): Boolean {
+        reconnectJob?.cancel()
+        reconnectJob = null
+        return connectOnce(ConnectionState.Connecting)
+    }
+
+    private suspend fun connectOnce(connectingState: ConnectionState): Boolean {
         if (!isUnlocked()) {
             lock()
             return false
@@ -97,7 +105,7 @@ class RemoteClient(
         closeTransport()
         val candidate = transportFactory()
         transport = candidate
-        mutableState.value = mutableState.value.copy(connection = ConnectionState.Connecting)
+        mutableState.value = mutableState.value.copy(connection = connectingState)
         return try {
             candidate.connect()
             mutableState.value = mutableState.value.copy(connection = ConnectionState.Connected)
@@ -134,6 +142,8 @@ class RemoteClient(
     }
 
     fun lock() {
+        reconnectJob?.cancel()
+        reconnectJob = null
         closeTransport()
         transfers.clear()
         terminalAssembler.clear()
@@ -175,14 +185,22 @@ class RemoteClient(
             is RemoteServerEvent.Raw -> Unit
             is RemoteServerEvent.Failure -> {
                 val lostFocus = event.code == "terminal.input_not_owned"
+                val disconnected = event.code == "transport.disconnected"
                 mutableState.value = mutableState.value.copy(
+                    connection = if (disconnected) ConnectionState.Reconnecting else mutableState.value.connection,
                     focus = if (lostFocus) FocusOwner.Other else mutableState.value.focus,
                     readOnly = if (lostFocus) true else mutableState.value.readOnly,
                     showTakeFocus = if (lostFocus) true else mutableState.value.showTakeFocus,
                     lastError = event.message,
                 )
+                if (disconnected) {
+                    closeTransport()
+                    scheduleReconnect()
+                }
             }
             RemoteServerEvent.Revoked -> {
+                reconnectJob?.cancel()
+                reconnectJob = null
                 closeTransport()
                 transfers.clear()
                 terminalAssembler.clear()
@@ -190,6 +208,20 @@ class RemoteClient(
                 screenStore.clear()
                 mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
             }
+        }
+    }
+
+    private fun scheduleReconnect() {
+        if (reconnectJob?.isActive == true || !isUnlocked()) return
+        reconnectJob = scope.launch(dispatcher) {
+            for (delayMillis in RECONNECT_DELAYS_MILLIS) {
+                delay(delayMillis)
+                if (!isUnlocked() || mutableState.value.connection == ConnectionState.Revoked ||
+                    mutableState.value.connection == ConnectionState.Locked
+                ) return@launch
+                if (connectOnce(ConnectionState.Reconnecting)) return@launch
+            }
+            mutableState.value = mutableState.value.copy(connection = ConnectionState.Disconnected)
         }
     }
 
@@ -249,5 +281,6 @@ class RemoteClient(
 
     private companion object {
         const val MAX_PENDING_TRANSFERS = 4
+        val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }
