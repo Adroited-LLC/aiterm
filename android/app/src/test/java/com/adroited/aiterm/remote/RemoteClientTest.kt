@@ -180,6 +180,36 @@ class RemoteClientTest {
     }
 
     @Test
+    fun supersededSelectionsStillDetachTheCapturedOldAttachment() = runTest {
+        val transport = DeferredRemoteTransport()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-a")
+        runCurrent()
+        transport.completeNextAttach("tab-a", "attachment-a")
+        runCurrent()
+
+        client.selectTab("tab-b")
+        client.selectTab("tab-c")
+        runCurrent()
+
+        assertEquals(
+            listOf("terminal.attach", "terminal.detach", "terminal.attach"),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        transport.completeNextAttach("tab-c", "attachment-c")
+        runCurrent()
+        assertEquals("tab-c", client.state.value.activeTabId)
+        client.lock()
+    }
+
+    @Test
     fun revisionMismatchKeepsTheCurrentScreenAndRequestsAuthoritativeRecovery() = runTest {
         val transport = FakeRemoteTransport()
         val store = DefaultTerminalScreenStore()

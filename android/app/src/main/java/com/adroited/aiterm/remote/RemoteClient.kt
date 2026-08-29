@@ -644,9 +644,11 @@ class RemoteClient(
     }
 
     private suspend fun runSelection(selection: Selection) {
-        if (!isSelectionCurrent(selection)) return
         val previous = selection.previousAttachment
-        if (previous != null) {
+        if (previous != null && synchronized(lifecycleLock) {
+                isCurrent(selection.lifecycleGeneration, selection.transport)
+            }
+        ) {
             requestIgnoringError(
                 selection.transport,
                 "terminal.detach",
