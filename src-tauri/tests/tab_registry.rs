@@ -409,14 +409,34 @@ fn registry_lists_a_tab_and_owns_its_first_output_before_any_client_attaches() {
 }
 
 #[test]
-fn registry_late_binds_the_pty_before_flushing_a_first_chunk_terminal_reply() {
-    let (registry, pty) = registry();
-
-    registry
-        .open(shell_launch("shell:query").with_command("query-first"))
+fn first_desktop_attachment_replays_raw_output_emitted_while_opening() {
+    let (registry, _) = registry();
+    let id = registry
+        .open_desktop(shell_launch("shell:desktop-ready").with_command("emit-first"))
         .unwrap();
 
-    assert_eq!(pty.writes(), vec![b"\x1b[0n".to_vec()]);
+    let desktop = registry.attach(&id, AttachmentKind::Desktop).unwrap();
+
+    assert_eq!(
+        recv_matching(&desktop.events, |event| matches!(event, TabEvent::Raw(_))),
+        TabEvent::Raw(b"ready".to_vec()),
+    );
+}
+
+#[test]
+fn opening_output_waits_for_xterm_to_answer_terminal_queries_once() {
+    let (registry, pty) = registry();
+
+    let tab = registry
+        .open_desktop(shell_launch("shell:query").with_command("query-first"))
+        .unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+
+    assert!(pty.writes().is_empty());
+    assert_eq!(
+        recv_matching(&desktop.events, |event| matches!(event, TabEvent::Raw(_))),
+        TabEvent::Raw(b"\x1b[5n".to_vec()),
+    );
 }
 
 #[test]

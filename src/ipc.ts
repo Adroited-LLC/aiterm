@@ -179,16 +179,17 @@ export interface SessionMove {
 export const sessionMovedTo = (sessionId: string) =>
   invoke<SessionMove | null>("session_moved_to", { sessionId });
 /** A session start one of our claudes reported through its SessionStart hook,
- *  already resolved to the pty it happened in. `source` is claude's own word
+ *  already resolved to the authoritative tab it happened in. `source` is claude's own word
  *  for why: "startup", "resume", "clear", "compact". */
 export interface SessionEvent {
-  ptyId: number;
+  tabId: TabId;
+  tab: TabDescriptor;
   sessionId: string;
   source: string;
 }
 // Collect (and consume) the hook reports since last asked. The exact
 // counterpart to the sessionMovedTo heuristic: no inference, just what each
-// claude process said about itself, tied to the pty aiterm ran it in.
+// claude process said about itself, tied to the tab aiterm ran it in.
 export const drainSessionEvents = () =>
   invoke<SessionEvent[]>("drain_session_events");
 /** Whether verbose trace capture is on (Settings → Diagnostics). */
@@ -406,55 +407,102 @@ export const searchSessions = (query: string) =>
 export const reindexSessions = () =>
   invoke<{ indexed: number; total: number }>("reindex_sessions");
 
-// PTY output streams over a binary Channel (raw bytes → ArrayBuffer), not the
-// JSON event bus. Caller passes a Channel whose onmessage receives each chunk.
-export const ptySpawn = (
-  cwd: string | null, command: string | null, cols: number, rows: number,
-  onOutput: Channel<ArrayBuffer>,
-  /** Provider id whose API key the backend injects as process environment
-   *  (OPENROUTER_API_KEY) — the key itself never reaches the frontend. */
-  envProvider?: string,
-  /** Model id whose routing the backend compiles into the same environment
-   *  (OPENCODE_CONFIG_CONTENT). The id only: the routing is read from the
-   *  provider store in Rust, so no routing decision crosses IPC. */
-  envModel?: string,
-) => invoke<number>("pty_spawn", {
-  cwd, command, cols, rows, onOutput,
-  envProvider: envProvider ?? null, envModel: envModel ?? null,
-});
-// `pty_write` and `pty_resize` are async commands, so they run on the runtime
-// rather than the GTK main thread — which is what stops a keystroke queueing
-// behind a frame. The cost of that is that two calls are two tasks, and nothing
-// says tasks are polled in the order they were spawned. Both go through a
-// per-pty queue so only one is ever in flight: input keeps its order, and a
-// burst or a paste merges into a single crossing of the IPC boundary.
-export const ptyWrite = makeWriteQueue((id, data) =>
-  invoke<void>("pty_write", { id, data }));
+export type TabId = string;
+export type AttachmentId = string;
 
-/** Latest size wins — the sizes a window drag passes through on the way are of
- *  no interest, and an out-of-order pair would leave the pty on the wrong one. */
-const pendingSize = new Map<number, { cols: number; rows: number }>();
-const resizing = new Map<number, Promise<void>>();
-export const ptyResize = (id: number, cols: number, rows: number): Promise<void> => {
-  pendingSize.set(id, { cols, rows });
-  const running = resizing.get(id);
+export interface TabDescriptor {
+  id: TabId;
+  title: string;
+  cwd: string | null;
+  command: string | null;
+  sessionId?: string;
+  resumedId?: string;
+  agentId?: string;
+  slotId: string;
+  fresh?: boolean;
+  envProvider?: string;
+  envModel?: string;
+  size?: { cols: number; rows: number };
+  inputOwner?: AttachmentId;
+  state?: "running" | "exited";
+  exit?: { code: number | null; signal: string | null; requested: boolean };
+}
+
+export interface TabLaunch {
+  title: string;
+  cwd: string | null;
+  command: string | null;
+  sessionId?: string;
+  resumedId?: string;
+  agentId?: string;
+  slotId: string;
+  fresh?: boolean;
+  envProvider?: string;
+  envModel?: string;
+  size: { cols: number; rows: number };
+}
+
+export interface TabUpdate {
+  title?: string;
+  sessionId?: string;
+  resumedId?: string;
+  agentId?: string;
+  slotId?: string;
+  fresh?: boolean;
+}
+
+export const tabOpen = (launch: TabLaunch) =>
+  invoke<TabDescriptor>("tab_open", { launch });
+export const tabList = () => invoke<TabDescriptor[]>("tab_list");
+export const tabUpdate = (tabId: TabId, update: TabUpdate) =>
+  invoke<TabDescriptor>("tab_update", { tabId, update });
+export const tabAttachDesktop = (
+  tabId: TabId, onOutput: Channel<ArrayBuffer>,
+) => invoke<AttachmentId>("tab_attach_desktop", { tabId, onOutput });
+export const tabDetach = (tabId: TabId, attachmentId: AttachmentId) =>
+  invoke<void>("tab_detach", { tabId, attachmentId });
+
+type TabWriteTarget = { tabId: TabId; attachmentId: AttachmentId };
+const queuedTabWrite = makeWriteQueue<TabWriteTarget>(
+  (target, data) => invoke<void>("tab_write", { ...target, data }),
+  (target) => `${target.tabId}\0${target.attachmentId}`,
+);
+export const tabWrite = (tabId: TabId, attachmentId: AttachmentId, data: string) =>
+  queuedTabWrite({ tabId, attachmentId }, data);
+
+const pendingTabSize = new Map<string, {
+  target: TabWriteTarget;
+  cols: number;
+  rows: number;
+}>();
+const tabResizing = new Map<string, Promise<void>>();
+export const tabResize = (
+  tabId: TabId, attachmentId: AttachmentId, cols: number, rows: number,
+): Promise<void> => {
+  const identity = `${tabId}\0${attachmentId}`;
+  pendingTabSize.set(identity, { target: { tabId, attachmentId }, cols, rows });
+  const running = tabResizing.get(identity);
   if (running) return running;
   const chain = (async () => {
     try {
       for (;;) {
-        const next = pendingSize.get(id);
+        const next = pendingTabSize.get(identity);
         if (!next) return;
-        pendingSize.delete(id);
-        await invoke<void>("pty_resize", { id, cols: next.cols, rows: next.rows });
+        pendingTabSize.delete(identity);
+        await invoke<void>("tab_resize", { ...next.target, cols: next.cols, rows: next.rows });
       }
     } finally {
-      resizing.delete(id);
+      tabResizing.delete(identity);
     }
   })();
-  resizing.set(id, chain);
+  tabResizing.set(identity, chain);
   return chain;
 };
-export const ptyKill = (id: number) => invoke<void>("pty_kill", { id });
+
+export const tabTakeFocus = (
+  tabId: TabId, attachmentId: AttachmentId, cols: number, rows: number,
+) => invoke<void>("tab_take_focus", { tabId, attachmentId, cols, rows });
+export const tabClose = (tabId: TabId) => invoke<void>("tab_close", { tabId });
 
 export const gitRepoState = (path: string) => invoke<RepoState>("git_repo_state", { path });
 export const gitStatus = (path: string) => invoke<FileStatus[]>("git_status", { path });
@@ -842,7 +890,7 @@ export const desktopNotify = (summary: string, body: string, replaces: number) =
 export const desktopNotifyClose = (id: number) =>
   invoke<void>("desktop_notify_close", { id });
 
-export const trayAlerts = (alerts: { key: number; title: string; message?: string }[]) =>
+export const trayAlerts = (alerts: { key: TabId; title: string; message?: string }[]) =>
   invoke<void>("tray_alerts", { alerts });
 
 
@@ -859,10 +907,10 @@ export type LaunchRequest =
 /** Everything a tab needs to open, and nothing about who produced it. */
 export interface LaunchPlan {
   command: string;
-  /** Provider id whose key `pty_spawn` injects into the tab environment.
+  /** Provider id whose key tab opening injects into the tab environment.
    *  `null` means no key is needed. */
   env_provider: string | null;
-  /** Model id whose routing `pty_spawn` compiles into the tab environment,
+  /** Model id whose routing tab opening compiles into the tab environment,
    *  in the provider catalog's spelling. Set only alongside `env_provider`. */
   env_model: string | null;
   /** Non-null = a real session id panels may key to. `null` = the tab needs a

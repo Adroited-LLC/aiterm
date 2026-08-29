@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
+use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
@@ -83,10 +85,13 @@ pub struct TabLaunch {
     resumed_id: Option<String>,
     agent_id: Option<String>,
     slot_id: String,
+    #[serde(default)]
     fresh: bool,
     env_provider: Option<String>,
     env_model: Option<String>,
     size: TerminalSize,
+    #[serde(skip)]
+    desktop_pending: bool,
 }
 
 impl TabLaunch {
@@ -103,6 +108,7 @@ impl TabLaunch {
             env_provider: None,
             env_model: None,
             size,
+            desktop_pending: false,
         }
     }
 
@@ -749,9 +755,15 @@ impl TabRegistry {
         }
     }
 
+    pub fn open_desktop(&self, mut launch: TabLaunch) -> Result<TabId, TabError> {
+        launch.desktop_pending = true;
+        self.open(launch)
+    }
+
     pub fn open(&self, launch: TabLaunch) -> Result<TabId, TabError> {
         let id = TabId::new();
         let slot_id = launch.slot_id.clone();
+        let pending_desktop_raw = launch.desktop_pending.then(Vec::new);
         {
             let mut maps = self.inner.maps.lock().unwrap();
             if maps.by_slot.contains_key(&slot_id) || maps.pending_slots.contains_key(&slot_id) {
@@ -797,6 +809,7 @@ impl TabRegistry {
                 screen: ScreenModel::new(launch.size),
                 pty: PtyBinding::Pending,
                 attachments: HashMap::new(),
+                pending_desktop_raw,
                 pending_replies: VecDeque::new(),
                 exit_notified: false,
             }),
@@ -981,6 +994,13 @@ impl TabRegistry {
             {
                 return Err(TabError::new("tab.closed", "the tab is closing"));
             }
+            if kind == AttachmentKind::Desktop {
+                if let Some(pending) = live.pending_desktop_raw.take() {
+                    if !pending.is_empty() {
+                        let _ = mailbox.push_raw(pending);
+                    }
+                }
+            }
             live.attachments.insert(
                 attachment_id.clone(),
                 AttachmentState {
@@ -1125,10 +1145,200 @@ impl TabRegistry {
         Ok(())
     }
 
+    pub fn detach(&self, id: &TabId, attachment: &AttachmentId) -> Result<(), TabError> {
+        self.inner.tab(id)?;
+        if self.inner.detach(id, attachment) {
+            Ok(())
+        } else {
+            Err(TabError::new(
+                "terminal.attachment_not_found",
+                "the attachment does not belong to this tab",
+            ))
+        }
+    }
+
     pub fn tab_for_descendant(&self, pid: u32) -> Option<TabId> {
         let pty_id = self.inner.backend.pty_for_descendant(pid)?;
         self.inner.maps.lock().ok()?.by_pty.get(&pty_id).cloned()
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTabExit {
+    tab_id: TabId,
+    code: Option<u32>,
+    signal: Option<String>,
+}
+
+fn command_error(error: TabError) -> String {
+    error.to_string()
+}
+
+fn emit_desktop_exit(app: &AppHandle, tab_id: &TabId, exit: &TabExit) {
+    let _ = app.emit(
+        "tab://exit",
+        DesktopTabExit {
+            tab_id: tab_id.clone(),
+            code: exit.code(),
+            signal: exit.signal().map(str::to_owned),
+        },
+    );
+}
+
+#[tauri::command]
+pub async fn tab_open(
+    state: State<'_, TabRegistry>,
+    launch: TabLaunch,
+) -> Result<TabDescriptor, String> {
+    let registry = (*state).clone();
+    crate::run_blocking(move || {
+        let id = registry.open_desktop(launch).map_err(command_error)?;
+        registry.get(&id).map_err(command_error)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn tab_list(state: State<'_, TabRegistry>) -> Vec<TabDescriptor> {
+    state.list()
+}
+
+#[tauri::command]
+pub fn tab_update(
+    state: State<'_, TabRegistry>,
+    tab_id: TabId,
+    update: TabUpdate,
+) -> Result<TabDescriptor, String> {
+    state.update(&tab_id, update).map_err(command_error)
+}
+
+#[tauri::command]
+pub fn tab_attach_desktop(
+    app: AppHandle,
+    state: State<'_, TabRegistry>,
+    tab_id: TabId,
+    on_output: Channel<InvokeResponseBody>,
+) -> Result<AttachmentId, String> {
+    let registry = (*state).clone();
+    let attachment = match registry.attach(&tab_id, AttachmentKind::Desktop) {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            if let Ok(descriptor) = registry.get(&tab_id) {
+                if let Some(exit) = descriptor.exit() {
+                    emit_desktop_exit(&app, &tab_id, exit);
+                }
+            }
+            return Err(command_error(error));
+        }
+    };
+    let attachment_id = attachment.id.clone();
+    let events = attachment.events;
+    std::thread::Builder::new()
+        .name(format!("desktop-tab-{}", tab_id.as_str()))
+        .spawn(move || {
+            while let Ok(event) = events.recv() {
+                match event {
+                    TabEvent::Raw(bytes) => {
+                        let _ = on_output.send(InvokeResponseBody::Raw(bytes));
+                    }
+                    TabEvent::Metadata(descriptor) => {
+                        let _ = app.emit("tab://changed", descriptor);
+                    }
+                    TabEvent::Title(_) => {
+                        if let Ok(descriptor) = registry.get(&tab_id) {
+                            let _ = app.emit("tab://changed", descriptor);
+                        }
+                    }
+                    TabEvent::Exited(exit) => {
+                        emit_desktop_exit(&app, &tab_id, &exit);
+                    }
+                    TabEvent::Snapshot(_)
+                    | TabEvent::Diff(_)
+                    | TabEvent::FocusChanged { .. }
+                    | TabEvent::Bell => {}
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(attachment_id)
+}
+
+#[tauri::command]
+pub async fn tab_detach(
+    state: State<'_, TabRegistry>,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+) -> Result<(), String> {
+    let registry = (*state).clone();
+    crate::run_blocking(move || {
+        registry
+            .detach(&tab_id, &attachment_id)
+            .map_err(command_error)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn tab_write(
+    state: State<'_, TabRegistry>,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    data: String,
+) -> Result<(), String> {
+    let registry = (*state).clone();
+    crate::run_blocking(move || {
+        registry
+            .input(&tab_id, &attachment_id, data.as_bytes())
+            .map_err(command_error)
+    })
+    .await
+}
+
+fn terminal_size(cols: u16, rows: u16) -> Result<TerminalSize, String> {
+    TerminalSize::try_new(cols, rows).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn tab_resize(
+    state: State<'_, TabRegistry>,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let size = terminal_size(cols, rows)?;
+    let registry = (*state).clone();
+    crate::run_blocking(move || {
+        registry
+            .resize(&tab_id, &attachment_id, size)
+            .map_err(command_error)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn tab_take_focus(
+    state: State<'_, TabRegistry>,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let size = terminal_size(cols, rows)?;
+    let registry = (*state).clone();
+    crate::run_blocking(move || {
+        registry
+            .take_focus(&tab_id, &attachment_id, size)
+            .map_err(command_error)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn tab_close(state: State<'_, TabRegistry>, tab_id: TabId) -> Result<(), String> {
+    let registry = (*state).clone();
+    crate::run_blocking(move || registry.close(&tab_id).map_err(command_error)).await
 }
 
 struct RegistryInner {
@@ -1288,15 +1498,15 @@ impl RegistryInner {
         Ok(())
     }
 
-    fn detach(&self, tab_id: &TabId, attachment_id: &AttachmentId) {
+    fn detach(&self, tab_id: &TabId, attachment_id: &AttachmentId) -> bool {
         let Ok(tab) = self.tab(tab_id) else {
-            return;
+            return false;
         };
         let _output_order = tab.raw.send_order.lock().unwrap();
         let removed = {
             let mut live = tab.live.lock().unwrap();
             let Some(attachment) = live.attachments.remove(attachment_id) else {
-                return;
+                return false;
             };
             if live.descriptor.input_owner.as_ref() == Some(attachment_id) {
                 live.descriptor.input_owner = None;
@@ -1310,6 +1520,7 @@ impl RegistryInner {
         if removed == AttachmentKind::Desktop {
             tab.raw.unregister(attachment_id);
         }
+        true
     }
 }
 
@@ -1335,6 +1546,9 @@ struct LiveTab {
     screen: ScreenModel,
     pty: PtyBinding,
     attachments: HashMap<AttachmentId, AttachmentState>,
+    /// Lossless bytes emitted between `tab_open` and the first desktop attach.
+    /// Once taken, later desktop attachments observe only live output.
+    pending_desktop_raw: Option<Vec<u8>>,
     pending_replies: VecDeque<Vec<u8>>,
     exit_notified: bool,
 }
@@ -1423,12 +1637,13 @@ impl LiveTab {
     }
 
     fn queue_replies(&mut self, replies: Vec<Vec<u8>>) -> Option<u32> {
-        let desktop_owns = self
-            .descriptor
-            .input_owner
-            .as_ref()
-            .and_then(|owner| self.attachments.get(owner))
-            .is_some_and(|attachment| attachment.kind == AttachmentKind::Desktop);
+        let desktop_owns = self.pending_desktop_raw.is_some()
+            || self
+                .descriptor
+                .input_owner
+                .as_ref()
+                .and_then(|owner| self.attachments.get(owner))
+                .is_some_and(|attachment| attachment.kind == AttachmentKind::Desktop);
         if desktop_owns {
             return None;
         }
@@ -1466,11 +1681,17 @@ impl PtySink for TabSink {
             return;
         }
         let desktop_mailboxes = {
-            let live = tab.live.lock().unwrap();
+            let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return;
             }
-            live.desktop_mailboxes()
+            let mailboxes = live.desktop_mailboxes();
+            if mailboxes.is_empty() {
+                if let Some(pending) = &mut live.pending_desktop_raw {
+                    pending.extend_from_slice(bytes);
+                }
+            }
+            mailboxes
         };
         for mailbox in desktop_mailboxes {
             let _ = mailbox.push_raw(bytes.to_vec());

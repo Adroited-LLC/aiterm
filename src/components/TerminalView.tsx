@@ -5,9 +5,9 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
-import { makePtyExitBuffer } from "../ptyExitBuffer";
-import type { PtyExit } from "../ptyExitBuffer";
+import {
+  AttachmentId, TabId, tabAttachDesktop, tabDetach, tabResize, tabTakeFocus, tabWrite,
+} from "../ipc";
 import { boldWeightFor } from "../settings";
 import { TerminalInputLine } from "../terminalInput";
 import "@xterm/xterm/css/xterm.css";
@@ -38,7 +38,7 @@ function attachRenderer(term: Terminal): WebglAddon | null {
 export type { TermProgress };
 
 export interface TermTab {
-  key: number;
+  key: TabId;
   title: string;
   cwd: string | null;
   command: string | null;
@@ -97,10 +97,6 @@ export interface TermTab {
 
 /** Control surface a mounted terminal registers with the app. */
 export interface TermHandle {
-  /** The backend pty this terminal runs on. What lets a SessionStart hook
-   *  report — "session X started in process Y" — be traced to a tab: the
-   *  backend resolves Y's ancestry to a pty, and this is the other end. */
-  ptyId: number;
   /** Send raw bytes to the PTY. */
   write: (data: string) => void;
   /** Force a clean TUI repaint (SIGWINCH jiggle) — Ctrl+Shift+L. */
@@ -132,21 +128,21 @@ interface Props {
    *  (or null, if it couldn't be reaped) means it died on its own. `signal` is
    *  set instead when it was killed — portable-pty reports code 1 for every
    *  signal, so the code alone cannot tell a SIGKILL from `exit 1`. */
-  onExit: (key: number, code: number | null, signal: string | null) => void;
-  onRegister: (key: number, handle: TermHandle | null) => void;
-  onActivity: (key: number) => void;
+  onExit: (key: TabId, code: number | null, signal: string | null) => void;
+  onRegister: (key: TabId, handle: TermHandle | null) => void;
+  onActivity: (key: TabId) => void;
   /** Bell = the program wants eyes (claude prompts ring it); typing clears. */
-  onAttention: (key: number, on: boolean) => void;
+  onAttention: (key: TabId, on: boolean) => void;
   /** What the program wants eyes *for*. A bell is one byte and carries no
    *  payload; OSC 9 carries the sentence. It arrives on this tab's own pty, so
    *  no pid-to-tab lookup is needed to know who is asking. */
-  onNotify: (key: number, message: string) => void;
+  onNotify: (key: TabId, message: string) => void;
   /** OSC 9;4 progress. `null` means the program withdrew it. */
-  onProgress: (key: number, progress: TermProgress | null) => void;
+  onProgress: (key: TabId, progress: TermProgress | null) => void;
   /** The line the user just submitted through this terminal. This is kept
    * deliberately narrow: lifecycle watchers may use an explicit command as
    * evidence, but never inspect ordinary prompt text. */
-  onLineSubmit: (key: number, line: string) => void;
+  onLineSubmit: (key: TabId, line: string) => void;
   /** Focus the terminal when it becomes active. Once true only while the
    *  composer was hidden, back when the composer held a text input that would
    *  have been fighting for the same keystrokes. It is a pill strip now, so
@@ -170,8 +166,10 @@ export default function TerminalView({
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
-  const ptyIdRef = useRef<number | null>(null);
+  const attachmentIdRef = useRef<AttachmentId | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
   /** The live WebGL addon, when one is attached. Held because switching back to
    *  the DOM renderer is done by disposing it. */
   const webglRef = useRef<WebglAddon | null>(null);
@@ -211,9 +209,6 @@ export default function TerminalView({
 
     let unlistenExit: UnlistenFn | null = null;
     let disposed = false;
-    const exitBuffer = makePtyExitBuffer((event) => {
-      onExit(tab.key, event.code ?? null, event.signal ?? null);
-    });
 
     // Manual repaint escape hatch (Ctrl+Shift+L): a clean refit + full
     // re-render. With an accelerated renderer this is rarely needed — no
@@ -226,7 +221,8 @@ export default function TerminalView({
     // PTY output arrives as raw bytes over a binary Channel. Write the
     // Uint8Array straight to xterm (it keeps a persistent UTF-8 decoder, so
     // multibyte chars split across chunks are reassembled correctly). Set
-    // onmessage before spawning so no early output is missed.
+    // onmessage before attaching so replayed pre-attach output cannot race the
+    // renderer callback.
     const onOutput = new Channel<ArrayBuffer>();
     onOutput.onmessage = (chunk) => {
       term.write(new Uint8Array(chunk));
@@ -234,26 +230,27 @@ export default function TerminalView({
     };
 
     (async () => {
-      // Register before spawning: a short command can exit and emit its event
-      // before `ptySpawn` resolves. The buffer holds that event until the
-      // returned id has a registered terminal handle.
-      unlistenExit = await listen<PtyExit>("pty://exit", (e) => {
-        exitBuffer.receive(e.payload);
+      // The authoritative id is known before this component mounts, so even a
+      // short-lived child maps directly to its Rust tab with no numeric bind.
+      unlistenExit = await listen<{
+        tabId: TabId;
+        code: number | null;
+        signal: string | null;
+      }>("tab://exit", (e) => {
+        if (e.payload.tabId === tab.key) {
+          onExit(tab.key, e.payload.code ?? null, e.payload.signal ?? null);
+        }
       });
       if (disposed) {
         unlistenExit();
         return;
       }
-      const id = await ptySpawn(
-        tab.cwd, tab.command, term.cols, term.rows, onOutput,
-        tab.envProvider, tab.envModel,
-      );
+      const attachmentId = await tabAttachDesktop(tab.key, onOutput);
       if (disposed) {
-        ptyKill(id);
+        await tabDetach(tab.key, attachmentId).catch(() => {});
         return;
       }
-      ptyIdRef.current = id;
-      exitBuffer.bind(id);
+      attachmentIdRef.current = attachmentId;
       // Roughly how much unsent text is sitting in the running program's input
       // line. Every keystroke passes through here on its way to the PTY, which
       // is enough to answer the only question that matters: is the prompt
@@ -290,7 +287,7 @@ export default function TerminalView({
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type === "keydown" && ev.key === "Enter" && ev.shiftKey) {
           pending += 1; // the line is definitely not empty now
-          ptyWrite(id, "\\\r");
+          tabWrite(tab.key, attachmentId, "\\\r");
           return false;
         }
         return true;
@@ -308,19 +305,24 @@ export default function TerminalView({
         } else if (data >= " ") {
           pending += data.length;
         }
-        ptyWrite(id, data);
+        tabWrite(tab.key, attachmentId, data);
       });
-      term.onResize(({ cols, rows }) => ptyResize(id, cols, rows));
+      term.onResize(({ cols, rows }) =>
+        tabResize(tab.key, attachmentId, cols, rows).catch(() => {}));
+
+      const takeFocus = () =>
+        tabTakeFocus(tab.key, attachmentId, term.cols, term.rows).catch(() => {});
+      term.textarea?.addEventListener("focus", takeFocus);
 
       onRegister(tab.key, {
-        ptyId: id,
-        write: (data) => ptyWrite(id, data),
+        write: (data) => tabWrite(tab.key, attachmentId, data),
         redraw,
         paste: (text) => {
           inputLine.paste(text);
           pending += text.length;
-          ptyWrite(
-            id,
+          tabWrite(
+            tab.key,
+            attachmentId,
             term.modes.bracketedPasteMode ? `\x1b[200~${text}\x1b[201~` : text,
           );
         },
@@ -335,7 +337,7 @@ export default function TerminalView({
             payload = text + "\r";
           }
           pending = 0; // this call ends in Enter, so the line is spent
-          ptyWrite(id, payload);
+          tabWrite(tab.key, attachmentId, payload);
         },
         focus: () => term.focus(),
         pendingInput: () => pending > 0,
@@ -349,8 +351,11 @@ export default function TerminalView({
           return rows;
         },
       });
-      exitBuffer.flush();
-    })();
+      if (activeRef.current) takeFocus();
+    })().catch(() => {
+      // A tab can exit between App's authoritative open and this attachment.
+      // Rust emits the TabId-keyed exit before rejecting that late attach.
+    });
 
     // Debounce resize→fit: splitter drags fire the observer continuously, and
     // a SIGWINCH storm makes TUIs (claude's input box) redraw over half-painted
@@ -367,12 +372,13 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
-      exitBuffer.dispose();
       if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();
       unlistenExit?.();
       onRegister(tab.key, null);
-      if (ptyIdRef.current !== null) ptyKill(ptyIdRef.current);
+      const attachmentId = attachmentIdRef.current;
+      attachmentIdRef.current = null;
+      if (attachmentId !== null) tabDetach(tab.key, attachmentId).catch(() => {});
       term.dispose();
       started.current = false;
     };
@@ -382,9 +388,14 @@ export default function TerminalView({
   useEffect(() => {
     if (active) {
       fitRef.current?.fit();
+      const attachmentId = attachmentIdRef.current;
+      const term = termRef.current;
+      if (attachmentId && term) {
+        tabTakeFocus(tab.key, attachmentId, term.cols, term.rows).catch(() => {});
+      }
       if (autoFocus) termRef.current?.focus();
     }
-  }, [active, autoFocus]);
+  }, [active, autoFocus, tab.key]);
 
   useEffect(() => {
     if (termRef.current && termRef.current.options.fontSize !== fontSize) {

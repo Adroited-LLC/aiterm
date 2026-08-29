@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import Icon from "./Icon";
 import { Bell } from "lucide-react";
+import type { TabId } from "../ipc";
 
 export interface Alert {
   /** Tab key, so picking one can go straight there. */
-  key: number;
+  key: TabId;
   title: string;
   /** What the session said, when it sent words rather than a bell. */
   message?: string;
@@ -27,7 +28,7 @@ function ago(ms: number): string {
  *  answer ever leads to. */
 export default function AlertBell({ alerts, onGo }: {
   alerts: Alert[];
-  onGo: (key: number) => void;
+  onGo: (key: TabId) => void;
 }) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);

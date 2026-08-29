@@ -19,7 +19,7 @@ use tauri::{
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrayAlert {
     /// Tab key — round-tripped through the menu id so a click can say which.
-    pub key: i64,
+    pub key: String,
     pub title: String,
     pub message: Option<String>,
 }
@@ -32,7 +32,12 @@ const PREFIX: &str = "alert:";
 /// One row's text. Kept apart from the menu building so the shape can be
 /// checked without a display server.
 pub fn row_label(a: &TrayAlert) -> String {
-    match a.message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    match a
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         // The title alone is rarely enough to choose between two waiting
         // sessions; the sentence is the part that decides.
         Some(m) => format!("{} — {}", a.title, ellipsis(m, 60)),
@@ -50,8 +55,10 @@ fn ellipsis(s: &str, max: usize) -> String {
 }
 
 /// Parse a menu id back to the tab it came from.
-pub fn key_of(id: &str) -> Option<i64> {
-    id.strip_prefix(PREFIX)?.parse().ok()
+pub fn key_of(id: &str) -> Option<String> {
+    let key = id.strip_prefix(PREFIX)?;
+    uuid::Uuid::parse_str(key).ok()?;
+    Some(key.to_string())
 }
 
 /// Create the tray at startup, with an empty list.
@@ -60,14 +67,25 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
         .default_window_icon()
         .cloned()
         .ok_or_else(|| tauri::Error::AssetNotFound("window icon".into()))?;
-    let menu = Menu::with_items(app, &[&MenuItem::with_id(app, "idle", "Nothing waiting", false, None::<&str>)?])?;
+    let menu = Menu::with_items(
+        app,
+        &[&MenuItem::with_id(
+            app,
+            "idle",
+            "Nothing waiting",
+            false,
+            None::<&str>,
+        )?],
+    )?;
     TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .tooltip("aiterm")
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
-            let Some(key) = key_of(event.id.as_ref()) else { return };
+            let Some(key) = key_of(event.id.as_ref()) else {
+                return;
+            };
             // Raise the window first: picking a session from the tray means
             // going to it, and it is behind something or the tray would not
             // have been the way you reached for it.
@@ -87,19 +105,29 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
 pub fn tray_alerts(app: AppHandle, alerts: Vec<TrayAlert>) -> Result<(), String> {
     let tray = app.tray_by_id(TRAY_ID).ok_or("no tray icon")?;
     let items: Vec<MenuItem<_>> = if alerts.is_empty() {
-        vec![MenuItem::with_id(&app, "idle", "Nothing waiting", false, None::<&str>)
-            .map_err(|e| e.to_string())?]
+        vec![
+            MenuItem::with_id(&app, "idle", "Nothing waiting", false, None::<&str>)
+                .map_err(|e| e.to_string())?,
+        ]
     } else {
         alerts
             .iter()
             .map(|a| {
-                MenuItem::with_id(&app, format!("{PREFIX}{}", a.key), row_label(a), true, None::<&str>)
-                    .map_err(|e| e.to_string())
+                MenuItem::with_id(
+                    &app,
+                    format!("{PREFIX}{}", a.key),
+                    row_label(a),
+                    true,
+                    None::<&str>,
+                )
+                .map_err(|e| e.to_string())
             })
             .collect::<Result<_, _>>()?
     };
-    let refs: Vec<&dyn tauri::menu::IsMenuItem<_>> =
-        items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<_>).collect();
+    let refs: Vec<&dyn tauri::menu::IsMenuItem<_>> = items
+        .iter()
+        .map(|i| i as &dyn tauri::menu::IsMenuItem<_>)
+        .collect();
     let menu = Menu::with_items(&app, &refs).map_err(|e| e.to_string())?;
     tray.set_menu(Some(menu)).map_err(|e| e.to_string())?;
     tray.set_tooltip(Some(&match alerts.len() {
@@ -115,39 +143,69 @@ pub fn tray_alerts(app: AppHandle, alerts: Vec<TrayAlert>) -> Result<(), String>
 mod tests {
     use super::*;
 
-    fn alert(key: i64, title: &str, message: Option<&str>) -> TrayAlert {
-        TrayAlert { key, title: title.into(), message: message.map(Into::into) }
+    fn alert(key: &str, title: &str, message: Option<&str>) -> TrayAlert {
+        TrayAlert {
+            key: key.into(),
+            title: title.into(),
+            message: message.map(Into::into),
+        }
     }
 
     #[test]
     fn a_row_carries_the_sentence_that_decides_between_sessions() {
         assert_eq!(
-            row_label(&alert(3, "aiterm", Some("Permission to run git push"))),
+            row_label(&alert(
+                "550e8400-e29b-41d4-a716-446655440000",
+                "aiterm",
+                Some("Permission to run git push")
+            )),
             "aiterm — Permission to run git push"
         );
     }
 
     #[test]
     fn a_session_that_only_rang_the_bell_still_gets_a_row() {
-        assert_eq!(row_label(&alert(1, "mojo", None)), "mojo — waiting for input");
+        assert_eq!(
+            row_label(&alert("550e8400-e29b-41d4-a716-446655440000", "mojo", None)),
+            "mojo — waiting for input"
+        );
     }
 
     #[test]
     fn an_empty_message_is_treated_as_no_message() {
-        assert_eq!(row_label(&alert(1, "mojo", Some("   "))), "mojo — waiting for input");
+        assert_eq!(
+            row_label(&alert(
+                "550e8400-e29b-41d4-a716-446655440000",
+                "mojo",
+                Some("   ")
+            )),
+            "mojo — waiting for input"
+        );
     }
 
     #[test]
     fn a_long_message_is_cut_rather_than_stretching_the_menu() {
         let long = "x".repeat(200);
-        let row = row_label(&alert(1, "t", Some(&long)));
+        let row = row_label(&alert(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "t",
+            Some(&long),
+        ));
         assert!(row.chars().count() < 80, "{} chars", row.chars().count());
         assert!(row.ends_with('…'));
     }
 
     #[test]
     fn a_click_maps_back_to_the_tab_it_came_from() {
-        assert_eq!(key_of("alert:42"), Some(42));
+        assert_eq!(
+            key_of("alert:550e8400-e29b-41d4-a716-446655440000").as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+        );
+    }
+
+    #[test]
+    fn an_opaque_tab_id_roundtrips_through_a_tray_menu_id() {
+        assert!(key_of("alert:550e8400-e29b-41d4-a716-446655440000").is_some());
     }
 
     #[test]

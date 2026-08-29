@@ -1,11 +1,9 @@
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager};
 
 pub struct PtyInstance {
     master: Box<dyn MasterPty + Send>,
@@ -91,30 +89,6 @@ pub struct PtyManager {
     next_id: Arc<AtomicU32>,
 }
 
-#[derive(Clone, Serialize)]
-struct PtyExit {
-    id: u32,
-    /// The child's exit status, or `None` if it could not be reaped.
-    ///
-    /// This is the whole difference between "you left" and "something killed
-    /// it". A shell you typed `exit` into leaves 0; a `claude` killed from
-    /// `claude agents` — possibly from another terminal, possibly from a
-    /// phone — does not. Without this the UI cannot tell the two apart, and it
-    /// treated every death as a deliberate close: the tab vanished with no
-    /// explanation and no way back but hunting the session down in the sidebar.
-    code: Option<u32>,
-    /// The signal that killed the child, named ("Killed", "Terminated"), when
-    /// it was killed rather than having exited.
-    ///
-    /// `code` cannot carry this. portable-pty reports a *fixed* `exit_code()`
-    /// of 1 for every signal death, so a SIGKILL and a plain `exit 1` are
-    /// indistinguishable there — observed 2026-07-26, when a SIGKILLed shell
-    /// told the user "exited with status 1". Reporting a made-up exit code as
-    /// though the process chose it sends you looking for a failure that never
-    /// happened.
-    signal: Option<String>,
-}
-
 /// Receives the lifetime of one spawned PTY.
 ///
 /// The sink belongs to the caller that created this process, so output can be
@@ -152,31 +126,6 @@ impl PtySpawnSpec {
             env_provider: None,
             env_model: None,
         }
-    }
-}
-
-/// Thin adapter that keeps the existing desktop IPC contract while desktop
-/// callers still spawn PTYs directly. Task 5 replaces this with tab-owned
-/// attachments; process mechanics stay in [`PtyManager`].
-struct DesktopPtySink {
-    app: AppHandle,
-    on_output: Channel<InvokeResponseBody>,
-}
-
-impl PtySink for DesktopPtySink {
-    fn output(&self, _pty_id: u32, bytes: &[u8]) {
-        let _ = self.on_output.send(InvokeResponseBody::Raw(bytes.to_vec()));
-    }
-
-    fn exited(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>) {
-        let _ = self.app.emit(
-            "pty://exit",
-            PtyExit {
-                id: pty_id,
-                code,
-                signal: signal.map(str::to_owned),
-            },
-        );
     }
 }
 
@@ -291,35 +240,6 @@ fn scrub_agent_markers(cmd: &mut CommandBuilder) {
 fn reap_failed_spawn(child: &mut dyn portable_pty::Child) {
     let _ = child.kill();
     let _ = child.wait();
-}
-
-#[tauri::command]
-pub fn pty_spawn(
-    app: AppHandle,
-    state: State<'_, PtyManager>,
-    cwd: Option<String>,
-    command: Option<String>,
-    cols: u16,
-    rows: u16,
-    on_output: Channel<InvokeResponseBody>,
-    env_provider: Option<String>,
-    env_model: Option<String>,
-) -> Result<u32, String> {
-    state.spawn(
-        PtySpawnSpec {
-            cwd,
-            command,
-            size: PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            env_provider,
-            env_model,
-        },
-        Arc::new(DesktopPtySink { app, on_output }),
-    )
 }
 
 impl PtyManager {
@@ -454,20 +374,6 @@ impl PtyManager {
     }
 }
 
-/// Send input to a pty.
-///
-/// `async`, and that is the whole point of it: Tauri runs a *sync* command on
-/// the GTK main thread, which is also the thread that has to be free for the
-/// window to draw. Every keystroke was therefore a write syscall scheduled
-/// against the frame loop, and under load — several agents streaming, the
-/// compositor busy — typing went soft and laggy exactly when the machine could
-/// least afford it. An async command runs on the runtime instead, so a
-/// keystroke never queues behind a frame.
-#[tauri::command]
-pub async fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
-    write_to_pty(&state, id, data.as_bytes())
-}
-
 /// The write itself, with no transport attached, so a remote client reaches a
 /// pty through the same code the window does instead of a parallel copy.
 ///
@@ -475,19 +381,6 @@ pub async fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> R
 /// this cannot block the runtime the command above runs on.
 pub fn write_to_pty(manager: &PtyManager, id: u32, data: &[u8]) -> Result<(), String> {
     manager.write(id, data)
-}
-
-/// Off the main thread for the same reason as [`pty_write`]: a resize arrives
-/// on every window drag frame, and the ioctl has no business competing with the
-/// draw it was triggered by.
-#[tauri::command]
-pub async fn pty_resize(
-    state: State<'_, PtyManager>,
-    id: u32,
-    cols: u16,
-    rows: u16,
-) -> Result<(), String> {
-    resize_pty(&state, id, cols, rows)
 }
 
 /// Split from the command for the same reason as [`write_to_pty`].
@@ -734,13 +627,6 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
     }
     std::thread::sleep(std::time::Duration::from_millis(100));
     !tree.iter().any(|&p| pid_alive(p))
-}
-
-#[tauri::command]
-pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
-    let manager = state.inner().clone();
-    crate::run_blocking(move || manager.kill(id)).await;
-    Ok(())
 }
 
 #[cfg(test)]

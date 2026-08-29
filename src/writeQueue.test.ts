@@ -14,7 +14,7 @@ function fakeSend() {
 }
 
 test("only one write per pty is ever in flight", async () => {
-  // The reason this exists: two concurrent pty_write tasks have no guaranteed
+  // The reason this exists: two concurrent terminal-write tasks have no guaranteed
   // order on the async runtime, so the queue must never hand over two at once.
   const f = fakeSend();
   const write = makeWriteQueue(f.send);
@@ -73,4 +73,52 @@ test("an empty write is not a round trip", async () => {
   const write = makeWriteQueue(f.send);
   await write(1, "");
   assert.equal(f.calls.length, 0);
+});
+
+test("equivalent object identities share one ordered stream", async () => {
+  type Target = { tabId: string; attachmentId: string };
+  const calls: { target: Target; data: string }[] = [];
+  const gates: (() => void)[] = [];
+  const write = makeWriteQueue<Target>(
+    (target, data) => {
+      calls.push({ target, data });
+      return new Promise<void>((resolve) => gates.push(resolve));
+    },
+    (target) => `${target.tabId}\0${target.attachmentId}`,
+  );
+
+  const first = { tabId: "tab-a", attachmentId: "desktop-a" };
+  const second = { tabId: "tab-a", attachmentId: "desktop-a" };
+  write(first, "a");
+  write(second, "b");
+  assert.deepEqual(calls.map(({ data }) => data), ["a"]);
+
+  gates.shift()!();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(calls.map(({ target, data }) => ({ target, data })), [
+    { target: { tabId: "tab-a", attachmentId: "desktop-a" }, data: "a" },
+    { target: { tabId: "tab-a", attachmentId: "desktop-a" }, data: "b" },
+  ]);
+  assert.equal(calls[1].target, second, "the queued write retains the latest full target");
+});
+
+test("different attachment identities drain independently", () => {
+  type Target = { tabId: string; attachmentId: string };
+  const calls: { target: Target; data: string }[] = [];
+  const write = makeWriteQueue<Target>(
+    (target, data) => {
+      calls.push({ target, data });
+      return new Promise<void>(() => {});
+    },
+    (target) => `${target.tabId}\0${target.attachmentId}`,
+  );
+
+  write({ tabId: "tab-a", attachmentId: "desktop-a" }, "left");
+  write({ tabId: "tab-a", attachmentId: "desktop-b" }, "right");
+
+  assert.deepEqual(calls.map(({ target, data }) => ({ target, data })), [
+    { target: { tabId: "tab-a", attachmentId: "desktop-a" }, data: "left" },
+    { target: { tabId: "tab-a", attachmentId: "desktop-b" }, data: "right" },
+  ]);
 });

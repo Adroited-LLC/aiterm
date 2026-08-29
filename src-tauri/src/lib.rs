@@ -2,6 +2,7 @@ pub mod agents;
 pub mod cache;
 pub mod chat;
 pub mod claudecfg;
+pub mod detail;
 pub mod diag;
 pub mod fonts;
 pub mod fsx;
@@ -16,14 +17,13 @@ pub mod opencode;
 pub mod opencode_agent;
 pub mod permissions;
 pub mod providers;
-pub mod rendercost;
-pub mod remote;
-pub mod services;
 pub mod pty;
-pub mod detail;
+pub mod remote;
+pub mod rendercost;
+pub mod services;
 pub mod sessions;
-pub mod taskbar;
 pub mod tabs;
+pub mod taskbar;
 pub mod terminal;
 pub mod trace;
 pub mod tray;
@@ -43,11 +43,14 @@ pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'sta
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     trace::init();
+    let pty = pty::PtyManager::default();
+    let tabs = tabs::TabRegistry::new(pty.clone());
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
-        .manage(pty::PtyManager::default())
+        .manage(pty)
+        .manage(tabs)
         .manage(watcher::WatchState::default())
         // Off until the user turns it on, and it opens nothing on disk until
         // then: a desktop that never pairs a phone never grows a
@@ -57,10 +60,15 @@ pub fn run() {
         // In release `log_invokes` is the identity function and the generated
         // handler is passed straight through — see `trace.rs`.
         .invoke_handler(trace::log_invokes(tauri::generate_handler![
-            pty::pty_spawn,
-            pty::pty_write,
-            pty::pty_resize,
-            pty::pty_kill,
+            tabs::tab_open,
+            tabs::tab_list,
+            tabs::tab_update,
+            tabs::tab_attach_desktop,
+            tabs::tab_detach,
+            tabs::tab_write,
+            tabs::tab_resize,
+            tabs::tab_take_focus,
+            tabs::tab_close,
             agents::detect_agents,
             agents::agent_caps,
             rendercost::renderer_probe,
