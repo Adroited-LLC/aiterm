@@ -340,6 +340,34 @@ fn registry() -> (TabRegistry, Arc<FakePty>) {
 }
 
 #[test]
+fn registry_refuses_a_tab_that_would_make_roster_recovery_unbounded() {
+    let (registry, _) = registry();
+    for index in 0..128 {
+        registry
+            .open(shell_launch(&format!("bounded-roster-{index}")))
+            .unwrap();
+    }
+
+    let error = registry.open(shell_launch("one-tab-too-many")).unwrap_err();
+    assert_eq!(error.code(), "tab.too_many_tabs");
+}
+
+#[test]
+fn registry_rejects_metadata_that_cannot_fit_the_bounded_roster_transfer() {
+    let (registry, _) = registry();
+    let error = registry
+        .open(TabLaunch::new(
+            "x".repeat(33 * 1024),
+            "oversized-roster-entry",
+            size(80, 24),
+        ))
+        .unwrap_err();
+
+    assert_eq!(error.code(), "tab.metadata_too_large");
+    assert!(registry.list().is_empty());
+}
+
+#[test]
 fn registry_change_stream_recovers_overflow_with_a_current_snapshot() {
     let pty = Arc::new(FakePty::default());
     let registry = TabRegistry::with_backend_and_queue_capacity(pty, 1);
