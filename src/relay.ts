@@ -50,7 +50,7 @@ export function useRelay(io: {
   /** Whether the tab is reporting progress (a turn in flight). */
   busy: (key: number) => boolean;
   /** Start a session; resolves with the tab opened. */
-  open: (cwd: string, choice: StartChoice, prompt: string) => Promise<{ key: number; sessionId?: string } | null>;
+  open: (cwd: string, choice: StartChoice, prompt: string, extra: { parentKey: number; title: string }) => Promise<{ key: number; sessionId?: string } | null>;
 }) {
   const [relay, setRelay] = useState<RelayState | null>(null);
   const timer = useRef<number | null>(null);
@@ -118,7 +118,10 @@ export function useRelay(io: {
       transcript || "(nothing yet)",
     ].join("\n");
 
-    const opened = await ioRef.current.open(a.cwd, opts.choice, opening);
+    const short = opts.choice.kind === "agent"
+      ? (opts.choice.model || engineName(opts.choice.agentId))
+      : (opts.choice.modelId.split("/").pop() || opts.choice.modelId);
+    const opened = await ioRef.current.open(a.cwd, opts.choice, opening, { parentKey: a.key, title: short });
     if (myGen !== gen.current) return;
     if (!opened) { setRelay((r) => r && { ...r, phase: "error", note: "could not start the second agent" }); return; }
     const bKey = opened.key;

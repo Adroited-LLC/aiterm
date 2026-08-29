@@ -50,6 +50,10 @@ export interface TermTab {
    *  and it used to be inferred by sniffing the command text for `--resume
    *  <id>`. That inference broke the moment the command grew shell quoting. */
   resumedId?: string;
+  /** The session tab this one belongs to — a second agent brought into a
+   *  session lives under it: shown in that session's row, not the strip;
+   *  closed with it. Unset for a session of its own. */
+  parentKey?: number;
   /** Provider whose key the backend injects into this tab's environment. */
   envProvider?: string;
   /** Model whose routing the backend compiles into this tab's environment.

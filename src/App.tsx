@@ -1,4 +1,4 @@
-import { TimeFormatContext } from "./timefmt";
+import { TimeFormatContext, fullTime } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -28,7 +28,7 @@ import HomeDashboard from "./components/HomeDashboard";
 import { useLibrarian } from "./librarian";
 import { useRelay } from "./relay";
 import BringIn from "./components/BringIn";
-import { Users } from "lucide-react";
+import { RotateCcw, Users } from "lucide-react";
 import { LIBRARIAN_DIR_SUFFIX } from "./ipc";
 import {
   FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
@@ -169,7 +169,20 @@ interface OpenTabOpts {
   agentId?: string;
   /** The session this tab was opened to reopen — see `TermTab.resumedId`. */
   resumedId?: string;
+  /** See `TermTab.parentKey`. */
+  parentKey?: number;
 }
+
+/** A second agent brought into a session, remembered by the session's id
+ *  so it can be reopened from that session's row after its tab is closed —
+ *  or after the session itself is resumed another day. */
+interface BroughtIn {
+  sessionId: string;
+  agentId: string;
+  title: string;
+  at: number;
+}
+const BROUGHT_KEY = "aiterm.broughtIn";
 
 function loadJSON<T>(key: string, fallback: T): T {
   try {
@@ -260,6 +273,12 @@ export default function App() {
   // because everything claude-shaped below gates on which engine is in it.
   const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
   const activeSessionId = activeTabObj?.sessionId ?? null;
+  /** The session tab in front, seen from the strip: a brought-in agent's
+   *  tab stands for its parent there, and in the file row. */
+  const rootKey: number | null = activeTab === null ? null : (activeTabObj?.parentKey ?? activeTab);
+  const rootObj = tabs.find((t) => t.key === rootKey) ?? null;
+  const [broughtIn, setBroughtIn] = useState<Record<string, BroughtIn[]>>(() => loadJSON(BROUGHT_KEY, {}));
+  useEffect(() => localStorage.setItem(BROUGHT_KEY, JSON.stringify(broughtIn)), [broughtIn]);
 
   // What each engine supports, fetched once on mount. `agent_caps` asks the
   // registry and nothing else — no PATH probe, no `--version` — because these
@@ -479,7 +498,15 @@ export default function App() {
     handle: (key) => handles.current.get(key),
     quietFor: (key) => Date.now() - (lastOutput.current.get(key) ?? 0),
     busy: (key) => progressRef.current.has(key),
-    open: (cwd, choice, prompt) => newSession(cwd, choice, prompt),
+    open: async (cwd, choice, prompt, extra) => {
+      const opened = await newSession(cwd, choice, prompt, extra);
+      const parent = tabsRef.current.find((t) => t.key === extra.parentKey);
+      if (opened?.sessionId && parent?.sessionId) {
+        const rec: BroughtIn = { sessionId: opened.sessionId, agentId: choice.kind === "agent" ? choice.agentId : "api", title: extra.title, at: Date.now() };
+        setBroughtIn((m) => ({ ...m, [parent.sessionId!]: [...(m[parent.sessionId!] ?? []).filter((r) => r.sessionId !== rec.sessionId), rec] }));
+      }
+      return opened;
+    },
   });
   const [showBringIn, setShowBringIn] = useState(false);
   useEffect(() => {
@@ -748,7 +775,7 @@ export default function App() {
    *  is up (it covers the terminal, and the explorer shows *its* project),
    *  else the active terminal, else home. A file opened now belongs to this,
    *  and only files belonging to this are in the row. */
-  const fileScope: FileScope = previewSession ? `preview:${previewSession.id}` : activeTab;
+  const fileScope: FileScope = previewSession ? `preview:${previewSession.id}` : rootKey;
   const fileScopeRef = useRef<FileScope>(fileScope);
   fileScopeRef.current = fileScope;
   /** Which file each scope had on screen, so switching away and back finds
@@ -1462,8 +1489,11 @@ export default function App() {
   // all three things. Removed rather than left running for nobody to read.
 
   const closeTab = useCallback((key: number) => {
+    // A session's brought-in agents go with it.
+    const gone = new Set([key, ...tabsRef.current.filter((t) => t.parentKey === key).map((t) => t.key)]);
+    const parent = tabsRef.current.find((t) => t.key === key)?.parentKey;
     setFileTabs((list) => {
-      const dropped = list.filter((f) => f.termKey === key).map((f) => f.key);
+      const dropped = list.filter((f) => f.termKey !== null && typeof f.termKey === "number" && gone.has(f.termKey)).map((f) => f.key);
       if (dropped.length) {
         setDirtyFiles((prev) => {
           const next = new Set(prev);
@@ -1473,17 +1503,21 @@ export default function App() {
         setActiveFileTab((cur) =>
           cur !== null && dropped.includes(cur) ? null : cur);
       }
-      return list.filter((f) => f.termKey !== key);
+      return list.filter((f) => !(typeof f.termKey === "number" && gone.has(f.termKey)));
     });
     setEnded((m) => {
-      if (!m.has(key)) return m;
+      if (![...gone].some((k) => m.has(k))) return m;
       const next = new Map(m);
-      next.delete(key);
+      gone.forEach((k) => next.delete(k));
       return next;
     });
     setTabs((t) => {
-      const next = t.filter((x) => x.key !== key);
-      setActiveTab((cur) => (cur === key ? (next[next.length - 1]?.key ?? null) : cur));
+      const next = t.filter((x) => !gone.has(x.key));
+      setActiveTab((cur) => {
+        if (cur === null || !gone.has(cur)) return cur;
+        if (parent !== undefined && next.some((x) => x.key === parent)) return parent;
+        return next.filter((x) => x.parentKey === undefined).slice(-1)[0]?.key ?? null;
+      });
       return next;
     });
   }, []);
@@ -1518,10 +1552,11 @@ export default function App() {
     const h = (e: KeyboardEvent) => {
       if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
       if (e.key !== "PageDown" && e.key !== "PageUp") return;
-      const list = tabsRef.current;
+      const list = tabsRef.current.filter((t) => t.parentKey === undefined);
       if (list.length === 0) return;
       e.preventDefault();
-      const cur = list.findIndex((t) => t.key === activeTabRef.current);
+      const active = tabsRef.current.find((t) => t.key === activeTabRef.current);
+      const cur = list.findIndex((t) => t.key === (active?.parentKey ?? active?.key));
       const step = e.key === "PageDown" ? 1 : -1;
       const next = list[(cur + step + list.length) % list.length];
       setPreviewSession(null);
@@ -1930,7 +1965,10 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string): Promise<{ key: number; sessionId?: string } | null> => {
+  const newSession = useCallback(async (
+    cwd: string, choice: StartChoice, prompt?: string,
+    extra: { parentKey?: number; title?: string } = {},
+  ): Promise<{ key: number; sessionId?: string } | null> => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
     // the two are presented differently: a model tab is titled by its model
@@ -1962,11 +2000,12 @@ export default function App() {
           // tab's environment — set only for an engine that has said it
           // authenticates no other way. `env_model` names the model whose
           // routing goes in beside it; the routing is compiled in Rust.
-          const key = openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = openTab(extra.title ?? title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             envProvider: plan.env_provider ?? undefined,
             envModel: plan.env_model ?? undefined,
             agentId: plan.agent_id,
+            parentKey: extra.parentKey,
           });
           return { key, sessionId: plan.session_id ?? undefined };
         } catch (e) {
@@ -1990,10 +2029,11 @@ export default function App() {
           // placeholder row keeps the tab reachable, but nothing is keyed to it
           // as a session, because there is no session by that name and never
           // will be.
-          const key = openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = openTab(extra.title ?? basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             fresh: true,
             agentId: plan.agent_id,
+            parentKey: extra.parentKey,
             // An agent we could not name has to be identified after the fact.
             // Snapshot what already exists so adoption can tell its session
             // from one that was open before this tab did anything.
@@ -2015,6 +2055,22 @@ export default function App() {
       }
     }
     return null;
+  }, [openTab]);
+  /** Reopen a brought-in agent under its session's tab. */
+  const reopenBroughtIn = useCallback(async (rootKey: number, rec: BroughtIn) => {
+    const parent = tabsRef.current.find((t) => t.key === rootKey);
+    if (!parent?.cwd) return;
+    const open = tabsRef.current.find((t) => t.sessionId === rec.sessionId);
+    if (open) { setActiveTab(open.key); setActiveFileTab(null); return; }
+    try {
+      const plan = await resolveLaunch({ kind: "resume", sessionId: rec.sessionId });
+      openTab(rec.title, parent.cwd, plan.command, rec.sessionId, {
+        sessionId: rec.sessionId, resumedId: rec.sessionId, agentId: plan.agent_id, parentKey: rootKey,
+      });
+      setActiveFileTab(null);
+    } catch (e) {
+      setNotice(`Couldn't reopen ${rec.title}: ${e}`);
+    }
   }, [openTab]);
 
   /** The empty pane's own source/model/effort, so its button starts the same
@@ -2261,8 +2317,9 @@ export default function App() {
               {/* Every open session, in the order they sit — drag one to move
                   it, middle-click or × to close (which ends its process; the
                   conversation stays on disk and in the sidebar). */}
-              {tabs.map((t) => {
-                const on = t.key === activeTab && !previewSession;
+              {tabs.filter((t) => t.parentKey === undefined).map((t) => {
+                const on = t.key === rootKey && !previewSession;
+                const wants = attention.has(t.key) || tabs.some((c) => c.parentKey === t.key && attention.has(c.key));
                 const tint = agentTint(t.agentId);
                 return (
                   <button
@@ -2289,7 +2346,7 @@ export default function App() {
                       ? <AgentIcon agent={t.agentId} size={13} />
                       : <span className="center-tab-shell">❯</span>}
                     <span className="center-tab-name">{t.title}</span>
-                    {attention.has(t.key) && !on && <span className="center-tab-dot" title="Waiting for you" />}
+                    {wants && !on && <span className="center-tab-dot" title="Waiting for you" />}
                     <span
                       className="center-tab-close"
                       title="Close (ends the session's process)"
@@ -2298,73 +2355,66 @@ export default function App() {
                   </button>
                 );
               })}
-              {/* Right side: bring a second agent into the session in front. */}
-              {activeTabObj?.sessionId && !previewSession && (
-                <div className="strip-right">
-                  {relayCtl.relay && relayCtl.relay.aKey === activeTab || relayCtl.relay && relayCtl.relay.bKey === activeTab ? (
-                    <span className={"relay-pill " + relayCtl.relay!.phase} title={relayCtl.relay!.note || undefined}>
-                      <Icon of={Users} size="sm" />
-                      {relayCtl.relay!.phase === "opening" && `bringing in ${relayCtl.relay!.bName}…`}
-                      {relayCtl.relay!.phase === "waitB" && `round ${relayCtl.relay!.round}/${relayCtl.relay!.rounds} · waiting on ${relayCtl.relay!.bName}`}
-                      {relayCtl.relay!.phase === "waitA" && `round ${relayCtl.relay!.round}/${relayCtl.relay!.rounds} · waiting on ${relayCtl.relay!.aName}`}
-                      {relayCtl.relay!.phase === "done" && `done — ${relayCtl.relay!.note}`}
-                      {relayCtl.relay!.phase === "stopped" && "stopped"}
-                      {relayCtl.relay!.phase === "error" && `stopped: ${relayCtl.relay!.note}`}
-                      {(relayCtl.relay!.phase === "waitA" || relayCtl.relay!.phase === "waitB" || relayCtl.relay!.phase === "opening") ? (
-                        <button className="relay-x" title="Stop relaying" onClick={() => relayCtl.stop()}><Icon of={X} size="sm" /></button>
-                      ) : (
-                        <button className="relay-x" title="Dismiss" onClick={relayCtl.clear}><Icon of={X} size="sm" /></button>
-                      )}
-                      {relayCtl.relay!.bKey >= 0 && (
-                        <button className="relay-jump" onClick={() => setActiveTab(activeTab === relayCtl.relay!.aKey ? relayCtl.relay!.bKey : relayCtl.relay!.aKey)}>
-                          {activeTab === relayCtl.relay!.aKey ? "their tab" : "first tab"}
-                        </button>
-                      )}
-                    </span>
-                  ) : (
-                    <button className="strip-btn" title="Bring a second agent into this session — they talk to each other, you decide" onClick={() => setShowBringIn((v) => !v)}>
-                      <Icon of={Users} size="sm" /> Bring in…
-                    </button>
-                  )}
-                </div>
-              )}
             </div>
           )}
           {/* The bring-in popover hangs off the strip but lives outside it:
               the strip scrolls sideways, and a scroll container clips
               anything positioned inside it. */}
-          {showBringIn && activeTabObj?.sessionId && (
+          {showBringIn && rootObj?.sessionId && (
             <BringIn
               onClose={() => setShowBringIn(false)}
               onOpenModelAccess={openModelAccess}
               onGo={(choice, focus, rounds) => {
                 setShowBringIn(false);
-                if (activeTab !== null) void relayCtl.start({ aKey: activeTab, choice, focus, rounds });
+                if (rootKey !== null) void relayCtl.start({ aKey: rootKey, choice, focus, rounds });
               }}
             />
           )}
           {/* The session's own files, in a row of their own under the strip:
               what this session opened travels with it, and the leftmost tab
               is the way back to its terminal. */}
-          {fileTabs.some(showsFile) && (
+          {(fileTabs.some(showsFile) || (rootObj?.sessionId && !previewSession)) && (
             <div className="center-tabs file-row">
               <button
-                className={"center-tab sub back" + (activeFileTab === null ? " on" : "")}
-                title={previewSession ? "Back to the preview" : activeTabObj ? "Back to the terminal" : "Back to the start view"}
+                className={"center-tab sub back" + (activeFileTab === null && activeTab === rootKey ? " on" : "")}
+                title={previewSession ? "Back to the preview" : rootObj ? "Back to the terminal" : "Back to the start view"}
                 onClick={() => {
                   setActiveFileTab(null);
-                  if (activeTab !== null) handles.current.get(activeTab)?.focus();
+                  if (rootKey !== null) { setActiveTab(rootKey); handles.current.get(rootKey)?.focus(); }
                 }}
               >
                 {previewSession
                   ? <AgentIcon agent={previewSession.agent} size={12} />
-                  : activeTabObj
-                  ? (activeTabObj.agentId
-                      ? <AgentIcon agent={activeTabObj.agentId} size={12} />
+                  : rootObj
+                  ? (rootObj.agentId
+                      ? <AgentIcon agent={rootObj.agentId} size={12} />
                       : <span className="center-tab-shell">❯</span>)
                   : <Icon of={Home} size="sm" />}
-                <span className="center-tab-name">{previewSession ? "Preview" : activeTabObj ? "Terminal" : "Home"}</span>
+                <span className="center-tab-name">{previewSession ? "Preview" : rootObj ? "Terminal" : "Home"}</span>
               </button>
+              {/* Agents brought into this session: tabs of their own, under it. */}
+              {!previewSession && tabs.filter((c) => c.parentKey === rootKey).map((c) => {
+                const on = activeTab === c.key && activeFileTab === null;
+                return (
+                  <button
+                    key={c.key}
+                    className={"center-tab sub child" + (on ? " on" : "") + agentTint(c.agentId).className}
+                    style={agentTint(c.agentId).style}
+                    title={`${c.title} — brought into this session`}
+                    onClick={() => { setActiveFileTab(null); setActiveTab(c.key); handles.current.get(c.key)?.focus(); }}
+                    onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeTab(c.key); } }}
+                  >
+                    <AgentIcon agent={c.agentId ?? "api"} size={12} />
+                    <span className="center-tab-name">{c.title}</span>
+                    {attention.has(c.key) && !on && <span className="center-tab-dot" title="Waiting for you" />}
+                    <span
+                      className="center-tab-close"
+                      title="Close (ends their process; reopen from this row later)"
+                      onClick={(e) => { e.stopPropagation(); closeTab(c.key); }}
+                    ><Icon of={X} size="sm" /></span>
+                  </button>
+                );
+              })}
               {fileTabs.filter(showsFile).map((f) => (
                 <button
                   key={f.key}
@@ -2386,6 +2436,42 @@ export default function App() {
                   ><Icon of={X} size="sm" /></span>
                 </button>
               ))}
+              {/* Right side: this session's second agents — bring one in, the
+                  relay's state, and the ones closed that can be reopened. */}
+              {rootObj?.sessionId && !previewSession && rootKey !== null && (
+                <div className="strip-right">
+                  {(broughtIn[rootObj.sessionId] ?? [])
+                    .filter((r) => !tabs.some((t) => t.sessionId === r.sessionId))
+                    .map((r) => (
+                      <span key={r.sessionId} className="recall-chip" title={`Reopen ${r.title} — brought in ${fullTime(r.at)}`}>
+                        <button className="recall-open" onClick={() => void reopenBroughtIn(rootKey, r)}>
+                          <Icon of={RotateCcw} size="sm" /> <AgentIcon agent={r.agentId} size={11} /> {r.title}
+                        </button>
+                        <button className="recall-x" title="Forget" onClick={() => setBroughtIn((m) => ({ ...m, [rootObj.sessionId!]: (m[rootObj.sessionId!] ?? []).filter((x) => x.sessionId !== r.sessionId) }))}><Icon of={X} size="sm" /></button>
+                      </span>
+                    ))}
+                  {relayCtl.relay && relayCtl.relay.aKey === rootKey ? (
+                    <span className={"relay-pill " + relayCtl.relay.phase} title={relayCtl.relay.note || undefined}>
+                      <Icon of={Users} size="sm" />
+                      {relayCtl.relay.phase === "opening" && `bringing in ${relayCtl.relay.bName}…`}
+                      {relayCtl.relay.phase === "waitB" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.bName}`}
+                      {relayCtl.relay.phase === "waitA" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.aName}`}
+                      {relayCtl.relay.phase === "done" && `done — ${relayCtl.relay.note}`}
+                      {relayCtl.relay.phase === "stopped" && "stopped"}
+                      {relayCtl.relay.phase === "error" && `stopped: ${relayCtl.relay.note}`}
+                      {(relayCtl.relay.phase === "waitA" || relayCtl.relay.phase === "waitB" || relayCtl.relay.phase === "opening") ? (
+                        <button className="relay-x" title="Stop relaying" onClick={() => relayCtl.stop()}><Icon of={X} size="sm" /></button>
+                      ) : (
+                        <button className="relay-x" title="Dismiss" onClick={relayCtl.clear}><Icon of={X} size="sm" /></button>
+                      )}
+                    </span>
+                  ) : (
+                    <button className="strip-btn" title="Bring a second agent into this session — they talk to each other, you decide" onClick={() => setShowBringIn((v) => !v)}>
+                      <Icon of={Users} size="sm" /> Bring in…
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           )}
           <div className="term-stack">
