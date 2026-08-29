@@ -1860,11 +1860,15 @@ body.dragging * { pointer-events: none; }
    so they line up down the list. */
 .mb-col { flex-shrink: 0; font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; text-align: right; }
 .mb-col-ctx { width: 40px; }
-.mb-col-price { width: 88px; }
+.mb-col-price { width: 112px; white-space: nowrap; }
+.mb-more { margin: 6px 10px 10px; align-self: flex-start; }
 .mb-col-used { width: 52px; color: var(--text-dim); }
 .mb-wait { padding: 14px; }
-/* Grows with the window; 300px is the floor, not the size. */
-.mb-body { display: flex; flex: 1; min-height: 300px; }
+/* A box of fixed height: the list scrolls inside it and the controls above
+   it stay where they are. Without the bound the list grew the whole pane and
+   the modal's own scrollbar took over — hundreds of rows, and the search box
+   long gone off the top. */
+.mb-body { display: flex; flex: none; height: clamp(320px, 62vh, 640px); }
 .mb-list {
   /* Wide enough for "Vendor: Model Name (variant)" plus a context and a price
      column — the list is where the choosing happens; the card is detail. */

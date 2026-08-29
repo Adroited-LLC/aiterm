@@ -621,6 +621,13 @@ export default function ModelAccess({ focusProvider }: Props) {
     (e) => !e.headquarters && e.datacenters.length === 0,
   ).length;
 
+  /** Rows drawn so far. A catalogue of 400 is 400 buttons; drawn a page at a
+   *  time it opens instantly and "show more" is one click for the rare scroll
+   *  past the hundredth. Back to one page whenever the view changes. */
+  const PAGE = 100;
+  const [limit, setLimit] = useState(PAGE);
+  useEffect(() => { setLimit(PAGE); }, [query, filter, minCtx, vendor, input, sort, browsing]);
+
   const all = browsing ? cards[browsing] : undefined;
   const q = query.trim().toLowerCase();
   const starred = browsingProv?.startup_models ?? [];
@@ -1084,7 +1091,7 @@ export default function ModelAccess({ focusProvider }: Props) {
             <>
               <div className="mb-body">
                 <div className="mb-list">
-                  {shown.map((m) => (
+                  {shown.slice(0, limit).map((m) => (
                     <button
                       key={m.id}
                       className={"mb-item" + (sel?.id === m.id ? " on" : "")}
@@ -1112,6 +1119,11 @@ export default function ModelAccess({ focusProvider }: Props) {
                   ))}
                   {shown.length === 0 && (
                     <div className="set-hint mb-wait">Nothing matches those filters.</div>
+                  )}
+                  {shown.length > limit && (
+                    <button className="act-btn mb-more" onClick={() => setLimit((n) => n + PAGE)}>
+                      Show {Math.min(PAGE, shown.length - limit)} more · {shown.length - limit} left
+                    </button>
                   )}
                 </div>
                 {sel && (
