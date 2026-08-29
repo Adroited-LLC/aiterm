@@ -411,9 +411,7 @@ pub(crate) fn delete_to_trash_at(session_id: &str, trash: &std::fs::File) -> Res
 /// inode, not a pathname that can be redirected between dump and delete.
 #[cfg(target_os = "linux")]
 struct PinnedDatabase {
-    parent: std::fs::File,
     object: std::fs::File,
-    leaf: CString,
     device: u64,
     inode: u64,
 }
@@ -479,32 +477,10 @@ impl PinnedDatabase {
             return Err("OpenCode database is not a regular file".into());
         }
         Ok(Self {
-            parent,
             object,
-            leaf,
             device: metadata.dev(),
             inode: metadata.ino(),
         })
-    }
-
-    fn named_identity(&self) -> Result<(u64, u64), String> {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let result = unsafe {
-            libc::fstatat(
-                self.parent.as_raw_fd(),
-                self.leaf.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if result != 0 {
-            return Err("OpenCode database identity changed".into());
-        }
-        let stat = unsafe { stat.assume_init() };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-            return Err("OpenCode database identity changed".into());
-        }
-        Ok((stat.st_dev as u64, stat.st_ino as u64))
     }
 
     fn connect(
@@ -512,33 +488,30 @@ impl PinnedDatabase {
         before_open: impl FnOnce(),
         after_open: impl FnOnce(),
     ) -> Result<rusqlite::Connection, String> {
-        // `/proc/self/fd/<parent>/<leaf>` walks from the directory descriptor
-        // pinned above. If procfs is unavailable we fail closed; reopening the
-        // original pathname would reintroduce the root-replacement race.
-        let proc_parent = PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd()));
-        let proc_metadata = std::fs::metadata(&proc_parent)
+        // This is intentionally the procfs magic link for the *already-held
+        // object descriptor*, not a client/store pathname. Following that one
+        // trusted link is the binding mechanism: the kernel opens the same
+        // file description's inode even if every directory entry is replaced.
+        // Consequently SQLITE_OPEN_NOFOLLOW is not applicable here; applying
+        // it would reject the trusted proc link and force SQLite back to the
+        // ABA-prone parent/leaf name. Root and leaf symlinks were already
+        // rejected component-by-component when `object` was pinned.
+        let proc_object = PathBuf::from(format!("/proc/self/fd/{}", self.object.as_raw_fd()));
+        let proc_metadata = std::fs::metadata(&proc_object)
             .map_err(|_| "pinned OpenCode operations require Linux procfs".to_string())?;
-        let parent_metadata = self.parent.metadata().map_err(|error| error.to_string())?;
-        if proc_metadata.dev() != parent_metadata.dev()
-            || proc_metadata.ino() != parent_metadata.ino()
-        {
-            return Err("pinned OpenCode directory identity changed".into());
-        }
-        if self.named_identity()? != (self.device, self.inode) {
+        if (proc_metadata.dev(), proc_metadata.ino()) != (self.device, self.inode) {
             return Err("OpenCode database identity changed".into());
         }
         before_open();
         let connection = rusqlite::Connection::open_with_flags(
-            proc_parent.join(std::ffi::OsStr::from_bytes(self.leaf.as_bytes())),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            &proc_object,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         )
         .map_err(|error| format!("could not open pinned OpenCode database: {error}"))?;
         after_open();
-        let identity = self.named_identity()?;
-        if identity != (self.device, self.inode) {
-            return Err("OpenCode database identity changed".into());
-        }
-        // Keep the object descriptor observably live through connection setup.
+        // Keep the object descriptor observably live and exact through
+        // connection setup. No parent/leaf check follows: such a check is the
+        // ABA window this object-FD connection removes.
         let pinned = self.object.metadata().map_err(|error| error.to_string())?;
         if (pinned.dev(), pinned.ino()) != (self.device, self.inode) {
             return Err("OpenCode database identity changed".into());
@@ -1300,7 +1273,7 @@ mod tests {
         fixture_database(&database, session_id, "Pinned database");
         let trash = fixture_directory(&trash_path);
 
-        delete_to_trash_from_path_with_hooks(
+        let error = delete_to_trash_from_path_with_hooks(
             session_id,
             &database,
             &trash,
@@ -1315,16 +1288,12 @@ mod tests {
             || Ok(()),
             || Ok(()),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert!(!fixture_has_session(&database, session_id));
+        assert!(error.contains("readonly database"));
+        assert!(fixture_has_session(&database, session_id));
         assert!(fixture_has_session(&replacement, session_id));
-        assert_eq!(
-            dump_meta(&trash_path.join(format!("{session_id}.jsonl")))
-                .unwrap()
-                .0,
-            "Pinned database"
-        );
+        assert!(!trash_path.join(format!("{session_id}.jsonl")).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1347,7 +1316,7 @@ mod tests {
         let pinned_store = root.join("pinned-store");
         let outside_store = root.join("outside-store");
 
-        let error = delete_to_trash_from_path_with_hooks(
+        delete_to_trash_from_path_with_hooks(
             session_id,
             &database,
             &trash,
@@ -1364,10 +1333,9 @@ mod tests {
             || Ok(()),
             || Ok(()),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("could not open pinned OpenCode database"));
-        assert!(fixture_has_session(
+        assert!(!fixture_has_session(
             &pinned_store.join("opencode.db"),
             session_id
         ));
@@ -1375,13 +1343,18 @@ mod tests {
             &outside_store.join("opencode.db"),
             session_id
         ));
-        assert!(!trash_path.join(format!("{session_id}.jsonl")).exists());
+        assert_eq!(
+            dump_meta(&trash_path.join(format!("{session_id}.jsonl")))
+                .unwrap()
+                .0,
+            "Pinned database"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn opencode_delete_rejects_a_replaced_database_leaf() {
+    fn opencode_delete_stays_bound_to_the_held_database_across_leaf_replacement() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-opencode-leaf-replacement-{}",
             uuid::Uuid::new_v4()
@@ -1395,7 +1368,7 @@ mod tests {
         fixture_database(&database, session_id, "Pinned database");
         let trash = fixture_directory(&trash_path);
 
-        let error = delete_to_trash_from_path_with_hooks(
+        delete_to_trash_from_path_with_hooks(
             session_id,
             &database,
             &trash,
@@ -1407,12 +1380,16 @@ mod tests {
             || Ok(()),
             || Ok(()),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("database identity changed"));
-        assert!(fixture_has_session(&original, session_id));
+        assert!(!fixture_has_session(&original, session_id));
         assert!(fixture_has_session(&database, session_id));
-        assert!(!trash_path.join(format!("{session_id}.jsonl")).exists());
+        assert_eq!(
+            dump_meta(&trash_path.join(format!("{session_id}.jsonl")))
+                .unwrap()
+                .0,
+            "Pinned database"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
