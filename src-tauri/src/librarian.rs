@@ -46,6 +46,10 @@ pub struct Entry {
     pub at: i64,
     #[serde(default)]
     pub model: String,
+    /// Tags the person set by hand. Kept apart from the model's so no run
+    /// can drop them, and shown to the model as facts.
+    #[serde(default)]
+    pub user_tags: Vec<String>,
 }
 
 /// A thread: a bundle of related sessions, named once and reused.
@@ -58,6 +62,9 @@ pub struct Thread {
     pub tags: Vec<String>,
     #[serde(default)]
     pub created: i64,
+    /// Tags the person set by hand — see `Entry::user_tags`.
+    #[serde(default)]
+    pub user_tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -229,15 +236,19 @@ fn build_prompt(store: &Store, batch: &[serde_json::Value]) -> String {
     let threads: Vec<serde_json::Value> = store
         .threads
         .iter()
-        .map(|(id, t)| serde_json::json!({"id": id, "name": t.name, "description": t.description, "tags": t.tags}))
+        .map(|(id, t)| serde_json::json!({"id": id, "name": t.name, "description": t.description, "tags": t.tags, "user_tags": t.user_tags}))
         .collect();
-    let mut tags: Vec<&String> = store.sessions.values().flat_map(|e| e.tags.iter()).collect();
+    let mut tags: Vec<&String> = store.sessions.values().flat_map(|e| e.tags.iter().chain(e.user_tags.iter())).collect();
     tags.sort();
     tags.dedup();
+    let mut user: Vec<&String> = store.threads.values().flat_map(|t| t.user_tags.iter()).chain(store.sessions.values().flat_map(|e| e.user_tags.iter())).collect();
+    user.sort();
+    user.dedup();
     format!(
-        "Existing threads (file sessions under these where they belong):\n{}\n\nTags already in use: {}\n\nSessions to catalogue:\n{}",
+        "Existing threads (file sessions under these where they belong):\n{}\n\nTags already in use: {}\nTags the person set by hand (reuse these where they fit; they are how the person thinks about the work): {}\n\nSessions to catalogue:\n{}",
         serde_json::to_string_pretty(&threads).unwrap_or_default(),
         tags.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "),
+        user.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "),
         serde_json::to_string_pretty(batch).unwrap_or_default(),
     )
 }
@@ -470,6 +481,7 @@ pub fn apply(store: &mut Store, reply: &[serde_json::Value], asked: &[String], s
                             description: nt.get("description").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
                             tags: strings(nt.get("tags")),
                             created: now,
+                            user_tags: Vec::new(),
                         });
                         by_name.insert(tname.to_lowercase(), tid.clone());
                         thread_id = tid;
@@ -488,6 +500,8 @@ pub fn apply(store: &mut Store, reply: &[serde_json::Value], asked: &[String], s
                 seen: last,
                 at: now,
                 model: model.to_string(),
+                // A re-read never loses what the person set by hand.
+                user_tags: store.sessions.get(id).map(|e| e.user_tags.clone()).unwrap_or_default(),
             },
         );
         n += 1;
@@ -516,7 +530,9 @@ admin, development, setup, integration, tooling, research, ui.\n\
 - add: file a loose session under a thread when it plainly belongs (a session about Radarr belongs with the \
 media server). Leave greetings, smoke tests and true one-offs loose — do not invent a thread for them.\n\
 - Every existing thread id must appear in exactly one merge list. A thread that stands alone is a merge list of \
-one.\n\n\
+one.\n\
+- user_tags were set by the person by hand and are facts, not guesses: sessions or threads sharing a user tag are \
+the same body of work and belong together; a thread's user tags say what it is about. Never contradict them.\n\n\
 Reply with a JSON object only — no prose, no code fence: \
 {\"threads\": [{\"name\": \"...\", \"description\": \"...\", \"tags\": [...], \"merge\": [\"thread-id\", ...], \"add\": [\"session-id\", ...]}]}";
 
@@ -524,10 +540,11 @@ fn tidy_prompt(store: &Store, dirs: &BTreeMap<String, String>) -> String {
     let brief = |id: &str, e: &Entry| serde_json::json!({
         "id": id, "name": e.name, "summary": clip(&e.summary, 160),
         "directory": dirs.get(id).cloned().unwrap_or_default(),
+        "user_tags": e.user_tags,
     });
     let threads: Vec<serde_json::Value> = store.threads.iter().map(|(id, t)| {
         let ss: Vec<serde_json::Value> = store.sessions.iter().filter(|(_, e)| &e.thread == id).map(|(sid, e)| brief(sid, e)).collect();
-        serde_json::json!({"id": id, "name": t.name, "description": t.description, "tags": t.tags, "sessions": ss})
+        serde_json::json!({"id": id, "name": t.name, "description": t.description, "tags": t.tags, "user_tags": t.user_tags, "sessions": ss})
     }).collect();
     let loose: Vec<serde_json::Value> = store.sessions.iter().filter(|(_, e)| e.thread.is_empty() || !store.threads.contains_key(&e.thread)).map(|(sid, e)| brief(sid, e)).collect();
     format!(
@@ -562,6 +579,10 @@ pub fn apply_tidy(store: &mut Store, reply: &serde_json::Value) -> Result<(usize
         let id = if merge.len() == 1 { merge[0].clone() } else { slug(&name) };
         let id = if new_threads.contains_key(&id) { format!("{id}-{}", new_threads.len()) } else { id };
         let created = merge.iter().filter_map(|m| store.threads.get(m)).map(|t| t.created).filter(|c| *c > 0).min().unwrap_or(now);
+        // The person's tags survive a merge, all of them.
+        let mut user_tags: Vec<String> = merge.iter().filter_map(|m| store.threads.get(m)).flat_map(|t| t.user_tags.clone()).collect();
+        user_tags.sort();
+        user_tags.dedup();
         let mut tags = strings(f.get("tags"));
         if tags.is_empty() {
             tags = merge.iter().filter_map(|m| store.threads.get(m)).flat_map(|t| t.tags.clone()).collect();
@@ -572,6 +593,7 @@ pub fn apply_tidy(store: &mut Store, reply: &serde_json::Value) -> Result<(usize
             description: f.get("description").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
             tags,
             created,
+            user_tags,
         });
         for m in &merge {
             moved.insert(m.clone(), id.clone());
@@ -739,6 +761,41 @@ pub async fn librarian_forget() -> Result<(), String> {
     crate::run_blocking(|| save_store(&Store::default())).await
 }
 
+/// One tag the person sets or clears, on a thread or a session.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TagTarget {
+    /// "thread" or "session".
+    pub kind: String,
+    pub id: String,
+}
+
+fn set_tag(list: &mut Vec<String>, tag: &str, on: bool) {
+    let tag = tag.trim().to_lowercase().replace(' ', "-");
+    if tag.is_empty() {
+        return;
+    }
+    list.retain(|t| t != &tag);
+    if on {
+        list.push(tag);
+    }
+    list.sort();
+}
+
+#[tauri::command]
+pub async fn librarian_tag(target: TagTarget, tag: String, on: bool) -> Result<(), String> {
+    crate::run_blocking(move || {
+        let mut s = load_store();
+        match target.kind.as_str() {
+            "thread" => set_tag(&mut s.threads.get_mut(&target.id).ok_or("no such thread")?.user_tags, &tag, on),
+            "session" => set_tag(&mut s.sessions.get_mut(&target.id).ok_or("that session has not been read yet")?.user_tags, &tag, on),
+            _ => return Err("tag what?".into()),
+        }
+        save_store(&s)
+    })
+    .await
+}
+
 /// Rename a thread by hand; the model's names are a first draft.
 #[tauri::command]
 pub async fn librarian_rename_thread(id: String, name: String) -> Result<(), String> {
@@ -849,6 +906,8 @@ mod tests {
         for (id, name, created) in [("esp32-wiring", "ESP32 wiring", 5), ("esp32-camera", "ESP32 camera", 9), ("kalshi-bot", "Kalshi bot", 7), ("forgotten", "Forgotten", 3), ("empty", "Empty", 1)] {
             store.threads.insert(id.into(), Thread { name: name.into(), created, tags: vec!["automation".into()], ..Default::default() });
         }
+        store.threads.get_mut("esp32-wiring").unwrap().user_tags = vec!["workbench".into()];
+        store.threads.get_mut("esp32-camera").unwrap().user_tags = vec!["rig".into(), "workbench".into()];
         for (sid, th) in [("a", "esp32-wiring"), ("b", "esp32-camera"), ("c", "kalshi-bot"), ("d", "forgotten"), ("loose", "")] {
             store.sessions.insert(sid.into(), Entry { thread: th.into(), name: sid.into(), ..Default::default() });
         }
@@ -864,6 +923,7 @@ mod tests {
         assert_eq!(store.sessions["loose"].thread, "esp32-clock");
         assert_eq!(store.threads["esp32-clock"].created, 5);
         assert_eq!(store.threads["esp32-clock"].tags, vec!["esp32", "hardware"]);
+        assert_eq!(store.threads["esp32-clock"].user_tags, vec!["rig", "workbench"], "the person's tags survive a merge, unioned");
         assert_eq!(store.sessions["c"].thread, "kalshi-bot");
         assert_eq!(store.threads["kalshi-bot"].tags, vec!["automation"], "empty tags keep the old ones");
         assert_eq!(store.sessions["d"].thread, "forgotten");
@@ -902,6 +962,19 @@ mod tests {
         assert_eq!(parse_reply("```json\n[{\"id\":\"x\"}]\n```").unwrap().len(), 1);
         assert!(parse_reply("I could not do that.").is_err());
         assert!(parse_reply("[{broken").is_err());
+    }
+
+    #[test]
+    fn a_hand_set_tag_is_normalised_and_toggles() {
+        let mut v = vec!["esp32".to_string()];
+        set_tag(&mut v, "  Home Lab ", true);
+        assert_eq!(v, vec!["esp32", "home-lab"]);
+        set_tag(&mut v, "HOME-LAB", true);
+        assert_eq!(v, vec!["esp32", "home-lab"], "no duplicates");
+        set_tag(&mut v, "esp32", false);
+        assert_eq!(v, vec!["home-lab"]);
+        set_tag(&mut v, "   ", true);
+        assert_eq!(v, vec!["home-lab"]);
     }
 
     #[test]

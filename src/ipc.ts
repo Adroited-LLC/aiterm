@@ -969,12 +969,16 @@ export interface LibEntry {
   seen: number;
   at: number;
   model: string;
+  /** Tags the person set by hand — kept apart from the model's, and shown
+   *  to it as facts. */
+  user_tags: string[];
 }
 export interface LibThread {
   name: string;
   description: string;
   tags: string[];
   created: number;
+  user_tags: string[];
 }
 export interface LibStore {
   sessions: Record<string, LibEntry>;
@@ -1017,3 +1021,6 @@ export const librarianTidy = (engine: LibEngine) => invoke<LibTidyReport>("libra
 export const librarianForget = () => invoke<void>("librarian_forget");
 export const librarianRenameThread = (id: string, name: string) =>
   invoke<void>("librarian_rename_thread", { id, name });
+/** Set or clear one hand-set tag on a thread or a session. */
+export const librarianTag = (target: { kind: "thread" | "session"; id: string }, tag: string, on: boolean) =>
+  invoke<void>("librarian_tag", { target, tag, on });

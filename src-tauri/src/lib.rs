@@ -56,6 +56,7 @@ pub fn run() {
             librarian::librarian_forget,
             librarian::librarian_rename_thread,
             librarian::librarian_tidy,
+            librarian::librarian_tag,
             pty::pty_spawn,
             pty::pty_write,
             pty::pty_resize,

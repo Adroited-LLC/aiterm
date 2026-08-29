@@ -15,7 +15,58 @@ import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import { agentTint } from "../brand";
-import { BookOpen, ChevronRight, Loader2, Pencil, Play, Sparkles, Square, Wand2 } from "lucide-react";
+import { BookOpen, ChevronRight, Loader2, Pencil, Play, Plus, Sparkles, Square, Tag, Wand2, X } from "lucide-react";
+
+/** The tag chips of a thread or a session: the model's, then the person's
+ *  (outlined, with a ×), then a + that opens a one-line input. Clicking a
+ *  chip filters the view by it. */
+function Tags({ tags, userTags, onAdd, onRemove, onPick, active }: {
+  tags: string[];
+  userTags: string[];
+  onAdd: (t: string) => void;
+  onRemove: (t: string) => void;
+  onPick: (t: string) => void;
+  active: string | null;
+}) {
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState("");
+  const commit = () => {
+    const t = draft.trim();
+    if (t) onAdd(t);
+    setDraft("");
+    setAdding(false);
+  };
+  return (
+    <div className="thr-tags" onClick={(e) => e.stopPropagation()}>
+      {tags.filter((t) => !userTags.includes(t)).map((g) => (
+        <button key={g} className={"thr-tag" + (active === g ? " on" : "")} onClick={() => onPick(g)} title="Show only this tag">{g}</button>
+      ))}
+      {userTags.map((g) => (
+        <span key={"u:" + g} className={"thr-tag user" + (active === g ? " on" : "")} title="Your tag — the librarian keeps it and reads it as fact">
+          <button className="thr-tag-text" onClick={() => onPick(g)}>{g}</button>
+          <button className="thr-tag-x" title="Remove" onClick={() => onRemove(g)}><Icon of={X} size="sm" /></button>
+        </span>
+      ))}
+      {adding ? (
+        <input
+          className="thr-tag-input"
+          value={draft}
+          autoFocus
+          placeholder="tag"
+          spellCheck={false}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            if (e.key === "Escape") { setDraft(""); setAdding(false); }
+          }}
+          onBlur={commit}
+        />
+      ) : (
+        <button className="thr-tag add" title="Add a tag of your own" onClick={() => setAdding(true)}><Icon of={Plus} size="sm" /></button>
+      )}
+    </div>
+  );
+}
 
 interface ThreadCard {
   id: string;
@@ -90,6 +141,11 @@ export default function ThreadsView({
   const [open, setOpen] = useState<Set<string>>(() => new Set());
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  /** A tag to show only — set by clicking a chip. */
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [tagging, setTagging] = useState<string | null>(null);
+  const allTagsOf = (t: { tags: string[]; user_tags?: string[] }) => [...t.tags, ...(t.user_tags ?? [])];
+  const pickTag = (t: string) => setTagFilter((cur) => (cur === t ? null : t));
   const toggle = (id: string) => setOpen((prev) => {
     const next = new Set(prev);
     next.has(id) ? next.delete(id) : next.add(id);
@@ -102,22 +158,44 @@ export default function ThreadsView({
     const e = lib.store.sessions[s.id];
     const live = liveIds.has(s.id);
     const tint = agentTint(s.agent);
+    const showTags = tagging === s.id || (e?.user_tags.length ?? 0) > 0;
     return (
-      <div key={s.id} className="thr-row" onClick={() => onSelect(s)} title={s.title}>
-        <span className={"thr-badge" + tint.className} style={tint.style}>
-          <AgentIcon agent={s.agent} size={12} />
-          {live && <span className="live-dot badge-dot" />}
-        </span>
-        <span className="thr-row-text">
-          <span className="thr-row-name">{e?.name ?? s.title}</span>
-          {e?.summary && <span className="thr-row-sub">{e.summary}</span>}
-        </span>
-        <span className="thr-row-age" title={fullTime(s.last_active)}>{live ? "live" : when(s.last_active)}</span>
-        <button
-          className="thr-row-go"
-          title={live ? "Switch to it" : "Pick it up"}
-          onClick={(ev) => { ev.stopPropagation(); jumpIn(s); }}
-        ><Icon of={Play} size="sm" /></button>
+      <div key={s.id} className="thr-row-wrap">
+        <div className="thr-row" onClick={() => onSelect(s)} title={s.title}>
+          <span className={"thr-badge" + tint.className} style={tint.style}>
+            <AgentIcon agent={s.agent} size={12} />
+            {live && <span className="live-dot badge-dot" />}
+          </span>
+          <span className="thr-row-text">
+            <span className="thr-row-name">{e?.name ?? s.title}</span>
+            {e?.summary && <span className="thr-row-sub">{e.summary}</span>}
+          </span>
+          <span className="thr-row-age" title={fullTime(s.last_active)}>{live ? "live" : when(s.last_active)}</span>
+          {e && (
+            <button
+              className={"thr-row-go" + (showTags ? " stay" : "")}
+              title="Tag this session"
+              onClick={(ev) => { ev.stopPropagation(); setTagging((cur) => (cur === s.id ? null : s.id)); }}
+            ><Icon of={Tag} size="sm" /></button>
+          )}
+          <button
+            className="thr-row-go"
+            title={live ? "Switch to it" : "Pick it up"}
+            onClick={(ev) => { ev.stopPropagation(); jumpIn(s); }}
+          ><Icon of={Play} size="sm" /></button>
+        </div>
+        {e && showTags && (
+          <div className="thr-row-tags">
+            <Tags
+              tags={tagging === s.id ? e.tags : []}
+              userTags={e.user_tags}
+              active={tagFilter}
+              onPick={pickTag}
+              onAdd={(t) => void lib.tag({ kind: "session", id: s.id }, t, true)}
+              onRemove={(t) => void lib.tag({ kind: "session", id: s.id }, t, false)}
+            />
+          </div>
+        )}
       </div>
     );
   };
@@ -182,7 +260,16 @@ export default function ThreadsView({
         </div>
       )}
 
-      {threads.map((t) => {
+      {tagFilter && (
+        <div className="thr-filter">
+          <Icon of={Tag} size="sm" /> {tagFilter}
+          <button className="thr-tag-x" title="Show all" onClick={() => setTagFilter(null)}><Icon of={X} size="sm" /></button>
+        </div>
+      )}
+      {threads.filter((t) => !tagFilter
+        || allTagsOf({ tags: t.tags, user_tags: lib.store.threads[t.id]?.user_tags }).includes(tagFilter)
+        || t.sessions.some((s) => lib.store.sessions[s.id]?.user_tags.includes(tagFilter))
+      ).map((t) => {
         const latest = lib.store.sessions[t.latest.id];
         const isOpen = open.has(t.id);
         const hue = hueOf(t.id);
@@ -227,9 +314,14 @@ export default function ThreadsView({
                 {t.projects.slice(0, 3).join(", ")}{t.projects.length > 3 ? ` +${t.projects.length - 3}` : ""}
               </span>
             </div>
-            {t.tags.length > 0 && (
-              <div className="thr-tags">{t.tags.map((g) => <span key={g} className="thr-tag">{g}</span>)}</div>
-            )}
+            <Tags
+              tags={t.tags}
+              userTags={lib.store.threads[t.id]?.user_tags ?? []}
+              active={tagFilter}
+              onPick={pickTag}
+              onAdd={(g) => void lib.tag({ kind: "thread", id: t.id }, g, true)}
+              onRemove={(g) => void lib.tag({ kind: "thread", id: t.id }, g, false)}
+            />
             {latest?.summary && (
               <div className="thr-leftoff">
                 <span className="thr-k">Left off</span> {latest.summary}
@@ -256,7 +348,7 @@ export default function ThreadsView({
       {loose.length > 0 && (
         <section className="thr-loose">
           <div className="thr-loose-head">Loose ends <span className="thr-count">{loose.length}</span></div>
-          <div className="thr-list">{loose.map(row)}</div>
+          <div className="thr-list">{loose.filter((s) => !tagFilter || allTagsOf(lib.store.sessions[s.id]).includes(tagFilter)).map(row)}</div>
         </section>
       )}
     </div>
