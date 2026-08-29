@@ -83,6 +83,7 @@ interface RemoteTransport {
     val events: Flow<RemoteServerEvent>
     suspend fun connect()
     suspend fun request(request: RemoteRequest): RemoteResponse
+    fun completeAttachment(requestId: Long, publishEvents: Boolean) = Unit
     fun close()
 }
 
@@ -202,6 +203,11 @@ class RemoteClient(
             ) return
             val active = transport ?: return
             selectionGeneration += 1
+            val previous = activeAttachmentTabId?.let { previousTab ->
+                activeAttachmentId?.let { previousTab to it }
+            }
+            activeAttachmentId = null
+            activeAttachmentTabId = null
             screenStore.clear()
             mutableScrollback.value = emptyList()
             terminalAssembler.clear()
@@ -214,7 +220,7 @@ class RemoteClient(
                 showTakeFocus = false,
                 pendingTransfers = 0,
             )
-            Selection(lifecycleGeneration, selectionGeneration, tabId, active)
+            Selection(lifecycleGeneration, selectionGeneration, tabId, active, previous)
         }
         launchOwned(selection.lifecycleGeneration) {
             try {
@@ -514,7 +520,9 @@ class RemoteClient(
     }
 
     private fun acceptTerminalChunk(chunk: TerminalTransferChunk) {
-        if (chunk.tabId != activeAttachmentTabId || chunk.attachmentId != activeAttachmentId) return
+        if (chunk.tabId != mutableState.value.activeTabId || chunk.tabId != activeAttachmentTabId ||
+            chunk.attachmentId != activeAttachmentId
+        ) return
         when (val result = terminalAssembler.accept(chunk)) {
             TerminalTransferResult.Pending -> mutableState.value = mutableState.value.copy(pendingTransfers = 1)
             TerminalTransferResult.Recover -> requestRecovery(chunk.tabId, chunk.attachmentId)
@@ -637,12 +645,7 @@ class RemoteClient(
 
     private suspend fun runSelection(selection: Selection) {
         if (!isSelectionCurrent(selection)) return
-        val previous = synchronized(lifecycleLock) {
-            val value = activeAttachmentTabId?.let { tab -> activeAttachmentId?.let { tab to it } }
-            activeAttachmentId = null
-            activeAttachmentTabId = null
-            value
-        }
+        val previous = selection.previousAttachment
         if (previous != null) {
             requestIgnoringError(
                 selection.transport,
@@ -651,10 +654,12 @@ class RemoteClient(
             )
         }
         if (!isSelectionCurrent(selection)) return
+        val attachRequestId = nextRequestId.getAndIncrement()
         val response = selection.transport.request(
-            RemoteRequest(nextRequestId.getAndIncrement(), "terminal.attach", RemoteCommands.tab(selection.tabId)),
+            RemoteRequest(attachRequestId, "terminal.attach", RemoteCommands.tab(selection.tabId)),
         )
         if (response is RemoteResponse.Error) {
+            selection.transport.completeAttachment(attachRequestId, false)
             accept(
                 selection.lifecycleGeneration,
                 RemoteServerEvent.Failure(response.code, response.message),
@@ -663,6 +668,7 @@ class RemoteClient(
         }
         val attached = RemoteCommands.attached((response as RemoteResponse.Success).payload)
         if (!isSelectionCurrent(selection) || attached.tabId != selection.tabId) {
+            selection.transport.completeAttachment(attachRequestId, false)
             requestIgnoringError(
                 selection.transport,
                 "terminal.detach",
@@ -670,16 +676,27 @@ class RemoteClient(
             )
             return
         }
-        synchronized(lifecycleLock) {
-            if (!isSelectionCurrent(selection)) return@synchronized
-            activeAttachmentId = attached.attachmentId
-            activeAttachmentTabId = attached.tabId
-            mutableState.value = mutableState.value.copy(
-                activeTabId = attached.tabId,
-                activeTitle = attached.title,
-                focus = if (attached.hasFocus) FocusOwner.Self else FocusOwner.Other,
-                readOnly = !attached.hasFocus,
-                showTakeFocus = !attached.hasFocus,
+        val committed = synchronized(lifecycleLock) {
+            if (!isSelectionCurrent(selection)) false
+            else {
+                activeAttachmentId = attached.attachmentId
+                activeAttachmentTabId = attached.tabId
+                mutableState.value = mutableState.value.copy(
+                    activeTabId = attached.tabId,
+                    activeTitle = attached.title,
+                    focus = if (attached.hasFocus) FocusOwner.Self else FocusOwner.Other,
+                    readOnly = !attached.hasFocus,
+                    showTakeFocus = !attached.hasFocus,
+                )
+                true
+            }
+        }
+        selection.transport.completeAttachment(attachRequestId, committed)
+        if (!committed) {
+            requestIgnoringError(
+                selection.transport,
+                "terminal.detach",
+                RemoteCommands.attachment(attached.tabId, attached.attachmentId),
             )
         }
     }
@@ -716,6 +733,7 @@ class RemoteClient(
         val selectionGeneration: Long,
         val tabId: String,
         val transport: RemoteTransport,
+        val previousAttachment: Pair<String, String>?,
     )
 
     private companion object {

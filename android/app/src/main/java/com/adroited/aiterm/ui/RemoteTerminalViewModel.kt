@@ -28,7 +28,7 @@ class RemoteTerminalViewModel(
             AuthenticatedRemoteTransport(
                 desktop = desktop,
                 deviceKeys = deviceKeys,
-                isUnlocked = { !appLock.isLocked.value },
+                appLock = appLock,
                 dialer = dialer,
                 scope = viewModelScope,
             )

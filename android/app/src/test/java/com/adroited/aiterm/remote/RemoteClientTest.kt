@@ -151,6 +151,35 @@ class RemoteClientTest {
     }
 
     @Test
+    fun selectingANewTabAtomicallyRejectsOldAttachmentDamage() = runTest {
+        val transport = DeferredRemoteTransport()
+        val store = DefaultTerminalScreenStore()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-a")
+        runCurrent()
+        transport.completeNextAttach("tab-a", "attachment-a")
+        runCurrent()
+
+        client.selectTab("tab-b")
+        client.acceptForTest(snapshotChunk("late-a", "tab-a", "attachment-a", "WRONG"))
+        assertEquals(null, store.screen.value)
+
+        runCurrent()
+        transport.completeNextAttach("tab-b", "attachment-b")
+        runCurrent()
+        client.acceptForTest(snapshotChunk("current-b", "tab-b", "attachment-b", "RIGHT"))
+        assertEquals("RIGHT", store.screen.value?.visible?.single()?.plainText())
+        client.lock()
+    }
+
+    @Test
     fun revisionMismatchKeepsTheCurrentScreenAndRequestsAuthoritativeRecovery() = runTest {
         val transport = FakeRemoteTransport()
         val store = DefaultTerminalScreenStore()

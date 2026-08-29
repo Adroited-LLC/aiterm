@@ -42,6 +42,13 @@ class AppLock(private val clock: () -> Long) {
         mutableLocked.value = true
     }
 
+    /** Linearization gate shared by every transition to the locked state. */
+    @Synchronized
+    fun signChallengeWhileUnlocked(signer: () -> ByteArray): ByteArray? {
+        if (mutableLocked.value) return null
+        return signer()
+    }
+
     companion object {
         const val BACKGROUND_LOCK_TIMEOUT_MILLIS: Long = 5 * 60 * 1_000L
     }

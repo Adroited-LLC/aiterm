@@ -36,7 +36,7 @@ data class RemoteFocusEvent(
 
 data class RemoteTitleEvent(val tabId: String, val attachmentId: String, val title: String)
 data class RemoteTerminalExitEvent(val tabId: String, val attachmentId: String, val exit: RemoteTabExit)
-@Serializable data class RemotePreviewMessage(val role: String, val text: String)
+@Serializable data class RemotePreviewMessage(val role: String, val text: String, val at: String? = null)
 
 @Serializable
 data class RemoteModelOption(

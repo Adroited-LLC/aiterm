@@ -61,9 +61,11 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.text
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.TextFieldValue
@@ -407,10 +409,10 @@ private fun TerminalGrid(
         SelectionContainer {
             Column(Modifier.verticalScroll(scrollState)) {
                 scrollback.asReversed().forEach { row ->
-                    TerminalRowText(buildTerminalRow(row.cells, -1, screen))
+                    TerminalRowGrid(row)
                 }
-                screen?.visible?.forEachIndexed { rowIndex, row ->
-                    TerminalRowText(buildTerminalRow(row.cells, rowIndex, screen))
+                screen?.visible?.forEach { row ->
+                    TerminalRowGrid(row)
                 }
             }
         }
@@ -463,27 +465,40 @@ private fun TerminalGrid(
 }
 
 @Composable
-private fun TerminalRowText(row: AnnotatedString) {
-    BasicText(
-        text = row,
-        style = TextStyle(
-            color = Color(0xFFD8E6EF),
-            fontFamily = FontFamily.Monospace,
-            fontSize = 13.sp,
-            lineHeight = 16.sp,
-        ),
-        maxLines = 1,
-        softWrap = false,
-    )
+private fun TerminalRowGrid(row: ScreenRow) {
+    val uriHandler = LocalUriHandler.current
+    val plain = row.plainText()
+    val links = SAFE_LINK.findAll(plain).mapNotNull { match ->
+        val candidate = match.value.trimEnd('.', ',', ')', ']', '}')
+        candidate.takeIf { it.length <= 2_048 && isSafeRemoteLink(it) }?.let {
+            match.range.first until (match.range.first + candidate.length) to candidate
+        }
+    }.toList()
+    var textOffset = 0
+    Row(Modifier.height(16.dp).semantics(mergeDescendants = true) { text = AnnotatedString(plain) }) {
+        row.cells.forEach { cell ->
+            if (cell.continuation) return@forEach
+            val cellRange = textOffset until (textOffset + cell.text.length)
+            val link = links.firstOrNull { (range, _) ->
+                cellRange.first < range.last + 1 && range.first < cellRange.last + 1
+            }?.second
+            textOffset += cell.text.length
+            val slotBackground = when {
+                cell.attributes.inverse -> cell.foreground.color(Color(0xFFD8E6EF))
+                else -> cell.background.color(Color.Transparent)
+            }
+            var slot = Modifier.width((8.4f * cell.width).dp).height(16.dp).background(slotBackground)
+            if (link != null) slot = slot.clickable { uriHandler.openUri(link) }
+            Box(slot) {
+                TerminalCellText(cell, linked = link != null)
+            }
+        }
+    }
 }
 
-private fun buildTerminalRow(
-    cells: List<ScreenCell>,
-    row: Int,
-    screen: ScreenSnapshot?,
-): AnnotatedString = buildAnnotatedString {
-    cells.forEachIndexed { col, cell ->
-        if (cell.continuation) return@forEachIndexed
+@Composable
+private fun TerminalCellText(cell: ScreenCell, linked: Boolean) {
+    val text = buildAnnotatedString {
         val foreground = cell.foreground.color(default = Color(0xFFD8E6EF))
         val background = cell.background.color(default = Color.Transparent)
         val effectiveForeground = when {
@@ -493,24 +508,31 @@ private fun buildTerminalRow(
             else -> foreground
         }
         val effectiveBackground = when {
-            cell.attributes.inverse -> foreground
-            else -> background
+            else -> Color.Transparent
         }
-        pushStyle(cell.attributes.span(effectiveForeground, effectiveBackground))
+        val decoration = when {
+            linked && cell.attributes.strikethrough ->
+                TextDecoration.combine(listOf(TextDecoration.Underline, TextDecoration.LineThrough))
+            linked -> TextDecoration.Underline
+            else -> null
+        }
+        pushStyle(cell.attributes.span(effectiveForeground, effectiveBackground).let { style ->
+            if (decoration == null) style else style.copy(textDecoration = decoration)
+        })
         append(cell.text)
         pop()
     }
-    SAFE_LINK.findAll(toString()).forEach { match ->
-        val candidate = match.value.trimEnd('.', ',', ')', ']', '}')
-        if (candidate.length <= 2_048 && isSafeRemoteLink(candidate)) {
-            addLink(LinkAnnotation.Url(candidate), match.range.first, match.range.first + candidate.length)
-            addStyle(
-                SpanStyle(color = Color(0xFF74D9EA), textDecoration = TextDecoration.Underline),
-                match.range.first,
-                match.range.first + candidate.length,
-            )
-        }
-    }
+    BasicText(
+        text = text,
+        style = TextStyle(
+            color = Color(0xFFD8E6EF),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 13.sp,
+            lineHeight = 16.sp,
+        ),
+        maxLines = 1,
+        softWrap = false,
+    )
 }
 
 @Composable

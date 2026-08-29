@@ -1,8 +1,12 @@
 package com.adroited.aiterm.security
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * The five-minute background lock. The biometric prompt itself needs a device,
@@ -77,5 +81,38 @@ class AppLockTest {
         lock.onEnterForeground()
 
         assertTrue(lock.isLocked.value)
+    }
+
+    @Test
+    fun lockTransitionAndKeystoreUseShareOneLinearGate() {
+        val signerEntered = CountDownLatch(1)
+        val releaseSigner = CountDownLatch(1)
+        val lockRequested = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val signature = executor.submit<ByteArray?> {
+                lock.signChallengeWhileUnlocked {
+                    signerEntered.countDown()
+                    assertTrue(releaseSigner.await(1, TimeUnit.SECONDS))
+                    byteArrayOf(1, 2, 3)
+                }
+            }
+            assertTrue(signerEntered.await(1, TimeUnit.SECONDS))
+            val locking = executor.submit {
+                lockRequested.countDown()
+                lock.lockNow()
+            }
+            assertTrue(lockRequested.await(1, TimeUnit.SECONDS))
+            assertFalse(locking.isDone)
+
+            releaseSigner.countDown()
+            assertArrayEquals(byteArrayOf(1, 2, 3), signature.get(1, TimeUnit.SECONDS))
+            locking.get(1, TimeUnit.SECONDS)
+            assertTrue(lock.isLocked.value)
+            assertTrue(lock.signChallengeWhileUnlocked { byteArrayOf(9) } == null)
+        } finally {
+            releaseSigner.countDown()
+            executor.shutdownNow()
+        }
     }
 }
