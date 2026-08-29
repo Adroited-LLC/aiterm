@@ -54,7 +54,7 @@ import {
   TabDescriptor, TabId, TabRegistryEvent, tabClose, tabList, tabOpen,
   tabRegistrySnapshot, tabUpdate,
 } from "./ipc";
-import { applyTabRegistryEvent, reconcileTabs } from "./tabModel";
+import { createTabRegistryRecovery, reconcileTabs } from "./tabModel";
 import RefusalBanner from "./components/RefusalBanner";
 import { nextAdoptionDelay } from "./adoption";
 import "./App.css";
@@ -720,21 +720,14 @@ export default function App() {
   useEffect(() => {
     let stopped = false;
     let unlisten: (() => void) | null = null;
-    let recovering = false;
     let recoveryTimer: number | null = null;
 
-    const applyRegistryChange = (change: TabRegistryEvent) => {
+    const applyRegistryProjection = (projection: { revision: number | null; tabs: TabDescriptor[] }) => {
       if (stopped) return;
       const before = tabsRef.current;
-      const applied = applyTabRegistryEvent(tabRegistryProjection.current, change);
-      if (applied.needsSnapshot) {
-        void recover();
-        return;
-      }
-
-      tabRegistryProjection.current = applied.projection;
+      tabRegistryProjection.current = projection;
       setTabs((current) => {
-        const next = reconcileTermTabs(current, applied.projection.tabs);
+        const next = reconcileTermTabs(current, projection.tabs);
         tabsRef.current = next;
         setActiveTab((active) =>
           active !== null && next.some((tab) => tab.key === active)
@@ -743,7 +736,7 @@ export default function App() {
         return next;
       });
 
-      const live = new Set(applied.projection.tabs.map((tab) => tab.id));
+      const live = new Set(projection.tabs.map((tab) => tab.id));
       const removed = new Set(before.filter((tab) => !live.has(tab.key)).map((tab) => tab.key));
       if (removed.size === 0) return;
       setFileTabs((files) => {
@@ -766,34 +759,48 @@ export default function App() {
       });
     };
 
-    const recover = async () => {
-      if (stopped || recovering) return;
-      recovering = true;
-      try {
-        const snapshot = await tabRegistrySnapshot();
-        applyRegistryChange({ change: "snapshot", ...snapshot });
-      } catch {
+    const recovery = createTabRegistryRecovery(
+      tabRegistryProjection.current,
+      tabRegistrySnapshot,
+      applyRegistryProjection,
+    );
+
+    const recover = () => {
+      if (stopped) return;
+      void recovery.recover().catch(() => {
         if (!stopped && recoveryTimer === null) {
           recoveryTimer = window.setTimeout(() => {
             recoveryTimer = null;
-            void recover();
+            recover();
           }, 250);
         }
-      } finally {
-        recovering = false;
+      });
+    };
+
+    const acceptRegistryChange = (change: TabRegistryEvent) => {
+      const pending = recovery.accept(change);
+      if (pending !== null) {
+        void pending.catch(() => {
+          if (!stopped && recoveryTimer === null) {
+            recoveryTimer = window.setTimeout(() => {
+              recoveryTimer = null;
+              recover();
+            }, 250);
+          }
+        });
       }
     };
 
     void (async () => {
       const stop = await listen<TabRegistryEvent>("tab://registry", (event) => {
-        applyRegistryChange(event.payload);
+        acceptRegistryChange(event.payload);
       });
       if (stopped) {
         stop();
         return;
       }
       unlisten = stop;
-      await recover();
+      recover();
     })();
     return () => {
       stopped = true;

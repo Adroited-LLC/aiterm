@@ -18,6 +18,12 @@ export interface TabRegistryApplyResult<T extends { id: TabId }> {
   removed?: { tabId: TabId; requested: boolean };
 }
 
+export interface TabRegistryRecovery<T extends { id: TabId }> {
+  accept(event: TabRegistryEvent<T>): Promise<void> | null;
+  recover(): Promise<void>;
+  projection(): TabRegistryProjection<T>;
+}
+
 /** Apply one revisioned registry event without ever accepting a partial gap.
  *
  * Rust's bounded process-wide stream recovers its own overflow with a
@@ -74,6 +80,77 @@ export function applyTabRegistryEvent<T extends { id: TabId }>(
   return {
     projection: { revision: event.revision, tabs: next },
     needsSnapshot: false,
+  };
+}
+
+/** Keep the renderer lossless across the asynchronous snapshot boundary.
+ *
+ * Tauri events are ordered, but the invoke used to fetch a recovery snapshot
+ * is an independent promise. Events received while that promise is pending
+ * are retained here. Once snapshot R arrives, events through R are discarded,
+ * contiguous events after R are replayed, and any gap causes another current
+ * snapshot fetch instead of accepting partial state.
+ */
+export function createTabRegistryRecovery<T extends { id: TabId }>(
+  initial: TabRegistryProjection<T>,
+  loadSnapshot: () => Promise<{ revision: number; tabs: Array<Partial<T> & { id: TabId }> }>,
+  onProjection: (projection: TabRegistryProjection<T>) => void,
+): TabRegistryRecovery<T> {
+  let current = initial;
+  let pending: TabRegistryEvent<T>[] = [];
+  let inFlight: Promise<void> | null = null;
+
+  const commit = (event: TabRegistryEvent<T>): boolean => {
+    const applied = applyTabRegistryEvent(current, event);
+    if (applied.needsSnapshot) return false;
+    if (applied.projection !== current) {
+      current = applied.projection;
+      onProjection(current);
+    }
+    return true;
+  };
+
+  const recover = (): Promise<void> => {
+    if (inFlight !== null) return inFlight;
+    inFlight = (async () => {
+      for (;;) {
+        const snapshot = await loadSnapshot();
+        commit({ change: "snapshot", ...snapshot });
+
+        const queued = pending;
+        pending = [];
+        let gap = false;
+        for (let index = 0; index < queued.length; index += 1) {
+          const event = queued[index];
+          if (event.revision <= (current.revision ?? -1)) continue;
+          if (!commit(event)) {
+            pending.push(...queued.slice(index));
+            gap = true;
+            break;
+          }
+        }
+        if (!gap) return;
+      }
+    })().finally(() => {
+      inFlight = null;
+    });
+    return inFlight;
+  };
+
+  return {
+    accept(event) {
+      if (inFlight !== null) {
+        pending.push(event);
+        return inFlight;
+      }
+      if (!commit(event)) {
+        pending.push(event);
+        return recover();
+      }
+      return null;
+    },
+    recover,
+    projection: () => current,
   };
 }
 
