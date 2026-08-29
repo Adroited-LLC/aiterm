@@ -175,7 +175,7 @@ pub struct SessionEvent {
 /// cost of the quiet case.
 #[tauri::command]
 pub fn drain_session_events(
-    state: tauri::State<'_, crate::tabs::TabRegistry>,
+    state: tauri::State<'_, std::sync::Arc<crate::tabs::TabRegistry>>,
 ) -> Vec<SessionEvent> {
     let Some(dir) = spool_dir() else {
         return Vec::new();

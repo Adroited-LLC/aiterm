@@ -1,8 +1,6 @@
 //! PTY output-boundary checks. Tab ownership tests join this file in Task 4.
 
-use aiterm_lib::pty::{
-    clear_observer, set_observer, PtyManager, PtyObserver, PtySink, PtySpawnSpec,
-};
+use aiterm_lib::pty::{PtyManager, PtySink, PtySpawnSpec};
 use aiterm_lib::remote::model::TerminalSize;
 use aiterm_lib::tabs::{
     AttachmentId, AttachmentKind, PtyBackend, TabEvent, TabId, TabLaunch, TabRegistry, TabState,
@@ -69,16 +67,6 @@ impl PtySink for RecordingSink {
     }
 }
 
-impl PtyObserver for RecordingSink {
-    fn on_output(&self, pty_id: u32, bytes: &[u8]) {
-        PtySink::output(self, pty_id, bytes);
-    }
-
-    fn on_exit(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>) {
-        PtySink::exited(self, pty_id, code, signal);
-    }
-}
-
 #[derive(Default)]
 struct ExitOrderingState {
     preparing: bool,
@@ -127,14 +115,6 @@ impl PtySink for BackpressuredExitSink {
         let mut state = self.state.lock().unwrap();
         state.events.push("exited");
         self.changed.notify_all();
-    }
-}
-
-struct ObserverReset;
-
-impl Drop for ObserverReset {
-    fn drop(&mut self) {
-        clear_observer();
     }
 }
 
@@ -209,26 +189,6 @@ fn each_spawn_routes_bytes_only_to_its_own_sink() {
     assert_eq!(second.output(), b"beta");
     assert_eq!(first.exits()[0].pty_id, first_id);
     assert_eq!(second.exits()[0].pty_id, second_id);
-}
-
-#[test]
-fn spawned_pty_also_reaches_the_temporary_legacy_observer() {
-    let _pty_test_lock = PTY_TEST_LOCK.lock().unwrap();
-    let _observer_reset = ObserverReset;
-    let manager = PtyManager::default();
-    let sink = Arc::new(RecordingSink::default());
-    let observer = Arc::new(RecordingSink::default());
-    set_observer(observer.clone());
-
-    let id = manager
-        .spawn(PtySpawnSpec::command("printf bridge"), sink.clone())
-        .expect("spawn PTY");
-    sink.wait_for_exit();
-    observer.wait_for_exit();
-
-    assert_eq!(sink.output(), b"bridge");
-    assert_eq!(observer.output(), b"bridge");
-    assert_eq!(observer.exits()[0].pty_id, id);
 }
 
 #[test]

@@ -123,7 +123,7 @@ impl ProtocolError {
 
 /// Reject a serialized terminal frame before it reaches a remote transport.
 pub fn validate_terminal_frame(frame: &[u8]) -> Result<(), ProtocolError> {
-    if frame.len() > MAX_SCREEN_FRAME_BYTES {
+    if frame.len() >= MAX_SCREEN_FRAME_BYTES {
         return Err(ProtocolError::frame_too_large());
     }
     Ok(())
@@ -167,7 +167,7 @@ impl CappedFrameWriter {
 
 impl Write for CappedFrameWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_SCREEN_FRAME_BYTES.saturating_sub(self.bytes.len()) {
+        if bytes.len() >= MAX_SCREEN_FRAME_BYTES.saturating_sub(self.bytes.len()) {
             self.overflowed = true;
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,

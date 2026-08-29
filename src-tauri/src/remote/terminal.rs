@@ -1,188 +1,27 @@
-//! Fan pty traffic out to remote subscribers.
-//!
-//! The broker sits between the pty reader threads and the gateway. It exists to
-//! keep three things true at once:
-//!
-//! * Android never learns a pty id. Streams are named by 128 random bits, so a
-//!   compromised or buggy client cannot address a terminal it was never given.
-//! * A client that reconnects gets its terminal back, not a blank screen. Each
-//!   stream keeps the last mebibyte of output with a sequence number per chunk,
-//!   which is enough to replay a dropped connection and cheap enough to hold
-//!   for every attached terminal.
-//! * Two clients never interleave keystrokes. Exactly one subscriber owns input
-//!   per stream; everyone else watches until they explicitly take it.
-//!
-//! Nothing here touches Tauri. The pty side arrives through [`PtyObserver`] and
-//! leaves through [`PtyControl`], both of which are plain traits, so the whole
-//! broker is testable without a window, a runtime or a spawned shell.
+//! Transport-neutral remote projection of Rust-owned terminal tabs.
 
-use super::model::TerminalSize;
-use crate::pty::PtyObserver;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand_core::{OsRng, RngCore};
+use super::model::{RemoteEvent, TerminalSize, PROTOCOL_VERSION};
+use crate::tabs::{
+    AttachmentId, AttachmentKind, TabAttachment, TabDescriptor, TabError, TabEvent,
+    TabEventReceiver, TabExit, TabId, TabLaunch, TabRegistry,
+};
+use crate::terminal::model::{
+    CursorState, Revision, RowPatch, ScreenDiff, ScreenRow, ScreenSnapshot, TerminalModes,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 
-/// Per-stream replay window. The spec fixes this at 1 MiB: enough to redraw a
-/// full-screen TUI plus scrollback after a tunnel drops, small enough that a
-/// dozen attached terminals cost less than a single tab's xterm.js buffer.
-pub const REPLAY_CAPACITY: usize = 1024 * 1024;
+pub const MAX_WIRE_FRAME_BYTES: usize = 1024 * 1024;
+pub const DIFF_INTERVAL: Duration = Duration::from_millis(16);
+const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_STAGED_TRANSFER_BYTES: usize = 128 * 1024 * 1024;
+const MAX_STAGED_TRANSFER_ROWS: usize = 5_000;
 
-/// Events a subscriber may fall behind by before it is dropped.
-///
-/// Dropping is the right answer rather than growing the queue: a client that
-/// stopped reading is either gone or wedged, and the replay buffer already
-/// covers the case where it comes back. An unbounded queue would let one dead
-/// phone hold every byte a busy terminal ever produced.
-const EVENT_QUEUE_DEPTH: usize = 512;
-
-/// How the broker reaches a pty. Implemented over the real pty table by
-/// `pty::AppPtyControl`, and by a recorder in the tests.
-pub trait PtyControl: Send + Sync {
-    fn write(&self, pty_id: u32, data: &[u8]) -> Result<(), String>;
-    fn resize(&self, pty_id: u32, cols: u16, rows: u16) -> Result<(), String>;
-}
-
-fn opaque_id() -> String {
-    let mut raw = [0u8; 16];
-    OsRng.fill_bytes(&mut raw);
-    URL_SAFE_NO_PAD.encode(raw)
-}
-
-/// A terminal's name on the wire. Deliberately unrelated to the pty id: the
-/// mapping lives only in [`TerminalBroker`], so nothing a client says can be
-/// turned into a pty id it was not handed a stream for.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StreamId(String);
-
-impl StreamId {
-    fn random() -> Self {
-        Self(opaque_id())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for StreamId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// One attachment to one stream. Two tabs on the same phone are two
-/// subscribers, because focus is a property of the attachment and not of the
-/// device that made it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SubscriberId(String);
-
-impl SubscriberId {
-    fn random() -> Self {
-        Self(opaque_id())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for SubscriberId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// What a client is handed when it attaches.
-///
-/// The two variants are not a detail the client can ignore. A `Delta` continues
-/// what it already has on screen; a `Snapshot` means the replay window rolled
-/// past the point it acknowledged, so it must reset its emulator and draw the
-/// snapshot from scratch. Appending a snapshot as though it were a delta
-/// duplicates a screenful of output and leaves the emulator's state wrong.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Replay {
-    Snapshot { bytes: Vec<u8>, sequence: u64 },
-    Delta { bytes: Vec<u8>, sequence: u64 },
-}
-
-impl Replay {
-    /// The sequence of the last chunk included, which is what the client
-    /// acknowledges on its next reconnect.
-    pub fn sequence(&self) -> u64 {
-        match self {
-            Replay::Snapshot { sequence, .. } | Replay::Delta { sequence, .. } => *sequence,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Attachment {
-    stream: StreamId,
-    subscriber: SubscriberId,
-    replay: Replay,
-    has_focus: bool,
-}
-
-impl Attachment {
-    pub fn stream(&self) -> &StreamId {
-        &self.stream
-    }
-
-    pub fn subscriber(&self) -> &SubscriberId {
-        &self.subscriber
-    }
-
-    pub fn replay(&self) -> &Replay {
-        &self.replay
-    }
-
-    pub fn has_focus(&self) -> bool {
-        self.has_focus
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalEvent {
-    Output {
-        sequence: u64,
-        bytes: Vec<u8>,
-    },
-    Exited {
-        code: Option<u32>,
-        signal: Option<String>,
-    },
-    /// Sent to every subscriber of the stream, the new owner included: a client
-    /// that took focus and a client that lost it need the same update, and
-    /// telling only the losers leaves the winner guessing whether it worked.
-    FocusChanged {
-        owner: Option<SubscriberId>,
-    },
-}
-
-/// The receiving half of one attachment. Dropping it detaches that subscriber
-/// the next time the stream produces anything.
-#[derive(Debug)]
-pub struct TerminalEvents {
-    events: mpsc::Receiver<TerminalEvent>,
-}
-
-impl TerminalEvents {
-    pub async fn next(&mut self) -> Option<TerminalEvent> {
-        self.events.recv().await
-    }
-
-    pub fn try_next(&mut self) -> Option<TerminalEvent> {
-        self.events.try_recv().ok()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalError {
     code: &'static str,
     message: String,
@@ -196,23 +35,25 @@ impl TerminalError {
         }
     }
 
-    fn unknown_stream() -> Self {
-        Self::new("terminal.unknown_stream", "no such terminal stream")
-    }
-
-    fn unknown_subscriber() -> Self {
-        Self::new("terminal.unknown_subscriber", "not attached to this stream")
-    }
-
-    fn input_not_owned() -> Self {
+    fn semantic_row_too_large() -> Self {
         Self::new(
-            "terminal.input_not_owned",
-            "another client holds input for this terminal",
+            "protocol.semantic_row_too_large",
+            "a semantic terminal row cannot fit in one wire frame",
         )
+    }
+
+    fn invalid_transfer(message: impl Into<String>) -> Self {
+        Self::new("protocol.invalid_transfer", message)
     }
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+}
+
+impl From<TabError> for TerminalError {
+    fn from(error: TabError) -> Self {
+        Self::new(error.code(), error.to_string())
     }
 }
 
@@ -224,377 +65,902 @@ impl fmt::Display for TerminalError {
 
 impl std::error::Error for TerminalError {}
 
-struct Chunk {
-    sequence: u64,
-    bytes: Vec<u8>,
-    /// True when the front of this chunk was cut away to fit the window, which
-    /// disqualifies it from starting a delta — see [`ReplayBuffer::replay`].
-    partial: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalEvent {
+    Snapshot(ScreenSnapshot),
+    Diff(ScreenDiff),
+    FocusChanged {
+        owner: Option<AttachmentId>,
+        size: TerminalSize,
+    },
+    Title(String),
+    Bell,
+    Exited(TabExit),
 }
 
-/// The per-stream ring: whole output chunks, newest last, trimmed from the
-/// front once they exceed [`REPLAY_CAPACITY`].
-#[derive(Default)]
-struct ReplayBuffer {
-    chunks: VecDeque<Chunk>,
-    buffered: usize,
-    last_sequence: u64,
-}
-
-impl ReplayBuffer {
-    fn push(&mut self, bytes: &[u8]) -> u64 {
-        self.last_sequence += 1;
-        self.chunks.push_back(Chunk {
-            sequence: self.last_sequence,
-            bytes: bytes.to_vec(),
-            partial: false,
-        });
-        self.buffered += bytes.len();
-        while self.buffered > REPLAY_CAPACITY && self.chunks.len() > 1 {
-            if let Some(dropped) = self.chunks.pop_front() {
-                self.buffered -= dropped.bytes.len();
-            }
-        }
-        // A single write larger than the whole window keeps only its tail. That
-        // costs the chunk its delta eligibility but keeps the memory bound
-        // absolute, which matters more: the bound is the only thing standing
-        // between a `cat` of a large file and unbounded growth per stream.
-        if self.buffered > REPLAY_CAPACITY {
-            if let Some(only) = self.chunks.front_mut() {
-                let excess = self.buffered - REPLAY_CAPACITY;
-                only.bytes.drain(..excess);
-                only.partial = true;
-                self.buffered = REPLAY_CAPACITY;
-            }
-        }
-        self.last_sequence
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.buffered);
-        for chunk in &self.chunks {
-            bytes.extend_from_slice(&chunk.bytes);
-        }
-        bytes
-    }
-
-    /// The lowest acknowledged sequence a delta can still be built from: one
-    /// below the oldest whole chunk, or the oldest chunk itself when its front
-    /// was trimmed and a client resuming from before it would be sent output
-    /// with a hole in the middle.
-    fn earliest_serviceable(&self) -> u64 {
-        match self.chunks.front() {
-            Some(first) if first.partial => first.sequence,
-            Some(first) => first.sequence - 1,
-            None => self.last_sequence,
-        }
-    }
-
-    fn replay(&self, since: Option<u64>) -> Replay {
-        // A client resuming from a sequence we never issued is as lost as one
-        // whose window rolled — it is reset rather than argued with.
-        let resumable = since
-            .filter(|acknowledged| *acknowledged <= self.last_sequence)
-            .filter(|acknowledged| *acknowledged >= self.earliest_serviceable());
-        let Some(acknowledged) = resumable else {
-            return Replay::Snapshot {
-                bytes: self.snapshot(),
-                sequence: self.last_sequence,
-            };
-        };
-        let mut bytes = Vec::new();
-        for chunk in self.chunks.iter().filter(|c| c.sequence > acknowledged) {
-            bytes.extend_from_slice(&chunk.bytes);
-        }
-        Replay::Delta {
-            bytes,
-            sequence: self.last_sequence,
-        }
+fn project_event(event: TabEvent) -> Option<TerminalEvent> {
+    match event {
+        TabEvent::Snapshot(snapshot) => Some(TerminalEvent::Snapshot(snapshot)),
+        TabEvent::Diff(diff) => Some(TerminalEvent::Diff(diff)),
+        TabEvent::FocusChanged { owner, size } => Some(TerminalEvent::FocusChanged { owner, size }),
+        TabEvent::Metadata(_) | TabEvent::Title(_) => None,
+        TabEvent::Bell => Some(TerminalEvent::Bell),
+        TabEvent::Exited(exit) => Some(TerminalEvent::Exited(exit)),
+        TabEvent::Raw(_) => None,
     }
 }
 
-struct Subscriber {
-    id: SubscriberId,
-    events: mpsc::Sender<TerminalEvent>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteAttachment {
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    snapshot: ScreenSnapshot,
+    has_focus: bool,
 }
 
-struct Stream {
-    pty_id: u32,
-    buffer: ReplayBuffer,
-    subscribers: Vec<Subscriber>,
-    owner: Option<SubscriberId>,
-}
-
-impl Stream {
-    /// Deliver to everyone still listening and prune everyone who is not.
-    /// Returns the subscribers that were dropped.
-    fn fan_out(&mut self, event: &TerminalEvent) -> Vec<SubscriberId> {
-        let mut dropped = Vec::new();
-        self.subscribers.retain(|subscriber| {
-            if subscriber.events.try_send(event.clone()).is_ok() {
-                return true;
-            }
-            dropped.push(subscriber.id.clone());
-            false
-        });
-        dropped
+impl RemoteAttachment {
+    pub fn tab_id(&self) -> &TabId {
+        &self.tab_id
     }
 
-    fn broadcast(&mut self, event: TerminalEvent) {
-        let dropped = self.fan_out(&event);
-        if self
-            .owner
-            .as_ref()
-            .is_some_and(|owner| dropped.contains(owner))
-        {
-            self.owner = None;
-            let released = TerminalEvent::FocusChanged { owner: None };
-            self.fan_out(&released);
-        }
+    pub fn attachment_id(&self) -> &AttachmentId {
+        &self.attachment_id
     }
 
-    fn require_owner(&self, subscriber: &SubscriberId) -> Result<u32, TerminalError> {
-        if !self.subscribers.iter().any(|s| &s.id == subscriber) {
-            return Err(TerminalError::unknown_subscriber());
-        }
-        if self.owner.as_ref() != Some(subscriber) {
-            return Err(TerminalError::input_not_owned());
-        }
-        Ok(self.pty_id)
+    pub fn snapshot(&self) -> &ScreenSnapshot {
+        &self.snapshot
+    }
+
+    pub fn has_focus(&self) -> bool {
+        self.has_focus
     }
 }
 
-#[derive(Default)]
-struct BrokerState {
-    streams: HashMap<StreamId, Stream>,
-    by_pty: HashMap<u32, StreamId>,
+pub struct RemoteTerminalEvents {
+    receiver: Arc<Mutex<TabEventReceiver>>,
+    registry: Arc<TabRegistry>,
+    tab_id: TabId,
+    last_title: String,
+    coalescer: DiffCoalescer,
+    diff_started: Option<Instant>,
 }
 
-pub struct TerminalBroker {
-    control: Arc<dyn PtyControl>,
-    state: Mutex<BrokerState>,
+impl fmt::Debug for RemoteTerminalEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteTerminalEvents")
+            .finish_non_exhaustive()
+    }
 }
 
-impl TerminalBroker {
-    pub fn new(control: Arc<dyn PtyControl>) -> Self {
+impl RemoteTerminalEvents {
+    fn new(
+        receiver: TabEventReceiver,
+        registry: Arc<TabRegistry>,
+        tab_id: TabId,
+        title: String,
+    ) -> Self {
         Self {
-            control,
-            state: Mutex::new(BrokerState::default()),
+            receiver: Arc::new(Mutex::new(receiver)),
+            registry,
+            tab_id,
+            last_title: title,
+            coalescer: DiffCoalescer::new(),
+            diff_started: None,
         }
     }
 
-    /// Start (or find) the stream for a pty.
-    ///
-    /// Streams are created on demand rather than for every spawned pty: a
-    /// stream costs up to a mebibyte of replay, and a desktop with twenty tabs
-    /// open and no phone attached should pay nothing at all.
-    pub fn open_stream(&self, pty_id: u32) -> StreamId {
-        let mut state = self.lock();
-        if let Some(existing) = state.by_pty.get(&pty_id) {
-            return existing.clone();
+    /// Only diffs wait for the 16 ms coalescing deadline. Control events and
+    /// recovery snapshots return as soon as the registry publishes them.
+    pub async fn next(&mut self) -> Option<TerminalEvent> {
+        loop {
+            let timeout = self
+                .diff_started
+                .map(|started| DIFF_INTERVAL.saturating_sub(started.elapsed()));
+            if timeout == Some(Duration::ZERO) {
+                self.diff_started = None;
+                if let Some(diff) = self.coalescer.flush() {
+                    return Some(TerminalEvent::Diff(diff));
+                }
+            }
+            let receiver = self.receiver.clone();
+            let received = tokio::task::spawn_blocking(move || {
+                let receiver = receiver.lock().unwrap();
+                match timeout {
+                    Some(timeout) => receiver.recv_timeout(timeout).ok(),
+                    None => receiver.recv().ok(),
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(event) = received else {
+                if self.diff_started.take().is_some() {
+                    return self.coalescer.flush().map(TerminalEvent::Diff);
+                }
+                return None;
+            };
+            match event {
+                TabEvent::Diff(diff) => {
+                    if self.diff_started.is_none() {
+                        self.diff_started = Some(Instant::now());
+                    }
+                    if self.coalescer.push(diff).is_err() {
+                        self.diff_started = None;
+                        self.coalescer.clear();
+                        return self
+                            .registry
+                            .snapshot(&self.tab_id)
+                            .ok()
+                            .map(TerminalEvent::Snapshot);
+                    }
+                }
+                TabEvent::Snapshot(snapshot) => {
+                    self.diff_started = None;
+                    self.coalescer.clear();
+                    return Some(TerminalEvent::Snapshot(snapshot));
+                }
+                TabEvent::Metadata(descriptor) => {
+                    if descriptor.title() != self.last_title {
+                        self.last_title = descriptor.title().to_owned();
+                        return Some(TerminalEvent::Title(self.last_title.clone()));
+                    }
+                }
+                TabEvent::Title(title) => {
+                    if title != self.last_title {
+                        self.last_title = title;
+                        return Some(TerminalEvent::Title(self.last_title.clone()));
+                    }
+                }
+                other => {
+                    if let Some(projected) = project_event(other) {
+                        return Some(projected);
+                    }
+                }
+            }
         }
-        let id = StreamId::random();
-        state.streams.insert(
-            id.clone(),
-            Stream {
-                pty_id,
-                buffer: ReplayBuffer::default(),
-                subscribers: Vec::new(),
-                owner: None,
-            },
-        );
-        state.by_pty.insert(pty_id, id.clone());
-        id
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteTerminal {
+    registry: Arc<TabRegistry>,
+}
+
+impl RemoteTerminal {
+    pub fn new(registry: Arc<TabRegistry>) -> Self {
+        Self { registry }
     }
 
-    /// Forget a stream and its replay buffer. Attached clients see their event
-    /// channels close.
-    pub fn close_stream(&self, stream: &StreamId) {
-        let mut state = self.lock();
-        if let Some(closed) = state.streams.remove(stream) {
-            state.by_pty.remove(&closed.pty_id);
-        }
+    pub fn registry(&self) -> &Arc<TabRegistry> {
+        &self.registry
     }
 
-    /// Attach to a stream, resuming after `since` when the client has output it
-    /// already drew. `None` asks for a full snapshot.
     pub fn attach(
         &self,
-        stream: &StreamId,
-        since: Option<u64>,
-    ) -> Result<(Attachment, TerminalEvents), TerminalError> {
-        let mut state = self.lock();
-        let stream_entry = state
-            .streams
-            .get_mut(stream)
-            .ok_or_else(TerminalError::unknown_stream)?;
-        let replay = stream_entry.buffer.replay(since);
-        let subscriber = SubscriberId::random();
-        let (sender, receiver) = mpsc::channel(EVENT_QUEUE_DEPTH);
-        stream_entry.subscribers.push(Subscriber {
-            id: subscriber.clone(),
-            events: sender,
-        });
-        // Unowned input goes to whoever attaches next, which is what makes the
-        // first client an owner without a special case. It also means a
-        // terminal whose owner left is picked up by the next arrival rather
-        // than sitting untypeable until someone thinks to take focus.
-        let has_focus = if stream_entry.owner.is_none() {
-            stream_entry.owner = Some(subscriber.clone());
-            true
-        } else {
-            false
+        tab_id: &TabId,
+    ) -> Result<(RemoteAttachment, RemoteTerminalEvents), TerminalError> {
+        let TabAttachment { id, events } = self.registry.attach(tab_id, AttachmentKind::Remote)?;
+        let snapshot = match events.recv().map_err(|_| {
+            TerminalError::new(
+                "terminal.attach_failed",
+                "initial snapshot was not published",
+            )
+        })? {
+            TabEvent::Snapshot(snapshot) => snapshot,
+            _ => {
+                return Err(TerminalError::new(
+                    "terminal.attach_failed",
+                    "initial remote event was not a snapshot",
+                ))
+            }
         };
+        let descriptor = self.registry.get(tab_id)?;
+        let has_focus = descriptor.input_owner().is_some_and(|owner| owner == &id);
         Ok((
-            Attachment {
-                stream: stream.clone(),
-                subscriber,
-                replay,
+            RemoteAttachment {
+                tab_id: tab_id.clone(),
+                attachment_id: id,
+                snapshot,
                 has_focus,
             },
-            TerminalEvents { events: receiver },
+            RemoteTerminalEvents::new(
+                events,
+                self.registry.clone(),
+                tab_id.clone(),
+                descriptor.title().to_owned(),
+            ),
         ))
     }
 
-    pub fn detach(
+    /// Resume is revision-based. The registry does not retain historical
+    /// bytes or diffs, so a non-current revision always receives recovery.
+    pub fn resume(
         &self,
-        stream: &StreamId,
-        subscriber: &SubscriberId,
-    ) -> Result<(), TerminalError> {
-        let mut state = self.lock();
-        let stream_entry = state
-            .streams
-            .get_mut(stream)
-            .ok_or_else(TerminalError::unknown_stream)?;
-        let before = stream_entry.subscribers.len();
-        stream_entry.subscribers.retain(|s| &s.id != subscriber);
-        if stream_entry.subscribers.len() == before {
-            return Err(TerminalError::unknown_subscriber());
-        }
-        if stream_entry.owner.as_ref() == Some(subscriber) {
-            stream_entry.owner = None;
-            stream_entry.broadcast(TerminalEvent::FocusChanged { owner: None });
-        }
-        Ok(())
+        tab_id: &TabId,
+        revision: Revision,
+    ) -> Result<TerminalEvent, TerminalError> {
+        let _ = revision;
+        Ok(TerminalEvent::Snapshot(self.registry.snapshot(tab_id)?))
     }
 
-    /// Hand input ownership to `subscriber` and tell every attached client.
-    pub fn take_focus(
-        &self,
-        stream: &StreamId,
-        subscriber: &SubscriberId,
-    ) -> Result<(), TerminalError> {
-        let mut state = self.lock();
-        let stream_entry = state
-            .streams
-            .get_mut(stream)
-            .ok_or_else(TerminalError::unknown_stream)?;
-        if !stream_entry.subscribers.iter().any(|s| &s.id == subscriber) {
-            return Err(TerminalError::unknown_subscriber());
-        }
-        stream_entry.owner = Some(subscriber.clone());
-        stream_entry.broadcast(TerminalEvent::FocusChanged {
-            owner: Some(subscriber.clone()),
-        });
-        Ok(())
+    pub fn list(&self) -> Vec<TabDescriptor> {
+        self.registry.list()
     }
 
-    pub fn owner(&self, stream: &StreamId) -> Option<SubscriberId> {
-        self.lock().streams.get(stream)?.owner.clone()
+    pub fn open(&self, launch: TabLaunch) -> Result<TabId, TerminalError> {
+        self.registry.open(launch).map_err(Into::into)
+    }
+
+    pub fn close(&self, tab: &TabId) -> Result<(), TerminalError> {
+        self.registry.close(tab).map_err(Into::into)
     }
 
     pub fn input(
         &self,
-        stream: &StreamId,
-        subscriber: &SubscriberId,
-        data: &[u8],
+        tab: &TabId,
+        attachment: &AttachmentId,
+        bytes: &[u8],
     ) -> Result<(), TerminalError> {
-        let pty_id = self.owned_pty(stream, subscriber)?;
-        // The write happens outside the broker lock: a pty write can block on a
-        // full kernel buffer, and holding the map through that would stall
-        // every other stream's output fan-out behind one stuck terminal. The
-        // window this opens — focus changing between the check and the write —
-        // is a keystroke wide and resolves the same way it does on a desktop
-        // where two hands reach for the keyboard at once.
-        self.control
-            .write(pty_id, data)
-            // The pty's own error text only: input bytes must never reach a
-            // message that could be logged or shown.
-            .map_err(|error| TerminalError::new("terminal.write_failed", error))
+        self.registry
+            .input(tab, attachment, bytes)
+            .map_err(Into::into)
     }
 
-    /// Resize is owned exactly as input is. A read-only client reshaping the
-    /// terminal would reflow the owner's screen under them, and the client that
-    /// is typing is the one that knows what size it is drawing at.
     pub fn resize(
         &self,
-        stream: &StreamId,
-        subscriber: &SubscriberId,
+        tab: &TabId,
+        attachment: &AttachmentId,
         size: TerminalSize,
     ) -> Result<(), TerminalError> {
-        let pty_id = self.owned_pty(stream, subscriber)?;
-        self.control
-            .resize(pty_id, size.cols(), size.rows())
-            .map_err(|error| TerminalError::new("terminal.resize_failed", error))
+        self.registry
+            .resize(tab, attachment, size)
+            .map_err(Into::into)
     }
 
-    fn owned_pty(
+    pub fn focus(
         &self,
-        stream: &StreamId,
-        subscriber: &SubscriberId,
-    ) -> Result<u32, TerminalError> {
-        self.lock()
-            .streams
-            .get(stream)
-            .ok_or_else(TerminalError::unknown_stream)?
-            .require_owner(subscriber)
+        tab: &TabId,
+        attachment: &AttachmentId,
+        size: TerminalSize,
+    ) -> Result<(), TerminalError> {
+        self.registry
+            .take_focus(tab, attachment, size)
+            .map_err(Into::into)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BrokerState> {
-        // A poisoned lock here would mean a panic inside a fan-out. The state
-        // it guards is a map of buffers and channels, none of which a panic can
-        // leave half-written, so recovering beats taking the app down with it.
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-impl PtyObserver for TerminalBroker {
-    fn on_output(&self, pty_id: u32, bytes: &[u8]) {
-        let mut state = self.lock();
-        let Some(stream) = state.by_pty.get(&pty_id).cloned() else {
-            return;
-        };
-        let Some(stream_entry) = state.streams.get_mut(&stream) else {
-            return;
-        };
-        let sequence = stream_entry.buffer.push(bytes);
-        stream_entry.broadcast(TerminalEvent::Output {
-            sequence,
-            bytes: bytes.to_vec(),
-        });
+    pub fn detach(&self, tab: &TabId, attachment: &AttachmentId) -> Result<(), TerminalError> {
+        self.registry.detach(tab, attachment).map_err(Into::into)
     }
 
-    fn on_exit(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>) {
-        let mut state = self.lock();
-        let Some(stream) = state.by_pty.get(&pty_id).cloned() else {
-            return;
-        };
-        let Some(stream_entry) = state.streams.get_mut(&stream) else {
-            return;
-        };
-        // The stream outlives the pty on purpose: a phone that was disconnected
-        // when the command finished still has to be able to attach and read
-        // what it printed before it died.
-        stream_entry.broadcast(TerminalEvent::Exited {
-            code,
-            signal: signal.map(str::to_string),
-        });
+    pub fn scrollback(
+        &self,
+        tab: &TabId,
+        offset: usize,
+        count: usize,
+    ) -> Result<Vec<ScreenRow>, TerminalError> {
+        self.registry
+            .scrollback(tab, offset, count)
+            .map_err(Into::into)
     }
 }
 
-/// Point the process-wide pty observer at this broker.
-pub fn observe_ptys(broker: Arc<TerminalBroker>) {
-    crate::pty::set_observer(broker);
+#[derive(Default)]
+pub struct DiffCoalescer {
+    tab_id: Option<String>,
+    base_revision: Option<Revision>,
+    revision: Option<Revision>,
+    rows: BTreeMap<u16, ScreenRow>,
+    cursor: Option<CursorState>,
+    modes: Option<TerminalModes>,
+}
+
+impl DiffCoalescer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn push(&mut self, diff: ScreenDiff) -> Result<(), TerminalError> {
+        if let (Some(tab), Some(revision)) = (&self.tab_id, self.revision) {
+            if tab != diff.tab_id() || revision != diff.base_revision() {
+                self.clear();
+                return Err(TerminalError::new(
+                    "terminal.revision_gap",
+                    "screen damage did not continue the current revision",
+                ));
+            }
+        }
+        if self.tab_id.is_none() {
+            self.tab_id = Some(diff.tab_id().to_owned());
+            self.base_revision = Some(diff.base_revision());
+        }
+        self.revision = Some(diff.revision());
+        for patch in diff.rows() {
+            self.rows.insert(patch.row(), patch.content().clone());
+        }
+        if let Some(cursor) = diff.cursor() {
+            self.cursor = Some(cursor.clone());
+        }
+        if let Some(modes) = diff.modes() {
+            self.modes = Some(modes.clone());
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Option<ScreenDiff> {
+        let tab_id = self.tab_id.take()?;
+        let base = self.base_revision.take()?;
+        let revision = self.revision.take()?;
+        let rows = std::mem::take(&mut self.rows)
+            .into_iter()
+            .map(|(row, content)| RowPatch::new(row, content))
+            .collect();
+        let mut diff = ScreenDiff::for_tab(tab_id, base, revision, rows);
+        if let Some(cursor) = self.cursor.take() {
+            diff = diff.with_cursor(cursor);
+        }
+        if let Some(modes) = self.modes.take() {
+            diff = diff.with_modes(modes);
+        }
+        Some(diff)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferKind {
+    Snapshot,
+    Diff,
+    Scrollback,
+}
+
+impl TransferKind {
+    fn event_kind(self) -> &'static str {
+        match self {
+            Self::Snapshot => "terminal.snapshot",
+            Self::Diff => "terminal.diff",
+            Self::Scrollback => "terminal.scrollback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferChunk {
+    pub transfer_id: String,
+    pub tab_id: TabId,
+    pub attachment_id: Option<AttachmentId>,
+    pub kind: TransferKind,
+    pub base_revision: Revision,
+    pub final_revision: Revision,
+    pub row_start: u32,
+    pub row_end: u32,
+    pub index: u32,
+    pub total: u32,
+    pub request_id: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SnapshotPart {
+    cols: u16,
+    rows: u16,
+    visible: Vec<ScreenRow>,
+    cursor: CursorState,
+    modes: TerminalModes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DiffPart {
+    rows: Vec<RowPatch>,
+    cursor: Option<CursorState>,
+    modes: Option<TerminalModes>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ScrollbackPart {
+    rows: Vec<ScreenRow>,
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, TerminalError> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(value, &mut bytes)
+        .map_err(|_| TerminalError::invalid_transfer("unable to encode transfer"))?;
+    Ok(bytes)
+}
+
+fn wire_len(chunk: &TransferChunk) -> Result<usize, TerminalError> {
+    let payload = encode(chunk)?;
+    encode(&RemoteEvent {
+        version: PROTOCOL_VERSION,
+        request_id: chunk.request_id,
+        kind: chunk.kind.event_kind().to_owned(),
+        payload,
+    })
+    .map(|bytes| bytes.len())
+}
+
+fn finish_chunks(mut chunks: Vec<TransferChunk>) -> Result<Vec<TransferChunk>, TerminalError> {
+    let total = u32::try_from(chunks.len())
+        .map_err(|_| TerminalError::invalid_transfer("too many transfer chunks"))?;
+    for chunk in &mut chunks {
+        chunk.total = total;
+        if wire_len(chunk)? >= MAX_WIRE_FRAME_BYTES {
+            return Err(TerminalError::semantic_row_too_large());
+        }
+    }
+    Ok(chunks)
+}
+
+fn chunk_rows<T, F>(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    kind: TransferKind,
+    base_revision: Revision,
+    final_revision: Revision,
+    row_count: usize,
+    mut encode_range: F,
+) -> Result<Vec<TransferChunk>, TerminalError>
+where
+    F: FnMut(std::ops::Range<usize>) -> Result<T, TerminalError>,
+    T: Serialize,
+{
+    let transfer_id = Uuid::new_v4().to_string();
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    if row_count == 0 {
+        let payload = encode(&encode_range(0..0)?)?;
+        chunks.push(TransferChunk {
+            transfer_id,
+            tab_id: tab.clone(),
+            attachment_id: attachment_id.cloned(),
+            kind,
+            base_revision,
+            final_revision,
+            row_start: 0,
+            row_end: 0,
+            index: 0,
+            total: u32::MAX,
+            request_id,
+            payload,
+        });
+        return finish_chunks(chunks);
+    }
+    while start < row_count {
+        let mut best: Option<TransferChunk> = None;
+        let mut low = start + 1;
+        let mut high = row_count;
+        while low <= high {
+            let end = low + (high - low) / 2;
+            let payload = encode(&encode_range(start..end)?)?;
+            let candidate = TransferChunk {
+                transfer_id: transfer_id.clone(),
+                tab_id: tab.clone(),
+                attachment_id: attachment_id.cloned(),
+                kind,
+                base_revision,
+                final_revision,
+                row_start: u32::try_from(start).unwrap(),
+                row_end: u32::try_from(end).unwrap(),
+                index: u32::try_from(chunks.len()).unwrap(),
+                total: u32::MAX,
+                request_id,
+                payload,
+            };
+            if wire_len(&candidate)? >= MAX_WIRE_FRAME_BYTES {
+                high = end - 1;
+            } else {
+                best = Some(candidate);
+                low = end + 1;
+            }
+        }
+        let Some(chunk) = best else {
+            return Err(TerminalError::semantic_row_too_large());
+        };
+        start = usize::try_from(chunk.row_end).unwrap();
+        chunks.push(chunk);
+    }
+    finish_chunks(chunks)
+}
+
+pub fn chunk_snapshot(
+    request_id: u64,
+    tab: &TabId,
+    snapshot: &ScreenSnapshot,
+) -> Result<Vec<TransferChunk>, TerminalError> {
+    chunk_snapshot_for_attachment(request_id, tab, None, snapshot)
+}
+
+pub fn chunk_snapshot_for_attachment(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    snapshot: &ScreenSnapshot,
+) -> Result<Vec<TransferChunk>, TerminalError> {
+    let visible = snapshot.visible();
+    chunk_rows(
+        request_id,
+        tab,
+        attachment_id,
+        TransferKind::Snapshot,
+        snapshot.revision(),
+        snapshot.revision(),
+        visible.len(),
+        |range| {
+            Ok(SnapshotPart {
+                cols: snapshot.cols(),
+                rows: snapshot.rows(),
+                visible: visible[range].to_vec(),
+                cursor: snapshot.cursor().clone(),
+                modes: snapshot.modes().clone(),
+            })
+        },
+    )
+}
+
+pub fn chunk_diff(
+    request_id: u64,
+    tab: &TabId,
+    diff: &ScreenDiff,
+) -> Result<Vec<TransferChunk>, TerminalError> {
+    chunk_diff_for_attachment(request_id, tab, None, diff)
+}
+
+pub fn chunk_diff_for_attachment(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    diff: &ScreenDiff,
+) -> Result<Vec<TransferChunk>, TerminalError> {
+    let rows = diff.rows();
+    chunk_rows(
+        request_id,
+        tab,
+        attachment_id,
+        TransferKind::Diff,
+        diff.base_revision(),
+        diff.revision(),
+        rows.len(),
+        |range| {
+            Ok(DiffPart {
+                rows: rows[range].to_vec(),
+                cursor: diff.cursor().cloned(),
+                modes: diff.modes().cloned(),
+            })
+        },
+    )
+}
+
+pub fn chunk_scrollback(
+    request_id: u64,
+    tab: &TabId,
+    revision: Revision,
+    rows: Vec<ScreenRow>,
+) -> Result<Vec<TransferChunk>, TerminalError> {
+    chunk_scrollback_for_attachment(request_id, tab, None, revision, rows)
+}
+
+pub fn chunk_scrollback_for_attachment(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    revision: Revision,
+    rows: Vec<ScreenRow>,
+) -> Result<Vec<TransferChunk>, TerminalError> {
+    chunk_rows(
+        request_id,
+        tab,
+        attachment_id,
+        TransferKind::Scrollback,
+        revision,
+        revision,
+        rows.len(),
+        |range| {
+            Ok(ScrollbackPart {
+                rows: rows[range].to_vec(),
+            })
+        },
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferPayload {
+    Snapshot(ScreenSnapshot),
+    Diff(ScreenDiff),
+    Scrollback(Vec<ScreenRow>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferStatus {
+    Pending,
+    Complete(TransferPayload),
+    Recover,
+}
+
+struct StagedTransfer {
+    transfer_id: String,
+    attachment_id: Option<AttachmentId>,
+    kind: TransferKind,
+    base_revision: Revision,
+    final_revision: Revision,
+    request_id: u64,
+    total: u32,
+    next_index: u32,
+    next_row: u32,
+    bytes: usize,
+    rows: usize,
+    started: Instant,
+    payloads: Vec<Vec<u8>>,
+}
+
+pub struct TransferAssembler {
+    connection_id: String,
+    tab_id: TabId,
+    attachment_id: Option<AttachmentId>,
+    timeout: Duration,
+    revision_floor: Revision,
+    staged: Option<StagedTransfer>,
+}
+
+impl TransferAssembler {
+    pub fn new(connection_id: impl Into<String>, tab_id: TabId) -> Self {
+        Self::with_timeout(connection_id, tab_id, DEFAULT_TRANSFER_TIMEOUT)
+    }
+
+    pub fn with_timeout(
+        connection_id: impl Into<String>,
+        tab_id: TabId,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            connection_id: connection_id.into(),
+            tab_id,
+            attachment_id: None,
+            timeout,
+            revision_floor: Revision(0),
+            staged: None,
+        }
+    }
+
+    pub fn bind_attachment(mut self, attachment_id: AttachmentId) -> Self {
+        self.attachment_id = Some(attachment_id);
+        self
+    }
+
+    pub fn reset_for_snapshot(&mut self, revision: Revision) {
+        self.staged = None;
+        self.revision_floor = revision;
+    }
+
+    pub fn expire_at(&mut self, now: Instant) -> bool {
+        let expired = self
+            .staged
+            .as_ref()
+            .is_some_and(|staged| now.saturating_duration_since(staged.started) >= self.timeout);
+        if expired {
+            self.staged = None;
+        }
+        expired
+    }
+
+    pub fn accept(&mut self, connection_id: &str, chunk: TransferChunk) -> TransferStatus {
+        self.accept_at(connection_id, chunk, Instant::now())
+    }
+
+    pub fn accept_at(
+        &mut self,
+        connection_id: &str,
+        chunk: TransferChunk,
+        now: Instant,
+    ) -> TransferStatus {
+        if self.expire_at(now)
+            || connection_id != self.connection_id
+            || chunk.tab_id != self.tab_id
+            || chunk.attachment_id != self.attachment_id
+            || chunk.total == 0
+            || usize::try_from(chunk.total).map_or(true, |total| total > MAX_STAGED_TRANSFER_ROWS)
+            || usize::try_from(chunk.row_end)
+                .map_or(true, |row_end| row_end > MAX_STAGED_TRANSFER_ROWS)
+            || chunk.final_revision.0 < self.revision_floor.0
+            || !valid_revision_metadata(&chunk)
+            || wire_len(&chunk).map_or(true, |size| size >= MAX_WIRE_FRAME_BYTES)
+        {
+            self.staged = None;
+            return TransferStatus::Recover;
+        }
+        if self.staged.is_none() {
+            if chunk.index != 0 || chunk.row_start != 0 {
+                return TransferStatus::Recover;
+            }
+            self.staged = Some(StagedTransfer {
+                transfer_id: chunk.transfer_id.clone(),
+                attachment_id: chunk.attachment_id.clone(),
+                kind: chunk.kind,
+                base_revision: chunk.base_revision,
+                final_revision: chunk.final_revision,
+                request_id: chunk.request_id,
+                total: chunk.total,
+                next_index: 0,
+                next_row: 0,
+                bytes: 0,
+                rows: 0,
+                started: now,
+                payloads: Vec::new(),
+            });
+        }
+        let staged = self.staged.as_mut().unwrap();
+        let row_count = usize::try_from(chunk.row_end.saturating_sub(chunk.row_start)).unwrap();
+        let consistent = chunk.transfer_id == staged.transfer_id
+            && chunk.attachment_id == staged.attachment_id
+            && chunk.kind == staged.kind
+            && chunk.base_revision == staged.base_revision
+            && chunk.final_revision == staged.final_revision
+            && chunk.request_id == staged.request_id
+            && chunk.total == staged.total
+            && chunk.index == staged.next_index
+            && chunk.row_start == staged.next_row
+            && chunk.row_end >= chunk.row_start
+            && (chunk.row_end > chunk.row_start
+                || (chunk.total == 1 && chunk.index == 0 && chunk.row_start == 0))
+            && chunk.index < chunk.total;
+        let bounded = staged.bytes.saturating_add(chunk.payload.len()) <= MAX_STAGED_TRANSFER_BYTES
+            && staged.rows.saturating_add(row_count) <= MAX_STAGED_TRANSFER_ROWS;
+        if !consistent || !bounded || validate_part(&chunk, row_count).is_err() {
+            self.staged = None;
+            return TransferStatus::Recover;
+        }
+        staged.bytes += chunk.payload.len();
+        staged.rows += row_count;
+        staged.next_index += 1;
+        staged.next_row = chunk.row_end;
+        staged.payloads.push(chunk.payload);
+        if staged.next_index != staged.total {
+            return TransferStatus::Pending;
+        }
+        let staged = self.staged.take().unwrap();
+        match assemble_payload(&self.tab_id, staged) {
+            Ok(payload) => {
+                self.revision_floor = match &payload {
+                    TransferPayload::Snapshot(snapshot) => snapshot.revision(),
+                    TransferPayload::Diff(diff) => diff.revision(),
+                    TransferPayload::Scrollback(_) => self.revision_floor,
+                };
+                TransferStatus::Complete(payload)
+            }
+            Err(_) => TransferStatus::Recover,
+        }
+    }
+}
+
+fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, TerminalError> {
+    ciborium::from_reader(bytes)
+        .map_err(|_| TerminalError::invalid_transfer("invalid transfer payload"))
+}
+
+fn validate_part(chunk: &TransferChunk, expected_rows: usize) -> Result<(), TerminalError> {
+    let rows = match chunk.kind {
+        TransferKind::Snapshot => decode::<SnapshotPart>(&chunk.payload)?.visible,
+        TransferKind::Diff => decode::<DiffPart>(&chunk.payload)?
+            .rows
+            .into_iter()
+            .map(|patch| patch.content().clone())
+            .collect(),
+        TransferKind::Scrollback => decode::<ScrollbackPart>(&chunk.payload)?.rows,
+    };
+    if rows.len() != expected_rows || rows.iter().any(|row| !valid_row(row)) {
+        return Err(TerminalError::invalid_transfer(
+            "row range does not match payload",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_revision_metadata(chunk: &TransferChunk) -> bool {
+    match chunk.kind {
+        TransferKind::Snapshot | TransferKind::Scrollback => {
+            chunk.base_revision == chunk.final_revision
+        }
+        TransferKind::Diff => chunk.base_revision.0 < chunk.final_revision.0,
+    }
+}
+
+fn valid_row(row: &ScreenRow) -> bool {
+    row.cells().len() <= 512
+        && row
+            .cells()
+            .iter()
+            .all(|cell| cell.is_continuation() || matches!(cell.text().chars().count(), 1..=33))
+}
+
+fn assemble_payload(
+    tab_id: &TabId,
+    staged: StagedTransfer,
+) -> Result<TransferPayload, TerminalError> {
+    match staged.kind {
+        TransferKind::Snapshot => {
+            let mut visible = Vec::new();
+            let mut header: Option<(u16, u16, CursorState, TerminalModes)> = None;
+            for payload in staged.payloads {
+                let part: SnapshotPart = decode(&payload)?;
+                let current = (
+                    part.cols,
+                    part.rows,
+                    part.cursor.clone(),
+                    part.modes.clone(),
+                );
+                if header.as_ref().is_some_and(|header| header != &current) {
+                    return Err(TerminalError::invalid_transfer("mixed snapshot metadata"));
+                }
+                header = Some(current);
+                visible.extend(part.visible);
+            }
+            let (cols, rows, cursor, modes) = header.ok_or_else(|| {
+                TerminalError::invalid_transfer("snapshot transfer has no payload")
+            })?;
+            if visible.len() != usize::from(rows) {
+                return Err(TerminalError::invalid_transfer(
+                    "snapshot does not contain the complete viewport",
+                ));
+            }
+            if visible
+                .iter()
+                .any(|row| row.cells().len() != usize::from(cols))
+            {
+                return Err(TerminalError::invalid_transfer(
+                    "snapshot rows do not match its column count",
+                ));
+            }
+            let size = TerminalSize::try_new(cols, rows)
+                .map_err(|error| TerminalError::new(error.code(), "invalid snapshot dimensions"))?;
+            Ok(TransferPayload::Snapshot(ScreenSnapshot::new(
+                tab_id.as_str(),
+                staged.final_revision,
+                size,
+                visible,
+                Vec::new(),
+                cursor,
+                modes,
+            )))
+        }
+        TransferKind::Diff => {
+            let mut rows = Vec::new();
+            let mut cursor = None;
+            let mut modes = None;
+            for payload in staged.payloads {
+                let part: DiffPart = decode(&payload)?;
+                rows.extend(part.rows);
+                cursor = part.cursor;
+                modes = part.modes;
+            }
+            let mut patched = std::collections::HashSet::new();
+            if rows.iter().any(|patch| !patched.insert(patch.row())) {
+                return Err(TerminalError::invalid_transfer(
+                    "diff contains duplicate row patches",
+                ));
+            }
+            let mut diff = ScreenDiff::for_tab(
+                tab_id.as_str(),
+                staged.base_revision,
+                staged.final_revision,
+                rows,
+            );
+            if let Some(value) = cursor {
+                diff = diff.with_cursor(value);
+            }
+            if let Some(value) = modes {
+                diff = diff.with_modes(value);
+            }
+            Ok(TransferPayload::Diff(diff))
+        }
+        TransferKind::Scrollback => {
+            let mut rows = Vec::new();
+            for payload in staged.payloads {
+                rows.extend(decode::<ScrollbackPart>(&payload)?.rows);
+            }
+            Ok(TransferPayload::Scrollback(rows))
+        }
+    }
 }

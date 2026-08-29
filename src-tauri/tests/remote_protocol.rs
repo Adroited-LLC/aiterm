@@ -111,6 +111,16 @@ fn terminal_frames_larger_than_one_mebibyte_are_rejected() {
     );
 }
 
+#[test]
+fn terminal_frames_exactly_one_mebibyte_are_rejected() {
+    assert_eq!(
+        validate_terminal_frame(&vec![0; 1024 * 1024])
+            .unwrap_err()
+            .code(),
+        "protocol.frame_too_large"
+    );
+}
+
 #[derive(Serialize)]
 struct OversizedTypedFrame {
     payload: Vec<u8>,

@@ -2,8 +2,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use tauri::{AppHandle, Manager};
+use std::sync::{Arc, Mutex};
 
 pub struct PtyInstance {
     master: Box<dyn MasterPty + Send>,
@@ -129,45 +128,6 @@ impl PtySpawnSpec {
     }
 }
 
-/// A second listener on a pty's life, for anything that is not the desktop
-/// window.
-///
-/// The remote gateway needs the same bytes xterm.js gets, and it cannot get
-/// them from the frontend: the renderer is not running when a phone attaches to
-/// a tab nobody is looking at, and routing terminal traffic through it would
-/// put every remote keystroke behind a frame. So the reader thread calls here
-/// as well as sending on its Channel — *as well as*, never instead of. The
-/// desktop path below must behave identically whether or not anyone is
-/// observing.
-pub trait PtyObserver: Send + Sync {
-    fn on_output(&self, pty_id: u32, bytes: &[u8]);
-    fn on_exit(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>);
-}
-
-/// Process-global because pty reader threads have nothing else in common: each
-/// one is spawned by a command, owns no state, and would otherwise need the
-/// broker threaded through `pty_spawn`'s signature for a feature that is off by
-/// default. Unregistered costs one uncontended read lock per 8 KiB chunk.
-static OBSERVER: RwLock<Option<Arc<dyn PtyObserver>>> = RwLock::new(None);
-
-pub fn set_observer(observer: Arc<dyn PtyObserver>) {
-    if let Ok(mut slot) = OBSERVER.write() {
-        *slot = Some(observer);
-    }
-}
-
-/// Called when Remote Access is switched off: the broker stops seeing traffic
-/// the moment the listener closes, rather than at the next app restart.
-pub fn clear_observer() {
-    if let Ok(mut slot) = OBSERVER.write() {
-        *slot = None;
-    }
-}
-
-fn observer() -> Option<Arc<dyn PtyObserver>> {
-    OBSERVER.read().ok()?.clone()
-}
-
 /// Environment variables that mean "you are already inside an agent session".
 ///
 /// A CLI agent exports these so anything it launches behaves as a *nested* run
@@ -245,9 +205,8 @@ fn reap_failed_spawn(child: &mut dyn portable_pty::Child) {
 impl PtyManager {
     /// Spawn one PTY and deliver its bytes and terminal exit to `sink`.
     ///
-    /// The legacy observer remains a temporary additive bridge for the remote
-    /// broker. It is deliberately not used as the spawn's primary sink: the
-    /// passed sink observes every byte from this PTY's reader thread.
+    /// The passed sink is the single owner of output and exit delivery for this
+    /// PTY. Higher-level projections subscribe through the owning tab registry.
     pub fn spawn(&self, spec: PtySpawnSpec, sink: Arc<dyn PtySink>) -> Result<u32, String> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(spec.size).map_err(|e| e.to_string())?;
@@ -346,11 +305,6 @@ impl PtyManager {
                         // A single raw byte stream preserves multibyte UTF-8 across
                         // 8 KiB reads; the sink decides how its transport consumes it.
                         sink.output(id, &buf[..n]);
-                        // Compatibility-only fan-out for the existing remote broker.
-                        // Task 6 removes this after every consumer takes a per-spawn sink.
-                        if let Some(observer) = observer() {
-                            observer.on_output(id, &buf[..n]);
-                        }
                     }
                 }
             }
@@ -365,49 +319,9 @@ impl PtyManager {
             // on a possibly reused OS pid after the child has been reaped.
             ptys.remove(id);
             sink.exited(id, code, signal.as_deref());
-            if let Some(observer) = observer() {
-                observer.on_exit(id, code, signal.as_deref());
-            }
         });
 
         Ok(id)
-    }
-}
-
-/// The write itself, with no transport attached, so a remote client reaches a
-/// pty through the same code the window does instead of a parallel copy.
-///
-/// The lock is held for the write and nothing else, with no await inside it, so
-/// this cannot block the runtime the command above runs on.
-pub fn write_to_pty(manager: &PtyManager, id: u32, data: &[u8]) -> Result<(), String> {
-    manager.write(id, data)
-}
-
-/// Split from the command for the same reason as [`write_to_pty`].
-pub fn resize_pty(manager: &PtyManager, id: u32, cols: u16, rows: u16) -> Result<(), String> {
-    manager.resize(id, cols, rows)
-}
-
-/// Reaches the pty table through the Tauri state the app already manages, so
-/// the remote broker can stay free of Tauri types: it holds this as a
-/// `PtyControl` and never learns where the ptys live.
-pub struct AppPtyControl {
-    app: AppHandle,
-}
-
-impl AppPtyControl {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-impl crate::remote::terminal::PtyControl for AppPtyControl {
-    fn write(&self, pty_id: u32, data: &[u8]) -> Result<(), String> {
-        write_to_pty(&self.app.state::<PtyManager>(), pty_id, data)
-    }
-
-    fn resize(&self, pty_id: u32, cols: u16, rows: u16) -> Result<(), String> {
-        resize_pty(&self.app.state::<PtyManager>(), pty_id, cols, rows)
     }
 }
 
@@ -887,35 +801,6 @@ mod tests {
         for key in ["PATH", "HOME"] {
             assert!(cmd.get_env(key).is_some(), "{key} was lost");
         }
-    }
-
-    /// The observer is strictly additive, so the property that matters is that
-    /// an unregistered one is genuinely absent — the reader thread must do
-    /// nothing extra for a desktop that never enabled Remote Access. The
-    /// fan-out itself is covered by `tests/remote_terminal.rs`.
-    #[test]
-    fn the_pty_observer_is_absent_until_something_registers() {
-        struct Counting(AtomicU32);
-        impl PtyObserver for Counting {
-            fn on_output(&self, _pty_id: u32, _bytes: &[u8]) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-            fn on_exit(&self, _pty_id: u32, _code: Option<u32>, _signal: Option<&str>) {}
-        }
-
-        assert!(
-            observer().is_none(),
-            "nothing should be observing by default"
-        );
-        let counting = Arc::new(Counting(AtomicU32::new(0)));
-        set_observer(counting.clone());
-        observer()
-            .expect("a registered observer should be handed back")
-            .on_output(1, b"x");
-        assert_eq!(counting.0.load(Ordering::SeqCst), 1);
-
-        clear_observer();
-        assert!(observer().is_none(), "clearing must really unregister");
     }
 
     #[test]

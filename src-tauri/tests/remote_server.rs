@@ -1,5 +1,7 @@
 use aiterm_lib::remote::auth::DeviceStore;
-use aiterm_lib::remote::server::{RemoteGateway, TlsIdentity};
+use aiterm_lib::remote::model::TerminalSize;
+use aiterm_lib::remote::server::{RemoteGateway, RemoteServices, TlsIdentity};
+use aiterm_lib::tabs::{TabLaunch, TabRegistry};
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand_core::OsRng;
@@ -60,6 +62,45 @@ struct RequestEnvelope<'a> {
     request_id: u64,
     kind: &'a str,
     payload: &'a [u8],
+}
+
+#[derive(Deserialize)]
+struct ResponseEnvelope {
+    version: u16,
+    request_id: u64,
+    kind: String,
+    payload: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct TabListReply {
+    tabs: Vec<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct ErrorReply {
+    code: String,
+}
+
+#[derive(Serialize)]
+struct TabRequest<'a> {
+    tab_id: &'a aiterm_lib::tabs::TabId,
+}
+
+#[derive(Deserialize)]
+struct AttachedReply {
+    tab_id: String,
+    attachment_id: String,
+    has_focus: bool,
+}
+
+#[derive(Deserialize)]
+struct SnapshotChunkReply {
+    tab_id: String,
+    attachment_id: Option<String>,
+    kind: String,
+    index: u32,
+    total: u32,
 }
 
 fn private_test_dir(name: &str) -> PathBuf {
@@ -153,10 +194,33 @@ fn valid_request(request_id: u64) -> Message {
     )
 }
 
+fn request(request_id: u64, kind: &str, payload: &[u8]) -> Message {
+    Message::Binary(
+        encode(&RequestEnvelope {
+            version: 1,
+            request_id,
+            kind,
+            payload,
+        })
+        .into(),
+    )
+}
+
+async fn response(socket: &mut TestSocket) -> ResponseEnvelope {
+    let Message::Binary(bytes) = socket.next().await.unwrap().unwrap() else {
+        panic!("response should be a binary CBOR frame");
+    };
+    decode(&bytes)
+}
+
 async fn assert_closed(socket: &mut TestSocket) {
-    match tokio::time::timeout(Duration::from_secs(2), socket.next()).await {
-        Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {}
-        other => panic!("server left an unauthorized connection open: {other:?}"),
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout_at(deadline, socket.next()).await {
+            Ok(Some(Ok(Message::Binary(_)))) => continue,
+            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
+            other => panic!("server left an unauthorized connection open: {other:?}"),
+        }
     }
 }
 
@@ -172,15 +236,24 @@ fn paired_store(root: &PathBuf) -> (Arc<DeviceStore>, SigningKey, String) {
     (store, key, device.id)
 }
 
+fn services() -> RemoteServices {
+    RemoteServices::new(Arc::new(TabRegistry::default()))
+}
+
 #[tokio::test]
 async fn authenticated_device_completes_a_real_tls_websocket_handshake() {
     let root = private_test_dir("proof");
     let (store, key, device_id) = paired_store(&root);
     let identity =
         TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
-    let gateway = RemoteGateway::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), store, identity)
-        .await
-        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services(),
+    )
+    .await
+    .unwrap();
     let mut socket = connect(&gateway).await;
     let challenge = challenge(&mut socket).await;
     assert_eq!(challenge.kind, "auth.challenge");
@@ -210,6 +283,127 @@ async fn authenticated_device_completes_a_real_tls_websocket_handshake() {
 }
 
 #[tokio::test]
+async fn authenticated_tab_list_is_dispatched_with_a_typed_correlated_response() {
+    let root = private_test_dir("tab-list-dispatch");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let services = RemoteServices::new(Arc::new(TabRegistry::default()));
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services,
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    socket.send(request(44, "tab.list", b"")).await.unwrap();
+    let reply = response(&mut socket).await;
+
+    assert_eq!(reply.version, 1);
+    assert_eq!(reply.request_id, 44);
+    assert_eq!(reply.kind, "tab.list");
+    let payload: TabListReply = decode(&reply.payload);
+    assert!(payload.tabs.is_empty());
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn session_requests_receive_structured_unsupported_responses() {
+    let root = private_test_dir("unsupported-dispatch");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let services = RemoteServices::new(Arc::new(TabRegistry::default()));
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services,
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    socket.send(request(73, "session.list", b"")).await.unwrap();
+    let reply = response(&mut socket).await;
+
+    assert_eq!(reply.request_id, 73);
+    assert_eq!(reply.kind, "error");
+    let payload: ErrorReply = decode(&reply.payload);
+    assert_eq!(payload.code, "protocol.unsupported_request");
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn terminal_attach_returns_an_opaque_attachment_and_typed_snapshot_chunks() {
+    let root = private_test_dir("terminal-attach-dispatch");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::default());
+    let tab = registry
+        .open(
+            TabLaunch::new(
+                "Remote shell",
+                "remote-server-test",
+                TerminalSize::try_new(20, 2).unwrap(),
+            )
+            .with_command("sleep 5"),
+        )
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    socket
+        .send(request(
+            91,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached = response(&mut socket).await;
+    assert_eq!(attached.request_id, 91);
+    assert_eq!(attached.kind, "terminal.attach");
+    let attached_payload: AttachedReply = decode(&attached.payload);
+    assert_eq!(attached_payload.tab_id, tab.as_str());
+    assert!(!attached_payload.attachment_id.is_empty());
+    assert!(!attached_payload.has_focus);
+
+    let snapshot = response(&mut socket).await;
+    assert_eq!(snapshot.request_id, 91);
+    assert_eq!(snapshot.kind, "terminal.snapshot");
+    let snapshot_payload: SnapshotChunkReply = decode(&snapshot.payload);
+    assert_eq!(snapshot_payload.tab_id, tab.as_str());
+    assert_eq!(
+        snapshot_payload.attachment_id.as_deref(),
+        Some(attached_payload.attachment_id.as_str())
+    );
+    assert_eq!(snapshot_payload.kind, "snapshot");
+    assert_eq!(snapshot_payload.index, 0);
+    assert!(snapshot_payload.total >= 1);
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn qr_pairing_waits_for_explicit_desktop_approval_before_issuing_device_identity() {
     let root = private_test_dir("pairing");
     let store = Arc::new(DeviceStore::open(root.join("devices")).unwrap());
@@ -223,6 +417,7 @@ async fn qr_pairing_waits_for_explicit_desktop_approval_before_issuing_device_id
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         store.clone(),
         identity,
+        services(),
     )
     .await
     .unwrap();
@@ -268,9 +463,14 @@ async fn websocket_rejects_messages_before_device_nonce_proof() {
     let (store, _, _) = paired_store(&root);
     let identity =
         TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
-    let gateway = RemoteGateway::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), store, identity)
-        .await
-        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services(),
+    )
+    .await
+    .unwrap();
     let mut socket = connect(&gateway).await;
     let _ = challenge(&mut socket).await;
 
@@ -292,9 +492,14 @@ async fn websocket_rejects_a_frame_larger_than_one_mebibyte() {
     let (store, _, _) = paired_store(&root);
     let identity =
         TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
-    let gateway = RemoteGateway::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), store, identity)
-        .await
-        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services(),
+    )
+    .await
+    .unwrap();
     let mut socket = connect(&gateway).await;
     let _ = challenge(&mut socket).await;
 
@@ -313,12 +518,12 @@ async fn authenticated_connection_rejects_a_replayed_request_id() {
     let root = private_test_dir("replay");
     let (store, key, device_id) = paired_store(&root);
     let identity =
-        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            .unwrap();
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
     let gateway = RemoteGateway::start(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         store,
         identity,
+        services(),
     )
     .await
     .unwrap();
@@ -338,12 +543,12 @@ async fn authenticated_connection_closes_on_more_than_120_requests_per_second() 
     let root = private_test_dir("rate-limit");
     let (store, key, device_id) = paired_store(&root);
     let identity =
-        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)])
-            .unwrap();
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
     let gateway = RemoteGateway::start(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         store,
         identity,
+        services(),
     )
     .await
     .unwrap();
@@ -371,9 +576,14 @@ async fn tls_twelve_client_cannot_connect() {
     let (store, _, _) = paired_store(&root);
     let identity =
         TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
-    let gateway = RemoteGateway::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), store, identity)
-        .await
-        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        services(),
+    )
+    .await
+    .unwrap();
     let url = format!("wss://127.0.0.1:{}/v1/ws", gateway.local_addr().port());
 
     let result = connect_async_tls_with_config(

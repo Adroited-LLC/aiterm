@@ -44,7 +44,7 @@ pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'sta
 pub fn run() {
     trace::init();
     let pty = pty::PtyManager::default();
-    let tabs = tabs::TabRegistry::new(pty.clone());
+    let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

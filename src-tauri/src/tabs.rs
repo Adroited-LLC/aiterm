@@ -1206,7 +1206,7 @@ fn emit_desktop_exit(app: &AppHandle, tab_id: &TabId, exit: &TabExit) {
 /// Start the one process-wide projection from registry exits to Tauri events.
 /// Setup installs it before the webview can open a tab, so the channel needs
 /// no replay lane and attachment workers never duplicate lifecycle events.
-pub fn start_desktop_exit_bridge(app: AppHandle, registry: TabRegistry) -> Result<(), String> {
+pub fn start_desktop_exit_bridge(app: AppHandle, registry: Arc<TabRegistry>) -> Result<(), String> {
     let exits = registry.subscribe_exits();
     std::thread::Builder::new()
         .name("desktop-tab-exits".to_string())
@@ -1221,7 +1221,7 @@ pub fn start_desktop_exit_bridge(app: AppHandle, registry: TabRegistry) -> Resul
 
 #[tauri::command]
 pub async fn tab_open(
-    state: State<'_, TabRegistry>,
+    state: State<'_, Arc<TabRegistry>>,
     launch: TabLaunch,
 ) -> Result<TabDescriptor, String> {
     let registry = (*state).clone();
@@ -1233,13 +1233,13 @@ pub async fn tab_open(
 }
 
 #[tauri::command]
-pub fn tab_list(state: State<'_, TabRegistry>) -> Vec<TabDescriptor> {
+pub fn tab_list(state: State<'_, Arc<TabRegistry>>) -> Vec<TabDescriptor> {
     state.list()
 }
 
 #[tauri::command]
 pub fn tab_update(
-    state: State<'_, TabRegistry>,
+    state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
     update: TabUpdate,
 ) -> Result<TabDescriptor, String> {
@@ -1249,7 +1249,7 @@ pub fn tab_update(
 #[tauri::command]
 pub fn tab_attach_desktop(
     app: AppHandle,
-    state: State<'_, TabRegistry>,
+    state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
     on_output: Channel<InvokeResponseBody>,
 ) -> Result<AttachmentId, String> {
@@ -1289,7 +1289,7 @@ pub fn tab_attach_desktop(
 
 #[tauri::command]
 pub async fn tab_detach(
-    state: State<'_, TabRegistry>,
+    state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
     attachment_id: AttachmentId,
 ) -> Result<(), String> {
@@ -1304,7 +1304,7 @@ pub async fn tab_detach(
 
 #[tauri::command]
 pub async fn tab_write(
-    state: State<'_, TabRegistry>,
+    state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
     attachment_id: AttachmentId,
     data: String,
@@ -1324,7 +1324,7 @@ fn terminal_size(cols: u16, rows: u16) -> Result<TerminalSize, String> {
 
 #[tauri::command]
 pub async fn tab_resize(
-    state: State<'_, TabRegistry>,
+    state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
     attachment_id: AttachmentId,
     cols: u16,
@@ -1342,7 +1342,7 @@ pub async fn tab_resize(
 
 #[tauri::command]
 pub async fn tab_take_focus(
-    state: State<'_, TabRegistry>,
+    state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
     attachment_id: AttachmentId,
     cols: u16,
@@ -1359,7 +1359,7 @@ pub async fn tab_take_focus(
 }
 
 #[tauri::command]
-pub async fn tab_close(state: State<'_, TabRegistry>, tab_id: TabId) -> Result<(), String> {
+pub async fn tab_close(state: State<'_, Arc<TabRegistry>>, tab_id: TabId) -> Result<(), String> {
     let registry = (*state).clone();
     crate::run_blocking(move || registry.close(&tab_id).map_err(command_error)).await
 }

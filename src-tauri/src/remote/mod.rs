@@ -6,7 +6,7 @@ pub mod terminal;
 use auth::{DeviceStore, PendingPairing, TrustedDevice};
 use qrcode::{EcLevel, QrCode};
 use serde::Serialize;
-use server::{GatewayHandle, RemoteGateway, TlsIdentity};
+use server::{GatewayHandle, RemoteGateway, RemoteServices, TlsIdentity};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -185,9 +185,7 @@ pub fn shareable_addresses(found: Vec<IpAddr>) -> Vec<String> {
         let usable = match address {
             IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
             IpAddr::V6(v6) => {
-                !v6.is_loopback()
-                    && !v6.is_unspecified()
-                    && (v6.segments()[0] & 0xffc0) != 0xfe80
+                !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
             }
         };
         if !usable {
@@ -252,6 +250,7 @@ struct Inner {
     gateway: Option<GatewayHandle>,
     bound: Option<SocketAddr>,
     fingerprint: Option<String>,
+    starting: bool,
 }
 
 #[derive(Default)]
@@ -264,8 +263,8 @@ impl Inner {
         if let Some(devices) = &self.devices {
             return Ok(devices.clone());
         }
-        let store = DeviceStore::open(state_root()?.join("devices"))
-            .map_err(|error| error.to_string())?;
+        let store =
+            DeviceStore::open(state_root()?.join("devices")).map_err(|error| error.to_string())?;
         let store = Arc::new(store);
         self.devices = Some(store.clone());
         Ok(store)
@@ -282,18 +281,23 @@ impl Inner {
 }
 
 #[tauri::command]
-pub async fn remote_status(state: tauri::State<'_, RemoteState>) -> Result<RemoteStatusView, String> {
+pub async fn remote_status(
+    state: tauri::State<'_, RemoteState>,
+) -> Result<RemoteStatusView, String> {
     Ok(state.inner.lock().await.status())
 }
 
 #[tauri::command]
-pub async fn remote_interfaces(_state: tauri::State<'_, RemoteState>) -> Result<Vec<String>, String> {
+pub async fn remote_interfaces(
+    _state: tauri::State<'_, RemoteState>,
+) -> Result<Vec<String>, String> {
     Ok(shareable_addresses(local_addresses()))
 }
 
 #[tauri::command]
 pub async fn remote_start(
     state: tauri::State<'_, RemoteState>,
+    tabs: tauri::State<'_, Arc<crate::tabs::TabRegistry>>,
     address: String,
     port: u16,
 ) -> Result<RemoteStatusView, String> {
@@ -303,16 +307,42 @@ pub async fn remote_start(
     if shareable_addresses(vec![ip]).is_empty() {
         return Err("remote access will not bind loopback or a link-local address".into());
     }
+    let devices = {
+        let mut inner = state.inner.lock().await;
+        if inner.gateway.is_some() {
+            return Ok(inner.status());
+        }
+        if inner.starting {
+            return Err("remote access is already starting".to_string());
+        }
+        inner.starting = true;
+        match inner.devices() {
+            Ok(devices) => devices,
+            Err(error) => {
+                inner.starting = false;
+                return Err(error);
+            }
+        }
+    };
+    let identity = match state_root().and_then(|root| {
+        TlsIdentity::load_or_create(root.join("tls"), &[ip]).map_err(|e| e.to_string())
+    }) {
+        Ok(identity) => identity,
+        Err(error) => {
+            state.inner.lock().await.starting = false;
+            return Err(error);
+        }
+    };
+    let started = RemoteGateway::start(
+        SocketAddr::new(ip, port),
+        devices,
+        identity,
+        RemoteServices::new(tabs.inner().clone()),
+    )
+    .await;
     let mut inner = state.inner.lock().await;
-    if inner.gateway.is_some() {
-        return Ok(inner.status());
-    }
-    let devices = inner.devices()?;
-    let identity = TlsIdentity::load_or_create(state_root()?.join("tls"), &[ip])
-        .map_err(|error| error.to_string())?;
-    let gateway = RemoteGateway::start(SocketAddr::new(ip, port), devices, identity)
-        .await
-        .map_err(|error| error.to_string())?;
+    inner.starting = false;
+    let gateway = started.map_err(|error| error.to_string())?;
     inner.bound = Some(gateway.local_addr());
     inner.fingerprint = Some(gateway.spki_fingerprint().to_string());
     inner.gateway = Some(gateway);
@@ -321,15 +351,21 @@ pub async fn remote_start(
 
 #[tauri::command]
 pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteStatusView, String> {
-    let mut inner = state.inner.lock().await;
+    let gateway = {
+        let mut inner = state.inner.lock().await;
+        if inner.starting {
+            return Err("remote access is still starting".to_string());
+        }
+        inner.bound = None;
+        inner.fingerprint = None;
+        inner.gateway.take()
+    };
     // Closing the listener is not a statement about any phone: trusted
     // devices stay trusted, and revocation stays an explicit act.
-    if let Some(gateway) = inner.gateway.take() {
+    if let Some(gateway) = gateway {
         gateway.stop().await.map_err(|error| error.to_string())?;
     }
-    inner.bound = None;
-    inner.fingerprint = None;
-    Ok(inner.status())
+    Ok(state.inner.lock().await.status())
 }
 
 #[tauri::command]
@@ -415,5 +451,7 @@ pub async fn remote_revoke_device(
     device_id: String,
 ) -> Result<bool, String> {
     let devices = state.inner.lock().await.devices()?;
-    devices.revoke(&device_id).map_err(|error| error.to_string())
+    devices
+        .revoke(&device_id)
+        .map_err(|error| error.to_string())
 }
