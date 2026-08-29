@@ -49,6 +49,10 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -319,60 +323,9 @@ pub fn has_session(session_id: &str) -> bool {
     query(&sql).is_some_and(|json| !json.trim().is_empty())
 }
 
-/// How long the dump-and-delete steps may take. Longer than [`QUERY_TIMEOUT`]
-/// because a big session's parts are megabytes crossing the pipe, and giving
-/// up halfway through a delete someone asked for is worse than a slow sidebar.
-const DELETE_TIMEOUT: Duration = Duration::from_secs(20);
-
 /// The first line of a trash dump: enough to list the entry by name, and to
 /// recognize the file for what it is.
 const DUMP_KIND: &str = "opencode-session-dump";
-
-/// One read that may take its time, answered as rows or a reason.
-///
-/// [`query`]'s `None`-means-"nothing to show" is right for listing; a delete's
-/// dump step owes an error instead, because proceeding without the dump would
-/// break the promise the trash makes.
-fn rows(sql: &str) -> Result<Vec<serde_json::Value>, String> {
-    let bin = crate::agents::which("sqlite3").ok_or("sqlite3 is not installed")?;
-    let db = db_path().ok_or("OpenCode's database is not on this machine")?;
-    let out = crate::agents::run_bounded(
-        &bin.to_string_lossy(),
-        &["-json", "-readonly", &db.to_string_lossy(), sql],
-        DELETE_TIMEOUT,
-    )
-    .ok_or("could not read OpenCode's database")?;
-    let text = String::from_utf8_lossy(&out);
-    if text.trim().is_empty() {
-        return Ok(vec![]);
-    }
-    serde_json::from_str(text.trim()).map_err(|e| format!("unreadable rows: {e}"))
-}
-
-/// Run one *write* against the database, and say why it failed.
-///
-/// Not [`crate::agents::run_bounded`], which folds every failure into `None` —
-/// the right shape for reads, where they all mean "no sessions". A destructive
-/// step owes a reason: a database locked by a running OpenCode and a missing
-/// `sqlite3` call for different next moves.
-fn execute(sql: &str) -> Result<(), String> {
-    let bin = crate::agents::which("sqlite3").ok_or("sqlite3 is not installed")?;
-    let db = db_path().ok_or("OpenCode's database is not on this machine")?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let program = bin.to_string_lossy().into_owned();
-    let args = [db.to_string_lossy().into_owned(), sql.to_string()];
-    std::thread::spawn(move || {
-        let _ = tx.send(std::process::Command::new(&program).args(&args).output());
-    });
-    match rx.recv_timeout(DELETE_TIMEOUT) {
-        Ok(Ok(out)) if out.status.success() => Ok(()),
-        Ok(Ok(out)) => {
-            Err(format!("sqlite3: {}", String::from_utf8_lossy(&out.stderr).trim()))
-        }
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("timed out — is the database locked by a running OpenCode?".into()),
-    }
-}
 
 /// The id set a delete covers: the session and every descendant, spelled as a
 /// subquery. OpenCode mints a child session per subagent run (`parent_id`),
@@ -854,6 +807,201 @@ mod tests {
         .unwrap();
         assert_eq!(dump_meta(&p), Some(("hi".into(), "/home/x/p".into())));
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_database(path: &std::path::Path, session_id: &str, title: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "create table session (id text primary key, title text, directory text, time_updated integer, parent_id text, time_archived integer);\
+                 create table message (id text primary key, session_id text, data text, time_created integer);\
+                 create table part (id text primary key, message_id text, session_id text, data text, time_created integer);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "insert into session values (?1, ?2, '/fixture/project', 1, null, null)",
+                rusqlite::params![session_id, title],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "insert into message values ('msg_1', ?1, '{\"role\":\"user\"}', 1)",
+                [session_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "insert into part values ('part_1', 'msg_1', ?1, '{\"type\":\"text\",\"text\":\"hello\"}', 1)",
+                [session_id],
+            )
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_has_session(path: &std::path::Path, session_id: &str) -> bool {
+        rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap()
+        .query_row(
+            "select exists(select 1 from session where id = ?1)",
+            [session_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_directory(path: &std::path::Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_delete_uses_the_pinned_database_when_its_root_is_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-opencode-root-replacement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = root.join("store");
+        let database = store.join("opencode.db");
+        let trash_path = root.join("trash");
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let session_id = "ses_rootreplace";
+        fixture_database(&database, session_id, "Pinned database");
+        let trash = fixture_directory(&trash_path);
+        let pinned_store = root.join("pinned-store");
+        let outside_store = root.join("outside-store");
+
+        delete_to_trash_from_path_with_hooks(
+            session_id,
+            &database,
+            &trash,
+            || {
+                std::fs::rename(&store, &pinned_store).unwrap();
+                fixture_database(
+                    &outside_store.join("opencode.db"),
+                    session_id,
+                    "Outside sentinel",
+                );
+                symlink(&outside_store, &store).unwrap();
+            },
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(!fixture_has_session(
+            &pinned_store.join("opencode.db"),
+            session_id
+        ));
+        assert!(fixture_has_session(
+            &outside_store.join("opencode.db"),
+            session_id
+        ));
+        assert_eq!(
+            dump_meta(&trash_path.join(format!("{session_id}.jsonl")))
+                .unwrap()
+                .0,
+            "Pinned database"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_delete_rejects_a_replaced_database_leaf() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-opencode-leaf-replacement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = root.join("store");
+        let database = store.join("opencode.db");
+        let original = store.join("original.db");
+        let trash_path = root.join("trash");
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let session_id = "ses_leafreplace";
+        fixture_database(&database, session_id, "Pinned database");
+        let trash = fixture_directory(&trash_path);
+
+        let error = delete_to_trash_from_path_with_hooks(
+            session_id,
+            &database,
+            &trash,
+            || {
+                std::fs::rename(&database, &original).unwrap();
+                fixture_database(&database, session_id, "Replacement sentinel");
+            },
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("database identity changed"));
+        assert!(fixture_has_session(&original, session_id));
+        assert!(fixture_has_session(&database, session_id));
+        assert!(!trash_path.join(format!("{session_id}.jsonl")).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_delete_rolls_back_rows_and_dump_on_dump_or_sql_failure() {
+        for stage in ["dump", "sql"] {
+            let root = std::env::temp_dir().join(format!(
+                "aiterm-opencode-{stage}-failure-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let database = root.join("store/opencode.db");
+            let trash_path = root.join("trash");
+            std::fs::create_dir_all(&trash_path).unwrap();
+            let session_id = if stage == "dump" {
+                "ses_dumpfail"
+            } else {
+                "ses_sqlfail"
+            };
+            fixture_database(&database, session_id, "Must survive");
+            let trash = fixture_directory(&trash_path);
+
+            let result = delete_to_trash_from_path_with_hooks(
+                session_id,
+                &database,
+                &trash,
+                || {},
+                || {
+                    if stage == "dump" {
+                        Err("injected dump failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    if stage == "sql" {
+                        Err("injected SQL failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            assert!(result.is_err());
+            assert!(fixture_has_session(&database, session_id));
+            assert!(!trash_path.join(format!("{session_id}.jsonl")).exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     /// The whole delete, end to end, against a *copy* of this machine's real
