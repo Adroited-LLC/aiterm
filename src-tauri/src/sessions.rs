@@ -2736,11 +2736,31 @@ fn parse_sidecar_archive(
 }
 
 #[cfg(target_os = "linux")]
-fn create_directory_exclusive(parent: &File, name: &OsStr) -> Result<File, String> {
+fn create_directory_exclusive_with_hook(
+    parent: &File,
+    name: &OsStr,
+    after_mkdir: impl FnOnce(),
+) -> Result<File, String> {
+    use std::os::unix::fs::MetadataExt;
+
     let name = CString::new(name.as_bytes()).map_err(|_| "invalid restored directory name")?;
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
+    let mut created_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            created_stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let created_stat = unsafe { created_stat.assume_init() };
+    after_mkdir();
     let descriptor = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -2751,8 +2771,21 @@ fn create_directory_exclusive(parent: &File, name: &OsStr) -> Result<File, Strin
     if descriptor < 0 {
         Err(std::io::Error::last_os_error().to_string())
     } else {
-        Ok(unsafe { File::from_raw_fd(descriptor) })
+        let directory = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = directory.metadata().map_err(|error| error.to_string())?;
+        if metadata.dev() != created_stat.st_dev as u64
+            || metadata.ino() != created_stat.st_ino as u64
+            || !directory_entry_is_exact_object(parent, &name, &directory)?
+        {
+            return Err("restored directory changed while it was opened".into());
+        }
+        Ok(directory)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn create_directory_exclusive(parent: &File, name: &OsStr) -> Result<File, String> {
+    create_directory_exclusive_with_hook(parent, name, || {})
 }
 
 #[cfg(target_os = "linux")]
@@ -2780,8 +2813,173 @@ fn open_restored_parent(root: &File, path: &[u8]) -> Result<(File, std::ffi::OsS
 }
 
 #[cfg(target_os = "linux")]
-fn restore_sidecar_archive(
-    archive_path: &Path,
+struct StrictArchiveEntry {
+    parent: VerifiedDirectory,
+    name: CString,
+    display_path: std::path::PathBuf,
+    archive: HeldWriteLease,
+    hash: [u8; 32],
+    size: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl StrictArchiveEntry {
+    fn open(path: &Path) -> Result<Self, String> {
+        let parent_path = path.parent().ok_or("strict archive has no parent")?;
+        let file_name = path.file_name().ok_or("strict archive has no name")?;
+        let name = CString::new(file_name.as_bytes()).map_err(|_| "invalid strict archive name")?;
+        let parent = VerifiedDirectory::open(parent_path)?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() || !directory_entry_is_exact_object(&parent.file, &name, &file)? {
+            return Err("strict archive changed while it was opened".into());
+        }
+        let archive = HeldWriteLease::existing(file)?;
+        let archive_bound = u64::try_from(ArchiveLimits::default().entries)
+            .ok()
+            .and_then(|entries| entries.checked_mul(8192))
+            .and_then(|overhead| ArchiveLimits::default().bytes.checked_add(overhead))
+            .ok_or("archive bound overflow")?;
+        let (hash, size) = hash_exact_file_bounded(&archive.file, archive_bound)?;
+        Ok(Self {
+            parent,
+            name,
+            display_path: path.to_path_buf(),
+            archive,
+            hash,
+            size,
+        })
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        self.archive.verify("restore archive")?;
+        let (hash, size) = hash_exact_file_bounded(
+            &self.archive.file,
+            self.size.checked_add(1).ok_or("archive bound overflow")?,
+        )?;
+        if hash != self.hash || size != self.size {
+            return Err("held restore archive changed during restore".into());
+        }
+        Ok(())
+    }
+
+    fn publish_recovery_link(&self) -> Result<std::path::PathBuf, String> {
+        let recovery_name = format!(".aiterm-restore-recovery-{}", uuid::Uuid::new_v4());
+        let recovery = CString::new(recovery_name.as_bytes()).unwrap();
+        if unsafe {
+            libc::linkat(
+                self.archive.file.as_raw_fd(),
+                c"".as_ptr(),
+                self.parent.file.as_raw_fd(),
+                recovery.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "could not preserve held restore archive: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.parent
+            .file
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        Ok(self
+            .display_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(recovery_name))
+    }
+
+    fn remove_exact(&self) -> Result<(), String> {
+        self.verify()?;
+        if !directory_entry_is_exact_object(&self.parent.file, &self.name, &self.archive.file)? {
+            let recovery = self.publish_recovery_link()?;
+            return Err(format!(
+                "archive name changed before removal; exact archive is recoverable at {}",
+                recovery.display()
+            ));
+        }
+        let quarantine_name = format!(".aiterm-restore-remove-{}", uuid::Uuid::new_v4());
+        let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
+        let quarantine_path = self
+            .display_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&quarantine_name);
+        rename_noreplace(
+            self.parent.file.as_raw_fd(),
+            &self.name,
+            self.parent.file.as_raw_fd(),
+            &quarantine,
+        )?;
+        if !directory_entry_is_exact_object(
+            &self.parent.file,
+            &quarantine,
+            &self.archive.file,
+        )? {
+            let recovery = self.publish_recovery_link()?;
+            return Err(format!(
+                "archive name changed during removal; exact archive is recoverable at {} and the moved entry at {}",
+                recovery.display(),
+                quarantine_path.display()
+            ));
+        }
+        self.verify()?;
+        self.archive.verify("restore archive")?;
+        self.archive
+            .file
+            .set_len(0)
+            .map_err(|error| error.to_string())?;
+        self.archive
+            .file
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        if !directory_entry_is_exact_object(
+            &self.parent.file,
+            &quarantine,
+            &self.archive.file,
+        )? {
+            return Err(format!(
+                "archive quarantine changed after permanent purge; unexpected entry remains at {}",
+                quarantine_path.display()
+            ));
+        }
+        if unsafe {
+            libc::unlinkat(
+                self.parent.file.as_raw_fd(),
+                quarantine.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "purged restore archive remains at {}: {}",
+                quarantine_path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.parent
+            .file
+            .sync_all()
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_sidecar_archive_from_file(
+    archive: &File,
     destination_root: &Path,
     root_name: &OsStr,
 ) -> Result<(), String> {
@@ -2795,11 +2993,6 @@ fn restore_sidecar_archive(
     {
         return Err("invalid restored sidecar root name".into());
     }
-    let archive = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(archive_path)
-        .map_err(|error| error.to_string())?;
     let records = parse_sidecar_archive(&archive, ArchiveLimits::default())?;
     let destination = VerifiedDirectory::open(destination_root)?;
     let restored_root = create_directory_exclusive(&destination.file, root_name)?;
@@ -2878,6 +3071,30 @@ fn restore_sidecar_archive(
         .file
         .sync_all()
         .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn restore_sidecar_archive(
+    archive_path: &Path,
+    destination_root: &Path,
+    root_name: &OsStr,
+) -> Result<(), String> {
+    let archive = StrictArchiveEntry::open(archive_path)?;
+    restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_sidecar_archive_and_remove_with_hook(
+    archive_path: &Path,
+    destination_root: &Path,
+    root_name: &OsStr,
+    before_remove: impl FnOnce(),
+) -> Result<(), String> {
+    let archive = StrictArchiveEntry::open(archive_path)?;
+    restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)?;
+    archive.verify()?;
+    before_remove();
+    archive.remove_exact()
 }
 
 #[cfg(target_os = "linux")]
@@ -6079,6 +6296,17 @@ mod tests {
         std::fs::create_dir_all(&restored_root).unwrap();
         std::fs::write(source.join("state.json"), b"state").unwrap();
         std::fs::write(source.join("nested/output.txt"), b"output").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            source.join("state.json"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let held_mtime = UNIX_EPOCH + std::time::Duration::from_secs(1_234_567);
+        File::open(source.join("state.json"))
+            .unwrap()
+            .set_modified(held_mtime)
+            .unwrap();
         let verified = verified_directory_entry(&sidecars, &source).unwrap();
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
 
@@ -6095,6 +6323,15 @@ mod tests {
         assert!(std::fs::read(&archive)
             .unwrap()
             .starts_with(SIDECAR_ARCHIVE_MAGIC));
+        let archive_file = File::open(&archive).unwrap();
+        let records = parse_sidecar_archive(&archive_file, ArchiveLimits::default()).unwrap();
+        let state_record = records
+            .iter()
+            .find(|record| record.path == b"state.json")
+            .unwrap();
+        assert_eq!(state_record.mode & 0o777, 0o640);
+        assert_eq!(state_record.mtime_sec, 1_234_567);
+        drop(archive_file);
 
         restore_sidecar_archive(&archive, &restored_root, OsStr::new("session-sidecar")).unwrap();
         let restored = restored_root.join("session-sidecar");
@@ -6102,6 +6339,9 @@ mod tests {
             std::fs::read(restored.join("state.json")).unwrap(),
             b"state"
         );
+        let restored_metadata = restored.join("state.json").metadata().unwrap();
+        assert_eq!(restored_metadata.permissions().mode() & 0o777, 0o640);
+        assert_eq!(restored_metadata.modified().unwrap(), held_mtime);
         assert_eq!(
             std::fs::read(restored.join("nested/output.txt")).unwrap(),
             b"output"
