@@ -16,6 +16,8 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
+pub const MAX_TAB_ROSTER_ENTRIES: usize = 128;
+pub const MAX_TAB_DESCRIPTOR_TEXT_BYTES: usize = 32 * 1024;
 /// Tauri raw frames must stay comfortably below the remote protocol's 1 MiB
 /// ceiling too. PTY reads are normally 8 KiB; this also bounds adversarial or
 /// test sinks that deliver a much larger slice in one callback.
@@ -362,6 +364,54 @@ impl TabDescriptor {
     pub fn exit(&self) -> Option<&TabExit> {
         self.exit.as_ref()
     }
+
+    fn text_bytes(&self) -> usize {
+        descriptor_text_bytes([
+            Some(self.title.as_str()),
+            self.cwd.as_deref(),
+            self.command.as_deref(),
+            self.session_id.as_deref(),
+            self.resumed_id.as_deref(),
+            self.agent_id.as_deref(),
+            Some(self.slot_id.as_str()),
+            self.env_provider.as_deref(),
+            self.env_model.as_deref(),
+            self.exit.as_ref().and_then(|exit| exit.signal.as_deref()),
+        ])
+    }
+}
+
+fn descriptor_text_bytes<const N: usize>(values: [Option<&str>; N]) -> usize {
+    values
+        .into_iter()
+        .flatten()
+        .try_fold(0usize, |total, value| total.checked_add(value.len()))
+        .unwrap_or(usize::MAX)
+}
+
+fn launch_text_bytes(launch: &TabLaunch) -> usize {
+    descriptor_text_bytes([
+        Some(launch.title.as_str()),
+        launch.cwd.as_deref(),
+        launch.command.as_deref(),
+        launch.session_id.as_deref(),
+        launch.resumed_id.as_deref(),
+        launch.agent_id.as_deref(),
+        Some(launch.slot_id.as_str()),
+        launch.env_provider.as_deref(),
+        launch.env_model.as_deref(),
+    ])
+}
+
+fn truncate_utf8(value: &str, bytes: usize) -> String {
+    if value.len() <= bytes {
+        return value.to_owned();
+    }
+    let mut end = bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1248,11 +1298,25 @@ impl TabRegistry {
     }
 
     pub fn open(&self, launch: TabLaunch) -> Result<TabId, TabError> {
+        if launch_text_bytes(&launch) > MAX_TAB_DESCRIPTOR_TEXT_BYTES {
+            return Err(TabError::new(
+                "tab.metadata_too_large",
+                "tab metadata exceeds the recoverable roster bound",
+            ));
+        }
         let id = TabId::new();
         let slot_id = launch.slot_id.clone();
         let desktop_open = launch.desktop_pending;
         {
             let mut maps = self.inner.maps.lock().unwrap();
+            if maps.by_id.len().saturating_add(maps.pending_slots.len())
+                >= MAX_TAB_ROSTER_ENTRIES
+            {
+                return Err(TabError::new(
+                    "tab.too_many_tabs",
+                    "the recoverable tab roster limit was reached",
+                ));
+            }
             if maps.by_slot.contains_key(&slot_id) || maps.pending_slots.contains_key(&slot_id) {
                 return Err(TabError::new(
                     "tab.slot_in_use",
@@ -1407,12 +1471,38 @@ impl TabRegistry {
             if live.descriptor.state != TabState::Running {
                 return Err(TabError::new("tab.closed", "the tab has exited"));
             }
+            let mut candidate = live.descriptor.clone();
+            if let Some(title) = update.title {
+                candidate.title = title;
+            }
+            if let Some(session_id) = update.session_id {
+                candidate.session_id = Some(session_id);
+            }
+            if let Some(resumed_id) = update.resumed_id {
+                candidate.resumed_id = Some(resumed_id);
+            }
+            if let Some(agent_id) = update.agent_id {
+                candidate.agent_id = Some(agent_id);
+            }
             if let Some(slot) = update.slot_id {
+                candidate.slot_id = slot;
+            }
+            if let Some(fresh) = update.fresh {
+                candidate.fresh = fresh;
+            }
+            if candidate.text_bytes() > MAX_TAB_DESCRIPTOR_TEXT_BYTES {
+                return Err(TabError::new(
+                    "tab.metadata_too_large",
+                    "tab metadata exceeds the recoverable roster bound",
+                ));
+            }
+            if candidate.slot_id != live.descriptor.slot_id {
+                let slot = &candidate.slot_id;
                 let mut maps = self.inner.maps.lock().unwrap();
-                if maps.by_slot.get(&slot).is_some_and(|owner| owner != id)
+                if maps.by_slot.get(slot).is_some_and(|owner| owner != id)
                     || maps
                         .pending_slots
-                        .get(&slot)
+                        .get(slot)
                         .is_some_and(|owner| owner != id)
                 {
                     return Err(TabError::new(
@@ -1422,23 +1512,8 @@ impl TabRegistry {
                 }
                 maps.by_slot.remove(&live.descriptor.slot_id);
                 maps.by_slot.insert(slot.clone(), id.clone());
-                live.descriptor.slot_id = slot;
             }
-            if let Some(title) = update.title {
-                live.descriptor.title = title;
-            }
-            if let Some(session_id) = update.session_id {
-                live.descriptor.session_id = Some(session_id);
-            }
-            if let Some(resumed_id) = update.resumed_id {
-                live.descriptor.resumed_id = Some(resumed_id);
-            }
-            if let Some(agent_id) = update.agent_id {
-                live.descriptor.agent_id = Some(agent_id);
-            }
-            if let Some(fresh) = update.fresh {
-                live.descriptor.fresh = fresh;
-            }
+            live.descriptor = candidate;
             let descriptor = live.descriptor.clone();
             live.enqueue_control_all(TabEvent::Metadata(descriptor.clone()));
             self.inner
@@ -2665,6 +2740,11 @@ impl PtySink for TabSink {
                     live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
                 }
                 let changed = if let Some(title) = damage.title {
+                    let other = live.descriptor.text_bytes().saturating_sub(live.descriptor.title.len());
+                    let title = truncate_utf8(
+                        &title,
+                        MAX_TAB_DESCRIPTOR_TEXT_BYTES.saturating_sub(other),
+                    );
                     live.descriptor.title = title.clone();
                     live.enqueue_control_all(TabEvent::Title(title));
                     Some(live.descriptor.clone())

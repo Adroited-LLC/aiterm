@@ -861,7 +861,10 @@ struct AgentStartedPayload<'a> {
 
 #[derive(Serialize)]
 struct StateSnapshotPayload {
+    transfer_id: String,
     revision: u64,
+    index: u32,
+    total: u32,
     tabs: Vec<RemoteTabDescriptor>,
 }
 
@@ -874,7 +877,7 @@ struct TabChangedPayload {
     requested: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteTabDescriptor {
     id: TabId,
@@ -1077,22 +1080,99 @@ fn project_remote_descriptor(descriptor: TabDescriptor, owns_input: bool) -> Rem
     }
 }
 
-fn registry_event_response(
+const MAX_REGISTRY_EVENT_BURST: usize = 8;
+const MAX_ROSTER_TRANSFER_BYTES: usize =
+    crate::tabs::MAX_TAB_ROSTER_ENTRIES * crate::tabs::MAX_TAB_DESCRIPTOR_TEXT_BYTES
+        + super::terminal::MAX_WIRE_FRAME_BYTES;
+
+fn state_snapshot_responses(
+    revision: u64,
+    tabs: Vec<TabDescriptor>,
+    attachments: &HashMap<AttachmentId, ConnectionAttachment>,
+) -> Result<Vec<RemoteEvent>, &'static str> {
+    if tabs.len() > crate::tabs::MAX_TAB_ROSTER_ENTRIES {
+        return Err("protocol.response_too_large");
+    }
+    let tabs = tabs
+        .into_iter()
+        .map(|tab| live_remote_descriptor(tab, attachments))
+        .collect::<Vec<_>>();
+    let mut resident_bytes = 0usize;
+    for tab in &tabs {
+        resident_bytes = resident_bytes
+            .checked_add(payload(tab)?.len())
+            .ok_or("protocol.response_too_large")?;
+        if resident_bytes > MAX_ROSTER_TRANSFER_BYTES {
+            return Err("protocol.response_too_large");
+        }
+    }
+
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let mut groups = Vec::<Vec<RemoteTabDescriptor>>::new();
+    let mut current = Vec::new();
+    for tab in tabs {
+        current.push(tab);
+        let probe = StateSnapshotPayload {
+            transfer_id: transfer_id.clone(),
+            revision,
+            index: u32::MAX,
+            total: u32::MAX,
+            tabs: current.clone(),
+        };
+        match response(0, "state.snapshot", &probe) {
+            Ok(_) => {}
+            Err("protocol.response_too_large") if current.len() > 1 => {
+                let last = current.pop().expect("the candidate contains a final tab");
+                groups.push(std::mem::take(&mut current));
+                current.push(last);
+                let single = StateSnapshotPayload {
+                    transfer_id: transfer_id.clone(),
+                    revision,
+                    index: u32::MAX,
+                    total: u32::MAX,
+                    tabs: current.clone(),
+                };
+                response(0, "state.snapshot", &single)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !current.is_empty() || groups.is_empty() {
+        groups.push(current);
+    }
+    let total: u32 = groups
+        .len()
+        .try_into()
+        .map_err(|_| "protocol.response_too_large")?;
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, tabs)| {
+            response(
+                0,
+                "state.snapshot",
+                &StateSnapshotPayload {
+                    transfer_id: transfer_id.clone(),
+                    revision,
+                    index: index
+                        .try_into()
+                        .map_err(|_| "protocol.response_too_large")?,
+                    total,
+                    tabs,
+                },
+            )
+        })
+        .collect()
+}
+
+fn registry_event_responses(
     event: TabRegistryEvent,
     attachments: &HashMap<AttachmentId, ConnectionAttachment>,
-) -> Result<RemoteEvent, &'static str> {
+) -> Result<Vec<RemoteEvent>, &'static str> {
     match event {
-        TabRegistryEvent::Snapshot { revision, tabs } => response(
-            0,
-            "state.snapshot",
-            &StateSnapshotPayload {
-                revision,
-                tabs: tabs
-                    .into_iter()
-                    .map(|tab| live_remote_descriptor(tab, attachments))
-                    .collect(),
-            },
-        ),
+        TabRegistryEvent::Snapshot { revision, tabs } => {
+            state_snapshot_responses(revision, tabs, attachments)
+        }
         TabRegistryEvent::Opened { revision, tab } => {
             let tab_id = tab.id().clone();
             response(
@@ -1105,7 +1185,7 @@ fn registry_event_response(
                     tab: Some(live_remote_descriptor(tab, attachments)),
                     requested: None,
                 },
-            )
+            ).map(|event| vec![event])
         }
         TabRegistryEvent::Changed { revision, tab } => {
             let tab_id = tab.id().clone();
@@ -1119,7 +1199,7 @@ fn registry_event_response(
                     tab: Some(live_remote_descriptor(tab, attachments)),
                     requested: None,
                 },
-            )
+            ).map(|event| vec![event])
         }
         TabRegistryEvent::Removed {
             revision,
@@ -1135,7 +1215,7 @@ fn registry_event_response(
                 tab: None,
                 requested: Some(requested),
             },
-        ),
+        ).map(|event| vec![event]),
     }
 }
 
@@ -2805,6 +2885,7 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
         tokio::sync::mpsc::channel(MAX_ATTACHMENTS_PER_CONNECTION);
     let mut reap_tick = tokio::time::interval(ATTACHMENT_REAP_INTERVAL);
     reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut registry_event_burst = 0usize;
     'socket: loop {
         reap_finished_attachments(&mut attachments, &mut closed_attachments).await;
         let message = tokio::select! {
@@ -2821,19 +2902,25 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                 }
                 continue;
             }
-            registry_event = registry_events.recv_async() => {
+            registry_event = registry_events.recv_async(), if registry_event_burst < MAX_REGISTRY_EVENT_BURST => {
                 let Some(registry_event) = registry_event else { break; };
-                let Ok(event) = registry_event_response(registry_event, &attachments) else {
+                let Ok(events) = registry_event_responses(registry_event, &attachments) else {
                     let _ = cancelled.send(true);
                     let _ = outbound.controls.try_send(EgressControl::Close);
                     break;
                 };
-                if enqueue_event(&outbound, event).await.is_err() {
-                    break;
+                registry_event_burst = registry_event_burst.saturating_add(events.len());
+                for event in events {
+                    if enqueue_event(&outbound, event).await.is_err() {
+                        break 'socket;
+                    }
                 }
                 continue;
             }
-            message = inbound_messages.recv() => message,
+            message = inbound_messages.recv() => {
+                registry_event_burst = 0;
+                message
+            },
             changed = cancellation.changed() => {
                 if changed.is_err() || *cancellation.borrow() { break; }
                 continue;
