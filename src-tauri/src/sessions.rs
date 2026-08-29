@@ -5890,6 +5890,176 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn source_name_replacement_immediately_before_quarantine_is_never_retired() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-source-name-final-check-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "24242424-2424-4424-8424-242424242424";
+        let source = project.join(format!("{id}.jsonl"));
+        let displaced = project.join("displaced-original");
+        std::fs::write(&source, b"archived original").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_transaction_hooks(
+            &trash,
+            vec![(verified, format!("{id}.jsonl").into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+            |_| {
+                std::fs::rename(&source, &displaced).unwrap();
+                std::fs::write(&source, b"unarchived replacement").unwrap();
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("source name changed"), "{error}");
+        assert_eq!(std::fs::read(&source).unwrap(), b"unarchived replacement");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"archived original");
+        assert!(!std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn destination_replacement_after_quarantine_prevents_source_truncation() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-destination-final-check-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "25252525-2525-4525-8525-252525252525";
+        let source = project.join(format!("{id}.jsonl"));
+        let destination = trash_path.join(format!("{id}.jsonl"));
+        let displaced = trash_path.join("held-archive");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_transaction_hooks(
+            &trash,
+            vec![(verified, format!("{id}.jsonl").into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+            |_| Ok(()),
+            |_| {
+                std::fs::rename(&destination, &displaced).unwrap();
+                std::fs::write(&destination, b"replacement").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("destination changed"), "{error}");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"source bytes");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        let quarantined = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-"))
+            .expect("the exact original remains recoverable after quarantine")
+            .path();
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"source bytes");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lost_source_write_lease_prevents_retirement() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-source-lease-final-check-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "26262626-2626-4626-8626-262626262626";
+        let source = project.join(format!("{id}.jsonl"));
+        std::fs::write(&source, b"lease bytes").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_transaction_hooks(
+            &trash,
+            vec![(verified, format!("{id}.jsonl").into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+            |_| Ok(()),
+            |prepared| {
+                let descriptor = prepared[0].retirements[0].source.as_raw_fd();
+                assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_SETLEASE, libc::F_UNLCK) }, 0);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("source lease"), "{error}");
+        let quarantined = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-"))
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(quarantined).unwrap(), b"lease bytes");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_entry_added_after_enumeration_prevents_quarantine() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-directory-final-check-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sidecars = root.join("sidecars");
+        let source = sidecars.join("session");
+        let trash_path = root.join("trash");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::write(source.join("archived"), b"yes").unwrap();
+        let verified = verified_directory_entry(&sidecars, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_transaction_hooks(
+            &trash,
+            vec![(verified, "session.tasks".into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+            |_| {
+                std::fs::write(source.join("late"), b"must survive").unwrap();
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("directory changed"), "{error}");
+        assert_eq!(std::fs::read(source.join("late")).unwrap(), b"must survive");
+        assert!(source.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn leased_archive_sets_keep_timestamp_on_its_held_fd_and_collision_is_non_destructive() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-leased-timestamp-{}",
