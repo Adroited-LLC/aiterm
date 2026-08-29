@@ -8,7 +8,7 @@ import {
 import RoutingActivity from "./RoutingActivity";
 import BrandIcon from "./BrandIcon";
 import Icon from "./Icon";
-import { Pin, Star, X } from "lucide-react";
+import { Pin, Plus, Star, X } from "lucide-react";
 import { brandForModel, brandForName, brandForUrl } from "../brand";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
@@ -231,6 +231,12 @@ export default function ModelAccess({ focusProvider }: Props) {
   // What actually ran. Its own section, next to the policy it reports against:
   // one says what will happen, the other what already did.
   const [actOpen, setActOpen] = useState(false);
+  /** Which face of the open provider is showing. Models is the catalogue;
+   *  Routing and Activity are OpenRouter's account-wide rules and record —
+   *  three things, three tabs, rather than three stacked boxes. */
+  const [mbTab, setMbTab] = useState<"models" | "routing" | "activity">("models");
+  /** The add-provider form, folded until asked for once one provider exists. */
+  const [addOpen, setAddOpen] = useState(false);
   /** The management key being typed in. `/activity` is the only endpoint that
    *  refuses an inference key, so this is the only place that asks for one. */
   const [mgmtKey, setMgmtKey] = useState("");
@@ -749,14 +755,65 @@ export default function ModelAccess({ focusProvider }: Props) {
     setError(null);
   };
 
+  /** One form for both add and edit: rendered under the row being edited,
+   *  or at the foot of the list for a new provider. */
+  const providerForm = (
+      <div className="prov-form">
+        <div className="set-label">{editing ? `Edit ${name}` : "Add a provider"}</div>
+        {!editing && (
+          <div className="set-hint">
+            Any OpenAI-compatible endpoint. The key is kept in
+            {" "}<code>~/.config/aiterm/providers.json</code> (0600) and never shown again.
+          </div>
+        )}
+        {!editing && (
+          <div className="prov-presets">
+            {PRESETS.map((s) => (
+              <button
+                key={s.name}
+                className="prov-preset"
+                onClick={() => { setName(s.name); setBaseUrl(s.base_url); }}
+              >
+                <BrandIcon name={brandForUrl(s.base_url) ?? brandForName(s.name)} size={13} className="inline" />
+                {s.name}
+              </button>
+            ))}
+          </div>
+        )}
+        <input
+          className="set-input" placeholder="Name"
+          value={name} onChange={(e) => setName(e.target.value)}
+        />
+        <input
+          className="set-input" placeholder="Base URL — https://openrouter.ai/api/v1"
+          value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
+        />
+        <input
+          className="set-input" type="password" autoComplete="off"
+          placeholder={editing ? "API key — leave blank to keep the saved one" : "API key"}
+          value={apiKey} onChange={(e) => setApiKey(e.target.value)}
+        />
+        {error && <div className="set-notice">{error}</div>}
+        <div className="prov-form-acts">
+          <button className="set-done" disabled={busy} onClick={submit}>
+            {busy ? "Saving…" : editing ? "Save changes" : "Add provider"}
+          </button>
+          <button className="act-btn" onClick={() => { reset(); setAddOpen(false); }}>Cancel</button>
+        </div>
+      </div>
+  );
+
   return (
     <div className="set-section">
-      {/* No heading of its own — the settings pane title already says where
-          we are. */}
-      <div className="set-hint">
-        Any OpenAI-compatible endpoint. Keys are stored in
-        {" "}<code>~/.config/aiterm/providers.json</code> with 0600 permissions, and are
-        never shown again after saving.
+      {/* Two things live here and the page says which is which: the
+          providers (accounts — a key and a URL), and for one of them at a
+          time, its catalogue. */}
+      <div className="ma-head">
+        <span className="set-label">Providers</span>
+        <span className="set-hint">
+          Where API models come from. <b>Test</b> proves a key works; <b>Browse</b> opens
+          the catalogue, where starring a model puts it in the ＋ menu.
+        </span>
       </div>
 
       {providers === null ? (
@@ -793,11 +850,15 @@ export default function ModelAccess({ focusProvider }: Props) {
               <div className="prov-acts">
                 <button
                   className={"act-btn" + (browsing === p.id ? " on" : "")}
-                  title="Browse its models"
+                  title="Open its catalogue"
                   onClick={() => browse(p)}
-                >Models</button>
+                >{browsing === p.id ? "Browsing" : "Browse models"}</button>
                 <button className="act-btn" title="Ask for its model list" onClick={() => test(p)}>Test</button>
-                <button className="act-btn" onClick={() => edit(p)}>Edit</button>
+                <button
+                  className={"act-btn" + (editing === p.id ? " on" : "")}
+                  title="Change its name, URL or key"
+                  onClick={() => (editing === p.id ? reset() : edit(p))}
+                >Edit</button>
                 {confirmDel === p.id ? (
                   <>
                     <button
@@ -810,9 +871,12 @@ export default function ModelAccess({ focusProvider }: Props) {
                     <button className="act-btn" onClick={() => setConfirmDel(null)}>Cancel</button>
                   </>
                 ) : (
-                  <button className="act-btn danger" onClick={() => setConfirmDel(p.id)}><Icon of={X} size="sm" /></button>
+                  <button className="act-btn danger" title="Remove this provider" onClick={() => setConfirmDel(p.id)}><Icon of={X} size="sm" /></button>
                 )}
               </div>
+              {/* Editing happens on the row being edited, not in a form off
+                  the bottom of the page. */}
+              {editing === p.id && providerForm}
             </div>
           ))}
           {providers.length === 0 && (
@@ -821,18 +885,38 @@ export default function ModelAccess({ focusProvider }: Props) {
         </div>
       )}
 
-      {browsing && (
+      {browsing && browsingProv && (
         <div className="mb">
-          {/* Account-wide, so it sits above the model list rather than in a
+          <div className="mb-head">
+            <BrandIcon name={brandForUrl(browsingProv.base_url) ?? brandForName(browsingProv.name)} size={15} className="inline" />
+            <span className="mb-head-name">{browsingProv.name}</span>
+            <div className="seg mb-tabs">
+              <button className={"seg-btn" + (mbTab === "models" ? " on" : "")} onClick={() => setMbTab("models")}>
+                Models{all ? ` · ${all.length}` : ""}
+              </button>
+              {isOpenRouter && (
+                <>
+                  <button
+                    className={"seg-btn" + (mbTab === "routing" ? " on" : "")}
+                    onClick={() => { setMbTab("routing"); if (!polOpen) openPolicy(); }}
+                  >Routing{pol && ignored > 0 ? ` · ${ignored} excluded` : ""}</button>
+                  <button
+                    className={"seg-btn" + (mbTab === "activity" ? " on" : "")}
+                    onClick={() => { setMbTab("activity"); setActOpen(true); }}
+                  >Activity</button>
+                </>
+              )}
+            </div>
+            <span className="mb-spacer" />
+            <button className="icon-btn" title="Close the catalogue" onClick={() => setBrowsing(null)}><Icon of={X} size="sm" /></button>
+          </div>
+          {/* Account-wide, so it is its own tab rather than part of a
               model's card: one rule, applied to every request this provider
               serves. */}
-          {isOpenRouter && pol && (
+          {isOpenRouter && pol && mbTab === "routing" && (
             <div className="pol">
               <div className="pol-head">
-                <button
-                  className={"act-btn" + (polOpen ? " on" : "")}
-                  onClick={openPolicy}
-                >{polOpen ? "Hide routing policy" : "Routing policy"}</button>
+                <span className="set-label">Routing policy</span>
                 {/* Shown open or closed: whether a rule is in force, and
                     whether it still describes the directory, is the answer
                     someone came here for. */}
@@ -955,13 +1039,10 @@ export default function ModelAccess({ focusProvider }: Props) {
           )}
           {/* The other half of the policy above: that one says what will
               happen, this one says what already did. */}
-          {isOpenRouter && browsingProv && (
+          {isOpenRouter && mbTab === "activity" && (
             <div className="acty">
               <div className="acty-head">
-                <button
-                  className={"act-btn" + (actOpen ? " on" : "")}
-                  onClick={() => setActOpen(!actOpen)}
-                >{actOpen ? "Hide activity" : "What actually ran"}</button>
+                <span className="set-label">What actually ran</span>
                 <div className="set-hint">
                   {browsingProv.has_management_key
                     ? `Management key ${browsingProv.management_key_hint
@@ -1008,12 +1089,29 @@ export default function ModelAccess({ focusProvider }: Props) {
               )}
             </div>
           )}
-          {starred.length === 0 && all && all.length > 0 && (
-            <div className="prov-todo mb-todo">
-              Nothing on the startup list yet. Select a model below and
-              {" "}<b>☆ Add to startup list</b> — that is what puts it in the ＋ menu.
-            </div>
-          )}
+          {mbTab === "models" && (<>
+          {/* What this provider offers in the ＋ menu — the selection, kept
+              apart from the catalogue it is chosen from. */}
+          <div className="mb-startup-strip">
+            <span className="mb-strip-label"><Icon of={Star} size="sm" fill="currentColor" /> In the ＋ menu</span>
+            {starred.length === 0 ? (
+              <span className="set-hint">
+                {all && all.length > 0
+                  ? "Nothing yet — pick a model below and add it to the startup list."
+                  : "Nothing yet."}
+              </span>
+            ) : (
+              starred.map((id) => (
+                <span key={id} className="mb-strip-chip" title={id}>
+                  <BrandIcon name={brandForModel(id)} size={12} className="inline" />
+                  {all?.find((m) => m.id === id)?.name ?? id}
+                  <button className="mb-strip-x" title="Remove from the ＋ menu" onClick={() => toggleStartup(id)}>
+                    <Icon of={X} size="sm" />
+                  </button>
+                </span>
+              ))
+            )}
+          </div>
           <div className="mb-controls">
             <input
               className="set-input mb-search"
@@ -1021,6 +1119,26 @@ export default function ModelAccess({ focusProvider }: Props) {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
+            <label className="mb-sort">
+              <span className="set-hint">Sort</span>
+              <select className="set-select mb-ctx" value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
+                {SORTS.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+              </select>
+            </label>
+            {/* The pin is the "default search": what is typed, filtered and
+                sorted now becomes what the browser opens with. Lit when the
+                current view is the saved one. */}
+            <button
+              className={"act-btn mb-pin" + (isDefault ? " on" : "")}
+              title={isDefault ? "This is the default view" : "Make this the default view"}
+              onClick={pinDefault}
+              disabled={isDefault}
+            ><Icon of={Pin} size="sm" fill={isDefault ? "currentColor" : "none"} /> {isDefault ? "Default" : "Set default"}</button>
+            {!isDefault && (
+              <button className="act-btn" title="Back to the default view" onClick={resetToDefault}>Reset</button>
+            )}
+          </div>
+          <div className="mb-controls mb-controls-2">
             <div className="seg">
               {(["all", "free", "paid", "starred"] as const).map((f) => (
                 <button
@@ -1042,8 +1160,6 @@ export default function ModelAccess({ focusProvider }: Props) {
               <option value={200000}>≥ 200K</option>
               <option value={1000000}>≥ 1M</option>
             </select>
-          </div>
-          <div className="mb-controls mb-controls-2">
             {vendors.length > 0 && (
               <select className="set-select mb-ctx" value={vendor} onChange={(e) => setVendor(e.target.value)} title="Vendor">
                 <option value="">Any vendor</option>
@@ -1055,25 +1171,6 @@ export default function ModelAccess({ focusProvider }: Props) {
               <option value="text">Text only</option>
               <option value="image">Takes images</option>
             </select>
-            <label className="mb-sort">
-              <span className="set-hint">Sort</span>
-              <select className="set-select mb-ctx" value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
-                {SORTS.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
-              </select>
-            </label>
-            <span className="mb-spacer" />
-            {/* The pin is the "default search": what is typed, filtered and
-                sorted now becomes what the browser opens with. Lit when the
-                current view is the saved one. */}
-            <button
-              className={"act-btn mb-pin" + (isDefault ? " on" : "")}
-              title={isDefault ? "This is the default view" : "Make this the default view"}
-              onClick={pinDefault}
-              disabled={isDefault}
-            ><Icon of={Pin} size="sm" fill={isDefault ? "currentColor" : "none"} /> {isDefault ? "Default view" : "Set as default"}</button>
-            {!isDefault && (
-              <button className="act-btn" title="Back to the default view" onClick={resetToDefault}>Reset</button>
-            )}
           </div>
           {sort === "used" && usedBy !== null && usedBy.size === 0 && (
             <div className="set-hint mb-wait">
@@ -1279,52 +1376,18 @@ export default function ModelAccess({ focusProvider }: Props) {
               </div>
             </>
           )}
+          </>)}
         </div>
       )}
 
-      <div className="prov-form">
-        <div className="set-label">{editing ? `Edit ${name}` : "Add a provider"}</div>
-        {!editing && (
-          <div className="prov-presets">
-            {PRESETS.map((s) => (
-              <button
-                key={s.name}
-                className="prov-preset"
-                onClick={() => { setName(s.name); setBaseUrl(s.base_url); }}
-              >
-                <BrandIcon name={brandForUrl(s.base_url) ?? brandForName(s.name)} size={13} className="inline" />
-                {s.name}
-              </button>
-            ))}
-          </div>
-        )}
-        <input
-          className="set-input" placeholder="Name"
-          value={name} onChange={(e) => setName(e.target.value)}
-        />
-        <input
-          className="set-input" placeholder="Base URL — https://openrouter.ai/api/v1"
-          value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
-        />
-        <input
-          className="set-input" type="password" autoComplete="off"
-          placeholder={editing ? "API key — leave blank to keep the saved one" : "API key"}
-          value={apiKey} onChange={(e) => setApiKey(e.target.value)}
-        />
-        {error && <div className="set-notice">{error}</div>}
-        <div className="prov-form-acts">
-          <button className="set-done" disabled={busy} onClick={submit}>
-            {busy ? "Saving…" : editing ? "Save changes" : "Add provider"}
+      {editing === null && (
+        providers && providers.length > 0 && !addOpen ? (
+          <button className="act-btn ma-add" onClick={() => setAddOpen(true)}>
+            <Icon of={Plus} size="sm" /> Add a provider
           </button>
-          {editing && <button className="act-btn" onClick={reset}>Cancel</button>}
-        </div>
-      </div>
+        ) : providerForm
+      )}
 
-      <div className="set-hint">
-        Models on a startup list appear in the new-session menu and open as a
-        chat console in a tab. Test proves the key and URL work before anything
-        depends on them.
-      </div>
     </div>
   );
 }
