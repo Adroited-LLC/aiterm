@@ -184,6 +184,19 @@ interface BroughtIn {
 }
 const BROUGHT_KEY = "aiterm.broughtIn";
 
+/** What a session had around it when it was last on screen — the files
+ *  open in its row, which one was up, and the second agents still open
+ *  under it. A session is a workspace: reopening it puts these back. Kept by
+ *  session id, so it survives the tab, the app, and the day. */
+interface Workspace {
+  files: string[];
+  activeFile: string | null;
+  /** Session ids of brought-in agents whose tabs were open. */
+  agents: string[];
+  at: number;
+}
+const WORKSPACES_KEY = "aiterm.workspaces";
+
 function loadJSON<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -279,6 +292,8 @@ export default function App() {
   const rootObj = tabs.find((t) => t.key === rootKey) ?? null;
   const [broughtIn, setBroughtIn] = useState<Record<string, BroughtIn[]>>(() => loadJSON(BROUGHT_KEY, {}));
   useEffect(() => localStorage.setItem(BROUGHT_KEY, JSON.stringify(broughtIn)), [broughtIn]);
+  const [workspaces, setWorkspaces] = useState<Record<string, Workspace>>(() => loadJSON(WORKSPACES_KEY, {}));
+  useEffect(() => localStorage.setItem(WORKSPACES_KEY, JSON.stringify(workspaces)), [workspaces]);
 
   // What each engine supports, fetched once on mount. `agent_caps` asks the
   // registry and nothing else — no PATH probe, no `--version` — because these
@@ -2072,6 +2087,64 @@ export default function App() {
       setNotice(`Couldn't reopen ${rec.title}: ${e}`);
     }
   }, [openTab]);
+
+  // The workspace snapshot: whenever what is open changes, write down, for
+  // every session tab on screen, its files, the one in front, and its open
+  // second agents. A tab that closes takes its files and agents with it in
+  // the same update, so the last snapshot written is the one from just
+  // before — which is exactly what reopening should put back.
+  useEffect(() => {
+    const roots = tabs.filter((t) => t.parentKey === undefined && t.sessionId);
+    if (roots.length === 0) return;
+    setWorkspaces((prev) => {
+      let next = prev;
+      for (const t of roots) {
+        const files = fileTabs.filter((f) => f.termKey === t.key).map((f) => f.path);
+        const upKey = fileFor.current.get(t.key) ?? (activeTab === t.key ? activeFileTab : null);
+        const activeFile = fileTabs.find((f) => f.key === upKey && f.termKey === t.key)?.path ?? null;
+        const agents = tabs.filter((c) => c.parentKey === t.key && c.sessionId).map((c) => c.sessionId!);
+        const cur = prev[t.sessionId!];
+        if (cur && cur.activeFile === activeFile && cur.files.join("\0") === files.join("\0") && cur.agents.join("\0") === agents.join("\0")) continue;
+        if (next === prev) next = { ...prev };
+        next[t.sessionId!] = { files, activeFile, agents, at: Date.now() };
+      }
+      return next;
+    });
+  }, [tabs, fileTabs, activeFileTab, activeTab]);
+
+  /** Tabs whose workspace has been put back — once per tab. */
+  const restoredKeys = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    for (const t of tabs) {
+      // Only a session opened to reopen its conversation has a workspace to
+      // restore; a fresh start has nothing, and a second agent's own tab is
+      // part of its parent's workspace, not one of its own.
+      if (t.parentKey !== undefined || !t.sessionId || !t.resumedId || restoredKeys.current.has(t.key)) continue;
+      restoredKeys.current.add(t.key);
+      const ws = workspaces[t.sessionId];
+      if (!ws) continue;
+      const rootKey = t.key;
+      if (ws.files.length) {
+        const fresh: FileTab[] = ws.files.map((path) => ({ key: nextKey.current++, termKey: rootKey, path }));
+        setFileTabs((list) => [...list.filter((f) => !(f.termKey === rootKey && ws.files.includes(f.path))), ...fresh]);
+        const up = fresh.find((f) => f.path === ws.activeFile);
+        if (up) {
+          fileFor.current.set(rootKey, up.key);
+          // After the scope effect has had its say for the new tab.
+          window.setTimeout(() => { if (activeTabRef.current === rootKey) setActiveFileTab(up.key); }, 0);
+        }
+      }
+      for (const id of ws.agents) {
+        if (tabsRef.current.some((c) => c.sessionId === id)) continue;
+        const rec = (broughtIn[t.sessionId] ?? []).find((r) => r.sessionId === id)
+          ?? (() => {
+            const s = sessionsRef.current.find((x) => x.id === id);
+            return s ? { sessionId: id, agentId: s.agent, title: s.agent, at: 0 } : null;
+          })();
+        if (rec) void reopenBroughtIn(rootKey, rec);
+      }
+    }
+  }, [tabs, workspaces, broughtIn, reopenBroughtIn]);
 
   /** The empty pane's own source/model/effort, so its button starts the same
    *  session the ＋ menu would. It used to take the first installed agent on
