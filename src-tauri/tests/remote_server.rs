@@ -4,6 +4,8 @@ use aiterm_lib::remote::model::TerminalSize;
 use aiterm_lib::remote::server::{
     RemoteGateway, RemoteServices, TlsIdentity, MAX_SCROLLBACK_PAGE_ROWS, MAX_TERMINAL_INPUT_BYTES,
 };
+use aiterm_lib::services::agents::AgentService;
+use aiterm_lib::services::sessions::{SessionRoots, SessionService};
 use aiterm_lib::tabs::{
     AttachmentId, AttachmentKind, PtyBackend, TabLaunch, TabRegistry, TabRegistryEvent, TabUpdate,
 };
@@ -748,12 +750,22 @@ async fn authenticated_tab_list_is_dispatched_with_a_typed_correlated_response()
 }
 
 #[tokio::test]
-async fn session_requests_receive_structured_unsupported_responses() {
-    let root = private_test_dir("unsupported-dispatch");
+async fn session_list_is_available_after_authentication() {
+    let root = private_test_dir("session-list-dispatch");
     let (store, key, device_id) = paired_store(&root);
     let identity =
         TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
-    let services = RemoteServices::new(Arc::new(TabRegistry::default()));
+    let services = RemoteServices::with_application_services(
+        Arc::new(TabRegistry::default()),
+        SessionService::from_roots(SessionRoots::new(
+            root.join("sessions"),
+            root.join("trash"),
+            root.join("tasks"),
+            root.join("jobs"),
+            root.join("forks.json"),
+        )),
+        AgentService::empty(),
+    );
     let gateway = RemoteGateway::start(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         store,
@@ -769,9 +781,9 @@ async fn session_requests_receive_structured_unsupported_responses() {
     let reply = response(&mut socket).await;
 
     assert_eq!(reply.request_id, 73);
-    assert_eq!(reply.kind, "error");
-    let payload: ErrorReply = decode(&reply.payload);
-    assert_eq!(payload.code, "protocol.unsupported_request");
+    assert_eq!(reply.kind, "session.list");
+    let payload: serde::de::IgnoredAny = decode(&reply.payload);
+    let _ = payload;
     gateway.stop().await.unwrap();
     std::fs::remove_dir_all(root).ok();
 }
@@ -1076,7 +1088,10 @@ async fn tab_list_and_focus_projection_never_serialize_internal_attachment_ids()
         ))
         .await
         .unwrap();
-    assert_eq!(response(&mut other).await.kind, "terminal.focus");
+    assert_eq!(
+        response_kind(&mut other, "terminal.focus").await.kind,
+        "terminal.focus"
+    );
     let first_focus_event = response_kind(&mut socket, "terminal.focus_changed").await;
     let first_focus: FocusChangedReply = decode(&first_focus_event.payload);
     assert_eq!(first_focus.attachment_id, attached.attachment_id);

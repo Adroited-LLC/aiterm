@@ -83,6 +83,15 @@ pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
     Some(with_permission(plan, &flags))
 }
 
+/// Resolve a desktop launch with the same detailed error the existing Tauri
+/// command presents. Kept transport-independent so the remote agent/session
+/// adapters and desktop command cannot drift in launch semantics.
+pub fn resolve_result(request: LaunchRequest) -> Result<LaunchPlan, String> {
+    let list = crate::agents::backends();
+    let providers = crate::providers::load_providers();
+    resolve_in(&list, &providers, request.clone()).ok_or_else(|| explain(&list, &request))
+}
+
 /// Append an engine's permission flags to a resolved command. The single point
 /// at which those flags enter the argv; split out so it can be checked without
 /// the stored file. Empty flags — the engine's own default, or an engine with
@@ -280,13 +289,9 @@ fn explain(list: &[Box<dyn AgentBackend>], request: &LaunchRequest) -> String {
 #[tauri::command]
 pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String> {
     crate::run_blocking(move || {
-        let list = crate::agents::backends();
-        let providers = crate::providers::load_providers();
-        // The registry is built once and used for both the answer and, when
-        // there is none, the explanation — otherwise the two could disagree
-        // about which engines exist.
-        resolve_in(&list, &providers, request.clone())
-            .ok_or_else(|| explain(&list, &request))
+        crate::services::agents::AgentService::desktop()
+            .resolve(request)
+            .map_err(|error| error.message().to_owned())
     })
     .await
 }

@@ -1513,7 +1513,7 @@ pub fn backend_messages(agent_id: &str, session_id: &str) -> Option<Vec<(String,
 /// `usage.rs` and `fonts.rs` are `async`.
 #[tauri::command(async)]
 pub fn detect_agents() -> Vec<Detection> {
-    backends().iter().map(|b| b.detect()).collect()
+    crate::services::agents::AgentService::desktop().detect()
 }
 
 /// What every registered engine supports, keyed by id.
@@ -1532,10 +1532,7 @@ pub fn detect_agents() -> Vec<Detection> {
 /// what it can offer.
 #[tauri::command]
 pub fn agent_caps() -> std::collections::HashMap<String, Caps> {
-    backends()
-        .iter()
-        .map(|b| (b.id().to_string(), b.caps()))
-        .collect()
+    crate::services::agents::AgentService::desktop().caps()
 }
 
 /// What a new session can be started as: the agents that are actually here,
@@ -1553,16 +1550,7 @@ pub struct AgentChoice {
 /// Codex shells out again to read its model list.
 #[tauri::command(async)]
 pub fn agent_choices() -> Vec<AgentChoice> {
-    backends()
-        .iter()
-        .filter(|b| b.offered() && b.detect().available)
-        .map(|b| AgentChoice {
-            id: b.id().to_string(),
-            display_name: b.display_name().to_string(),
-            models: b.models(),
-            mints_session_id: b.mints_session_id(),
-        })
-        .collect()
+    crate::services::agents::AgentService::desktop().list()
 }
 
 /// The id of the session `agent_id` just started in `cwd`, once it exists.

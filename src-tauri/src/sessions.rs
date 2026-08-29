@@ -524,6 +524,12 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
     })
 }
 
+/// Parse one explicitly rooted transcript for the shared session service.
+/// Fixture-root callers never consult the process home directory.
+pub(crate) fn parse_session_service(path: &Path) -> Option<Session> {
+    parse_session(path, None)
+}
+
 /// Collapse a Claude Code worktree path to the repo it was cut from:
 /// `<repo>/.claude/worktrees/<name>[/<sub>]` → `<repo>`. `/fork` can run its
 /// child agent in a fresh worktree, which lands the transcript in a project
@@ -653,7 +659,16 @@ fn deletable<'a>(
 /// `opencode.db` instead.
 #[tauri::command]
 pub async fn session_delete(session_id: String) -> Result<(), String> {
-    crate::run_blocking(move || session_delete_sync(session_id)).await
+    crate::run_blocking(move || {
+        crate::services::sessions::SessionService::desktop()
+            .delete(&session_id)
+            .map_err(|error| error.message().to_owned())
+    })
+    .await
+}
+
+pub(crate) fn session_delete_service(session_id: &str) -> Result<(), String> {
+    session_delete_sync(session_id.to_owned())
 }
 
 fn session_delete_sync(session_id: String) -> Result<(), String> {
@@ -1183,7 +1198,12 @@ pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
 
 #[tauri::command]
 pub async fn session_preview(session_id: String) -> Vec<PreviewMsg> {
-    crate::run_blocking(move || session_preview_sync(session_id)).await
+    crate::run_blocking(move || {
+        crate::services::sessions::SessionService::desktop()
+            .preview(&session_id)
+            .unwrap_or_default()
+    })
+    .await
 }
 
 /// How many messages the preview keeps, and how much of each.
@@ -1204,7 +1224,19 @@ fn session_preview_sync(session_id: String) -> Vec<PreviewMsg> {
     if let Some(msgs) = backend.sessions().messages(&session_id) {
         return preview_from_messages(msgs);
     }
-    let Ok(file) = File::open(&path) else {
+    preview_file(&path)
+}
+
+pub(crate) fn session_preview_service(session_id: &str) -> Vec<PreviewMsg> {
+    session_preview_sync(session_id.to_owned())
+}
+
+pub(crate) fn preview_file_service(path: &Path) -> Vec<PreviewMsg> {
+    preview_file(path)
+}
+
+fn preview_file(path: &Path) -> Vec<PreviewMsg> {
+    let Ok(file) = File::open(path) else {
         return vec![];
     };
     let mut out: std::collections::VecDeque<PreviewMsg> = std::collections::VecDeque::new();
@@ -2361,9 +2393,17 @@ fn roster_from_cli() -> Vec<RosterEntry> {
 /// seconds. Run inline it would freeze the window for that whole time.
 #[tauri::command]
 pub async fn stop_session(session_id: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || stop_session_blocking(session_id))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::services::sessions::SessionService::desktop()
+            .stop(&session_id)
+            .map_err(|error| error.message().to_owned())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn stop_session_service(session_id: &str) -> Result<(), String> {
+    stop_session_blocking(session_id.to_owned())
 }
 
 fn stop_session_blocking(session_id: String) -> Result<(), String> {
@@ -3036,7 +3076,16 @@ fn rewrite_session_ids(text: &str, old: &str, new: &str) -> (String, usize) {
 /// unresumable.)
 #[tauri::command]
 pub async fn session_fork(session_id: String) -> Result<String, String> {
-    crate::run_blocking(move || session_fork_sync(session_id)).await
+    crate::run_blocking(move || {
+        crate::services::sessions::SessionService::desktop()
+            .fork(&session_id)
+            .map_err(|error| error.message().to_owned())
+    })
+    .await
+}
+
+pub(crate) fn session_fork_service(session_id: &str) -> Result<String, String> {
+    session_fork_sync(session_id.to_owned())
 }
 
 fn session_fork_sync(session_id: String) -> Result<String, String> {
@@ -3910,15 +3959,12 @@ mod tests {
 
 #[tauri::command]
 pub async fn list_sessions() -> Vec<Session> {
-    crate::run_blocking(list_sessions_sync).await
-}
-
-fn list_sessions_sync() -> Vec<Session> {
-    // Adding an agent means adding a backend in `agents.rs` and nothing here.
-    crate::agents::scan_all_with_paths()
-        .into_iter()
-        .map(|(s, _)| s)
-        .collect()
+    crate::run_blocking(|| {
+        crate::services::sessions::SessionService::desktop()
+            .list()
+            .unwrap_or_default()
+    })
+    .await
 }
 
 #[cfg(test)]

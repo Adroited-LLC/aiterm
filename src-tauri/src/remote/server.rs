@@ -7,6 +7,9 @@ use super::terminal::{
     plan_snapshot_for_attachment, RemoteTerminal, RemoteTerminalEvents, TerminalEvent,
     TransferChunk, TransferPlan,
 };
+use crate::launch::LaunchRequest;
+use crate::services::agents::AgentService;
+use crate::services::sessions::SessionService;
 use crate::tabs::{
     AttachmentId, RecoveryBoundary, TabAttachmentCancellation, TabDescriptor, TabId, TabLaunch,
     TabRegistry, TabRegistryEvent, TabState,
@@ -165,6 +168,8 @@ struct GatewayState {
 pub struct RemoteServices {
     registry: Arc<TabRegistry>,
     terminal: RemoteTerminal,
+    sessions: SessionService,
+    agents: AgentService,
     blocking_operations: Arc<tokio::sync::Semaphore>,
 }
 
@@ -174,10 +179,23 @@ impl RemoteServices {
         Self {
             terminal: RemoteTerminal::new(registry.clone()),
             registry,
+            sessions: SessionService::desktop(),
+            agents: AgentService::desktop(),
             blocking_operations: BLOCKING_OPERATIONS
                 .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(REMOTE_BLOCKING_OPERATIONS)))
                 .clone(),
         }
+    }
+
+    pub fn with_application_services(
+        registry: Arc<TabRegistry>,
+        sessions: SessionService,
+        agents: AgentService,
+    ) -> Self {
+        let mut services = Self::new(registry);
+        services.sessions = sessions;
+        services.agents = agents;
+        services
     }
 
     pub fn registry(&self) -> &Arc<TabRegistry> {
@@ -736,6 +754,39 @@ struct ResumePayload {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionIdPayload {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionOpenPayload {
+    session_id: String,
+    size: TerminalSize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionClosePayload {
+    session_id: String,
+    tab_id: Option<TabId>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum AgentActionPayload {
+    Start {
+        agent_id: String,
+        model: Option<String>,
+        effort: Option<String>,
+        cwd: String,
+        title: String,
+        size: TerminalSize,
+    },
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct TabOpenPayload {
     title: String,
@@ -755,6 +806,45 @@ struct TabOpenPayload {
 #[derive(Serialize)]
 struct TabListPayload {
     tabs: Vec<RemoteTabDescriptor>,
+}
+
+#[derive(Serialize)]
+struct SessionListPayload {
+    sessions: Vec<crate::sessions::Session>,
+}
+
+#[derive(Serialize)]
+struct SessionPreviewPayload {
+    messages: Vec<crate::sessions::PreviewMsg>,
+}
+
+#[derive(Serialize)]
+struct SessionOpenedPayload<'a> {
+    tab_id: &'a TabId,
+    selected_existing: bool,
+}
+
+#[derive(Serialize)]
+struct SessionClosedPayload<'a> {
+    tab_id: &'a TabId,
+    ok: bool,
+}
+
+#[derive(Serialize)]
+struct SessionForkedPayload {
+    session_id: String,
+}
+
+#[derive(Serialize)]
+struct AgentListPayload {
+    agents: Vec<crate::agents::AgentChoice>,
+    caps: std::collections::HashMap<String, crate::agents::Caps>,
+}
+
+#[derive(Serialize)]
+struct AgentStartedPayload<'a> {
+    tab_id: &'a TabId,
+    session_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -880,12 +970,20 @@ fn response<T: Serialize>(
     kind: &str,
     value: &T,
 ) -> Result<RemoteEvent, &'static str> {
-    Ok(RemoteEvent {
+    let event = RemoteEvent {
         version: PROTOCOL_VERSION,
         request_id,
         kind: kind.to_owned(),
         payload: payload(value)?,
-    })
+    };
+    encode_terminal_frame(&event).map_err(|error| {
+        if error.code() == "protocol.frame_too_large" {
+            "protocol.response_too_large"
+        } else {
+            "protocol.invalid_response"
+        }
+    })?;
+    Ok(event)
 }
 
 fn error_response(request_id: u64, code: &str, message: &str) -> RemoteEvent {
@@ -1080,6 +1178,34 @@ fn launch_from_wire(wire: TabOpenPayload) -> Result<TabLaunch, &'static str> {
     Ok(launch)
 }
 
+fn tab_matches_session(tab: &TabDescriptor, session_id: &str) -> bool {
+    tab.session_id() == Some(session_id)
+        || tab.resumed_id() == Some(session_id)
+        || tab.slot_id() == session_id
+}
+
+fn launch_from_plan(
+    title: String,
+    cwd: String,
+    slot_id: String,
+    plan: crate::launch::LaunchPlan,
+    size: TerminalSize,
+) -> TabLaunch {
+    let mut launch = TabLaunch::new(title, slot_id, size)
+        .with_cwd(cwd)
+        .with_command(plan.command)
+        .with_agent_id(plan.agent_id);
+    if let Some(session_id) = plan.session_id {
+        launch = launch
+            .with_session_id(session_id.clone())
+            .with_resumed_id(session_id);
+    }
+    if let (Some(provider), Some(model)) = (plan.env_provider, plan.env_model) {
+        launch = launch.with_environment(provider, model);
+    }
+    launch
+}
+
 impl RemoteServices {
     fn dispatch(
         &self,
@@ -1104,12 +1230,226 @@ impl RemoteServices {
     ) -> Result<DispatchOutcome, &'static str> {
         let request_id = request.request_id();
         match request.kind() {
-            kind if kind.starts_with("session.") || kind.starts_with("agent.") => {
-                Ok(DispatchOutcome::frames(vec![error_response(
+            "session.list" => {
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
+                let sessions = self.sessions.list().map_err(|error| error.code())?;
+                Ok(DispatchOutcome::frames(vec![response(
                     request_id,
-                    "protocol.unsupported_request",
-                    "this service is not available through the remote gateway yet",
-                )]))
+                    "session.list",
+                    &SessionListPayload { sessions },
+                )?]))
+            }
+            "session.preview" => {
+                let payload: SessionIdPayload = decode_payload(request)?;
+                let messages = self
+                    .sessions
+                    .preview(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.preview",
+                    &SessionPreviewPayload { messages },
+                )?]))
+            }
+            "session.open" => {
+                let payload: SessionOpenPayload = decode_payload(request)?;
+                self.sessions
+                    .validate_id(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                let matches: Vec<_> = self
+                    .registry
+                    .list()
+                    .into_iter()
+                    .filter(|tab| {
+                        tab.state() == &TabState::Running
+                            && tab_matches_session(tab, &payload.session_id)
+                    })
+                    .collect();
+                if matches.len() > 1 {
+                    return Err("session.tab_ambiguous");
+                }
+                let (tab_id, selected_existing) = if let Some(existing) = matches.first() {
+                    (existing.id().clone(), true)
+                } else {
+                    let session = self
+                        .sessions
+                        .find(&payload.session_id)
+                        .map_err(|error| error.code())?;
+                    let plan = self
+                        .agents
+                        .resolve(LaunchRequest::Resume {
+                            session_id: payload.session_id.clone(),
+                        })
+                        .map_err(|error| error.code())?;
+                    let slot_id = if self
+                        .registry
+                        .list()
+                        .iter()
+                        .any(|tab| tab.slot_id() == payload.session_id)
+                    {
+                        format!("remote-resume:{}", uuid::Uuid::new_v4())
+                    } else {
+                        payload.session_id.clone()
+                    };
+                    let launch = launch_from_plan(
+                        session.title,
+                        session.project_path,
+                        slot_id,
+                        plan,
+                        payload.size,
+                    );
+                    (
+                        self.terminal.open(launch).map_err(|error| error.code())?,
+                        false,
+                    )
+                };
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.open",
+                    &SessionOpenedPayload {
+                        tab_id: &tab_id,
+                        selected_existing,
+                    },
+                )?]))
+            }
+            "session.close" => {
+                let payload: SessionClosePayload = decode_payload(request)?;
+                self.sessions
+                    .validate_id(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                let matches: Vec<_> = self
+                    .registry
+                    .list()
+                    .into_iter()
+                    .filter(|tab| {
+                        tab.state() == &TabState::Running
+                            && tab_matches_session(tab, &payload.session_id)
+                    })
+                    .collect();
+                let tab_id = match payload.tab_id {
+                    Some(tab_id) => matches
+                        .iter()
+                        .find(|tab| tab.id() == &tab_id)
+                        .map(|tab| tab.id().clone())
+                        .ok_or("session.tab_mismatch")?,
+                    None if matches.is_empty() => return Err("session.tab_not_found"),
+                    None if matches.len() > 1 => return Err("session.tab_ambiguous"),
+                    None => matches[0].id().clone(),
+                };
+                self.terminal
+                    .close(&tab_id)
+                    .map_err(|error| error.code())?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.close",
+                    &SessionClosedPayload {
+                        tab_id: &tab_id,
+                        ok: true,
+                    },
+                )?]))
+            }
+            "session.delete" => {
+                let payload: SessionIdPayload = decode_payload(request)?;
+                self.sessions
+                    .delete(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.delete",
+                    &SuccessPayload { ok: true },
+                )?]))
+            }
+            "session.fork" => {
+                let payload: SessionIdPayload = decode_payload(request)?;
+                let session_id = self
+                    .sessions
+                    .fork(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.fork",
+                    &SessionForkedPayload { session_id },
+                )?]))
+            }
+            "session.stop" => {
+                let payload: SessionIdPayload = decode_payload(request)?;
+                self.sessions
+                    .stop(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.stop",
+                    &SuccessPayload { ok: true },
+                )?]))
+            }
+            "agent.list" => {
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "agent.list",
+                    &AgentListPayload {
+                        agents: self.agents.list(),
+                        caps: self.agents.caps(),
+                    },
+                )?]))
+            }
+            "agent.action" => {
+                let payload: AgentActionPayload = decode_payload(request)?;
+                match payload {
+                    AgentActionPayload::Start {
+                        agent_id,
+                        model,
+                        effort,
+                        cwd,
+                        title,
+                        size,
+                    } => {
+                        bounded(&agent_id, MAX_IDENTIFIER_BYTES)?;
+                        bounded(&cwd, MAX_PATH_BYTES)?;
+                        bounded(&title, MAX_TITLE_BYTES)?;
+                        for value in [model.as_deref(), effort.as_deref()].into_iter().flatten() {
+                            bounded(value, MAX_IDENTIFIER_BYTES)?;
+                        }
+                        let cwd_is_exposed = self
+                            .sessions
+                            .list()
+                            .map_err(|error| error.code())?
+                            .iter()
+                            .any(|session| session.project_path == cwd);
+                        if !cwd_is_exposed {
+                            return Err("remote.path_not_allowed");
+                        }
+                        let plan = self
+                            .agents
+                            .resolve(LaunchRequest::Agent {
+                                agent_id,
+                                model,
+                                effort,
+                            })
+                            .map_err(|error| error.code())?;
+                        let slot_id = plan
+                            .session_id
+                            .clone()
+                            .unwrap_or_else(|| format!("agent:{}", uuid::Uuid::new_v4()));
+                        let launch = launch_from_plan(title, cwd, slot_id, plan.clone(), size);
+                        let tab_id = self
+                            .terminal
+                            .open(launch)
+                            .map_err(|error| error.code())?;
+                        Ok(DispatchOutcome::frames(vec![response(
+                            request_id,
+                            "agent.action",
+                            &AgentStartedPayload {
+                                tab_id: &tab_id,
+                                session_id: plan.session_id.as_deref(),
+                            },
+                        )?]))
+                    }
+                }
             }
             "tab.list" => {
                 if !request.payload().is_empty() {
@@ -1290,7 +1630,7 @@ impl RemoteServices {
                 });
                 Ok(outcome)
             }
-            _ => Err("protocol.unsupported_request"),
+            _ => Err("remote.unsupported"),
         }
     }
 }
@@ -2507,9 +2847,17 @@ async fn run_authenticated_socket(socket: WebSocket, services: RemoteServices) {
                             let _ = outbound.controls.try_send(EgressControl::Close);
                             break;
                         }
+                        let (code, message) = if error.code() == "protocol.unknown_request" {
+                            (
+                                "remote.unsupported",
+                                "this operation is not available through the remote gateway",
+                            )
+                        } else {
+                            (error.code(), error.message())
+                        };
                         if enqueue_event(
                             &outbound,
-                            error_response(request_id, error.code(), error.message()),
+                            error_response(request_id, code, message),
                         )
                         .await
                         .is_err()
