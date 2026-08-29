@@ -15,15 +15,7 @@ import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
 import { followRekey } from "../selection";
 
-/** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
-function shortTime(ms: number): string {
-  const s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 60) return "now";
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  if (s < 30 * 86400) return `${Math.floor(s / 86400)}d`;
-  return `${Math.floor(s / (30 * 86400))}mo`;
-}
+import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 
 type ViewMode = "recent" | "project" | "date";
 
@@ -520,6 +512,7 @@ export default function SessionsPanel({
   }
 
   const toggle = (k: keyof SessionDisplayOpts) => onOptsChange({ ...opts, [k]: !opts[k] });
+  const { format: timeFormat, setFormat: setTimeFormat } = useTimeFormat();
 
   const filteredTrash = useMemo(() => {
     const q = query.toLowerCase();
@@ -718,7 +711,7 @@ export default function SessionsPanel({
       <div className="session-text">
         <div className="session-title-row">
           <span className="session-title">{t.title}</span>
-          <span className="session-time">{shortTime(t.deleted_at)}</span>
+          <span className="session-time" title={fullTime(t.deleted_at)}>{fmtTimeShort(t.deleted_at, timeFormat)}</span>
         </div>
         <div className="session-meta">
           <span className="session-sub">
@@ -878,7 +871,7 @@ export default function SessionsPanel({
               </span>
             )}
             <span className="session-title">{s.title}</span>
-            {opts.showTime && <span className="session-time">{shortTime(s.last_active)}</span>}
+            {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
           {(opts.showPath || (opts.showBranch && s.branch)) && (
             <div className="session-meta">
@@ -1187,6 +1180,13 @@ export default function SessionsPanel({
               <label><input type="checkbox" checked={opts.showPath} onChange={() => toggle("showPath")} /> Project path</label>
               <label><input type="checkbox" checked={opts.showBranch} onChange={() => toggle("showBranch")} /> Git branch</label>
               <label><input type="checkbox" checked={opts.showTime} onChange={() => toggle("showTime")} /> Last active</label>
+              <label title="Clock time instead of “3h” — the same setting as Settings → Appearance">
+                <input
+                  type="checkbox"
+                  checked={timeFormat === "absolute"}
+                  onChange={() => setTimeFormat(timeFormat === "absolute" ? "relative" : "absolute")}
+                /> As clock time
+              </label>
             </div>
           )}
         </div>

@@ -287,6 +287,17 @@ export default function SettingsModal({
                   />
                   <span className="srow-value">{settings.iconSize}px</span>
                 </Row>
+                <Row label="Times" desc="How “last active” is written in the session list, the home screen, and the agent panel">
+                  <div className="seg">
+                    {([["relative", "3h ago"], ["absolute", "Clock time"]] as const).map(([v, name]) => (
+                      <button
+                        key={v}
+                        className={"seg-btn" + (settings.timeFormat === v ? " on" : "")}
+                        onClick={() => set({ timeFormat: v })}
+                      >{name}</button>
+                    ))}
+                  </div>
+                </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
                     <button

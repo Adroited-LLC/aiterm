@@ -1,3 +1,4 @@
+import { TimeFormatContext } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -1983,7 +1984,13 @@ export default function App() {
 
   const showRight = showExplorer || showGit;
 
+  const timeFormatCtx = useMemo(() => ({
+    format: settings.timeFormat,
+    setFormat: (f: AppSettings["timeFormat"]) => setSettings((s) => ({ ...s, timeFormat: f })),
+  }), [settings.timeFormat]);
+
   return (
+    <TimeFormatContext.Provider value={timeFormatCtx}>
     <div className="app">
       {notice && (
         <div className="app-toast" role="status" onClick={() => setNotice(null)}>
@@ -2450,6 +2457,7 @@ export default function App() {
         />
       )}
     </div>
+    </TimeFormatContext.Provider>
   );
 }
 

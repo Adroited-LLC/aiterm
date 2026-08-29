@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { PreviewMsg, Session, homeAbbrev, relTime, sessionPreview } from "../ipc";
+import { PreviewMsg, Session, homeAbbrev, sessionPreview } from "../ipc";
+import { fmtTime, fullTime, useTimeFormat } from "../timefmt";
 import Icon from "./Icon";
 import { GitBranch, Play, X } from "lucide-react";
 
@@ -17,6 +18,7 @@ interface Props {
  *  when a sidebar item is selected — so you can check it's the right
  *  session before ▶ actually resumes it. */
 export default function SessionPreview({ session, onResume, onClose, canResume }: Props) {
+  const { format: timeFormat } = useTimeFormat();
   const [msgs, setMsgs] = useState<PreviewMsg[] | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
 
@@ -45,7 +47,7 @@ export default function SessionPreview({ session, onResume, onClose, canResume }
           <div className="preview-sub">
             {homeAbbrev(session.project_path)}
             {session.branch ? <>{"  "}<Icon of={GitBranch} size="sm" /> {session.branch}</> : ""}
-            {"  ·  "}{relTime(session.last_active)}
+            {"  ·  "}<span title={fullTime(session.last_active)}>{fmtTime(session.last_active, timeFormat)}</span>
           </div>
         </div>
         {canResume && (

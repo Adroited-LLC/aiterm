@@ -1,4 +1,5 @@
 /** App-wide appearance settings: theme, fonts, per-panel sizing. */
+import type { TimeFormat } from "./timefmt";
 
 export interface PanelScales {
   sessions: number;
@@ -40,6 +41,9 @@ export interface AppSettings {
   /** Pixel size of the toolbar and panel icons (Lucide set). Row actions and
    *  inline marks scale with it, a step under. */
   iconSize: number;
+  /** How "last active" and the like are written: "3h ago", or the clock
+   *  time. See `timefmt.ts`. */
+  timeFormat: TimeFormat;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -56,6 +60,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   termRenderer: "gpu",
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
   iconSize: 16,
+  timeFormat: "relative",
 };
 
 /** Weights offered for terminal text, and what to call them.

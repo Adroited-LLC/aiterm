@@ -12,7 +12,8 @@
  * project list. This draws; it fetches nothing.
  */
 import { ReactNode } from "react";
-import { ProjectInfo, Session, homeAbbrev, relTime } from "../ipc";
+import { ProjectInfo, Session, homeAbbrev } from "../ipc";
+import { fmtTime, fullTime, useTimeFormat } from "../timefmt";
 import { Alert } from "./AlertBell";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
@@ -39,6 +40,8 @@ export default function HomeDashboard({
   start: ReactNode;
 }) {
   const now = Date.now();
+  const { format: timeFormat } = useTimeFormat();
+  const when = (ms: number) => fmtTime(ms, timeFormat);
   const recent = [...sessions].sort((a, b) => b.last_active - a.last_active);
   const month = recent.filter((s) => now - s.last_active < 30 * DAY);
 
@@ -97,7 +100,7 @@ export default function HomeDashboard({
                         {s.branch && <span className="home-branch"><Icon of={GitBranch} size="sm" />{s.branch}</span>}
                       </span>
                     </span>
-                    <span className="home-row-age">{live ? "live" : relTime(s.last_active)}</span>
+                    <span className="home-row-age" title={fullTime(s.last_active)}>{live ? "live" : when(s.last_active)}</span>
                     <button
                       className="home-row-go"
                       title={live ? "Switch to it" : "Resume it"}
@@ -124,7 +127,7 @@ export default function HomeDashboard({
                       <span className="home-row-title">{a.title}</span>
                       {a.message && <span className="home-row-sub">{a.message}</span>}
                     </span>
-                    <span className="home-row-age">{relTime(a.at)}</span>
+                    <span className="home-row-age" title={fullTime(a.at)}>{when(a.at)}</span>
                   </div>
                 ))}
               </div>
@@ -153,7 +156,7 @@ export default function HomeDashboard({
                     <span className="home-row-title">{p.name}</span>
                     <span className="home-row-sub">{homeAbbrev(p.path)}</span>
                   </span>
-                  <span className="home-row-age">{p.count} session{p.count === 1 ? "" : "s"} · {relTime(p.last)}</span>
+                  <span className="home-row-age">{p.count} session{p.count === 1 ? "" : "s"} · {when(p.last)}</span>
                 </div>
               ))}
             </div>

@@ -849,6 +849,7 @@ body.dragging * { pointer-events: none; }
   color: var(--text-faint);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .session-meta .branch {
   display: inline-flex;
