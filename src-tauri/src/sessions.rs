@@ -1350,19 +1350,20 @@ impl VerifiedSessionFile {
                 quarantine_path.display()
             ))?;
             after_quarantine();
-            after_verification();
             match self.kind {
                 VerifiedEntryKind::File => archive_exact_file(
                     &self.object,
                     destination,
                     name,
                     &quarantine_path,
+                    after_verification,
                 ),
                 VerifiedEntryKind::Directory => archive_exact_directory(
                     &self.object,
                     destination,
                     name,
                     &quarantine_path,
+                    after_verification,
                 ),
             }
         }
@@ -1563,6 +1564,7 @@ fn archive_exact_file(
     destination: &VerifiedDirectory,
     name: &OsStr,
     quarantine_path: &Path,
+    after_verification: impl FnOnce(),
 ) -> Result<(), String> {
     let temporary_name = format!(".aiterm-exact-archive-{}", uuid::Uuid::new_v4());
     let temporary = CString::new(temporary_name.as_bytes()).unwrap();
@@ -1574,6 +1576,7 @@ fn archive_exact_file(
         )
     })?;
     verify_exact_file(&retirement)?;
+    after_verification();
     rename_noreplace(
         destination.file.as_raw_fd(),
         &temporary,
@@ -1758,6 +1761,7 @@ fn archive_exact_directory(
     destination: &VerifiedDirectory,
     name: &OsStr,
     quarantine_path: &Path,
+    after_verification: impl FnOnce(),
 ) -> Result<(), String> {
     let temporary_name = format!(".aiterm-exact-directory-{}", uuid::Uuid::new_v4());
     let temporary = CString::new(temporary_name.as_bytes()).unwrap();
@@ -1785,6 +1789,7 @@ fn archive_exact_directory(
     for retirement in &retirements {
         verify_exact_file(retirement)?;
     }
+    after_verification();
     rename_noreplace(
         destination.file.as_raw_fd(),
         &temporary,
@@ -4766,6 +4771,75 @@ mod tests {
             .unwrap()
             .path();
         assert_eq!(std::fs::read(replacement).unwrap(), b"unverified replacement");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_archive_never_publishes_a_destination_replacement_after_verification() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-session-destination-aba-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "17171717-1717-4717-8717-171717171717";
+        let source = project.join(format!("{id}.jsonl"));
+        let displaced_archive = trash_path.join("held-exact-archive");
+        std::fs::write(&source, b"verified original transcript").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let result = verified.rename_to_with_hooks(
+            &trash,
+            OsStr::new(&format!("{id}.jsonl")),
+            || {},
+            || {},
+            || {
+                let temporary = std::fs::read_dir(&trash_path)
+                    .unwrap()
+                    .flatten()
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .contains(".aiterm-exact-archive-")
+                    })
+                    .unwrap()
+                    .path();
+                std::fs::rename(&temporary, &displaced_archive).unwrap();
+                std::fs::write(&temporary, b"unverified destination replacement").unwrap();
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&displaced_archive).unwrap(),
+            b"verified original transcript"
+        );
+        assert_eq!(std::fs::read(&source).unwrap_or_default(), b"");
+        assert_eq!(
+            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap_or_default(),
+            b""
+        );
+        let quarantine = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".aiterm-quarantine-")
+            })
+            .unwrap()
+            .path();
+        assert_eq!(
+            std::fs::read(quarantine).unwrap(),
+            b"verified original transcript"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
