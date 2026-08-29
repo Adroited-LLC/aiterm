@@ -130,7 +130,6 @@ export default function HomeDashboard({
             </section>
           )}
 
-        </div>
 
         <section className="home-card home-projects">
           <div className="home-card-head">
@@ -159,7 +158,7 @@ export default function HomeDashboard({
             </div>
           )}
         </section>
-
+        </div>
       </div>
     </div>
   );
