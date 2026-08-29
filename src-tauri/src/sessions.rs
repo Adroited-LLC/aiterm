@@ -1324,7 +1324,6 @@ struct VerifiedSessionFile;
 #[cfg(not(unix))]
 impl VerifiedSessionFile {
     fn open(&self) -> Result<File, String> { Err(unsupported_verified_operations()) }
-    fn rename_to(&self, _destination: &VerifiedDirectory, _name: &OsStr) -> Result<(), String> { Err(unsupported_verified_operations()) }
     fn create_sibling(&self, _name: &OsStr, _bytes: &[u8]) -> Result<(), String> { Err(unsupported_verified_operations()) }
 }
 
@@ -1370,64 +1369,6 @@ impl VerifiedSessionFile {
             return Err("session transcript is not a regular file".into());
         }
         self.object.try_clone().map_err(|e| e.to_string())
-    }
-
-    fn rename_to(&self, destination: &VerifiedDirectory, name: &OsStr) -> Result<(), String> {
-        self.rename_to_with_hooks(destination, name, || {}, || {}, || {})
-    }
-
-    fn rename_to_with_hooks(
-        &self,
-        destination: &VerifiedDirectory,
-        name: &OsStr,
-        before_quarantine: impl FnOnce(),
-        after_quarantine: impl FnOnce(),
-        after_verification: impl FnOnce(),
-    ) -> Result<(), String> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (
-                destination,
-                name,
-                before_quarantine,
-                after_quarantine,
-                after_verification,
-            );
-            return Err("exact-inode session moves require Linux renameat2".into());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let source = CString::new(self.name.as_bytes())
-                .map_err(|_| "invalid session entry name")?;
-            let quarantine_name = format!(".aiterm-quarantine-{}", uuid::Uuid::new_v4());
-            let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
-            let quarantine_path = self.display_parent.join(&quarantine_name);
-            before_quarantine();
-            rename_noreplace(
-                self.parent.as_raw_fd(),
-                &source,
-                self.parent.as_raw_fd(),
-                &quarantine,
-            )
-            .map_err(|error| format!(
-                "could not quarantine verified session entry at {}: {error}",
-                quarantine_path.display()
-            ))?;
-            after_quarantine();
-            match self.kind {
-                VerifiedEntryKind::File => archive_exact_file(
-                    &self.object,
-                    destination,
-                    name,
-                    &quarantine_path,
-                    after_verification,
-                ),
-                VerifiedEntryKind::Directory => Err(
-                    "sidecar directories require a leased multi-artifact archive transaction"
-                        .into(),
-                ),
-            }
-        }
     }
 
     fn create_sibling(&self, name: &OsStr, bytes: &[u8]) -> Result<(), String> {
@@ -1586,7 +1527,6 @@ enum VerifiedArchiveInput {
 #[cfg(target_os = "linux")]
 struct ExactFileRetirement {
     source: File,
-    archive: Option<File>,
     size: u64,
     modified: std::time::SystemTime,
     hash: [u8; 32],
@@ -1733,7 +1673,6 @@ fn copy_regular_into_anonymous_archive(
     archive.sync_all().map_err(|error| error.to_string())?;
     Ok(ExactFileRetirement {
         source: source.try_clone().map_err(|error| error.to_string())?,
-        archive: None,
         size: offset,
         modified,
         hash: source_hash,
@@ -1957,7 +1896,6 @@ fn write_sidecar_tree(
                             let modified = before.modified().map_err(|error| error.to_string())?;
                             retirements.push(ExactFileRetirement {
                                 source: file,
-                                archive: None,
                                 size: copied,
                                 modified,
                                 hash: digest.finalize().into(),
@@ -2148,7 +2086,6 @@ fn prepare_leased_file_set_archive(
             .ok_or("session rollout byte count overflow")?;
         retirements.push(ExactFileRetirement {
             source: source.object.try_clone().map_err(|error| error.to_string())?,
-            archive: None,
             size: copied,
             modified: before.modified().map_err(|error| error.to_string())?,
             hash: digest.finalize().into(),
@@ -2722,97 +2659,6 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
 }
 
 #[cfg(target_os = "linux")]
-fn create_exact_archive_file(
-    directory: &File,
-    name: &CString,
-    mode: u32,
-) -> Result<File, String> {
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC,
-            mode as libc::mode_t,
-        )
-    };
-    if descriptor < 0 {
-        Err(std::io::Error::last_os_error().to_string())
-    } else {
-        Ok(unsafe { File::from_raw_fd(descriptor) })
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn copy_exact_file(
-    source: &File,
-    destination_directory: &File,
-    destination_name: &CString,
-) -> Result<ExactFileRetirement, String> {
-    use std::io::Write;
-    use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
-
-    let before = source.metadata().map_err(|error| error.to_string())?;
-    if !before.is_file() {
-        return Err("exact archive source is not a regular file".into());
-    }
-    let modified = before.modified().map_err(|error| error.to_string())?;
-    let mut destination = create_exact_archive_file(
-        destination_directory,
-        destination_name,
-        before.mode() & 0o7777,
-    )?;
-    let mut offset = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = source
-            .read_at(&mut buffer, offset)
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        destination
-            .write_all(&buffer[..read])
-            .map_err(|error| error.to_string())?;
-        offset = offset
-            .checked_add(read as u64)
-            .ok_or("session archive size overflow")?;
-    }
-    let after = source.metadata().map_err(|error| error.to_string())?;
-    if before.len() != after.len()
-        || before.modified().ok() != after.modified().ok()
-        || offset != before.len()
-    {
-        return Err("session changed while its exact archive was copied".into());
-    }
-    destination
-        .set_permissions(std::fs::Permissions::from_mode(before.mode() & 0o7777))
-        .map_err(|error| error.to_string())?;
-    destination
-        .set_modified(modified)
-        .map_err(|error| error.to_string())?;
-    destination.sync_all().map_err(|error| error.to_string())?;
-    let (source_hash, source_size) = hash_exact_file(source)?;
-    let (destination_hash, destination_size) = hash_exact_file(&destination)?;
-    if source_hash != destination_hash
-        || source_size != destination_size
-        || source_size != before.len()
-    {
-        return Err("durable trash copy does not match the held session object".into());
-    }
-    Ok(ExactFileRetirement {
-        source: source.try_clone().map_err(|error| error.to_string())?,
-        archive: Some(destination),
-        size: source_size,
-        modified,
-        hash: source_hash,
-    })
-}
-
-#[cfg(target_os = "linux")]
 fn directory_entry_is_exact_object(
     directory: &File,
     name: &CString,
@@ -2871,45 +2717,6 @@ fn retire_exact_files(retirements: &[ExactFileRetirement]) -> Result<(), String>
             .map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn archive_exact_file(
-    source: &File,
-    destination: &VerifiedDirectory,
-    name: &OsStr,
-    quarantine_path: &Path,
-    after_verification: impl FnOnce(),
-) -> Result<(), String> {
-    let final_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash name")?;
-    let retirement = copy_exact_file(source, &destination.file, &final_name).map_err(|error| {
-        format!(
-            "could not create exact trash copy; source remains recoverable at {} and any exclusive destination is left for recovery: {error}",
-            quarantine_path.display(),
-        )
-    })?;
-    verify_exact_file(&retirement)?;
-    after_verification();
-    let archive = retirement
-        .archive
-        .as_ref()
-        .ok_or("exact trash archive descriptor is missing")?;
-    if !directory_entry_is_exact_object(&destination.file, &final_name, archive)? {
-        return Err(format!(
-            "exact trash destination changed; source remains recoverable at {} and is not retired",
-            quarantine_path.display()
-        ));
-    }
-    destination
-        .file
-        .sync_all()
-        .map_err(|error| format!("could not make exact trash copy durable: {error}"))?;
-    retire_exact_files(&[retirement]).map_err(|error| {
-        format!(
-            "durable trash copy exists but exact source remains at {}: {error}",
-            quarantine_path.display()
-        )
-    })
 }
 
 #[cfg(target_os = "linux")]
@@ -5725,311 +5532,19 @@ mod tests {
         symlink(&outside, &projects).unwrap();
 
         assert!(verified_session_file("claude", &discovered, &home).is_err());
-        verified.rename_to(&trash, OsStr::new(&format!("{id}.jsonl"))).unwrap();
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, std::ffi::OsString::from(format!("{id}.jsonl")))],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside sentinel");
         assert!(!pinned.join("project").join(format!("{id}.jsonl")).exists());
         assert_eq!(std::fs::read(pinned_trash.join(format!("{id}.jsonl"))).unwrap(), b"original");
         std::fs::remove_dir_all(root).unwrap();
     }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exact_inode_trash_archives_the_held_object_when_source_is_swapped() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-production-session-leaf-swap-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let home = root.join("home");
-        let project = home.join(".claude/projects/project");
-        let trash_path = home.join(".claude/trash");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&trash_path).unwrap();
-        let id = "13131313-1313-4313-8313-131313131313";
-        let source = project.join(format!("{id}.jsonl"));
-        let original_elsewhere = project.join("original-elsewhere.jsonl");
-        std::fs::write(&source, b"verified original").unwrap();
-        let verified = verified_session_file("claude", &source, &home).unwrap();
-        let trash = VerifiedDirectory::open(&trash_path).unwrap();
-
-        let result = verified.rename_to_with_hooks(
-            &trash,
-            OsStr::new(&format!("{id}.jsonl")),
-            || {
-                std::fs::rename(&source, &original_elsewhere).unwrap();
-                std::fs::write(&source, b"unverified replacement").unwrap();
-            },
-            || {},
-            || {},
-        );
-
-        result.unwrap();
-        assert!(!source.exists());
-        assert_eq!(std::fs::read(&original_elsewhere).unwrap(), b"");
-        assert_eq!(
-            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
-            b"verified original"
-        );
-        let quarantine = std::fs::read_dir(&project)
-            .unwrap()
-            .flatten()
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".aiterm-quarantine-")
-            })
-            .unwrap()
-            .path();
-        assert_eq!(std::fs::read(quarantine).unwrap(), b"unverified replacement");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exact_inode_trash_never_mutates_a_swapped_leaf_or_new_source_occupant() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-production-session-quarantine-fallback-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let home = root.join("home");
-        let project = home.join(".claude/projects/project");
-        let trash_path = home.join(".claude/trash");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&trash_path).unwrap();
-        let id = "14141414-1414-4414-8414-141414141414";
-        let source = project.join(format!("{id}.jsonl"));
-        let original_elsewhere = project.join("original-elsewhere.jsonl");
-        std::fs::write(&source, b"verified original").unwrap();
-        let verified = verified_session_file("claude", &source, &home).unwrap();
-        let trash = VerifiedDirectory::open(&trash_path).unwrap();
-
-        verified
-            .rename_to_with_hooks(
-                &trash,
-                OsStr::new(&format!("{id}.jsonl")),
-                || {
-                    std::fs::rename(&source, &original_elsewhere).unwrap();
-                    std::fs::write(&source, b"unverified replacement").unwrap();
-                },
-                || {
-                    std::fs::write(&source, b"new source occupant").unwrap();
-                },
-                || {},
-            )
-            .unwrap();
-
-        let quarantine = std::fs::read_dir(&project)
-            .unwrap()
-            .flatten()
-            .find(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-"))
-            .expect("the mismatched object remains at a recoverable internal name")
-            .path();
-        assert_eq!(std::fs::read(&source).unwrap(), b"new source occupant");
-        assert_eq!(std::fs::read(&quarantine).unwrap(), b"unverified replacement");
-        assert_eq!(
-            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
-            b"verified original"
-        );
-        assert_eq!(std::fs::read(&original_elsewhere).unwrap(), b"");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exact_inode_trash_never_moves_an_unopenable_quarantine_replacement() {
-        use std::cell::RefCell;
-        use std::os::unix::fs::symlink;
-
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-production-session-quarantine-open-failure-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let home = root.join("home");
-        let project = home.join(".claude/projects/project");
-        let trash_path = home.join(".claude/trash");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&trash_path).unwrap();
-        let id = "15151515-1515-4515-8515-151515151515";
-        let source = project.join(format!("{id}.jsonl"));
-        let held_original = project.join("held-original.jsonl");
-        let outside = root.join("outside-sentinel");
-        std::fs::write(&source, b"verified original").unwrap();
-        std::fs::write(&outside, b"outside sentinel").unwrap();
-        let verified = verified_session_file("claude", &source, &home).unwrap();
-        let trash = VerifiedDirectory::open(&trash_path).unwrap();
-        let quarantine_path = RefCell::new(None);
-
-        verified
-            .rename_to_with_hooks(
-                &trash,
-                OsStr::new(&format!("{id}.jsonl")),
-                || {},
-                || {
-                    let quarantine = std::fs::read_dir(&project)
-                        .unwrap()
-                        .flatten()
-                        .find(|entry| {
-                            entry
-                                .file_name()
-                                .to_string_lossy()
-                                .contains(".aiterm-quarantine-")
-                        })
-                        .unwrap()
-                        .path();
-                    std::fs::rename(&quarantine, &held_original).unwrap();
-                    symlink(&outside, &quarantine).unwrap();
-                    quarantine_path.replace(Some(quarantine));
-                },
-                || {},
-            )
-            .unwrap();
-
-        let quarantine = quarantine_path.into_inner().unwrap();
-        assert!(std::fs::symlink_metadata(&quarantine)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
-        assert_eq!(std::fs::read(&held_original).unwrap(), b"");
-        assert!(!source.exists());
-        assert_eq!(
-            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
-            b"verified original"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exact_inode_trash_ignores_a_quarantine_aba_after_verification() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-production-session-post-verify-aba-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let home = root.join("home");
-        let project = home.join(".claude/projects/project");
-        let trash_path = home.join(".claude/trash");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&trash_path).unwrap();
-        let id = "16161616-1616-4616-8616-161616161616";
-        let source = project.join(format!("{id}.jsonl"));
-        let held_original = project.join("held-original.jsonl");
-        std::fs::write(&source, b"verified original transcript").unwrap();
-        let verified = verified_session_file("claude", &source, &home).unwrap();
-        let trash = VerifiedDirectory::open(&trash_path).unwrap();
-
-        verified
-            .rename_to_with_hooks(
-                &trash,
-                OsStr::new(&format!("{id}.jsonl")),
-                || {},
-                || {},
-                || {
-                    let quarantine = std::fs::read_dir(&project)
-                        .unwrap()
-                        .flatten()
-                        .find(|entry| {
-                            entry
-                                .file_name()
-                                .to_string_lossy()
-                                .contains(".aiterm-quarantine-")
-                        })
-                        .unwrap()
-                        .path();
-                    std::fs::rename(&quarantine, &held_original).unwrap();
-                    std::fs::write(&quarantine, b"unverified replacement").unwrap();
-                },
-            )
-            .unwrap();
-
-        assert_eq!(
-            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
-            b"verified original transcript"
-        );
-        assert_eq!(std::fs::read(&held_original).unwrap(), b"");
-        let replacement = std::fs::read_dir(&project)
-            .unwrap()
-            .flatten()
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".aiterm-quarantine-")
-            })
-            .unwrap()
-            .path();
-        assert_eq!(std::fs::read(replacement).unwrap(), b"unverified replacement");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exact_archive_never_publishes_a_destination_replacement_after_verification() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-production-session-destination-aba-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let home = root.join("home");
-        let project = home.join(".claude/projects/project");
-        let trash_path = home.join(".claude/trash");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&trash_path).unwrap();
-        let id = "17171717-1717-4717-8717-171717171717";
-        let source = project.join(format!("{id}.jsonl"));
-        let displaced_archive = trash_path.join("held-exact-archive");
-        std::fs::write(&source, b"verified original transcript").unwrap();
-        let verified = verified_session_file("claude", &source, &home).unwrap();
-        let trash = VerifiedDirectory::open(&trash_path).unwrap();
-
-        let result = verified.rename_to_with_hooks(
-            &trash,
-            OsStr::new(&format!("{id}.jsonl")),
-            || {},
-            || {},
-            || {
-                let archive_entry = std::fs::read_dir(&trash_path)
-                    .unwrap()
-                    .flatten()
-                    .find(|entry| {
-                        let name = entry.file_name();
-                        let name = name.to_string_lossy();
-                        name.contains(".aiterm-exact-archive-") || name == format!("{id}.jsonl")
-                    })
-                    .unwrap()
-                    .path();
-                std::fs::rename(&archive_entry, &displaced_archive).unwrap();
-                std::fs::write(&archive_entry, b"unverified destination replacement").unwrap();
-            },
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            std::fs::read(&displaced_archive).unwrap(),
-            b"verified original transcript"
-        );
-        assert_eq!(std::fs::read(&source).unwrap_or_default(), b"");
-        assert_eq!(
-            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
-            b"unverified destination replacement"
-        );
-        let quarantine = std::fs::read_dir(&project)
-            .unwrap()
-            .flatten()
-            .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".aiterm-quarantine-")
-            })
-            .unwrap()
-            .path();
-        assert_eq!(
-            std::fs::read(quarantine).unwrap(),
-            b"verified original transcript"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
     #[cfg(target_os = "linux")]
     #[test]
     fn archive_transaction_holds_a_write_lease_through_source_retirement() {
