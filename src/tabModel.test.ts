@@ -106,6 +106,40 @@ test("registry recovery refetches when queued post-snapshot revisions have a gap
   assert.deepEqual(recovery.projection().tabs, snapshots[1].tabs);
 });
 
+test("registry recovery bounds an event flood and replaces it with a fresh snapshot", async () => {
+  let loads = 0;
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const recovery = createTabRegistryRecovery<{ id: string; title: string }>(
+    { revision: null, tabs: [] },
+    async () => {
+      loads += 1;
+      if (loads === 1) {
+        await firstGate;
+        return { revision: 1, tabs: [{ id: "stale", title: "stale" }] };
+      }
+      return { revision: 2_000, tabs: [{ id: "current", title: "current" }] };
+    },
+    () => {},
+  );
+
+  const recovering = recovery.recover();
+  for (let revision = 2; revision <= 1_100; revision += 1) {
+    recovery.accept({
+      change: "opened",
+      revision,
+      tabId: `tab-${revision}`,
+      tab: { id: `tab-${revision}`, title: "flood" },
+    });
+  }
+  releaseFirst();
+  await recovering;
+
+  assert.equal(loads, 2);
+  assert.equal(recovery.projection().revision, 2_000);
+  assert.deepEqual(recovery.projection().tabs, [{ id: "current", title: "current" }]);
+});
+
 test("Rust descriptors replace metadata without changing active tab identity", () => {
   const before = [{ id: "tab-a", title: "repo", slotId: "old" }];
   const after = reconcileTabs(before, [{ id: "tab-a", title: "repo", slotId: "new" }]);

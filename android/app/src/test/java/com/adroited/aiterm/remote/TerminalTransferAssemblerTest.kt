@@ -64,6 +64,33 @@ class TerminalTransferAssemblerTest {
         assertTrue(assembler.accept(invalid) is TerminalTransferResult.Recover)
     }
 
+    @Test
+    fun scrollbackRowBudgetIsEnforcedBeforeAnIncompleteTransferCanAccumulate() {
+        val assembler = TerminalTransferAssembler(maxScrollbackRows = 1)
+        val oversizedFirstChunk = TerminalTransferChunk(
+            transferId = "history",
+            tabId = "tab-1",
+            attachmentId = "attachment-1",
+            kind = TerminalTransferKind.Scrollback,
+            baseRevision = 11,
+            finalRevision = 11,
+            rowStart = 0,
+            rowEnd = 2,
+            index = 0,
+            total = 2,
+            requestId = 4,
+            part = TerminalTransferPart.Scrollback(
+                listOf(
+                    ScreenRow(listOf(ScreenCell("a"))),
+                    ScreenRow(listOf(ScreenCell("b"))),
+                ),
+            ),
+        )
+
+        assertTrue(assembler.accept(oversizedFirstChunk) is TerminalTransferResult.Recover)
+        assertEquals(0, assembler.pendingCount)
+    }
+
     private fun snapshotChunk(index: Int, row: Int, text: String) = TerminalTransferChunk(
         transferId = "11111111-1111-4111-8111-111111111111",
         tabId = "tab-1",

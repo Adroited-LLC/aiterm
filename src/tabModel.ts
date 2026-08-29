@@ -98,6 +98,7 @@ export function createTabRegistryRecovery<T extends { id: TabId }>(
 ): TabRegistryRecovery<T> {
   let current = initial;
   let pending: TabRegistryEvent<T>[] = [];
+  let pendingOverflowed = false;
   let inFlight: Promise<void> | null = null;
 
   const commit = (event: TabRegistryEvent<T>): boolean => {
@@ -116,6 +117,12 @@ export function createTabRegistryRecovery<T extends { id: TabId }>(
       for (;;) {
         const snapshot = await loadSnapshot();
         commit({ change: "snapshot", ...snapshot });
+
+        if (pendingOverflowed) {
+          pending = [];
+          pendingOverflowed = false;
+          continue;
+        }
 
         const queued = pending;
         pending = [];
@@ -140,7 +147,12 @@ export function createTabRegistryRecovery<T extends { id: TabId }>(
   return {
     accept(event) {
       if (inFlight !== null) {
-        pending.push(event);
+        if (!pendingOverflowed && pending.length < MAX_RECOVERY_EVENTS) {
+          pending.push(event);
+        } else {
+          pending = [];
+          pendingOverflowed = true;
+        }
         return inFlight;
       }
       if (!commit(event)) {
@@ -153,6 +165,8 @@ export function createTabRegistryRecovery<T extends { id: TabId }>(
     projection: () => current,
   };
 }
+
+const MAX_RECOVERY_EVENTS = 1_024;
 
 interface ExitEvent {
   tabId: TabId;

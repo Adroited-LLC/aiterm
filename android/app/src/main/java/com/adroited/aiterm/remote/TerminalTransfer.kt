@@ -75,6 +75,7 @@ sealed interface TerminalTransferResult {
 class TerminalTransferAssembler(
     private val maxViewportRows: Int = 512,
     private val maxScrollbackRows: Int = 10_000,
+    private val maxDecodedBytes: Long = 8L * 1_024 * 1_024,
 ) {
     private var header: Header? = null
     private var nextIndex = 0
@@ -83,6 +84,7 @@ class TerminalTransferAssembler(
     private var diffMetadata: TerminalTransferPart.Diff? = null
     private val rows = mutableListOf<ScreenRow>()
     private val patches = mutableListOf<RowPatch>()
+    private var decodedBytes = 0L
 
     val activeTransferId: String? get() = header?.transferId
     val pendingCount: Int get() = if (header == null) 0 else 1
@@ -102,11 +104,15 @@ class TerminalTransferAssembler(
             }
             if (chunk.index != nextIndex || chunk.rowStart != nextRow) invalid()
             if (chunk.rowEnd - chunk.rowStart != chunk.part.transferRows.size) invalid()
+            accountDecodedRows(chunk.part.transferRows)
 
             when (val part = chunk.part) {
                 is TerminalTransferPart.Snapshot -> acceptSnapshotPart(part)
                 is TerminalTransferPart.Diff -> acceptDiffPart(part)
-                is TerminalTransferPart.Scrollback -> rows += part.rows
+                is TerminalTransferPart.Scrollback -> {
+                    if (rows.size + part.rows.size > maxScrollbackRows) invalid()
+                    rows += part.rows
+                }
             }
             nextIndex++
             nextRow = chunk.rowEnd
@@ -127,6 +133,7 @@ class TerminalTransferAssembler(
         diffMetadata = null
         rows.clear()
         patches.clear()
+        decodedBytes = 0L
     }
 
     private fun acceptSnapshotPart(part: TerminalTransferPart.Snapshot) {
@@ -183,7 +190,6 @@ class TerminalTransferAssembler(
                 chunk.attachmentId,
             )
             TerminalTransferKind.Scrollback -> {
-                if (rows.size > maxScrollbackRows) invalid()
                 TerminalTransferResult.Scrollback(
                     chunk.tabId,
                     chunk.finalRevision,
@@ -246,6 +252,16 @@ class TerminalTransferAssembler(
                 index += 2
             } else {
                 index++
+            }
+        }
+    }
+
+    private fun accountDecodedRows(incoming: List<ScreenRow>) {
+        for (row in incoming) {
+            decodedBytes += 16
+            for (cell in row.cells) {
+                decodedBytes += 32L + cell.text.encodeToByteArray().size
+                if (decodedBytes > maxDecodedBytes) invalid()
             }
         }
     }
