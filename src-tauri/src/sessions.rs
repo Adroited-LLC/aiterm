@@ -1085,6 +1085,16 @@ impl VerifiedDirectory {
 struct VerifiedSessionFile {
     parent: File,
     name: std::ffi::OsString,
+    object: File,
+    kind: VerifiedEntryKind,
+    display_parent: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum VerifiedEntryKind {
+    File,
+    Directory,
 }
 
 #[cfg(not(unix))]
@@ -1100,38 +1110,144 @@ impl VerifiedSessionFile {
 
 #[cfg(unix)]
 impl VerifiedSessionFile {
-    fn open(&self) -> Result<File, String> {
-        let name = CString::new(self.name.as_bytes()).map_err(|_| "invalid transcript name")?;
-        let fd = unsafe {
-            libc::openat(
-                self.parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
+    fn from_entry(
+        parent: File,
+        name: std::ffi::OsString,
+        kind: VerifiedEntryKind,
+        display_parent: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid session entry name")?;
+        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        if matches!(kind, VerifiedEntryKind::Directory) {
+            flags |= libc::O_DIRECTORY;
+        }
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name_c.as_ptr(), flags) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let file = unsafe { File::from_raw_fd(fd) };
-        if !file.metadata().map_err(|e| e.to_string())?.file_type().is_file() {
+        let object = unsafe { File::from_raw_fd(fd) };
+        let file_type = object.metadata().map_err(|e| e.to_string())?.file_type();
+        let expected = match kind {
+            VerifiedEntryKind::File => file_type.is_file(),
+            VerifiedEntryKind::Directory => file_type.is_dir(),
+        };
+        if !expected {
+            return Err("session entry has an unexpected type".into());
+        }
+        Ok(Self {
+            parent,
+            name,
+            object,
+            kind,
+            display_parent,
+        })
+    }
+
+    fn open(&self) -> Result<File, String> {
+        if !matches!(self.kind, VerifiedEntryKind::File) {
             return Err("session transcript is not a regular file".into());
         }
-        Ok(file)
+        self.object.try_clone().map_err(|e| e.to_string())
     }
 
     fn rename_to(&self, destination: &VerifiedDirectory, name: &OsStr) -> Result<(), String> {
-        let _open = self.open()?;
-        let source = CString::new(self.name.as_bytes()).map_err(|_| "invalid transcript name")?;
-        let destination_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash name")?;
-        let result = unsafe {
-            libc::renameat(
+        self.rename_to_with_hooks(destination, name, || {}, || {})
+    }
+
+    fn rename_to_with_hooks(
+        &self,
+        destination: &VerifiedDirectory,
+        name: &OsStr,
+        before_quarantine: impl FnOnce(),
+        after_quarantine: impl FnOnce(),
+    ) -> Result<(), String> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (destination, name, before_quarantine, after_quarantine);
+            return Err("exact-inode session moves require Linux renameat2".into());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let source = CString::new(self.name.as_bytes())
+                .map_err(|_| "invalid session entry name")?;
+            let quarantine_name = format!(".aiterm-quarantine-{}", uuid::Uuid::new_v4());
+            let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
+            let quarantine_path = self.display_parent.join(&quarantine_name);
+            let source_path = self.display_parent.join(&self.name);
+            before_quarantine();
+            rename_noreplace(
                 self.parent.as_raw_fd(),
-                source.as_ptr(),
-                destination.file.as_raw_fd(),
-                destination_name.as_ptr(),
+                &source,
+                self.parent.as_raw_fd(),
+                &quarantine,
             )
-        };
-        if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error().to_string()) }
+            .map_err(|error| format!(
+                "could not quarantine verified session entry at {}: {error}",
+                quarantine_path.display()
+            ))?;
+            after_quarantine();
+
+            let quarantined = self.open_named(&quarantine)?;
+            if !same_file_identity(&self.object, &quarantined)? {
+                return match rename_noreplace(
+                    self.parent.as_raw_fd(),
+                    &quarantine,
+                    self.parent.as_raw_fd(),
+                    &source,
+                ) {
+                    Ok(()) => Err(format!(
+                        "session entry identity changed; unverified object restored from {} to {}",
+                        quarantine_path.display(),
+                        source_path.display()
+                    )),
+                    Err(error) => Err(format!(
+                        "session entry identity changed; unverified object remains recoverable at {} because {} is occupied: {error}",
+                        quarantine_path.display(),
+                        source_path.display()
+                    )),
+                };
+            }
+
+            let destination_name = CString::new(name.as_bytes())
+                .map_err(|_| "invalid trash name")?;
+            if let Err(error) = rename_noreplace(
+                self.parent.as_raw_fd(),
+                &quarantine,
+                destination.file.as_raw_fd(),
+                &destination_name,
+            ) {
+                return match rename_noreplace(
+                    self.parent.as_raw_fd(),
+                    &quarantine,
+                    self.parent.as_raw_fd(),
+                    &source,
+                ) {
+                    Ok(()) => Err(format!(
+                        "could not move verified session entry to trash; restored from {} to {}: {error}",
+                        quarantine_path.display(),
+                        source_path.display()
+                    )),
+                    Err(restore_error) => Err(format!(
+                        "could not move verified session entry to trash; exact object remains recoverable at {}: {error}; restore failed: {restore_error}",
+                        quarantine_path.display()
+                    )),
+                };
+            }
+            Ok(())
+        }
+    }
+
+    fn open_named(&self, name: &CString) -> Result<File, String> {
+        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        if matches!(self.kind, VerifiedEntryKind::Directory) {
+            flags |= libc::O_DIRECTORY;
+        }
+        let fd = unsafe { libc::openat(self.parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error().to_string())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
     }
 
     fn create_sibling(&self, name: &OsStr, bytes: &[u8]) -> Result<(), String> {
@@ -1154,29 +1270,42 @@ impl VerifiedSessionFile {
     }
 
     fn rename_directory_to(&self, destination: &VerifiedDirectory, name: &OsStr) -> Result<(), String> {
-        let source = CString::new(self.name.as_bytes()).map_err(|_| "invalid directory name")?;
-        let fd = unsafe {
-            libc::openat(
-                self.parent.as_raw_fd(),
-                source.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+        if !matches!(self.kind, VerifiedEntryKind::Directory) {
+            return Err("session sidecar is not a directory".into());
         }
-        let _verified = unsafe { File::from_raw_fd(fd) };
-        let destination_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash name")?;
-        let result = unsafe {
-            libc::renameat(
-                self.parent.as_raw_fd(),
-                source.as_ptr(),
-                destination.file.as_raw_fd(),
-                destination_name.as_ptr(),
-            )
-        };
-        if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error().to_string()) }
+        self.rename_to(destination, name)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(
+    old_dir: std::os::fd::RawFd,
+    old_name: &CString,
+    new_dir: std::os::fd::RawFd,
+    new_name: &CString,
+) -> Result<(), String> {
+    let result = unsafe {
+        libc::renameat2(
+            old_dir,
+            old_name.as_ptr(),
+            new_dir,
+            new_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &File, right: &File) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let left = left.metadata().map_err(|e| e.to_string())?;
+    let right = right.metadata().map_err(|e| e.to_string())?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
 #[cfg(unix)]
@@ -1184,7 +1313,14 @@ fn verified_directory_entry(root: &Path, path: &Path) -> Result<VerifiedSessionF
     let relative = path.strip_prefix(root).map_err(|_| "directory escapes its store")?;
     let root = VerifiedDirectory::open(root)?;
     let (parent, name) = root.open_parent(relative)?;
-    Ok(VerifiedSessionFile { parent, name })
+    VerifiedSessionFile::from_entry(
+        parent,
+        name,
+        VerifiedEntryKind::Directory,
+        path.parent()
+            .ok_or("session sidecar has no parent")?
+            .to_path_buf(),
+    )
 }
 
 #[cfg(unix)]
@@ -1203,9 +1339,12 @@ fn verified_session_file(
     let relative = path.strip_prefix(&root).map_err(|_| "session transcript escapes its store")?;
     let root = VerifiedDirectory::open(&root)?;
     let (parent, name) = root.open_parent(relative)?;
-    let verified = VerifiedSessionFile { parent, name };
-    let _ = verified.open()?;
-    Ok(verified)
+    VerifiedSessionFile::from_entry(
+        parent,
+        name,
+        VerifiedEntryKind::File,
+        path.parent().ok_or("session transcript has no parent")?.to_path_buf(),
+    )
 }
 
 #[cfg(not(unix))]
@@ -3807,6 +3946,99 @@ mod tests {
         assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside sentinel");
         assert!(!pinned.join("project").join(format!("{id}.jsonl")).exists());
         assert_eq!(std::fs::read(pinned_trash.join(format!("{id}.jsonl"))).unwrap(), b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_inode_trash_refuses_and_restores_a_swapped_leaf() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-session-leaf-swap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "13131313-1313-4313-8313-131313131313";
+        let source = project.join(format!("{id}.jsonl"));
+        let original_elsewhere = project.join("original-elsewhere.jsonl");
+        std::fs::write(&source, b"verified original").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let result = verified.rename_to_with_hooks(
+            &trash,
+            OsStr::new(&format!("{id}.jsonl")),
+            || {
+                std::fs::rename(&source, &original_elsewhere).unwrap();
+                std::fs::write(&source, b"unverified replacement").unwrap();
+            },
+            || {},
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"unverified replacement");
+        assert_eq!(
+            std::fs::read(&original_elsewhere).unwrap(),
+            b"verified original"
+        );
+        assert!(!trash_path.join(format!("{id}.jsonl")).exists());
+        assert!(std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".aiterm-quarantine-")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_inode_trash_keeps_a_mismatched_leaf_recoverable_when_restore_is_occupied() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-production-session-quarantine-fallback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "14141414-1414-4414-8414-141414141414";
+        let source = project.join(format!("{id}.jsonl"));
+        let original_elsewhere = project.join("original-elsewhere.jsonl");
+        std::fs::write(&source, b"verified original").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = verified
+            .rename_to_with_hooks(
+                &trash,
+                OsStr::new(&format!("{id}.jsonl")),
+                || {
+                    std::fs::rename(&source, &original_elsewhere).unwrap();
+                    std::fs::write(&source, b"unverified replacement").unwrap();
+                },
+                || {
+                    std::fs::write(&source, b"new source occupant").unwrap();
+                },
+            )
+            .unwrap_err();
+
+        let quarantine = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().contains(".aiterm-quarantine-"))
+            .expect("the mismatched object remains at a recoverable internal name")
+            .path();
+        assert_eq!(std::fs::read(&source).unwrap(), b"new source occupant");
+        assert_eq!(std::fs::read(&quarantine).unwrap(), b"unverified replacement");
+        assert!(error.contains(&quarantine.to_string_lossy().to_string()));
+        assert!(!trash_path.join(format!("{id}.jsonl")).exists());
+        assert_eq!(
+            std::fs::read(&original_elsewhere).unwrap(),
+            b"verified original"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
