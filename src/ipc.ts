@@ -581,6 +581,8 @@ export interface ModelCard {
   prompt_price: number | null;
   completion_price: number | null;
   modalities: string[];
+  /** Epoch seconds the provider listed it, where it says. */
+  created: number | null;
 }
 export const providerModelCards = (id: string) =>
   invoke<ModelCard[]>("provider_model_cards", { id });

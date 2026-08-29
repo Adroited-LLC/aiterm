@@ -1,14 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   DirectoryEntry, EndpointCard, MaxPrice, ModelCard, Policy, ProviderView,
-  providerDelete, providerDirectory, providerManagementKeySet, providerModelCards,
+  providerActivity, providerDelete, providerDirectory, providerManagementKeySet, providerModelCards,
   providerModelEndpoints, providerModels, providerPolicySet, providerRouteSet,
   providerSave, providerStartupSet, providersList, Route,
 } from "../ipc";
 import RoutingActivity from "./RoutingActivity";
 import BrandIcon from "./BrandIcon";
 import Icon from "./Icon";
-import { Star, X } from "lucide-react";
+import { Pin, Star, X } from "lucide-react";
 import { brandForModel, brandForName, brandForUrl } from "../brand";
 
 /** Base URLs worth not making people look up. Anything OpenAI-compatible works;
@@ -31,6 +31,58 @@ const fmtPrice = (p: number | null) =>
   p == null ? "—" : p === 0 ? "free" : `$${+(p * 1e6).toFixed(2)}/M`;
 
 /** Free means the provider *said* zero — both directions, not just unknown. */
+/** How the browser is set up: what is typed, filtered and sorted. Saved as
+ *  the default the browser opens with, because "newest first" or "the ones I
+ *  use" is a way of looking at the catalogue, not a one-off. */
+export interface BrowseDefault {
+  query: string;
+  filter: "all" | "free" | "paid" | "starred";
+  minCtx: number;
+  vendor: string;
+  input: "any" | "text" | "image";
+  sort: SortKey;
+}
+export type SortKey = "name" | "newest" | "cheapest" | "priciest" | "context" | "used";
+const BROWSE_KEY = "aiterm.modelBrowser";
+const BROWSE_BLANK: BrowseDefault = { query: "", filter: "all", minCtx: 0, vendor: "", input: "any", sort: "name" };
+export function loadBrowseDefault(): BrowseDefault {
+  try {
+    const raw = localStorage.getItem(BROWSE_KEY);
+    return raw ? { ...BROWSE_BLANK, ...JSON.parse(raw) } : BROWSE_BLANK;
+  } catch {
+    return BROWSE_BLANK;
+  }
+}
+function saveBrowseDefault(d: BrowseDefault) {
+  try { localStorage.setItem(BROWSE_KEY, JSON.stringify(d)); } catch { /* private mode */ }
+}
+const sameBrowse = (a: BrowseDefault, b: BrowseDefault) =>
+  a.query.trim() === b.query.trim() && a.filter === b.filter && a.minCtx === b.minCtx
+  && a.vendor === b.vendor && a.input === b.input && a.sort === b.sort;
+
+/** The vendor half of an OpenRouter id, "anthropic/claude-x" → "anthropic";
+ *  a bare id has none. */
+const vendorOf = (m: ModelCard) => {
+  const i = m.id.indexOf("/");
+  return i > 0 ? m.id.slice(0, i) : "";
+};
+/** Blended $/M for ordering by price: input weighs 3:1 over output — a
+ *  typical turn reads far more than it writes — and a price nobody quoted
+ *  sorts last, not free. */
+const blendedPrice = (m: ModelCard) =>
+  m.prompt_price === null && m.completion_price === null
+    ? Number.POSITIVE_INFINITY
+    : ((m.prompt_price ?? 0) * 3 + (m.completion_price ?? 0)) / 4 * 1e6;
+
+const SORTS: { key: SortKey; label: string }[] = [
+  { key: "name", label: "Name" },
+  { key: "newest", label: "Newest" },
+  { key: "cheapest", label: "Cheapest" },
+  { key: "priciest", label: "Priciest" },
+  { key: "context", label: "Longest context" },
+  { key: "used", label: "Most used" },
+];
+
 const isFree = (m: ModelCard) =>
   m.prompt_price === 0 && (m.completion_price ?? 0) === 0;
 
@@ -128,9 +180,20 @@ export default function ModelAccess({ focusProvider }: Props) {
   const [browsing, setBrowsing] = useState<string | null>(null);
   const [cards, setCards] = useState<Record<string, ModelCard[]>>({});
   const [browseErr, setBrowseErr] = useState<string | null>(null);
-  const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<"all" | "free" | "paid" | "starred">("all");
-  const [minCtx, setMinCtx] = useState(0);
+  const browseDefault = useRef(loadBrowseDefault());
+  const [query, setQuery] = useState(browseDefault.current.query);
+  const [vendor, setVendor] = useState(browseDefault.current.vendor);
+  const [input, setInput] = useState<BrowseDefault["input"]>(browseDefault.current.input);
+  const [sort, setSort] = useState<SortKey>(browseDefault.current.sort);
+  /** Bumped when the default is saved, so the pin re-reads it. */
+  const [defaultGen, setDefaultGen] = useState(0);
+  /** Requests per model from the account's activity — the "most used" order.
+   *  Fetched the first time that order is asked for; null until then, an
+   *  empty map when the account cannot say (no management key). */
+  const [usedBy, setUsedBy] = useState<Map<string, number> | null>(null);
+  const [usedErr, setUsedErr] = useState<string | null>(null);
+  const [filter, setFilter] = useState<BrowseDefault["filter"]>(browseDefault.current.filter);
+  const [minCtx, setMinCtx] = useState(browseDefault.current.minCtx);
   const [picked, setPicked] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   /** Providers that have answered a real request this session — the green
@@ -561,13 +624,56 @@ export default function ModelAccess({ focusProvider }: Props) {
   const all = browsing ? cards[browsing] : undefined;
   const q = query.trim().toLowerCase();
   const starred = browsingProv?.startup_models ?? [];
-  const shown = (all ?? []).filter(
+  const vendors = [...new Set((all ?? []).map(vendorOf).filter(Boolean))].sort();
+  const filtered = (all ?? []).filter(
     (m) =>
       (!q || m.id.toLowerCase().includes(q) || (m.name ?? "").toLowerCase().includes(q)) &&
       (filter === "all" ||
         (filter === "starred" ? starred.includes(m.id) : (filter === "free") === isFree(m))) &&
-      (minCtx === 0 || (m.context_length ?? 0) >= minCtx),
+      (minCtx === 0 || (m.context_length ?? 0) >= minCtx) &&
+      (!vendor || vendorOf(m) === vendor) &&
+      (input === "any" || (input === "image") === m.modalities.includes("image")),
   );
+  const byName = (a: ModelCard, b: ModelCard) => (a.name ?? a.id).localeCompare(b.name ?? b.id);
+  const shown = [...filtered].sort((a, b) => {
+    switch (sort) {
+      case "newest": return (b.created ?? 0) - (a.created ?? 0) || byName(a, b);
+      case "cheapest": return blendedPrice(a) - blendedPrice(b) || byName(a, b);
+      case "priciest": return blendedPrice(b) - blendedPrice(a) || byName(a, b);
+      case "context": return (b.context_length ?? 0) - (a.context_length ?? 0) || byName(a, b);
+      case "used": return (usedBy?.get(b.id) ?? 0) - (usedBy?.get(a.id) ?? 0) || byName(a, b);
+      default: return byName(a, b);
+    }
+  });
+  const current: BrowseDefault = { query, filter, minCtx, vendor, input, sort };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const isDefault = useMemo(() => sameBrowse(current, loadBrowseDefault()), [query, filter, minCtx, vendor, input, sort, defaultGen]);
+  const pinDefault = () => {
+    saveBrowseDefault(current);
+    browseDefault.current = current;
+    setDefaultGen((g) => g + 1);
+  };
+  const resetToDefault = () => {
+    const d = loadBrowseDefault();
+    setQuery(d.query); setFilter(d.filter); setMinCtx(d.minCtx);
+    setVendor(d.vendor); setInput(d.input); setSort(d.sort);
+  };
+
+  // "Most used" needs the account's activity, which needs the management
+  // key. Asked for once per provider, when that order is first chosen.
+  useEffect(() => {
+    if (sort !== "used" || !browsing || usedBy !== null) return;
+    providerActivity(browsing).then((rows) => {
+      const m = new Map<string, number>();
+      for (const r of rows) m.set(r.model, (m.get(r.model) ?? 0) + r.requests);
+      setUsedBy(m);
+      setUsedErr(null);
+    }).catch((e) => {
+      setUsedBy(new Map());
+      setUsedErr(String(e));
+    });
+  }, [sort, browsing, usedBy]);
+  useEffect(() => { setUsedBy(null); setUsedErr(null); }, [browsing]);
   // The card follows the pick, or the first match — so it always shows
   // something while there is anything to show.
   const sel = shown.find((m) => m.id === picked) ?? shown[0];
@@ -930,6 +1036,45 @@ export default function ModelAccess({ focusProvider }: Props) {
               <option value={1000000}>≥ 1M</option>
             </select>
           </div>
+          <div className="mb-controls mb-controls-2">
+            {vendors.length > 0 && (
+              <select className="set-select mb-ctx" value={vendor} onChange={(e) => setVendor(e.target.value)} title="Vendor">
+                <option value="">Any vendor</option>
+                {vendors.map((v) => <option key={v} value={v}>{v}</option>)}
+              </select>
+            )}
+            <select className="set-select mb-ctx" value={input} onChange={(e) => setInput(e.target.value as BrowseDefault["input"])} title="Input">
+              <option value="any">Any input</option>
+              <option value="text">Text only</option>
+              <option value="image">Takes images</option>
+            </select>
+            <label className="mb-sort">
+              <span className="set-hint">Sort</span>
+              <select className="set-select mb-ctx" value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
+                {SORTS.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+              </select>
+            </label>
+            <span className="mb-spacer" />
+            {/* The pin is the "default search": what is typed, filtered and
+                sorted now becomes what the browser opens with. Lit when the
+                current view is the saved one. */}
+            <button
+              className={"act-btn mb-pin" + (isDefault ? " on" : "")}
+              title={isDefault ? "This is the default view" : "Make this the default view"}
+              onClick={pinDefault}
+              disabled={isDefault}
+            ><Icon of={Pin} size="sm" fill={isDefault ? "currentColor" : "none"} /> {isDefault ? "Default view" : "Set as default"}</button>
+            {!isDefault && (
+              <button className="act-btn" title="Back to the default view" onClick={resetToDefault}>Reset</button>
+            )}
+          </div>
+          {sort === "used" && usedBy !== null && usedBy.size === 0 && (
+            <div className="set-hint mb-wait">
+              {usedErr
+                ? "Most used needs the account's activity — add an OpenRouter management key below (Activity)."
+                : "No activity recorded for this key yet, so nothing to order by."}
+            </div>
+          )}
 
           {browseErr ? (
             <div className="set-notice">{browseErr}</div>
@@ -945,7 +1090,7 @@ export default function ModelAccess({ focusProvider }: Props) {
                       className={"mb-item" + (sel?.id === m.id ? " on" : "")}
                       onClick={() => setPicked(m.id)}
                     >
-                      <span className="mb-item-name">
+                      <span className="mb-item-name" title={m.id}>
                         <BrandIcon name={brandForModel(m.id)} size={13} className="inline" />
                         {m.name ?? m.id}
                       </span>
@@ -953,6 +1098,16 @@ export default function ModelAccess({ focusProvider }: Props) {
                         <span className="mb-star" title="On the startup list"><Icon of={Star} size="sm" fill="currentColor" /></span>
                       )}
                       {isFree(m) && <span className="mb-free">free</span>}
+                      <span className="mb-col mb-col-ctx" title="Context length">{fmtCtx(m.context_length)}</span>
+                      <span className="mb-col mb-col-price" title="Input / output $ per million tokens">
+                        {isFree(m) ? "" : `${fmtPrice(m.prompt_price)} / ${fmtPrice(m.completion_price)}`}
+                      </span>
+                      {sort === "used" && (usedBy?.get(m.id) ?? 0) > 0 && (
+                        <span className="mb-col mb-col-used" title="Requests, last 30 days">{usedBy!.get(m.id)}×</span>
+                      )}
+                      {sort === "newest" && m.created && (
+                        <span className="mb-col mb-col-used" title="Listed">{ago(m.created)}</span>
+                      )}
                     </button>
                   ))}
                   {shown.length === 0 && (

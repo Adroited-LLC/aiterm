@@ -1851,11 +1851,24 @@ body.dragging * { pointer-events: none; }
    later in this file, and an equal-specificity override would lose the tie. */
 .mb-controls .mb-search { flex: 1; min-width: 60px; width: auto; }
 .mb-controls .mb-ctx { width: auto; flex-shrink: 0; }
+.mb-controls-2 { padding-top: 0; flex-wrap: wrap; }
+.mb-sort { display: inline-flex; align-items: center; gap: 6px; }
+.mb-spacer { flex: 1; }
+.mb-pin { display: inline-flex; align-items: center; gap: 4px; }
+.mb-pin.on { color: var(--accent); border-color: var(--accent); opacity: 1; }
+/* Row columns: name takes the width, the figures sit right in a fixed slot
+   so they line up down the list. */
+.mb-col { flex-shrink: 0; font-size: 10.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; text-align: right; }
+.mb-col-ctx { width: 40px; }
+.mb-col-price { width: 88px; }
+.mb-col-used { width: 52px; color: var(--text-dim); }
 .mb-wait { padding: 14px; }
 /* Grows with the window; 300px is the floor, not the size. */
 .mb-body { display: flex; flex: 1; min-height: 300px; }
 .mb-list {
-  width: clamp(236px, 30%, 400px);
+  /* Wide enough for "Vendor: Model Name (variant)" plus a context and a price
+     column — the list is where the choosing happens; the card is detail. */
+  width: clamp(380px, 56%, 680px);
   flex-shrink: 0;
   overflow-y: auto;
   border-right: 1px solid var(--border);
