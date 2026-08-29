@@ -6,6 +6,5 @@
     <string name="desktops_empty_body">Enable Remote Access on AITerm desktop, choose Pair phone, then scan the QR code it shows.</string>
     <string name="action_pair_desktop">Pair a desktop</string>
     <string name="pairing_title">Pair a desktop</string>
-    <string name="pairing_placeholder">QR pairing arrives with the enrollment flow.</string>
     <string name="action_back">Back</string>
 </resources>

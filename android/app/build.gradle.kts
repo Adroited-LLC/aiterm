@@ -59,6 +59,8 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.process)
+    implementation(libs.androidx.lifecycle.viewmodel.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.navigation.compose)
 
@@ -79,6 +81,7 @@ dependencies {
     implementation(libs.androidx.biometric)
 
     // Tasks 8 and 9: pinned TLS enrollment call and the /v1/ws transport.
+    implementation(libs.conscrypt.android)
     implementation(libs.okhttp)
     implementation(libs.okhttp.tls)
 
