@@ -186,6 +186,7 @@ interface Props {
    *  has written where `renameRows` says to use them. */
   librarian: LibrarianCtl;
   renameRows: boolean;
+  showThreads: boolean;
   onOpenLibrarian: () => void;
 }
 
@@ -196,7 +197,7 @@ export default function SessionsPanel({
   onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
-  librarian, renameRows, onOpenLibrarian,
+  librarian, renameRows, showThreads, onOpenLibrarian,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
@@ -287,6 +288,8 @@ export default function SessionsPanel({
   const [ftResults, setFtResults] = useState<Session[] | null>(null);
 
   useEffect(() => localStorage.setItem("aiterm.viewMode", viewMode), [viewMode]);
+  // The Threads tab switched off while it was the one showing: fall back.
+  useEffect(() => { if (!showThreads && viewMode === "threads") setViewMode("recent"); }, [showThreads, viewMode]);
 
   // Debounced full-text search (tantivy index over titles + message text).
   useEffect(() => {
@@ -1213,7 +1216,7 @@ export default function SessionsPanel({
         />
       )}
       <div className="view-tabs">
-        {(["recent", "project", "date", "threads"] as ViewMode[]).map((m) => (
+        {(["recent", "project", "date", ...(showThreads ? ["threads" as const] : [])] as ViewMode[]).map((m) => (
           <button
             key={m}
             className={"view-tab" + (viewMode === m ? " on" : "")}

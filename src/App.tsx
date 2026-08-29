@@ -2209,6 +2209,7 @@ export default function App() {
                 onTrashSessions={trashSessions}
                 librarian={librarian}
                 renameRows={settings.librarian.renameRows}
+                showThreads={settings.librarian.showThreadsTab}
                 onOpenLibrarian={openLibrarian}
               />
             </div>

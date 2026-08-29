@@ -59,7 +59,6 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
   };
   const counted = Object.keys(lib.store.sessions).length;
   const threads = Object.keys(lib.store.threads).length;
-  const threadList = Object.entries(lib.store.threads).sort((a, b) => a[1].name.localeCompare(b[1].name));
 
   return (
     <>
@@ -135,6 +134,9 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
           <Row label="Use its names in the session list" desc="In place of the raw first prompt. The original stays in the tooltip.">
             <Switch checked={cfg.renameRows} onChange={(on) => set({ renameRows: on })} label="Rename rows" />
           </Row>
+          <Row label="Show the Threads tab" desc="The fourth tab in the sidebar. Off hides the tab; the librarian still runs and its names still show in the list.">
+            <Switch checked={cfg.showThreadsTab} onChange={(on) => set({ showThreadsTab: on })} label="Threads tab" />
+          </Row>
         </div>
       </div>
 
@@ -180,29 +182,6 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
           )}
         </div>
       </div>
-
-      {threadList.length > 0 && (
-        <div className="sgroup">
-          <div className="sgroup-title">Threads</div>
-          <div className="sgroup-rows">
-            <div className="sgroup-foot" style={{ paddingTop: 0, paddingBottom: 6 }}>
-              A hidden thread leaves the Threads tab with its sessions. It is still catalogued, so new sessions of that work keep landing in it.
-            </div>
-            <div className="lib-threads">
-              {threadList.map(([id, t]) => {
-                const n = Object.values(lib.store.sessions).filter((e) => e.thread === id).length;
-                return (
-                  <label key={id} className={"lib-thread" + (t.hidden ? " hidden" : "")}>
-                    <input type="checkbox" checked={!t.hidden} onChange={(e) => void lib.hideThread(id, !e.target.checked)} />
-                    <span className="lib-thread-name">{t.name}</span>
-                    <span className="lib-thread-n">{n}</span>
-                  </label>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      )}
 
       <div className="sgroup">
         <div className="sgroup-title">Prompts</div>

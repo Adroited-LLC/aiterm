@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   EMPTY_LIB, LibEngine, LibRunReport, LibStore, LibTidyReport, Session, librarianForget,
-  librarianHideThread, librarianRenameThread, librarianRun, librarianState, librarianTag, librarianTidy,
+  librarianRenameThread, librarianRun, librarianState, librarianTag, librarianTidy,
 } from "./ipc";
 import { LibrarianSettings } from "./settings";
 
@@ -147,11 +147,6 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     await reload();
   }, [reload]);
 
-  const hideThread = useCallback(async (id: string, hidden: boolean) => {
-    await librarianHideThread(id, hidden);
-    await reload();
-  }, [reload]);
-
   const renameThread = useCallback(async (id: string, name: string) => {
     await librarianRenameThread(id, name);
     await reload();
@@ -163,7 +158,7 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
 
   return {
     store, running, report, progress, pending, ready, run, stop, forget, renameThread, reload,
-    tidy, tidying, tidyReport, tidyDue, tag, hideThread,
+    tidy, tidying, tidyReport, tidyDue, tag,
   };
 }
 

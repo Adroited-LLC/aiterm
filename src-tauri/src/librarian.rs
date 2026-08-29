@@ -65,10 +65,6 @@ pub struct Thread {
     /// Tags the person set by hand — see `Entry::user_tags`.
     #[serde(default)]
     pub user_tags: Vec<String>,
-    /// Hidden from the Threads tab, with its sessions. Kept, and still
-    /// shown to the model, so a hidden thread keeps collecting its sessions.
-    #[serde(default)]
-    pub hidden: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -486,7 +482,6 @@ pub fn apply(store: &mut Store, reply: &[serde_json::Value], asked: &[String], s
                             tags: strings(nt.get("tags")),
                             created: now,
                             user_tags: Vec::new(),
-                            hidden: false,
                         });
                         by_name.insert(tname.to_lowercase(), tid.clone());
                         thread_id = tid;
@@ -599,8 +594,6 @@ pub fn apply_tidy(store: &mut Store, reply: &serde_json::Value) -> Result<(usize
             tags,
             created,
             user_tags,
-            // Hidden stays hidden through a merge if any part was.
-            hidden: merge.iter().filter_map(|m| store.threads.get(m)).any(|t| t.hidden),
         });
         for m in &merge {
             moved.insert(m.clone(), id.clone());
@@ -695,15 +688,6 @@ pub fn librarian_default_prompts() -> DefaultPrompts {
     DefaultPrompts { catalogue: SYSTEM, tidy: TIDY_SYSTEM }
 }
 
-#[tauri::command]
-pub async fn librarian_hide_thread(id: String, hidden: bool) -> Result<(), String> {
-    crate::run_blocking(move || {
-        let mut s = load_store();
-        s.threads.get_mut(&id).ok_or("no such thread")?.hidden = hidden;
-        save_store(&s)
-    })
-    .await
-}
 
 /// Sessions per model call. Several at once is what lets the model see that
 /// two sessions are the same work; too many and a small model loses the

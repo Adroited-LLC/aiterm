@@ -95,8 +95,6 @@ export function buildThreads(store: LibStore, sessions: Session[]): { threads: T
   for (const s of sessions) {
     const e = store.sessions[s.id];
     if (!e) { uncatalogued++; continue; }
-    // A hidden thread takes its sessions with it — they are not loose.
-    if (e.thread && store.threads[e.thread]?.hidden) continue;
     if (e.thread && store.threads[e.thread]) {
       (byThread.get(e.thread) ?? byThread.set(e.thread, []).get(e.thread)!).push(s);
     } else {
