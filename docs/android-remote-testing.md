@@ -102,6 +102,8 @@ scalar plus at most 32 combining scalars. Remote attachments receive complete
 snapshots and revisioned changed-row diffs. A revision mismatch, dropped
 queue, invalid/incomplete transfer, or reconnect requests a fresh snapshot;
 it never reconstructs the screen from historical PTY bytes.
+Scrollback is fetched separately as a bounded page, not carried in a live
+viewport snapshot or live diff.
 
 On 2026-08-29 the following fresh checks completed successfully:
 
@@ -109,9 +111,9 @@ On 2026-08-29 the following fresh checks completed successfully:
 git diff --check && npm run test:ui && npm run build
 # 68 UI tests passed; production build completed.
 
-CARGO_TARGET_DIR=/tmp/aiterm-android-rust-target cargo test --lib \\
-  --test remote_protocol --test remote_auth --test remote_server \\
-  --test remote_terminal --test remote_desktop --test tab_registry \\
+CARGO_TARGET_DIR=/tmp/aiterm-android-rust-target cargo test --lib \
+  --test remote_protocol --test remote_auth --test remote_server \
+  --test remote_terminal --test remote_desktop --test tab_registry \
   --test terminal_screen
 # exited 0; 390 library tests passed, with the selected protocol, gateway,
 # desktop, registry, and screen suites also passing.

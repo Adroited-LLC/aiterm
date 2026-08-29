@@ -23,6 +23,7 @@
   `00dae84`/`6376fd9`/`cc18cc6`/`95aa81e`; desktop migration
   `e530e3d`/`7fb3fc3`/`bc48ce7`; and screen-diff transport
   `7fc57c4`/`83eea25`/`6d484b3`/`4a8547f`/`e28a597`/`e47bcea`/`a2bb863`.
+- Its verification documentation is recorded in `88657a6`.
 - Task 8 is in progress. Its untracked Android files remain outside this
   completed desktop/protocol subplan.
 
