@@ -16,10 +16,10 @@ pub struct PtyInstance {
     child_pid: Option<u32>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PtyManager {
-    ptys: Mutex<HashMap<u32, PtyInstance>>,
-    next_id: AtomicU32,
+    ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
+    next_id: Arc<AtomicU32>,
 }
 
 #[derive(Clone, Serialize)]
@@ -44,6 +44,67 @@ struct PtyExit {
     /// though the process chose it sends you looking for a failure that never
     /// happened.
     signal: Option<String>,
+}
+
+/// Receives the lifetime of one spawned PTY.
+///
+/// The sink belongs to the caller that created this process, so output can be
+/// consumed from its first byte without giving the PTY manager any knowledge
+/// of tabs, screens, or transports.
+pub trait PtySink: Send + Sync + 'static {
+    fn output(&self, pty_id: u32, bytes: &[u8]);
+    fn exited(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>);
+}
+
+/// Process-only inputs for one PTY spawn.
+pub struct PtySpawnSpec {
+    pub cwd: Option<String>,
+    pub command: Option<String>,
+    pub size: PtySize,
+    pub env_provider: Option<String>,
+    pub env_model: Option<String>,
+}
+
+impl PtySpawnSpec {
+    pub fn command(command: impl Into<String>) -> Self {
+        Self {
+            cwd: None,
+            command: Some(command.into()),
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            env_provider: None,
+            env_model: None,
+        }
+    }
+}
+
+/// Thin adapter that keeps the existing desktop IPC contract while desktop
+/// callers still spawn PTYs directly. Task 5 replaces this with tab-owned
+/// attachments; process mechanics stay in [`PtyManager`].
+struct DesktopPtySink {
+    app: AppHandle,
+    on_output: Channel<InvokeResponseBody>,
+}
+
+impl PtySink for DesktopPtySink {
+    fn output(&self, _pty_id: u32, bytes: &[u8]) {
+        let _ = self.on_output.send(InvokeResponseBody::Raw(bytes.to_vec()));
+    }
+
+    fn exited(&self, pty_id: u32, code: Option<u32>, signal: Option<&str>) {
+        let _ = self.app.emit(
+            "pty://exit",
+            PtyExit {
+                id: pty_id,
+                code,
+                signal: signal.map(str::to_owned),
+            },
+        );
+    }
 }
 
 /// A second listener on a pty's life, for anything that is not the desktop
@@ -162,117 +223,128 @@ pub fn pty_spawn(
     env_provider: Option<String>,
     env_model: Option<String>,
 ) -> Result<u32, String> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| e.to_string())?;
-
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let mut cmd = match &command {
-        // Run through the login shell so PATH/aliases resolve like a normal terminal.
-        Some(c) => {
-            let mut b = CommandBuilder::new(&shell);
-            b.args(["-i", "-c", c]);
-            b
-        }
-        None => CommandBuilder::new(&shell),
-    };
-    describe_terminal(&mut cmd);
-    scrub_agent_markers(&mut cmd);
-    // A provider-backed tab (OpenCode on an OpenRouter model) gets the key as
-    // process environment, resolved here from the provider store. It never
-    // crosses the frontend and never touches a command line — /proc shows
-    // argv to everyone, but environ only to the same user, which is the same
-    // exposure as the tool's own credential file.
-    //
-    // That tab's routing rides in the same environment, for the same reason:
-    // the block is compiled here from stored state, so no routing decision
-    // crosses the frontend and none of it appears in argv.
-    // `OPENCODE_CONFIG_CONTENT` merges over the user's own config rather than
-    // replacing it, which is how a model's routing reaches OpenCode without
-    // aiterm ever writing their config file.
-    if let Some(pid) = env_provider {
-        if let Some(p) = crate::providers::load_providers().iter().find(|p| p.id == pid) {
-            if p.is_openrouter() && !p.api_key.is_empty() {
-                cmd.env("OPENROUTER_API_KEY", &p.api_key);
-            }
-            if let Some(model) = env_model.as_deref() {
-                if let Some(cfg) = crate::providers::opencode_config_content(p, model) {
-                    cmd.env("OPENCODE_CONFIG_CONTENT", cfg);
-                }
-            }
-        }
-    }
-    if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
-        cmd.cwd(dir);
-    }
-
-    let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
-    let child_pid = child.process_id();
-    let killer = child.clone_killer();
-    drop(pair.slave);
-
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-
-    let id = state.next_id.fetch_add(1, Ordering::SeqCst);
-    state.ptys.lock().unwrap().insert(
-        id,
-        PtyInstance {
-            master: pair.master,
-            writer,
-            killer,
-            child_pid,
+    state.spawn(
+        PtySpawnSpec {
+            cwd,
+            command,
+            size: PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            env_provider,
+            env_model,
         },
-    );
+        Arc::new(DesktopPtySink { app, on_output }),
+    )
+}
 
-    let app_reader = app.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    // Send raw bytes over a binary Channel — no JSON string
-                    // serialization, and no per-chunk `from_utf8_lossy`, which
-                    // used to corrupt any multibyte char (box-drawing borders,
-                    // emoji) straddling the 8 KB read boundary. xterm decodes
-                    // the byte stream with a persistent UTF-8 decoder, so a char
-                    // split across two chunks is reassembled correctly.
-                    let _ = on_output.send(InvokeResponseBody::Raw(buf[..n].to_vec()));
-                    if let Some(observer) = observer() {
-                        observer.on_output(id, &buf[..n]);
+impl PtyManager {
+    /// Spawn one PTY and deliver its bytes and terminal exit to `sink`.
+    ///
+    /// The legacy observer remains a temporary additive bridge for the remote
+    /// broker. It is deliberately not used as the spawn's primary sink: the
+    /// passed sink observes every byte from this PTY's reader thread.
+    pub fn spawn(&self, spec: PtySpawnSpec, sink: Arc<dyn PtySink>) -> Result<u32, String> {
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(spec.size).map_err(|e| e.to_string())?;
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let mut cmd = match &spec.command {
+            // Run through the login shell so PATH/aliases resolve like a normal terminal.
+            Some(c) => {
+                let mut b = CommandBuilder::new(&shell);
+                b.args(["-i", "-c", c]);
+                b
+            }
+            None => CommandBuilder::new(&shell),
+        };
+        describe_terminal(&mut cmd);
+        scrub_agent_markers(&mut cmd);
+        // A provider-backed tab (OpenCode on an OpenRouter model) gets the key as
+        // process environment, resolved here from the provider store. It never
+        // crosses the frontend and never touches a command line — /proc shows
+        // argv to everyone, but environ only to the same user, which is the same
+        // exposure as the tool's own credential file.
+        //
+        // That tab's routing rides in the same environment, for the same reason:
+        // the block is compiled here from stored state, so no routing decision
+        // crosses the frontend and none of it appears in argv.
+        // `OPENCODE_CONFIG_CONTENT` merges over the user's own config rather than
+        // replacing it, which is how a model's routing reaches OpenCode without
+        // aiterm ever writing their config file.
+        if let Some(pid) = spec.env_provider {
+            if let Some(p) = crate::providers::load_providers()
+                .iter()
+                .find(|p| p.id == pid)
+            {
+                if p.is_openrouter() && !p.api_key.is_empty() {
+                    cmd.env("OPENROUTER_API_KEY", &p.api_key);
+                }
+                if let Some(model) = spec.env_model.as_deref() {
+                    if let Some(cfg) = crate::providers::opencode_config_content(p, model) {
+                        cmd.env("OPENCODE_CONFIG_CONTENT", cfg);
                     }
                 }
             }
         }
-        // Reap the child before announcing the exit. The read loop ends when
-        // the pty closes, which says nothing about *why* — so wait for the
-        // real status. This blocks only this pty's reader thread, and the
-        // child is already gone by the time we get here in every path but a
-        // detaching one, so the wait returns immediately.
-        let status = child.wait().ok();
-        let code = status.as_ref().map(|s| s.exit_code());
-        let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
-        let _ = app_reader.emit(
-            "pty://exit",
-            PtyExit {
-                id,
-                code,
-                signal: signal.clone(),
+        if let Some(dir) = spec.cwd.filter(|d| std::path::Path::new(d).is_dir()) {
+            cmd.cwd(dir);
+        }
+
+        let mut child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+        let child_pid = child.process_id();
+        let killer = child.clone_killer();
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.ptys.lock().unwrap().insert(
+            id,
+            PtyInstance {
+                master: pair.master,
+                writer,
+                killer,
+                child_pid,
             },
         );
-        if let Some(observer) = observer() {
-            observer.on_exit(id, code, signal.as_deref());
-        }
-    });
 
-    Ok(id)
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // A single raw byte stream preserves multibyte UTF-8 across
+                        // 8 KiB reads; the sink decides how its transport consumes it.
+                        sink.output(id, &buf[..n]);
+                        // Compatibility-only fan-out for the existing remote broker.
+                        // Task 6 removes this after every consumer takes a per-spawn sink.
+                        if let Some(observer) = observer() {
+                            observer.on_output(id, &buf[..n]);
+                        }
+                    }
+                }
+            }
+            // Reap the child before announcing the exit. The read loop ends when
+            // the pty closes, which says nothing about *why* — so wait for the
+            // real status. This blocks only this pty's reader thread, and the
+            // child is already gone by the time we get here in every path but a
+            // detaching one, so the wait returns immediately.
+            let status = child.wait().ok();
+            let code = status.as_ref().map(|s| s.exit_code());
+            let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
+            sink.exited(id, code, signal.as_deref());
+            if let Some(observer) = observer() {
+                observer.on_exit(id, code, signal.as_deref());
+            }
+        });
+
+        Ok(id)
+    }
 }
 
 /// Send input to a pty.
@@ -295,9 +367,7 @@ pub async fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> R
 /// The lock is held for the write and nothing else, with no await inside it, so
 /// this cannot block the runtime the command above runs on.
 pub fn write_to_pty(manager: &PtyManager, id: u32, data: &[u8]) -> Result<(), String> {
-    let mut ptys = manager.ptys.lock().unwrap();
-    let pty = ptys.get_mut(&id).ok_or("no such pty")?;
-    pty.writer.write_all(data).map_err(|e| e.to_string())
+    manager.write(id, data)
 }
 
 /// Off the main thread for the same reason as [`pty_write`]: a resize arrives
@@ -315,16 +385,7 @@ pub async fn pty_resize(
 
 /// Split from the command for the same reason as [`write_to_pty`].
 pub fn resize_pty(manager: &PtyManager, id: u32, cols: u16, rows: u16) -> Result<(), String> {
-    let ptys = manager.ptys.lock().unwrap();
-    let pty = ptys.get(&id).ok_or("no such pty")?;
-    pty.master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| e.to_string())
+    manager.resize(id, cols, rows)
 }
 
 /// Reaches the pty table through the Tauri state the app already manages, so
@@ -411,6 +472,51 @@ fn parent_of(pid: u32) -> Option<u32> {
 }
 
 impl PtyManager {
+    /// Write input to one live PTY.
+    pub fn write(&self, id: u32, data: &[u8]) -> Result<(), String> {
+        let mut ptys = self.ptys.lock().unwrap();
+        let pty = ptys.get_mut(&id).ok_or("no such pty")?;
+        pty.writer.write_all(data).map_err(|e| e.to_string())
+    }
+
+    /// Resize one live PTY without coupling the process manager to a caller's
+    /// attachment or focus policy.
+    pub fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+        let ptys = self.ptys.lock().unwrap();
+        let pty = ptys.get(&id).ok_or("no such pty")?;
+        pty.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Stop a PTY's complete process tree and release its process resources.
+    pub fn kill(&self, id: u32) {
+        // Take the instance out under the lock, then release it: the kill below
+        // can block for over a second, and holding the map would stall every
+        // other PTY's writes and resizes for that whole time.
+        let taken = self.ptys.lock().unwrap().remove(&id);
+        if let Some(mut pty) = taken {
+            // `killer.kill()` only reaches the pty's direct child — the login
+            // shell. zsh forks the command rather than exec'ing it, so killing the
+            // shell orphaned every `claude` aiterm ever launched: they stayed in
+            // `claude agents` forever, which made their rows permanently "running"
+            // and left fork-a-copy as the only action the UI would offer.
+            if let Some(pid) = pty.child_pid {
+                kill_tree(pid, std::time::Duration::from_millis(1500));
+            }
+            let _ = pty.killer.kill();
+            // Closing a tab is one of the few things that changes the roster from
+            // inside aiterm. Say so, rather than letting the sidebar keep showing
+            // the session as running for the rest of the cache window.
+            crate::sessions::invalidate_roster();
+        }
+    }
+
     /// The pty whose child tree contains `pid`, found by walking `pid`'s
     /// ancestor chain up to some pty's direct child (the login shell).
     ///
@@ -526,28 +632,8 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
 
 #[tauri::command]
 pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
-    // Take the instance out under the lock, then release it: the kill below
-    // can block for over a second, and holding the map would stall every other
-    // tab's writes and resizes for that whole time.
-    let taken = state.ptys.lock().unwrap().remove(&id);
-    if let Some(mut pty) = taken {
-        crate::run_blocking(move || {
-            // `killer.kill()` only reaches the pty's direct child — the login
-            // shell. zsh forks the command rather than exec'ing it, so killing the
-            // shell orphaned every `claude` aiterm ever launched: they stayed in
-            // `claude agents` forever, which made their rows permanently "running"
-            // and left fork-a-copy as the only action the UI would offer.
-            if let Some(pid) = pty.child_pid {
-                kill_tree(pid, std::time::Duration::from_millis(1500));
-            }
-            let _ = pty.killer.kill();
-            // Closing a tab is one of the few things that changes the roster from
-            // inside aiterm. Say so, rather than letting the sidebar keep showing
-            // the session as running for the rest of the cache window.
-            crate::sessions::invalidate_roster();
-        })
-        .await;
-    }
+    let manager = state.inner().clone();
+    crate::run_blocking(move || manager.kill(id)).await;
     Ok(())
 }
 
@@ -578,7 +664,10 @@ mod tests {
         }
         assert!(!kids.is_empty(), "sh never forked a child to test against");
 
-        assert!(kill_tree(root, Duration::from_millis(1500)), "tree survived");
+        assert!(
+            kill_tree(root, Duration::from_millis(1500)),
+            "tree survived"
+        );
         assert!(!pid_alive(root), "shell still alive");
         for kid in kids {
             assert!(!pid_alive(kid), "grandchild {kid} outlived the kill");
@@ -595,7 +684,12 @@ mod tests {
     fn exit_status_separates_leaving_from_dying() {
         for (script, want) in [("exit 0", 0u32), ("exit 7", 7)] {
             let pair = native_pty_system()
-                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
                 .expect("openpty");
             let mut cmd = CommandBuilder::new("sh");
             cmd.args(["-c", script]);
@@ -609,7 +703,11 @@ mod tests {
                 let _ = reader.read_to_end(&mut sink);
             });
             let status = child.wait().expect("wait");
-            assert_eq!(status.exit_code(), want, "`{script}` reported the wrong status");
+            assert_eq!(
+                status.exit_code(),
+                want,
+                "`{script}` reported the wrong status"
+            );
         }
     }
 
@@ -618,7 +716,12 @@ mod tests {
     #[test]
     fn a_signalled_child_is_not_reported_as_clean() {
         let pair = native_pty_system()
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("openpty");
         let mut cmd = CommandBuilder::new("sh");
         cmd.args(["-c", "sleep 30"]);
@@ -632,7 +735,11 @@ mod tests {
         });
         assert!(kill_tree(pid, Duration::from_millis(1500)), "tree survived");
         let status = child.wait().expect("wait");
-        assert_ne!(status.exit_code(), 0, "a killed child looked like a clean exit");
+        assert_ne!(
+            status.exit_code(),
+            0,
+            "a killed child looked like a clean exit"
+        );
         // And the status must say *how* it died. exit_code() alone is 1 for
         // every signal, which is also what `exit 1` reports — the ambiguity
         // that had a SIGKILLed shell claiming it "exited with status 1".
@@ -678,7 +785,10 @@ mod tests {
             Some(std::ffi::OsStr::new("/tmp/some-other-config")),
             "config, not a session marker — stripping it silently repoints the CLI",
         );
-        assert!(cmd.get_env("ANTHROPIC_API_KEY").is_some(), "credentials must survive");
+        assert!(
+            cmd.get_env("ANTHROPIC_API_KEY").is_some(),
+            "credentials must survive"
+        );
 
         std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
         std::env::remove_var("CLAUDE_CONFIG_DIR");
@@ -732,7 +842,10 @@ mod tests {
             fn on_exit(&self, _pty_id: u32, _code: Option<u32>, _signal: Option<&str>) {}
         }
 
-        assert!(observer().is_none(), "nothing should be observing by default");
+        assert!(
+            observer().is_none(),
+            "nothing should be observing by default"
+        );
         let counting = Arc::new(Counting(AtomicU32::new(0)));
         set_observer(counting.clone());
         observer()
@@ -763,7 +876,10 @@ mod tests {
         let me = std::process::id();
         assert!(chain.contains(&me), "our own pid is missing from the chain");
         if let Some(parent) = parent_of(me).filter(|&p| p > 1) {
-            assert!(chain.contains(&parent), "the walk stopped before our parent");
+            assert!(
+                chain.contains(&parent),
+                "the walk stopped before our parent"
+            );
         }
     }
 
@@ -778,7 +894,10 @@ mod tests {
         let mut tree = vec![unrelated_a, me, unrelated_b];
         let skipped = strip_own_chain(&mut tree, &self_and_ancestors());
 
-        assert!(skipped.contains(&me), "our own pid was left in the kill set");
+        assert!(
+            skipped.contains(&me),
+            "our own pid was left in the kill set"
+        );
         assert!(!tree.contains(&me), "our own pid survived the strip");
         assert_eq!(
             tree,
