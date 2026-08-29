@@ -23,6 +23,7 @@ pub mod pty;
 pub mod detail;
 pub mod sessions;
 pub mod taskbar;
+pub mod tabs;
 pub mod terminal;
 pub mod trace;
 pub mod tray;
