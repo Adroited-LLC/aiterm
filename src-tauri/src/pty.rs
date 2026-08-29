@@ -211,6 +211,15 @@ fn scrub_agent_markers(cmd: &mut CommandBuilder) {
     }
 }
 
+/// A child exists once `spawn_command` succeeds, even if the remaining PTY
+/// setup cannot produce a reader or writer. Do not leave that child running on
+/// an error path: terminate it and reap its status before returning the setup
+/// error to the caller.
+fn reap_failed_spawn(child: &mut dyn portable_pty::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[tauri::command]
 pub fn pty_spawn(
     app: AppHandle,
@@ -298,8 +307,20 @@ impl PtyManager {
         let killer = child.clone_killer();
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                reap_failed_spawn(&mut *child);
+                return Err(error.to_string());
+            }
+        };
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                reap_failed_spawn(&mut *child);
+                return Err(error.to_string());
+            }
+        };
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.ptys.lock().unwrap().insert(
@@ -312,6 +333,7 @@ impl PtyManager {
             },
         );
 
+        let ptys = Arc::clone(&self.ptys);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -337,6 +359,10 @@ impl PtyManager {
             let status = child.wait().ok();
             let code = status.as_ref().map(|s| s.exit_code());
             let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
+            // A concurrent `kill` may already have removed this entry. In
+            // either order, remove only by this PTY's allocation id; never act
+            // on a possibly reused OS pid after the child has been reaped.
+            ptys.lock().unwrap().remove(&id);
             sink.exited(id, code, signal.as_deref());
             if let Some(observer) = observer() {
                 observer.on_exit(id, code, signal.as_deref());

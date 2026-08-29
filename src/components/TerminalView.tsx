@@ -6,6 +6,8 @@ import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
+import { makePtyExitBuffer } from "../ptyExitBuffer";
+import type { PtyExit } from "../ptyExitBuffer";
 import { boldWeightFor } from "../settings";
 import { TerminalInputLine } from "../terminalInput";
 import "@xterm/xterm/css/xterm.css";
@@ -209,6 +211,9 @@ export default function TerminalView({
 
     let unlistenExit: UnlistenFn | null = null;
     let disposed = false;
+    const exitBuffer = makePtyExitBuffer((event) => {
+      onExit(tab.key, event.code ?? null, event.signal ?? null);
+    });
 
     // Manual repaint escape hatch (Ctrl+Shift+L): a clean refit + full
     // re-render. With an accelerated renderer this is rarely needed — no
@@ -229,6 +234,16 @@ export default function TerminalView({
     };
 
     (async () => {
+      // Register before spawning: a short command can exit and emit its event
+      // before `ptySpawn` resolves. The buffer holds that event until the
+      // returned id has a registered terminal handle.
+      unlistenExit = await listen<PtyExit>("pty://exit", (e) => {
+        exitBuffer.receive(e.payload);
+      });
+      if (disposed) {
+        unlistenExit();
+        return;
+      }
       const id = await ptySpawn(
         tab.cwd, tab.command, term.cols, term.rows, onOutput,
         tab.envProvider, tab.envModel,
@@ -238,15 +253,7 @@ export default function TerminalView({
         return;
       }
       ptyIdRef.current = id;
-      unlistenExit = await listen<{
-        id: number;
-        code: number | null;
-        signal: string | null;
-      }>("pty://exit", (e) => {
-        if (e.payload.id === id) {
-          onExit(tab.key, e.payload.code ?? null, e.payload.signal ?? null);
-        }
-      });
+      exitBuffer.bind(id);
       // Roughly how much unsent text is sitting in the running program's input
       // line. Every keystroke passes through here on its way to the PTY, which
       // is enough to answer the only question that matters: is the prompt
@@ -342,6 +349,7 @@ export default function TerminalView({
           return rows;
         },
       });
+      exitBuffer.flush();
     })();
 
     // Debounce resize→fit: splitter drags fire the observer continuously, and
@@ -359,6 +367,7 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
+      exitBuffer.dispose();
       if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();
       unlistenExit?.();

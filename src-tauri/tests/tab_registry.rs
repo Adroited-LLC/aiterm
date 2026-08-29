@@ -143,3 +143,26 @@ fn spawned_pty_also_reaches_the_temporary_legacy_observer() {
     assert_eq!(observer.output(), b"bridge");
     assert_eq!(observer.exits()[0].pty_id, id);
 }
+
+#[test]
+fn a_naturally_exited_pty_is_removed_before_its_sink_is_notified() {
+    let _pty_test_lock = PTY_TEST_LOCK.lock().unwrap();
+    let manager = PtyManager::default();
+    let sink = Arc::new(RecordingSink::default());
+
+    let id = manager
+        .spawn(PtySpawnSpec::command("printf finished"), sink.clone())
+        .expect("spawn PTY");
+    sink.wait_for_exit();
+
+    assert_eq!(
+        manager.write(id, b"late input").unwrap_err(),
+        "no such pty",
+        "a reaped PTY must no longer retain a writer"
+    );
+    assert_eq!(
+        manager.resize(id, 100, 30).unwrap_err(),
+        "no such pty",
+        "a reaped PTY must no longer retain its master"
+    );
+}
