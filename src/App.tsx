@@ -26,7 +26,7 @@ import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
 import {
-  FolderOpen, GitBranch, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
+  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -1435,6 +1435,51 @@ export default function App() {
     });
   }, []);
 
+  /** Show the start view with the open sessions left running behind it —
+   *  the home tab, and where a closed last tab lands. */
+  const goHome = useCallback(() => {
+    setPreviewSession(null);
+    setActiveFileTab(null);
+    setActiveTab(null);
+  }, []);
+
+  /** Tab strip reordering: drop `from` where `to` sits, shifting the rest. */
+  const dragKey = useRef<number | null>(null);
+  const [dragOver, setDragOver] = useState<number | null>(null);
+  const moveTab = useCallback((from: number | null, to: number) => {
+    if (from === null || from === to) return;
+    setTabs((t) => {
+      const a = t.findIndex((x) => x.key === from);
+      const b = t.findIndex((x) => x.key === to);
+      if (a < 0 || b < 0) return t;
+      const next = [...t];
+      const [moved] = next.splice(a, 1);
+      next.splice(b, 0, moved);
+      return next;
+    });
+  }, []);
+
+  // Ctrl+PageDown / Ctrl+PageUp walk the session tabs, wrapping. Not Ctrl+W:
+  // that is delete-word to every shell and editor in the terminal.
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+      if (e.key !== "PageDown" && e.key !== "PageUp") return;
+      const list = tabsRef.current;
+      if (list.length === 0) return;
+      e.preventDefault();
+      const cur = list.findIndex((t) => t.key === activeTabRef.current);
+      const step = e.key === "PageDown" ? 1 : -1;
+      const next = list[(cur + step + list.length) % list.length];
+      setPreviewSession(null);
+      setActiveFileTab(null);
+      setActiveTab(next.key);
+      handles.current.get(next.key)?.focus();
+    };
+    window.addEventListener("keydown", h, true);
+    return () => window.removeEventListener("keydown", h, true);
+  }, []);
+
   /** A terminal's process ended. Whether that closes the tab depends entirely
    *  on why.
    *
@@ -2129,43 +2174,71 @@ export default function App() {
         )}
 
         <div className="panel terminal-panel">
-          {(activeTabObj !== null || fileTabs.some(showsFile)) && (
+          {(tabs.length > 0 || previewSession || fileTabs.some(showsFile)) && (
             <div className="center-tabs">
-              {/* No terminal: the locked tab is the preview, or the start
-                  view, so there is still a way back from a file. */}
-              {!activeTabObj && (
+              {/* Leftmost, always: the way back to the start view — or the
+                  preview that stands in for it — so a file or a session is
+                  never a dead end. */}
+              {previewSession ? (
                 <button
                   className={"center-tab locked" + (activeFileTab === null ? " on" : "")
-                    + agentTint(previewSession?.agent).className}
-                  style={agentTint(previewSession?.agent).style}
-                  title={previewSession?.project_path ?? undefined}
+                    + agentTint(previewSession.agent).className}
+                  style={agentTint(previewSession.agent).style}
+                  title={previewSession.project_path}
                   onClick={() => setActiveFileTab(null)}
                 >
-                  {previewSession
-                    ? <AgentIcon agent={previewSession.agent} size={13} />
-                    : null}
-                  <span className="center-tab-name">
-                    {previewSession ? previewSession.title : "Start"}
-                  </span>
+                  <AgentIcon agent={previewSession.agent} size={13} />
+                  <span className="center-tab-name">{previewSession.title}</span>
                 </button>
-              )}
-              {activeTabObj && (
+              ) : (
                 <button
-                  className={"center-tab locked" + (activeFileTab === null ? " on" : "")
-                    + agentTint(activeTabObj.agentId).className}
-                  style={agentTint(activeTabObj.agentId).style}
-                  title={activeTabObj.cwd ?? undefined}
-                  onClick={() => {
-                    setActiveFileTab(null);
-                    if (activeTab !== null) handles.current.get(activeTab)?.focus();
-                  }}
+                  className={"center-tab home-tab" + (activeTab === null && activeFileTab === null ? " on" : "")}
+                  title="Home — start a session"
+                  onClick={goHome}
                 >
-                  {activeTabObj.agentId
-                    ? <AgentIcon agent={activeTabObj.agentId} size={13} />
-                    : <span className="center-tab-shell">❯</span>}
-                  <span className="center-tab-name">{activeTabObj.title}</span>
+                  <Icon of={Home} size="sm" />
                 </button>
               )}
+              {/* Every open session, in the order they sit — drag one to move
+                  it, middle-click or × to close (which ends its process; the
+                  conversation stays on disk and in the sidebar). */}
+              {tabs.map((t) => {
+                const on = t.key === activeTab && activeFileTab === null && !previewSession;
+                const tint = agentTint(t.agentId);
+                return (
+                  <button
+                    key={t.key}
+                    className={"center-tab session" + (on ? " on" : "") + tint.className
+                      + (ended.has(t.key) ? " ended" : "") + (dragOver === t.key ? " drop" : "")}
+                    style={tint.style}
+                    title={t.cwd ?? undefined}
+                    draggable
+                    onDragStart={(e) => { dragKey.current = t.key; e.dataTransfer.effectAllowed = "move"; }}
+                    onDragOver={(e) => { if (dragKey.current !== null) { e.preventDefault(); setDragOver(t.key); } }}
+                    onDragLeave={() => setDragOver((k) => (k === t.key ? null : k))}
+                    onDrop={(e) => { e.preventDefault(); moveTab(dragKey.current, t.key); dragKey.current = null; setDragOver(null); }}
+                    onDragEnd={() => { dragKey.current = null; setDragOver(null); }}
+                    onClick={() => {
+                      setPreviewSession(null);
+                      setActiveFileTab(null);
+                      setActiveTab(t.key);
+                      handles.current.get(t.key)?.focus();
+                    }}
+                    onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeTab(t.key); } }}
+                  >
+                    {t.agentId
+                      ? <AgentIcon agent={t.agentId} size={13} />
+                      : <span className="center-tab-shell">❯</span>}
+                    <span className="center-tab-name">{t.title}</span>
+                    {attention.has(t.key) && !on && <span className="center-tab-dot" title="Waiting for you" />}
+                    <span
+                      className="center-tab-close"
+                      title="Close (ends the session's process)"
+                      onClick={(e) => { e.stopPropagation(); closeTab(t.key); }}
+                    ><Icon of={X} size="sm" /></span>
+                  </button>
+                );
+              })}
               {fileTabs.filter(showsFile).map((f) => (
                 <button
                   key={f.key}
@@ -2267,7 +2340,7 @@ export default function App() {
             {/* The preview pane sits above the file layer, and the start view
                 would show through under it — neither is drawn while a file
                 tab is the one on screen. */}
-            {tabs.length === 0 && !previewSession && !fileOnScreen && (
+            {activeTab === null && !previewSession && !fileOnScreen && (
               <HomeDashboard
                 sessions={sessions}
                 liveIds={new Set(tabs.map((t) => t.slotId).filter((k): k is string => !!k))}

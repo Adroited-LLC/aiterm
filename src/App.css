@@ -3384,6 +3384,13 @@ input[type="range"]::-webkit-slider-thumb {
 .center-tab.branded { box-shadow: inset 0 2px 0 var(--brand); }
 .center-tab.branded.on { box-shadow: inset 0 2px 0 var(--brand); }
 .center-tab.locked { font-weight: 600; }
+.center-tab.home-tab { padding: 5px 9px; }
+.center-tab.home-tab.on { color: var(--accent); }
+.center-tab.session .center-tab-close { opacity: 0; }
+.center-tab.session:hover .center-tab-close, .center-tab.session.on .center-tab-close { opacity: 1; }
+.center-tab.session.ended { color: var(--text-faint); font-style: italic; }
+.center-tab.session.drop { border-left: 2px solid var(--accent); }
+.center-tab.session[draggable] { user-select: none; }
 .center-tab-name { overflow: hidden; text-overflow: ellipsis; }
 .center-tab-shell { font-size: 11px; color: var(--accent); }
 .center-tab-dot {
