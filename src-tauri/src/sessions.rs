@@ -1404,6 +1404,7 @@ const MAX_EXACT_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 struct ExactFileRetirement {
     source: File,
+    archive: File,
     size: u64,
     modified: std::time::SystemTime,
     hash: [u8; 32],
@@ -1516,10 +1517,36 @@ fn copy_exact_file(
     }
     Ok(ExactFileRetirement {
         source: source.try_clone().map_err(|error| error.to_string())?,
+        archive: destination,
         size: source_size,
         modified,
         hash: source_hash,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn directory_entry_is_exact_object(
+    directory: &File,
+    name: &CString,
+    object: &File,
+) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Ok(false);
+    }
+    let stat = unsafe { stat.assume_init() };
+    let metadata = object.metadata().map_err(|error| error.to_string())?;
+    Ok(stat.st_dev as u64 == metadata.dev() && stat.st_ino as u64 == metadata.ino())
 }
 
 #[cfg(target_os = "linux")]
@@ -1566,30 +1593,21 @@ fn archive_exact_file(
     quarantine_path: &Path,
     after_verification: impl FnOnce(),
 ) -> Result<(), String> {
-    let temporary_name = format!(".aiterm-exact-archive-{}", uuid::Uuid::new_v4());
-    let temporary = CString::new(temporary_name.as_bytes()).unwrap();
     let final_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash name")?;
-    let retirement = copy_exact_file(source, &destination.file, &temporary).map_err(|error| {
+    let retirement = copy_exact_file(source, &destination.file, &final_name).map_err(|error| {
         format!(
-            "could not create exact trash copy; source remains recoverable at {}: {error}",
-            quarantine_path.display()
+            "could not create exact trash copy; source remains recoverable at {} and any exclusive destination is left for recovery: {error}",
+            quarantine_path.display(),
         )
     })?;
     verify_exact_file(&retirement)?;
     after_verification();
-    rename_noreplace(
-        destination.file.as_raw_fd(),
-        &temporary,
-        destination.file.as_raw_fd(),
-        &final_name,
-    )
-    .map_err(|error| {
-        format!(
-            "could not publish exact trash copy; source remains recoverable at {} and copy at {}: {error}",
-            quarantine_path.display(),
-            temporary_name
-        )
-    })?;
+    if !directory_entry_is_exact_object(&destination.file, &final_name, &retirement.archive)? {
+        return Err(format!(
+            "exact trash destination changed; source remains recoverable at {} and is not retired",
+            quarantine_path.display()
+        ));
+    }
     destination
         .file
         .sync_all()
@@ -1763,17 +1781,15 @@ fn archive_exact_directory(
     quarantine_path: &Path,
     after_verification: impl FnOnce(),
 ) -> Result<(), String> {
-    let temporary_name = format!(".aiterm-exact-directory-{}", uuid::Uuid::new_v4());
-    let temporary = CString::new(temporary_name.as_bytes()).unwrap();
     let final_name = CString::new(name.as_bytes()).map_err(|_| "invalid trash directory name")?;
-    let temporary_directory = create_exact_archive_directory(&destination.file, &temporary)
+    let archive_directory = create_exact_archive_directory(&destination.file, &final_name)
         .map_err(|error| format!("could not create sidecar archive: {error}"))?;
     let mut entries = 0usize;
     let mut bytes = 0u64;
     let mut retirements = Vec::new();
     copy_exact_directory_tree(
         source,
-        &temporary_directory,
+        &archive_directory,
         0,
         &mut entries,
         &mut bytes,
@@ -1781,22 +1797,20 @@ fn archive_exact_directory(
     )
     .map_err(|error| {
         format!(
-            "could not create bounded exact sidecar archive; source remains at {} and partial copy at {}: {error}",
+            "could not create bounded exact sidecar archive; source remains at {} and the exclusive destination contains the recoverable partial copy: {error}",
             quarantine_path.display(),
-            temporary_name
         )
     })?;
     for retirement in &retirements {
         verify_exact_file(retirement)?;
     }
     after_verification();
-    rename_noreplace(
-        destination.file.as_raw_fd(),
-        &temporary,
-        destination.file.as_raw_fd(),
-        &final_name,
-    )
-    .map_err(|error| format!("could not publish exact sidecar archive: {error}"))?;
+    if !directory_entry_is_exact_object(&destination.file, &final_name, &archive_directory)? {
+        return Err(format!(
+            "exact sidecar destination changed; source remains recoverable at {} and is not retired",
+            quarantine_path.display()
+        ));
+    }
     destination
         .file
         .sync_all()
@@ -4799,19 +4813,18 @@ mod tests {
             || {},
             || {},
             || {
-                let temporary = std::fs::read_dir(&trash_path)
+                let archive_entry = std::fs::read_dir(&trash_path)
                     .unwrap()
                     .flatten()
                     .find(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .contains(".aiterm-exact-archive-")
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        name.contains(".aiterm-exact-archive-") || name == format!("{id}.jsonl")
                     })
                     .unwrap()
                     .path();
-                std::fs::rename(&temporary, &displaced_archive).unwrap();
-                std::fs::write(&temporary, b"unverified destination replacement").unwrap();
+                std::fs::rename(&archive_entry, &displaced_archive).unwrap();
+                std::fs::write(&archive_entry, b"unverified destination replacement").unwrap();
             },
         );
 
@@ -4822,8 +4835,8 @@ mod tests {
         );
         assert_eq!(std::fs::read(&source).unwrap_or_default(), b"");
         assert_eq!(
-            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap_or_default(),
-            b""
+            std::fs::read(trash_path.join(format!("{id}.jsonl"))).unwrap(),
+            b"unverified destination replacement"
         );
         let quarantine = std::fs::read_dir(&project)
             .unwrap()
