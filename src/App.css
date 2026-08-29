@@ -3880,3 +3880,4 @@ input[type="range"]::-webkit-slider-thumb {
 .thr-stop:hover { color: var(--red); border-color: var(--border); }
 .thr-bar { height: 3px; margin: -4px 6px 0; border-radius: 2px; background: var(--bg-raised); overflow: hidden; }
 .thr-bar > span { display: block; height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.4s; }
+.thr-hint { color: var(--text-faint); font-size: 10px; }

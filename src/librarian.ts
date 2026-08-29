@@ -102,6 +102,15 @@ export function useLibrarian(cfg: LibrarianSettings, sessions: Session[]) {
     return () => clearTimeout(t);
   }, [ready, cfg.auto, sessions]);
 
+  // While a run is going, re-read the store on a clock too: a batch lands
+  // every couple of minutes, and a run that overlapped from before a reload
+  // writes on its own schedule.
+  useEffect(() => {
+    if (!running) return;
+    const t = window.setInterval(() => { void reload(); }, 15_000);
+    return () => clearInterval(t);
+  }, [running, reload]);
+
   const forget = useCallback(async () => {
     await librarianForget();
     setReport(null);

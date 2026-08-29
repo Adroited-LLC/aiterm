@@ -147,6 +147,7 @@ export default function ThreadsView({
           <span className="thr-running">
             <Icon of={Loader2} size="sm" className="spin" />
             {lib.progress ? `${lib.progress.done} of ${lib.progress.total}` : "reading…"}
+            <span className="thr-hint">· ~2 min per 8</span>
             <button className="thr-stop" title="Stop after this batch" onClick={lib.stop}><Icon of={Square} size="sm" /></button>
           </span>
         ) : lib.pending.length > 0 ? (

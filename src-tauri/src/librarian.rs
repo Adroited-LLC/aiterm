@@ -494,7 +494,12 @@ pub fn apply(store: &mut Store, reply: &[serde_json::Value], asked: &[String], s
 /// thread list.
 const BATCH: usize = 8;
 
+/// One run at a time. Two overlapping runs each loaded the store, each
+/// saved it, and the second save dropped what the first had written.
+static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run_sync(engine: Engine, cands: Vec<Candidate>, max: usize) -> Result<RunReport, String> {
+    let _one_at_a_time = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let providers = crate::providers::load_providers();
     let model = engine.label();
     let mut store = load_store();
@@ -519,6 +524,10 @@ fn run_sync(engine: Engine, cands: Vec<Candidate>, max: usize) -> Result<RunRepo
         match ask(&engine, &providers, SYSTEM, &build_prompt(&store, &batch)) {
             Ok((text, cost)) => match parse_reply(&text) {
                 Ok(reply) => {
+                    // Re-read before writing: the model took a minute, and
+                    // anything written meanwhile — by hand, by a test — is
+                    // kept rather than overwritten with this run's copy.
+                    store = load_store();
                     let n = apply(&mut store, &reply, &asked, &seen, &model);
                     if n == 0 {
                         report.errors.push("the model answered, but about none of the sessions it was asked about".into());
