@@ -215,7 +215,10 @@ class AuthenticatedRemoteTransport(
 
     private companion object {
         const val AUTH_TIMEOUT_MILLIS = 10_000L
-        const val REQUEST_TIMEOUT_MILLIS = 15_000L
+        // The desktop bounds descriptor-safe session work at 120 seconds.
+        // Keep a small transport grace period so its correlated result wins
+        // rather than reconnecting while a protected delete is still active.
+        const val REQUEST_TIMEOUT_MILLIS = 130_000L
         const val MAX_PENDING_REQUESTS = 64
         const val MAX_COMPLETED_CORRELATIONS = 64
         const val MAX_EVENTS = 64

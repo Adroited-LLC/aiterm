@@ -6,6 +6,8 @@ import com.adroited.aiterm.terminal.ScreenCell
 import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.ScreenSnapshot
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -65,6 +67,64 @@ class RemoteClientTest {
         assertEquals(ConnectionState.Locked, client.state.value.connection)
         assertEquals(0, client.state.value.pendingTransfers)
         assertTrue(transport.closed)
+    }
+
+    @Test
+    fun lockDuringConnectCannotPublishTheLateConnection() = runTest {
+        val transport = DeferredRemoteTransport(connectImmediately = false)
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        val connecting = async { client.connect() }
+        runCurrent()
+        assertEquals(ConnectionState.Connecting, client.state.value.connection)
+
+        client.lock()
+        transport.allowConnect.complete(Unit)
+        advanceUntilIdle()
+
+        assertFalse(connecting.await())
+        assertEquals(ConnectionState.Locked, client.state.value.connection)
+        assertTrue(transport.closed)
+    }
+
+    @Test
+    fun rapidTabSelectionDetachesStaleAttachmentAndRejectsItsChunks() = runTest {
+        val transport = DeferredRemoteTransport()
+        val store = DefaultTerminalScreenStore()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+
+        client.selectTab("tab-a")
+        runCurrent()
+        client.selectTab("tab-b")
+        runCurrent()
+        assertEquals(1, transport.pendingAttachCount())
+
+        transport.completeNextAttach("tab-a", "attachment-a")
+        runCurrent()
+        assertEquals(listOf("terminal.attach", "terminal.detach", "terminal.attach"), transport.requests.map { it.kind })
+
+        transport.completeNextAttach("tab-b", "attachment-b")
+        runCurrent()
+        assertEquals("tab-b", client.state.value.activeTabId)
+
+        client.acceptForTest(snapshotChunk("old", "tab-a", "attachment-a", "WRONG"))
+        assertEquals(null, store.screen.value)
+        client.acceptForTest(snapshotChunk("current", "tab-b", "attachment-b", "RIGHT"))
+        assertEquals("RIGHT", store.screen.value?.visible?.single()?.plainText())
+        client.lock()
     }
 
     @Test
@@ -187,6 +247,34 @@ class RemoteClientTest {
     }
 }
 
+private fun snapshotChunk(
+    transferId: String,
+    tabId: String,
+    attachmentId: String,
+    text: String,
+) = RemoteServerEvent.TerminalChunk(
+    TerminalTransferChunk(
+        transferId = transferId,
+        tabId = tabId,
+        attachmentId = attachmentId,
+        kind = TerminalTransferKind.Snapshot,
+        baseRevision = 1,
+        finalRevision = 1,
+        rowStart = 0,
+        rowEnd = 1,
+        index = 0,
+        total = 1,
+        requestId = 0,
+        part = TerminalTransferPart.Snapshot(
+            cols = text.length,
+            rows = 1,
+            visible = listOf(ScreenRow(text.map { ScreenCell(it.toString()) })),
+            cursor = CursorState(0, 0, true),
+            modes = com.adroited.aiterm.terminal.TerminalModes(),
+        ),
+    ),
+)
+
 private class FakeRemoteTransport : RemoteTransport {
     override val events = MutableSharedFlow<RemoteServerEvent>(extraBufferCapacity = 8)
     val requests = mutableListOf<RemoteRequest>()
@@ -201,5 +289,52 @@ private class FakeRemoteTransport : RemoteTransport {
 
     override fun close() {
         closed = true
+    }
+}
+
+private class DeferredRemoteTransport(connectImmediately: Boolean = true) : RemoteTransport {
+    override val events = MutableSharedFlow<RemoteServerEvent>(extraBufferCapacity = 8)
+    val requests = mutableListOf<RemoteRequest>()
+    val allowConnect = CompletableDeferred<Unit>().also { if (connectImmediately) it.complete(Unit) }
+    private val attaches = ArrayDeque<Pair<RemoteRequest, CompletableDeferred<RemoteResponse>>>()
+    var closed = false
+
+    override suspend fun connect() {
+        allowConnect.await()
+    }
+
+    override suspend fun request(request: RemoteRequest): RemoteResponse {
+        requests += request
+        if (request.kind != "terminal.attach") {
+            return RemoteResponse.Success(request.requestId, request.kind, byteArrayOf())
+        }
+        val response = CompletableDeferred<RemoteResponse>()
+        attaches += request to response
+        return response.await()
+    }
+
+    fun pendingAttachCount(): Int = attaches.size
+
+    fun completeNextAttach(tabId: String, attachmentId: String) {
+        val (request, response) = attaches.removeFirst()
+        response.complete(RemoteResponse.Success(request.requestId, request.kind, attachedPayload(tabId, attachmentId)))
+    }
+
+    override fun close() {
+        closed = true
+    }
+
+    private fun attachedPayload(tabId: String, attachmentId: String): ByteArray {
+        fun text(value: String): String {
+            val bytes = value.encodeToByteArray()
+            require(bytes.size < 24)
+            return (0x60 + bytes.size).toString(16).padStart(2, '0') + bytes.joinToString("") {
+                it.toUByte().toString(16).padStart(2, '0')
+            }
+        }
+        val encoded = "a4" + text("tab_id") + text(tabId) +
+            text("attachment_id") + text(attachmentId) +
+            text("has_focus") + "f4" + text("title") + text(tabId)
+        return encoded.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
 }
