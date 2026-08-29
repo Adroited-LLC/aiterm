@@ -394,6 +394,7 @@ pub(crate) fn delete_to_trash_at(session_id: &str, trash: &std::fs::File) -> Res
             &database,
             trash,
             || {},
+            || {},
             || Ok(()),
             || Ok(()),
         )
@@ -506,7 +507,11 @@ impl PinnedDatabase {
         Ok((stat.st_dev as u64, stat.st_ino as u64))
     }
 
-    fn connect(&self) -> Result<rusqlite::Connection, String> {
+    fn connect(
+        &self,
+        before_open: impl FnOnce(),
+        after_open: impl FnOnce(),
+    ) -> Result<rusqlite::Connection, String> {
         // `/proc/self/fd/<parent>/<leaf>` walks from the directory descriptor
         // pinned above. If procfs is unavailable we fail closed; reopening the
         // original pathname would reintroduce the root-replacement race.
@@ -522,11 +527,13 @@ impl PinnedDatabase {
         if self.named_identity()? != (self.device, self.inode) {
             return Err("OpenCode database identity changed".into());
         }
+        before_open();
         let connection = rusqlite::Connection::open_with_flags(
             proc_parent.join(std::ffi::OsStr::from_bytes(self.leaf.as_bytes())),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(|error| format!("could not open pinned OpenCode database: {error}"))?;
+        after_open();
         let identity = self.named_identity()?;
         if identity != (self.device, self.inode) {
             return Err("OpenCode database identity changed".into());
@@ -648,6 +655,7 @@ fn delete_to_trash_from_path_with_hooks<AfterPin, DumpGate, SqlGate>(
     database_path: &std::path::Path,
     trash: &std::fs::File,
     after_pin: AfterPin,
+    after_connection_open: impl FnOnce(),
     dump_gate: DumpGate,
     sql_gate: SqlGate,
 ) -> Result<(), String>
@@ -660,8 +668,7 @@ where
         return Err("invalid session id".into());
     }
     let pinned = PinnedDatabase::open(database_path)?;
-    after_pin();
-    let mut connection = pinned.connect()?;
+    let mut connection = pinned.connect(after_pin, after_connection_open)?;
     connection
         .busy_timeout(Duration::from_secs(3))
         .map_err(|error| error.to_string())?;
@@ -1229,6 +1236,100 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn sqlite_can_commit_with_normal_journaling_through_a_held_object_fd() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-opencode-object-fd-probe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let database = root.join("store/opencode.db");
+        let session_id = "ses_objectfdprobe";
+        fixture_database(&database, session_id, "Before");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&database)
+            .unwrap();
+        let held_path = std::path::PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            held.as_raw_fd()
+        ));
+        let mut connection = rusqlite::Connection::open_with_flags(
+            held_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        transaction
+            .execute(
+                "update session set title = 'After' where id = ?1",
+                [session_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let title = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "select title from session where id = ?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(title, "After");
+        assert!(!database.with_extension("db-journal").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opencode_delete_cannot_open_a_replacement_during_a_leaf_aba() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-opencode-leaf-aba-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let database = root.join("store/opencode.db");
+        let held_original = root.join("store/held-original.db");
+        let replacement = root.join("store/replacement.db");
+        let trash_path = root.join("trash");
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let session_id = "ses_leafaba";
+        fixture_database(&database, session_id, "Pinned database");
+        let trash = fixture_directory(&trash_path);
+
+        delete_to_trash_from_path_with_hooks(
+            session_id,
+            &database,
+            &trash,
+            || {
+                std::fs::rename(&database, &held_original).unwrap();
+                fixture_database(&database, session_id, "Replacement sentinel");
+            },
+            || {
+                std::fs::rename(&database, &replacement).unwrap();
+                std::fs::rename(&held_original, &database).unwrap();
+            },
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(!fixture_has_session(&database, session_id));
+        assert!(fixture_has_session(&replacement, session_id));
+        assert_eq!(
+            dump_meta(&trash_path.join(format!("{session_id}.jsonl")))
+                .unwrap()
+                .0,
+            "Pinned database"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn opencode_delete_uses_the_pinned_database_when_its_root_is_replaced() {
         use std::os::unix::fs::symlink;
 
@@ -1259,6 +1360,7 @@ mod tests {
                 );
                 symlink(&outside_store, &store).unwrap();
             },
+            || {},
             || Ok(()),
             || Ok(()),
         )
@@ -1301,6 +1403,7 @@ mod tests {
                 std::fs::rename(&database, &original).unwrap();
                 fixture_database(&database, session_id, "Replacement sentinel");
             },
+            || {},
             || Ok(()),
             || Ok(()),
         )
@@ -1336,6 +1439,7 @@ mod tests {
                 session_id,
                 &database,
                 &trash,
+                || {},
                 || {},
                 || {
                     if stage == "dump" {
