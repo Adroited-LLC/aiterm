@@ -2588,6 +2588,60 @@ fn open_or_create_restored_parent(
 }
 
 #[cfg(target_os = "linux")]
+fn existing_rollout_matches(
+    archive: &File,
+    record: &SidecarArchiveRecord,
+    parent: &File,
+    name: &CString,
+) -> Result<bool, String> {
+    use std::os::unix::fs::FileExt;
+
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let existing = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = existing.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() != record.content_len {
+        return Ok(false);
+    }
+    let mut compared = 0u64;
+    let mut archived_bytes = [0u8; 64 * 1024];
+    let mut existing_bytes = [0u8; 64 * 1024];
+    while compared < record.content_len {
+        let request = archived_bytes.len().min(
+            usize::try_from(record.content_len - compared).unwrap_or(archived_bytes.len()),
+        );
+        let archive_offset = record
+            .content_offset
+            .checked_add(compared)
+            .ok_or("restored rollout offset overflow")?;
+        let archived = archive
+            .read_at(&mut archived_bytes[..request], archive_offset)
+            .map_err(|error| error.to_string())?;
+        let present = existing
+            .read_at(&mut existing_bytes[..request], compared)
+            .map_err(|error| error.to_string())?;
+        if archived == 0
+            || archived != present
+            || archived_bytes[..archived] != existing_bytes[..present]
+        {
+            return Ok(false);
+        }
+        compared = compared
+            .checked_add(archived as u64)
+            .ok_or("restored rollout byte count overflow")?;
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
 fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::FileExt;
@@ -2618,7 +2672,17 @@ fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Res
             )
         };
         if descriptor < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && existing_rollout_matches(&archive, &record, &parent, &name)?
+            {
+                continue;
+            }
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "restored rollout destination already exists with different data".into()
+            } else {
+                error.to_string()
+            });
         }
         let mut output = unsafe { File::from_raw_fd(descriptor) };
         let mut copied = 0u64;
@@ -3038,9 +3102,9 @@ fn trash_restore_sync(session_id: String) -> Result<(), String> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        restore_codex_rollouts(&trash, &session_id)?;
         std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&origin);
-        restore_codex_rollouts(&trash, &session_id)?;
         return restore_claude_sidecars(&trash, &session_id);
     }
 
@@ -5683,6 +5747,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::fs::read(&extra_path).unwrap(), b"extra rollout");
+        restore_file_set_archive(&trash_path.join("session.rollouts"), &sessions)
+            .expect("an interrupted restore retries idempotently when the bytes already match");
         std::fs::remove_dir_all(root).unwrap();
     }
 
