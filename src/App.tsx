@@ -2248,13 +2248,13 @@ export default function App() {
               <HomeDashboard
                 sessions={sessions}
                 liveIds={new Set(tabs.map((t) => t.slotId).filter((k): k is string => !!k))}
-                usage={usageSources}
                 alerts={alerts}
                 projects={projects}
                 onSelect={selectSession}
                 onResume={(s) => { void resumeSession(s); }}
                 onProject={selectProject}
                 onGoTab={(key) => setActiveTab(key)}
+                onAddModel={() => openModelAccess()}
                 start={
                   <div className="empty-start-controls">
                     <StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />
