@@ -343,7 +343,7 @@ pub const CLAUDE_PERMISSION_MODES: &[PermissionMode] = &[
     PermissionMode {
         id: "auto",
         label: "Auto",
-        note: "Claude's auto mode: routine actions run, the rest ask. What aiterm has always started with.",
+        note: "Claude's auto mode: routine actions run, the rest ask. What aiterm has always started with. Not available on Haiku — claude says so in its status line and falls back to asking for everything; pick Skip all permissions for a Haiku session that should not ask.",
         flags: &["--permission-mode auto", "--allow-dangerously-skip-permissions"],
     },
     PermissionMode {
