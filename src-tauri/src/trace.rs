@@ -224,16 +224,45 @@ where
                     let s = v.to_string();
                     // Long enough for an id and a path, short enough that a
                     // transcript-sized argument cannot flood the log.
-                    if s.len() > 300 {
-                        format!("{}… ({} bytes)", &s[..300], s.len())
-                    } else {
-                        s
-                    }
+                    clip(&s, 300)
                 }
                 tauri::ipc::InvokeBody::Raw(bytes) => format!("<{} raw bytes>", bytes.len()),
             };
             tracing::debug!(target: "aiterm::ipc", "→ {cmd} {args}");
         }
         handler(invoke)
+    }
+}
+
+/// The first `max` bytes of a string for the log, cut back to a character
+/// boundary. A slice at a fixed byte offset panics when it lands inside a
+/// multi-byte character — and it did, on a curly apostrophe 300 bytes into
+/// a `pty_write` payload, inside a WebKit callback that cannot unwind, which
+/// took the whole app down.
+fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut cut = max;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}… ({} bytes)", &s[..cut], s.len())
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::clip;
+
+    #[test]
+    fn a_cut_inside_a_multibyte_character_backs_off_instead_of_panicking() {
+        // 299 ASCII bytes, then a 3-byte ’: byte 300 is inside it.
+        let s = format!("{}’ and more", "x".repeat(299));
+        let out = clip(&s, 300);
+        assert!(out.starts_with(&"x".repeat(299)));
+        assert!(out.contains("… (311 bytes)"), "{out}");
+        assert!(!out.contains('’'));
+        assert_eq!(clip("short", 300), "short");
+        assert_eq!(clip(&"é".repeat(200), 301).chars().filter(|c| *c == 'é').count(), 150);
     }
 }
