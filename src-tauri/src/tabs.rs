@@ -6,7 +6,7 @@ use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -816,6 +816,7 @@ impl TabRegistry {
         };
 
         let exited_publication = {
+            let _output_order = tab.raw.send_order.lock().unwrap();
             let mut live = tab.live.lock().unwrap();
             if live.descriptor.state == TabState::Exited {
                 Some(self.inner.publish_locked(&id, &tab, &live, None))
@@ -835,6 +836,7 @@ impl TabRegistry {
 
         loop {
             let (reply, publication) = {
+                let _output_order = tab.raw.send_order.lock().unwrap();
                 let mut live = tab.live.lock().unwrap();
                 if live.descriptor.state == TabState::Exited {
                     (
@@ -898,6 +900,8 @@ impl TabRegistry {
 
     pub fn update(&self, id: &TabId, update: TabUpdate) -> Result<TabDescriptor, TabError> {
         let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open()?;
         let descriptor = {
             let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
@@ -960,6 +964,8 @@ impl TabRegistry {
         let tab = self.inner.tab(id)?;
         let attachment_id = AttachmentId::new();
         let mailbox = Arc::new(EventMailbox::new(kind, self.inner.queue_capacity));
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open()?;
         {
             let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
@@ -1003,6 +1009,7 @@ impl TabRegistry {
 
     pub fn snapshot(&self, id: &TabId) -> Result<ScreenSnapshot, TabError> {
         let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
         let snapshot = tab.live.lock().unwrap().screen.snapshot(id.as_str());
         Ok(snapshot)
     }
@@ -1014,6 +1021,7 @@ impl TabRegistry {
         count: usize,
     ) -> Result<Vec<ScreenRow>, TabError> {
         let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
         let page = tab
             .live
             .lock()
@@ -1030,6 +1038,8 @@ impl TabRegistry {
         bytes: &[u8],
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open()?;
         let live = tab.live.lock().unwrap();
         live.authorize_owner(attachment)?;
         let pty_id = live.live_pty()?;
@@ -1046,6 +1056,8 @@ impl TabRegistry {
         size: TerminalSize,
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open()?;
         {
             let mut live = tab.live.lock().unwrap();
             live.authorize_owner(attachment)?;
@@ -1066,6 +1078,8 @@ impl TabRegistry {
         size: TerminalSize,
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open()?;
         {
             let mut live = tab.live.lock().unwrap();
             if !live.attachments.contains_key(attachment) {
@@ -1091,11 +1105,12 @@ impl TabRegistry {
 
     pub fn close(&self, id: &TabId) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
-        // Cancellation is independent of the live state lock. A raw producer
-        // may be asleep on a full desktop mailbox, but it never owns `live`,
-        // and this wakeup happens before close needs that lock.
-        tab.raw.cancel();
+        // Cancellation is independent of both the output-order gate and live
+        // state. Wake a bounded raw producer first, then join its transaction
+        // before publishing Exited.
+        tab.raw.close();
         let (pty_id, slot_id) = {
+            let _output_order = tab.raw.send_order.lock().unwrap();
             let mut live = tab.live.lock().unwrap();
             let pty_id = live.pty.id();
             live.pty = PtyBinding::Exited;
@@ -1138,18 +1153,18 @@ struct TabCell {
 
 #[derive(Default)]
 struct RawDispatch {
-    closing: AtomicBool,
+    phase: AtomicU8,
     mailboxes: Mutex<HashMap<AttachmentId, Weak<EventMailbox>>>,
     send_order: Mutex<()>,
 }
 
 impl RawDispatch {
     fn register(&self, id: AttachmentId, mailbox: &Arc<EventMailbox>) -> bool {
-        if self.closing.load(Ordering::Acquire) {
+        if self.phase.load(Ordering::Acquire) != RAW_OPEN {
             return false;
         }
         let mut mailboxes = self.mailboxes.lock().unwrap();
-        if self.closing.load(Ordering::Acquire) {
+        if self.phase.load(Ordering::Acquire) != RAW_OPEN {
             return false;
         }
         mailboxes.insert(id, Arc::downgrade(mailbox));
@@ -1173,11 +1188,37 @@ impl RawDispatch {
         }
     }
 
-    fn cancel(&self) {
-        self.closing.store(true, Ordering::Release);
+    fn prepare_exit(&self) {
+        let _ = self.phase.compare_exchange(
+            RAW_OPEN,
+            RAW_PREPARING_EXIT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
         self.cancel_waits();
     }
+
+    fn close(&self) {
+        self.phase.store(RAW_CLOSING, Ordering::Release);
+        self.cancel_waits();
+    }
+
+    fn is_closing(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == RAW_CLOSING
+    }
+
+    fn require_open(&self) -> Result<(), TabError> {
+        if self.phase.load(Ordering::Acquire) == RAW_OPEN {
+            Ok(())
+        } else {
+            Err(TabError::new("tab.closed", "the tab is closing"))
+        }
+    }
 }
+
+const RAW_OPEN: u8 = 0;
+const RAW_PREPARING_EXIT: u8 = 1;
+const RAW_CLOSING: u8 = 2;
 
 impl RegistryInner {
     fn tab(&self, id: &TabId) -> Result<Arc<TabCell>, TabError> {
@@ -1251,6 +1292,7 @@ impl RegistryInner {
         let Ok(tab) = self.tab(tab_id) else {
             return;
         };
+        let _output_order = tab.raw.send_order.lock().unwrap();
         let removed = {
             let mut live = tab.live.lock().unwrap();
             let Some(attachment) = live.attachments.remove(attachment_id) else {
@@ -1417,10 +1459,10 @@ impl PtySink for TabSink {
             return;
         };
         // The PTY reader is normally the only producer, but keep raw chunks
-        // ordered even for controlled/concurrent sinks. Close never takes this
-        // guard: it flips cancellation and wakes any mailbox wait directly.
+        // ordered even for controlled/concurrent sinks. Close flips persistent
+        // cancellation without this guard, then joins it after raw push wakes.
         let _send_order = tab.raw.send_order.lock().unwrap();
-        if tab.raw.closing.load(Ordering::Acquire) {
+        if tab.raw.is_closing() {
             return;
         }
         let desktop_mailboxes = {
@@ -1432,11 +1474,11 @@ impl PtySink for TabSink {
         };
         for mailbox in desktop_mailboxes {
             let _ = mailbox.push_raw(bytes.to_vec());
-            if tab.raw.closing.load(Ordering::Acquire) {
+            if tab.raw.is_closing() {
                 return;
             }
         }
-        if tab.raw.closing.load(Ordering::Acquire) {
+        if tab.raw.is_closing() {
             return;
         }
         let flush = {
@@ -1464,7 +1506,7 @@ impl PtySink for TabSink {
 
     fn preparing_exit(&self, _pty_id: u32) {
         if let Some(tab) = self.tab.upgrade() {
-            tab.raw.cancel_waits();
+            tab.raw.prepare_exit();
         }
     }
 
@@ -1472,7 +1514,8 @@ impl PtySink for TabSink {
         let (Some(registry), Some(tab)) = (self.registry.upgrade(), self.tab.upgrade()) else {
             return;
         };
-        tab.raw.cancel();
+        tab.raw.close();
+        let _output_order = tab.raw.send_order.lock().unwrap();
         {
             let mut live = tab.live.lock().unwrap();
             live.pty = PtyBinding::Exited;

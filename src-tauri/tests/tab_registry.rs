@@ -290,6 +290,17 @@ impl FakePty {
         sink.exited(id, code, signal);
     }
 
+    fn prepare_exit(&self, id: u32) {
+        let sink = self
+            .sinks
+            .lock()
+            .unwrap()
+            .get(&id)
+            .expect("fake PTY has a registered sink")
+            .clone();
+        sink.preparing_exit(id);
+    }
+
     fn writes(&self) -> Vec<Vec<u8>> {
         self.writes
             .lock()
@@ -1058,6 +1069,80 @@ fn explicit_close_cancels_blocked_raw_output_and_retains_one_exit() {
     );
     writer.join().unwrap();
     close.join().unwrap();
+}
+
+#[test]
+fn focus_transfer_cannot_interleave_between_raw_delivery_and_reply_ownership() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry.open(shell_launch("slot:ordered-focus")).unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let _desktop_focus = desktop.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let _remote_snapshot = remote.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    let pty_id = pty.last_id();
+    pty.emit_output(pty_id, b"first");
+
+    let (output_done_tx, output_done_rx) = mpsc::channel();
+    let output = pty.clone();
+    let writer = thread::spawn(move || {
+        output.emit_output(pty_id, b"\x1b[5n");
+        output_done_tx.send(()).unwrap();
+    });
+    assert!(output_done_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+
+    let (focus_done_tx, focus_done_rx) = mpsc::channel();
+    let focusing = registry.clone();
+    let focus_tab = tab.clone();
+    let remote_id = remote.id.clone();
+    let focus = thread::spawn(move || {
+        focus_done_tx
+            .send(focusing.take_focus(&focus_tab, &remote_id, size(80, 24)))
+            .unwrap();
+    });
+    assert!(
+        focus_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "focus interleaved into an active raw/parse/reply transaction"
+    );
+
+    assert_eq!(
+        desktop.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabEvent::Raw(b"first".to_vec())
+    );
+    output_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    focus_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    assert!(
+        pty.writes().is_empty(),
+        "focus transfer changed reply ownership midway through output"
+    );
+    writer.join().unwrap();
+    focus.join().unwrap();
+}
+
+#[test]
+fn preparing_exit_persists_and_rejects_a_late_desktop_attachment() {
+    let (registry, pty) = registry();
+    let tab = registry.open(shell_launch("slot:preparing-exit")).unwrap();
+    let pty_id = pty.last_id();
+
+    pty.prepare_exit(pty_id);
+    assert_eq!(registry.get(&tab).unwrap().state(), &TabState::Running);
+    assert_eq!(
+        registry
+            .attach(&tab, AttachmentKind::Desktop)
+            .unwrap_err()
+            .code(),
+        "tab.closed"
+    );
+
+    pty.exit(pty_id, Some(0), None);
 }
 
 #[test]
