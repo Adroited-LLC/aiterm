@@ -48,6 +48,7 @@ libc = "0.2"
 # whether an id will name a real session. Already in the tree via Tauri, so
 # this turns on a feature rather than adding a dependency.
 uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
 tauri-plugin-dialog = "2"
 # No `release_max_level_off`: the Diagnostics panel can switch tracing on in
 # release builds, so the macros must survive into them. Off = a cached filter

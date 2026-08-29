@@ -1,10 +1,15 @@
 use super::auth::{set_private_permissions, write_private_file, DeviceStore, PairingOutcome};
-use super::model::{RemoteEvent, RemoteRequest, TerminalSize, PROTOCOL_VERSION};
-use super::terminal::{
-    chunk_diff_for_attachment, chunk_scrollback_for_attachment, chunk_snapshot_for_attachment,
-    RemoteTerminal, RemoteTerminalEvents, TerminalEvent, TransferChunk, MAX_WIRE_FRAME_BYTES,
+use super::model::{
+    encode_terminal_frame, RemoteEvent, RemoteRequest, TerminalSize, PROTOCOL_VERSION,
 };
-use crate::tabs::{AttachmentId, TabId, TabLaunch, TabRegistry};
+use super::terminal::{
+    plan_diff_for_attachment, plan_scrollback_for_attachment, plan_snapshot_for_attachment,
+    RemoteTerminal, RemoteTerminalEvents, TerminalEvent, TransferChunk, TransferPlan,
+};
+use crate::tabs::{
+    AttachmentId, TabAttachmentCancellation, TabDescriptor, TabId, TabLaunch, TabRegistry, TabState,
+};
+use crate::terminal::model::Revision;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::routing::get;
@@ -30,6 +35,16 @@ const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUESTS_PER_SECOND: f64 = 120.0;
 const OUTBOUND_EVENT_QUEUE: usize = 64;
+const MAX_CONNECTIONS: usize = 64;
+const MAX_ATTACHMENTS_PER_CONNECTION: usize = 8;
+pub const MAX_SCROLLBACK_PAGE_ROWS: usize = 256;
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+const MAX_TITLE_BYTES: usize = 4 * 1024;
+const MAX_PATH_BYTES: usize = 4 * 1024;
+const MAX_COMMAND_BYTES: usize = 32 * 1024;
+const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
+const ATTACHMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const ATTACHMENT_REAP_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct TlsIdentity {
@@ -132,6 +147,7 @@ fn build_server_config(
 struct GatewayState {
     devices: Arc<DeviceStore>,
     services: RemoteServices,
+    connections: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
@@ -168,7 +184,11 @@ impl RemoteGateway {
         let certificate_der = identity.certificate_der.clone();
         let spki_fingerprint = identity.spki_fingerprint.clone();
         let tls = identity.rustls_config()?;
-        let state = GatewayState { devices, services };
+        let state = GatewayState {
+            devices,
+            services,
+            connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+        };
         let router = Router::new()
             .route("/v1/ws", get(websocket_upgrade))
             .with_state(state);
@@ -233,7 +253,14 @@ async fn websocket_upgrade(
 ) -> impl axum::response::IntoResponse {
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| authenticate_socket(socket, state))
+        .on_upgrade(move |mut socket| async move {
+            let Ok(permit) = state.connections.clone().try_acquire_owned() else {
+                close_socket(&mut socket).await;
+                return;
+            };
+            authenticate_socket(socket, state).await;
+            drop(permit);
+        })
 }
 
 #[derive(Serialize)]
@@ -303,7 +330,7 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
     }
 
     let message = match tokio::time::timeout(AUTH_TIMEOUT, socket.next()).await {
-        Ok(Some(Ok(Message::Binary(bytes)))) => bytes,
+        Ok(Some(Ok(Message::Binary(bytes)))) if bytes.len() < MAX_MESSAGE_SIZE => bytes,
         _ => {
             close_socket(&mut socket).await;
             return;
@@ -392,6 +419,7 @@ impl RequestGuard {
 
 struct ConnectionAttachment {
     tab_id: TabId,
+    cancellation: TabAttachmentCancellation,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -399,20 +427,25 @@ struct StartedAttachment {
     tab_id: TabId,
     attachment_id: AttachmentId,
     events: RemoteTerminalEvents,
+    cancellation: TabAttachmentCancellation,
 }
 
 struct DispatchOutcome {
     frames: Vec<RemoteEvent>,
+    transfers: Vec<TransferPlan>,
     started: Option<StartedAttachment>,
     tab_id: Option<TabId>,
+    detached: Option<AttachmentId>,
 }
 
 impl DispatchOutcome {
     fn frames(frames: Vec<RemoteEvent>) -> Self {
         Self {
             frames,
+            transfers: Vec::new(),
             started: None,
             tab_id: None,
+            detached: None,
         }
     }
 }
@@ -455,9 +488,63 @@ struct ScrollbackPayload {
     count: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumePayload {
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    revision: Revision,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TabOpenPayload {
+    title: String,
+    cwd: Option<String>,
+    command: Option<String>,
+    session_id: Option<String>,
+    resumed_id: Option<String>,
+    agent_id: Option<String>,
+    slot_id: String,
+    #[serde(default)]
+    fresh: bool,
+    env_provider: Option<String>,
+    env_model: Option<String>,
+    size: TerminalSize,
+}
+
 #[derive(Serialize)]
 struct TabListPayload {
-    tabs: Vec<crate::tabs::TabDescriptor>,
+    tabs: Vec<RemoteTabDescriptor>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteTabDescriptor {
+    id: TabId,
+    title: String,
+    cwd: Option<String>,
+    command: Option<String>,
+    session_id: Option<String>,
+    resumed_id: Option<String>,
+    agent_id: Option<String>,
+    slot_id: String,
+    fresh: bool,
+    env_provider: Option<String>,
+    env_model: Option<String>,
+    size: TerminalSize,
+    focus: RemoteFocusState,
+    state: TabState,
+    exit: Option<crate::tabs::TabExit>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RemoteFocusState {
+    #[serde(rename = "self")]
+    Self_,
+    Other,
+    Unowned,
 }
 
 #[derive(Serialize)]
@@ -470,6 +557,16 @@ struct AttachedPayload<'a> {
     tab_id: &'a TabId,
     attachment_id: &'a AttachmentId,
     has_focus: bool,
+    title: &'a str,
+}
+
+#[derive(Serialize)]
+struct ResumeReplyPayload<'a> {
+    tab_id: &'a TabId,
+    attachment_id: &'a AttachmentId,
+    requested_revision: Revision,
+    current_revision: Revision,
+    recovery_required: bool,
 }
 
 #[derive(Serialize)]
@@ -487,7 +584,7 @@ struct ErrorPayload<'a> {
 struct FocusEventPayload<'a> {
     tab_id: &'a TabId,
     attachment_id: &'a AttachmentId,
-    owner: &'a Option<AttachmentId>,
+    focus: RemoteFocusState,
     size: TerminalSize,
 }
 
@@ -512,9 +609,13 @@ fn decode_payload<T: for<'de> Deserialize<'de>>(
 }
 
 fn payload<T: Serialize>(value: &T) -> Result<Vec<u8>, &'static str> {
-    let mut bytes = Vec::new();
-    ciborium::into_writer(value, &mut bytes).map_err(|_| "protocol.invalid_response")?;
-    Ok(bytes)
+    encode_terminal_frame(value).map_err(|error| {
+        if error.code() == "protocol.frame_too_large" {
+            "protocol.response_too_large"
+        } else {
+            "protocol.invalid_response"
+        }
+    })
 }
 
 fn response<T: Serialize>(
@@ -549,11 +650,101 @@ fn chunk_event(chunk: TransferChunk) -> RemoteEvent {
     }
 }
 
+fn remote_focus(
+    owner: Option<&AttachmentId>,
+    own_attachment: Option<&AttachmentId>,
+) -> RemoteFocusState {
+    match owner {
+        None => RemoteFocusState::Unowned,
+        Some(owner) if Some(owner) == own_attachment => RemoteFocusState::Self_,
+        Some(_) => RemoteFocusState::Other,
+    }
+}
+
+fn remote_descriptor(
+    descriptor: TabDescriptor,
+    attachments: &HashMap<AttachmentId, TabId>,
+) -> RemoteTabDescriptor {
+    let own_attachment = descriptor.input_owner().filter(|owner| {
+        attachments
+            .get(*owner)
+            .is_some_and(|tab_id| tab_id == descriptor.id())
+    });
+    RemoteTabDescriptor {
+        id: descriptor.id().clone(),
+        title: descriptor.title().to_owned(),
+        cwd: descriptor.cwd().map(str::to_owned),
+        command: descriptor.command().map(str::to_owned),
+        session_id: descriptor.session_id().map(str::to_owned),
+        resumed_id: descriptor.resumed_id().map(str::to_owned),
+        agent_id: descriptor.agent_id().map(str::to_owned),
+        slot_id: descriptor.slot_id().to_owned(),
+        fresh: descriptor.fresh(),
+        env_provider: descriptor.env_provider().map(str::to_owned),
+        env_model: descriptor.env_model().map(str::to_owned),
+        size: descriptor.size(),
+        focus: remote_focus(descriptor.input_owner(), own_attachment),
+        state: descriptor.state().clone(),
+        exit: descriptor.exit().cloned(),
+    }
+}
+
+fn bounded(value: &str, max: usize) -> Result<(), &'static str> {
+    if value.len() > max {
+        Err("protocol.value_too_large")
+    } else {
+        Ok(())
+    }
+}
+
+fn launch_from_wire(wire: TabOpenPayload) -> Result<TabLaunch, &'static str> {
+    bounded(&wire.title, MAX_TITLE_BYTES)?;
+    bounded(&wire.slot_id, MAX_IDENTIFIER_BYTES)?;
+    if let Some(value) = wire.cwd.as_deref() {
+        bounded(value, MAX_PATH_BYTES)?;
+    }
+    if let Some(value) = wire.command.as_deref() {
+        bounded(value, MAX_COMMAND_BYTES)?;
+    }
+    for value in [
+        wire.session_id.as_deref(),
+        wire.resumed_id.as_deref(),
+        wire.agent_id.as_deref(),
+        wire.env_provider.as_deref(),
+        wire.env_model.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bounded(value, MAX_IDENTIFIER_BYTES)?;
+    }
+    let mut launch = TabLaunch::new(wire.title, wire.slot_id, wire.size).with_fresh(wire.fresh);
+    if let Some(value) = wire.cwd {
+        launch = launch.with_cwd(value);
+    }
+    if let Some(value) = wire.command {
+        launch = launch.with_command(value);
+    }
+    if let Some(value) = wire.session_id {
+        launch = launch.with_session_id(value);
+    }
+    if let Some(value) = wire.resumed_id {
+        launch = launch.with_resumed_id(value);
+    }
+    if let Some(value) = wire.agent_id {
+        launch = launch.with_agent_id(value);
+    }
+    if let (Some(provider), Some(model)) = (wire.env_provider, wire.env_model) {
+        launch = launch.with_environment(provider, model);
+    }
+    Ok(launch)
+}
+
 impl RemoteServices {
     fn dispatch(
         &self,
         request: &RemoteRequest,
-        attachments: &mut HashMap<AttachmentId, ConnectionAttachment>,
+        attachments: &HashMap<AttachmentId, TabId>,
     ) -> DispatchOutcome {
         let result = self.dispatch_authorized(request, attachments);
         match result {
@@ -569,7 +760,7 @@ impl RemoteServices {
     fn dispatch_authorized(
         &self,
         request: &RemoteRequest,
-        attachments: &mut HashMap<AttachmentId, ConnectionAttachment>,
+        attachments: &HashMap<AttachmentId, TabId>,
     ) -> Result<DispatchOutcome, &'static str> {
         let request_id = request.request_id();
         match request.kind() {
@@ -580,15 +771,25 @@ impl RemoteServices {
                     "this service is not available through the remote gateway yet",
                 )]))
             }
-            "tab.list" => Ok(DispatchOutcome::frames(vec![response(
-                request_id,
-                "tab.list",
-                &TabListPayload {
-                    tabs: self.registry.list(),
-                },
-            )?])),
+            "tab.list" => {
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "tab.list",
+                    &TabListPayload {
+                        tabs: self
+                            .registry
+                            .list()
+                            .into_iter()
+                            .map(|descriptor| remote_descriptor(descriptor, attachments))
+                            .collect(),
+                    },
+                )?]))
+            }
             "tab.open" => {
-                let launch: TabLaunch = decode_payload(request)?;
+                let launch = launch_from_wire(decode_payload::<TabOpenPayload>(request)?)?;
                 let tab_id = self.terminal.open(launch).map_err(|error| error.code())?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
@@ -613,36 +814,47 @@ impl RemoteServices {
                     .terminal
                     .attach(&request.tab_id)
                     .map_err(|error| error.code())?;
-                let mut frames = vec![response(
+                let tab_id = attached.tab_id().clone();
+                let attachment_id = attached.attachment_id().clone();
+                let has_focus = attached.has_focus();
+                let title = attached.title().to_owned();
+                let snapshot = attached.into_snapshot();
+                let frames = vec![response(
                     request_id,
                     "terminal.attach",
                     &AttachedPayload {
-                        tab_id: attached.tab_id(),
-                        attachment_id: attached.attachment_id(),
-                        has_focus: attached.has_focus(),
+                        tab_id: &tab_id,
+                        attachment_id: &attachment_id,
+                        has_focus,
+                        title: &title,
                     },
                 )?];
-                let chunks = chunk_snapshot_for_attachment(
+                let transfer = plan_snapshot_for_attachment(
                     request_id,
-                    attached.tab_id(),
-                    Some(attached.attachment_id()),
-                    attached.snapshot(),
+                    &tab_id,
+                    Some(&attachment_id),
+                    snapshot,
                 )
                 .map_err(|error| error.code())?;
-                frames.extend(chunks.into_iter().map(chunk_event));
                 Ok(DispatchOutcome {
                     frames,
-                    tab_id: Some(attached.tab_id().clone()),
+                    transfers: vec![transfer],
+                    tab_id: Some(tab_id.clone()),
                     started: Some(StartedAttachment {
-                        tab_id: attached.tab_id().clone(),
-                        attachment_id: attached.attachment_id().clone(),
+                        tab_id,
+                        attachment_id,
+                        cancellation: events.cancellation(),
                         events,
                     }),
+                    detached: None,
                 })
             }
             "terminal.input" => {
                 let request: InputPayload = decode_payload(request)?;
                 authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
+                if request.data.len() > MAX_TERMINAL_INPUT_BYTES {
+                    return Err("terminal.input_too_large");
+                }
                 self.terminal
                     .input(&request.tab_id, &request.attachment_id, &request.data)
                     .map_err(|error| error.code())?;
@@ -673,41 +885,74 @@ impl RemoteServices {
             "terminal.detach" => {
                 let request: AttachmentPayload = decode_payload(request)?;
                 authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
-                self.terminal
-                    .detach(&request.tab_id, &request.attachment_id)
-                    .map_err(|error| error.code())?;
-                if let Some(attachment) = attachments.remove(&request.attachment_id) {
-                    attachment.task.abort();
-                }
-                Ok(DispatchOutcome::frames(vec![response(
-                    request_id,
-                    "terminal.detach",
-                    &SuccessPayload { ok: true },
-                )?]))
+                Ok(DispatchOutcome {
+                    frames: vec![response(
+                        request_id,
+                        "terminal.detach",
+                        &SuccessPayload { ok: true },
+                    )?],
+                    transfers: Vec::new(),
+                    started: None,
+                    tab_id: None,
+                    detached: Some(request.attachment_id),
+                })
             }
             "terminal.scrollback" => {
                 let request: ScrollbackPayload = decode_payload(request)?;
                 authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
-                let rows = self
-                    .terminal
-                    .scrollback(&request.tab_id, request.offset, request.count)
-                    .map_err(|error| error.code())?;
-                let revision = self
+                if request.count == 0
+                    || request.count > MAX_SCROLLBACK_PAGE_ROWS
+                    || request.offset > crate::terminal::MAX_SCROLLBACK_ROWS
+                {
+                    return Err("terminal.invalid_scrollback_page");
+                }
+                let page = self
                     .registry
-                    .snapshot(&request.tab_id)
-                    .map_err(|error| error.code())?
-                    .revision();
-                let chunks = chunk_scrollback_for_attachment(
+                    .scrollback_page(&request.tab_id, request.offset, request.count)
+                    .map_err(|error| error.code())?;
+                let transfer = plan_scrollback_for_attachment(
                     request_id,
                     &request.tab_id,
                     Some(&request.attachment_id),
-                    revision,
-                    rows,
+                    page.revision(),
+                    page.into_rows(),
                 )
                 .map_err(|error| error.code())?;
-                Ok(DispatchOutcome::frames(
-                    chunks.into_iter().map(chunk_event).collect(),
-                ))
+                let mut outcome = DispatchOutcome::frames(Vec::new());
+                outcome.transfers.push(transfer);
+                Ok(outcome)
+            }
+            "terminal.resume" => {
+                let request: ResumePayload = decode_payload(request)?;
+                authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
+                let TerminalEvent::Snapshot(snapshot) = self
+                    .terminal
+                    .resume(&request.tab_id, request.revision)
+                    .map_err(|error| error.code())?
+                else {
+                    return Err("terminal.recovery_required");
+                };
+                let frames = vec![response(
+                    request_id,
+                    "terminal.resume",
+                    &ResumeReplyPayload {
+                        tab_id: &request.tab_id,
+                        attachment_id: &request.attachment_id,
+                        requested_revision: request.revision,
+                        current_revision: snapshot.revision(),
+                        recovery_required: request.revision != snapshot.revision(),
+                    },
+                )?];
+                let transfer = plan_snapshot_for_attachment(
+                    request_id,
+                    &request.tab_id,
+                    Some(&request.attachment_id),
+                    snapshot,
+                )
+                .map_err(|error| error.code())?;
+                let mut outcome = DispatchOutcome::frames(frames);
+                outcome.transfers.push(transfer);
+                Ok(outcome)
             }
             _ => Err("protocol.unsupported_request"),
         }
@@ -715,13 +960,13 @@ impl RemoteServices {
 }
 
 fn authorize_attachment(
-    attachments: &HashMap<AttachmentId, ConnectionAttachment>,
+    attachments: &HashMap<AttachmentId, TabId>,
     tab_id: &TabId,
     attachment_id: &AttachmentId,
 ) -> Result<(), &'static str> {
     if attachments
         .get(attachment_id)
-        .is_some_and(|attachment| &attachment.tab_id == tab_id)
+        .is_some_and(|attachment_tab| attachment_tab == tab_id)
     {
         Ok(())
     } else {
@@ -734,80 +979,140 @@ async fn forward_attachment_events(
     outbound: tokio::sync::mpsc::Sender<RemoteEvent>,
 ) {
     while let Some(event) = attachment.events.next().await {
-        let frames = match event {
-            TerminalEvent::Snapshot(snapshot) => chunk_snapshot_for_attachment(
-                0,
-                &attachment.tab_id,
-                Some(&attachment.attachment_id),
-                &snapshot,
-            )
-            .map(|chunks| chunks.into_iter().map(chunk_event).collect())
-            .map_err(|_| ()),
-            TerminalEvent::Diff(diff) => chunk_diff_for_attachment(
-                0,
-                &attachment.tab_id,
-                Some(&attachment.attachment_id),
-                &diff,
-            )
-            .map(|chunks| chunks.into_iter().map(chunk_event).collect())
-            .map_err(|_| ()),
-            TerminalEvent::FocusChanged { owner, size } => response(
-                0,
-                "terminal.focus_changed",
-                &FocusEventPayload {
-                    tab_id: &attachment.tab_id,
-                    attachment_id: &attachment.attachment_id,
-                    owner: &owner,
-                    size,
-                },
-            )
-            .map(|event| vec![event])
-            .map_err(|_| ()),
-            TerminalEvent::Title(title) => response(
-                0,
-                "terminal.title",
-                &TitleEventPayload {
-                    tab_id: &attachment.tab_id,
-                    attachment_id: &attachment.attachment_id,
-                    title: &title,
-                },
-            )
-            .map(|event| vec![event])
-            .map_err(|_| ()),
-            TerminalEvent::Exited(exit) => response(
-                0,
-                "terminal.exited",
-                &ExitEventPayload {
-                    tab_id: &attachment.tab_id,
-                    attachment_id: &attachment.attachment_id,
-                    exit: &exit,
-                },
-            )
-            .map(|event| vec![event])
-            .map_err(|_| ()),
+        let transfer = match event {
+            TerminalEvent::Snapshot(snapshot) => {
+                let tab_id = attachment.tab_id.clone();
+                let attachment_id = attachment.attachment_id.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        plan_snapshot_for_attachment(0, &tab_id, Some(&attachment_id), snapshot)
+                    })
+                    .await
+                    .map_err(|_| ())
+                    .and_then(|result| result.map_err(|_| ())),
+                )
+            }
+            TerminalEvent::Diff(diff) => {
+                let tab_id = attachment.tab_id.clone();
+                let attachment_id = attachment.attachment_id.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        plan_diff_for_attachment(0, &tab_id, Some(&attachment_id), diff)
+                    })
+                    .await
+                    .map_err(|_| ())
+                    .and_then(|result| result.map_err(|_| ())),
+                )
+            }
+            TerminalEvent::FocusChanged { owner, size } => {
+                let event = response(
+                    0,
+                    "terminal.focus_changed",
+                    &FocusEventPayload {
+                        tab_id: &attachment.tab_id,
+                        attachment_id: &attachment.attachment_id,
+                        focus: remote_focus(owner.as_ref(), Some(&attachment.attachment_id)),
+                        size,
+                    },
+                );
+                if send_direct_event(&outbound, event).await.is_err() {
+                    return;
+                }
+                None
+            }
+            TerminalEvent::Title(title) => {
+                let event = response(
+                    0,
+                    "terminal.title",
+                    &TitleEventPayload {
+                        tab_id: &attachment.tab_id,
+                        attachment_id: &attachment.attachment_id,
+                        title: &title,
+                    },
+                );
+                if send_direct_event(&outbound, event).await.is_err() {
+                    return;
+                }
+                None
+            }
+            TerminalEvent::Exited(exit) => {
+                let event = response(
+                    0,
+                    "terminal.exited",
+                    &ExitEventPayload {
+                        tab_id: &attachment.tab_id,
+                        attachment_id: &attachment.attachment_id,
+                        exit: &exit,
+                    },
+                );
+                if send_direct_event(&outbound, event).await.is_err() {
+                    return;
+                }
+                None
+            }
             TerminalEvent::Bell => continue,
         };
-        let frames = match frames {
-            Ok(frames) => frames,
-            Err(_) => vec![error_response(
-                0,
-                "terminal.recovery_required",
-                "terminal state could not be represented; request a fresh snapshot",
-            )],
-        };
-        for frame in frames {
-            if outbound.send(bound_event(frame)).await.is_err() {
-                return;
+        if let Some(transfer) = transfer {
+            match transfer {
+                Ok(transfer) => {
+                    if send_transfer_to_queue(transfer, &outbound).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    if outbound
+                        .send(error_response(
+                            0,
+                            "terminal.recovery_required",
+                            "terminal state could not be represented; request a fresh snapshot",
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
         }
     }
+}
+
+async fn send_direct_event(
+    outbound: &tokio::sync::mpsc::Sender<RemoteEvent>,
+    event: Result<RemoteEvent, &'static str>,
+) -> Result<(), ()> {
+    let event = event.map_err(|_| ())?;
+    outbound.send(event).await.map_err(|_| ())
+}
+
+async fn send_transfer_to_queue(
+    mut transfer: TransferPlan,
+    outbound: &tokio::sync::mpsc::Sender<RemoteEvent>,
+) -> Result<(), ()> {
+    while let Some(chunk) = transfer.next_chunk().map_err(|_| ())? {
+        outbound.send(chunk_event(chunk)).await.map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+async fn send_transfer_to_socket(
+    socket: &mut WebSocket,
+    mut transfer: TransferPlan,
+) -> Result<(), ()> {
+    while let Some(chunk) = transfer.next_chunk().map_err(|_| ())? {
+        send_remote_event(socket, &chunk_event(chunk)).await?;
+    }
+    Ok(())
 }
 
 async fn run_authenticated_socket(mut socket: WebSocket, services: RemoteServices) {
     let mut guard = RequestGuard::new(Instant::now());
     let (outbound, mut outbound_events) = tokio::sync::mpsc::channel(OUTBOUND_EVENT_QUEUE);
     let mut attachments = HashMap::<AttachmentId, ConnectionAttachment>::new();
+    let mut reap_tick = tokio::time::interval(ATTACHMENT_REAP_INTERVAL);
+    reap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     'socket: loop {
+        reap_finished_attachments(&mut attachments).await;
         let message = tokio::select! {
             message = socket.next() => message,
             event = outbound_events.recv() => {
@@ -817,39 +1122,106 @@ async fn run_authenticated_socket(mut socket: WebSocket, services: RemoteService
                 }
                 continue;
             }
+            _ = reap_tick.tick() => continue,
         };
         let Some(message) = message else {
             break;
         };
         match message {
             Ok(Message::Binary(bytes)) => {
-                let Ok(request) = RemoteRequest::decode(&bytes) else {
+                if bytes.len() >= MAX_MESSAGE_SIZE {
                     close_socket(&mut socket).await;
                     break;
+                }
+                let request = match RemoteRequest::decode(&bytes) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let Some(request_id) = error.request_id() else {
+                            close_socket(&mut socket).await;
+                            break;
+                        };
+                        if guard.admit(request_id, Instant::now()).is_err() {
+                            close_socket(&mut socket).await;
+                            break;
+                        }
+                        let event = error_response(request_id, error.code(), error.message());
+                        if send_remote_event(&mut socket, &event).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 if guard.admit(request.request_id(), Instant::now()).is_err() {
                     close_socket(&mut socket).await;
                     break;
                 }
-                let outcome = services.dispatch(&request, &mut attachments);
-                for event in outcome.frames.into_iter().map(bound_event) {
+                if request.kind() == "terminal.attach"
+                    && attachments.len() >= MAX_ATTACHMENTS_PER_CONNECTION
+                {
+                    let event = error_response(
+                        request.request_id(),
+                        "terminal.too_many_attachments",
+                        "the connection attachment limit was reached",
+                    );
                     if send_remote_event(&mut socket, &event).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let owned = attachments
+                    .iter()
+                    .map(|(id, attachment)| (id.clone(), attachment.tab_id.clone()))
+                    .collect::<HashMap<_, _>>();
+                let dispatch_services = services.clone();
+                let dispatch_request = request.clone();
+                let outcome = match tokio::task::spawn_blocking(move || {
+                    dispatch_services.dispatch(&dispatch_request, &owned)
+                })
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        close_socket(&mut socket).await;
+                        break;
+                    }
+                };
+                if let Some(detached) = outcome.detached.as_ref() {
+                    if let Some(attachment) = attachments.remove(detached) {
+                        shutdown_attachment(attachment).await;
+                    }
+                }
+                for event in outcome.frames {
+                    if send_remote_event(&mut socket, &event).await.is_err() {
+                        break 'socket;
+                    }
+                }
+                for transfer in outcome.transfers {
+                    if send_transfer_to_socket(&mut socket, transfer)
+                        .await
+                        .is_err()
+                    {
                         break 'socket;
                     }
                 }
                 if let Some(started) = outcome.started {
                     let id = started.attachment_id.clone();
+                    let cancellation = started.cancellation.clone();
                     let task = tokio::spawn(forward_attachment_events(started, outbound.clone()));
                     attachments.insert(
                         id,
                         ConnectionAttachment {
                             tab_id: outcome.tab_id.expect("started attachments name their tab"),
+                            cancellation,
                             task,
                         },
                     );
                 }
             }
             Ok(Message::Ping(bytes)) => {
+                if bytes.len() >= MAX_MESSAGE_SIZE {
+                    close_socket(&mut socket).await;
+                    break;
+                }
                 if socket.send(Message::Pong(bytes)).await.is_err() {
                     break;
                 }
@@ -863,7 +1235,31 @@ async fn run_authenticated_socket(mut socket: WebSocket, services: RemoteService
         }
     }
     for (_, attachment) in attachments {
+        shutdown_attachment(attachment).await;
+    }
+}
+
+async fn shutdown_attachment(mut attachment: ConnectionAttachment) {
+    let cancellation = attachment.cancellation.clone();
+    let _ = tokio::task::spawn_blocking(move || cancellation.cancel()).await;
+    if tokio::time::timeout(ATTACHMENT_SHUTDOWN_TIMEOUT, &mut attachment.task)
+        .await
+        .is_err()
+    {
         attachment.task.abort();
+        let _ = attachment.task.await;
+    }
+}
+
+async fn reap_finished_attachments(attachments: &mut HashMap<AttachmentId, ConnectionAttachment>) {
+    let finished = attachments
+        .iter()
+        .filter_map(|(id, attachment)| attachment.task.is_finished().then(|| id.clone()))
+        .collect::<Vec<_>>();
+    for id in finished {
+        if let Some(attachment) = attachments.remove(&id) {
+            shutdown_attachment(attachment).await;
+        }
     }
 }
 
@@ -992,8 +1388,7 @@ async fn handle_pairing(mut socket: WebSocket, state: GatewayState, bytes: &[u8]
 }
 
 async fn send_cbor<T: Serialize>(socket: &mut WebSocket, value: &T) -> Result<(), ()> {
-    let mut bytes = Vec::new();
-    ciborium::into_writer(value, &mut bytes).map_err(|_| ())?;
+    let bytes = encode_terminal_frame(value).map_err(|_| ())?;
     socket
         .send(Message::Binary(bytes.into()))
         .await
@@ -1001,27 +1396,11 @@ async fn send_cbor<T: Serialize>(socket: &mut WebSocket, value: &T) -> Result<()
 }
 
 async fn send_remote_event(socket: &mut WebSocket, event: &RemoteEvent) -> Result<(), ()> {
-    let mut bytes = Vec::new();
-    ciborium::into_writer(event, &mut bytes).map_err(|_| ())?;
-    if bytes.len() >= MAX_WIRE_FRAME_BYTES {
-        return Err(());
-    }
+    let bytes = encode_terminal_frame(event).map_err(|_| ())?;
     socket
         .send(Message::Binary(bytes.into()))
         .await
         .map_err(|_| ())
-}
-
-fn bound_event(event: RemoteEvent) -> RemoteEvent {
-    let mut bytes = Vec::new();
-    if ciborium::into_writer(&event, &mut bytes).is_ok() && bytes.len() < MAX_WIRE_FRAME_BYTES {
-        return event;
-    }
-    error_response(
-        event.request_id,
-        "protocol.frame_too_large",
-        "the typed response cannot fit in one wire frame",
-    )
 }
 
 async fn close_socket(socket: &mut WebSocket) {

@@ -6,6 +6,7 @@ use crate::terminal::MAX_SCREEN_FRAME_BYTES;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_TERMINAL_DIMENSION: u16 = 512;
+pub const MAX_REQUEST_KIND_BYTES: usize = 64;
 
 const KNOWN_REQUESTS: &[&str] = &[
     "session.list",
@@ -25,6 +26,7 @@ const KNOWN_REQUESTS: &[&str] = &[
     "terminal.resize",
     "terminal.detach",
     "terminal.scrollback",
+    "terminal.resume",
     // Taking input ownership is its own request because it is a deliberate act.
     // Attaching gives a second client a read-only view; only this says "I am
     // typing now", and the broker announces it to everyone else on the stream.
@@ -40,6 +42,11 @@ struct RequestEnvelope {
     payload: Vec<u8>,
 }
 
+#[derive(Deserialize)]
+struct RequestEnvelopeProbe {
+    request_id: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteRequest {
     request_id: u64,
@@ -49,16 +56,34 @@ pub struct RemoteRequest {
 
 impl RemoteRequest {
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
-        let envelope: RequestEnvelope = ciborium::from_reader(bytes)
-            .map_err(|_| ProtocolError::new("protocol.invalid_cbor", "invalid request envelope"))?;
+        validate_terminal_frame(bytes)?;
+        let request_id = ciborium::from_reader::<RequestEnvelopeProbe, _>(bytes)
+            .ok()
+            .and_then(|probe| probe.request_id);
+        let envelope: RequestEnvelope = ciborium::from_reader(bytes).map_err(|_| {
+            ProtocolError::correlated(
+                request_id,
+                "protocol.invalid_cbor",
+                "invalid request envelope",
+            )
+        })?;
         if envelope.version != PROTOCOL_VERSION {
-            return Err(ProtocolError::new(
+            return Err(ProtocolError::correlated(
+                Some(envelope.request_id),
                 "protocol.unsupported_version",
                 "unsupported protocol version",
             ));
         }
+        if envelope.kind.len() > MAX_REQUEST_KIND_BYTES {
+            return Err(ProtocolError::correlated(
+                Some(envelope.request_id),
+                "protocol.invalid_request_kind",
+                "request kind is too long",
+            ));
+        }
         if !KNOWN_REQUESTS.contains(&envelope.kind.as_str()) {
-            return Err(ProtocolError::new(
+            return Err(ProtocolError::correlated(
+                Some(envelope.request_id),
                 "protocol.unknown_request",
                 "unknown request kind",
             ));
@@ -95,11 +120,24 @@ pub struct RemoteEvent {
 pub struct ProtocolError {
     code: &'static str,
     message: &'static str,
+    request_id: Option<u64>,
 }
 
 impl ProtocolError {
     fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            request_id: None,
+        }
+    }
+
+    fn correlated(request_id: Option<u64>, code: &'static str, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            request_id,
+        }
     }
 
     pub fn invalid_terminal_size() -> Self {
@@ -118,6 +156,14 @@ impl ProtocolError {
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+
+    pub fn request_id(&self) -> Option<u64> {
+        self.request_id
     }
 }
 
@@ -198,6 +244,7 @@ pub struct TerminalSize {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TerminalSizeWire {
     cols: u16,
     rows: u16,

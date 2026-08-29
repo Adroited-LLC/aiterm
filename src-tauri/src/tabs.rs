@@ -1,12 +1,12 @@
 use crate::pty::{PtyManager, PtySink, PtySpawnSpec};
 use crate::remote::model::TerminalSize;
-use crate::terminal::model::{ScreenDiff, ScreenRow, ScreenSnapshot};
+use crate::terminal::model::{Revision, ScreenDiff, ScreenRow, ScreenSnapshot};
 use crate::terminal::screen::ScreenModel;
 use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -675,6 +675,8 @@ fn pop_next(state: &mut MailboxState) -> Option<TabEvent> {
 pub struct TabAttachment {
     pub id: AttachmentId,
     pub events: TabEventReceiver,
+    pub cancellation: TabAttachmentCancellation,
+    descriptor: TabDescriptor,
 }
 
 impl fmt::Debug for TabAttachment {
@@ -685,11 +687,52 @@ impl fmt::Debug for TabAttachment {
     }
 }
 
-pub struct TabEventReceiver {
+impl TabAttachment {
+    /// Metadata captured under the same output/live ordering boundary as the
+    /// initial remote snapshot and subscriber insertion.
+    pub fn descriptor(&self) -> &TabDescriptor {
+        &self.descriptor
+    }
+}
+
+#[derive(Clone)]
+pub struct TabAttachmentCancellation {
     mailbox: Arc<EventMailbox>,
     registry: Weak<RegistryInner>,
     tab_id: TabId,
     attachment_id: AttachmentId,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for TabAttachmentCancellation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TabAttachmentCancellation")
+            .field("tab_id", &self.tab_id)
+            .field("attachment_id", &self.attachment_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TabAttachmentCancellation {
+    /// Wake the exact receiver mailbox before removing registry ownership.
+    /// The registry mutation is performed at most once across explicit
+    /// detach, task completion, connection teardown, and tab-exit races.
+    pub fn cancel(&self) {
+        self.mailbox.close_receiver();
+        if self.cancelled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            registry.detach(&self.tab_id, &self.attachment_id);
+        }
+    }
+}
+
+pub struct TabEventReceiver {
+    mailbox: Arc<EventMailbox>,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+    cancellation: TabAttachmentCancellation,
 }
 
 impl fmt::Debug for TabEventReceiver {
@@ -717,12 +760,27 @@ impl TabEventReceiver {
 
 impl Drop for TabEventReceiver {
     fn drop(&mut self) {
-        // Wake a desktop producer before trying to take the per-tab lock it may
-        // hold while applying lossless backpressure.
-        self.mailbox.close_receiver();
-        if let Some(registry) = self.registry.upgrade() {
-            registry.detach(&self.tab_id, &self.attachment_id);
-        }
+        self.cancellation.cancel();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScrollbackPage {
+    revision: Revision,
+    rows: Vec<ScreenRow>,
+}
+
+impl ScrollbackPage {
+    pub fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    pub fn rows(&self) -> &[ScreenRow] {
+        &self.rows
+    }
+
+    pub fn into_rows(self) -> Vec<ScreenRow> {
+        self.rows
     }
 }
 
@@ -992,7 +1050,7 @@ impl TabRegistry {
         let mailbox = Arc::new(EventMailbox::new(kind, self.inner.queue_capacity));
         let _output_order = tab.raw.send_order.lock().unwrap();
         tab.raw.require_open()?;
-        {
+        let descriptor = {
             let mut live = tab.live.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return Err(TabError::new("tab.closed", "the tab has exited"));
@@ -1021,7 +1079,8 @@ impl TabRegistry {
                     size: live.descriptor.size,
                 });
             }
-        }
+            live.descriptor.clone()
+        };
         if kind == AttachmentKind::Desktop {
             // Replay is asynchronous: a backlog larger than the downstream
             // mailbox cannot deadlock this attach before JS receives its
@@ -1030,14 +1089,23 @@ impl TabRegistry {
             // the backlog even after this method returns.
             tab.raw.start_opening_replay(mailbox.clone());
         }
+        let cancellation = TabAttachmentCancellation {
+            mailbox: mailbox.clone(),
+            registry: Arc::downgrade(&self.inner),
+            tab_id: id.clone(),
+            attachment_id: attachment_id.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
         Ok(TabAttachment {
             id: attachment_id.clone(),
             events: TabEventReceiver {
                 mailbox,
-                registry: Arc::downgrade(&self.inner),
                 tab_id: id.clone(),
                 attachment_id,
+                cancellation: cancellation.clone(),
             },
+            cancellation,
+            descriptor,
         })
     }
 
@@ -1063,6 +1131,29 @@ impl TabRegistry {
             .screen
             .scrollback_page(offset, count);
         Ok(page)
+    }
+
+    /// Read the scrollback revision and page under one output-order boundary.
+    pub fn scrollback_page(
+        &self,
+        id: &TabId,
+        offset: usize,
+        count: usize,
+    ) -> Result<ScrollbackPage, TabError> {
+        let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        let live = tab.live.lock().unwrap();
+        Ok(ScrollbackPage {
+            revision: live.screen.revision(),
+            rows: live.screen.scrollback_page(offset, count),
+        })
+    }
+
+    pub fn attachment_count(&self, id: &TabId) -> Result<usize, TabError> {
+        let tab = self.inner.tab(id)?;
+        let _output_order = tab.raw.send_order.lock().unwrap();
+        let count = tab.live.lock().unwrap().attachments.len();
+        Ok(count)
     }
 
     pub fn input(

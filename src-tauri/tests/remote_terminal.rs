@@ -1,7 +1,7 @@
 use aiterm_lib::pty::{PtySink, PtySpawnSpec};
 use aiterm_lib::remote::model::{RemoteEvent, TerminalSize, PROTOCOL_VERSION};
 use aiterm_lib::remote::terminal::{
-    chunk_scrollback, chunk_snapshot, DiffCoalescer, RemoteTerminal, TerminalEvent,
+    chunk_diff, chunk_scrollback, chunk_snapshot, DiffCoalescer, RemoteTerminal, TerminalEvent,
     TransferAssembler, TransferKind, TransferPayload, TransferStatus, MAX_WIRE_FRAME_BYTES,
 };
 use aiterm_lib::tabs::{PtyBackend, TabLaunch, TabRegistry, TabUpdate};
@@ -150,6 +150,37 @@ fn attaching_after_early_escape_sequences_gets_the_current_screen() {
         .map(row_text)
         .any(|row| row.contains("phone view")));
     assert!(attached.snapshot().modes().alternate_screen());
+}
+
+#[test]
+fn attach_captures_the_initial_title_at_the_snapshot_boundary() {
+    let (registry, _pty, tab) = setup(40, 4);
+    registry
+        .update(&tab, TabUpdate::new().title("current title"))
+        .unwrap();
+    let remote = RemoteTerminal::new(registry);
+
+    let (attached, _events) = remote.attach(&tab).unwrap();
+
+    assert_eq!(attached.title(), "current title");
+}
+
+#[tokio::test]
+async fn cancelling_an_idle_remote_event_stream_wakes_it_and_detaches_promptly() {
+    let (registry, _pty, tab) = setup(40, 4);
+    let remote = RemoteTerminal::new(registry.clone());
+    let (_attached, mut events) = remote.attach(&tab).unwrap();
+    assert_eq!(registry.attachment_count(&tab).unwrap(), 1);
+
+    events.cancel();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(100), events.next())
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(registry.attachment_count(&tab).unwrap(), 0);
 }
 
 #[test]
@@ -392,6 +423,146 @@ fn a_complete_transfer_is_applied_only_after_every_chunk_validates() {
 }
 
 #[test]
+fn a_real_sparse_registry_snapshot_round_trips_without_wire_padding() {
+    let (registry, pty, tab) = setup(8, 3);
+    pty.emit(pty.last_id(), b"x");
+    let remote = RemoteTerminal::new(registry);
+    let (attached, _events) = remote.attach(&tab).unwrap();
+    assert!(attached
+        .snapshot()
+        .visible()
+        .iter()
+        .any(|row| row.cells().len() < usize::from(attached.snapshot().cols())));
+
+    let chunks = chunk_snapshot(77, &tab, attached.snapshot()).unwrap();
+    let mut assembler = TransferAssembler::new("connection-a", tab);
+    let mut status = TransferStatus::Pending;
+    for chunk in chunks {
+        status = assembler.accept("connection-a", chunk);
+    }
+
+    let TransferStatus::Complete(TransferPayload::Snapshot(received)) = status else {
+        panic!("canonical sparse snapshot should assemble");
+    };
+    assert_eq!(received, *attached.snapshot());
+}
+
+#[test]
+fn diff_transfer_requires_the_current_applied_revision_without_advancing_on_a_gap() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let mut assembler = TransferAssembler::new("connection-a", tab.clone());
+    assembler.reset_for_snapshot(Revision(5));
+
+    let gap = ScreenDiff::for_tab(
+        tab.as_str(),
+        Revision(7),
+        Revision(8),
+        vec![RowPatch::new(0, screen_row("gap"))],
+    );
+    let gap = chunk_diff(1, &tab, &gap).unwrap().remove(0);
+    assert_eq!(
+        assembler.accept("connection-a", gap),
+        TransferStatus::Recover
+    );
+
+    let current = ScreenDiff::for_tab(
+        tab.as_str(),
+        Revision(5),
+        Revision(6),
+        vec![RowPatch::new(0, screen_row("current"))],
+    );
+    let current = chunk_diff(2, &tab, &current).unwrap().remove(0);
+    assert!(matches!(
+        assembler.accept("connection-a", current),
+        TransferStatus::Complete(TransferPayload::Diff(diff)) if diff.revision() == Revision(6)
+    ));
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DiffPartWire {
+    rows: Vec<RowPatch>,
+    cursor: Option<CursorState>,
+    modes: Option<TerminalModes>,
+}
+
+#[test]
+fn multi_chunk_diff_rejects_mismatched_cursor_or_mode_metadata() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let snapshot = large_snapshot(&tab);
+    let patches = snapshot
+        .visible()
+        .iter()
+        .enumerate()
+        .map(|(row, content)| RowPatch::new(u16::try_from(row).unwrap(), content.clone()))
+        .collect();
+    let diff = ScreenDiff::for_tab(tab.as_str(), Revision(7), Revision(8), patches)
+        .with_cursor(CursorState::new(1, 1, true))
+        .with_modes(TerminalModes::new(false, true, true));
+    let mut chunks = chunk_diff(8, &tab, &diff).unwrap();
+    assert!(chunks.len() > 1);
+    let mut second: DiffPartWire = ciborium::from_reader(chunks[1].payload.as_slice()).unwrap();
+    second.cursor = Some(CursorState::new(2, 1, true));
+    chunks[1].payload = ciborium_bytes(&second);
+    let mut assembler = TransferAssembler::new("connection-a", tab);
+    assembler.reset_for_snapshot(Revision(7));
+
+    assert_eq!(
+        assembler.accept("connection-a", chunks.remove(0)),
+        TransferStatus::Pending
+    );
+    assert_eq!(
+        assembler.accept("connection-a", chunks.remove(0)),
+        TransferStatus::Recover
+    );
+}
+
+#[test]
+fn a_cell_requires_one_base_scalar_followed_only_by_combining_scalars() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let invalid = ScreenRow::try_new(
+        vec![ScreenCell::try_new(
+            "ab",
+            1,
+            TerminalColor::Default,
+            TerminalColor::Default,
+            CellAttributes::default(),
+        )
+        .unwrap()],
+        false,
+    )
+    .unwrap();
+    let chunk = chunk_scrollback(9, &tab, Revision(1), vec![invalid])
+        .unwrap()
+        .remove(0);
+    let mut assembler = TransferAssembler::new("connection-a", tab);
+
+    assert_eq!(
+        assembler.accept("connection-a", chunk),
+        TransferStatus::Recover
+    );
+}
+
+#[test]
+fn diff_rows_and_cursor_are_bounded_to_the_canonical_viewport_limits() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let diff = ScreenDiff::for_tab(
+        tab.as_str(),
+        Revision(1),
+        Revision(2),
+        vec![RowPatch::new(999, screen_row("outside"))],
+    )
+    .with_cursor(CursorState::new(999, 999, true));
+    let chunk = chunk_diff(3, &tab, &diff).unwrap().remove(0);
+    let mut assembler = TransferAssembler::new("connection-a", tab);
+    assembler.reset_for_snapshot(Revision(1));
+
+    assert_eq!(
+        assembler.accept("connection-a", chunk),
+        TransferStatus::Recover
+    );
+}
+
+#[test]
 fn abandoned_transfer_expires_deterministically() {
     let tab = aiterm_lib::tabs::TabId::new();
     let snapshot = large_snapshot(&tab);
@@ -404,6 +575,19 @@ fn abandoned_transfer_expires_deterministically() {
         TransferStatus::Pending
     );
     assert!(assembler.expire_at(start + Duration::from_millis(6)));
+}
+
+#[test]
+fn staged_transfer_exposes_an_active_expiration_deadline() {
+    let tab = aiterm_lib::tabs::TabId::new();
+    let snapshot = large_snapshot(&tab);
+    let chunk = chunk_snapshot(1, &tab, &snapshot).unwrap().remove(0);
+    let start = Instant::now();
+    let mut assembler =
+        TransferAssembler::with_timeout("connection-a", tab, Duration::from_millis(5));
+    assembler.accept_at("connection-a", chunk, start);
+
+    assert_eq!(assembler.deadline(), Some(start + Duration::from_millis(5)));
 }
 
 fn ciborium_bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {

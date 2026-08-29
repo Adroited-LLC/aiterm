@@ -106,6 +106,10 @@ impl ScreenModel {
         }
     }
 
+    pub fn revision(&self) -> Revision {
+        self.revision
+    }
+
     pub fn process(&mut self, bytes: &[u8]) -> ScreenDamage {
         self.processor.advance(&mut self.term, bytes);
         self.collect_damage(false)

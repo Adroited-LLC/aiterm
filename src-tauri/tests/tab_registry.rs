@@ -708,6 +708,80 @@ fn dropping_an_attachment_cleans_it_up_and_releases_focus_ownership() {
 }
 
 #[test]
+fn explicit_attachment_cancellation_wakes_receivers_and_releases_focus_once() {
+    let (registry, pty) = registry();
+    let tab = registry.open(shell_launch("slot:cancel")).unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let _ = remote.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    registry.take_focus(&tab, &remote.id, size(80, 24)).unwrap();
+    assert_eq!(registry.attachment_count(&tab).unwrap(), 1);
+
+    remote.cancellation.cancel();
+    remote.cancellation.cancel();
+
+    assert_eq!(registry.attachment_count(&tab).unwrap(), 0);
+    assert!(registry.get(&tab).unwrap().input_owner().is_none());
+    assert!(remote
+        .events
+        .recv_timeout(Duration::from_millis(20))
+        .is_err());
+    assert!(registry.input(&tab, &remote.id, b"stale").is_err());
+    assert!(pty.writes().is_empty());
+}
+
+#[test]
+fn scrollback_page_captures_revision_and_rows_under_one_output_boundary() {
+    let (registry, pty) = registry();
+    let tab = registry
+        .open(TabLaunch::new(
+            "Small",
+            "slot:atomic-scrollback",
+            size(8, 2),
+        ))
+        .unwrap();
+    pty.emit_output(pty.last_id(), b"one\r\ntwo\r\nthree");
+
+    let page = registry.scrollback_page(&tab, 0, 1).unwrap();
+
+    assert_eq!(page.rows().len(), 1);
+    assert_eq!(page.revision(), registry.snapshot(&tab).unwrap().revision());
+}
+
+#[test]
+fn concurrent_output_keeps_atomic_scrollback_page_revisions_monotonic() {
+    let (registry, pty) = registry();
+    let tab = registry
+        .open(TabLaunch::new(
+            "Small",
+            "slot:concurrent-atomic-scrollback",
+            size(8, 2),
+        ))
+        .unwrap();
+    let pty_id = pty.last_id();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let producer_pty = pty.clone();
+    let producer_completed = completed.clone();
+    let producer = thread::spawn(move || {
+        for index in 0..200 {
+            producer_pty.emit_output(pty_id, format!("{index:04}\r\n").as_bytes());
+            producer_completed.store(index + 1, Ordering::Release);
+        }
+    });
+
+    let mut previous = aiterm_lib::terminal::model::Revision(0);
+    while completed.load(Ordering::Acquire) < 200 {
+        let page = registry.scrollback_page(&tab, 0, 16).unwrap();
+        assert!(page.revision().0 >= previous.0);
+        assert!(page.rows().len() <= 16);
+        previous = page.revision();
+        thread::yield_now();
+    }
+    producer.join().unwrap();
+    let page = registry.scrollback_page(&tab, 0, 16).unwrap();
+    assert_eq!(page.revision(), registry.snapshot(&tab).unwrap().revision());
+}
+
+#[test]
 fn remote_queue_loss_discards_stale_diffs_and_recovers_with_a_snapshot() {
     let pty = Arc::new(FakePty::default());
     let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);

@@ -93,12 +93,48 @@ fn accepts_an_explicit_take_focus_request() {
 
 #[test]
 fn accepts_tab_and_scrollback_requests() {
-    for kind in ["tab.list", "tab.open", "tab.close", "terminal.scrollback"] {
+    for kind in [
+        "tab.list",
+        "tab.open",
+        "tab.close",
+        "terminal.scrollback",
+        "terminal.resume",
+    ] {
         let request = RemoteRequest::decode(&cbor_request(1, kind, b""))
             .expect("the typed terminal protocol should define this request");
 
         assert_eq!(request.kind(), kind);
     }
+}
+
+#[derive(Serialize)]
+struct EnvelopeWithUnknownField<'a> {
+    version: u16,
+    request_id: u64,
+    kind: &'a str,
+    payload: &'a [u8],
+    unexpected: bool,
+}
+
+#[test]
+fn strict_envelope_errors_retain_a_recoverable_request_id() {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(
+        &EnvelopeWithUnknownField {
+            version: 1,
+            request_id: 88,
+            kind: "tab.list",
+            payload: b"",
+            unexpected: true,
+        },
+        &mut bytes,
+    )
+    .unwrap();
+
+    let error = RemoteRequest::decode(&bytes).unwrap_err();
+
+    assert_eq!(error.code(), "protocol.invalid_cbor");
+    assert_eq!(error.request_id(), Some(88));
 }
 
 #[test]

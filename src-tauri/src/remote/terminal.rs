@@ -1,9 +1,9 @@
 //! Transport-neutral remote projection of Rust-owned terminal tabs.
 
-use super::model::{RemoteEvent, TerminalSize, PROTOCOL_VERSION};
+use super::model::{encode_terminal_frame, RemoteEvent, TerminalSize, PROTOCOL_VERSION};
 use crate::tabs::{
-    AttachmentId, AttachmentKind, TabAttachment, TabDescriptor, TabError, TabEvent,
-    TabEventReceiver, TabExit, TabId, TabLaunch, TabRegistry,
+    AttachmentId, AttachmentKind, TabAttachment, TabAttachmentCancellation, TabDescriptor,
+    TabError, TabEvent, TabEventReceiver, TabExit, TabId, TabLaunch, TabRegistry,
 };
 use crate::terminal::model::{
     CursorState, Revision, RowPatch, ScreenDiff, ScreenRow, ScreenSnapshot, TerminalModes,
@@ -11,15 +11,23 @@ use crate::terminal::model::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use unicode_normalization::char::is_combining_mark;
 use uuid::Uuid;
 
 pub const MAX_WIRE_FRAME_BYTES: usize = 1024 * 1024;
 pub const DIFF_INTERVAL: Duration = Duration::from_millis(16);
 const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_STAGED_TRANSFER_BYTES: usize = 128 * 1024 * 1024;
+const MAX_STAGED_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STAGED_TRANSFER_ROWS: usize = 5_000;
+
+enum MailboxReceive {
+    Event(TabEvent),
+    Timeout,
+    Disconnected,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalError {
@@ -96,6 +104,7 @@ pub struct RemoteAttachment {
     attachment_id: AttachmentId,
     snapshot: ScreenSnapshot,
     has_focus: bool,
+    title: String,
 }
 
 impl RemoteAttachment {
@@ -114,10 +123,19 @@ impl RemoteAttachment {
     pub fn has_focus(&self) -> bool {
         self.has_focus
     }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn into_snapshot(self) -> ScreenSnapshot {
+        self.snapshot
+    }
 }
 
 pub struct RemoteTerminalEvents {
     receiver: Arc<Mutex<TabEventReceiver>>,
+    cancellation: TabAttachmentCancellation,
     registry: Arc<TabRegistry>,
     tab_id: TabId,
     last_title: String,
@@ -135,12 +153,14 @@ impl fmt::Debug for RemoteTerminalEvents {
 impl RemoteTerminalEvents {
     fn new(
         receiver: TabEventReceiver,
+        cancellation: TabAttachmentCancellation,
         registry: Arc<TabRegistry>,
         tab_id: TabId,
         title: String,
     ) -> Self {
         Self {
             receiver: Arc::new(Mutex::new(receiver)),
+            cancellation,
             registry,
             tab_id,
             last_title: title,
@@ -166,18 +186,27 @@ impl RemoteTerminalEvents {
             let received = tokio::task::spawn_blocking(move || {
                 let receiver = receiver.lock().unwrap();
                 match timeout {
-                    Some(timeout) => receiver.recv_timeout(timeout).ok(),
-                    None => receiver.recv().ok(),
+                    Some(timeout) => match receiver.recv_timeout(timeout) {
+                        Ok(event) => MailboxReceive::Event(event),
+                        Err(RecvTimeoutError::Timeout) => MailboxReceive::Timeout,
+                        Err(RecvTimeoutError::Disconnected) => MailboxReceive::Disconnected,
+                    },
+                    None => receiver
+                        .recv()
+                        .map(MailboxReceive::Event)
+                        .unwrap_or(MailboxReceive::Disconnected),
                 }
             })
-            .await
-            .ok()
-            .flatten();
-            let Some(event) = received else {
-                if self.diff_started.take().is_some() {
-                    return self.coalescer.flush().map(TerminalEvent::Diff);
+            .await;
+            let event = match received {
+                Ok(MailboxReceive::Event(event)) => event,
+                Ok(MailboxReceive::Timeout) => continue,
+                Ok(MailboxReceive::Disconnected) | Err(_) => {
+                    if self.diff_started.take().is_some() {
+                        return self.coalescer.flush().map(TerminalEvent::Diff);
+                    }
+                    return None;
                 }
-                return None;
             };
             match event {
                 TabEvent::Diff(diff) => {
@@ -187,10 +216,12 @@ impl RemoteTerminalEvents {
                     if self.coalescer.push(diff).is_err() {
                         self.diff_started = None;
                         self.coalescer.clear();
-                        return self
-                            .registry
-                            .snapshot(&self.tab_id)
+                        let registry = self.registry.clone();
+                        let tab_id = self.tab_id.clone();
+                        return tokio::task::spawn_blocking(move || registry.snapshot(&tab_id))
+                            .await
                             .ok()
+                            .and_then(Result::ok)
                             .map(TerminalEvent::Snapshot);
                     }
                 }
@@ -219,6 +250,20 @@ impl RemoteTerminalEvents {
             }
         }
     }
+
+    pub fn cancellation(&self) -> TabAttachmentCancellation {
+        self.cancellation.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl Drop for RemoteTerminalEvents {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 #[derive(Clone)]
@@ -239,7 +284,14 @@ impl RemoteTerminal {
         &self,
         tab_id: &TabId,
     ) -> Result<(RemoteAttachment, RemoteTerminalEvents), TerminalError> {
-        let TabAttachment { id, events } = self.registry.attach(tab_id, AttachmentKind::Remote)?;
+        let attachment = self.registry.attach(tab_id, AttachmentKind::Remote)?;
+        let descriptor = attachment.descriptor().clone();
+        let TabAttachment {
+            id,
+            events,
+            cancellation,
+            ..
+        } = attachment;
         let snapshot = match events.recv().map_err(|_| {
             TerminalError::new(
                 "terminal.attach_failed",
@@ -254,7 +306,6 @@ impl RemoteTerminal {
                 ))
             }
         };
-        let descriptor = self.registry.get(tab_id)?;
         let has_focus = descriptor.input_owner().is_some_and(|owner| owner == &id);
         Ok((
             RemoteAttachment {
@@ -262,9 +313,11 @@ impl RemoteTerminal {
                 attachment_id: id,
                 snapshot,
                 has_focus,
+                title: descriptor.title().to_owned(),
             },
             RemoteTerminalEvents::new(
                 events,
+                cancellation,
                 self.registry.clone(),
                 tab_id.clone(),
                 descriptor.title().to_owned(),
@@ -428,6 +481,7 @@ impl TransferKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransferChunk {
     pub transfer_id: String,
     pub tab_id: TabId,
@@ -444,6 +498,7 @@ pub struct TransferChunk {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SnapshotPart {
     cols: u16,
     rows: u16,
@@ -453,6 +508,7 @@ struct SnapshotPart {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DiffPart {
     rows: Vec<RowPatch>,
     cursor: Option<CursorState>,
@@ -460,15 +516,40 @@ struct DiffPart {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScrollbackPart {
     rows: Vec<ScreenRow>,
 }
 
+#[derive(Serialize)]
+struct SnapshotPartRef<'a> {
+    cols: u16,
+    rows: u16,
+    visible: &'a [ScreenRow],
+    cursor: &'a CursorState,
+    modes: &'a TerminalModes,
+}
+
+#[derive(Serialize)]
+struct DiffPartRef<'a> {
+    rows: &'a [RowPatch],
+    cursor: Option<&'a CursorState>,
+    modes: Option<&'a TerminalModes>,
+}
+
+#[derive(Serialize)]
+struct ScrollbackPartRef<'a> {
+    rows: &'a [ScreenRow],
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, TerminalError> {
-    let mut bytes = Vec::new();
-    ciborium::into_writer(value, &mut bytes)
-        .map_err(|_| TerminalError::invalid_transfer("unable to encode transfer"))?;
-    Ok(bytes)
+    encode_terminal_frame(value).map_err(|error| {
+        if error.code() == "protocol.frame_too_large" {
+            TerminalError::semantic_row_too_large()
+        } else {
+            TerminalError::invalid_transfer("unable to encode transfer")
+        }
+    })
 }
 
 fn wire_len(chunk: &TransferChunk) -> Result<usize, TerminalError> {
@@ -482,39 +563,151 @@ fn wire_len(chunk: &TransferChunk) -> Result<usize, TerminalError> {
     .map(|bytes| bytes.len())
 }
 
-fn finish_chunks(mut chunks: Vec<TransferChunk>) -> Result<Vec<TransferChunk>, TerminalError> {
-    let total = u32::try_from(chunks.len())
-        .map_err(|_| TerminalError::invalid_transfer("too many transfer chunks"))?;
-    for chunk in &mut chunks {
-        chunk.total = total;
-        if wire_len(chunk)? >= MAX_WIRE_FRAME_BYTES {
-            return Err(TerminalError::semantic_row_too_large());
-        }
-    }
-    Ok(chunks)
+#[derive(Clone)]
+enum TransferSource {
+    Snapshot(ScreenSnapshot),
+    Diff(ScreenDiff),
+    Scrollback(Vec<ScreenRow>),
 }
 
-fn chunk_rows<T, F>(
+impl TransferSource {
+    fn row_count(&self) -> usize {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.visible().len(),
+            Self::Diff(diff) => diff.rows().len(),
+            Self::Scrollback(rows) => rows.len(),
+        }
+    }
+
+    fn encode_range(&self, range: std::ops::Range<usize>) -> Result<Vec<u8>, TerminalError> {
+        match self {
+            Self::Snapshot(snapshot) => encode(&SnapshotPartRef {
+                cols: snapshot.cols(),
+                rows: snapshot.rows(),
+                visible: &snapshot.visible()[range],
+                cursor: snapshot.cursor(),
+                modes: snapshot.modes(),
+            }),
+            Self::Diff(diff) => encode(&DiffPartRef {
+                rows: &diff.rows()[range],
+                cursor: diff.cursor(),
+                modes: diff.modes(),
+            }),
+            Self::Scrollback(rows) => encode(&ScrollbackPartRef { rows: &rows[range] }),
+        }
+    }
+}
+
+/// An owned canonical payload plus metadata-only row ranges. No encoded chunk
+/// or outbound frame is retained; callers encode and send one chunk at a time.
+pub struct TransferPlan {
+    transfer_id: String,
+    tab_id: TabId,
+    attachment_id: Option<AttachmentId>,
+    kind: TransferKind,
+    base_revision: Revision,
+    final_revision: Revision,
+    request_id: u64,
+    source: TransferSource,
+    ranges: Vec<std::ops::Range<usize>>,
+    next: usize,
+}
+
+impl TransferPlan {
+    fn new(
+        request_id: u64,
+        tab: &TabId,
+        attachment_id: Option<&AttachmentId>,
+        kind: TransferKind,
+        base_revision: Revision,
+        final_revision: Revision,
+        source: TransferSource,
+    ) -> Result<Self, TerminalError> {
+        let transfer_id = Uuid::new_v4().to_string();
+        let ranges = plan_row_ranges(
+            request_id,
+            tab,
+            attachment_id,
+            kind,
+            base_revision,
+            final_revision,
+            &transfer_id,
+            &source,
+        )?;
+        Ok(Self {
+            transfer_id,
+            tab_id: tab.clone(),
+            attachment_id: attachment_id.cloned(),
+            kind,
+            base_revision,
+            final_revision,
+            request_id,
+            source,
+            ranges,
+            next: 0,
+        })
+    }
+
+    pub fn next_chunk(&mut self) -> Result<Option<TransferChunk>, TerminalError> {
+        let Some(range) = self.ranges.get(self.next).cloned() else {
+            return Ok(None);
+        };
+        let payload = self.source.encode_range(range.clone())?;
+        let chunk = TransferChunk {
+            transfer_id: self.transfer_id.clone(),
+            tab_id: self.tab_id.clone(),
+            attachment_id: self.attachment_id.clone(),
+            kind: self.kind,
+            base_revision: self.base_revision,
+            final_revision: self.final_revision,
+            row_start: u32::try_from(range.start)
+                .map_err(|_| TerminalError::invalid_transfer("row index exceeds protocol"))?,
+            row_end: u32::try_from(range.end)
+                .map_err(|_| TerminalError::invalid_transfer("row index exceeds protocol"))?,
+            index: u32::try_from(self.next)
+                .map_err(|_| TerminalError::invalid_transfer("too many transfer chunks"))?,
+            total: u32::try_from(self.ranges.len())
+                .map_err(|_| TerminalError::invalid_transfer("too many transfer chunks"))?,
+            request_id: self.request_id,
+            payload,
+        };
+        if wire_len(&chunk)? >= MAX_WIRE_FRAME_BYTES {
+            return Err(TerminalError::semantic_row_too_large());
+        }
+        self.next += 1;
+        Ok(Some(chunk))
+    }
+
+    pub fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    fn collect_chunks(mut self) -> Result<Vec<TransferChunk>, TerminalError> {
+        let mut chunks = Vec::with_capacity(self.ranges.len());
+        while let Some(chunk) = self.next_chunk()? {
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+}
+
+fn plan_row_ranges(
     request_id: u64,
     tab: &TabId,
     attachment_id: Option<&AttachmentId>,
     kind: TransferKind,
     base_revision: Revision,
     final_revision: Revision,
-    row_count: usize,
-    mut encode_range: F,
-) -> Result<Vec<TransferChunk>, TerminalError>
-where
-    F: FnMut(std::ops::Range<usize>) -> Result<T, TerminalError>,
-    T: Serialize,
-{
-    let transfer_id = Uuid::new_v4().to_string();
-    let mut chunks = Vec::new();
+    transfer_id: &str,
+    source: &TransferSource,
+) -> Result<Vec<std::ops::Range<usize>>, TerminalError> {
+    let row_count = source.row_count();
+    let mut ranges = Vec::new();
     let mut start = 0usize;
     if row_count == 0 {
-        let payload = encode(&encode_range(0..0)?)?;
-        chunks.push(TransferChunk {
-            transfer_id,
+        let payload = source.encode_range(0..0)?;
+        let chunk = TransferChunk {
+            transfer_id: transfer_id.to_owned(),
             tab_id: tab.clone(),
             attachment_id: attachment_id.cloned(),
             kind,
@@ -526,18 +719,28 @@ where
             total: u32::MAX,
             request_id,
             payload,
-        });
-        return finish_chunks(chunks);
+        };
+        if wire_len(&chunk)? >= MAX_WIRE_FRAME_BYTES {
+            return Err(TerminalError::semantic_row_too_large());
+        }
+        return Ok(vec![0..0]);
     }
     while start < row_count {
-        let mut best: Option<TransferChunk> = None;
+        let mut best: Option<usize> = None;
         let mut low = start + 1;
         let mut high = row_count;
         while low <= high {
             let end = low + (high - low) / 2;
-            let payload = encode(&encode_range(start..end)?)?;
+            let payload = match source.encode_range(start..end) {
+                Ok(payload) => payload,
+                Err(error) if error.code() == "protocol.semantic_row_too_large" => {
+                    high = end - 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let candidate = TransferChunk {
-                transfer_id: transfer_id.clone(),
+                transfer_id: transfer_id.to_owned(),
                 tab_id: tab.clone(),
                 attachment_id: attachment_id.cloned(),
                 kind,
@@ -545,25 +748,85 @@ where
                 final_revision,
                 row_start: u32::try_from(start).unwrap(),
                 row_end: u32::try_from(end).unwrap(),
-                index: u32::try_from(chunks.len()).unwrap(),
+                index: u32::try_from(ranges.len()).unwrap(),
                 total: u32::MAX,
                 request_id,
                 payload,
             };
-            if wire_len(&candidate)? >= MAX_WIRE_FRAME_BYTES {
-                high = end - 1;
-            } else {
-                best = Some(candidate);
-                low = end + 1;
+            match wire_len(&candidate) {
+                Ok(size) if size < MAX_WIRE_FRAME_BYTES => {
+                    best = Some(end);
+                    low = end + 1;
+                }
+                Ok(_) => high = end - 1,
+                Err(error) if error.code() == "protocol.semantic_row_too_large" => {
+                    high = end - 1;
+                }
+                Err(error) => return Err(error),
             }
         }
-        let Some(chunk) = best else {
+        let Some(end) = best else {
             return Err(TerminalError::semantic_row_too_large());
         };
-        start = usize::try_from(chunk.row_end).unwrap();
-        chunks.push(chunk);
+        ranges.push(start..end);
+        start = end;
     }
-    finish_chunks(chunks)
+    Ok(ranges)
+}
+
+pub fn plan_snapshot_for_attachment(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    snapshot: ScreenSnapshot,
+) -> Result<TransferPlan, TerminalError> {
+    let revision = snapshot.revision();
+    TransferPlan::new(
+        request_id,
+        tab,
+        attachment_id,
+        TransferKind::Snapshot,
+        revision,
+        revision,
+        TransferSource::Snapshot(snapshot),
+    )
+}
+
+pub fn plan_diff_for_attachment(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    diff: ScreenDiff,
+) -> Result<TransferPlan, TerminalError> {
+    let base = diff.base_revision();
+    let revision = diff.revision();
+    TransferPlan::new(
+        request_id,
+        tab,
+        attachment_id,
+        TransferKind::Diff,
+        base,
+        revision,
+        TransferSource::Diff(diff),
+    )
+}
+
+pub fn plan_scrollback_for_attachment(
+    request_id: u64,
+    tab: &TabId,
+    attachment_id: Option<&AttachmentId>,
+    revision: Revision,
+    rows: Vec<ScreenRow>,
+) -> Result<TransferPlan, TerminalError> {
+    TransferPlan::new(
+        request_id,
+        tab,
+        attachment_id,
+        TransferKind::Scrollback,
+        revision,
+        revision,
+        TransferSource::Scrollback(rows),
+    )
 }
 
 pub fn chunk_snapshot(
@@ -580,25 +843,7 @@ pub fn chunk_snapshot_for_attachment(
     attachment_id: Option<&AttachmentId>,
     snapshot: &ScreenSnapshot,
 ) -> Result<Vec<TransferChunk>, TerminalError> {
-    let visible = snapshot.visible();
-    chunk_rows(
-        request_id,
-        tab,
-        attachment_id,
-        TransferKind::Snapshot,
-        snapshot.revision(),
-        snapshot.revision(),
-        visible.len(),
-        |range| {
-            Ok(SnapshotPart {
-                cols: snapshot.cols(),
-                rows: snapshot.rows(),
-                visible: visible[range].to_vec(),
-                cursor: snapshot.cursor().clone(),
-                modes: snapshot.modes().clone(),
-            })
-        },
-    )
+    plan_snapshot_for_attachment(request_id, tab, attachment_id, snapshot.clone())?.collect_chunks()
 }
 
 pub fn chunk_diff(
@@ -615,23 +860,7 @@ pub fn chunk_diff_for_attachment(
     attachment_id: Option<&AttachmentId>,
     diff: &ScreenDiff,
 ) -> Result<Vec<TransferChunk>, TerminalError> {
-    let rows = diff.rows();
-    chunk_rows(
-        request_id,
-        tab,
-        attachment_id,
-        TransferKind::Diff,
-        diff.base_revision(),
-        diff.revision(),
-        rows.len(),
-        |range| {
-            Ok(DiffPart {
-                rows: rows[range].to_vec(),
-                cursor: diff.cursor().cloned(),
-                modes: diff.modes().cloned(),
-            })
-        },
-    )
+    plan_diff_for_attachment(request_id, tab, attachment_id, diff.clone())?.collect_chunks()
 }
 
 pub fn chunk_scrollback(
@@ -650,20 +879,7 @@ pub fn chunk_scrollback_for_attachment(
     revision: Revision,
     rows: Vec<ScreenRow>,
 ) -> Result<Vec<TransferChunk>, TerminalError> {
-    chunk_rows(
-        request_id,
-        tab,
-        attachment_id,
-        TransferKind::Scrollback,
-        revision,
-        revision,
-        rows.len(),
-        |range| {
-            Ok(ScrollbackPart {
-                rows: rows[range].to_vec(),
-            })
-        },
-    )
+    plan_scrollback_for_attachment(request_id, tab, attachment_id, revision, rows)?.collect_chunks()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -694,6 +910,7 @@ struct StagedTransfer {
     rows: usize,
     started: Instant,
     payloads: Vec<Vec<u8>>,
+    metadata: Option<PartMetadata>,
 }
 
 pub struct TransferAssembler {
@@ -746,6 +963,14 @@ impl TransferAssembler {
         expired
     }
 
+    /// Exposed so a receiver can schedule reclamation even if no later chunk
+    /// arrives to drive `accept_at`.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.staged
+            .as_ref()
+            .map(|staged| staged.started + self.timeout)
+    }
+
     pub fn accept(&mut self, connection_id: &str, chunk: TransferChunk) -> TransferStatus {
         self.accept_at(connection_id, chunk, Instant::now())
     }
@@ -764,7 +989,7 @@ impl TransferAssembler {
             || usize::try_from(chunk.total).map_or(true, |total| total > MAX_STAGED_TRANSFER_ROWS)
             || usize::try_from(chunk.row_end)
                 .map_or(true, |row_end| row_end > MAX_STAGED_TRANSFER_ROWS)
-            || chunk.final_revision.0 < self.revision_floor.0
+            || !revision_continues(self.revision_floor, &chunk)
             || !valid_revision_metadata(&chunk)
             || wire_len(&chunk).map_or(true, |size| size >= MAX_WIRE_FRAME_BYTES)
         {
@@ -789,6 +1014,7 @@ impl TransferAssembler {
                 rows: 0,
                 started: now,
                 payloads: Vec::new(),
+                metadata: None,
             });
         }
         let staged = self.staged.as_mut().unwrap();
@@ -808,9 +1034,19 @@ impl TransferAssembler {
             && chunk.index < chunk.total;
         let bounded = staged.bytes.saturating_add(chunk.payload.len()) <= MAX_STAGED_TRANSFER_BYTES
             && staged.rows.saturating_add(row_count) <= MAX_STAGED_TRANSFER_ROWS;
-        if !consistent || !bounded || validate_part(&chunk, row_count).is_err() {
+        let metadata = validate_part(&chunk, row_count);
+        let metadata_consistent = metadata.as_ref().is_ok_and(|metadata| {
+            staged
+                .metadata
+                .as_ref()
+                .is_none_or(|current| current == metadata)
+        });
+        if !consistent || !bounded || !metadata_consistent {
             self.staged = None;
             return TransferStatus::Recover;
+        }
+        if staged.metadata.is_none() {
+            staged.metadata = metadata.ok();
         }
         staged.bytes += chunk.payload.len();
         staged.rows += row_count;
@@ -840,22 +1076,62 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, TerminalError
         .map_err(|_| TerminalError::invalid_transfer("invalid transfer payload"))
 }
 
-fn validate_part(chunk: &TransferChunk, expected_rows: usize) -> Result<(), TerminalError> {
-    let rows = match chunk.kind {
-        TransferKind::Snapshot => decode::<SnapshotPart>(&chunk.payload)?.visible,
-        TransferKind::Diff => decode::<DiffPart>(&chunk.payload)?
-            .rows
-            .into_iter()
-            .map(|patch| patch.content().clone())
-            .collect(),
-        TransferKind::Scrollback => decode::<ScrollbackPart>(&chunk.payload)?.rows,
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PartMetadata {
+    Snapshot(u16, u16, CursorState, TerminalModes),
+    Diff(Option<CursorState>, Option<TerminalModes>),
+    Scrollback,
+}
+
+fn validate_part(
+    chunk: &TransferChunk,
+    expected_rows: usize,
+) -> Result<PartMetadata, TerminalError> {
+    let metadata = match chunk.kind {
+        TransferKind::Snapshot => {
+            let part = decode::<SnapshotPart>(&chunk.payload)?;
+            if part.visible.len() != expected_rows
+                || !(1..=512).contains(&part.cols)
+                || !(1..=512).contains(&part.rows)
+                || part.cursor.col() >= part.cols
+                || part.cursor.row() >= part.rows
+                || part.visible.iter().any(|row| !valid_row(row))
+            {
+                return Err(TerminalError::invalid_transfer(
+                    "snapshot part exceeds canonical bounds",
+                ));
+            }
+            PartMetadata::Snapshot(part.cols, part.rows, part.cursor, part.modes)
+        }
+        TransferKind::Diff => {
+            let part = decode::<DiffPart>(&chunk.payload)?;
+            if part.rows.len() != expected_rows
+                || part
+                    .rows
+                    .iter()
+                    .any(|patch| patch.row() >= 512 || !valid_row(patch.content()))
+                || part
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.col() >= 512 || cursor.row() >= 512)
+            {
+                return Err(TerminalError::invalid_transfer(
+                    "diff part exceeds canonical bounds",
+                ));
+            }
+            PartMetadata::Diff(part.cursor, part.modes)
+        }
+        TransferKind::Scrollback => {
+            let part = decode::<ScrollbackPart>(&chunk.payload)?;
+            if part.rows.len() != expected_rows || part.rows.iter().any(|row| !valid_row(row)) {
+                return Err(TerminalError::invalid_transfer(
+                    "scrollback row range does not match payload",
+                ));
+            }
+            PartMetadata::Scrollback
+        }
     };
-    if rows.len() != expected_rows || rows.iter().any(|row| !valid_row(row)) {
-        return Err(TerminalError::invalid_transfer(
-            "row range does not match payload",
-        ));
-    }
-    Ok(())
+    Ok(metadata)
 }
 
 fn valid_revision_metadata(chunk: &TransferChunk) -> bool {
@@ -867,12 +1143,40 @@ fn valid_revision_metadata(chunk: &TransferChunk) -> bool {
     }
 }
 
+fn revision_continues(current: Revision, chunk: &TransferChunk) -> bool {
+    match chunk.kind {
+        TransferKind::Snapshot => chunk.final_revision.0 >= current.0,
+        TransferKind::Diff => chunk.base_revision == current,
+        // History pages are independent of the applied live viewport. Their
+        // atomic registry revision is descriptive and never advances it.
+        TransferKind::Scrollback => true,
+    }
+}
+
 fn valid_row(row: &ScreenRow) -> bool {
     row.cells().len() <= 512
         && row
             .cells()
             .iter()
-            .all(|cell| cell.is_continuation() || matches!(cell.text().chars().count(), 1..=33))
+            .all(|cell| cell.is_continuation() || valid_cell_text(cell.text()))
+}
+
+fn valid_cell_text(text: &str) -> bool {
+    let mut scalars = text.chars();
+    let Some(base) = scalars.next() else {
+        return false;
+    };
+    if is_combining_mark(base) {
+        return false;
+    }
+    let mut combining = 0usize;
+    for scalar in scalars {
+        combining += 1;
+        if combining > 32 || !is_combining_mark(scalar) {
+            return false;
+        }
+    }
+    true
 }
 
 fn assemble_payload(
@@ -907,7 +1211,7 @@ fn assemble_payload(
             }
             if visible
                 .iter()
-                .any(|row| row.cells().len() != usize::from(cols))
+                .any(|row| row.cells().len() > usize::from(cols))
             {
                 return Err(TerminalError::invalid_transfer(
                     "snapshot rows do not match its column count",
