@@ -1,6 +1,7 @@
 use crate::remote::model::TerminalSize;
 use crate::terminal::MAX_SCROLLBACK_ROWS;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
+use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision(pub u64);
@@ -73,7 +74,7 @@ impl CellAttributes {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ScreenCell {
     text: String,
     width: u8,
@@ -83,22 +84,38 @@ pub struct ScreenCell {
     attributes: CellAttributes,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenCellError {
+    InvalidWidth,
+}
+
+impl std::fmt::Display for ScreenCellError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("screen cell width must be one or two")
+    }
+}
+
+impl std::error::Error for ScreenCellError {}
+
 impl ScreenCell {
-    pub fn new(
+    pub fn try_new(
         text: impl Into<String>,
         width: u8,
         foreground: TerminalColor,
         background: TerminalColor,
         attributes: CellAttributes,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ScreenCellError> {
+        if !matches!(width, 1 | 2) {
+            return Err(ScreenCellError::InvalidWidth);
+        }
+        Ok(Self {
             text: text.into(),
             width,
             continuation: false,
             foreground,
             background,
             attributes,
-        }
+        })
     }
 
     pub fn continuation() -> Self {
@@ -137,15 +154,88 @@ impl ScreenCell {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Deserialize)]
+struct ScreenCellWire {
+    text: String,
+    width: u8,
+    continuation: bool,
+    foreground: TerminalColor,
+    background: TerminalColor,
+    attributes: CellAttributes,
+}
+
+impl<'de> Deserialize<'de> for ScreenCell {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ScreenCellWire::deserialize(deserializer)?;
+        if wire.continuation {
+            if wire.width != 0
+                || !wire.text.is_empty()
+                || wire.foreground != TerminalColor::Default
+                || wire.background != TerminalColor::Default
+                || wire.attributes != CellAttributes::default()
+            {
+                return Err(D::Error::custom("invalid continuation cell"));
+            }
+            return Ok(Self::continuation());
+        }
+        Self::try_new(
+            wire.text,
+            wire.width,
+            wire.foreground,
+            wire.background,
+            wire.attributes,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ScreenRow {
     cells: Vec<ScreenCell>,
     wrapped: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenRowError {
+    OrphanContinuation,
+    WideCellMissingContinuation,
+}
+
+impl std::fmt::Display for ScreenRowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OrphanContinuation => f.write_str("wide-cell continuation has no lead cell"),
+            Self::WideCellMissingContinuation => {
+                f.write_str("wide-cell lead must be followed by one continuation")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScreenRowError {}
+
 impl ScreenRow {
-    pub fn new(cells: Vec<ScreenCell>, wrapped: bool) -> Self {
-        Self { cells, wrapped }
+    pub fn try_new(cells: Vec<ScreenCell>, wrapped: bool) -> Result<Self, ScreenRowError> {
+        let mut index = 0;
+        while index < cells.len() {
+            let cell = &cells[index];
+            if cell.is_continuation() {
+                return Err(ScreenRowError::OrphanContinuation);
+            }
+            if cell.width() == 2 {
+                let continuation = cells.get(index + 1);
+                if !continuation.is_some_and(ScreenCell::is_continuation) {
+                    return Err(ScreenRowError::WideCellMissingContinuation);
+                }
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
+        Ok(Self { cells, wrapped })
     }
 
     pub fn cells(&self) -> &[ScreenCell] {
@@ -154,6 +244,22 @@ impl ScreenRow {
 
     pub fn wrapped(&self) -> bool {
         self.wrapped
+    }
+}
+
+#[derive(Deserialize)]
+struct ScreenRowWire {
+    cells: Vec<ScreenCell>,
+    wrapped: bool,
+}
+
+impl<'de> Deserialize<'de> for ScreenRow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ScreenRowWire::deserialize(deserializer)?;
+        Self::try_new(wire.cells, wire.wrapped).map_err(D::Error::custom)
     }
 }
 
@@ -208,6 +314,7 @@ pub struct TerminalModes {
     application_cursor: bool,
     bracketed_paste: bool,
     line_wrap: bool,
+    alternate_screen: bool,
 }
 
 impl TerminalModes {
@@ -216,6 +323,7 @@ impl TerminalModes {
             application_cursor,
             bracketed_paste,
             line_wrap,
+            alternate_screen: false,
         }
     }
 
@@ -229,6 +337,15 @@ impl TerminalModes {
 
     pub fn line_wrap(&self) -> bool {
         self.line_wrap
+    }
+
+    pub fn with_alternate_screen(mut self, alternate_screen: bool) -> Self {
+        self.alternate_screen = alternate_screen;
+        self
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.alternate_screen
     }
 }
 
@@ -301,7 +418,67 @@ impl ScreenSnapshot {
     pub fn modes(&self) -> &TerminalModes {
         &self.modes
     }
+
+    /// Apply a diff only when it is for this tab and exactly follows this
+    /// snapshot. Validation completes before any snapshot field is changed.
+    pub fn apply(&mut self, diff: ScreenDiff) -> Result<(), ScreenApplyError> {
+        if diff.tab_id != self.tab_id {
+            return Err(ScreenApplyError::TabIdMismatch);
+        }
+        if diff.base_revision != self.revision {
+            return Err(ScreenApplyError::BaseRevisionMismatch);
+        }
+        if diff.revision.0 <= self.revision.0 {
+            return Err(ScreenApplyError::RevisionDidNotAdvance);
+        }
+
+        let mut patched_rows = HashSet::with_capacity(diff.rows.len());
+        for patch in &diff.rows {
+            let row = usize::from(patch.row);
+            if row >= usize::from(self.rows) || row >= self.visible.len() {
+                return Err(ScreenApplyError::RowOutOfBounds);
+            }
+            if !patched_rows.insert(row) {
+                return Err(ScreenApplyError::DuplicateRowPatch);
+            }
+        }
+
+        for patch in diff.rows {
+            self.visible[usize::from(patch.row)] = patch.content;
+        }
+        if let Some(cursor) = diff.cursor {
+            self.cursor = cursor;
+        }
+        if let Some(modes) = diff.modes {
+            self.modes = modes;
+        }
+        self.revision = diff.revision;
+        Ok(())
+    }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenApplyError {
+    TabIdMismatch,
+    BaseRevisionMismatch,
+    RevisionDidNotAdvance,
+    RowOutOfBounds,
+    DuplicateRowPatch,
+}
+
+impl std::fmt::Display for ScreenApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TabIdMismatch => f.write_str("diff tab id does not match snapshot"),
+            Self::BaseRevisionMismatch => f.write_str("diff base revision does not match snapshot"),
+            Self::RevisionDidNotAdvance => f.write_str("diff revision must advance the snapshot"),
+            Self::RowOutOfBounds => f.write_str("diff row is outside the visible screen"),
+            Self::DuplicateRowPatch => f.write_str("diff contains duplicate row patches"),
+        }
+    }
+}
+
+impl std::error::Error for ScreenApplyError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowPatch {

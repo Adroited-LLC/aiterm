@@ -1,5 +1,5 @@
 use aiterm_lib::remote::model::{
-    validate_terminal_frame, ProtocolError, RemoteRequest, TerminalSize,
+    encode_terminal_frame, validate_terminal_frame, ProtocolError, RemoteRequest, TerminalSize,
 };
 use serde::Serialize;
 
@@ -109,4 +109,44 @@ fn terminal_frames_larger_than_one_mebibyte_are_rejected() {
             .code(),
         "protocol.frame_too_large"
     );
+}
+
+#[derive(Serialize)]
+struct OversizedTypedFrame {
+    payload: Vec<u8>,
+}
+
+#[test]
+fn typed_terminal_frames_stop_encoding_at_the_one_mebibyte_limit() {
+    let err = encode_terminal_frame(&OversizedTypedFrame {
+        payload: vec![0; 1024 * 1024 + 1],
+    })
+    .expect_err("oversized typed frame must not finish encoding");
+
+    assert_eq!(err.code(), "protocol.frame_too_large");
+}
+
+#[derive(Serialize)]
+struct RawTerminalSize {
+    cols: u16,
+    rows: u16,
+}
+
+#[test]
+fn terminal_size_deserialization_rejects_invalid_json_and_cbor() {
+    assert!(serde_json::from_str::<TerminalSize>(r#"{"cols":0,"rows":24}"#).is_err());
+    assert!(serde_json::from_str::<TerminalSize>(r#"{"cols":80,"rows":513}"#).is_err());
+
+    let mut cbor = Vec::new();
+    ciborium::into_writer(
+        &RawTerminalSize {
+            cols: 513,
+            rows: 24,
+        },
+        &mut cbor,
+    )
+    .expect("test CBOR should encode");
+    let decoded: Result<TerminalSize, _> = ciborium::from_reader(cbor.as_slice());
+
+    assert!(decoded.is_err());
 }
