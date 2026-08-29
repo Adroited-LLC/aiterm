@@ -61,6 +61,7 @@ export default function HomeDashboard({
 
   return (
     <div className="home">
+      <div className="home-inner">
       <section className="home-card home-start">
         <div className="home-card-head">
           <Icon of={Rocket} /> <h2>Start a session</h2>
@@ -159,6 +160,7 @@ export default function HomeDashboard({
           )}
         </section>
         </div>
+      </div>
       </div>
     </div>
   );
