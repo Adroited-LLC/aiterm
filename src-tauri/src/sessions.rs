@@ -1414,7 +1414,11 @@ struct ArchiveLimits {
     depth: usize,
     component_bytes: usize,
     path_bytes: usize,
+    before_file_read: fn(&File),
 }
+
+#[cfg(target_os = "linux")]
+fn archive_noop_file_hook(_file: &File) {}
 
 #[cfg(target_os = "linux")]
 impl Default for ArchiveLimits {
@@ -1425,6 +1429,7 @@ impl Default for ArchiveLimits {
             depth: MAX_SESSION_DISCOVERY_DEPTH,
             component_bytes: 255,
             path_bytes: 4096,
+            before_file_read: archive_noop_file_hook,
         }
     }
 }
@@ -1610,6 +1615,7 @@ fn copy_regular_into_anonymous_archive(
         return Err("exact archive source is not a regular file".into());
     }
     let modified = before.modified().map_err(|error| error.to_string())?;
+    (limits.before_file_read)(source);
     let mut destination = archive.try_clone().map_err(|error| error.to_string())?;
     destination.set_len(0).map_err(|error| error.to_string())?;
     destination
@@ -1821,6 +1827,7 @@ fn write_sidecar_tree(
                 } else {
                     let file = unsafe { File::from_raw_fd(descriptor) };
                     let before = file.metadata().map_err(|error| error.to_string())?;
+                    (limits.before_file_read)(&file);
                     let declared = before.len();
                     let remaining = limits.bytes.saturating_sub(*bytes);
                     if declared > remaining {
@@ -2008,6 +2015,16 @@ fn archive_verified_entries_with_hooks(
         .map_err(|error| format!("could not make session archives durable: {error}"))?;
     after_publish()?;
     for archive in &prepared {
+        if !directory_entry_is_exact_object(
+            &destination.file,
+            &archive.destination_name,
+            &archive.archive.file,
+        )? {
+            return Err(format!(
+                "exact archive destination changed before source retirement; source remains visible at {}",
+                archive.source.display_parent.join(&archive.source.name).display()
+            ));
+        }
         let archive_bound = limits
             .bytes
             .checked_add((limits.entries as u64).saturating_mul(8192))
