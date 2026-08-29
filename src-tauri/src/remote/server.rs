@@ -3505,7 +3505,10 @@ mod request_guard_tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(maximum.load(Ordering::SeqCst), REMOTE_BLOCKING_OPERATIONS);
-        let _ = cancelled.send(true);
+        // `send` discards the new value when the receiver count reaches zero
+        // at the same instant. `send_replace` makes cancellation sticky for
+        // tasks that have been spawned but have not polled their receiver yet.
+        cancelled.send_replace(true);
         for task in tasks {
             assert!(task.await.unwrap().is_err());
         }
