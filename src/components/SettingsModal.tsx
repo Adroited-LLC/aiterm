@@ -1,6 +1,9 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
+import Icon from "./Icon";
+import { X } from "lucide-react";
+import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
 import RemoteAccessSettings from "./RemoteAccessSettings";
@@ -12,6 +15,7 @@ import {
 import {
   Caps, FontFamily, FontPackage,
   AgentDetection, detectAgents, homeAbbrev,
+  AgentPermissions, agentPermissions, agentPermissionSet,
   fontPackages, installFontFiles, installFontPackage, listFonts,
   diagEnvironment, diagLogPath, diagLogTail, openPath,
   traceSet, traceStatus,
@@ -146,8 +150,20 @@ export default function SettingsModal({
   // opens and when explicitly re-checked — never on a timer. `null` is "not
   // asked yet", which is a different thing to show than an empty list.
   const [agents, setAgents] = useState<AgentDetection[] | null>(null);
-  const refreshAgents = () => detectAgents().then(setAgents).catch(() => setAgents([]));
+  // Permission presets per engine, keyed by agent id for the row that renders
+  // them. Loaded alongside detection — it is one small file read.
+  const [perms, setPerms] = useState<AgentPermissions[]>([]);
+  const refreshAgents = () => {
+    detectAgents().then(setAgents).catch(() => setAgents([]));
+    agentPermissions().then(setPerms).catch(() => setPerms([]));
+  };
   useEffect(() => { if (tab === "agents" && agents === null) refreshAgents(); }, [tab, agents]);
+  // A change takes effect on the next session the engine opens; the returned
+  // list is authoritative, so the dropdown reflects exactly what was stored.
+  const setPermission = (agentId: string, mode: string) => {
+    setPerms((prev) => prev.map((p) => (p.agent_id === agentId ? { ...p, selected: mode } : p)));
+    agentPermissionSet(agentId, mode).then(setPerms).catch(() => refreshAgents());
+  };
 
   // Diagnostics: what aiterm is and what it has been doing. Read on demand —
   // the log tail is a file read and the environment spawns a detect, so
@@ -255,7 +271,7 @@ export default function SettingsModal({
             {tab === "diagnostics" && (
               <button className="set-recheck" onClick={refreshDiag}>Refresh</button>
             )}
-            <button className="icon-btn" title="Close (Esc)" onClick={onClose}>✕</button>
+            <button className="icon-btn" title="Close (Esc)" onClick={onClose}><Icon of={X} /></button>
           </div>
           <div className="sm-pane-body" ref={paneRef}>
 
@@ -271,6 +287,14 @@ export default function SettingsModal({
                     />
                   ))}
                 </div>
+                <Row label="Icon size" desc="Toolbar and panel buttons; row actions follow a step smaller">
+                  <input
+                    type="range" min={12} max={24} step={1}
+                    value={settings.iconSize}
+                    onChange={(e) => set({ iconSize: +e.target.value })}
+                  />
+                  <span className="srow-value">{settings.iconSize}px</span>
+                </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
                     <button
@@ -507,6 +531,7 @@ export default function SettingsModal({
                         <span className={"agent-dot" + (a.available ? " on" : "")} />
                         <div className="agent-text">
                           <div className="agent-name">
+                            <AgentIcon agent={a.id} size={14} />
                             {a.display_name}
                             <span className="agent-state">
                               {a.available ? (a.version ?? "installed") : "not installed"}
@@ -527,6 +552,32 @@ export default function SettingsModal({
                               sessions, so aiterm adopts the id once it starts.
                             </div>
                           )}
+                          {/* How much this engine asks before acting, applied
+                              to every session aiterm starts or resumes for it.
+                              Only shown for an installed engine that has a
+                              permission switch — the API chat harness has none. */}
+                          {a.available && (() => {
+                            const p = perms.find((x) => x.agent_id === a.id);
+                            if (!p) return null;
+                            const cur = p.modes.find((m) => m.id === p.selected);
+                            return (
+                              <div className="agent-perm">
+                                <label className="agent-perm-label">
+                                  Permissions
+                                  <select
+                                    className="ns-select"
+                                    value={p.selected}
+                                    onChange={(e) => setPermission(a.id, e.target.value)}
+                                  >
+                                    {p.modes.map((m) => (
+                                      <option key={m.id} value={m.id}>{m.label}</option>
+                                    ))}
+                                  </select>
+                                </label>
+                                {cur && <div className="agent-perm-note">{cur.note}</div>}
+                              </div>
+                            );
+                          })()}
                         </div>
                         {capsOf(a.id).config && a.available && (
                           <button className="agent-config-btn" onClick={() => setConfigFor(a)}>

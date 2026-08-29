@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Caps, ProjectInfo, Session, TrashedSession, homeAbbrev, searchSessions } from "../ipc";
+import {
+  Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
+} from "../ipc";
+import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
+import Icon from "./Icon";
+import {
+  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Play, RefreshCw, Search,
+  Settings as SettingsIcon, Trash2, X,
+} from "lucide-react";
+import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
 import { followRekey } from "../selection";
@@ -293,6 +302,66 @@ export default function SessionsPanel({
   const [groups, setGroups] = useState<Group[]>(loadGroups);
   const [orders, setOrders] = useState<Record<string, string[]>>(loadOrders);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // ---- hover flyout ----
+  // Opens beside a row after the pointer has rested on it — a flyout that
+  // chased the pointer down the list would be noise. Details are read once
+  // per session and kept for the panel's life; a transcript changes only
+  // while its session is running, and a running one is refetched on each
+  // open. Placed from the row's rectangle: fixed, so it escapes the list's
+  // scrolling, above the row when the row is in the lower half of the window
+  // so the card never runs off the bottom.
+  const [fly, setFly] = useState<{ s: Session; top?: number; bottom?: number; left: number } | null>(null);
+  const flyTimer = useRef<number | null>(null);
+  const flyCache = useRef<Map<string, SessionDetail>>(new Map());
+  const [flyDetail, setFlyDetail] = useState<SessionDetail | null>(null);
+  const flyEnter = (s: Session, el: HTMLElement, running: boolean) => {
+    if (flyTimer.current) window.clearTimeout(flyTimer.current);
+    flyTimer.current = window.setTimeout(() => {
+      const r = el.getBoundingClientRect();
+      const panel = el.closest(".panel")?.getBoundingClientRect();
+      const left = (panel?.right ?? r.right) + 8;
+      const lower = r.top > window.innerHeight / 2;
+      setFly(lower
+        ? { s, left, bottom: Math.max(8, window.innerHeight - r.bottom) }
+        : { s, left, top: Math.max(8, r.top) });
+      const cached = flyCache.current.get(s.id);
+      setFlyDetail(cached && !running ? cached : null);
+      if (!cached || running) {
+        sessionDetail(s.id).then((d) => {
+          if (!d) return;
+          flyCache.current.set(s.id, d);
+          setFlyDetail((cur) => (cur === null || cur.id === d.id ? d : cur));
+        }).catch(() => {});
+      }
+    }, 450);
+  };
+  // Leaving the row does not close the card at once: the pointer needs the
+  // gap between row and card to cross into it, and once in it the card is
+  // held open so its text can be selected and copied.
+  const flyClose = useRef<number | null>(null);
+  const flyLeave = () => {
+    if (flyTimer.current) { window.clearTimeout(flyTimer.current); flyTimer.current = null; }
+    if (flyClose.current) window.clearTimeout(flyClose.current);
+    flyClose.current = window.setTimeout(() => setFly(null), 250);
+  };
+  const flyHold = () => {
+    if (flyClose.current) { window.clearTimeout(flyClose.current); flyClose.current = null; }
+  };
+  useEffect(() => {
+    // Anything that moves the row from under the pointer closes the card —
+    // except acting inside the card itself, which is selecting its text.
+    const inCard = (e: Event) => (e.target as HTMLElement | null)?.closest?.(".sfly") != null;
+    const close = (e: Event) => { if (!inCard(e)) setFly(null); };
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("pointerdown", close, true);
+    window.addEventListener("keydown", close, true);
+    return () => {
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("pointerdown", close, true);
+      window.removeEventListener("keydown", close, true);
+    };
+  }, []);
   const [dragId, setDragId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
   const [dragOverItem, setDragOverItem] = useState<string | null>(null);
@@ -644,10 +713,7 @@ export default function SessionsPanel({
   const renderTrash = (t: TrashedSession) => (
     <div key={t.id} className="session-item trash-item">
       <div className="agent-badge trash-badge">
-        <svg viewBox="0 0 16 16" width="13" height="13" fill="none"
-          stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-          <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.8 9.5a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9L12 4M6.5 7v4.5M9.5 7v4.5" />
-        </svg>
+        <Icon of={Trash2} />
       </div>
       <div className="session-text">
         <div className="session-title-row">
@@ -688,7 +754,7 @@ export default function SessionsPanel({
             <button
               className="act-btn danger" title="Delete forever…"
               onClick={() => setConfirmDel(`trash:${t.id}`)}
-            >✕</button>
+            ><Icon of={X} size="sm" /></button>
           </>
         )}
       </div>
@@ -738,6 +804,8 @@ export default function SessionsPanel({
         key={s.id}
         data-item={container ? s.id : undefined}
         data-container={container}
+        onMouseEnter={(e) => { if (!isDragging) flyEnter(s, e.currentTarget, isRunning); }}
+        onMouseLeave={flyLeave}
         onPointerDown={(e) => {
           if (e.button !== 0 || !container || searchList) return;
           if ((e.target as HTMLElement).closest("button")) return;
@@ -780,7 +848,10 @@ export default function SessionsPanel({
           onSelect(s);
         }}
       >
-        <div className={"agent-badge" + (s.agent === "claude" ? " claude" : "")}>
+        <div
+          className={"agent-badge" + (s.agent === "claude" ? " claude" : "") + agentTint(s.agent).className}
+          style={agentTint(s.agent).style}
+        >
           <AgentIcon agent={s.agent} />
           {/* Green: the session is running. Whether aiterm also has a tab for
               it is still tracked (`hasTab`, for the row's actions) but no
@@ -803,7 +874,7 @@ export default function SessionsPanel({
                     : "Continues an earlier session past a compaction"
                 }
               >
-                ⑂
+                <Icon of={GitFork} size="sm" />
               </span>
             )}
             <span className="session-title">{s.title}</span>
@@ -816,9 +887,7 @@ export default function SessionsPanel({
               )}
               {opts.showBranch && s.branch && (
                 <span className="branch">
-                  <svg viewBox="0 0 16 16" width="9" height="9" fill="currentColor">
-                    <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628a2.25 2.25 0 0 1-1.5-2.122z" />
-                  </svg>
+                  <Icon of={GitBranch} size="sm" />
                   {s.branch}
                 </span>
               )}
@@ -907,7 +976,7 @@ export default function SessionsPanel({
                   onClick={() =>
                     isRunning || hasTab ? setConfirmStop(s.id) : onResume(s)
                   }
-                >▶</button>
+                ><Icon of={Play} size="sm" /></button>
               )}
               {/* Branching is a deliberate act (two divergent lines from one
                   history), not a workaround for resume being unavailable.
@@ -918,7 +987,7 @@ export default function SessionsPanel({
                   className="act-btn"
                   title="Branch a copy at this point — appears as a stopped session, resumable"
                   onClick={() => onFork(s)}
-                >⑂</button>
+                ><Icon of={GitFork} size="sm" /></button>
               )}
               {/* aiterm's own clear — same end shape as typing /clear, built
                   like ⑂: no claude machinery, just a fresh process on a
@@ -961,10 +1030,7 @@ export default function SessionsPanel({
                   className="act-btn danger" title="Delete session…"
                   onClick={() => setConfirmDel(s.id)}
                 >
-                  <svg viewBox="0 0 16 16" width="11" height="11" fill="none"
-                    stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-                    <path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.8 9.5a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9L12 4M6.5 7v4.5M9.5 7v4.5" />
-                  </svg>
+                  <Icon of={Trash2} size="sm" />
                 </button>
               )}
             </>
@@ -987,7 +1053,10 @@ export default function SessionsPanel({
         className={"session-item pending-item" + (isShowing ? " active showing" : "")}
         onClick={() => onSelectPending(p.id)}
       >
-        <div className={"agent-badge" + (p.agent === "claude" ? " claude" : "")}>
+        <div
+          className={"agent-badge" + (p.agent === "claude" ? " claude" : "") + agentTint(p.agent).className}
+          style={agentTint(p.agent).style}
+        >
           <AgentIcon agent={p.agent} />
           <span
             className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
@@ -1029,10 +1098,7 @@ export default function SessionsPanel({
         onClick={() => onSelectProject(p)}
       >
         <div className="agent-badge folder">
-          <svg className="agent-icon" viewBox="0 0 24 24" width="15" height="15" fill="none"
-            stroke="currentColor" strokeWidth="2">
-            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-          </svg>
+          <Icon of={Folder} className="agent-icon" />
           {(isLive || hasAttn) && (
             <span
               className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
@@ -1054,7 +1120,7 @@ export default function SessionsPanel({
           <button
             className="act-btn" title="Start claude here"
             onClick={(e) => { e.stopPropagation(); onProjectClaude(p); }}
-          >▶</button>
+          ><Icon of={Play} size="sm" /></button>
           <button
             className="act-btn" title="New shell here"
             onClick={(e) => { e.stopPropagation(); onProjectShell(p); }}
@@ -1066,13 +1132,18 @@ export default function SessionsPanel({
 
   return (
     <div className="sessions-panel">
+      {fly && (
+        <div
+          style={{ position: "fixed", left: fly.left, top: fly.top, bottom: fly.bottom, zIndex: 70 }}
+          onMouseEnter={flyHold}
+          onMouseLeave={flyLeave}
+        >
+          <SessionFlyout session={fly.s} detail={flyDetail && flyDetail.id === fly.s.id ? flyDetail : null} />
+        </div>
+      )}
       <div className="panel-toolbar">
         <div className="search-box">
-          <svg className="search-icon" viewBox="0 0 16 16" width="12" height="12"
-            fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
-            <circle cx="7" cy="7" r="4.5" />
-            <path d="M10.5 10.5L14 14" />
-          </svg>
+          <Icon of={Search} size="sm" className="search-icon" />
           <input
             className="search-input"
             placeholder="Search sessions…"
@@ -1081,7 +1152,7 @@ export default function SessionsPanel({
             onKeyDown={(e) => e.key === "Escape" && setQuery("")}
           />
           {query && (
-            <button className="search-clear" title="Clear" onClick={() => setQuery("")}>✕</button>
+            <button className="search-clear" title="Clear" onClick={() => setQuery("")}><Icon of={X} size="sm" /></button>
           )}
         </div>
         {/* Starting a session used to require a row to start it *from*: ▶ on a
@@ -1095,20 +1166,13 @@ export default function SessionsPanel({
           data-new-session-trigger=""
           onClick={() => setShowNewSession((v) => !v)}
         >＋</button>
-        <button className="icon-btn" title="Refresh" onClick={onRefresh}>⟳</button>
+        <button className="icon-btn" title="Refresh" onClick={onRefresh}><Icon of={RefreshCw} /></button>
         <button
           className="icon-btn"
           title={anyOpen ? "Collapse all" : "Expand all"}
           onClick={toggleAll}
         >
-          <svg viewBox="0 0 16 16" width="12" height="12" fill="none"
-            stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-            {anyOpen ? (
-              <path d="M4 9.5L8 6l4 3.5M4 13.5L8 10l4 3.5" transform="translate(0 -1.5)" />
-            ) : (
-              <path d="M4 3l4 3.5L12 3M4 8l4 3.5L12 8" transform="translate(0 1)" />
-            )}
-          </svg>
+          {anyOpen ? <Icon of={ChevronsDownUp} size="sm" /> : <Icon of={ChevronsUpDown} size="sm" />}
         </button>
         <div className="settings-wrap">
           <button
@@ -1116,7 +1180,7 @@ export default function SessionsPanel({
             title="Display settings"
             onClick={() => setShowSettings(!showSettings)}
           >
-            ⚙
+            <Icon of={SettingsIcon} />
           </button>
           {showSettings && (
             <div className="settings-pop">
@@ -1299,7 +1363,7 @@ export default function SessionsPanel({
                   className="icon-btn group-del"
                   title="Ungroup (items go back to the main list)"
                   onClick={(e) => { e.stopPropagation(); deleteGroup(g.id); }}
-                >✕</button>
+                ><Icon of={X} size="sm" /></button>
               </div>
               {open && members.map((s) => renderItem(s, `group:${g.id}`))}
             </div>
@@ -1374,7 +1438,7 @@ export default function SessionsPanel({
                   className="icon-btn group-del"
                   title="Empty trash…"
                   onClick={(e) => { e.stopPropagation(); setEmptyConfirm(true); }}
-                >✕</button>
+                ><Icon of={X} size="sm" /></button>
               )}
             </div>
             {sectionOpen("trash") && filteredTrash.map(renderTrash)}

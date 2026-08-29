@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { ActivityRow, ProviderView, providerActivity } from "../ipc";
 import { groupActivity, totalOf } from "../activity";
+import BrandIcon from "./BrandIcon";
+import { brandForModel, brandForName } from "../brand";
 
 /** USD. Zero is a real answer here — free models are most of why this view is
  *  worth reading — so it is printed as `$0.00` rather than "free", and a real
@@ -88,7 +90,10 @@ export default function RoutingActivity({ prov }: { prov: ProviderView }) {
                 : `${plural(h.models.length, "model")} — click to ${open === h.name ? "fold" : "list"}`}
               onClick={() => setOpen(open === h.name ? null : h.name)}
             >
-              <span className="acty-name">{h.name || "Unnamed host"}</span>
+              <span className="acty-name">
+                <BrandIcon name={brandForName(h.name) ?? brandForName(h.slug)} size={12} className="inline" />
+                {h.name || "Unnamed host"}
+              </span>
               {why && (
                 <span className="acty-blocked" title={`Excluded: ${why}`}>now blocked</span>
               )}
@@ -100,7 +105,10 @@ export default function RoutingActivity({ prov }: { prov: ProviderView }) {
               <div className="acty-models">
                 {h.models.map((m) => (
                   <div key={m.model} className="acty-row acty-model">
-                    <span className="acty-name">{m.model || "unnamed model"}</span>
+                    <span className="acty-name">
+                      <BrandIcon name={brandForModel(m.model)} size={12} className="inline" />
+                      {m.model || "unnamed model"}
+                    </span>
                     <span className="acty-n">{plural(m.requests, "request")}</span>
                     <span className="acty-tok">{fmtTok(m.tokens)} tok</span>
                     <span className="acty-usd">{fmtUsd(m.usage)}</span>

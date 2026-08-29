@@ -95,6 +95,39 @@ export interface PreviewMsg {
 export const listSessions = () => invoke<Session[]>("list_sessions");
 export const sessionPreview = (sessionId: string) =>
   invoke<PreviewMsg[]>("session_preview", { sessionId });
+
+/** Everything worth remembering about a session, from one read of its
+ *  transcript — the sidebar's hover flyout. See `detail.rs`. */
+export interface SessionDetail {
+  id: string;
+  started: string | null;
+  last_active: string | null;
+  cwd: string | null;
+  branch: string | null;
+  cli_version: string | null;
+  /** In order of first use; more than one means the model was switched. */
+  models: string[];
+  effort: string | null;
+  permission_mode: string | null;
+  user_messages: number;
+  assistant_messages: number;
+  tool_calls: number;
+  tools: { name: string; count: number }[];
+  /** What the context window held at the last assistant turn. */
+  context_tokens: number | null;
+  context_window: number | null;
+  output_tokens: number;
+  title: string | null;
+  first_prompt: string | null;
+  last_user: string | null;
+  last_assistant: string | null;
+  /** Written or edited, most recent first. */
+  files: string[];
+  pr_links: string[];
+  compactions: number;
+}
+export const sessionDetail = (sessionId: string) =>
+  invoke<SessionDetail | null>("session_detail", { sessionId });
 export const sessionDelete = (sessionId: string) =>
   invoke<void>("session_delete", { sessionId });
 
@@ -295,7 +328,9 @@ export interface UsageSource {
   /** "anthropic" | "codex" | "grok" | "provider:<id>". */
   id: string;
   name: string;
-  /** "ok" | "signed_out" | "unreachable" | "rejected" | "no_balance". */
+  /** "ok" | "signed_out" | "unreachable" | "rejected" | "limited" | "no_balance".
+   *  "limited" is a 429: the service will answer again shortly, nothing is
+   *  wrong with the login. */
   state: string;
   /** What to do about a non-"ok" state. Empty when "ok". */
   detail: string;
@@ -861,6 +896,30 @@ export interface AgentChoice {
 }
 
 export const agentChoices = () => invoke<AgentChoice[]>("agent_choices");
+
+/** One permission/approval preset an engine can start under. `flags` is what
+ *  it adds to the command; empty for the engine's own default. */
+export interface PermissionMode {
+  id: string;
+  label: string;
+  note: string;
+  flags: string[];
+}
+/** An engine's permission presets and the one currently in force. Only engines
+ *  that have a permission switch are returned. */
+export interface AgentPermissions {
+  agent_id: string;
+  display_name: string;
+  modes: PermissionMode[];
+  /** The id of the mode in force — stored, or the first when nothing is. */
+  selected: string;
+}
+/** Every engine with a permission switch, its modes, and the one in force. */
+export const agentPermissions = () => invoke<AgentPermissions[]>("agent_permissions");
+/** Store the mode an engine starts in; returns the refreshed list. Rejects an
+ *  id the engine does not list. */
+export const agentPermissionSet = (agentId: string, mode: string) =>
+  invoke<AgentPermissions[]>("agent_permission_set", { agentId, mode });
 
 
 /** The id of the session an agent just started in `cwd`, once it exists.

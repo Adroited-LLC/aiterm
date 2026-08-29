@@ -5,6 +5,8 @@ import InstructionsSection from "./InstructionsSection";
 import McpSection from "./McpSection";
 import SkillsSection from "./SkillsSection";
 import HooksSection from "./HooksSection";
+import Icon from "../Icon";
+import { ChevronLeft } from "lucide-react";
 
 type Section = "settings" | "instructions" | "hooks" | "mcp" | "skills";
 
@@ -38,7 +40,7 @@ export default function ClaudeConfig({ agent, project, onBack }: {
   return (
     <div>
       <div className="acfg-head">
-        <button className="acfg-back" onClick={onBack}>← Agents</button>
+        <button className="acfg-back" onClick={onBack}><Icon of={ChevronLeft} size="sm" /> Agents</button>
         <span className="acfg-title">{agent.display_name}</span>
         <span className="acfg-ver">{agent.version ?? "installed"}</span>
         {agent.path && <span className="acfg-path">{homeAbbrev(agent.path)}</span>}

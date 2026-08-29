@@ -61,13 +61,37 @@ pub struct LaunchPlan {
     pub caps: Caps,
 }
 
-/// Resolve against the real registry and the saved providers.
+/// Resolve against the real registry and the saved providers, then stamp the
+/// engine's chosen permission mode onto the command.
+///
+/// The permission flags are applied here, on the finished plan, rather than
+/// inside any backend's `launch`/`resume`/`clear`: three of the four engines
+/// build their resume command on a path that never touches `launch`, so a
+/// default added there would reach starts and silently miss resumes. One place,
+/// every path — a start, a ▶ resume, a restart, a `/clear` — gets the same
+/// flags. `resolve_in` stays free of them so the routing tests read the bare
+/// commands; this thin wrapper is where the machine's stored choice enters, so
+/// it is deliberately the untested half, exactly like it was before.
 pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
-    resolve_in(
-        &crate::agents::backends(),
-        &crate::providers::load_providers(),
-        request,
-    )
+    let list = crate::agents::backends();
+    let plan = resolve_in(&list, &crate::providers::load_providers(), request)?;
+    let flags = list
+        .iter()
+        .find(|b| b.id() == plan.agent_id)
+        .map(|b| crate::permissions::flags_for(&**b))
+        .unwrap_or_default();
+    Some(with_permission(plan, &flags))
+}
+
+/// Append an engine's permission flags to a resolved command. The single point
+/// at which those flags enter the argv; split out so it can be checked without
+/// the stored file. Empty flags — the engine's own default, or an engine with
+/// no switch — leave the command untouched.
+fn with_permission(mut plan: LaunchPlan, flags: &str) -> LaunchPlan {
+    if !flags.is_empty() {
+        plan.command = format!("{} {}", plan.command, flags);
+    }
+    plan
 }
 
 /// The body of [`resolve`], over an explicit registry.
@@ -272,6 +296,27 @@ mod tests {
     use super::*;
     use crate::agents::{Detection, ModelOption};
     use crate::sessions::{Session, SessionProvider};
+
+    /// The permission flags land at the end of the command, and empty flags
+    /// leave it exactly as it was — the "engine's own default" and "no switch"
+    /// cases must add nothing.
+    #[test]
+    fn permission_flags_are_appended_and_empty_ones_change_nothing() {
+        let plan = LaunchPlan {
+            command: "claude --resume 'abc'".into(),
+            env_provider: None,
+            env_model: None,
+            session_id: Some("abc".into()),
+            agent_id: "claude".into(),
+            caps: Caps::default(),
+        };
+        let stamped = with_permission(plan.clone(), "--dangerously-skip-permissions");
+        assert_eq!(stamped.command, "claude --resume 'abc' --dangerously-skip-permissions");
+        // The re-key guard watches for the quoted resume form; appending must
+        // not disturb it.
+        assert!(stamped.command.contains("--resume 'abc'"));
+        assert_eq!(with_permission(plan.clone(), "").command, plan.command);
+    }
 
     /* ---- fakes, in the shape agents.rs already uses ---------------------- */
 

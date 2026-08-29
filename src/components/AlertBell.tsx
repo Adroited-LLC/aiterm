@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import Icon from "./Icon";
+import { Bell } from "lucide-react";
 
 export interface Alert {
   /** Tab key, so picking one can go straight there. */
@@ -64,10 +66,7 @@ export default function AlertBell({ alerts, onGo }: {
         }
         onClick={() => count && setOpen((v) => !v)}
       >
-        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.5">
-          <path d="M8 2a3.6 3.6 0 0 0-3.6 3.6c0 3-1.2 4-1.2 4h9.6s-1.2-1-1.2-4A3.6 3.6 0 0 0 8 2z" strokeLinejoin="round" />
-          <path d="M6.6 12a1.6 1.6 0 0 0 2.8 0" strokeLinecap="round" />
-        </svg>
+        <Icon of={Bell} />
         {/* The number matters more than the icon once there is more than one. */}
         {count > 0 && <span className="bell-count">{count > 9 ? "9+" : count}</span>}
       </button>

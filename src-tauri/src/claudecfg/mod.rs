@@ -32,9 +32,13 @@ fn layer_paths(home: &str, project: Option<&str>, injected: &str) -> Vec<(LayerI
     out
 }
 
-/// The flags aiterm adds to every claude launch — the launcher's own list.
-fn injected_flags() -> &'static [&'static str] {
-    crate::agents::CLAUDE_LAUNCH_FLAGS
+/// The permission flags aiterm adds to every claude launch — claude's current
+/// mode from `permissions.rs`, not a fixed pair any more. Read through the same
+/// path the launcher uses so the panel and the argv can never disagree.
+fn injected_flags() -> Vec<String> {
+    crate::permissions::mode_for(&crate::agents::ClaudeBackend)
+        .map(|m| m.flags.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Serialize)]
@@ -119,7 +123,7 @@ pub fn claude_settings(project: Option<String>) -> SettingsView {
         settings,
         errors,
         order: concern::ORDER.iter().map(|s| s.to_string()).collect(),
-        injected_flags: injected_flags().iter().map(|s| s.to_string()).collect(),
+        injected_flags: injected_flags(),
     }
 }
 
@@ -311,9 +315,13 @@ mod tests {
     }
 
     #[test]
-    fn the_flags_reported_are_the_launchers_own() {
-        // Not a second copy that can drift from what is run.
-        assert_eq!(injected_flags(), crate::agents::CLAUDE_LAUNCH_FLAGS);
+    fn the_flags_reported_are_claudes_current_permission_mode() {
+        // Not a second copy that can drift from what is run: the panel reads
+        // claude's mode through the same call the launcher's `flags_for` does.
+        let mode = crate::permissions::mode_for(&crate::agents::ClaudeBackend)
+            .expect("claude has permission modes");
+        let expected: Vec<String> = mode.flags.iter().map(|s| s.to_string()).collect();
+        assert_eq!(injected_flags(), expected);
     }
 
     #[test]

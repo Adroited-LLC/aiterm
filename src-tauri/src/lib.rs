@@ -14,11 +14,13 @@ pub mod mcp;
 pub mod notify;
 pub mod opencode;
 pub mod opencode_agent;
+pub mod permissions;
 pub mod providers;
 pub mod rendercost;
 pub mod remote;
 pub mod services;
 pub mod pty;
+pub mod detail;
 pub mod sessions;
 pub mod taskbar;
 pub mod trace;
@@ -78,6 +80,8 @@ pub fn run() {
             agents::agent_choices,
             agents::clear_successor_session,
             launch::resolve_launch,
+            permissions::agent_permissions,
+            permissions::agent_permission_set,
             providers::providers_list,
             providers::provider_save,
             providers::provider_delete,
@@ -93,6 +97,7 @@ pub fn run() {
             sessions::list_sessions,
             sessions::session_status,
             sessions::session_preview,
+            detail::session_detail,
             sessions::session_delete,
             sessions::trash_list,
             sessions::trash_restore,

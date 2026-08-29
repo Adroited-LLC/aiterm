@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DirEntry, listDir, openPath } from "../ipc";
+import Icon from "./Icon";
+import { File as FileGlyph, Folder } from "lucide-react";
 
 interface Node extends DirEntry {
   depth: number;
@@ -13,19 +15,13 @@ function Chevron({ open }: { open: boolean }) {
 
 function FolderIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" className="tree-icon folder">
-      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-    </svg>
+    <Icon of={Folder} size="sm" className="tree-icon folder" />
   );
 }
 
 function FileIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" className="tree-icon">
-      <path d="M14 3v5h5M6 3h8l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" />
-    </svg>
+    <Icon of={FileGlyph} size="sm" className="tree-icon" />
   );
 }
 
