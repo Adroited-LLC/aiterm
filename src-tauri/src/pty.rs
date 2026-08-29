@@ -16,9 +16,67 @@ pub struct PtyInstance {
     child_pid: Option<u32>,
 }
 
+/// The global table protects allocation membership only. Each returned value
+/// has its own lock, so a blocked write/resize/kill for one PTY cannot retain
+/// the map guard and stall unrelated terminals.
+struct PtyTable<T> {
+    entries: Arc<Mutex<HashMap<u32, Arc<Mutex<T>>>>>,
+}
+
+impl<T> Clone for PtyTable<T> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+        }
+    }
+}
+
+impl<T> Default for PtyTable<T> {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<T> PtyTable<T> {
+    fn insert(&self, id: u32, value: T) {
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(Mutex::new(value)));
+    }
+
+    fn get(&self, id: u32) -> Option<Arc<Mutex<T>>> {
+        self.entries.lock().ok()?.get(&id).cloned()
+    }
+
+    fn remove(&self, id: u32) -> Option<Arc<Mutex<T>>> {
+        self.entries.lock().ok()?.remove(&id)
+    }
+
+    fn snapshot(&self) -> Vec<(u32, Arc<Mutex<T>>)> {
+        self.entries
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(id, value)| (*id, value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn with<R>(&self, id: u32, body: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let value = self.get(id)?;
+        let mut value = value.lock().ok()?;
+        Some(body(&mut value))
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct PtyManager {
-    ptys: Arc<Mutex<HashMap<u32, PtyInstance>>>,
+    ptys: PtyTable<PtyInstance>,
     next_id: Arc<AtomicU32>,
 }
 
@@ -323,7 +381,7 @@ impl PtyManager {
         };
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.ptys.lock().unwrap().insert(
+        self.ptys.insert(
             id,
             PtyInstance {
                 master: pair.master,
@@ -333,7 +391,7 @@ impl PtyManager {
             },
         );
 
-        let ptys = Arc::clone(&self.ptys);
+        let ptys = self.ptys.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -362,7 +420,7 @@ impl PtyManager {
             // A concurrent `kill` may already have removed this entry. In
             // either order, remove only by this PTY's allocation id; never act
             // on a possibly reused OS pid after the child has been reaped.
-            ptys.lock().unwrap().remove(&id);
+            ptys.remove(id);
             sink.exited(id, code, signal.as_deref());
             if let Some(observer) = observer() {
                 observer.on_exit(id, code, signal.as_deref());
@@ -500,24 +558,28 @@ fn parent_of(pid: u32) -> Option<u32> {
 impl PtyManager {
     /// Write input to one live PTY.
     pub fn write(&self, id: u32, data: &[u8]) -> Result<(), String> {
-        let mut ptys = self.ptys.lock().unwrap();
-        let pty = ptys.get_mut(&id).ok_or("no such pty")?;
-        pty.writer.write_all(data).map_err(|e| e.to_string())
+        self.ptys
+            .with(id, |pty| {
+                pty.writer.write_all(data).map_err(|e| e.to_string())
+            })
+            .ok_or_else(|| "no such pty".to_string())?
     }
 
     /// Resize one live PTY without coupling the process manager to a caller's
     /// attachment or focus policy.
     pub fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<(), String> {
-        let ptys = self.ptys.lock().unwrap();
-        let pty = ptys.get(&id).ok_or("no such pty")?;
-        pty.master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
+        self.ptys
+            .with(id, |pty| {
+                pty.master
+                    .resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|e| e.to_string())
             })
-            .map_err(|e| e.to_string())
+            .ok_or_else(|| "no such pty".to_string())?
     }
 
     /// Stop a PTY's complete process tree and release its process resources.
@@ -525,8 +587,9 @@ impl PtyManager {
         // Take the instance out under the lock, then release it: the kill below
         // can block for over a second, and holding the map would stall every
         // other PTY's writes and resizes for that whole time.
-        let taken = self.ptys.lock().unwrap().remove(&id);
-        if let Some(mut pty) = taken {
+        let taken = self.ptys.remove(id);
+        if let Some(pty) = taken {
+            let mut pty = pty.lock().unwrap();
             // `killer.kill()` only reaches the pty's direct child — the login
             // shell. zsh forks the command rather than exec'ing it, so killing the
             // shell orphaned every `claude` aiterm ever launched: they stayed in
@@ -553,10 +616,9 @@ impl PtyManager {
     pub fn pty_for_descendant(&self, pid: u32) -> Option<u32> {
         let roots: HashMap<u32, u32> = self
             .ptys
-            .lock()
-            .ok()?
-            .iter()
-            .filter_map(|(id, p)| p.child_pid.map(|child| (child, *id)))
+            .snapshot()
+            .into_iter()
+            .filter_map(|(id, pty)| pty.lock().ok()?.child_pid.map(|child| (child, id)))
             .collect();
         let mut cur = pid;
         for _ in 0..64 {
@@ -666,7 +728,43 @@ pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn a_blocked_instance_does_not_hold_the_pty_table_lock() {
+        let table = PtyTable::default();
+        table.insert(1, "first");
+        table.insert(2, "second");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocked = table.clone();
+        let worker = std::thread::spawn(move || {
+            blocked
+                .with(1, |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let independent = table.clone();
+        let independent_worker = std::thread::spawn(move || {
+            let value = independent.with(2, |value| *value).unwrap();
+            done_tx.send(value).unwrap();
+        });
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "second",
+            "instance 1 held the global PTY map while blocked"
+        );
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        independent_worker.join().unwrap();
+    }
 
     /// The regression that started all of this: killing a shell does not kill
     /// what the shell forked. `zsh -i -c claude …` forks rather than execs, so

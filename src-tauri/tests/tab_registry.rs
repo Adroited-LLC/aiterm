@@ -9,8 +9,9 @@ use aiterm_lib::tabs::{
     TabUpdate,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
+use std::thread;
 use std::time::Duration;
 
 // The compatibility observer is process-global until Task 6. Serialize PTY
@@ -239,6 +240,9 @@ impl PtyBackend for FakePty {
             sink.output(id, b"ready");
         } else if spec.command.as_deref() == Some("query-first") {
             sink.output(id, b"\x1b[5n");
+        } else if spec.command.as_deref() == Some("exit-first") {
+            self.sinks.lock().unwrap().remove(&id);
+            sink.exited(id, Some(0), None);
         }
         Ok(id)
     }
@@ -640,4 +644,390 @@ fn registry_rejects_unknown_tab_and_attachment_ids_consistently() {
         registry.close(&unknown_tab).unwrap_err().code(),
         "tab.not_found"
     );
+}
+
+#[derive(Default)]
+struct BlockingSpawnPty {
+    state: Mutex<BlockingSpawnState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct BlockingSpawnState {
+    entered: bool,
+    released: bool,
+    sink: Option<Arc<dyn PtySink>>,
+}
+
+impl BlockingSpawnPty {
+    fn wait_until_entered(&self) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.entered)
+            .unwrap();
+        assert!(!timeout.timed_out(), "spawn did not reach its barrier");
+        drop(state);
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+impl PtyBackend for BlockingSpawnPty {
+    fn spawn(&self, _spec: PtySpawnSpec, sink: Arc<dyn PtySink>) -> Result<u32, String> {
+        let mut state = self.state.lock().unwrap();
+        state.entered = true;
+        state.sink = Some(sink);
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+        Ok(41)
+    }
+
+    fn write(&self, _id: u32, _bytes: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resize(&self, _id: u32, _cols: u16, _rows: u16) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn kill(&self, _id: u32) {}
+
+    fn pty_for_descendant(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+}
+
+#[test]
+fn a_blocked_spawn_is_unpublished_so_close_cannot_find_a_phantom_tab() {
+    let pty = Arc::new(BlockingSpawnPty::default());
+    let registry = TabRegistry::with_backend(pty.clone());
+    let opener = registry.clone();
+    let open = thread::spawn(move || opener.open(shell_launch("slot:blocked-spawn")));
+    pty.wait_until_entered();
+
+    assert!(registry.list().is_empty());
+    assert_eq!(
+        registry.close(&TabId::new()).unwrap_err().code(),
+        "tab.not_found"
+    );
+
+    pty.release();
+    let id = open.join().unwrap().unwrap();
+    assert_eq!(registry.list()[0].id(), &id);
+}
+
+#[test]
+fn a_tab_that_exited_during_spawn_is_coherent_and_rejects_late_attach() {
+    let (registry, _) = registry();
+    let id = registry
+        .open(shell_launch("slot:exit-first").with_command("exit-first"))
+        .unwrap();
+
+    assert_eq!(registry.get(&id).unwrap().state(), &TabState::Exited);
+    assert_eq!(
+        registry
+            .attach(&id, AttachmentKind::Desktop)
+            .unwrap_err()
+            .code(),
+        "tab.closed"
+    );
+    assert_eq!(
+        registry
+            .attach(&id, AttachmentKind::Remote)
+            .unwrap_err()
+            .code(),
+        "tab.closed"
+    );
+}
+
+#[test]
+fn remote_screen_overflow_atomically_replaces_stale_diffs_then_keeps_later_diffs() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 2);
+    let tab = registry
+        .open(shell_launch("slot:ordered-recovery"))
+        .unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let _initial = remote.events.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    pty.emit_output(pty.last_id(), b"one");
+    pty.emit_output(pty.last_id(), b"\rtwo");
+    pty.emit_output(pty.last_id(), b"\rthree");
+    pty.emit_output(pty.last_id(), b"\rfour");
+
+    let TabEvent::Snapshot(mut recovered) =
+        remote.events.recv_timeout(Duration::from_secs(1)).unwrap()
+    else {
+        panic!("overflow must atomically replace stale diffs with a snapshot");
+    };
+    let TabEvent::Diff(after) = remote.events.recv_timeout(Duration::from_secs(1)).unwrap() else {
+        panic!("a diff produced after recovery snapshot replacement must be retained");
+    };
+    recovered.apply(after).unwrap();
+    assert_eq!(recovered, registry.snapshot(&tab).unwrap());
+}
+
+#[test]
+fn full_remote_screen_queue_retains_control_events_and_exit_exactly_once() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry
+        .open(shell_launch("slot:control-overflow"))
+        .unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+
+    registry
+        .update(&tab, TabUpdate::new().title("metadata-title"))
+        .unwrap();
+    registry.take_focus(&tab, &remote.id, size(70, 20)).unwrap();
+    pty.emit_output(pty.last_id(), b"\x1b]2;terminal-title\x07\x07");
+    pty.exit(pty.last_id(), Some(9), Some("Killed"));
+
+    let mut events = Vec::new();
+    loop {
+        match remote.events.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => events.push(event),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("exited mailbox did not close after retained events")
+            }
+        }
+    }
+
+    assert!(matches!(events.first(), Some(TabEvent::Snapshot(_))));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TabEvent::Metadata(descriptor) if descriptor.title() == "metadata-title"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TabEvent::FocusChanged { owner: Some(owner), size: current }
+            if owner == &remote.id && *current == size(70, 20)
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        TabEvent::Title(title) if title == "terminal-title"
+    )));
+    assert!(events.iter().any(|event| matches!(event, TabEvent::Bell)));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TabEvent::Exited(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn desktop_raw_queue_applies_lossless_backpressure_instead_of_dropping_bytes() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry
+        .open(shell_launch("slot:desktop-backpressure"))
+        .unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let _focus = desktop.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    pty.emit_output(pty.last_id(), b"first");
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let second = pty.clone();
+    let pty_id = pty.last_id();
+    let writer = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        second.emit_output(pty_id, b"second");
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    assert_eq!(
+        desktop.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabEvent::Raw(b"first".to_vec())
+    );
+    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        desktop.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+        TabEvent::Raw(b"second".to_vec())
+    );
+    writer.join().unwrap();
+}
+
+#[test]
+fn dropping_a_full_desktop_receiver_unblocks_the_output_producer() {
+    let pty = Arc::new(FakePty::default());
+    let registry = TabRegistry::with_backend_and_queue_capacity(pty.clone(), 1);
+    let tab = registry
+        .open(shell_launch("slot:desktop-drop-unblock"))
+        .unwrap();
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let _focus = desktop.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    pty.emit_output(pty.last_id(), b"first");
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let second = pty.clone();
+    let pty_id = pty.last_id();
+    let writer = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        second.emit_output(pty_id, b"second");
+        done_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    drop(desktop);
+    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    writer.join().unwrap();
+}
+
+#[derive(Default)]
+struct OrderedReplyPty {
+    sink: Mutex<Option<Arc<dyn PtySink>>>,
+    calls: AtomicUsize,
+    writes: Mutex<Vec<Vec<u8>>>,
+    first_state: Mutex<(bool, bool)>,
+    first_changed: Condvar,
+}
+
+impl OrderedReplyPty {
+    fn wait_for_first_write(&self) {
+        let state = self.first_state.lock().unwrap();
+        let (state, timeout) = self
+            .first_changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.0)
+            .unwrap();
+        assert!(!timeout.timed_out(), "pending reply A was never written");
+        drop(state);
+    }
+
+    fn emit_second_query(&self) {
+        self.sink
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .output(1, b"\x1b[6n");
+    }
+
+    fn release_first(&self) {
+        let mut state = self.first_state.lock().unwrap();
+        state.1 = true;
+        self.first_changed.notify_all();
+    }
+
+    fn writes(&self) -> Vec<Vec<u8>> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl PtyBackend for OrderedReplyPty {
+    fn spawn(&self, _spec: PtySpawnSpec, sink: Arc<dyn PtySink>) -> Result<u32, String> {
+        *self.sink.lock().unwrap() = Some(sink.clone());
+        sink.output(1, b"\x1b[5n");
+        Ok(1)
+    }
+
+    fn write(&self, _id: u32, bytes: &[u8]) -> Result<(), String> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            let mut state = self.first_state.lock().unwrap();
+            state.0 = true;
+            self.first_changed.notify_all();
+            while !state.1 {
+                state = self.first_changed.wait(state).unwrap();
+            }
+        }
+        self.writes.lock().unwrap().push(bytes.to_vec());
+        Ok(())
+    }
+
+    fn resize(&self, _id: u32, _cols: u16, _rows: u16) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn kill(&self, _id: u32) {}
+
+    fn pty_for_descendant(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+}
+
+#[test]
+fn a_new_reply_cannot_overtake_the_pending_reply_being_flushed_during_bind() {
+    let pty = Arc::new(OrderedReplyPty::default());
+    let registry = TabRegistry::with_backend(pty.clone());
+    let opener = registry.clone();
+    let open = thread::spawn(move || opener.open(shell_launch("slot:reply-order")));
+    pty.wait_for_first_write();
+
+    pty.emit_second_query();
+    assert!(pty.writes().is_empty(), "reply B overtook blocked reply A");
+    assert!(
+        registry.list().is_empty(),
+        "tab published before bind flush completed"
+    );
+
+    pty.release_first();
+    open.join().unwrap().unwrap();
+    assert_eq!(
+        pty.writes(),
+        vec![b"\x1b[0n".to_vec(), b"\x1b[1;1R".to_vec()]
+    );
+}
+
+#[test]
+fn a_waiting_remote_receiver_has_no_event_notification_lost_wakeup() {
+    let (registry, pty) = registry();
+    let tab = registry.open(shell_launch("slot:mailbox-wakeup")).unwrap();
+    let remote = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    let _initial = remote.events.recv_timeout(Duration::from_secs(1)).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let waiting = barrier.clone();
+    let receiver = thread::spawn(move || {
+        waiting.wait();
+        remote.events.recv_timeout(Duration::from_secs(1))
+    });
+
+    barrier.wait();
+    pty.emit_output(pty.last_id(), b"wake");
+
+    assert!(matches!(
+        receiver.join().unwrap().unwrap(),
+        TabEvent::Diff(_)
+    ));
+}
+
+#[test]
+fn concurrent_remote_attach_and_output_always_expose_snapshot_before_diff() {
+    let (registry, pty) = registry();
+    let tab = registry.open(shell_launch("slot:attach-order")).unwrap();
+
+    for _ in 0..32 {
+        let barrier = Arc::new(Barrier::new(2));
+        let attaching = barrier.clone();
+        let attaching_registry = registry.clone();
+        let attaching_tab = tab.clone();
+        let attach = thread::spawn(move || {
+            attaching.wait();
+            attaching_registry
+                .attach(&attaching_tab, AttachmentKind::Remote)
+                .unwrap()
+        });
+        barrier.wait();
+        pty.emit_output(pty.last_id(), b"x\r");
+        let remote = attach.join().unwrap();
+
+        assert!(matches!(
+            remote.events.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TabEvent::Snapshot(_)
+        ));
+    }
 }

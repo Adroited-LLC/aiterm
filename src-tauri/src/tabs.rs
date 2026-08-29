@@ -4,11 +4,11 @@ use crate::terminal::model::{ScreenDiff, ScreenRow, ScreenSnapshot};
 use crate::terminal::screen::ScreenModel;
 use portable_pty::PtySize;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 64;
@@ -376,6 +376,279 @@ impl PtyBackend for PtyManager {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ControlKind {
+    Focus,
+    Metadata,
+    Title,
+    Bell,
+    Exited,
+}
+
+struct QueuedEvent {
+    sequence: u64,
+    event: TabEvent,
+}
+
+struct MailboxState {
+    next_sequence: u64,
+    screen: VecDeque<QueuedEvent>,
+    raw: VecDeque<QueuedEvent>,
+    controls: HashMap<ControlKind, QueuedEvent>,
+    receiver_closed: bool,
+    producer_closed: bool,
+}
+
+impl Default for MailboxState {
+    fn default() -> Self {
+        Self {
+            next_sequence: 0,
+            screen: VecDeque::new(),
+            raw: VecDeque::new(),
+            controls: HashMap::new(),
+            receiver_closed: false,
+            producer_closed: false,
+        }
+    }
+}
+
+struct EventMailbox {
+    kind: AttachmentKind,
+    capacity: usize,
+    state: Mutex<MailboxState>,
+    changed: Condvar,
+}
+
+impl EventMailbox {
+    fn new(kind: AttachmentKind, capacity: usize) -> Self {
+        Self {
+            kind,
+            capacity: capacity.max(1),
+            state: Mutex::new(MailboxState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn push_initial_snapshot(&self, snapshot: ScreenSnapshot) {
+        let mut state = self.state.lock().unwrap();
+        if state.receiver_closed || state.producer_closed {
+            return;
+        }
+        let sequence = take_sequence(&mut state);
+        state.screen.push_back(QueuedEvent {
+            sequence,
+            event: TabEvent::Snapshot(snapshot),
+        });
+        self.changed.notify_one();
+    }
+
+    fn push_snapshot(&self, snapshot: ScreenSnapshot) {
+        self.push_screen(TabEvent::Snapshot(snapshot.clone()), || snapshot);
+    }
+
+    fn push_diff(&self, diff: ScreenDiff, recovery: impl FnOnce() -> ScreenSnapshot) {
+        self.push_screen(TabEvent::Diff(diff), recovery);
+    }
+
+    fn push_screen(&self, event: TabEvent, recovery: impl FnOnce() -> ScreenSnapshot) {
+        debug_assert_eq!(self.kind, AttachmentKind::Remote);
+        let mut state = self.state.lock().unwrap();
+        if state.receiver_closed || state.producer_closed {
+            return;
+        }
+        let event_sequence = take_sequence(&mut state);
+        if state.screen.len() >= self.capacity {
+            // Keep the earliest replaced event's position relative to control
+            // events. The snapshot semantically supersedes every removed
+            // screen event, while later diffs receive later sequence numbers.
+            let sequence = state
+                .screen
+                .front()
+                .map(|queued| queued.sequence)
+                .unwrap_or(event_sequence);
+            state.screen.clear();
+            state.screen.push_back(QueuedEvent {
+                sequence,
+                event: TabEvent::Snapshot(recovery()),
+            });
+        } else {
+            state.screen.push_back(QueuedEvent {
+                sequence: event_sequence,
+                event,
+            });
+        }
+        self.changed.notify_one();
+    }
+
+    fn push_raw(&self, bytes: Vec<u8>) -> bool {
+        debug_assert_eq!(self.kind, AttachmentKind::Desktop);
+        let mut state = self.state.lock().unwrap();
+        while state.raw.len() >= self.capacity && !state.receiver_closed && !state.producer_closed {
+            state = self.changed.wait(state).unwrap();
+        }
+        if state.receiver_closed || state.producer_closed {
+            return false;
+        }
+        let sequence = take_sequence(&mut state);
+        state.raw.push_back(QueuedEvent {
+            sequence,
+            event: TabEvent::Raw(bytes),
+        });
+        self.changed.notify_one();
+        true
+    }
+
+    fn push_control(&self, event: TabEvent) {
+        let Some(kind) = control_kind(&event) else {
+            return;
+        };
+        let mut state = self.state.lock().unwrap();
+        if state.receiver_closed || state.producer_closed {
+            return;
+        }
+        if kind == ControlKind::Exited && state.controls.contains_key(&kind) {
+            return;
+        }
+        let sequence = take_sequence(&mut state);
+        state.controls.insert(kind, QueuedEvent { sequence, event });
+        self.changed.notify_one();
+    }
+
+    fn finish(&self, exit: TabExit) {
+        let mut state = self.state.lock().unwrap();
+        if state.receiver_closed || state.producer_closed {
+            return;
+        }
+        if !state.controls.contains_key(&ControlKind::Exited) {
+            let sequence = take_sequence(&mut state);
+            state.controls.insert(
+                ControlKind::Exited,
+                QueuedEvent {
+                    sequence,
+                    event: TabEvent::Exited(exit),
+                },
+            );
+        }
+        state.producer_closed = true;
+        self.changed.notify_all();
+    }
+
+    fn close_receiver(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.receiver_closed = true;
+        state.screen.clear();
+        state.raw.clear();
+        state.controls.clear();
+        self.changed.notify_all();
+    }
+
+    fn recv(&self) -> Result<TabEvent, RecvError> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(event) = pop_next(&mut state) {
+                self.changed.notify_all();
+                return Ok(event);
+            }
+            if state.receiver_closed || state.producer_closed {
+                return Err(RecvError);
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<TabEvent, RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(event) = pop_next(&mut state) {
+                self.changed.notify_all();
+                return Ok(event);
+            }
+            if state.receiver_closed || state.producer_closed {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let (next, timeout_result) = self.changed.wait_timeout(state, deadline - now).unwrap();
+            state = next;
+            if timeout_result.timed_out()
+                && state.screen.is_empty()
+                && state.raw.is_empty()
+                && state.controls.is_empty()
+            {
+                return Err(RecvTimeoutError::Timeout);
+            }
+        }
+    }
+
+    fn try_recv(&self) -> Result<TabEvent, TryRecvError> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(event) = pop_next(&mut state) {
+            self.changed.notify_all();
+            return Ok(event);
+        }
+        if state.receiver_closed || state.producer_closed {
+            Err(TryRecvError::Disconnected)
+        } else {
+            Err(TryRecvError::Empty)
+        }
+    }
+}
+
+fn take_sequence(state: &mut MailboxState) -> u64 {
+    let sequence = state.next_sequence;
+    state.next_sequence = state.next_sequence.saturating_add(1);
+    sequence
+}
+
+fn control_kind(event: &TabEvent) -> Option<ControlKind> {
+    match event {
+        TabEvent::FocusChanged { .. } => Some(ControlKind::Focus),
+        TabEvent::Metadata(_) => Some(ControlKind::Metadata),
+        TabEvent::Title(_) => Some(ControlKind::Title),
+        TabEvent::Bell => Some(ControlKind::Bell),
+        TabEvent::Exited(_) => Some(ControlKind::Exited),
+        TabEvent::Raw(_) | TabEvent::Snapshot(_) | TabEvent::Diff(_) => None,
+    }
+}
+
+fn pop_next(state: &mut MailboxState) -> Option<TabEvent> {
+    enum Lane {
+        Screen,
+        Raw,
+        Control(ControlKind),
+    }
+
+    let mut next: Option<(u64, Lane)> = state
+        .screen
+        .front()
+        .map(|queued| (queued.sequence, Lane::Screen));
+    if let Some(raw) = state.raw.front() {
+        if next
+            .as_ref()
+            .is_none_or(|(sequence, _)| raw.sequence < *sequence)
+        {
+            next = Some((raw.sequence, Lane::Raw));
+        }
+    }
+    for (kind, queued) in &state.controls {
+        if next
+            .as_ref()
+            .is_none_or(|(sequence, _)| queued.sequence < *sequence)
+        {
+            next = Some((queued.sequence, Lane::Control(*kind)));
+        }
+    }
+
+    match next?.1 {
+        Lane::Screen => state.screen.pop_front().map(|queued| queued.event),
+        Lane::Raw => state.raw.pop_front().map(|queued| queued.event),
+        Lane::Control(kind) => state.controls.remove(&kind).map(|queued| queued.event),
+    }
+}
+
 pub struct TabAttachment {
     pub id: AttachmentId,
     pub events: TabEventReceiver,
@@ -390,7 +663,7 @@ impl fmt::Debug for TabAttachment {
 }
 
 pub struct TabEventReceiver {
-    receiver: Receiver<TabEvent>,
+    mailbox: Arc<EventMailbox>,
     registry: Weak<RegistryInner>,
     tab_id: TabId,
     attachment_id: AttachmentId,
@@ -407,41 +680,23 @@ impl fmt::Debug for TabEventReceiver {
 
 impl TabEventReceiver {
     pub fn recv(&self) -> Result<TabEvent, RecvError> {
-        if let Some(snapshot) = self.take_recovery() {
-            return Ok(snapshot);
-        }
-        let event = self.receiver.recv()?;
-        Ok(self.take_recovery().unwrap_or(event))
+        self.mailbox.recv()
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<TabEvent, RecvTimeoutError> {
-        if let Some(snapshot) = self.take_recovery() {
-            return Ok(snapshot);
-        }
-        let event = self.receiver.recv_timeout(timeout)?;
-        Ok(self.take_recovery().unwrap_or(event))
+        self.mailbox.recv_timeout(timeout)
     }
 
     pub fn try_recv(&self) -> Result<TabEvent, TryRecvError> {
-        if let Some(snapshot) = self.take_recovery() {
-            return Ok(snapshot);
-        }
-        let event = self.receiver.try_recv()?;
-        Ok(self.take_recovery().unwrap_or(event))
-    }
-
-    fn take_recovery(&self) -> Option<TabEvent> {
-        let snapshot = self
-            .registry
-            .upgrade()?
-            .take_recovery(&self.tab_id, &self.attachment_id)?;
-        while self.receiver.try_recv().is_ok() {}
-        Some(TabEvent::Snapshot(snapshot))
+        self.mailbox.try_recv()
     }
 }
 
 impl Drop for TabEventReceiver {
     fn drop(&mut self) {
+        // Wake a desktop producer before trying to take the per-tab lock it may
+        // hold while applying lossless backpressure.
+        self.mailbox.close_receiver();
         if let Some(registry) = self.registry.upgrade() {
             registry.detach(&self.tab_id, &self.attachment_id);
         }
@@ -483,6 +738,17 @@ impl TabRegistry {
 
     pub fn open(&self, launch: TabLaunch) -> Result<TabId, TabError> {
         let id = TabId::new();
+        let slot_id = launch.slot_id.clone();
+        {
+            let mut maps = self.inner.maps.lock().unwrap();
+            if maps.by_slot.contains_key(&slot_id) || maps.pending_slots.contains(&slot_id) {
+                return Err(TabError::new(
+                    "tab.slot_in_use",
+                    "another tab already owns this slot",
+                ));
+            }
+            maps.pending_slots.insert(slot_id.clone());
+        }
         let descriptor = TabDescriptor {
             id: id.clone(),
             title: launch.title,
@@ -515,25 +781,11 @@ impl TabRegistry {
         let tab = Arc::new(Mutex::new(LiveTab {
             descriptor,
             screen: ScreenModel::new(launch.size),
-            pty_id: None,
+            pty: PtyBinding::Pending,
             attachments: HashMap::new(),
-            pending_replies: Vec::new(),
+            pending_replies: VecDeque::new(),
             exit_notified: false,
         }));
-
-        {
-            let mut maps = self.inner.maps.lock().unwrap();
-            let slot = tab.lock().unwrap().descriptor.slot_id.clone();
-            if maps.by_slot.contains_key(&slot) {
-                return Err(TabError::new(
-                    "tab.slot_in_use",
-                    "another tab already owns this slot",
-                ));
-            }
-            maps.by_slot.insert(slot, id.clone());
-            maps.order.push(id.clone());
-            maps.by_id.insert(id.clone(), tab.clone());
-        }
 
         let sink = Arc::new(TabSink {
             registry: Arc::downgrade(&self.inner),
@@ -542,26 +794,49 @@ impl TabRegistry {
         let pty_id = match self.inner.backend.spawn(spec, sink) {
             Ok(pty_id) => pty_id,
             Err(error) => {
-                let slot_id = tab.lock().unwrap().descriptor.slot_id.clone();
-                self.inner.remove_tab(&id, &slot_id, None);
+                self.inner.release_pending_slot(&slot_id);
                 return Err(TabError::new("tab.spawn_failed", error));
             }
         };
 
-        let pending_replies = {
+        {
             let mut live = tab.lock().unwrap();
-            if live.descriptor.state == TabState::Running {
-                live.pty_id = Some(pty_id);
-                let mut maps = self.inner.maps.lock().unwrap();
-                maps.by_pty.insert(pty_id, id.clone());
+            if live.descriptor.state == TabState::Exited {
+                self.inner.publish_locked(&id, &tab, &live, None);
+                return Ok(id);
             }
-            std::mem::take(&mut live.pending_replies)
-        };
-        for reply in pending_replies {
-            let _ = self.inner.backend.write(pty_id, &reply);
+            live.pty = PtyBinding::Flushing(pty_id);
         }
 
-        Ok(id)
+        loop {
+            let reply = {
+                let mut live = tab.lock().unwrap();
+                if live.descriptor.state == TabState::Exited {
+                    self.inner.publish_locked(&id, &tab, &live, None);
+                    return Ok(id);
+                }
+                match live.pending_replies.pop_front() {
+                    Some(reply) => Some(reply),
+                    None => {
+                        live.pty = PtyBinding::Ready(pty_id);
+                        self.inner.publish_locked(&id, &tab, &live, Some(pty_id));
+                        None
+                    }
+                }
+            };
+            let Some(reply) = reply else {
+                return Ok(id);
+            };
+            if let Err(error) = self.inner.backend.write(pty_id, &reply) {
+                let exited = tab.lock().unwrap().descriptor.state == TabState::Exited;
+                if exited {
+                    continue;
+                }
+                self.inner.release_pending_slot(&slot_id);
+                self.inner.backend.kill(pty_id);
+                return Err(TabError::new("tab.reply_failed", error));
+            }
+        }
     }
 
     pub fn list(&self) -> Vec<TabDescriptor> {
@@ -585,7 +860,7 @@ impl TabRegistry {
 
     pub fn update(&self, id: &TabId, update: TabUpdate) -> Result<TabDescriptor, TabError> {
         let tab = self.inner.tab(id)?;
-        let (descriptor, dispatches) = {
+        let descriptor = {
             let mut live = tab.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return Err(TabError::new("tab.closed", "the tab has exited"));
@@ -618,10 +893,9 @@ impl TabRegistry {
                 live.descriptor.fresh = fresh;
             }
             let descriptor = live.descriptor.clone();
-            let dispatches = live.dispatches_to_all(TabEvent::Metadata(descriptor.clone()));
-            (descriptor, dispatches)
+            live.enqueue_control_all(TabEvent::Metadata(descriptor.clone()));
+            descriptor
         };
-        dispatch(&tab, dispatches);
         Ok(descriptor)
     }
 
@@ -642,40 +916,37 @@ impl TabRegistry {
     pub fn attach(&self, id: &TabId, kind: AttachmentKind) -> Result<TabAttachment, TabError> {
         let tab = self.inner.tab(id)?;
         let attachment_id = AttachmentId::new();
-        let (sender, receiver) = mpsc::sync_channel(self.inner.queue_capacity);
-        let dispatches = {
+        let mailbox = Arc::new(EventMailbox::new(kind, self.inner.queue_capacity));
+        {
             let mut live = tab.lock().unwrap();
+            if live.descriptor.state != TabState::Running {
+                return Err(TabError::new("tab.closed", "the tab has exited"));
+            }
+            // The snapshot is in the mailbox before the attachment enters the
+            // tab's subscriber map. Output cannot discover this attachment and
+            // enqueue a diff ahead of its initial state.
+            if kind == AttachmentKind::Remote {
+                mailbox.push_initial_snapshot(live.screen.snapshot(id.as_str()));
+            }
             live.attachments.insert(
                 attachment_id.clone(),
                 AttachmentState {
                     kind,
-                    sender: sender.clone(),
-                    recover_snapshot: false,
+                    mailbox: mailbox.clone(),
                 },
             );
-            let mut dispatches = Vec::new();
-            if kind == AttachmentKind::Remote {
-                dispatches.push(Dispatch::new(
-                    attachment_id.clone(),
-                    kind,
-                    sender,
-                    TabEvent::Snapshot(live.screen.snapshot(id.as_str())),
-                ));
-            }
             if kind == AttachmentKind::Desktop && live.descriptor.input_owner.is_none() {
                 live.descriptor.input_owner = Some(attachment_id.clone());
-                dispatches.extend(live.dispatches_to_all(TabEvent::FocusChanged {
+                live.enqueue_control_all(TabEvent::FocusChanged {
                     owner: Some(attachment_id.clone()),
                     size: live.descriptor.size,
-                }));
+                });
             }
-            dispatches
-        };
-        dispatch(&tab, dispatches);
+        }
         Ok(TabAttachment {
             id: attachment_id.clone(),
             events: TabEventReceiver {
-                receiver,
+                mailbox,
                 registry: Arc::downgrade(&self.inner),
                 tab_id: id.clone(),
                 attachment_id,
@@ -723,7 +994,7 @@ impl TabRegistry {
         size: TerminalSize,
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
-        let dispatches = {
+        {
             let mut live = tab.lock().unwrap();
             live.authorize_owner(attachment)?;
             let pty_id = live.live_pty()?;
@@ -731,9 +1002,8 @@ impl TabRegistry {
                 .backend
                 .resize(pty_id, size.cols(), size.rows())
                 .map_err(|error| TabError::new("terminal.resize_failed", error))?;
-            live.resize(id, size)
-        };
-        dispatch(&tab, dispatches);
+            live.resize(id, size);
+        }
         Ok(())
     }
 
@@ -744,7 +1014,7 @@ impl TabRegistry {
         size: TerminalSize,
     ) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
-        let dispatches = {
+        {
             let mut live = tab.lock().unwrap();
             if !live.attachments.contains_key(attachment) {
                 return Err(TabError::new(
@@ -758,28 +1028,26 @@ impl TabRegistry {
                 .resize(pty_id, size.cols(), size.rows())
                 .map_err(|error| TabError::new("terminal.resize_failed", error))?;
             live.descriptor.input_owner = Some(attachment.clone());
-            let mut dispatches = live.resize(id, size);
-            dispatches.extend(live.dispatches_to_all(TabEvent::FocusChanged {
+            live.resize(id, size);
+            live.enqueue_control_all(TabEvent::FocusChanged {
                 owner: Some(attachment.clone()),
                 size,
-            }));
-            dispatches
-        };
-        dispatch(&tab, dispatches);
+            });
+        }
         Ok(())
     }
 
     pub fn close(&self, id: &TabId) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
-        let (pty_id, slot_id, dispatches) = {
+        let (pty_id, slot_id) = {
             let mut live = tab.lock().unwrap();
-            let pty_id = live.pty_id.take();
+            let pty_id = live.pty.id();
+            live.pty = PtyBinding::Exited;
             let slot_id = live.descriptor.slot_id.clone();
-            let dispatches = live.mark_exited(None, None, true);
-            (pty_id, slot_id, dispatches)
+            live.mark_exited(None, None, true);
+            (pty_id, slot_id)
         };
         self.inner.remove_tab(id, &slot_id, pty_id);
-        dispatch(&tab, dispatches);
         if let Some(pty_id) = pty_id {
             self.inner.backend.kill(pty_id);
         }
@@ -803,6 +1071,7 @@ struct RegistryMaps {
     by_id: HashMap<TabId, Arc<Mutex<LiveTab>>>,
     by_slot: HashMap<String, TabId>,
     by_pty: HashMap<u32, TabId>,
+    pending_slots: HashSet<String>,
     order: Vec<TabId>,
 }
 
@@ -830,50 +1099,71 @@ impl RegistryInner {
         maps.by_pty.retain(|_, tab_id| tab_id != id);
     }
 
+    fn release_pending_slot(&self, slot_id: &str) {
+        self.maps.lock().unwrap().pending_slots.remove(slot_id);
+    }
+
+    /// Publish only while the caller holds this tab's lock. This makes the
+    /// Ready/Exited state and every public index appear as one transition.
+    fn publish_locked(
+        &self,
+        id: &TabId,
+        tab: &Arc<Mutex<LiveTab>>,
+        live: &LiveTab,
+        pty_id: Option<u32>,
+    ) {
+        let mut maps = self.maps.lock().unwrap();
+        maps.pending_slots.remove(&live.descriptor.slot_id);
+        maps.by_slot
+            .insert(live.descriptor.slot_id.clone(), id.clone());
+        maps.order.push(id.clone());
+        maps.by_id.insert(id.clone(), tab.clone());
+        if let Some(pty_id) = pty_id {
+            maps.by_pty.insert(pty_id, id.clone());
+        }
+    }
+
     fn detach(&self, tab_id: &TabId, attachment_id: &AttachmentId) {
         let Ok(tab) = self.tab(tab_id) else {
             return;
         };
-        let dispatches = {
-            let mut live = tab.lock().unwrap();
-            if live.attachments.remove(attachment_id).is_none() {
-                return;
-            }
-            if live.descriptor.input_owner.as_ref() == Some(attachment_id) {
-                live.descriptor.input_owner = None;
-                live.dispatches_to_all(TabEvent::FocusChanged {
-                    owner: None,
-                    size: live.descriptor.size,
-                })
-            } else {
-                Vec::new()
-            }
-        };
-        dispatch(&tab, dispatches);
-    }
-
-    fn take_recovery(
-        &self,
-        tab_id: &TabId,
-        attachment_id: &AttachmentId,
-    ) -> Option<ScreenSnapshot> {
-        let tab = self.tab(tab_id).ok()?;
-        let mut live = tab.lock().ok()?;
-        let attachment = live.attachments.get_mut(attachment_id)?;
-        if attachment.kind != AttachmentKind::Remote || !attachment.recover_snapshot {
-            return None;
+        let mut live = tab.lock().unwrap();
+        if live.attachments.remove(attachment_id).is_none() {
+            return;
         }
-        attachment.recover_snapshot = false;
-        Some(live.screen.snapshot(tab_id.as_str()))
+        if live.descriptor.input_owner.as_ref() == Some(attachment_id) {
+            live.descriptor.input_owner = None;
+            live.enqueue_control_all(TabEvent::FocusChanged {
+                owner: None,
+                size: live.descriptor.size,
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtyBinding {
+    Pending,
+    Flushing(u32),
+    Ready(u32),
+    Exited,
+}
+
+impl PtyBinding {
+    fn id(self) -> Option<u32> {
+        match self {
+            Self::Flushing(id) | Self::Ready(id) => Some(id),
+            Self::Pending | Self::Exited => None,
+        }
     }
 }
 
 struct LiveTab {
     descriptor: TabDescriptor,
     screen: ScreenModel,
-    pty_id: Option<u32>,
+    pty: PtyBinding,
     attachments: HashMap<AttachmentId, AttachmentState>,
-    pending_replies: Vec<Vec<u8>>,
+    pending_replies: VecDeque<Vec<u8>>,
     exit_notified: bool,
 }
 
@@ -882,7 +1172,8 @@ impl LiveTab {
         if self.descriptor.state != TabState::Running {
             return Err(TabError::new("tab.closed", "the tab has exited"));
         }
-        self.pty_id
+        self.pty
+            .id()
             .ok_or_else(|| TabError::new("tab.not_ready", "the PTY is still starting"))
     }
 
@@ -902,48 +1193,50 @@ impl LiveTab {
         Ok(())
     }
 
-    fn dispatches_to_all(&self, event: TabEvent) -> Vec<Dispatch> {
-        self.attachments
-            .iter()
-            .map(|(id, attachment)| {
-                Dispatch::new(
-                    id.clone(),
-                    attachment.kind,
-                    attachment.sender.clone(),
-                    event.clone(),
-                )
-            })
-            .collect()
+    fn enqueue_control_all(&self, event: TabEvent) {
+        for attachment in self.attachments.values() {
+            attachment.mailbox.push_control(event.clone());
+        }
     }
 
-    fn dispatches_to_kind(&self, kind: AttachmentKind, event: TabEvent) -> Vec<Dispatch> {
-        self.attachments
-            .iter()
-            .filter(|(_, attachment)| {
-                attachment.kind == kind
-                    && !(kind == AttachmentKind::Remote && attachment.recover_snapshot)
-            })
-            .map(|(id, attachment)| {
-                Dispatch::new(id.clone(), kind, attachment.sender.clone(), event.clone())
-            })
-            .collect()
+    fn enqueue_desktop_raw(&self, bytes: &[u8]) {
+        for attachment in self
+            .attachments
+            .values()
+            .filter(|attachment| attachment.kind == AttachmentKind::Desktop)
+        {
+            attachment.mailbox.push_raw(bytes.to_vec());
+        }
     }
 
-    fn resize(&mut self, id: &TabId, size: TerminalSize) -> Vec<Dispatch> {
+    fn enqueue_remote_diff(&self, id: &TabId, diff: ScreenDiff) {
+        for attachment in self
+            .attachments
+            .values()
+            .filter(|attachment| attachment.kind == AttachmentKind::Remote)
+        {
+            attachment
+                .mailbox
+                .push_diff(diff.clone(), || self.screen.snapshot(id.as_str()));
+        }
+    }
+
+    fn resize(&mut self, id: &TabId, size: TerminalSize) {
         self.descriptor.size = size;
         self.screen.resize(size);
         let snapshot = self.screen.snapshot(id.as_str());
-        self.dispatches_to_kind(AttachmentKind::Remote, TabEvent::Snapshot(snapshot))
+        for attachment in self
+            .attachments
+            .values()
+            .filter(|attachment| attachment.kind == AttachmentKind::Remote)
+        {
+            attachment.mailbox.push_snapshot(snapshot.clone());
+        }
     }
 
-    fn mark_exited(
-        &mut self,
-        code: Option<u32>,
-        signal: Option<String>,
-        requested: bool,
-    ) -> Vec<Dispatch> {
+    fn mark_exited(&mut self, code: Option<u32>, signal: Option<String>, requested: bool) {
         if self.exit_notified {
-            return Vec::new();
+            return;
         }
         self.exit_notified = true;
         self.descriptor.state = TabState::Exited;
@@ -954,63 +1247,35 @@ impl LiveTab {
             requested,
         };
         self.descriptor.exit = Some(exit.clone());
-        self.dispatches_to_all(TabEvent::Exited(exit))
+        for attachment in self.attachments.values() {
+            attachment.mailbox.finish(exit.clone());
+        }
+    }
+
+    fn queue_replies(&mut self, replies: Vec<Vec<u8>>) -> Option<u32> {
+        let desktop_owns = self
+            .descriptor
+            .input_owner
+            .as_ref()
+            .and_then(|owner| self.attachments.get(owner))
+            .is_some_and(|attachment| attachment.kind == AttachmentKind::Desktop);
+        if desktop_owns {
+            return None;
+        }
+        self.pending_replies.extend(replies);
+        if let PtyBinding::Ready(pty_id) = self.pty {
+            if !self.pending_replies.is_empty() {
+                self.pty = PtyBinding::Flushing(pty_id);
+                return Some(pty_id);
+            }
+        }
+        None
     }
 }
 
 struct AttachmentState {
     kind: AttachmentKind,
-    sender: SyncSender<TabEvent>,
-    recover_snapshot: bool,
-}
-
-struct Dispatch {
-    attachment_id: AttachmentId,
-    kind: AttachmentKind,
-    sender: SyncSender<TabEvent>,
-    event: TabEvent,
-}
-
-impl Dispatch {
-    fn new(
-        attachment_id: AttachmentId,
-        kind: AttachmentKind,
-        sender: SyncSender<TabEvent>,
-        event: TabEvent,
-    ) -> Self {
-        Self {
-            attachment_id,
-            kind,
-            sender,
-            event,
-        }
-    }
-}
-
-fn dispatch(tab: &Arc<Mutex<LiveTab>>, dispatches: Vec<Dispatch>) {
-    for item in dispatches {
-        match item.sender.try_send(item.event) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) if item.kind == AttachmentKind::Remote => {
-                if let Ok(mut live) = tab.lock() {
-                    if let Some(attachment) = live.attachments.get_mut(&item.attachment_id) {
-                        attachment.recover_snapshot = true;
-                    }
-                }
-            }
-            Err(mpsc::TrySendError::Full(_)) => {}
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                if let Ok(mut live) = tab.lock() {
-                    let was_owner =
-                        live.descriptor.input_owner.as_ref() == Some(&item.attachment_id);
-                    live.attachments.remove(&item.attachment_id);
-                    if was_owner {
-                        live.descriptor.input_owner = None;
-                    }
-                }
-            }
-        }
-    }
+    mailbox: Arc<EventMailbox>,
 }
 
 struct TabSink {
@@ -1019,48 +1284,31 @@ struct TabSink {
 }
 
 impl PtySink for TabSink {
-    fn output(&self, pty_id: u32, bytes: &[u8]) {
+    fn output(&self, _pty_id: u32, bytes: &[u8]) {
         let (Some(registry), Some(tab)) = (self.registry.upgrade(), self.tab.upgrade()) else {
             return;
         };
-        let (dispatches, replies) = {
+        let flush = {
             let mut live = tab.lock().unwrap();
             if live.descriptor.state != TabState::Running {
                 return;
             }
-            let mut dispatches =
-                live.dispatches_to_kind(AttachmentKind::Desktop, TabEvent::Raw(bytes.to_vec()));
+            live.enqueue_desktop_raw(bytes);
             let damage = live.screen.process(bytes);
             if let Some(diff) = damage.diff {
-                dispatches
-                    .extend(live.dispatches_to_kind(AttachmentKind::Remote, TabEvent::Diff(diff)));
+                live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
             }
             if let Some(title) = damage.title {
                 live.descriptor.title = title.clone();
-                dispatches.extend(live.dispatches_to_all(TabEvent::Title(title)));
+                live.enqueue_control_all(TabEvent::Title(title));
             }
             if damage.bell {
-                dispatches.extend(live.dispatches_to_all(TabEvent::Bell));
+                live.enqueue_control_all(TabEvent::Bell);
             }
-            let desktop_owns = live
-                .descriptor
-                .input_owner
-                .as_ref()
-                .and_then(|owner| live.attachments.get(owner))
-                .is_some_and(|attachment| attachment.kind == AttachmentKind::Desktop);
-            let replies = if desktop_owns {
-                Vec::new()
-            } else if live.pty_id.is_some() {
-                damage.replies
-            } else {
-                live.pending_replies.extend(damage.replies);
-                Vec::new()
-            };
-            (dispatches, replies)
+            live.queue_replies(damage.replies)
         };
-        dispatch(&tab, dispatches);
-        for reply in replies {
-            let _ = registry.backend.write(pty_id, &reply);
+        if let Some(pty_id) = flush {
+            flush_replies(&registry, &tab, pty_id);
         }
     }
 
@@ -1068,12 +1316,39 @@ impl PtySink for TabSink {
         let (Some(registry), Some(tab)) = (self.registry.upgrade(), self.tab.upgrade()) else {
             return;
         };
-        let dispatches = {
+        {
             let mut live = tab.lock().unwrap();
-            live.pty_id = None;
-            live.mark_exited(code, signal.map(str::to_owned), false)
-        };
+            live.pty = PtyBinding::Exited;
+            live.pending_replies.clear();
+            live.mark_exited(code, signal.map(str::to_owned), false);
+        }
         registry.maps.lock().unwrap().by_pty.remove(&pty_id);
-        dispatch(&tab, dispatches);
+    }
+}
+
+fn flush_replies(registry: &RegistryInner, tab: &Arc<Mutex<LiveTab>>, pty_id: u32) {
+    loop {
+        let reply = {
+            let mut live = tab.lock().unwrap();
+            if live.descriptor.state != TabState::Running
+                || live.pty != PtyBinding::Flushing(pty_id)
+            {
+                return;
+            }
+            match live.pending_replies.pop_front() {
+                Some(reply) => reply,
+                None => {
+                    live.pty = PtyBinding::Ready(pty_id);
+                    return;
+                }
+            }
+        };
+        if registry.backend.write(pty_id, &reply).is_err() {
+            let mut live = tab.lock().unwrap();
+            if live.pty == PtyBinding::Flushing(pty_id) {
+                live.pty = PtyBinding::Ready(pty_id);
+            }
+            return;
+        }
     }
 }
