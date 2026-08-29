@@ -66,6 +66,16 @@ pub trait SessionProvider: Send + Sync {
         None
     }
 
+    /// Everything the hover flyout shows, for an engine whose records say
+    /// more than `messages()` can carry — grok's `summary.json` has the
+    /// model, the effort, the branch and the timestamps; OpenCode's database
+    /// has token counts and tool calls. `None` means "read it the generic
+    /// way" — `messages()`, then the transcript — which stays the default.
+    fn detail(&self, session_id: &str) -> Option<crate::detail::SessionDetail> {
+        let _ = session_id;
+        None
+    }
+
     /// The session's task list, for an engine that records one in its own
     /// shape — grok's `todo_write`, codex's `update_plan`. `None` means
     /// "scan the claude transcript", which stays the default.
