@@ -6561,6 +6561,56 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn permanent_trash_delete_removes_strict_codex_rollout_task_and_job_archives() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-strict-trash-purge-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let trash = root.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let id = "28282828-2828-4828-8828-282828282828";
+        for suffix in ["jsonl", "origin", "tasks", "job", "rollouts"] {
+            std::fs::write(trash.join(format!("{id}.{suffix}")), suffix.as_bytes()).unwrap();
+        }
+
+        trash_delete_in_directory(&trash, id).unwrap();
+
+        for suffix in ["jsonl", "origin", "tasks", "job", "rollouts"] {
+            assert!(!trash.join(format!("{id}.{suffix}")).exists(), "{suffix}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn permanent_trash_delete_propagates_task_archive_lease_failure_before_main_purge() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-strict-trash-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let trash = root.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let id = "29292929-2929-4929-8929-292929292929";
+        let main = trash.join(format!("{id}.jsonl"));
+        let tasks = trash.join(format!("{id}.tasks"));
+        let rollouts = trash.join(format!("{id}.rollouts"));
+        std::fs::write(&main, b"main").unwrap();
+        std::fs::write(&tasks, b"tasks").unwrap();
+        std::fs::write(&rollouts, b"rollouts").unwrap();
+        let competing_reader = File::open(&tasks).unwrap();
+
+        let error = trash_delete_in_directory(&trash, id).unwrap_err();
+
+        assert!(error.contains("lease"), "{error}");
+        assert_eq!(std::fs::read(&main).unwrap(), b"main");
+        assert_eq!(std::fs::read(&tasks).unwrap(), b"tasks");
+        assert_eq!(std::fs::read(&rollouts).unwrap(), b"rollouts");
+        drop(competing_reader);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn codex_rollout_set_uses_the_same_leased_transaction_and_strict_archive() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-codex-leased-rollouts-{}",
