@@ -557,7 +557,13 @@ fn parse_codex_header(first_line: &str) -> Option<CodexHeader> {
 
 fn codex_root() -> Option<std::path::PathBuf> {
     let dir = dirs::home_dir()?.join(".codex/sessions");
-    dir.is_dir().then_some(dir)
+    let kind = std::fs::symlink_metadata(&dir).ok()?.file_type();
+    (kind.is_dir() && !kind.is_symlink()).then_some(dir)
+}
+
+struct PinnedCodexRollout {
+    file: std::fs::File,
+    path: std::path::PathBuf,
 }
 
 /// Every `*.jsonl` under `dir`, recursively.
@@ -566,40 +572,51 @@ fn codex_root() -> Option<std::path::PathBuf> {
 /// walk costs the same as three nested reads and does not break the day that
 /// changes.
 fn codex_rollouts_bounded(
-    dir: &std::path::Path,
+    dir: &crate::sessions::PinnedDiscoveryDirectory,
     depth: usize,
     budget: &mut crate::sessions::DiscoveryBudget,
-    out: &mut Vec<std::path::PathBuf>,
+    out: &mut Vec<PinnedCodexRollout>,
 ) {
-    if budget.remaining() == 0 || !budget.enter_directory(dir, depth) {
+    if budget.remaining() == 0 || !budget.enter_pinned_directory(dir.file(), depth) {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Some(entries) = dir.entries() else {
         return;
     };
     for e in entries.flatten() {
         if budget.remaining() == 0 {
             break;
         }
-        let path = e.path();
-        let Ok(file_type) = e.file_type() else { continue };
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            codex_rollouts_bounded(&path, depth + 1, budget, out);
-        } else if file_type.is_file()
-            && path.extension().is_some_and(|x| x == "jsonl")
-            && budget.claim_file()
+        let name = e.file_name();
+        if let Some(child) = dir.open_directory(&name) {
+            codex_rollouts_bounded(&child, depth + 1, budget, out);
+        } else if std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
         {
-            out.push(path);
+            let Some(file) = dir.open_file(&name) else {
+                continue;
+            };
+            if budget.claim_file() {
+                out.push(PinnedCodexRollout {
+                    file,
+                    path: dir.child_path(&name),
+                });
+            }
         }
     }
 }
 
-fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let mut budget = crate::sessions::DiscoveryBudget::new();
-    codex_rollouts_bounded(dir, 0, &mut budget, out);
+fn pinned_codex_rollouts_bounded(
+    root: &std::path::Path,
+    budget: &mut crate::sessions::DiscoveryBudget,
+) -> Vec<PinnedCodexRollout> {
+    let Some(root) = crate::sessions::PinnedDiscoveryDirectory::open(root) else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    codex_rollouts_bounded(&root, 0, budget, &mut output);
+    output
 }
 
 /// The body of [`CodexSessions::scan_with_paths`], over an explicit root.
@@ -617,8 +634,7 @@ fn scan_codex_dir_bounded(
     root: &std::path::Path,
     budget: &mut crate::sessions::DiscoveryBudget,
 ) -> Vec<(Session, std::path::PathBuf)> {
-    let mut files = Vec::new();
-    codex_rollouts_bounded(root, 0, budget, &mut files);
+    let files = pinned_codex_rollouts_bounded(root, budget);
     // Newer Codex writes MANY rollout files per conversation — one per turn or
     // thread, each with its own `id` in the filename, all sharing the original
     // conversation's `session_id` (and `parent_thread_id`) in their headers. A
@@ -629,8 +645,8 @@ fn scan_codex_dir_bounded(
     // fork rows and OpenCode child sessions are collapsed elsewhere.
     let mut by_session: std::collections::HashMap<String, (Session, std::path::PathBuf)> =
         std::collections::HashMap::new();
-    for path in files {
-        let Some((session, path)) = read_codex_row(&path) else {
+    for rollout in files {
+        let Some((session, path)) = read_codex_row_from(rollout.file, &rollout.path) else {
             continue;
         };
         match by_session.get(&session.id) {
@@ -656,12 +672,12 @@ pub fn codex_session_files(session_id: &str) -> Vec<std::path::PathBuf> {
 /// The body of [`codex_session_files`], over an explicit root so it can be
 /// tested against a directory built for the purpose.
 fn codex_session_files_in(root: &std::path::Path, session_id: &str) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    codex_rollouts(root, &mut files);
+    let mut budget = crate::sessions::DiscoveryBudget::new();
+    let files = pinned_codex_rollouts_bounded(root, &mut budget);
     let mut mine: Vec<(u64, std::path::PathBuf)> = files
-        .iter()
-        .filter_map(|p| {
-            let (s, path) = read_codex_row(p)?;
+        .into_iter()
+        .filter_map(|rollout| {
+            let (s, path) = read_codex_row_from(rollout.file, &rollout.path)?;
             (s.id == session_id).then_some((s.last_active, path))
         })
         .collect();
@@ -673,14 +689,17 @@ fn codex_session_files_in(root: &std::path::Path, session_id: &str) -> Vec<std::
 /// rollout. The unit both [`scan_codex_dir`] and [`CodexSessions::find_session_file`]
 /// build on, so the row a click selects and the file a delete moves are read
 /// the same way.
-fn read_codex_row(path: &std::path::Path) -> Option<(Session, std::path::PathBuf)> {
-    let file = std::fs::File::open(path).ok()?;
+fn read_codex_row_from(
+    file: std::fs::File,
+    path: &std::path::Path,
+) -> Option<(Session, std::path::PathBuf)> {
+    let metadata = file.metadata().ok()?;
     let mut first = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut first).ok()?;
     let h = parse_codex_header(&first)?;
-    let last_active = std::fs::metadata(path)
+    let last_active = metadata
+        .modified()
         .ok()
-        .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);

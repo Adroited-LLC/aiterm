@@ -10,9 +10,134 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 pub(crate) const MAX_DISCOVERED_SESSION_FILES: usize = 4096;
 pub(crate) const MAX_SESSION_DISCOVERY_DEPTH: usize = 16;
+
+/// A provider directory opened component-by-component without following a
+/// symlink. Discovery reads children relative to this descriptor, so replacing
+/// the provider root (or any directory below it) cannot redirect a scan into
+/// an outside tree. Linux procfs is used only to enumerate the already-open
+/// directory; if it is unavailable, discovery fails closed.
+pub(crate) struct PinnedDiscoveryDirectory {
+    file: File,
+    display_path: std::path::PathBuf,
+}
+
+impl PinnedDiscoveryDirectory {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open(path: &Path) -> Option<Self> {
+        use std::path::Component;
+
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/")
+            .ok()?;
+        for component in path.components() {
+            let Component::Normal(name) = component else {
+                if matches!(component, Component::RootDir) {
+                    continue;
+                }
+                return None;
+            };
+            file = open_discovery_directory_at(&file, name)?;
+        }
+        let pinned = Self {
+            file,
+            display_path: path.to_path_buf(),
+        };
+        pinned.proc_path()?;
+        Some(pinned)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open(_path: &Path) -> Option<Self> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_path(&self) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+        let proc_metadata = std::fs::metadata(&path).ok()?;
+        let pinned_metadata = self.file.metadata().ok()?;
+        (proc_metadata.dev() == pinned_metadata.dev()
+            && proc_metadata.ino() == pinned_metadata.ino())
+            .then_some(path)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn proc_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
+    pub(crate) fn entries(&self) -> Option<std::fs::ReadDir> {
+        std::fs::read_dir(self.proc_path()?).ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_directory(&self, name: &OsStr) -> Option<Self> {
+        Some(Self {
+            file: open_discovery_directory_at(&self.file, name)?,
+            display_path: self.display_path.join(name),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open_directory(&self, _name: &OsStr) -> Option<Self> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_file(&self, name: &OsStr) -> Option<File> {
+        let name = CString::new(name.as_bytes()).ok()?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return None;
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        file.metadata().ok()?.is_file().then_some(file)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open_file(&self, _name: &OsStr) -> Option<File> {
+        None
+    }
+
+    pub(crate) fn child_path(&self, name: &OsStr) -> std::path::PathBuf {
+        self.display_path.join(name)
+    }
+
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_discovery_directory_at(parent: &File, name: &OsStr) -> Option<File> {
+    let name = CString::new(name.as_bytes()).ok()?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    (descriptor >= 0).then(|| unsafe { File::from_raw_fd(descriptor) })
+}
 
 pub struct DiscoveryBudget {
     remaining: usize,
@@ -42,19 +167,20 @@ impl DiscoveryBudget {
         }
     }
 
-    pub(crate) fn enter_directory(&mut self, path: &Path, depth: usize) -> bool {
+    pub(crate) fn enter_pinned_directory(&mut self, file: &File, depth: usize) -> bool {
         if depth > MAX_SESSION_DISCOVERY_DEPTH {
             return false;
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let Ok(metadata) = std::fs::metadata(path) else { return false };
+            let Ok(metadata) = file.metadata() else { return false };
             metadata.file_type().is_dir() && self.visited.insert((metadata.dev(), metadata.ino()))
         }
         #[cfg(not(unix))]
         {
-            path.is_dir()
+            let _ = file;
+            false
         }
     }
 }
@@ -155,6 +281,67 @@ pub trait SessionProvider: Send + Sync {
 
 pub struct ClaudeProvider;
 
+fn scan_claude_root_bounded(
+    root: &Path,
+    budget: &mut DiscoveryBudget,
+) -> Vec<(Session, std::path::PathBuf)> {
+    let Some(root) = PinnedDiscoveryDirectory::open(root) else {
+        return Vec::new();
+    };
+    if !budget.enter_pinned_directory(root.file(), 0) {
+        return Vec::new();
+    }
+    let Some(projects) = root.entries() else {
+        return Vec::new();
+    };
+
+    let mut sessions = Vec::new();
+    for project_entry in projects.flatten() {
+        let project_name = project_entry.file_name();
+        let Some(project) = root.open_directory(&project_name) else {
+            continue;
+        };
+        if !budget.enter_pinned_directory(project.file(), 1) {
+            continue;
+        }
+        let Some(entries) = project.entries() else {
+            continue;
+        };
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            if budget.remaining() == 0 {
+                break;
+            }
+            let name = entry.file_name();
+            let path_name = Path::new(&name);
+            if path_name.extension().is_none_or(|extension| extension != "jsonl")
+                || name.to_string_lossy().contains(".orphaned-")
+            {
+                continue;
+            }
+            let Some(file) = project.open_file(&name) else {
+                continue;
+            };
+            if !budget.claim_file() {
+                break;
+            }
+            files.push((project.child_path(&name), file));
+        }
+        let dir_cwd = files.iter().find_map(|(_, file)| {
+            file.try_clone().ok().and_then(read_first_cwd_from)
+        });
+        for (path, file) in files {
+            if let Some(session) = parse_session_from(file, &path, dir_cwd.as_deref()) {
+                sessions.push((session, path));
+            }
+        }
+        if budget.remaining() == 0 {
+            break;
+        }
+    }
+    sessions
+}
+
 impl SessionProvider for ClaudeProvider {
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
         claude_session_file(session_id)
@@ -174,46 +361,7 @@ impl SessionProvider for ClaudeProvider {
             return vec![];
         };
         let root = home.join(".claude/projects");
-        let Ok(projects) = std::fs::read_dir(&root) else {
-            return vec![];
-        };
-
-        let mut sessions = Vec::new();
-        for project in projects.flatten() {
-            let Ok(project_type) = project.file_type() else { continue };
-            if project_type.is_symlink() || !project_type.is_dir() {
-                continue;
-            }
-            let Ok(files) = std::fs::read_dir(project.path()) else {
-                continue;
-            };
-            let paths: Vec<std::path::PathBuf> = files
-                .flatten()
-                .filter_map(|f| {
-                    let file_type = f.file_type().ok()?;
-                    (!file_type.is_symlink() && file_type.is_file()).then(|| f.path())
-                })
-                .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
-                // Claude Code renames superseded transcripts to
-                // <id>.orphaned-<ts>-<hash>.jsonl — not resumable sessions.
-                .filter(|p| {
-                    !p.file_name()
-                        .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
-                })
-                .take_while(|_| budget.claim_file())
-                .collect();
-            // Every real session in a project dir records the same cwd; find it
-            // once so /fork stub files (title-only, no cwd) can borrow it.
-            let dir_cwd = paths.iter().find_map(|p| read_first_cwd(p));
-            for path in paths {
-                if let Some(s) = parse_session(&path, dir_cwd.as_deref()) {
-                    sessions.push((s, path));
-                }
-            }
-            if budget.remaining() == 0 {
-                break;
-            }
-        }
+        let mut sessions = scan_claude_root_bounded(&root, budget);
         // Attach fork lineage from Claude Code's job state. This has to come
         // from outside the transcript: a fresh `/fork` stub is two lines
         // (`ai-title` + `agent-name`) with no message chain at all, so the
@@ -329,8 +477,8 @@ fn fork_parent_map(jobs_dir: &Path) -> std::collections::HashMap<String, String>
 /// Read the first `cwd` a transcript records. Used to backfill the project for
 /// Claude Code /fork stub files, which are title-only and omit `cwd`. Only the
 /// head of the file is scanned — cwd appears on the earliest real records.
-fn read_first_cwd(path: &Path) -> Option<String> {
-    let reader = BufReader::new(File::open(path).ok()?);
+fn read_first_cwd_from(file: File) -> Option<String> {
+    let reader = BufReader::new(file);
     for line in reader.lines().take(80).flatten() {
         if !line.contains("\"cwd\"") {
             continue;
@@ -462,7 +610,11 @@ pub(crate) fn is_system_meta_prompt(text: &str) -> bool {
 /// Pull title/cwd/branch out of the first lines of a session jsonl without
 /// parsing the whole transcript.
 fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
-    let meta = std::fs::metadata(path).ok()?;
+    parse_session_from(File::open(path).ok()?, path, dir_cwd)
+}
+
+fn parse_session_from(file: File, path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
+    let meta = file.metadata().ok()?;
     if meta.len() == 0 {
         return None;
     }
@@ -474,7 +626,7 @@ fn parse_session(path: &Path, dir_cwd: Option<&str>) -> Option<Session> {
         .as_millis() as u64;
 
     let id = path.file_stem()?.to_string_lossy().to_string();
-    let reader = BufReader::new(File::open(path).ok()?);
+    let reader = BufReader::new(file);
 
     let mut title: Option<String> = None;
     // Claude Code's auto-generated title (record type `ai-title`). Used as a
