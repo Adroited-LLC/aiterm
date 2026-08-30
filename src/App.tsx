@@ -2249,9 +2249,12 @@ export default function App() {
       if (s) remoteRef.current.resumeSession(s);
       else setNotice(`The phone asked for a session that is not listed: ${id.slice(0, 8)}…`);
     });
-    const unNew = listen<{ agentId: string; cwd: string; prompt: string | null }>("remote://new-session", (e) => {
-      const { agentId, cwd, prompt } = e.payload;
-      remoteRef.current.newSession(cwd, { kind: "agent", agentId, model: null, effort: null }, prompt ?? undefined);
+    const unNew = listen<{ agentId: string; cwd: string; prompt: string | null; model: string | null; effort: string | null; title: string | null }>("remote://new-session", (e) => {
+      const { agentId, cwd, prompt, model, effort, title } = e.payload;
+      remoteRef.current.newSession(
+        cwd, { kind: "agent", agentId, model: model ?? null, effort: effort ?? null }, prompt ?? undefined,
+        title ? { title } : {},
+      );
     });
     return () => {
       unOpen.then((f) => f());

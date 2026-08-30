@@ -163,6 +163,9 @@ pub struct RemoteState {
     reach: Mutex<Reach>,
     clients: Mutex<HashMap<u64, ClientInfo>>,
     next_client: std::sync::atomic::AtomicU64,
+    /// Last good answer per usage source. A service that rate-limits the
+    /// question this minute still had a number a minute ago.
+    usage_cache: Mutex<HashMap<String, crate::usage::UsageSource>>,
     /// Why the last start failed, for the settings panel. Cleared on success.
     last_error: Mutex<Option<String>>,
     /// Bad tokens per address: (failures, first failure). See `auth`.
@@ -178,6 +181,7 @@ impl Default for RemoteState {
             reach: Mutex::new(Reach { upnp: "off".into(), public_ip: None }),
             clients: Mutex::new(HashMap::new()),
             next_client: std::sync::atomic::AtomicU64::new(1),
+            usage_cache: Mutex::new(HashMap::new()),
             last_error: Mutex::new(None),
             strikes: Mutex::new(HashMap::new()),
             events: broadcast::channel(64).0,
@@ -619,6 +623,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/usage", get(usage))
         .route("/v1/agents", get(agents))
+        .route("/v1/uploads", post(upload).layer(axum::extract::DefaultBodyLimit::max(UPLOAD_LIMIT + 1024)))
         .route("/v1/sessions", get(sessions).post(new_session))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/conversation", get(conversation))
@@ -732,9 +737,55 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
 /// The same numbers the desktop's usage strip shows: plan limits per engine
 /// and provider balances. Slow — it asks each service — so the phone asks
 /// rarely and shows the last answer.
-async fn usage() -> Response {
-    let report = crate::run_blocking(crate::usage::usage_report).await;
+async fn usage(State(ctx): State<Ctx>) -> Response {
+    let fresh = crate::run_blocking(crate::usage::usage_report).await;
+    let state = ctx.app.state::<RemoteState>();
+    let mut cache = state.usage_cache.lock().unwrap();
+    let report: Vec<crate::usage::UsageSource> = fresh
+        .into_iter()
+        .map(|u| {
+            if u.state == "ok" {
+                cache.insert(u.id.clone(), u.clone());
+                u
+            } else {
+                cache.get(&u.id).cloned().unwrap_or(u)
+            }
+        })
+        .collect();
     Json(report).into_response()
+}
+
+const UPLOAD_LIMIT: usize = 25 * 1024 * 1024;
+
+/// A file from the phone — a screenshot, a document — lands on the desktop's
+/// disk, and the phone puts its path in the message. That is how a CLI agent
+/// takes an attachment: by reading it where it sits.
+async fn upload(headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let raw = headers.get("x-filename").and_then(|v| v.to_str().ok()).unwrap_or("upload");
+    let name: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('.')
+        .chars()
+        .take(80)
+        .collect();
+    let name = if name.is_empty() { "upload".to_string() } else { name };
+    if body.len() > UPLOAD_LIMIT {
+        return err(StatusCode::PAYLOAD_TOO_LARGE, "25 MB at most");
+    }
+    let Some(dir) = dirs::data_dir().map(|d| d.join("aiterm").join("uploads")) else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "no data dir");
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let path = dir.join(format!("{stamp}-{name}"));
+    if let Err(e) = std::fs::write(&path, &body) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    Json(serde_json::json!({ "path": path.to_string_lossy(), "bytes": body.len() })).into_response()
 }
 
 async fn detail(Path(id): Path<String>) -> Response {
@@ -819,12 +870,19 @@ struct NewSessionBody {
     agent_id: String,
     cwd: String,
     prompt: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    /// A name for the tab, when the person gave one.
+    title: Option<String>,
 }
 
 async fn new_session(State(ctx): State<Ctx>, Json(body): Json<NewSessionBody>) -> Response {
     let _ = ctx.app.emit(
         "remote://new-session",
-        serde_json::json!({ "agentId": body.agent_id, "cwd": body.cwd, "prompt": body.prompt }),
+        serde_json::json!({
+            "agentId": body.agent_id, "cwd": body.cwd, "prompt": body.prompt,
+            "model": body.model, "effort": body.effort, "title": body.title,
+        }),
     );
     StatusCode::ACCEPTED.into_response()
 }
