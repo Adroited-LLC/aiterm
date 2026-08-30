@@ -2366,6 +2366,43 @@ fn preserve_prepared_source(
 }
 
 #[cfg(target_os = "linux")]
+fn preserve_prepared_archive(
+    destination: &VerifiedDirectory,
+    archive: &PreparedLeasedArchive,
+) -> Result<ArchiveRecoveryLink, String> {
+    let recovery_name = format!(".aiterm-archive-recovery-{}", uuid::Uuid::new_v4());
+    let name = CString::new(recovery_name.as_bytes()).unwrap();
+    if unsafe {
+        libc::linkat(
+            archive.archive.file.as_raw_fd(),
+            c"".as_ptr(),
+            destination.file.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "could not preserve exact archive before retirement: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    destination
+        .file
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    let parent = std::fs::read_link(format!(
+        "/proc/self/fd/{}",
+        destination.file.as_raw_fd()
+    ))
+    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    Ok(ArchiveRecoveryLink {
+        name,
+        path: parent.join(recovery_name),
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_prepared_source(
     source: &VerifiedSessionFile,
     recovery: Option<ArchiveRecoveryLink>,
@@ -2625,6 +2662,10 @@ fn archive_verified_inputs_with_transaction_hooks(
         .map_err(|error| format!("could not make session archives durable: {error}"))?;
     after_publish()?;
     verify_prepared_archives(&prepared, destination, limits, true, true)?;
+    let archive_recoveries = prepared
+        .iter()
+        .map(|archive| preserve_prepared_archive(destination, archive))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut source_recoveries = prepared
         .iter()
         .map(|archive| {
@@ -2671,7 +2712,15 @@ fn archive_verified_inputs_with_transaction_hooks(
     // archive bindings are checked again below.
     before_retirement(&prepared)?;
     for archive in &prepared {
-        if let Err(error) = retire_exact_files(&archive.retirements) {
+        if let Err(error) = retire_exact_files_with_validation(&archive.retirements, || {
+            verify_prepared_archives(
+                std::slice::from_ref(archive),
+                destination,
+                limits,
+                false,
+                false,
+            )
+        }) {
             let locations = recovery
                 .iter()
                 .map(|path| path.display().to_string())
@@ -2692,6 +2741,29 @@ fn archive_verified_inputs_with_transaction_hooks(
             "durable session archives exist but post-retirement identity validation failed; recoverable quarantines: {locations}: {error}"
         )
     })?;
+    for (archive, recovery) in prepared.iter().zip(&archive_recoveries) {
+        if unsafe { libc::unlinkat(destination.file.as_raw_fd(), recovery.name.as_ptr(), 0) } != 0 {
+            return Err(format!(
+                "archive recovery link remains at {}: {}",
+                recovery.path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        destination
+            .file
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        if !directory_entry_is_exact_object(
+            &destination.file,
+            &archive.destination_name,
+            &archive.archive.file,
+        )? {
+            return Err(format!(
+                "public archive changed while releasing recovery at {}",
+                recovery.path.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3713,11 +3785,16 @@ fn verify_exact_file(retirement: &ExactFileRetirement) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn retire_exact_files(retirements: &[ExactFileRetirement]) -> Result<(), String> {
+fn retire_exact_files_with_validation(
+    retirements: &[ExactFileRetirement],
+    mut validate_archive: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     for retirement in retirements {
         verify_exact_file(retirement)?;
     }
     for retirement in retirements {
+        validate_archive()?;
+        verify_exact_file(retirement)?;
         retirement.source.verify("source")?;
         retirement
             .source
@@ -7396,6 +7473,18 @@ mod tests {
         assert!(error.contains("destination changed"), "{error}");
         assert_eq!(std::fs::read(&displaced).unwrap(), b"source bytes");
         assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        let archive_recovery = std::fs::read_dir(&trash_path)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aiterm-archive-recovery-")
+            })
+            .expect("the exact archive remains linked through retirement validation")
+            .path();
+        assert_eq!(std::fs::read(archive_recovery).unwrap(), b"source bytes");
         let quarantined = std::fs::read_dir(&project)
             .unwrap()
             .flatten()
