@@ -974,14 +974,24 @@ async fn session_files(State(ctx): State<Ctx>, Path(id): Path<String>) -> Respon
     Json(out).into_response()
 }
 
-/// Per-harness output directories for one session. Codex is the only one
-/// with such a place today (`~/.codex/generated_images/<session id>/`).
+/// Per-harness output directories for one session: codex's
+/// `~/.codex/generated_images/<session id>/`, and grok's
+/// `~/.grok/sessions/<url-encoded cwd>/<session id>/images/` — the encoded
+/// cwd is not known here, so every cwd directory is checked.
 fn harness_output_dirs(session_id: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(home) = dirs::home_dir() {
         let codex = home.join(".codex").join("generated_images").join(session_id);
         if codex.is_dir() {
             out.push(codex);
+        }
+        if let Ok(cwds) = std::fs::read_dir(home.join(".grok").join("sessions")) {
+            for c in cwds.flatten() {
+                let images = c.path().join(session_id).join("images");
+                if images.is_dir() {
+                    out.push(images);
+                }
+            }
         }
     }
     out
@@ -1101,6 +1111,7 @@ async fn file_is_allowed(real: &std::path::Path) -> bool {
     }
     if let Some(home) = dirs::home_dir() {
         always.push(home.join(".codex").join("generated_images"));
+        always.push(home.join(".grok").join("sessions"));
     }
     for dir in always {
         if let Ok(dir) = dir.canonicalize() {

@@ -127,7 +127,7 @@ pub fn start(app: &AppHandle) {
         }
         if ev.paths.iter().all(|p| {
             let s = p.to_string_lossy();
-            SKIP.iter().any(|k| s.contains(k))
+            SKIP.iter().any(|k| s.contains(k)) || harness_noise(&s)
         }) {
             return;
         }
@@ -151,47 +151,79 @@ pub fn start(app: &AppHandle) {
         }
     }
     if let Some(home) = dirs::home_dir() {
-        let root = home.join(".codex").join("generated_images");
-        watch_root(app, root.clone());
-        backfill_output_dir(app, &root);
+        for root in [home.join(".codex").join("generated_images"), home.join(".grok").join("sessions")] {
+            watch_root(app, root.clone());
+            backfill_output_dir(app, &root);
+        }
     }
     let app = app.clone();
     std::thread::spawn(move || pump(app, rx));
+}
+
+/// The session a path inside a harness's own output tree belongs to, named
+/// by the path itself. Codex: `~/.codex/generated_images/<sid>/…`. Grok:
+/// `~/.grok/sessions/<url-encoded cwd>/<sid>/images/…` — aiterm's grok
+/// session ids are those uuids (see grok.rs). `None` for anything else,
+/// including the bookkeeping that shares grok's session directory.
+fn harness_session_of(s: &str) -> Option<String> {
+    if let Some(rest) = s.split("/.codex/generated_images/").nth(1) {
+        return rest.split('/').next().map(str::to_string);
+    }
+    if let Some(rest) = s.split("/.grok/sessions/").nth(1) {
+        let mut seg = rest.split('/');
+        let _encoded_cwd = seg.next()?;
+        let sid = seg.next()?;
+        if seg.next() == Some("images") {
+            return Some(sid.to_string());
+        }
+    }
+    None
+}
+
+/// Inside a harness's tree, only what it made *for the person* counts.
+/// Grok's session directory is mostly bookkeeping — transcripts, locks,
+/// signals — rewritten on every turn; recording that as "files the agent
+/// produced" would bury the real artifacts.
+fn harness_noise(s: &str) -> bool {
+    s.contains("/.grok/sessions/") && harness_session_of(s).is_none()
 }
 
 /// Files that landed while no watcher was running. The app restarts often
 /// (every dev rebuild) and a harness writes whenever it pleases, so a file
 /// created in the gap would otherwise never exist as far as the ledger is
 /// concerned — an image generated at 13:14 is invisible to a watcher started
-/// at 13:52. A harness output directory names its session in the path, so
-/// these are attributable after the fact; workspace files are not (nobody
+/// at 13:52. A harness output tree names its session in the path, so these
+/// are attributable after the fact; workspace files are not (nobody
 /// remembers who was active) and stay watcher-only.
 fn backfill_output_dir(app: &AppHandle, root: &Path) {
+    fn walk(dir: &Path, depth: usize, seen: &mut dyn FnMut(&Path, std::fs::Metadata)) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(&p, depth - 1, seen);
+            } else if md.is_file() {
+                seen(&p, md);
+            }
+        }
+    }
     let ledger = app.state::<ChangeLedger>();
     let known: HashSet<String> = ledger.inner.lock().unwrap().entries.iter().map(|e| e.path.clone()).collect();
     let mut found: Vec<Change> = Vec::new();
-    let Ok(sessions) = std::fs::read_dir(root) else { return };
-    for s in sessions.flatten() {
-        let dir = s.path();
-        if !dir.is_dir() {
-            continue;
+    walk(root, 4, &mut |p, md| {
+        let path = p.to_string_lossy().into_owned();
+        let Some(sid) = harness_session_of(&path) else { return };
+        if known.contains(&path) {
+            return;
         }
-        let sid = dir.file_name().map(|n| n.to_string_lossy().into_owned());
-        let Ok(files) = std::fs::read_dir(&dir) else { continue };
-        for f in files.flatten() {
-            let Ok(md) = f.metadata() else { continue };
-            if !md.is_file() {
-                continue;
-            }
-            let path = f.path().to_string_lossy().into_owned();
-            if known.contains(&path) {
-                continue;
-            }
-            let at = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-            let name = f.file_name().to_string_lossy().into_owned();
-            found.push(Change { path, name, kind: "created".into(), at, session_id: sid.clone(), bytes: md.len() });
-        }
-    }
+        let at = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        found.push(Change { path, name, kind: "created".into(), at, session_id: Some(sid), bytes: md.len() });
+    });
     if found.is_empty() {
         return;
     }
@@ -265,7 +297,7 @@ fn pump(app: AppHandle, rx: mpsc::Receiver<notify::Result<notify::Event>>) {
             };
             for p in ev.paths {
                 let s = p.to_string_lossy();
-                if SKIP.iter().any(|k| s.contains(k)) || is_scratch(&p) {
+                if SKIP.iter().any(|k| s.contains(k)) || is_scratch(&p) || harness_noise(&s) {
                     continue;
                 }
                 let e = pending.entry(p).or_insert(kind);
@@ -346,10 +378,8 @@ fn record(app: &AppHandle, path: PathBuf, kind: &str) {
 /// share the credit, none at all means nobody's agent did it.
 fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
     let s = path.to_string_lossy();
-    if let Some(rest) = s.split("/.codex/generated_images/").nth(1) {
-        if let Some(sid) = rest.split('/').next() {
-            return vec![sid.to_string()];
-        }
+    if let Some(sid) = harness_session_of(&s) {
+        return vec![sid];
     }
     // Only a session that is working, or was a moment ago, gets the credit.
     // An idle tab in the folder does not — the person editing in another
