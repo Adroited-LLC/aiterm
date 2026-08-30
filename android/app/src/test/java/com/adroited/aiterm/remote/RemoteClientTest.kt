@@ -98,7 +98,7 @@ class RemoteClientTest {
         val transport = object : RemoteTransport {
             override val events = MutableSharedFlow<RemoteServerEvent>()
             override suspend fun connect() = throw RemoteAccessRevokedException()
-            override fun request(kind: String, payload: ByteArray) =
+            override fun request(kind: String, payload: ByteArray, onAssigned: (Long) -> Unit) =
                 CompletableDeferred<RemoteResponse>().also { it.completeExceptionally(IllegalStateException("not connected")) }
             override fun close() = Unit
         }
@@ -298,8 +298,9 @@ class RemoteClientTest {
                 cursor = CursorState(0, 0, true),
             ),
         )
+        val transport = FakeRemoteTransport()
         val client = RemoteClient(
-            transportFactory = { FakeRemoteTransport() },
+            transportFactory = { transport },
             screenStore = store,
             isUnlocked = { true },
             scope = this,
@@ -319,6 +320,8 @@ class RemoteClientTest {
             ),
         )
 
+        assertTrue(client.requestNextScrollbackPage(128))
+        val requestId = transport.requests.last { it.kind == "terminal.scrollback" }.requestId
         client.acceptForTest(
             RemoteServerEvent.TerminalChunk(
                 TerminalTransferChunk(
@@ -332,7 +335,7 @@ class RemoteClientTest {
                     rowEnd = 1,
                     index = 0,
                     total = 1,
-                    requestId = 3,
+                    requestId = requestId,
                     part = TerminalTransferPart.Scrollback(
                         listOf(ScreenRow("old".map { ScreenCell(it.toString()) })),
                     ),
@@ -347,9 +350,10 @@ class RemoteClientTest {
     @Test
     fun rapidScrollbackPagingKeepsOnlyOneRequestForTheExpectedOffset() = runTest {
         val transport = FakeRemoteTransport()
+        val store = DefaultTerminalScreenStore()
         val client = RemoteClient(
             transportFactory = { transport },
-            screenStore = DefaultTerminalScreenStore(),
+            screenStore = store,
             isUnlocked = { true },
             scope = this,
             dispatcher = StandardTestDispatcher(testScheduler),
@@ -367,9 +371,10 @@ class RemoteClientTest {
     @Test
     fun unexpectedScrollbackCorrelationCannotPublishOutOfOrderRows() = runTest {
         val transport = FakeRemoteTransport()
+        val store = DefaultTerminalScreenStore()
         val client = RemoteClient(
             transportFactory = { transport },
-            screenStore = DefaultTerminalScreenStore(),
+            screenStore = store,
             isUnlocked = { true },
             scope = this,
             dispatcher = StandardTestDispatcher(testScheduler),
@@ -377,6 +382,16 @@ class RemoteClientTest {
         client.connect()
         client.selectTab("tab-1")
         advanceUntilIdle()
+        store.replace(
+            ScreenSnapshot(
+                tabId = "tab-1",
+                revision = 1,
+                cols = 1,
+                rows = 1,
+                visible = listOf(ScreenRow(listOf(ScreenCell("x")))),
+                cursor = CursorState(0, 0, true),
+            ),
+        )
         assertTrue(client.requestNextScrollbackPage(128))
         val expectedId = transport.requests.last { it.kind == "terminal.scrollback" }.requestId
 
@@ -444,8 +459,13 @@ private class FakeRemoteTransport : RemoteTransport {
 
     private var nextRequestId = 1L
 
-    override fun request(kind: String, payload: ByteArray): CompletableDeferred<RemoteResponse> {
+    override fun request(
+        kind: String,
+        payload: ByteArray,
+        onAssigned: (Long) -> Unit,
+    ): CompletableDeferred<RemoteResponse> {
         val request = RemoteRequest(nextRequestId++, kind, payload)
+        onAssigned(request.requestId)
         requests += request
         val responsePayload = if (request.kind == "terminal.attach") {
             attachedPayload("tab-1", "attachment-1")
@@ -472,8 +492,13 @@ private class DeferredRemoteTransport(connectImmediately: Boolean = true) : Remo
         allowConnect.await()
     }
 
-    override fun request(kind: String, payload: ByteArray): CompletableDeferred<RemoteResponse> {
+    override fun request(
+        kind: String,
+        payload: ByteArray,
+        onAssigned: (Long) -> Unit,
+    ): CompletableDeferred<RemoteResponse> {
         val request = RemoteRequest(nextRequestId++, kind, payload)
+        onAssigned(request.requestId)
         requests += request
         if (request.kind != "terminal.attach") {
             return CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))

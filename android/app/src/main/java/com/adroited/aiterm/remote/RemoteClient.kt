@@ -83,7 +83,11 @@ interface RemoteTransport {
     val events: Flow<RemoteServerEvent>
     suspend fun connect()
     /** Enqueues in caller order; the transport assigns the wire id when its writer dequeues it. */
-    fun request(kind: String, payload: ByteArray): Deferred<RemoteResponse>
+    fun request(
+        kind: String,
+        payload: ByteArray,
+        onAssigned: (Long) -> Unit = {},
+    ): Deferred<RemoteResponse>
     suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) = Unit
     fun close()
 }
@@ -109,6 +113,7 @@ class RemoteClient(
     private var eventJob: Job? = null
     private var reconnectJob: Job? = null
     private var recoveryRequested = false
+    private var scrollbackRequest: ScrollbackRequest? = null
     private var activeAttachmentId: String? = null
     private var activeAttachmentTabId: String? = null
     private var lifecycleGeneration = 0L
@@ -253,8 +258,53 @@ class RemoteClient(
 
     fun requestScrollback(offset: Int, count: Int): Boolean {
         if (offset < 0 || count !in 1..512) return false
-        val (tabId, attachmentId) = synchronized(lifecycleLock) { activeTarget() } ?: return false
-        launchRequest("terminal.scrollback", RemoteCommands.scrollback(tabId, attachmentId, offset, count))
+        val context = synchronized(lifecycleLock) {
+            if (scrollbackRequest != null || offset != mutableScrollback.value.size) return false
+            val (tabId, attachmentId) = activeTarget() ?: return false
+            val active = transport ?: return false
+            ScrollbackRequest(lifecycleGeneration, active, tabId, attachmentId, offset).also {
+                scrollbackRequest = it
+            }
+        }
+        val response = context.transport.request(
+            "terminal.scrollback",
+            RemoteCommands.scrollback(context.tabId, context.attachmentId, offset, count),
+        ) { requestId ->
+            synchronized(lifecycleLock) {
+                if (scrollbackRequest === context) context.requestId = requestId
+            }
+        }
+        val launched = launchOwned(context.lifecycleGeneration) {
+            try {
+                when (val result = response.await()) {
+                    is RemoteResponse.Error -> {
+                        synchronized(lifecycleLock) {
+                            if (scrollbackRequest === context) scrollbackRequest = null
+                        }
+                        accept(
+                            context.lifecycleGeneration,
+                            RemoteServerEvent.Failure(result.code, result.message),
+                        )
+                    }
+                    is RemoteResponse.Success -> Unit
+                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                synchronized(lifecycleLock) {
+                    if (scrollbackRequest === context) scrollbackRequest = null
+                }
+                accept(
+                    context.lifecycleGeneration,
+                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                )
+            }
+        }
+        if (!launched) {
+            response.cancel()
+            synchronized(lifecycleLock) { if (scrollbackRequest === context) scrollbackRequest = null }
+            return false
+        }
         return true
     }
 
@@ -361,6 +411,7 @@ class RemoteClient(
             activeAttachmentTabId = null
             screenStore.clear()
             mutableScrollback.value = emptyList()
+            scrollbackRequest = null
             mutableState.value = RemoteClientState(connection = ConnectionState.Locked)
         }
     }
@@ -523,6 +574,12 @@ class RemoteClient(
         if (chunk.tabId != mutableState.value.activeTabId || chunk.tabId != activeAttachmentTabId ||
             chunk.attachmentId != activeAttachmentId
         ) return
+        if (chunk.kind == TerminalTransferKind.Scrollback) {
+            val paging = scrollbackRequest ?: return
+            if (paging.tabId != chunk.tabId || paging.attachmentId != chunk.attachmentId ||
+                paging.requestId == null || paging.requestId != chunk.requestId
+            ) return
+        }
         when (val result = terminalAssembler.accept(chunk)) {
             TerminalTransferResult.Pending -> mutableState.value = mutableState.value.copy(pendingTransfers = 1)
             TerminalTransferResult.Recover -> requestRecovery(chunk.tabId, chunk.attachmentId)
@@ -546,9 +603,13 @@ class RemoteClient(
             }
             is TerminalTransferResult.Scrollback -> {
                 mutableState.value = mutableState.value.copy(pendingTransfers = 0)
-                if (result.tabId == screenStore.screen.value?.tabId) {
+                val paging = scrollbackRequest
+                if (paging != null && result.tabId == screenStore.screen.value?.tabId &&
+                    paging.offset == mutableScrollback.value.size
+                ) {
                     mutableScrollback.value = (mutableScrollback.value + result.rows).take(MAX_SCROLLBACK_ROWS)
                 }
+                scrollbackRequest = null
             }
         }
     }
@@ -597,6 +658,7 @@ class RemoteClient(
             terminalAssembler.clear()
             rosterAssembler.clear()
             recoveryRequested = false
+            scrollbackRequest = null
             activeAttachmentId = null
             activeAttachmentTabId = null
             active to jobs
@@ -619,6 +681,7 @@ class RemoteClient(
             terminalAssembler.clear()
             rosterAssembler.clear()
             recoveryRequested = false
+            scrollbackRequest = null
             mutableState.value = mutableState.value.copy(connection = connectingState)
             Triple(previous, jobs, lifecycleGeneration)
         }
@@ -727,6 +790,14 @@ class RemoteClient(
     }
 
     private data class RequestContext(val lifecycleGeneration: Long, val transport: RemoteTransport)
+    private data class ScrollbackRequest(
+        val lifecycleGeneration: Long,
+        val transport: RemoteTransport,
+        val tabId: String,
+        val attachmentId: String,
+        val offset: Int,
+        var requestId: Long? = null,
+    )
     private data class Selection(
         val lifecycleGeneration: Long,
         val selectionGeneration: Long,

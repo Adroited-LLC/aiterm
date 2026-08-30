@@ -117,7 +117,11 @@ class AuthenticatedRemoteTransport(
         }
     }
 
-    override fun request(kind: String, payload: ByteArray): CompletableDeferred<RemoteResponse> {
+    override fun request(
+        kind: String,
+        payload: ByteArray,
+        onAssigned: (Long) -> Unit,
+    ): CompletableDeferred<RemoteResponse> {
         val deferred = CompletableDeferred<RemoteResponse>()
         val accepted = synchronized(stateLock) {
             if (closed || socket == null || pending.size + queuedRequests >= MAX_PENDING_REQUESTS) false
@@ -126,7 +130,7 @@ class AuthenticatedRemoteTransport(
                 true
             }
         }
-        if (!accepted || outbound.trySend(OutboundRequest(kind, payload.copyOf(), deferred)).isFailure) {
+        if (!accepted || outbound.trySend(OutboundRequest(kind, payload.copyOf(), onAssigned, deferred)).isFailure) {
             synchronized(stateLock) { if (accepted) queuedRequests -= 1 }
             deferred.completeExceptionally(RemoteProtocolException("invalid or over-bound remote request"))
         }
@@ -143,6 +147,7 @@ class AuthenticatedRemoteTransport(
                     val requestId = nextRequestId++
                     pending[requestId] = PendingRequest(outgoing.kind, outgoing.deferred)
                     if (outgoing.kind == "terminal.attach") heldAttachments[requestId] = HeldAttachment()
+                    outgoing.onAssigned(requestId)
                     Triple(active, requestId, RemoteRequest(requestId, outgoing.kind, outgoing.payload))
                 }
             }
@@ -387,6 +392,7 @@ class AuthenticatedRemoteTransport(
     private data class OutboundRequest(
         val kind: String,
         val payload: ByteArray,
+        val onAssigned: (Long) -> Unit,
         val deferred: CompletableDeferred<RemoteResponse>,
     )
     private data class HeldAttachment(
