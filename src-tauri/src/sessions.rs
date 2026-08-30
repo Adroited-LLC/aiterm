@@ -2845,9 +2845,7 @@ impl RestoreDirectoryTree {
 
     fn parent_for(&mut self, path: &[u8]) -> Result<(File, std::ffi::OsString), String> {
         let components = path.split(|byte| *byte == b'/').collect::<Vec<_>>();
-        let (leaf, parents) = components
-            .split_last()
-            .ok_or("sidecar path is empty")?;
+        let (leaf, parents) = components.split_last().ok_or("sidecar path is empty")?;
         let mut key = Vec::new();
         for component in parents {
             let parent = self
@@ -3005,9 +3003,7 @@ impl StrictArchiveEntry {
                 std::io::Error::last_os_error()
             ));
         }
-        self.parent
-            .sync_all()
-            .map_err(|error| error.to_string())?;
+        self.parent.sync_all().map_err(|error| error.to_string())?;
         Ok(self
             .display_path
             .parent()
@@ -3037,11 +3033,7 @@ impl StrictArchiveEntry {
             self.parent.as_raw_fd(),
             &quarantine,
         )?;
-        if !directory_entry_is_exact_object(
-            &self.parent,
-            &quarantine,
-            &self.archive.file,
-        )? {
+        if !directory_entry_is_exact_object(&self.parent, &quarantine, &self.archive.file)? {
             let recovery = self.publish_recovery_link()?;
             return Err(format!(
                 "archive name changed during removal; exact archive is recoverable at {} and the moved entry at {}",
@@ -3059,33 +3051,20 @@ impl StrictArchiveEntry {
             .file
             .sync_all()
             .map_err(|error| error.to_string())?;
-        if !directory_entry_is_exact_object(
-            &self.parent,
-            &quarantine,
-            &self.archive.file,
-        )? {
+        if !directory_entry_is_exact_object(&self.parent, &quarantine, &self.archive.file)? {
             return Err(format!(
                 "archive quarantine changed after permanent purge; unexpected entry remains at {}",
                 quarantine_path.display()
             ));
         }
-        if unsafe {
-            libc::unlinkat(
-                self.parent.as_raw_fd(),
-                quarantine.as_ptr(),
-                0,
-            )
-        } != 0
-        {
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), quarantine.as_ptr(), 0) } != 0 {
             return Err(format!(
                 "purged restore archive remains at {}: {}",
                 quarantine_path.display(),
                 std::io::Error::last_os_error()
             ));
         }
-        self.parent
-            .sync_all()
-            .map_err(|error| error.to_string())
+        self.parent.sync_all().map_err(|error| error.to_string())
     }
 }
 
@@ -3150,8 +3129,8 @@ impl PreparedTrashDirectory {
             if *budget > MAX_EXACT_ARCHIVE_ENTRIES {
                 return Err("trash directory exceeds purge entry limit".into());
             }
-            let entry_name = CString::new(entry.name.as_bytes())
-                .map_err(|_| "invalid trash child name")?;
+            let entry_name =
+                CString::new(entry.name.as_bytes()).map_err(|_| "invalid trash child name")?;
             let kind = entry.mode & libc::S_IFMT;
             if kind == libc::S_IFREG as u32 {
                 entries.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
@@ -3224,9 +3203,7 @@ impl PreparedTrashDirectory {
                 std::io::Error::last_os_error()
             ));
         }
-        self.parent
-            .sync_all()
-            .map_err(|error| error.to_string())
+        self.parent.sync_all().map_err(|error| error.to_string())
     }
 }
 
@@ -3282,7 +3259,9 @@ fn restore_sidecar_archive_from_file(
     let mut directories = std::collections::BTreeMap::new();
     directories.insert(
         Vec::<u8>::new(),
-        restored_root.try_clone().map_err(|error| error.to_string())?,
+        restored_root
+            .try_clone()
+            .map_err(|error| error.to_string())?,
     );
     let mut directory_metadata = Vec::new();
     for record in records {
@@ -3471,7 +3450,10 @@ fn open_matching_existing_rollout(
 }
 
 #[cfg(target_os = "linux")]
-fn restore_file_set_archive_from_file(archive: &File, destination_root: &Path) -> Result<(), String> {
+fn restore_file_set_archive_from_file(
+    archive: &File,
+    destination_root: &Path,
+) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::FileExt;
 
@@ -4208,17 +4190,13 @@ fn prepare_named_trash_entry(
     }
     let stat = unsafe { stat.assume_init() };
     match stat.st_mode & libc::S_IFMT {
-        libc::S_IFREG => Ok(Some(PreparedTrashEntry::File(
-            StrictArchiveEntry::open_in(&trash.file, display_trash, name)?,
-        ))),
+        libc::S_IFREG => Ok(Some(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
+            &trash.file,
+            display_trash,
+            name,
+        )?))),
         libc::S_IFDIR if allow_directory => Ok(Some(PreparedTrashEntry::Directory(
-            PreparedTrashDirectory::open_in(
-                &trash.file,
-                display_trash,
-                name,
-                budget,
-                0,
-            )?,
+            PreparedTrashDirectory::open_in(&trash.file, display_trash, name, budget, 0)?,
         ))),
         _ => Err(format!(
             "trash purge rejects unexpected entry at {}",
@@ -4261,15 +4239,8 @@ fn trash_delete_in_directory_with_hook(
         }
     }
     let main_name = std::ffi::OsString::from(format!("{session_id}.jsonl"));
-    let main = prepare_named_trash_entry(
-        &trash,
-        trash_path,
-        &main_name,
-        false,
-        true,
-        &mut budget,
-    )?
-    .ok_or("trash transcript is missing")?;
+    let main = prepare_named_trash_entry(&trash, trash_path, &main_name, false, true, &mut budget)?
+        .ok_or("trash transcript is missing")?;
     before_purge();
     for entry in &optional {
         entry.remove_exact()?;
@@ -6788,15 +6759,12 @@ mod tests {
         let replacement = root.join("restored");
         let displaced = root.join("displaced");
 
-        let error = create_directory_exclusive_with_hook(
-            &destination.file,
-            OsStr::new("restored"),
-            || {
+        let error =
+            create_directory_exclusive_with_hook(&destination.file, OsStr::new("restored"), || {
                 std::fs::rename(&replacement, &displaced).unwrap();
                 std::fs::create_dir(&replacement).unwrap();
-            },
-        )
-        .unwrap_err();
+            })
+            .unwrap_err();
 
         assert!(error.contains("changed while it was opened"), "{error}");
         assert!(replacement.is_dir());
@@ -6861,6 +6829,65 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn strict_restore_keeps_archive_when_destination_is_replaced_before_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-restore-destination-final-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source_parent = root.join("sidecars");
+        let source = source_parent.join("session");
+        let trash_path = root.join("trash");
+        let restored = root.join("restored");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::create_dir_all(&restored).unwrap();
+        std::fs::write(source.join("entry"), b"archived bytes").unwrap();
+        let verified = verified_directory_entry(&source_parent, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, "session.tasks".into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        let archive = trash_path.join("session.tasks");
+        let restored_session = restored.join("session");
+        let displaced = restored.join("displaced-exact-restore");
+
+        let error = restore_sidecar_archive_and_remove_with_hook(
+            &archive,
+            &restored,
+            OsStr::new("session"),
+            || {
+                std::fs::rename(&restored_session, &displaced).unwrap();
+                std::fs::create_dir(&restored_session).unwrap();
+                std::fs::write(restored_session.join("entry"), b"replacement").unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("restored entry changed"), "{error}");
+        assert_eq!(
+            std::fs::read(restored_session.join("entry")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("entry")).unwrap(),
+            b"archived bytes"
+        );
+        assert!(archive.exists() || std::fs::read_dir(&trash_path).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aiterm-restore-recovery-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn permanent_trash_delete_removes_strict_codex_rollout_task_and_job_archives() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-strict-trash-purge-{}",
@@ -6912,10 +6939,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn permanent_trash_delete_never_unlinks_a_rollout_name_replacement() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-strict-trash-swap-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-strict-trash-swap-{}", uuid::Uuid::new_v4()));
         let trash = root.join("trash");
         std::fs::create_dir_all(&trash).unwrap();
         let id = "30303030-3030-4030-8030-303030303030";
