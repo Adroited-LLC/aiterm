@@ -369,6 +369,36 @@ class RemoteClientTest {
     }
 
     @Test
+    fun selectingBDiscardsAPagingTransactionAndAllowsBPaging() = runTest {
+        val transport = DeferredRemoteTransport()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-a")
+        runCurrent()
+        transport.completeNextAttach("tab-a", "attachment-a")
+        advanceUntilIdle()
+        assertTrue(client.requestNextScrollbackPage(128))
+        val oldRequestId = transport.requests.last { it.kind == "terminal.scrollback" }.requestId
+
+        client.selectTab("tab-b")
+        runCurrent()
+        transport.completeNextAttach("tab-b", "attachment-b")
+        advanceUntilIdle()
+        client.acceptForTest(scrollbackChunk(oldRequestId, "stale-a", "tab-a", "attachment-a"))
+
+        assertEquals(emptyList<ScreenRow>(), client.scrollback.value)
+        assertTrue(client.requestNextScrollbackPage(128))
+        assertEquals(2, transport.requests.count { it.kind == "terminal.scrollback" })
+        client.lock()
+    }
+
+    @Test
     fun unexpectedScrollbackCorrelationCannotPublishOutOfOrderRows() = runTest {
         val transport = FakeRemoteTransport()
         val store = DefaultTerminalScreenStore()
@@ -431,11 +461,16 @@ private fun snapshotChunk(
     ),
 )
 
-private fun scrollbackChunk(requestId: Long, text: String) = RemoteServerEvent.TerminalChunk(
+private fun scrollbackChunk(
+    requestId: Long,
+    text: String,
+    tabId: String = "tab-1",
+    attachmentId: String = "attachment-1",
+) = RemoteServerEvent.TerminalChunk(
     TerminalTransferChunk(
         transferId = "history-$requestId",
-        tabId = "tab-1",
-        attachmentId = "attachment-1",
+        tabId = tabId,
+        attachmentId = attachmentId,
         kind = TerminalTransferKind.Scrollback,
         baseRevision = 1,
         finalRevision = 1,
