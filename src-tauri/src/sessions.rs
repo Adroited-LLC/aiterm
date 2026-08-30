@@ -2559,6 +2559,7 @@ fn archive_verified_entries_with_hooks(
         after_publish,
         |_| Ok(()),
         |_| Ok(()),
+        |_| Ok(()),
     )
 }
 
@@ -2571,6 +2572,7 @@ fn archive_verified_entries_with_transaction_hooks(
     after_publish: impl FnOnce() -> Result<(), String>,
     before_quarantine: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
     before_retirement: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
+    before_recovery_release: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
 ) -> Result<(), String> {
     archive_verified_inputs_with_transaction_hooks(
         destination,
@@ -2586,6 +2588,7 @@ fn archive_verified_entries_with_transaction_hooks(
         after_publish,
         before_quarantine,
         before_retirement,
+        before_recovery_release,
     )
 }
 
@@ -2605,6 +2608,7 @@ fn archive_verified_inputs_with_hooks(
         after_publish,
         |_| Ok(()),
         |_| Ok(()),
+        |_| Ok(()),
     )
 }
 
@@ -2617,6 +2621,7 @@ fn archive_verified_inputs_with_transaction_hooks(
     after_publish: impl FnOnce() -> Result<(), String>,
     before_quarantine: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
     before_retirement: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
+    before_recovery_release: impl FnOnce(&[PreparedLeasedArchive]) -> Result<(), String>,
 ) -> Result<(), String> {
     if inputs.is_empty() {
         return Err("session delete has no verified archive source".into());
@@ -2741,7 +2746,7 @@ fn archive_verified_inputs_with_transaction_hooks(
             "durable session archives exist but post-retirement identity validation failed; recoverable quarantines: {locations}: {error}"
         )
     })?;
-    for (archive, recovery) in prepared.iter().zip(&archive_recoveries) {
+    for recovery in &archive_recoveries {
         if unsafe { libc::unlinkat(destination.file.as_raw_fd(), recovery.name.as_ptr(), 0) } != 0 {
             return Err(format!(
                 "archive recovery link remains at {}: {}",
@@ -2753,6 +2758,9 @@ fn archive_verified_inputs_with_transaction_hooks(
             .file
             .sync_all()
             .map_err(|error| error.to_string())?;
+    }
+    before_recovery_release(&prepared)?;
+    for (archive, recovery) in prepared.iter().zip(&archive_recoveries) {
         if !directory_entry_is_exact_object(
             &destination.file,
             &archive.destination_name,
@@ -7614,6 +7622,7 @@ mod tests {
                 Ok(())
             },
             |_| Ok(()),
+            |_| Ok(()),
         )
         .unwrap_err();
 
@@ -7674,6 +7683,7 @@ mod tests {
                 std::fs::write(&destination, b"replacement").unwrap();
                 Ok(())
             },
+            |_| Ok(()),
         )
         .unwrap_err();
 
@@ -7704,6 +7714,58 @@ mod tests {
             .expect("the exact original remains recoverable after quarantine")
             .path();
         assert_eq!(std::fs::read(quarantined).unwrap(), b"source bytes");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn archive_recovery_survives_public_unlink_at_final_release_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-archive-final-release-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = root.join("home");
+        let project = home.join(".claude/projects/project");
+        let trash_path = home.join(".claude/trash");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        let id = "35353535-3535-4535-8535-353535353535";
+        let source = project.join(format!("{id}.jsonl"));
+        let destination = trash_path.join(format!("{id}.jsonl"));
+        std::fs::write(&source, b"must remain recoverable").unwrap();
+        let verified = verified_session_file("claude", &source, &home).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+
+        let error = archive_verified_entries_with_transaction_hooks(
+            &trash,
+            vec![(verified, format!("{id}.jsonl").into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| {
+                std::fs::remove_file(&destination).unwrap();
+                std::fs::write(&destination, b"replacement").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("public archive changed"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        let recovery = std::fs::read_dir(&trash_path)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aiterm-archive-recovery-")
+            })
+            .expect("the full archive recovery link must survive final validation")
+            .path();
+        assert_eq!(std::fs::read(recovery).unwrap(), b"must remain recoverable");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7740,6 +7802,7 @@ mod tests {
                 );
                 Ok(())
             },
+            |_| Ok(()),
         )
         .unwrap_err();
         assert!(error.contains("source lease"), "{error}");
@@ -7784,6 +7847,7 @@ mod tests {
                 std::fs::write(source.join("late"), b"must survive").unwrap();
                 Ok(())
             },
+            |_| Ok(()),
             |_| Ok(()),
         )
         .unwrap_err();
