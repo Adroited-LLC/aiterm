@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
@@ -499,7 +498,7 @@ private fun TerminalInputBar(
             BasicTextField(
                 value = value,
                 onValueChange = onValueChange,
-                modifier = Modifier.weight(1f).heightIn(min = 44.dp)
+                modifier = Modifier.weight(1f).height(44.dp)
                     .focusRequester(focusRequester)
                     .onPreviewKeyEvent { event ->
                         if (!direct || event.type != KeyEventType.KeyDown) {

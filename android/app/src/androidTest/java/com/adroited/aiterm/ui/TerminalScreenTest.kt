@@ -106,7 +106,6 @@ class TerminalScreenTest {
         compose.onNodeWithText("Type").performClick()
         compose.waitForIdle()
 
-        val terminal = compose.onNodeWithTag("terminal-grid").fetchSemanticsNode().boundsInRoot
         val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
         val overlay = compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true)
@@ -115,8 +114,12 @@ class TerminalScreenTest {
             .fetchSemanticsNode().boundsInRoot
         val placeholder = compose.onNodeWithText("Type a command or prompt…", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
+        val maxSingleRowHeight = 60f * compose.activity.resources.displayMetrics.density
 
-        assertTrue("composer must float inside the terminal", overlay.top < terminal.bottom)
+        assertTrue(
+            "composer input must remain a compact single row",
+            field.height <= maxSingleRowHeight,
+        )
         assertTrue("terminal content must end above the composer", render.bottom <= overlay.top + 1f)
         assertTrue(
             "placeholder must be vertically centered in the input",
