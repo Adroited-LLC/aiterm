@@ -1,14 +1,17 @@
 package com.adroited.aiterm.ui
 
+import android.view.WindowInsets
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onAllNodesWithText
@@ -16,6 +19,10 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performImeAction
+import androidx.compose.ui.test.performKeyInput
+import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.pressKey
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
@@ -37,6 +44,137 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class TerminalScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComposeTestActivity>()
+
+    @Test
+    fun textComposerKeepsTheDraftVisibleUntilSend() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    focus = FocusOwner.Self,
+                    activeTabId = "tab-compose",
+                    activeTitle = "Prompt",
+                ),
+                screen = ScreenSnapshot(
+                    tabId = "tab-compose",
+                    revision = 1,
+                    cols = 5,
+                    rows = 1,
+                    visible = listOf(ScreenRow("ready".map { ScreenCell(it.toString()) })),
+                    cursor = CursorState(0, 0, true),
+                ),
+                onInput = sent::add,
+            )
+        }
+
+        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+        composer.assertIsDisplayed().performTextInput("hello phone")
+        composer.assertTextEquals("hello phone")
+        compose.runOnIdle { assertTrue(sent.isEmpty()) }
+
+        composer.performImeAction()
+
+        compose.runOnIdle { assertEquals(listOf("hello phone\r"), sent) }
+        composer.assertTextEquals("")
+    }
+
+    @Test
+    fun textComposerStaysAboveTheSoftwareKeyboard() {
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    focus = FocusOwner.Self,
+                    activeTabId = "tab-ime",
+                ),
+                screen = ScreenSnapshot(
+                    tabId = "tab-ime",
+                    revision = 1,
+                    cols = 1,
+                    rows = 1,
+                    visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
+                    cursor = CursorState(0, 0, true),
+                ),
+            )
+        }
+
+        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+        composer.performClick().performTextInput("visible")
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) == true
+        }
+
+        val composerBottom = composer.fetchSemanticsNode().boundsInRoot.bottom
+        val decor = compose.activity.window.decorView
+        val keyboardTop = decor.height - decor.rootWindowInsets
+            .getInsets(WindowInsets.Type.ime()).bottom
+        assertTrue(
+            "composer bottom $composerBottom must be above keyboard top $keyboardTop",
+            composerBottom <= keyboardTop + 1f,
+        )
+    }
+
+    @Test
+    fun rawModeSendsCommittedTextImmediately() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    focus = FocusOwner.Self,
+                    activeTabId = "tab-raw",
+                ),
+                screen = ScreenSnapshot(
+                    tabId = "tab-raw",
+                    revision = 1,
+                    cols = 1,
+                    rows = 1,
+                    visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
+                    cursor = CursorState(0, 0, true),
+                ),
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithTag("input-mode-raw").performClick()
+        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+        composer.performTextInput("x")
+
+        compose.runOnIdle { assertEquals(listOf("x"), sent) }
+        composer.assertTextEquals("")
+    }
+
+    @Test
+    fun rawModeForwardsHardwareTerminalKeys() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    focus = FocusOwner.Self,
+                    activeTabId = "tab-raw-key",
+                ),
+                screen = ScreenSnapshot(
+                    tabId = "tab-raw-key",
+                    revision = 1,
+                    cols = 1,
+                    rows = 1,
+                    visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
+                    cursor = CursorState(0, 0, true),
+                ),
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithTag("input-mode-raw").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .performClick()
+            .performKeyInput { pressKey(Key.DirectionUp) }
+
+        compose.runOnIdle { assertEquals(listOf("\u001b[A"), sent) }
+    }
 
     @Test
     fun sessionsDrawerOmitsTheAgentLauncherForTheRemoteClient() {

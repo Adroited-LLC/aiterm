@@ -1,6 +1,7 @@
 package com.adroited.aiterm.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -13,10 +14,13 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -24,9 +28,12 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -53,6 +60,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -70,6 +78,9 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -80,6 +91,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.adroited.aiterm.remote.ConnectionState
+import com.adroited.aiterm.remote.FocusOwner
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.terminal.CellAttributes
@@ -146,6 +158,11 @@ fun TerminalScreenContent(
     var rows by remember { mutableIntStateOf(screen?.rows ?: 24) }
     var deleteTarget by remember { mutableStateOf<RemoteSession?>(null) }
     val terminalMetrics = rememberTerminalMetrics()
+    val inputFocus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    var inputMode by remember(screen?.tabId) { mutableStateOf(TerminalInputMode.Text) }
+    var textInput by remember(screen?.tabId) { mutableStateOf(TextFieldValue()) }
+    var rawInput by remember(screen?.tabId) { mutableStateOf(TextFieldValue()) }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -193,7 +210,7 @@ fun TerminalScreenContent(
                 )
             },
         ) { padding ->
-            Column(Modifier.fillMaxSize().padding(padding)) {
+            Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
                 ConnectionRail(state, onReconnect)
                 BoxWithConstraints(
                     Modifier.weight(1f).fillMaxWidth()
@@ -211,7 +228,12 @@ fun TerminalScreenContent(
                         screen = screen,
                         scrollback = scrollback,
                         modifier = Modifier.fillMaxSize(),
-                        onInput = onInput,
+                        onRequestKeyboard = {
+                            if (state.focus == FocusOwner.Self) {
+                                inputFocus.requestFocus()
+                                keyboard?.show()
+                            }
+                        },
                         metrics = terminalMetrics,
                     )
                     if (screen == null) {
@@ -221,6 +243,33 @@ fun TerminalScreenContent(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                }
+                if (screen != null) {
+                    TerminalInputBar(
+                        mode = inputMode,
+                        onModeChange = { inputMode = it },
+                        value = if (inputMode == TerminalInputMode.Text) textInput else rawInput,
+                        onValueChange = { next ->
+                            if (inputMode == TerminalInputMode.Text) {
+                                textInput = next
+                            } else if (next.composition == null && next.text.isNotEmpty()) {
+                                onInput(next.text.replace("\n", "\r"))
+                                rawInput = TextFieldValue()
+                            } else {
+                                rawInput = next
+                            }
+                        },
+                        onSend = {
+                            if (textInput.text.isNotEmpty()) {
+                                onInput(textInput.text + "\r")
+                                textInput = TextFieldValue()
+                            }
+                        },
+                        onRawKey = onInput,
+                        focusRequester = inputFocus,
+                        enabled = state.focus == FocusOwner.Self,
+                        applicationCursor = screen.modes.applicationCursor,
+                    )
                 }
                 if (state.showTakeFocus && screen != null) {
                     Button(
@@ -342,24 +391,18 @@ private fun TerminalGrid(
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow>,
     modifier: Modifier,
-    onInput: (String) -> Unit,
+    onRequestKeyboard: () -> Unit,
     metrics: TerminalMetrics,
 ) {
-    val focusRequester = remember { FocusRequester() }
-    val keyboard = LocalSoftwareKeyboardController.current
     val terminalRows = remember(scrollback, screen?.visible) {
         scrollback.asReversed() + (screen?.visible ?: emptyList())
     }
     val listState = rememberLazyListState(
         initialFirstVisibleItemIndex = scrollback.size.coerceAtMost(terminalRows.lastIndex.coerceAtLeast(0)),
     )
-    var imeValue by remember { mutableStateOf(TextFieldValue()) }
     val density = LocalDensity.current
     Box(
-        modifier.clickable {
-            focusRequester.requestFocus()
-            keyboard?.show()
-        }.testTag("terminal-grid"),
+        modifier.clickable(onClick = onRequestKeyboard).testTag("terminal-grid"),
     ) {
         SelectionContainer {
             LazyColumn(
@@ -403,26 +446,123 @@ private fun TerminalGrid(
                     },
             )
         }
+    }
+}
+
+private enum class TerminalInputMode { Text, Raw }
+
+@Composable
+private fun TerminalInputBar(
+    mode: TerminalInputMode,
+    onModeChange: (TerminalInputMode) -> Unit,
+    value: TextFieldValue,
+    onValueChange: (TextFieldValue) -> Unit,
+    onSend: () -> Unit,
+    onRawKey: (String) -> Unit,
+    focusRequester: FocusRequester,
+    enabled: Boolean,
+    applicationCursor: Boolean,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth()
+            .background(Color(0xFF0B1A26))
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        InputModeButton(
+            label = "Text",
+            selected = mode == TerminalInputMode.Text,
+            enabled = enabled,
+            tag = "input-mode-text",
+        ) { onModeChange(TerminalInputMode.Text) }
+        InputModeButton(
+            label = "Raw",
+            selected = mode == TerminalInputMode.Raw,
+            enabled = enabled,
+            tag = "input-mode-raw",
+        ) { onModeChange(TerminalInputMode.Raw) }
         BasicTextField(
-            value = imeValue,
-            onValueChange = { next ->
-                if (next.composition == null && next.text.isNotEmpty()) {
-                    onInput(next.text.replace("\n", "\r"))
-                    imeValue = TextFieldValue()
-                } else {
-                    imeValue = next
-                }
-            },
-            modifier = Modifier.size(1.dp).focusRequester(focusRequester)
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.weight(1f).heightIn(min = 42.dp)
+                .border(1.dp, Color(0xFF315269), MaterialTheme.shapes.small)
+                .background(Color(0xFF07111B), MaterialTheme.shapes.small)
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+                .focusRequester(focusRequester)
                 .onPreviewKeyEvent { event ->
-                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
-                    terminalKeySequence(event.key, screen?.modes?.applicationCursor == true)?.let {
-                        onInput(it)
+                    if (mode != TerminalInputMode.Raw || event.type != KeyEventType.KeyDown) {
+                        return@onPreviewKeyEvent false
+                    }
+                    terminalKeySequence(event.key, applicationCursor)?.let { sequence ->
+                        onRawKey(sequence)
+                        onValueChange(TextFieldValue())
                         true
                     } ?: false
-                }.testTag("terminal-input"),
-            textStyle = TextStyle(color = Color.Transparent),
+                }
+                .testTag("terminal-composer"),
+            enabled = enabled,
+            singleLine = true,
+            textStyle = MaterialTheme.typography.bodyMedium.copy(
+                color = Color(0xFFD8E6EF),
+                fontFamily = FontFamily.Monospace,
+            ),
+            cursorBrush = SolidColor(Color(0xFF63D3E1)),
+            keyboardOptions = KeyboardOptions(
+                capitalization = if (mode == TerminalInputMode.Text) {
+                    KeyboardCapitalization.Sentences
+                } else {
+                    KeyboardCapitalization.None
+                },
+                autoCorrectEnabled = mode == TerminalInputMode.Text,
+                keyboardType = if (mode == TerminalInputMode.Text) KeyboardType.Text else KeyboardType.Ascii,
+                imeAction = if (mode == TerminalInputMode.Text) ImeAction.Send else ImeAction.None,
+            ),
+            keyboardActions = KeyboardActions(onSend = { onSend() }),
+            decorationBox = { inner ->
+                Box(contentAlignment = Alignment.CenterStart) {
+                    if (value.text.isEmpty()) {
+                        Text(
+                            when {
+                                !enabled -> "Take focus to type"
+                                mode == TerminalInputMode.Text -> "Type a command or prompt…"
+                                else -> "Raw keys send immediately"
+                            },
+                            color = Color(0xFF6F8798),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    inner()
+                }
+            },
         )
+        if (mode == TerminalInputMode.Text) {
+            Button(onClick = onSend, enabled = enabled && value.text.isNotEmpty()) {
+                Text("Send")
+            }
+        }
+    }
+}
+
+@Composable
+private fun InputModeButton(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    tag: String,
+    onClick: () -> Unit,
+) {
+    TextButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.widthIn(min = 44.dp).height(36.dp).testTag(tag),
+        colors = ButtonDefaults.textButtonColors(
+            containerColor = if (selected) Color(0xFF17465B) else Color.Transparent,
+            contentColor = if (selected) Color(0xFF8DE7F2) else Color(0xFF8CA1B0),
+        ),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 7.dp),
+    ) {
+        Text(label, style = MaterialTheme.typography.labelMedium)
     }
 }
 
