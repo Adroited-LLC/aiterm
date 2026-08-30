@@ -18,6 +18,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AuthenticatedRemoteTransportTest {
@@ -182,6 +185,38 @@ class AuthenticatedRemoteTransportTest {
     }
 
     @Test
+    fun outboundRequestsCannotOvertakeAnEarlierBlockedSend() = runTest {
+        val socket = ReorderingBinarySocket().apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+        }
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(),
+            deviceKeys = RecordingDeviceKeys(),
+            appLock = unlockedAppLock(),
+            dialer = FakeDialer(socket),
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        transport.connect()
+
+        val first = async(kotlinx.coroutines.Dispatchers.Default) {
+            transport.request(RemoteRequest(1, "tab.list", byteArrayOf()))
+        }
+        assertTrue(socket.firstRequestEntered.await(2, TimeUnit.SECONDS))
+        val second = async(kotlinx.coroutines.Dispatchers.Default) {
+            transport.request(RemoteRequest(2, "agent.list", byteArrayOf()))
+        }
+        assertTrue(socket.secondRequestSent.await(2, TimeUnit.SECONDS))
+        socket.releaseFirstRequest.countDown()
+
+        assertEquals(listOf(1, 2), socket.requestSendOrder)
+        transport.close()
+        first.cancel()
+        second.cancel()
+    }
+
+    @Test
     fun attachSnapshotWaitsForTheClientToCommitItsAttachment() = runTest {
         val socket = FakeBinarySocket().apply {
             incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
@@ -312,6 +347,35 @@ private class FakeBinarySocket : RemoteBinarySocket {
     }
     override fun close() {
         closed = true
+        incoming.close()
+    }
+}
+
+private class ReorderingBinarySocket : RemoteBinarySocket {
+    val incoming = Channel<ByteArray>(Channel.UNLIMITED)
+    val firstRequestEntered = CountDownLatch(1)
+    val secondRequestSent = CountDownLatch(1)
+    val releaseFirstRequest = CountDownLatch(1)
+    val requestSendOrder = mutableListOf<Int>()
+    private val sends = AtomicInteger()
+
+    override suspend fun receive(): ByteArray = incoming.receive()
+
+    override fun send(bytes: ByteArray): Boolean {
+        val call = sends.getAndIncrement()
+        if (call == 0) return true // authentication proof
+        val request = call
+        if (request == 1) {
+            firstRequestEntered.countDown()
+            releaseFirstRequest.await(2, TimeUnit.SECONDS)
+        }
+        synchronized(requestSendOrder) { requestSendOrder += request }
+        if (request == 2) secondRequestSent.countDown()
+        return true
+    }
+
+    override fun close() {
+        releaseFirstRequest.countDown()
         incoming.close()
     }
 }
