@@ -40,7 +40,7 @@ class AuthenticatedRemoteTransport(
     private val dialer: RemoteSocketDialer,
     private val scope: CoroutineScope,
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val afterRequestAccepted: () -> Unit = {},
+    private val beforeRequestEnqueue: () -> Unit = {},
 ) : RemoteTransport {
     private val eventChannel = Channel<RemoteServerEvent>(
         capacity = MAX_EVENTS,
@@ -52,6 +52,7 @@ class AuthenticatedRemoteTransport(
     private val stateLock = Any()
     private val publicationMutex = Mutex()
     private val pending = LinkedHashMap<Long, PendingRequest>()
+    private val acceptedRequests = LinkedHashSet<CompletableDeferred<RemoteResponse>>()
     private val completed = LinkedHashSet<Long>()
     private val heldAttachments = LinkedHashMap<Long, HeldAttachment>()
     private var socket: RemoteBinarySocket? = null
@@ -124,16 +125,18 @@ class AuthenticatedRemoteTransport(
         onAssigned: (Long) -> Unit,
     ): CompletableDeferred<RemoteResponse> {
         val deferred = CompletableDeferred<RemoteResponse>()
+        val outgoing = OutboundRequest(kind, payload.copyOf(), onAssigned, deferred)
+        beforeRequestEnqueue()
         val accepted = synchronized(stateLock) {
-            if (closed || socket == null || pending.size + queuedRequests >= MAX_PENDING_REQUESTS) false
-            else {
+            if (closed || socket == null || acceptedRequests.size >= MAX_PENDING_REQUESTS) false
+            else if (outbound.trySend(outgoing).isSuccess) {
                 queuedRequests += 1
+                acceptedRequests += deferred
                 true
-            }
+            } else false
         }
-        if (accepted) afterRequestAccepted()
-        if (!accepted || outbound.trySend(OutboundRequest(kind, payload.copyOf(), onAssigned, deferred)).isFailure) {
-            synchronized(stateLock) { if (accepted) queuedRequests -= 1 }
+        if (!accepted) {
+            outgoing.payload.fill(0)
             deferred.completeExceptionally(RemoteProtocolException("invalid or over-bound remote request"))
         }
         return deferred
@@ -142,7 +145,7 @@ class AuthenticatedRemoteTransport(
     private suspend fun writeLoop() {
         for (outgoing in outbound) {
             val prepared = synchronized(stateLock) {
-                queuedRequests -= 1
+                queuedRequests = (queuedRequests - 1).coerceAtLeast(0)
                 val active = socket
                 if (closed || active == null) null
                 else {
@@ -183,7 +186,9 @@ class AuthenticatedRemoteTransport(
     private fun failPendingSend(requestId: Long, message: String) {
         val request = synchronized(stateLock) {
             heldAttachments.remove(requestId)
-            pending.remove(requestId)
+            pending.remove(requestId).also { request ->
+                request?.let { acceptedRequests.remove(it.deferred) }
+            }
         }
         request?.deferred?.completeExceptionally(RemoteProtocolException(message))
     }
@@ -191,7 +196,9 @@ class AuthenticatedRemoteTransport(
     private fun timeoutPending(requestId: Long) {
         val request = synchronized(stateLock) {
             heldAttachments.remove(requestId)
-            pending.remove(requestId)
+            pending.remove(requestId).also { request ->
+                request?.let { acceptedRequests.remove(it.deferred) }
+            }
         } ?: return
         rememberCompleted(requestId)
         request.deferred.completeExceptionally(RemoteProtocolException("remote request timed out"))
@@ -202,6 +209,7 @@ class AuthenticatedRemoteTransport(
         val toFail: List<CompletableDeferred<RemoteResponse>>
         synchronized(stateLock) {
             closed = true
+            outbound.close()
             readerJob?.cancel()
             readerJob = null
             writerJob?.cancel()
@@ -211,7 +219,8 @@ class AuthenticatedRemoteTransport(
             socket?.close()
             socket = null
             pending.values.forEach { it.timeout?.cancel() }
-            toFail = pending.values.map(PendingRequest::deferred)
+            toFail = acceptedRequests.toList()
+            acceptedRequests.clear()
             pending.clear()
             queuedRequests = 0
             completed.clear()
@@ -271,7 +280,11 @@ class AuthenticatedRemoteTransport(
 
     private fun acceptResponse(event: RemoteEventEnvelope) {
         if (event.requestId <= 0) protocolFailure()
-        val request = synchronized(stateLock) { pending.remove(event.requestId) }
+        val request = synchronized(stateLock) {
+            pending.remove(event.requestId).also { request ->
+                request?.let { acceptedRequests.remove(it.deferred) }
+            }
+        }
         if (request == null) {
             if (synchronized(stateLock) { completed.contains(event.requestId) }) return
             protocolFailure()
@@ -283,7 +296,11 @@ class AuthenticatedRemoteTransport(
     }
 
     private fun completeTransferOnlyRequest(event: RemoteEventEnvelope) {
-        val request = synchronized(stateLock) { pending.remove(event.requestId) }
+        val request = synchronized(stateLock) {
+            pending.remove(event.requestId).also { request ->
+                request?.let { acceptedRequests.remove(it.deferred) }
+            }
+        }
         if (request == null) {
             if (synchronized(stateLock) { completed.contains(event.requestId) }) return
             protocolFailure()
@@ -300,7 +317,11 @@ class AuthenticatedRemoteTransport(
             emit(RemoteServerEvent.Failure(error.code, error.message))
             return
         }
-        val request = synchronized(stateLock) { pending.remove(event.requestId) }
+        val request = synchronized(stateLock) {
+            pending.remove(event.requestId).also { request ->
+                request?.let { acceptedRequests.remove(it.deferred) }
+            }
+        }
         if (request == null) {
             if (synchronized(stateLock) { completed.contains(event.requestId) }) return
             protocolFailure()

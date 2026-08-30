@@ -231,7 +231,7 @@ class AuthenticatedRemoteTransportTest {
             dialer = FakeDialer(authenticatedSocket()),
             scope = backgroundScope,
             dispatcher = StandardTestDispatcher(testScheduler),
-            afterRequestAccepted = {
+            beforeRequestEnqueue = {
                 accepted.countDown()
                 releaseEnqueue.await(2, TimeUnit.SECONDS)
             },
