@@ -2,7 +2,7 @@
 
 ## Status
 
-`DONE — automated verification complete; live first-pair smoke is user-interactive`
+`DONE — Fix Round 1 automated verification complete; live first-pair smoke is user-interactive`
 
 Task 9 now has the seven binding Rust prerequisites, a remembered-device
 authenticated Android WebSocket client, descriptor-bound roster and terminal
@@ -193,3 +193,163 @@ pairing, scan/approve one QR. The manual check should attach a live tab, run
 scrollback, disconnect/reconnect, and revoke the phone. No automated step
 changes biometric state, device credentials, remote-access settings, or trust
 records.
+
+## Fix Round 1 — external review dispositions
+
+Every claim was checked against the then-current implementation before it was
+changed. All nine automated findings were technically valid; none required a
+pushback. The live-pair finding remains deliberately user-interactive. The
+review fixes are the immutable storm checkpoints `ba90fc2` through `33133ab`,
+plus the exact maximum-burst coverage checkpoint `0cfdb2d`.
+
+### Critical findings
+
+1. **CRITICAL 1 — accepted and fixed.** `AuthenticatedRemoteTransport` now has
+   one bounded outbound actor. It assigns monotonically increasing request IDs
+   only as it dequeues and serially sends requests, so independently scheduled
+   callers cannot reorder IDs or terminal input. Responses remain correlated
+   and may complete independently. Covering test:
+   `android/app/src/test/java/com/adroited/aiterm/remote/AuthenticatedRemoteTransportTest.kt`
+   (`outboundRequestsCannotOvertakeAnEarlierBlockedSend`). Command and output:
+   `./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug` —
+   `106 tests, 0 failures, 0 errors, 0 skipped; BUILD SUCCESSFUL; lint passed`.
+2. **CRITICAL 2 — accepted and fixed.** A descriptor-derived recovery hardlink
+   captures the exact source inode before the quarantine race window. Strict
+   file purge captures the exact archive to a kernel-backed tombstone before
+   truncation; recursive purge does the same for children and the directory.
+   A pathname replacement is restored or left untouched, and a verified
+   zero-length tombstone is deliberately retained where Linux has no atomic
+   pathname-conditional unlink. Covering tests in `src-tauri/src/sessions.rs`:
+   `source_name_replacement_immediately_before_quarantine_is_never_retired`,
+   `strict_file_purge_restores_replacement_swapped_after_name_check`,
+   `recursive_purge_restores_directory_replacement_swapped_after_final_check`,
+   and `permanent_trash_delete_never_unlinks_a_rollout_name_replacement`.
+   Command and output: isolated `CARGO_TARGET_DIR`,
+   `cargo test --lib -- --test-threads=1` —
+   `429 passed, 0 failed, 7 ignored`.
+3. **CRITICAL 3 — accepted and fixed.** Archive publication now creates and
+   fsyncs a descriptor-derived recovery link before source retirement,
+   revalidates the public archive binding immediately before each exact-source
+   truncation, and retains the recovery link through post-retirement
+   validation. Covering tests in `src-tauri/src/sessions.rs`:
+   `destination_replacement_after_quarantine_prevents_source_truncation` and
+   `leased_archive_detects_a_destination_name_swap_before_retirement`.
+   Command and output: the same isolated library command —
+   `429 passed, 0 failed, 7 ignored`.
+4. **CRITICAL 4 — accepted and fixed.** File-set and sidecar restore helpers now
+   return a `PreparedRestore` holding exact destination FDs. Archive removal
+   retains and revalidates that transaction after exact archive capture and
+   before archive truncation; mismatch preserves the archive recovery link.
+   Covering tests in `src-tauri/src/sessions.rs`:
+   `strict_restore_keeps_archive_when_destination_is_replaced_before_removal`
+   and `strict_restore_rechecks_destination_after_archive_capture_before_truncate`.
+   Command and output: the same isolated library command —
+   `429 passed, 0 failed, 7 ignored`.
+
+### Important findings
+
+1. **IMPORTANT 1 — accepted and fixed.** After each eight-event registry
+   budget, the server gives inbound work one nonblocking fair turn and resets
+   the event budget even when no request is waiting. Covering tests:
+   `src-tauri/tests/remote_server.rs`
+   (`sustained_registry_events_cannot_starve_a_correlated_inbound_request`,
+   `idle_authenticated_connection_continues_past_each_registry_fairness_budget`).
+   Command and output: isolated `CARGO_TARGET_DIR`,
+   `cargo test --test remote_auth --test remote_desktop --test remote_operations
+   --test remote_protocol --test remote_server --test remote_terminal
+   --test tab_registry --test terminal_screen -- --test-threads=1` —
+   `210 passed, 0 failed` (including `remote_server: 39 passed`).
+2. **IMPORTANT 2 — accepted and fixed.** Publication now uses one suspending,
+   backpressured path. Reader teardown closes in `finally`, including when a
+   failure notice cannot enter a full queue. Covering tests:
+   `AuthenticatedRemoteTransportTest.kt`
+   (`maximumValidEventBurstBackpressuresWithoutClosingTheTransport`,
+   `maximumValidHeldAttachmentBurstDrainsWithoutClosingTheTransport`, and
+   `protocolFailureClosesEvenWhenFailureNotificationCannotBeQueued`). The
+   dedicated command
+   `./gradlew :app:testDebugUnitTest --tests
+   com.adroited.aiterm.remote.AuthenticatedRemoteTransportTest` produced
+   `13 tests, 0 failures, 0 errors; BUILD SUCCESSFUL`; this explicitly exercises
+   the protocol's legal 128-event and 512-held-frame maxima.
+3. **IMPORTANT 3 — accepted and fixed.** Held attachments now retain
+   pending/publish/discard and complete state; publication and reader arrival
+   share one mutex, and a held correlation remains pinned until its final chunk
+   drains. Covering tests in `AuthenticatedRemoteTransportTest.kt`:
+   `attachmentDrainCannotBeOvertakenByANewChunk` and
+   `attachmentCorrelationRemainsPinnedPastCompletedRequestEviction`. Command
+   and output: the final Android aggregate above — `106/106 JVM tests passed`.
+4. **IMPORTANT 4 — accepted and fixed.** One in-flight scrollback transaction
+   owns the generation, transport, tab, attachment, offset, and assigned
+   request ID. Duplicate offsets are rejected and an unexpected correlation
+   cannot append rows. Covering tests:
+   `android/app/src/test/java/com/adroited/aiterm/remote/RemoteClientTest.kt`
+   (`rapidScrollbackPagingKeepsOnlyOneRequestForTheExpectedOffset`,
+   `unexpectedScrollbackCorrelationCannotPublishOutOfOrderRows`). Command and
+   output: the final Android aggregate above — `106/106 JVM tests passed`.
+5. **IMPORTANT 5 — accepted and fixed.** A measured monospace `TerminalMetrics`
+   is now the single source for viewport, row, cell, cursor, and text geometry.
+   A `LazyColumn` virtualizes scrollback and visible rows. Covering tests:
+   `android/app/src/androidTest/java/com/adroited/aiterm/ui/TerminalScreenTest.kt`
+   (`measuredGridKeepsWideCombiningAndCursorOnTheSameFontScaledGeometry`,
+   `largeScrollbackComposesOnlyTheBoundedVisibleRowWindow`). Command and output:
+   `ANDROID_SERIAL=10.0.0.115:37713 ./gradlew
+   :app:connectedDebugAndroidTest` — `16/16 passed on Pixel 10 Pro XL / API 37;
+   BUILD SUCCESSFUL`.
+6. **IMPORTANT 6 — USER-INTERACTIVE, not automated.** A live desktop/phone QR,
+   desktop approval, device unlock, attach/input/reconnect/revoke smoke still
+   requires the user. No test changed credentials, biometrics, trust, or remote
+   access settings.
+
+The eager mixed drawer is recorded as the review's deferred minor; the terminal
+geometry work did not require risking an unrelated drawer rewrite. Mouse remains
+a legitimate future typed-contract gap and is not a Task 9 defect.
+
+### Prior-task guarantee checks
+
+- Default-disabled LAN/VPN bind is still explicit: `RemoteState::default()` has
+  no gateway, status is enabled only when `gateway.is_some()`, and only
+  `remote_start(address, port)` validates a shareable non-loopback/non-link-local
+  address and starts the listener.
+- QR lifecycle remains single-use and approval-gated. The safe `remote_auth`
+  suite passed `pairing_submission_consumes_the_qr_but_does_not_trust_before_desktop_approval`,
+  `enrollment_can_be_approved_exactly_once_before_expiry`, and revoked-device
+  persistence checks.
+- Android Keystore generation still requires user authentication, strong
+  biometric or device credential on API 30+, and an unlocked device on API 28+.
+  The pinned instrumentation aggregate includes `AndroidDeviceKeyStoreTest`.
+- `android/app/build.gradle.kts` still declares
+  `applicationId = "com.adroited.aiterm"` and `minSdk = 26`; the final JVM
+  aggregate includes `AppIdentityTest`.
+
+### Fresh Fix Round 1 verification
+
+All Rust commands used a newly created isolated `CARGO_TARGET_DIR`. The unsafe
+real-HOME backend target was not run; HOME was not repurposed and preserved
+dumps were not inspected. No Fix Round 1 change touched `src/App.css` or desktop
+frontend code, so the already-green 75-test UI/build evidence above remains the
+applicable desktop evidence.
+
+```text
+cargo test --lib -- --test-threads=1
+429 passed, 0 failed, 7 ignored (436 total)
+
+safe integration aggregate listed above
+210 passed, 0 failed
+
+cargo check
+passed
+
+./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+106 passed, 0 failed; APK build passed; lint passed
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:connectedDebugAndroidTest
+16/16 passed on the pinned Pixel
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:installDebug
+installed on exactly one pinned device
+
+adb -s 10.0.0.115:37713 shell am force-stop com.adroited.aiterm
+adb -s 10.0.0.115:37713 shell am start -W \
+  -n com.adroited.aiterm/.MainActivity
+Status: ok; LaunchState: COLD; TotalTime: 746 ms
+```
