@@ -152,7 +152,6 @@ class AuthenticatedRemoteTransport(
                     val requestId = nextRequestId++
                     pending[requestId] = PendingRequest(outgoing.kind, outgoing.deferred)
                     if (outgoing.kind == "terminal.attach") heldAttachments[requestId] = HeldAttachment()
-                    outgoing.onAssigned(requestId)
                     Triple(active, requestId, RemoteRequest(requestId, outgoing.kind, outgoing.payload))
                 }
             }
@@ -161,6 +160,13 @@ class AuthenticatedRemoteTransport(
                 continue
             }
             val (active, requestId, request) = prepared
+            try {
+                outgoing.onAssigned(requestId)
+            } catch (_: Exception) {
+                failPendingSend(requestId, "remote request assignment callback failed")
+                outgoing.payload.fill(0)
+                continue
+            }
             val encoded = RemoteWireCodec.encodeRequest(request)
             val sent = try {
                 active.send(encoded)

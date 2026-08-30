@@ -419,73 +419,79 @@ class RemoteClient(
 
     internal fun acceptForTest(event: RemoteServerEvent) = accept(null, event)
 
-    private fun accept(expectedGeneration: Long?, event: RemoteServerEvent) = synchronized(lifecycleLock) {
-        if (expectedGeneration != null && expectedGeneration != lifecycleGeneration) return@synchronized
-        when (event) {
-            is RemoteServerEvent.FocusChanged -> mutableState.value = mutableState.value.copy(
-                focus = event.focus,
-                readOnly = event.focus != FocusOwner.Self,
-                showTakeFocus = event.focus != FocusOwner.Self,
-            )
-            is RemoteServerEvent.TransferStarted -> {
-                if (transfers.size >= MAX_PENDING_TRANSFERS) {
-                    closeTransport()
-                    transfers.clear()
-                    mutableState.value = mutableState.value.copy(
-                        connection = ConnectionState.Disconnected,
-                        pendingTransfers = 0,
-                        lastError = "Too many pending terminal transfers",
-                    )
-                } else {
-                    transfers += event.transferId
+    private fun accept(expectedGeneration: Long?, event: RemoteServerEvent) {
+        var closing: ClosingTransport? = null
+        var reconnect = false
+        synchronized(lifecycleLock) {
+            if (expectedGeneration != null && expectedGeneration != lifecycleGeneration) return
+            when (event) {
+                is RemoteServerEvent.FocusChanged -> mutableState.value = mutableState.value.copy(
+                    focus = event.focus,
+                    readOnly = event.focus != FocusOwner.Self,
+                    showTakeFocus = event.focus != FocusOwner.Self,
+                )
+                is RemoteServerEvent.TransferStarted -> {
+                    if (transfers.size >= MAX_PENDING_TRANSFERS) {
+                        closing = detachTransportLocked()
+                        transfers.clear()
+                        mutableState.value = mutableState.value.copy(
+                            connection = ConnectionState.Disconnected,
+                            pendingTransfers = 0,
+                            lastError = "Too many pending terminal transfers",
+                        )
+                    } else {
+                        transfers += event.transferId
+                        mutableState.value = mutableState.value.copy(pendingTransfers = transfers.size)
+                    }
+                }
+                is RemoteServerEvent.TransferFinished -> {
+                    transfers -= event.transferId
                     mutableState.value = mutableState.value.copy(pendingTransfers = transfers.size)
                 }
-            }
-            is RemoteServerEvent.TransferFinished -> {
-                transfers -= event.transferId
-                mutableState.value = mutableState.value.copy(pendingTransfers = transfers.size)
-            }
-            is RemoteServerEvent.TerminalChunk -> acceptTerminalChunk(event.chunk)
-            is RemoteServerEvent.RosterChunk -> {
-                val roster = try {
-                    rosterAssembler.accept(event.chunk)
-                } catch (error: RemoteProtocolException) {
-                    mutableState.value = mutableState.value.copy(lastError = error.message)
-                    null
+                is RemoteServerEvent.TerminalChunk -> acceptTerminalChunk(event.chunk)
+                is RemoteServerEvent.RosterChunk -> {
+                    val roster = try {
+                        rosterAssembler.accept(event.chunk)
+                    } catch (error: RemoteProtocolException) {
+                        mutableState.value = mutableState.value.copy(lastError = error.message)
+                        null
+                    }
+                    if (roster != null) mutableState.value = mutableState.value.copy(tabs = roster.tabs)
                 }
-                if (roster != null) mutableState.value = mutableState.value.copy(tabs = roster.tabs)
-            }
-            is RemoteServerEvent.Raw -> acceptRaw(event)
-            is RemoteServerEvent.Failure -> {
-                val lostFocus = event.code == "terminal.input_not_owned"
-                val disconnected = event.code == "transport.disconnected"
-                mutableState.value = mutableState.value.copy(
-                    connection = if (disconnected) ConnectionState.Reconnecting else mutableState.value.connection,
-                    focus = if (lostFocus) FocusOwner.Other else mutableState.value.focus,
-                    readOnly = if (lostFocus) true else mutableState.value.readOnly,
-                    showTakeFocus = if (lostFocus) true else mutableState.value.showTakeFocus,
-                    lastError = event.message,
-                )
-                if (disconnected) {
-                    closeTransport()
-                    scheduleReconnect()
+                is RemoteServerEvent.Raw -> acceptRaw(event)
+                is RemoteServerEvent.Failure -> {
+                    val lostFocus = event.code == "terminal.input_not_owned"
+                    val disconnected = event.code == "transport.disconnected"
+                    mutableState.value = mutableState.value.copy(
+                        connection = if (disconnected) ConnectionState.Reconnecting else mutableState.value.connection,
+                        focus = if (lostFocus) FocusOwner.Other else mutableState.value.focus,
+                        readOnly = if (lostFocus) true else mutableState.value.readOnly,
+                        showTakeFocus = if (lostFocus) true else mutableState.value.showTakeFocus,
+                        lastError = event.message,
+                    )
+                    if (disconnected) {
+                        closing = detachTransportLocked()
+                        reconnect = true
+                    }
                 }
-            }
-            RemoteServerEvent.Revoked -> {
-                reconnectJob?.cancel()
-                reconnectJob = null
-                closeTransport()
-                transfers.clear()
-                terminalAssembler.clear()
-                rosterAssembler.clear()
-                recoveryRequested = false
-                activeAttachmentId = null
-                activeAttachmentTabId = null
-                screenStore.clear()
-                mutableScrollback.value = emptyList()
-                mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
+                RemoteServerEvent.Revoked -> {
+                    reconnectJob?.cancel()
+                    reconnectJob = null
+                    closing = detachTransportLocked()
+                    transfers.clear()
+                    terminalAssembler.clear()
+                    rosterAssembler.clear()
+                    recoveryRequested = false
+                    activeAttachmentId = null
+                    activeAttachmentTabId = null
+                    screenStore.clear()
+                    mutableScrollback.value = emptyList()
+                    mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
+                }
             }
         }
+        closing?.let(::finishTransportClose)
+        if (reconnect) scheduleReconnect()
     }
 
     private fun acceptRaw(event: RemoteServerEvent.Raw) {
@@ -648,24 +654,30 @@ class RemoteClient(
     }
 
     private fun closeTransport() {
-        val closing = synchronized(lifecycleLock) {
-            lifecycleGeneration += 1
-            selectionGeneration += 1
-            val jobs = ownedJobs.toList()
-            ownedJobs.clear()
-            val active = transport
-            eventJob = null
-            transport = null
-            terminalAssembler.clear()
-            rosterAssembler.clear()
-            recoveryRequested = false
-            scrollbackRequest = null
-            activeAttachmentId = null
-            activeAttachmentTabId = null
-            active to jobs
-        }
-        closing.second.forEach(Job::cancel)
-        closing.first?.close()
+        val closing = synchronized(lifecycleLock) { detachTransportLocked() }
+        finishTransportClose(closing)
+    }
+
+    private fun detachTransportLocked(): ClosingTransport {
+        lifecycleGeneration += 1
+        selectionGeneration += 1
+        val jobs = ownedJobs.toList()
+        ownedJobs.clear()
+        val active = transport
+        eventJob = null
+        transport = null
+        terminalAssembler.clear()
+        rosterAssembler.clear()
+        recoveryRequested = false
+        scrollbackRequest = null
+        activeAttachmentId = null
+        activeAttachmentTabId = null
+        return ClosingTransport(active, jobs)
+    }
+
+    private fun finishTransportClose(closing: ClosingTransport) {
+        closing.jobs.forEach(Job::cancel)
+        closing.transport?.close()
     }
 
     private fun beginConnection(candidate: RemoteTransport, connectingState: ConnectionState): Long {
@@ -791,6 +803,7 @@ class RemoteClient(
     }
 
     private data class RequestContext(val lifecycleGeneration: Long, val transport: RemoteTransport)
+    private data class ClosingTransport(val transport: RemoteTransport?, val jobs: List<Job>)
     private data class ScrollbackRequest(
         val lifecycleGeneration: Long,
         val transport: RemoteTransport,
