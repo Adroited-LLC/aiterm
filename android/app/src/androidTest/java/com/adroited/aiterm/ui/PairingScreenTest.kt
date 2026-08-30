@@ -1,15 +1,10 @@
 package com.adroited.aiterm.ui
 
-import android.Manifest
-import android.content.Context
-import android.os.Build
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import androidx.test.platform.app.InstrumentationRegistry
 import com.adroited.aiterm.pairing.EnrollmentOutcome
 import com.adroited.aiterm.pairing.EnrollmentSecret
 import com.adroited.aiterm.pairing.PairedDesktop
@@ -23,7 +18,6 @@ import com.adroited.aiterm.testing.ComposeTestActivity
 import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
-import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -83,14 +77,8 @@ class PairingScreenTest {
 
     @Test
     fun api37PairingDoesNotReachTheTransportBeforeLocalNetworkAccessIsGranted() {
-        assumeTrue(Build.VERSION.SDK_INT >= 37)
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
-        instrumentation.uiAutomation.revokeRuntimePermission(
-            context.packageName,
-            Manifest.permission.ACCESS_LOCAL_NETWORK,
-        )
         val transport = CountingTransport()
+        var permissionRequests = 0
         val viewModel = PairingViewModel(
             repository = PairingRepository(
                 transport = transport,
@@ -102,22 +90,21 @@ class PairingScreenTest {
         )
         viewModel.onQrCode(pairingUri())
 
-        try {
-            compose.setContent {
-                PairingScreen(
-                    repository = PairingRepository(transport, StaticDeviceKeys, EmptyDesktopStore),
-                    onBack = {},
-                    onPaired = {},
-                    viewModel = viewModel,
-                )
-            }
-            compose.onNodeWithText("Pair").performClick()
-            compose.waitForIdle()
-
-            assertEquals(0, transport.attempts)
-        } finally {
-            instrumentation.uiAutomation.executeShellCommand("input keyevent BACK").close()
+        compose.setContent {
+            PairingScreen(
+                repository = PairingRepository(transport, StaticDeviceKeys, EmptyDesktopStore),
+                onBack = {},
+                onPaired = {},
+                viewModel = viewModel,
+                localNetworkAccessGranted = { false },
+                requestLocalNetworkAccess = { permissionRequests++ },
+            )
         }
+        compose.onNodeWithText("Pair").performClick()
+        compose.waitForIdle()
+
+        assertEquals(1, permissionRequests)
+        assertEquals(0, transport.attempts)
     }
 
     @Test

@@ -137,6 +137,73 @@ class RemoteWireCodecTest {
     }
 
     @Test
+    fun snapshotChunkAcceptsAValidPayloadLargerThanTheCollectionItemLimit() {
+        val attributes = linkedMapOf(
+            "bold" to false,
+            "faint" to false,
+            "italic" to false,
+            "underline" to false,
+            "inverse" to false,
+            "hidden" to false,
+            "strikethrough" to false,
+        )
+        val cell = linkedMapOf(
+            "text" to "x",
+            "width" to 1,
+            "continuation" to false,
+            "foreground" to "Default",
+            "background" to "Default",
+            "attributes" to attributes,
+        )
+        val visible = List(64) {
+            linkedMapOf("cells" to List(80) { cell }, "wrapped" to false)
+        }
+        val part = fixture(
+            linkedMapOf(
+                "cols" to 80,
+                "rows" to 64,
+                "visible" to visible,
+                "cursor" to linkedMapOf(
+                    "col" to 0,
+                    "row" to 0,
+                    "visible" to true,
+                    "shape" to "Block",
+                ),
+                "modes" to linkedMapOf(
+                    "application_cursor" to false,
+                    "bracketed_paste" to false,
+                    "line_wrap" to true,
+                    "alternate_screen" to false,
+                ),
+            ),
+        )
+        val encoded = fixture(
+            linkedMapOf(
+                "transfer_id" to "transfer-large",
+                "tab_id" to "tab-1",
+                "attachment_id" to "attachment-1",
+                "kind" to "snapshot",
+                "base_revision" to 9,
+                "final_revision" to 9,
+                "row_start" to 0,
+                "row_end" to 64,
+                "index" to 0,
+                "total" to 1,
+                "request_id" to 7,
+                "payload" to part,
+            ),
+        )
+        require(part.size > 300_000)
+        require(encoded.size < RemoteWireCodec.MAX_FRAME_BYTES)
+
+        val chunk = RemoteWireCodec.decodeTerminalChunk(encoded, expectedRequestId = 7)
+
+        val snapshot = chunk.part as TerminalTransferPart.Snapshot
+        assertEquals(64, snapshot.visible.size)
+        assertEquals(80, snapshot.visible.first().cells.size)
+    }
+
+    @Test
     fun rosterDescriptorUsesTheRustCamelCaseFieldContract() {
         val payload = fixture(
             linkedMapOf(
@@ -171,8 +238,14 @@ class RemoteWireCodecTest {
             } else if (size <= 0xff) {
                 output.write((major shl 5) or 24)
                 output.write(size)
-            } else {
+            } else if (size <= 0xffff) {
                 output.write((major shl 5) or 25)
+                output.write(size ushr 8)
+                output.write(size)
+            } else {
+                output.write((major shl 5) or 26)
+                output.write(size ushr 24)
+                output.write(size ushr 16)
                 output.write(size ushr 8)
                 output.write(size)
             }

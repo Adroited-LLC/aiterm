@@ -209,10 +209,10 @@ private class CborValueReader(private val bytes: ByteArray) {
                     malformed()
                 },
             )
-            4 -> CborValue.ArrayValue(List(count(length)) { value(depth + 1) })
+            4 -> CborValue.ArrayValue(List(collectionCount(length)) { value(depth + 1) })
             5 -> {
                 val result = LinkedHashMap<String, CborValue>()
-                repeat(count(length)) {
+                repeat(collectionCount(length)) {
                     val key = value(depth + 1) as? CborValue.Text ?: malformed()
                     if (result.put(key.value, value(depth + 1)) != null) malformed()
                 }
@@ -238,14 +238,14 @@ private class CborValueReader(private val bytes: ByteArray) {
         return value
     }
 
-    private fun count(value: ULong): Int {
+    private fun collectionCount(value: ULong): Int {
         if (value > 300_000u) malformed()
         return value.toInt()
     }
 
     private fun take(length: ULong): ByteArray {
-        val count = count(length)
-        if (position + count > bytes.size) malformed()
+        if (length > (bytes.size - position).toULong()) malformed()
+        val count = length.toInt()
         return bytes.copyOfRange(position, position + count).also { position += count }
     }
 

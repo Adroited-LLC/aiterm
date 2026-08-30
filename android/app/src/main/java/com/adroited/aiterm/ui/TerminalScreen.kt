@@ -111,9 +111,6 @@ fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit)
         onForkSession = viewModel::forkSession,
         onDeleteSession = viewModel::deleteSession,
         onOpenShell = { cols, rows -> viewModel.openShell(null, cols, rows) },
-        onStartAgent = { agent, model, effort, cwd, cols, rows ->
-            viewModel.startAgent(agent, model, effort, cwd, cols, rows)
-        },
         onInput = viewModel::sendInput,
         onTakeFocus = viewModel::takeFocus,
         onResize = viewModel::resize,
@@ -138,14 +135,6 @@ fun TerminalScreenContent(
     onForkSession: (String) -> Unit = {},
     onDeleteSession: (String) -> Unit = {},
     onOpenShell: (Int, Int) -> Unit = { _, _ -> },
-    onStartAgent: (
-        com.adroited.aiterm.remote.RemoteAgentChoice,
-        String?,
-        String?,
-        String,
-        Int,
-        Int,
-    ) -> Unit = { _, _, _, _, _, _ -> },
     onInput: (String) -> Unit = {},
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
     onResize: (Int, Int) -> Unit = { _, _ -> },
@@ -178,9 +167,6 @@ fun TerminalScreenContent(
                     onForkSession = onForkSession,
                     onDeleteSession = { id -> deleteTarget = state.sessions.firstOrNull { it.id == id } },
                     onOpenShell = { onOpenShell(cols, rows) },
-                    onStartAgent = { agent, model, effort, cwd ->
-                        onStartAgent(agent, model, effort, cwd, cols, rows)
-                    },
                 )
             }
         },
@@ -301,7 +287,6 @@ private fun SessionDrawer(
     onForkSession: (String) -> Unit,
     onDeleteSession: (String) -> Unit,
     onOpenShell: () -> Unit,
-    onStartAgent: (com.adroited.aiterm.remote.RemoteAgentChoice, String?, String?, String) -> Unit,
 ) {
     Text("LIVE TABS", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.labelMedium)
     state.tabs.forEach { tab ->
@@ -322,47 +307,6 @@ private fun SessionDrawer(
         Text("New shell ${cols}×${rows}")
     }
     HorizontalDivider(Modifier.padding(vertical = 12.dp))
-    val launchPath = state.sessions.firstOrNull()?.projectPath
-    if (state.agents.isNotEmpty() && launchPath != null) {
-        Text("NEW AGENT", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
-        state.agents.forEach { agent ->
-            Column(Modifier.padding(horizontal = 12.dp)) {
-                if (agent.models.isEmpty()) {
-                    TextButton(onClick = { onStartAgent(agent, null, null, launchPath) }) {
-                        Text("Start ${agent.displayName} · default")
-                    }
-                }
-                agent.models.forEach { model ->
-                    val efforts = model.efforts.ifEmpty { listOfNotNull(model.defaultEffort) }
-                    if (efforts.isEmpty()) {
-                        TextButton(onClick = { onStartAgent(agent, model.id, null, launchPath) }) {
-                            Text("Start ${agent.displayName} · ${model.displayName}")
-                        }
-                    } else {
-                        efforts.forEach { effort ->
-                            TextButton(onClick = { onStartAgent(agent, model.id, effort, launchPath) }) {
-                                Text("Start ${agent.displayName} · ${model.displayName} · $effort")
-                            }
-                        }
-                    }
-                }
-                val caps = state.agentCaps[agent.id]
-                if (caps != null) {
-                    Text(
-                        listOfNotNull(
-                            "resume".takeIf { caps.resume },
-                            "fork".takeIf { caps.fork },
-                            "tasks".takeIf { caps.tasks },
-                            "delete".takeIf { caps.delete },
-                        ).joinToString(" · ").ifBlank { "terminal only" },
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-        }
-        HorizontalDivider(Modifier.padding(vertical = 12.dp))
-    }
     Text("SESSIONS", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
     LazyColumn(modifier = Modifier.fillMaxHeight()) {
         items(state.sessions, key = RemoteSession::id) { session ->

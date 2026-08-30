@@ -20,6 +20,9 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
 import com.adroited.aiterm.remote.RemoteClientState
+import com.adroited.aiterm.remote.RemoteAgentChoice
+import com.adroited.aiterm.remote.RemoteModelOption
+import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.terminal.CursorState
 import com.adroited.aiterm.terminal.ScreenCell
 import com.adroited.aiterm.terminal.ScreenRow
@@ -34,6 +37,52 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class TerminalScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComposeTestActivity>()
+
+    @Test
+    fun sessionsDrawerOmitsTheAgentLauncherForTheRemoteClient() {
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    sessions = listOf(
+                        RemoteSession(
+                            id = "session-1",
+                            agent = "codex",
+                            title = "AITerm",
+                            projectPath = "/projects/aiterm",
+                            groupPath = "/projects/aiterm",
+                            forked = false,
+                            background = false,
+                            lastActive = 1,
+                        ),
+                    ),
+                    agents = listOf(
+                        RemoteAgentChoice(
+                            id = "codex",
+                            displayName = "Codex",
+                            models = listOf(
+                                RemoteModelOption(
+                                    id = "gpt-5",
+                                    displayName = "GPT-5",
+                                    efforts = listOf("high"),
+                                ),
+                            ),
+                            mintsSessionId = true,
+                        ),
+                    ),
+                ),
+                screen = null,
+            )
+        }
+
+        compose.onNodeWithText("Sessions").performClick()
+        compose.waitForIdle()
+
+        compose.onNodeWithText("LIVE TABS").assertIsDisplayed()
+        compose.onNodeWithText("SESSIONS").assertIsDisplayed()
+        assertTrue(compose.onAllNodesWithText("NEW AGENT").fetchSemanticsNodes().isEmpty())
+        assertTrue(compose.onAllNodesWithText("Start Codex · GPT-5 · high").fetchSemanticsNodes().isEmpty())
+    }
 
     @Test
     fun nativeGridRemainsVisibleWhileReadOnlyAndOffersFocusAndExtraKeys() {

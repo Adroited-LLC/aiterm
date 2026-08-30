@@ -168,24 +168,31 @@ fun PairingScreen(
     onBack: () -> Unit,
     onPaired: () -> Unit,
     viewModel: PairingViewModel = viewModel(factory = PairingViewModel.factory(repository)),
+    localNetworkAccessGranted: (() -> Boolean)? = null,
+    requestLocalNetworkAccess: (((Boolean) -> Unit) -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
-    val localNetworkPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
+    val confirmAfterPermission: (Boolean) -> Unit = { granted ->
         if (granted) viewModel.confirm()
     }
+    val localNetworkPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+        confirmAfterPermission,
+    )
     val confirmWithLocalNetworkAccess = {
-        val granted = Build.VERSION.SDK_INT < 37 ||
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.ACCESS_LOCAL_NETWORK,
-            ) == PackageManager.PERMISSION_GRANTED
+        val granted = localNetworkAccessGranted?.invoke() ?: (
+            Build.VERSION.SDK_INT < 37 ||
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.ACCESS_LOCAL_NETWORK,
+                ) == PackageManager.PERMISSION_GRANTED
+            )
         if (granted) {
             viewModel.confirm()
         } else {
-            localNetworkPermission.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
+            requestLocalNetworkAccess?.invoke(confirmAfterPermission)
+                ?: localNetworkPermission.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
         }
     }
 
