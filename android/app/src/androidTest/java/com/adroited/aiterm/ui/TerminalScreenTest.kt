@@ -139,6 +139,66 @@ class TerminalScreenTest {
     }
 
     @Test
+    fun advertisedViewportUsesTheFontScaledPaddedRenderBoundsAcrossRotation() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        val dimensions = mutableStateOf(400.dp to 800.dp)
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, 1.6f)) {
+                Box(
+                    Modifier.size(dimensions.value.first, dimensions.value.second),
+                ) {
+                    TerminalScreenContent(
+                        state = RemoteClientState(connection = ConnectionState.Connected),
+                        screen = ScreenSnapshot(
+                            tabId = "tab-render-bounds",
+                            revision = 1,
+                            cols = 1,
+                            rows = 1,
+                            visible = listOf(ScreenRow(listOf(ScreenCell("M")))),
+                            cursor = CursorState(0, 0, true),
+                        ),
+                        onResize = { cols, rows -> sizes += cols to rows },
+                    )
+                }
+            }
+        }
+
+        fun assertLatestViewportMatchesGrid() {
+            val advertised = sizes.last()
+            val grid = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val cell = compose.onNodeWithTag("terminal-cell-0-0", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val row = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            assertEquals(
+                "advertised columns must come from the padded grid width",
+                (grid.width / cell.width).toInt().coerceIn(1, 512),
+                advertised.first,
+            )
+            assertEquals(
+                "advertised rows must come from the padded grid height",
+                (grid.height / row.height).toInt().coerceIn(1, 512),
+                advertised.second,
+            )
+            assertTrue(advertised.first * cell.width <= grid.width + 1f)
+            assertTrue(advertised.second * row.height <= grid.height + 1f)
+        }
+
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
+        for (width in 380..410) {
+            compose.runOnIdle { dimensions.value = width.dp to 800.dp }
+            compose.waitForIdle()
+            assertLatestViewportMatchesGrid()
+        }
+        val portrait = sizes.last()
+        compose.runOnIdle { dimensions.value = 800.dp to 400.dp }
+        compose.waitUntil(8_000) { sizes.lastOrNull() != portrait }
+        assertLatestViewportMatchesGrid()
+    }
+
+    @Test
     fun largeScrollbackComposesOnlyTheBoundedVisibleRowWindow() {
         val history = List(5_000) { index ->
             ScreenRow("history-$index".map { ScreenCell(it.toString()) })

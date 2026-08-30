@@ -414,7 +414,10 @@ private fun TerminalGrid(
         }.padding(horizontal = 4.dp, vertical = 3.dp).testTag("terminal-grid"),
     ) {
         SelectionContainer {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().testTag("terminal-render-content"),
+            ) {
                 itemsIndexed(
                     terminalRows,
                     key = { index, _ -> "${screen?.tabId ?: "none"}:$index" },
