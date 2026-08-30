@@ -3967,3 +3967,17 @@ input[type="range"]::-webkit-slider-thumb {
 .change-big { margin: 8px 6px; border-radius: 8px; overflow: hidden; background: #000; cursor: zoom-out; }
 .change-big img, .change-big video { display: block; width: 100%; height: auto; max-height: 60vh; object-fit: contain; }
 .change-big-actions { padding: 6px; display: flex; justify-content: flex-end; background: var(--bg-hover); }
+
+/* A file path clicked in a terminal: the file itself, centered, click-away. */
+.media-peek {
+  position: fixed; inset: 0; z-index: 220;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex; align-items: center; justify-content: center;
+  cursor: zoom-out;
+}
+.media-peek img, .media-peek video {
+  max-width: 88vw; max-height: 88vh;
+  border-radius: 8px; box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+  cursor: default;
+}
+.media-peek-note { color: #ddd; font-size: 13px; }

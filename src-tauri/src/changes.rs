@@ -151,10 +151,57 @@ pub fn start(app: &AppHandle) {
         }
     }
     if let Some(home) = dirs::home_dir() {
-        watch_root(app, home.join(".codex").join("generated_images"));
+        let root = home.join(".codex").join("generated_images");
+        watch_root(app, root.clone());
+        backfill_output_dir(app, &root);
     }
     let app = app.clone();
     std::thread::spawn(move || pump(app, rx));
+}
+
+/// Files that landed while no watcher was running. The app restarts often
+/// (every dev rebuild) and a harness writes whenever it pleases, so a file
+/// created in the gap would otherwise never exist as far as the ledger is
+/// concerned — an image generated at 13:14 is invisible to a watcher started
+/// at 13:52. A harness output directory names its session in the path, so
+/// these are attributable after the fact; workspace files are not (nobody
+/// remembers who was active) and stay watcher-only.
+fn backfill_output_dir(app: &AppHandle, root: &Path) {
+    let ledger = app.state::<ChangeLedger>();
+    let known: HashSet<String> = ledger.inner.lock().unwrap().entries.iter().map(|e| e.path.clone()).collect();
+    let mut found: Vec<Change> = Vec::new();
+    let Ok(sessions) = std::fs::read_dir(root) else { return };
+    for s in sessions.flatten() {
+        let dir = s.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let sid = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        for f in files.flatten() {
+            let Ok(md) = f.metadata() else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let path = f.path().to_string_lossy().into_owned();
+            if known.contains(&path) {
+                continue;
+            }
+            let at = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            let name = f.file_name().to_string_lossy().into_owned();
+            found.push(Change { path, name, kind: "created".into(), at, session_id: sid.clone(), bytes: md.len() });
+        }
+    }
+    if found.is_empty() {
+        return;
+    }
+    found.sort_by_key(|c| c.at);
+    crate::diag!("changes", "backfill: {} file(s) under {}", found.len(), root.display());
+    let mut inner = ledger.inner.lock().unwrap();
+    for c in found {
+        append(&c);
+        inner.entries.push(c);
+    }
 }
 
 fn watch_root(app: &AppHandle, root: PathBuf) {
@@ -338,6 +385,9 @@ pub fn for_session(app: &AppHandle, session_id: &str) -> Vec<Change> {
             out.push(c.clone());
         }
     }
+    // Backfilled entries append out of order; time, not file position, is
+    // what "newest first" means.
+    out.sort_by(|a, b| b.at.cmp(&a.at));
     out
 }
 

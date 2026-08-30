@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ILink } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { parseOsc9, TermProgress } from "../osc9";
@@ -163,11 +163,65 @@ interface Props {
   /** Which renderer draws this terminal — see `AppSettings.termRenderer`. */
   renderer: "gpu" | "dom";
   theme: Record<string, string>;
+  /** A file path printed in the output was clicked. The terminal only finds
+   *  the path; what "open" means (editor tab, image preview) is the app's
+   *  call. */
+  onOpenPath?: (path: string) => void;
+}
+
+/** File paths in output become clickable. Agents narrate in paths — "Saved
+ *  to: file:///…", "Wrote /home/…/main.rs" — and the person reading wants to
+ *  see the file, not retype the path. Conservative on purpose: file:// URIs,
+ *  and absolute paths bearing a file extension. */
+const FILE_LINK_RE = /file:\/\/(\/[^\s'"()[\]{}]+)|(?:^|[\s'"([])(\/(?:[\w.@%+~-]+\/)+[\w.@%+~-]+\.[A-Za-z0-9]{1,8})/g;
+
+/** Find file paths on the hovered row. A generated image's path rarely fits
+ *  one row, so the wrapped logical line is joined first and match positions
+ *  are mapped back to (row, col) — a link may span rows. */
+function registerFileLinks(term: Terminal, open: (path: string) => void) {
+  term.registerLinkProvider({
+    provideLinks(y: number, cb: (links: ILink[] | undefined) => void) {
+      const buf = term.buffer.active;
+      let startRow = y - 1; // buffer rows are 0-based; y is 1-based
+      while (startRow > 0 && buf.getLine(startRow)?.isWrapped) startRow--;
+      let endRow = startRow;
+      while (buf.getLine(endRow + 1)?.isWrapped) endRow++;
+      let text = "";
+      for (let i = startRow; i <= endRow; i++) {
+        text += (buf.getLine(i)?.translateToString(false) ?? "").padEnd(term.cols);
+      }
+      const links: ILink[] = [];
+      for (const m of text.matchAll(FILE_LINK_RE)) {
+        const raw = m[1] ?? m[2];
+        if (!raw || m.index === undefined) continue;
+        const path = raw.replace(/[.,:;'")\]]+$/, "");
+        const first = m.index + m[0].indexOf(raw);
+        const last = first + path.length - 1;
+        const sy = startRow + Math.floor(first / term.cols) + 1;
+        const ey = startRow + Math.floor(last / term.cols) + 1;
+        if (y < sy || y > ey) continue; // not on the hovered row
+        let target = path;
+        if (m[1]) {
+          try { target = decodeURI(path); } catch { /* keep as printed */ }
+        }
+        links.push({
+          range: {
+            start: { x: (first % term.cols) + 1, y: sy },
+            end: { x: (last % term.cols) + 1, y: ey },
+          },
+          text: target,
+          activate: (_e, t) => open(t),
+        });
+      }
+      cb(links.length ? links : undefined);
+    },
+  });
 }
 
 export default function TerminalView({
   tab, active, onExit, onRegister, onActivity, onAttention, onNotify, onProgress,
   onLineSubmit, autoFocus, fontSize, fontFamily, lineHeight, fontWeight, renderer, theme,
+  onOpenPath,
 }: Props) {
   const elRef = useRef<HTMLDivElement>(null);
   const started = useRef(false);
@@ -189,6 +243,10 @@ export default function TerminalView({
    *  the renderer under the terminal that already exists. */
   const rendererRef = useRef(renderer);
   rendererRef.current = renderer;
+  /** Same reason as `rendererRef`: the mount effect runs once, the handler
+   *  it registers must always call the current prop. */
+  const onOpenPathRef = useRef(onOpenPath);
+  onOpenPathRef.current = onOpenPath;
 
   useEffect(() => {
     if (!elRef.current || started.current) return;
@@ -217,6 +275,7 @@ export default function TerminalView({
       webglRef.current = attachRenderer(term);
     }
     fit.fit();
+    registerFileLinks(term, (p) => onOpenPathRef.current?.(p));
 
     let unlistenExit: UnlistenFn | null = null;
     let disposed = false;

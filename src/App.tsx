@@ -29,7 +29,7 @@ import { useLibrarian } from "./librarian";
 import { useRelay } from "./relay";
 import BringIn from "./components/BringIn";
 import { RotateCcw, Users } from "lucide-react";
-import { LIBRARIAN_DIR_SUFFIX } from "./ipc";
+import { LIBRARIAN_DIR_SUFFIX, isImagePath, isVideoPath, readFileBase64 } from "./ipc";
 import {
   FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
 } from "lucide-react";
@@ -840,6 +840,20 @@ export default function App() {
       return [...list, { key, termKey: term, path }];
     });
   }, []);
+
+  /** A file path clicked in a terminal. Media gets a lightbox — a PNG in a
+   *  CodeMirror tab is noise — and everything else opens as a file tab. */
+  const [mediaPeek, setMediaPeek] = useState<string | null>(null);
+  const openFromTerminal = useCallback((path: string) => {
+    if (isImagePath(path) || isVideoPath(path)) setMediaPeek(path);
+    else openFileTab(path);
+  }, [openFileTab]);
+  useEffect(() => {
+    if (!mediaPeek) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setMediaPeek(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mediaPeek]);
 
   const noteFileDirty = useCallback((key: number, dirty: boolean) => {
     setDirtyFiles((prev) => {
@@ -2593,6 +2607,7 @@ export default function App() {
                 fontWeight={settings.termFontWeight}
                 renderer={settings.termRenderer}
                 theme={xtermTheme}
+                onOpenPath={openFromTerminal}
               />
             ))}
             {fileTabs.map((f) => (
@@ -2840,6 +2855,11 @@ export default function App() {
           </>
         )}
       </div>
+      {mediaPeek && (
+        <div className="media-peek" onClick={() => setMediaPeek(null)}>
+          <MediaPeek path={mediaPeek} />
+        </div>
+      )}
       {showSettingsModal && (
         <SettingsModal
           settings={settings}
@@ -2855,6 +2875,27 @@ export default function App() {
     </div>
     </TimeFormatContext.Provider>
   );
+}
+
+/** The clicked file, big, on a click-away backdrop. Reads through the
+ *  backend like the agent panel's previews do — the webview can't see
+ *  arbitrary disk paths on its own. */
+function MediaPeek({ path }: { path: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let stop = false;
+    setSrc(null); setFailed(false);
+    readFileBase64(path)
+      .then((f) => !stop && setSrc(`data:${f.mime};base64,${f.data}`))
+      .catch(() => !stop && setFailed(true));
+    return () => { stop = true; };
+  }, [path]);
+  if (failed) return <div className="media-peek-note">Could not read {path}</div>;
+  if (!src) return <div className="media-peek-note">Loading…</div>;
+  return isVideoPath(path)
+    ? <video src={src} controls autoPlay onClick={(e) => e.stopPropagation()} />
+    : <img src={src} alt={path} onClick={(e) => e.stopPropagation()} />;
 }
 
 function basename(p: string): string {
