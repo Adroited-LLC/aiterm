@@ -15,6 +15,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.advanceTimeBy
@@ -158,6 +160,52 @@ class RemoteClientTest {
         assertEquals(ConnectionState.Revoked, client.state.value.connection)
         assertEquals(null, store.screen.value)
         assertEquals(0, client.state.value.pendingTransfers)
+        advanceTimeBy(32_000)
+        runCurrent()
+        assertEquals(1, factoryCalls)
+    }
+
+    @Test
+    fun pendingRequestFailureCannotWinBeforeFullQueueRevocationOutcome() = runTest {
+        val socket = roundThreeAuthenticatedSocket()
+        val delegate = roundThreeAuthenticatedTransport(
+            socket,
+            backgroundScope,
+            StandardTestDispatcher(testScheduler),
+        )
+        val releaseEvents = CompletableDeferred<Unit>()
+        val first = GatedEventsRemoteTransport(delegate, releaseEvents)
+        val replacement = FakeRemoteTransport()
+        var factoryCalls = 0
+        val store = DefaultTerminalScreenStore()
+        val client = RemoteClient(
+            transportFactory = {
+                factoryCalls += 1
+                if (factoryCalls == 1) first else replacement
+            },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        assertTrue(client.connect())
+        runCurrent()
+        store.replace(roundThreeScreen())
+        client.acceptForTest(RemoteServerEvent.TransferStarted("stale-transfer"))
+        client.refreshSessions()
+        runCurrent()
+        assertEquals("the request must be sent and awaiting its response", 2, socket.sentFrames.size)
+        repeat(64) {
+            delegate.acceptEnvelopeForTest(RemoteEventEnvelope(0, "error", roundThreeBusyError()))
+        }
+
+        delegate.acceptEnvelopeForTest(RemoteEventEnvelope(0, "auth.revoked", byteArrayOf()))
+        runCurrent()
+
+        assertEquals(ConnectionState.Revoked, client.state.value.connection)
+        assertEquals(null, store.screen.value)
+        assertEquals(0, client.state.value.pendingTransfers)
+        releaseEvents.complete(Unit)
         advanceTimeBy(32_000)
         runCurrent()
         assertEquals(1, factoryCalls)
@@ -670,6 +718,29 @@ private class DeferredRemoteTransport(connectImmediately: Boolean = true) : Remo
 
 }
 
+private class GatedEventsRemoteTransport(
+    private val delegate: RemoteTransport,
+    private val releaseEvents: CompletableDeferred<Unit>,
+) : RemoteTransport {
+    override val events = flow {
+        releaseEvents.await()
+        emitAll(delegate.events)
+    }
+
+    override suspend fun connect() = delegate.connect()
+
+    override fun request(
+        kind: String,
+        payload: ByteArray,
+        onAssigned: (Long) -> Unit,
+    ) = delegate.request(kind, payload, onAssigned)
+
+    override suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) =
+        delegate.completeAttachment(requestId, publishEvents)
+
+    override fun close() = delegate.close()
+}
+
 private fun attachedPayload(tabId: String, attachmentId: String): ByteArray {
     fun text(value: String): String {
         val bytes = value.encodeToByteArray()
@@ -733,10 +804,14 @@ private fun roundThreeAuthenticatedTransport(
 
 private class RoundThreeBinarySocket : RemoteBinarySocket {
     val incoming = Channel<ByteArray>(Channel.UNLIMITED)
+    val sentFrames = mutableListOf<ByteArray>()
     var closed = false
 
     override suspend fun receive(): ByteArray = incoming.receive()
-    override fun send(bytes: ByteArray): Boolean = true
+    override fun send(bytes: ByteArray): Boolean {
+        sentFrames += bytes.copyOf()
+        return true
+    }
     override fun close() {
         closed = true
         incoming.close()
