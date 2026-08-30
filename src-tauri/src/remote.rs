@@ -624,7 +624,10 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/usage", get(usage))
         .route("/v1/agents", get(agents))
         .route("/v1/uploads", post(upload).layer(axum::extract::DefaultBodyLimit::max(UPLOAD_LIMIT + 1024)))
+        .route("/v1/search", get(search))
+        .route("/v1/files", get(file))
         .route("/v1/sessions", get(sessions).post(new_session))
+        .route("/v1/sessions/{id}/artifacts", get(artifacts))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/conversation", get(conversation))
         .route("/v1/sessions/{id}/open", post(open))
@@ -786,6 +789,65 @@ async fn upload(headers: HeaderMap, body: axum::body::Bytes) -> Response {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     Json(serde_json::json!({ "path": path.to_string_lossy(), "bytes": body.len() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+/// The desktop's own full-text index over transcripts — the same answer
+/// the sidebar's search box gives.
+async fn search(Query(q): Query<SearchQuery>) -> Response {
+    if q.q.trim().is_empty() {
+        return Json(Vec::<crate::sessions::Session>::new()).into_response();
+    }
+    Json(crate::indexer::search_sessions(q.q).await).into_response()
+}
+
+/// Files a session wrote, by tool and time — what the desktop's panel lists.
+async fn artifacts(Path(id): Path<String>) -> Response {
+    Json(crate::sessions::session_artifacts(id).await).into_response()
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+/// Read one file the agent produced, by path, with ranges (video seeks)
+/// and a content type from the extension. Only files inside a project
+/// folder that has sessions, or in uploads/, are served — the phone sees
+/// what the agents make, not the disk.
+async fn file(Query(q): Query<FileQuery>, req: Request) -> Response {
+    use tower::ServiceExt;
+    let path = std::path::PathBuf::from(&q.path);
+    let Ok(real) = path.canonicalize() else {
+        return err(StatusCode::NOT_FOUND, "no such file");
+    };
+    if !real.is_file() || !file_is_allowed(&real).await {
+        return err(StatusCode::FORBIDDEN, "not a file an agent produced here");
+    }
+    match tower_http::services::ServeFile::new(&real).oneshot(req).await {
+        Ok(r) => r.into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn file_is_allowed(real: &std::path::Path) -> bool {
+    if let Some(up) = dirs::data_dir().map(|d| d.join("aiterm").join("uploads")) {
+        if let Ok(up) = up.canonicalize() {
+            if real.starts_with(&up) {
+                return true;
+            }
+        }
+    }
+    let roots: Vec<PathBuf> = crate::sessions::list_sessions()
+        .await
+        .into_iter()
+        .flat_map(|s| [PathBuf::from(s.project_path), PathBuf::from(s.group_path)])
+        .collect();
+    roots.iter().any(|r| r.canonicalize().map(|r| real.starts_with(r)).unwrap_or(false))
 }
 
 async fn detail(Path(id): Path<String>) -> Response {
