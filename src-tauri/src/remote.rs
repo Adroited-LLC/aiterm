@@ -824,7 +824,7 @@ struct FileEntry {
 }
 
 const FILES_CAP: usize = 300;
-const FILES_DEPTH: usize = 6;
+const FILES_DEPTH: usize = 9;
 const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git", ".cache", ".gradle", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".kotlin"];
 
 /// Everything a session produced, as best the desktop can tell: files its
