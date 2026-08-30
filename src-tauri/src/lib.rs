@@ -63,6 +63,7 @@ pub fn run() {
             detail::session_conversation,
             pty::pty_spawn,
             pty::pty_bind_session,
+            pty::pty_set_activity,
             remote::remote_status,
             remote::remote_set_enabled,
             remote::remote_rotate_token,

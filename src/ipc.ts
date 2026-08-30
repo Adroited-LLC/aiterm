@@ -1040,6 +1040,10 @@ export const sessionConversation = (sessionId: string, maxChars: number) =>
 /** Tell the backend which session a tab runs — remote input finds it by this. */
 export const ptyBindSession = (id: number, sessionId: string) =>
   invoke<void>("pty_bind_session", { id, sessionId });
+/** What the terminal sees the agent doing, for a phone that cannot see it. */
+export type TabActivity = "working" | "attention" | "idle";
+export const ptySetActivity = (id: number, activity: TabActivity) =>
+  invoke<void>("pty_set_activity", { id, activity });
 
 export interface RemoteStatus {
   enabled: boolean;
@@ -1048,6 +1052,12 @@ export interface RemoteStatus {
   name: string;
   /** Addresses a phone might reach this machine on, best first. */
   addresses: string[];
+  /** What the router said: "off" | "searching" | "mapped" | "no_router" | "refused". */
+  upnp: string;
+  /** The address the internet sees, when the router told us. */
+  public_address: string | null;
+  /** SHA-256 of the listener certificate — what a paired phone pins. */
+  fingerprint: string | null;
   error: string | null;
 }
 export const remoteStatus = () => invoke<RemoteStatus>("remote_status");

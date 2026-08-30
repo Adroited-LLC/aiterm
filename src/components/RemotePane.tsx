@@ -53,6 +53,23 @@ export default function RemotePane() {
       {status.error && (
         <Row label="Problem" desc={status.error} />
       )}
+      {status.running && (
+        <Row label="From outside the house" desc={
+          status.upnp === "mapped" && status.public_address
+            ? `The router is forwarding port ${status.port}. The phone reaches this machine at ${status.public_address} from anywhere — no relay, no VPN.`
+            : status.upnp === "searching" ? "Asking the router to forward the port…"
+            : status.upnp === "no_router" ? "No UPnP router answered. The phone works on this network; from outside it will need the port forwarded by hand."
+            : status.upnp === "refused" ? "The router refused to forward the port. Turn on UPnP in its settings, or forward the port by hand."
+            : "Off"
+        }>
+          <button className="act-btn" onClick={load}>Check again</button>
+        </Row>
+      )}
+      {status.fingerprint && (
+        <Row label="Identity" desc="The listener's certificate. A phone trusts this and nothing else; it changes only if remote-cert.pem is deleted.">
+          <code className="diag-val" style={{ fontSize: 11 }}>{status.fingerprint.match(/.{1,4}/g)?.join(" ")}</code>
+        </Row>
+      )}
       <Row label="This machine's name" desc="What the phone shows for this desktop">
         <input
           type="text" value={name}
@@ -63,7 +80,7 @@ export default function RemotePane() {
         />
       </Row>
       {status.running && (
-        <Row label="Pair a phone" desc="Open AITerm on the phone, tap Pair, and scan. Both devices must be on the same network or the same Tailscale." wide>
+        <Row label="Pair a phone" desc="Open AITerm on the phone, tap Scan, and scan. The QR carries every address, home network first, so pair at home and it keeps working from outside." wide>
           <div style={{ display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" }}>
             <button className="act-btn" onClick={showQr}>{pair ? "Refresh QR" : "Show QR"}</button>
             {pairError && <span className="srow-value">{pairError}</span>}
@@ -74,11 +91,9 @@ export default function RemotePane() {
               />
             )}
           </div>
-          {status.addresses.length > 1 && (
-            <div className="srow-desc" style={{ marginTop: 8 }}>
-              The QR carries every address, best first: {status.addresses.join(", ")}.
-            </div>
-          )}
+          <div className="srow-desc" style={{ marginTop: 8 }}>
+            Addresses in the QR: {[...status.addresses, ...(status.public_address ? [status.public_address] : [])].join(", ")}.
+          </div>
         </Row>
       )}
       <Row label="Forget every phone" desc="Rotates the secret. Each phone must scan a new QR to reconnect.">
@@ -91,7 +106,7 @@ export default function RemotePane() {
           <button className="act-btn" onClick={() => setConfirmForget(true)}>Forget…</button>
         )}
       </Row>
-      <Row label="What the phone can do" desc="See the session list, read any session as a conversation, send it a message, open or stop it, and start a new one. It never receives terminal output, and it cannot change settings or touch files." />
+      <Row label="What the phone can do" desc="See the session list, read any session as a conversation, send it a message, interrupt it, open or stop it, and start a new one. It never receives terminal output, and it cannot change settings or touch files." />
     </>
   );
 }

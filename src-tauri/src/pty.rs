@@ -18,6 +18,9 @@ pub struct PtyInstance {
     /// for a resume, later for a fresh launch whose id the hook reports.
     /// It is how remote input finds the right tab (`remote.rs`).
     session_id: Option<String>,
+    /// What the terminal last reported: "working" (progress shown),
+    /// "attention" (bell or notification — waiting on a person), "idle".
+    activity: String,
 }
 
 #[derive(Default)]
@@ -66,13 +69,44 @@ impl PtyManager {
     pub fn bound_sessions(&self) -> Vec<String> {
         self.ptys.lock().unwrap().values().filter_map(|p| p.session_id.clone()).collect()
     }
+
+    /// Record what a tab is doing. Returns the session it is bound to when
+    /// the activity actually changed, so the caller can announce it.
+    pub fn set_activity(&self, id: u32, activity: &str) -> Option<String> {
+        let mut ptys = self.ptys.lock().unwrap();
+        let p = ptys.get_mut(&id)?;
+        if p.activity == activity {
+            return None;
+        }
+        p.activity = activity.to_string();
+        p.session_id.clone()
+    }
+
+    pub fn activities(&self) -> Vec<(String, String)> {
+        self.ptys
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|p| p.session_id.clone().map(|s| (s, p.activity.clone())))
+            .collect()
+    }
+}
+
+/// The renderer reports what its terminal sees — progress, a bell, quiet —
+/// so a phone can show "working" without ever seeing the screen.
+#[tauri::command]
+pub fn pty_set_activity(app: AppHandle, state: State<'_, PtyManager>, id: u32, activity: String) {
+    if let Some(session_id) = state.set_activity(id, &activity) {
+        crate::remote::notify(&app, crate::remote::Event::Activity { session_id, activity });
+    }
 }
 
 /// The renderer tells the backend which session a tab runs, whenever it
 /// learns or changes it. See `PtyInstance::session_id`.
 #[tauri::command]
-pub fn pty_bind_session(state: State<'_, PtyManager>, id: u32, session_id: String) {
+pub fn pty_bind_session(app: AppHandle, state: State<'_, PtyManager>, id: u32, session_id: String) {
     state.bind_session(id, &session_id);
+    crate::remote::notify(&app, crate::remote::Event::SessionsChanged);
 }
 
 #[derive(Clone, Serialize)]
@@ -243,6 +277,7 @@ pub fn pty_spawn(
             killer,
             child_pid,
             session_id: None,
+            activity: "idle".into(),
         },
     );
 

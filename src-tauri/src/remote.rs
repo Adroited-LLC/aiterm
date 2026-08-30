@@ -9,23 +9,31 @@
 //! both screens always agree about what is running.
 //!
 //! What this deliberately is not: a terminal. The phone never receives PTY
-//! bytes and never owns one. And it is not a security boundary of its own —
-//! there is no TLS here. The LAN, or the VPN (Tailscale) that carries this
-//! port off it, is the transport security; the token is what stops a
-//! neighbour on that network. Forwarding the port to the internet is not a
-//! supported configuration.
+//! bytes and never owns one.
+//!
+//! Reaching the desktop from outside the house is the desktop's own job —
+//! there is no relay and no third party in the path. While remote access is
+//! on, the desktop asks the router (UPnP IGD) to map its port, learns its
+//! public address, and puts LAN and public addresses in the QR; the phone
+//! tries them in order. The listener is TLS with a self-signed identity the
+//! desktop mints once and keeps; the QR carries the certificate's SHA-256
+//! and the phone trusts that certificate and nothing else. The token is what
+//! stops a stranger who can reach the port; repeated bad tokens from one
+//! address are refused for a while.
 //!
 //! State on disk is one file, `remote.json` in the aiterm data directory,
 //! owner-readable only. Turning remote access off keeps the token, so the
 //! phone reconnects without a new QR; "forget phones" rotates it.
 
+use std::collections::HashMap;
 use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -33,7 +41,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 
 const DEFAULT_PORT: u16 = 8877;
 /// Bumped when a phone would misread an older desktop. The phone checks it.
@@ -116,19 +124,34 @@ pub enum Event {
     SessionExit { session_id: Option<String>, code: Option<u32> },
     /// A session raised a desktop notification — it is waiting on a person.
     Attention { title: String, body: String },
+    /// A tab's activity changed: "working" | "attention" | "idle".
+    Activity { session_id: String, activity: String },
     Ping,
 }
 
 struct Running {
     port: u16,
-    stop: Option<oneshot::Sender<()>>,
+    handle: axum_server::Handle<SocketAddr>,
+    /// Set false to end the UPnP renewal loop.
+    upnp_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What the router said, for the panel and the QR.
+#[derive(Clone, Default)]
+struct Reach {
+    /// "off" | "searching" | "mapped" | "no_router" | "refused"
+    upnp: String,
+    public_ip: Option<IpAddr>,
 }
 
 pub struct RemoteState {
     config: Mutex<Config>,
     running: Mutex<Option<Running>>,
+    reach: Mutex<Reach>,
     /// Why the last start failed, for the settings panel. Cleared on success.
     last_error: Mutex<Option<String>>,
+    /// Bad tokens per address: (failures, first failure). See `auth`.
+    strikes: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -137,10 +160,136 @@ impl Default for RemoteState {
         RemoteState {
             config: Mutex::new(load_config()),
             running: Mutex::new(None),
+            reach: Mutex::new(Reach { upnp: "off".into(), public_ip: None }),
             last_error: Mutex::new(None),
+            strikes: Mutex::new(HashMap::new()),
             events: broadcast::channel(64).0,
         }
     }
+}
+
+// ---------------------------------------------------------------- identity
+
+/// The listener's certificate, minted once and kept beside the config. Its
+/// SHA-256 is what the phone pins, so regenerating it means pairing again —
+/// which is why it is only ever generated when the files are absent.
+struct Identity {
+    cert_pem: Vec<u8>,
+    key_pem: Vec<u8>,
+    fingerprint: String,
+}
+
+fn identity() -> Result<Identity, String> {
+    let dir = config_path().and_then(|p| p.parent().map(|d| d.to_path_buf())).ok_or("no data dir")?;
+    let cert_path = dir.join("remote-cert.pem");
+    let key_path = dir.join("remote-key.pem");
+    let (cert_pem, key_pem) = match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
+        (Ok(c), Ok(k)) => (c, k),
+        _ => {
+            let ck = rcgen::generate_simple_self_signed(vec!["aiterm".to_string()])
+                .map_err(|e| format!("could not create a certificate: {e}"))?;
+            let c = ck.cert.pem().into_bytes();
+            let k = ck.signing_key.serialize_pem().into_bytes();
+            let _ = std::fs::create_dir_all(&dir);
+            std::fs::write(&cert_path, &c).map_err(|e| e.to_string())?;
+            std::fs::write(&key_path, &k).map_err(|e| e.to_string())?;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            (c, k)
+        }
+    };
+    let der = pem_to_der(&cert_pem).ok_or("certificate file is not PEM")?;
+    use sha2::Digest;
+    let fingerprint = sha2::Sha256::digest(&der).iter().map(|b| format!("{b:02x}")).collect();
+    Ok(Identity { cert_pem, key_pem, fingerprint })
+}
+
+fn pem_to_der(pem: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(pem).ok()?;
+    let body: String = text
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    base64_decode(&body)
+}
+
+/// Standard base64 (what PEM uses), decoded without a crate.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for c in s.bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = T.iter().position(|&t| t == c)? as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------- reachability
+
+const UPNP_LEASE_SECS: u32 = 3600;
+
+/// Ask the router for the port, and keep asking while we are on. Runs on
+/// its own thread: IGD discovery is a blocking multicast search and the
+/// renewal is a sleep loop. Every outcome is written to `reach` for the
+/// panel; none of them is an error the listener cares about — a desktop
+/// with no cooperative router still serves the LAN.
+fn keep_port_mapped(app: AppHandle, port: u16, alive: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let set = |upnp: &str, ip: Option<IpAddr>| {
+        if let Some(state) = app.try_state::<RemoteState>() {
+            *state.reach.lock().unwrap() = Reach { upnp: upnp.into(), public_ip: ip };
+        }
+    };
+    set("searching", None);
+    let options = igd_next::SearchOptions { timeout: Some(Duration::from_secs(4)), ..Default::default() };
+    let gateway = match igd_next::search_gateway(options) {
+        Ok(g) => g,
+        Err(e) => {
+            crate::diag!("remote", "no UPnP router: {e}");
+            set("no_router", None);
+            return;
+        }
+    };
+    // The address the router can reach us on: whichever interface routes to it.
+    let local_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect(gateway.addr).map(|_| s))
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let local = SocketAddr::new(local_ip, port);
+    let mut ip = gateway.get_external_ip().ok();
+    while alive.load(Ordering::Relaxed) {
+        match gateway.add_port(igd_next::PortMappingProtocol::TCP, port, local, UPNP_LEASE_SECS, "aiterm remote") {
+            Ok(()) => {
+                ip = gateway.get_external_ip().ok().or(ip);
+                set("mapped", ip);
+            }
+            Err(e) => {
+                crate::diag!("remote", "router refused the port mapping: {e}");
+                set("refused", ip);
+            }
+        }
+        // Renew well inside the lease; wake often enough that stop is prompt.
+        let mut slept = 0;
+        while alive.load(Ordering::Relaxed) && slept < UPNP_LEASE_SECS / 2 {
+            std::thread::sleep(Duration::from_secs(5));
+            slept += 5;
+        }
+    }
+    let _ = gateway.remove_port(igd_next::PortMappingProtocol::TCP, port);
+    set("off", None);
 }
 
 /// Push an event to every connected phone. Cheap and never fails: with no
@@ -171,36 +320,55 @@ fn start(app: &AppHandle) -> Result<(), String> {
     // not a log line inside a task nobody reads.
     let std_listener = std::net::TcpListener::bind(("0.0.0.0", port))
         .map_err(|e| format!("could not listen on port {port}: {e}"))?;
+    // Tokio adopts the socket and requires it non-blocking; handing it a
+    // blocking one panics the accept loop, silently, on a worker thread.
     std_listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let id = identity()?;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let handle = axum_server::Handle::<SocketAddr>::new();
     let router = router(app.clone());
+    let served = handle.clone();
     tauri::async_runtime::spawn(async move {
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(l) => l,
+        let tls = match axum_server::tls_rustls::RustlsConfig::from_pem(id.cert_pem, id.key_pem).await {
+            Ok(t) => t,
+            Err(e) => {
+                crate::diag!("remote", "TLS setup failed: {e}");
+                return;
+            }
+        };
+        let server = match axum_server::from_tcp_rustls(std_listener, tls) {
+            Ok(s) => s,
             Err(e) => {
                 crate::diag!("remote", "listener handoff failed: {e}");
                 return;
             }
         };
-        let _ = axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                let _ = stop_rx.await;
-            })
+        let r = server
+            .handle(served)
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await;
+        if let Err(e) = r {
+            crate::diag!("remote", "listener ended: {e}");
+        }
     });
-    *state.running.lock().unwrap() = Some(Running { port, stop: Some(stop_tx) });
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let app = app.clone();
+        let alive = alive.clone();
+        std::thread::spawn(move || keep_port_mapped(app, port, alive));
+    }
+    *state.running.lock().unwrap() = Some(Running { port, handle, upnp_alive: alive });
     *state.last_error.lock().unwrap() = None;
-    crate::diag!("remote", "listening on port {port}");
+    crate::diag!("remote", "listening (TLS) on port {port}");
     Ok(())
 }
 
 fn stop(app: &AppHandle) {
     let state = app.state::<RemoteState>();
     let taken = state.running.lock().unwrap().take();
-    if let Some(mut running) = taken {
-        if let Some(tx) = running.stop.take() {
-            let _ = tx.send(());
-        }
+    if let Some(running) = taken {
+        running.upnp_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+        running.handle.graceful_shutdown(Some(Duration::from_secs(2)));
         crate::diag!("remote", "stopped listening on port {}", running.port);
     }
 }
@@ -215,6 +383,12 @@ pub struct RemoteStatus {
     pub name: String,
     /// Addresses a phone might reach this machine on, best first.
     pub addresses: Vec<String>,
+    /// What the router said: "off" | "searching" | "mapped" | "no_router" | "refused".
+    pub upnp: String,
+    /// The address the internet sees, when the router told us.
+    pub public_address: Option<String>,
+    /// SHA-256 of the listener certificate, hex — what a paired phone pins.
+    pub fingerprint: Option<String>,
     pub error: Option<String>,
 }
 
@@ -223,12 +397,16 @@ fn status_of(app: &AppHandle) -> RemoteStatus {
     let cfg = state.config.lock().unwrap().clone();
     let running = state.running.lock().unwrap().is_some();
     let error = state.last_error.lock().unwrap().clone();
+    let reach = state.reach.lock().unwrap().clone();
     RemoteStatus {
         enabled: cfg.enabled,
         running,
         port: cfg.port,
         name: cfg.name,
         addresses: addresses(),
+        upnp: reach.upnp,
+        public_address: reach.public_ip.map(|ip| ip.to_string()),
+        fingerprint: identity().ok().map(|i| i.fingerprint),
         error,
     }
 }
@@ -321,10 +499,11 @@ pub struct PairPayload {
 }
 
 /// The QR is one URI and nothing else:
-/// `aiterm://pair?v=1&p=<port>&t=<token>&n=<name>&h=<addr>&h=<addr>…`
-/// `h` repeats, best address first; the phone tries them in order and keeps
-/// the one that answers. The token is the only secret and this is the only
-/// place it leaves the desktop.
+/// `aiterm://pair?v=1&p=<port>&t=<token>&f=<cert sha256>&n=<name>&h=<addr>&h=<addr>…`
+/// `h` repeats, LAN addresses first and the public one last; the phone
+/// tries them in order and keeps the one that answers. `f` is the listener
+/// certificate the phone will trust and nothing else. The token is the only
+/// secret and this is the only place it leaves the desktop.
 #[tauri::command]
 pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
     let state = app.state::<RemoteState>();
@@ -332,14 +511,20 @@ pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
         return Err("Turn remote access on first".into());
     }
     let cfg = state.config.lock().unwrap().clone();
-    let addrs = addresses();
+    let public_ip = state.reach.lock().unwrap().public_ip;
+    let mut addrs = addresses();
+    if let Some(ip) = public_ip {
+        addrs.push(ip.to_string());
+    }
     if addrs.is_empty() {
         return Err("No network address a phone could reach".into());
     }
+    let fingerprint = identity()?.fingerprint;
     let mut uri = format!(
-        "aiterm://pair?v={API_VERSION}&p={}&t={}&n={}",
+        "aiterm://pair?v={API_VERSION}&p={}&t={}&f={}&n={}",
         cfg.port,
         cfg.token,
+        fingerprint,
         percent_encode(&cfg.name)
     );
     for h in &addrs {
@@ -377,12 +562,14 @@ fn router(app: AppHandle) -> Router {
     let ctx = Ctx { app };
     Router::new()
         .route("/v1/status", get(status))
+        .route("/v1/usage", get(usage))
         .route("/v1/agents", get(agents))
         .route("/v1/sessions", get(sessions).post(new_session))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/conversation", get(conversation))
         .route("/v1/sessions/{id}/open", post(open))
         .route("/v1/sessions/{id}/input", post(input))
+        .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop_session))
         .route("/v1/events", get(events))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
@@ -394,24 +581,48 @@ struct TokenQuery {
     token: Option<String>,
 }
 
+const STRIKES_ALLOWED: u32 = 20;
+const STRIKES_WINDOW: Duration = Duration::from_secs(600);
+
 /// Every route, the WebSocket included. The token is read per request so a
-/// rotation takes effect on the next call, with nothing to restart.
+/// rotation takes effect on the next call, with nothing to restart. An
+/// address that keeps presenting bad tokens is refused outright for a
+/// while — the port may be reachable from the internet, and a 256-bit
+/// token is only unguessable if guessing is slow.
 async fn auth(
     State(ctx): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<TokenQuery>,
     req: Request,
     next: Next,
 ) -> Response {
+    let state = ctx.app.state::<RemoteState>();
+    {
+        let mut strikes = state.strikes.lock().unwrap();
+        if let Some((n, since)) = strikes.get(&peer.ip()).copied() {
+            if since.elapsed() > STRIKES_WINDOW {
+                strikes.remove(&peer.ip());
+            } else if n >= STRIKES_ALLOWED {
+                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "too many bad tokens" }))).into_response();
+            }
+        }
+    }
     let presented = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string)
         .or(q.token);
-    let expected = ctx.app.state::<RemoteState>().config.lock().unwrap().token.clone();
+    let expected = state.config.lock().unwrap().token.clone();
     let ok = presented.is_some_and(|p| constant_eq(p.as_bytes(), expected.as_bytes()));
     if !ok {
+        let mut strikes = state.strikes.lock().unwrap();
+        let e = strikes.entry(peer.ip()).or_insert((0, Instant::now()));
+        e.0 += 1;
+        if e.0 == 1 || e.0 == STRIKES_ALLOWED {
+            crate::diag!("remote", "bad token from {} ({} so far)", peer.ip(), e.0);
+        }
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" }))).into_response();
     }
     next.run(req).await
@@ -443,19 +654,32 @@ async fn agents() -> Response {
     Json(list).into_response()
 }
 
-/// The sidebar's list, plus the three facts the phone renders as state:
-/// `running` (a process holds this session), `open` (a desktop tab is bound
-/// to it — input will land), `live` (the roster's word for it).
+/// The sidebar's list, plus what the phone renders as state: `running` (a
+/// process holds this session), `open` (a desktop tab is bound to it —
+/// input will land), and `activity` for open ones — "working" while the
+/// agent reports progress, "attention" when it rang for a person, else
+/// "idle". The desktop's terminal is the source of all three.
 async fn sessions(State(ctx): State<Ctx>) -> Response {
     let sessions = crate::sessions::list_sessions().await;
     let running = crate::sessions::running_session_ids().await;
-    let open = ctx.app.state::<crate::pty::PtyManager>().bound_sessions();
+    let ptys = ctx.app.state::<crate::pty::PtyManager>();
+    let open = ptys.bound_sessions();
+    let activity: HashMap<String, String> = ptys.activities().into_iter().collect();
     Json(serde_json::json!({
         "sessions": sessions,
         "running": running,
         "open": open,
+        "activity": activity,
     }))
     .into_response()
+}
+
+/// The same numbers the desktop's usage strip shows: plan limits per engine
+/// and provider balances. Slow — it asks each service — so the phone asks
+/// rarely and shows the last answer.
+async fn usage() -> Response {
+    let report = crate::run_blocking(crate::usage::usage_report).await;
+    Json(report).into_response()
 }
 
 async fn detail(Path(id): Path<String>) -> Response {
@@ -513,6 +737,19 @@ async fn input(State(ctx): State<Ctx>, Path(id): Path<String>, Json(body): Json<
         }
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Escape: what stops an agent's current turn in every TUI here, without
+/// ending the session. A stop is a different, heavier thing (below).
+async fn interrupt(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    let ptys = ctx.app.state::<crate::pty::PtyManager>();
+    let Some(pty) = ptys.pty_for_session(&id) else {
+        return err(StatusCode::CONFLICT, "session is not open in a tab");
+    };
+    match ptys.write_str(pty, "\x1b") {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
 async fn stop_session(Path(id): Path<String>) -> Response {
@@ -593,6 +830,13 @@ mod tests {
         assert!(constant_eq(b"abc", b"abc"));
         assert!(!constant_eq(b"abc", b"abd"));
         assert!(!constant_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn pem_decodes_to_the_der_it_wraps() {
+        let der = b"\x30\x03\x02\x01\x05";
+        let pem = "-----BEGIN CERTIFICATE-----\nMAMCAQU=\n-----END CERTIFICATE-----\n";
+        assert_eq!(pem_to_der(pem.as_bytes()).unwrap(), der);
     }
 
     #[test]

@@ -5,7 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { ptySpawn, ptyWrite, ptyResize, ptyKill, ptyBindSession } from "../ipc";
+import { ptySpawn, ptyWrite, ptyResize, ptyKill, ptyBindSession, ptySetActivity, TabActivity } from "../ipc";
 import { boldWeightFor } from "../settings";
 import { TerminalInputLine } from "../terminalInput";
 import "@xterm/xterm/css/xterm.css";
@@ -272,7 +272,11 @@ export default function TerminalView({
       let pending = 0;
       const inputLine = new TerminalInputLine();
 
-      term.onBell(() => onAttention(tab.key, true));
+      // What the phone shows as the agent's state comes from here and only
+      // here: progress means working, a bell or notification means it wants
+      // a person, and typing (or progress ending) means neither.
+      const report = (a: TabActivity) => { if (ptyIdRef.current !== null) ptySetActivity(ptyIdRef.current, a); };
+      term.onBell(() => { onAttention(tab.key, true); report("attention"); });
 
       // Returning true claims the sequence. Nothing else in aiterm reads OSC 9,
       // and an unclaimed sequence is passed through to be printed, which would
@@ -281,9 +285,11 @@ export default function TerminalView({
         const parsed = parseOsc9(data);
         if (parsed?.kind === "progress") {
           onProgress(tab.key, parsed.progress);
+          report(parsed.progress ? "working" : "idle");
         } else if (parsed?.kind === "message") {
           onNotify(tab.key, parsed.message);
           onAttention(tab.key, true);
+          report("attention");
         }
         return true;
       });
@@ -302,6 +308,7 @@ export default function TerminalView({
       });
       term.onData((data) => {
         onAttention(tab.key, false);
+        report("idle");
         const submitted = inputLine.write(data);
         if (data === "\r" || data === "\n") {
           onLineSubmit(tab.key, submitted ?? "");
