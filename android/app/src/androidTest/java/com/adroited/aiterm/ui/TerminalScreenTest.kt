@@ -74,10 +74,11 @@ class TerminalScreenTest {
         composer.assertIsDisplayed().performTextInput("hello phone")
         composer.assertTextEquals("hello phone")
         compose.runOnIdle { assertTrue(sent.isEmpty()) }
+        assertTrue(compose.onAllNodesWithText("Send").fetchSemanticsNodes().isEmpty())
 
         composer.performImeAction()
 
-        compose.runOnIdle { assertEquals(listOf("hello phone\r"), sent) }
+        compose.runOnIdle { assertEquals(listOf("hello phone", "\r"), sent) }
         assertTrue(compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
         compose.onNodeWithText("Type").assertIsDisplayed()
     }

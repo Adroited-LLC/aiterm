@@ -4,7 +4,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 
 internal data class TerminalComposerUpdate(
     val state: TerminalComposerState,
-    val outbound: String? = null,
+    val outbound: List<String> = emptyList(),
 )
 
 internal data class TerminalComposerState(
@@ -31,15 +31,19 @@ internal data class TerminalComposerState(
         }
         return TerminalComposerUpdate(
             state = copy(directValue = TextFieldValue()),
-            outbound = next.text.replace("\n", "\r"),
+            outbound = listOf(next.text.replace("\n", "\r")),
         )
     }
 
     fun sendText(): TerminalComposerUpdate {
-        if (direct || textValue.text.isEmpty()) return TerminalComposerUpdate(this)
+        if (direct) return TerminalComposerUpdate(this)
+        val outbound = buildList {
+            if (textValue.text.isNotEmpty()) add(textValue.text)
+            add("\r")
+        }
         return TerminalComposerUpdate(
             state = copy(expanded = false, textValue = TextFieldValue()),
-            outbound = textValue.text + "\r",
+            outbound = outbound,
         )
     }
 }

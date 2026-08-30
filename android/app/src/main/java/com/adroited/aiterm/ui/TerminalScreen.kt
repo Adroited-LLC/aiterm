@@ -273,12 +273,12 @@ fun TerminalScreenContent(
                                 onValueChange = { next ->
                                     val update = composer.updateValue(next)
                                     composer = update.state
-                                    update.outbound?.let(onInput)
+                                    update.outbound.forEach(onInput)
                                 },
                                 onSend = {
                                     val update = composer.sendText()
                                     composer = update.state
-                                    update.outbound?.let(onInput)
+                                    update.outbound.forEach(onInput)
                                     if (!update.state.expanded) keyboard?.hide()
                                 },
                                 onDirectKey = onInput,
@@ -523,9 +523,9 @@ private fun TerminalInputBar(
                     capitalization = if (direct) KeyboardCapitalization.None else KeyboardCapitalization.Sentences,
                     autoCorrectEnabled = !direct,
                     keyboardType = if (direct) KeyboardType.Ascii else KeyboardType.Text,
-                    imeAction = if (direct) ImeAction.None else ImeAction.Send,
+                    imeAction = if (direct) ImeAction.None else ImeAction.Go,
                 ),
-                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                keyboardActions = KeyboardActions(onGo = { onSend() }),
                 decorationBox = { inner ->
                     Box(
                         Modifier.fillMaxSize()
@@ -556,11 +556,6 @@ private fun TerminalInputBar(
                 tag = "input-mode-direct",
                 onClick = onToggleDirect,
             )
-            if (!direct) {
-                Button(onClick = onSend, enabled = enabled && value.text.isNotEmpty()) {
-                    Text("Send")
-                }
-            }
         }
     }
 }
