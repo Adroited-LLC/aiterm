@@ -1058,8 +1058,21 @@ export interface RemoteStatus {
   public_address: string | null;
   /** SHA-256 of the listener certificate — what a paired phone pins. */
   fingerprint: string | null;
+  /** Phones holding the event socket open right now. */
+  clients: RemoteClient[];
   error: string | null;
 }
+export interface RemoteClient {
+  id: number;
+  device: string;
+  os: string;
+  app: string;
+  address: string;
+  /** Unix seconds. */
+  since: number;
+}
+export const remoteSetPort = (port: number) =>
+  invoke<RemoteStatus>("remote_set_port", { port });
 export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
 export const remoteSetEnabled = (on: boolean) =>
   invoke<RemoteStatus>("remote_set_enabled", { on });

@@ -3948,3 +3948,11 @@ input[type="range"]::-webkit-slider-thumb {
 .recall-open:hover { color: var(--text); }
 .recall-x { background: none; border: none; color: var(--text-faint); padding: 0 2px; cursor: pointer; display: inline-flex; }
 .recall-x:hover { color: var(--red); }
+
+/* Settings → Remote: the pairing QR is backend-rendered SVG with its own
+   pixel size; it must fill its box, not the page. */
+.remote-qr { background: #fff; padding: 8px; border-radius: 6px; width: 232px; height: 232px; flex: none; }
+.remote-qr svg { display: block; width: 100%; height: 100%; }
+.remote-clients { display: flex; flex-direction: column; gap: 4px; }
+.remote-client { font-size: 12px; }
+.remote-client .dim { opacity: 0.6; }

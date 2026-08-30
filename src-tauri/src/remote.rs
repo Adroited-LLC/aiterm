@@ -144,10 +144,25 @@ struct Reach {
     public_ip: Option<IpAddr>,
 }
 
+/// A phone holding the event socket open — the definition of "connected".
+#[derive(Clone, Serialize)]
+pub struct ClientInfo {
+    pub id: u64,
+    /// What the phone calls itself ("Google Pixel 10 Pro XL").
+    pub device: String,
+    pub os: String,
+    pub app: String,
+    pub address: String,
+    /// Unix seconds.
+    pub since: u64,
+}
+
 pub struct RemoteState {
     config: Mutex<Config>,
     running: Mutex<Option<Running>>,
     reach: Mutex<Reach>,
+    clients: Mutex<HashMap<u64, ClientInfo>>,
+    next_client: std::sync::atomic::AtomicU64,
     /// Why the last start failed, for the settings panel. Cleared on success.
     last_error: Mutex<Option<String>>,
     /// Bad tokens per address: (failures, first failure). See `auth`.
@@ -161,6 +176,8 @@ impl Default for RemoteState {
             config: Mutex::new(load_config()),
             running: Mutex::new(None),
             reach: Mutex::new(Reach { upnp: "off".into(), public_ip: None }),
+            clients: Mutex::new(HashMap::new()),
+            next_client: std::sync::atomic::AtomicU64::new(1),
             last_error: Mutex::new(None),
             strikes: Mutex::new(HashMap::new()),
             events: broadcast::channel(64).0,
@@ -369,6 +386,8 @@ fn stop(app: &AppHandle) {
     if let Some(running) = taken {
         running.upnp_alive.store(false, std::sync::atomic::Ordering::Relaxed);
         running.handle.graceful_shutdown(Some(Duration::from_secs(2)));
+        state.clients.lock().unwrap().clear();
+        let _ = app.emit("remote://clients", ());
         crate::diag!("remote", "stopped listening on port {}", running.port);
     }
 }
@@ -389,6 +408,8 @@ pub struct RemoteStatus {
     pub public_address: Option<String>,
     /// SHA-256 of the listener certificate, hex — what a paired phone pins.
     pub fingerprint: Option<String>,
+    /// Phones holding the event socket open right now.
+    pub clients: Vec<ClientInfo>,
     pub error: Option<String>,
 }
 
@@ -398,6 +419,8 @@ fn status_of(app: &AppHandle) -> RemoteStatus {
     let running = state.running.lock().unwrap().is_some();
     let error = state.last_error.lock().unwrap().clone();
     let reach = state.reach.lock().unwrap().clone();
+    let mut clients: Vec<ClientInfo> = state.clients.lock().unwrap().values().cloned().collect();
+    clients.sort_by_key(|c| c.since);
     RemoteStatus {
         enabled: cfg.enabled,
         running,
@@ -407,8 +430,40 @@ fn status_of(app: &AppHandle) -> RemoteStatus {
         upnp: reach.upnp,
         public_address: reach.public_ip.map(|ip| ip.to_string()),
         fingerprint: identity().ok().map(|i| i.fingerprint),
+        clients,
         error,
     }
+}
+
+/// Change the port. Takes effect at once when listening: the listener and
+/// the router mapping both move. Paired phones keep working only if they
+/// scan again — the port is in the QR — so the panel says so.
+#[tauri::command]
+pub fn remote_set_port(app: AppHandle, port: u16) -> Result<RemoteStatus, String> {
+    if port < 1024 {
+        return Err("Pick a port from 1024 to 65535".into());
+    }
+    let was_running = {
+        let state = app.state::<RemoteState>();
+        let mut cfg = state.config.lock().unwrap();
+        if cfg.port == port {
+            return Ok(status_of(&app));
+        }
+        cfg.port = port;
+        save_config(&cfg);
+        let running = state.running.lock().unwrap().is_some();
+        running
+    };
+    if was_running {
+        stop(&app);
+        // The old socket closes asynchronously; give it a moment before rebinding.
+        std::thread::sleep(Duration::from_millis(300));
+        if let Err(e) = start(&app) {
+            *app.state::<RemoteState>().last_error.lock().unwrap() = Some(e.clone());
+            return Err(e);
+        }
+    }
+    Ok(status_of(&app))
 }
 
 /// IPv4 addresses on real interfaces, ordered so the one a phone is most
@@ -774,9 +829,34 @@ async fn new_session(State(ctx): State<Ctx>, Json(body): Json<NewSessionBody>) -
     StatusCode::ACCEPTED.into_response()
 }
 
-async fn events(State(ctx): State<Ctx>, ws: WebSocketUpgrade) -> Response {
-    let rx = ctx.app.state::<RemoteState>().events.subscribe();
-    ws.on_upgrade(move |socket| stream_events(socket, rx))
+async fn events(
+    State(ctx): State<Ctx>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let state = ctx.app.state::<RemoteState>();
+    let rx = state.events.subscribe();
+    let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
+    let info = ClientInfo {
+        id: state.next_client.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        device: h("x-aiterm-device").chars().take(80).collect::<String>().trim().to_string(),
+        os: h("x-aiterm-os").chars().take(40).collect(),
+        app: h("x-aiterm-app").chars().take(20).collect(),
+        address: peer.ip().to_string(),
+        since: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    };
+    let app = ctx.app.clone();
+    ws.on_upgrade(move |socket| async move {
+        let id = info.id;
+        crate::diag!("remote", "phone connected: {} ({}) from {}", info.device, info.os, info.address);
+        app.state::<RemoteState>().clients.lock().unwrap().insert(id, info);
+        let _ = app.emit("remote://clients", ());
+        stream_events(socket, rx).await;
+        app.state::<RemoteState>().clients.lock().unwrap().remove(&id);
+        let _ = app.emit("remote://clients", ());
+        crate::diag!("remote", "phone disconnected");
+    })
 }
 
 async fn stream_events(mut socket: WebSocket, mut rx: broadcast::Receiver<Event>) {

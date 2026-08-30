@@ -68,6 +68,7 @@ pub fn run() {
             remote::remote_set_enabled,
             remote::remote_rotate_token,
             remote::remote_set_name,
+            remote::remote_set_port,
             remote::remote_pair_payload,
             pty::pty_write,
             pty::pty_resize,
