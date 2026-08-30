@@ -3173,13 +3173,13 @@ impl StrictArchiveEntry {
         self.remove_exact_after(|| Ok(()))
     }
 
-    fn remove_exact_after(&self, validate: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    fn remove_exact_after(&self, validate: impl FnMut() -> Result<(), String>) -> Result<(), String> {
         self.remove_exact_after_with_hook(validate, || {})
     }
 
     fn remove_exact_after_with_hook(
         &self,
-        validate: impl FnOnce() -> Result<(), String>,
+        mut validate: impl FnMut() -> Result<(), String>,
         after_name_check: impl FnOnce(),
     ) -> Result<(), String> {
         self.verify()?;
@@ -3219,6 +3219,13 @@ impl StrictArchiveEntry {
             );
             return Err(format!(
                 "archive name changed during removal; exact archive is recoverable at {} and the moved entry at {}",
+                recovery.path.display(),
+                quarantine_path.display()
+            ));
+        }
+        if let Err(error) = validate() {
+            return Err(format!(
+                "{error}; exact archive is recoverable at {} and {}",
                 recovery.path.display(),
                 quarantine_path.display()
             ));
@@ -7124,6 +7131,72 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .starts_with(".aiterm-restore-recovery-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_restore_rechecks_destination_after_archive_capture_before_truncate() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-restore-destination-capture-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source_parent = root.join("sidecars");
+        let source = source_parent.join("session");
+        let trash_path = root.join("trash");
+        let restored_root = root.join("restored");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::create_dir_all(&restored_root).unwrap();
+        std::fs::write(source.join("entry"), b"archived bytes").unwrap();
+        let verified = verified_directory_entry(&source_parent, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, "session.tasks".into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        let archive_path = trash_path.join("session.tasks");
+        let restored_path = restored_root.join("session");
+        let displaced = restored_root.join("displaced-exact-restore");
+
+        let error = {
+            let archive = StrictArchiveEntry::open(&archive_path).unwrap();
+            let restored = restore_sidecar_archive_from_file(
+                &archive.archive.file,
+                &restored_root,
+                OsStr::new("session"),
+            )
+            .unwrap();
+            archive
+                .remove_exact_after_with_hook(
+                    || restored.verify(),
+                    || {
+                        std::fs::rename(&restored_path, &displaced).unwrap();
+                        std::fs::create_dir(&restored_path).unwrap();
+                        std::fs::write(restored_path.join("entry"), b"replacement").unwrap();
+                    },
+                )
+                .unwrap_err()
+        };
+
+        assert!(error.contains("restored entry changed"), "{error}");
+        assert_eq!(
+            std::fs::read(restored_path.join("entry")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(std::fs::read(displaced.join("entry")).unwrap(), b"archived bytes");
+        assert!(std::fs::read_dir(&trash_path).unwrap().flatten().any(|entry| {
+            let name = entry.file_name();
+            (name.to_string_lossy().starts_with(".aiterm-restore-recovery-")
+                || name.to_string_lossy().starts_with(".aiterm-purged-file-"))
+                && std::fs::read(entry.path())
+                    .map(|bytes| bytes.starts_with(SIDECAR_ARCHIVE_MAGIC))
+                    .unwrap_or(false)
         }));
         std::fs::remove_dir_all(root).unwrap();
     }
