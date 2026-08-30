@@ -415,9 +415,51 @@ pub fn for_session(app: &AppHandle, session_id: &str) -> Vec<Change> {
             out.push(c.clone());
         }
     }
+    // The harness's own output directory is ground truth for this session,
+    // ledger or no ledger — a file that landed while nothing was running
+    // still belongs on the list. Read it live and fold in what's missing.
+    for dir in harness_output_dirs(session_id) {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for f in rd.flatten() {
+            let Ok(md) = f.metadata() else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let path = f.path().to_string_lossy().into_owned();
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let at = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            let name = f.file_name().to_string_lossy().into_owned();
+            out.push(Change { path, name, kind: "created".into(), at, session_id: Some(session_id.to_string()), bytes: md.len() });
+        }
+    }
     // Backfilled entries append out of order; time, not file position, is
     // what "newest first" means.
     out.sort_by(|a, b| b.at.cmp(&a.at));
+    out
+}
+
+/// Per-harness output directories for one session: codex's
+/// `~/.codex/generated_images/<session id>/`, and grok's
+/// `~/.grok/sessions/<url-encoded cwd>/<session id>/images/` — the encoded
+/// cwd is not known here, so every cwd directory is checked.
+pub fn harness_output_dirs(session_id: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        let codex = home.join(".codex").join("generated_images").join(session_id);
+        if codex.is_dir() {
+            out.push(codex);
+        }
+        if let Ok(cwds) = std::fs::read_dir(home.join(".grok").join("sessions")) {
+            for c in cwds.flatten() {
+                let images = c.path().join(session_id).join("images");
+                if images.is_dir() {
+                    out.push(images);
+                }
+            }
+        }
+    }
     out
 }
 

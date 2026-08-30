@@ -974,28 +974,7 @@ async fn session_files(State(ctx): State<Ctx>, Path(id): Path<String>) -> Respon
     Json(out).into_response()
 }
 
-/// Per-harness output directories for one session: codex's
-/// `~/.codex/generated_images/<session id>/`, and grok's
-/// `~/.grok/sessions/<url-encoded cwd>/<session id>/images/` — the encoded
-/// cwd is not known here, so every cwd directory is checked.
-fn harness_output_dirs(session_id: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        let codex = home.join(".codex").join("generated_images").join(session_id);
-        if codex.is_dir() {
-            out.push(codex);
-        }
-        if let Ok(cwds) = std::fs::read_dir(home.join(".grok").join("sessions")) {
-            for c in cwds.flatten() {
-                let images = c.path().join(session_id).join("images");
-                if images.is_dir() {
-                    out.push(images);
-                }
-            }
-        }
-    }
-    out
-}
+use crate::changes::harness_output_dirs;
 
 fn file_entry(path: &std::path::Path, via: &str) -> Option<FileEntry> {
     let md = std::fs::metadata(path).ok()?;

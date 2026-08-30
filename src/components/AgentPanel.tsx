@@ -31,7 +31,7 @@ function Thumb({ path }: { path: string }) {
   return src ? <img className="change-thumb" src={src} alt="" /> : <span className="change-thumb blank" />;
 }
 
-function ChangesList({ sessionId, onOpenFile }: { sessionId: string; onOpenFile?: (path: string) => void }) {
+function ChangesList({ sessionId, extra, onOpenFile }: { sessionId: string; extra?: Artifact[]; onOpenFile?: (path: string) => void }) {
   const { format: timeFormat } = useTimeFormat();
   const [changes, setChanges] = useState<Change[]>([]);
   const [big, setBig] = useState<string | null>(null);
@@ -42,12 +42,28 @@ function ChangesList({ sessionId, onOpenFile }: { sessionId: string; onOpenFile?
     const un = listen<Change>("changes://file", (e) => { if (e.payload.session_id === sessionId) load(); });
     return () => { stop = true; un.then((f) => f()); };
   }, [sessionId]);
-  if (changes.length === 0) {
-    return <div className="empty-note">Nothing changed on disk in this session yet. Files it creates or edits — any engine, any tool — show up here as they land.</div>;
+  // One list for everything the session produced: the filesystem's word
+  // (the ledger, plus harness output read live) and, folded in, files the
+  // transcript says it wrote that the watcher never saw.
+  const rows: Change[] = [
+    ...changes,
+    ...(extra ?? [])
+      .filter((a) => !changes.some((c) => c.path === a.path))
+      .map((a) => ({
+        path: a.path,
+        name: a.path.split("/").pop() ?? a.path,
+        kind: a.tool === "Write" ? "created" : "modified",
+        at: Math.floor(Date.parse(a.at) / 1000) || 0,
+        session_id: sessionId,
+        bytes: 0,
+      })),
+  ].sort((x, y) => y.at - x.at);
+  if (rows.length === 0) {
+    return <div className="empty-note">Nothing produced in this session yet. Files it creates or edits — any engine, any tool — show up here as they land.</div>;
   }
   return (
     <div className="tasks-body">
-      {changes.map((c) => (
+      {rows.map((c) => (
         <div
           key={c.path}
           className={"task-row artifact-row change-row " + c.kind}
@@ -102,8 +118,7 @@ function statusIcon(t: SessionTask) {
 }
 
 export default function AgentPanel({ sessionId, changesSessionId, onOpenFile }: Props) {
-  const { format: timeFormat } = useTimeFormat();
-  const [tab, setTab] = useState<"tasks" | "artifacts" | "changes">("tasks");
+  const [tab, setTab] = useState<"tasks" | "artifacts">("tasks");
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
@@ -188,15 +203,11 @@ export default function AgentPanel({ sessionId, changesSessionId, onOpenFile }: 
         <button
           className={"git-tab" + (tab === "artifacts" ? " on" : "")}
           onClick={() => setTab("artifacts")}
-        >Artifacts{artifacts.length ? ` (${artifacts.length})` : ""}</button>
-        <button
-          className={"git-tab" + (tab === "changes" ? " on" : "")}
-          onClick={() => setTab("changes")}
-        >Changes</button>
+        >Artifacts</button>
       </div>
-      {tab === "changes" ? (
-        <ChangesList sessionId={changesSessionId ?? sessionId} onOpenFile={onOpenFile} />
-      ) : tab === "tasks" ? (
+      {tab !== "tasks" ? (
+        <ChangesList sessionId={changesSessionId ?? sessionId} extra={artifacts} onOpenFile={onOpenFile} />
+      ) : (
         tasks.length === 0 ? (
           <div className="empty-note">No tasks in this session yet</div>
         ) : (
@@ -217,31 +228,6 @@ export default function AgentPanel({ sessionId, changesSessionId, onOpenFile }: 
             ))}
           </div>
         )
-      ) : artifacts.length === 0 ? (
-        <div className="empty-note">No files written in this session yet</div>
-      ) : (
-        <div className="tasks-body">
-          {artifacts.map((a) => (
-            <div
-              key={a.path}
-              className="task-row artifact-row"
-              title={`${a.path} (${a.tool})`}
-              onClick={() =>
-                onOpenFile ? onOpenFile(a.path) : openPath(a.path).catch(() => {})}
-            >
-              <span className={"artifact-tool " + a.tool.toLowerCase()}>
-                {a.tool === "Write" ? "W" : "E"}
-              </span>
-              <span className="task-subject">
-                {a.path.split("/").pop()}
-                <span className="artifact-dir"> {homeAbbrev(a.path).replace(/\/[^/]*$/, "")}</span>
-              </span>
-              {a.at && (
-                <span className="artifact-time" title={fullTime(new Date(a.at).getTime())}>{fmtTime(new Date(a.at).getTime(), timeFormat)}</span>
-              )}
-            </div>
-          ))}
-        </div>
       )}
     </div>
   );

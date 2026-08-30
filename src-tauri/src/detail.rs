@@ -723,7 +723,8 @@ fn line_events(v: &serde_json::Value) -> Vec<(String, String)> {
                             other => other.to_string(),
                         })
                         .unwrap_or_default();
-                    out.push((name.to_string(), cap(&input)));
+                    let (name, text) = if name == "exec" { codex_exec_summary(&input) } else { (name.to_string(), input) };
+                    out.push((name, cap(&text)));
                 }
                 Some("reasoning") => {
                     let mut text = String::new();
@@ -747,6 +748,52 @@ fn line_events(v: &serde_json::Value) -> Vec<(String, String)> {
         _ => {}
     }
     out
+}
+
+/// Codex's `exec` input is a JavaScript snippet; a person cares what it did,
+/// not how it was invoked. `tools.exec_command({"cmd":…})` is a shell
+/// command — show the command. `tools.image_gen__imagegen({prompt:…})` is an
+/// image being generated — show it as one, with its prompt. Anything else
+/// stays raw.
+fn codex_exec_summary(input: &str) -> (String, String) {
+    if input.contains("tools.image_gen__imagegen(") {
+        let text = js_string_after(input, "prompt:\"")
+            .or_else(|| js_string_after(input, "prompt: \""))
+            .unwrap_or_else(|| "Generating an image".into());
+        return ("image".into(), text);
+    }
+    if input.contains("tools.exec_command(") {
+        if let Some(cmd) = js_string_after(input, "\"cmd\":\"") {
+            return ("exec".into(), cmd);
+        }
+    }
+    ("exec".into(), input.to_string())
+}
+
+/// The double-quoted string starting right after `key`, JSON-style escapes
+/// resolved. Good enough for the two shapes above; `None` when the string
+/// never closes.
+fn js_string_after(s: &str, key: &str) -> Option<String> {
+    let start = s.find(key)? + key.len();
+    let mut out = String::new();
+    let mut esc = false;
+    for c in s[start..].chars() {
+        if esc {
+            out.push(match c {
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            });
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
 }
 
 /// A tool call's input, as a person would skim it: the command for Bash,
