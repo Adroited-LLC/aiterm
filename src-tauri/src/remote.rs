@@ -708,11 +708,21 @@ fn err(status: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 async fn status(State(ctx): State<Ctx>) -> Response {
-    let cfg = ctx.app.state::<RemoteState>().config.lock().unwrap().clone();
+    let state = ctx.app.state::<RemoteState>();
+    let cfg = state.config.lock().unwrap().clone();
+    // The addresses the desktop answers on right now, LAN first, public
+    // last — the same list the QR carries. The phone refreshes its
+    // candidates from this on every connect, so a DHCP move or a new
+    // public IP never strands it with only stale addresses.
+    let mut hosts = addresses();
+    if let Some(ip) = state.reach.lock().unwrap().public_ip {
+        hosts.push(ip.to_string());
+    }
     Json(serde_json::json!({
         "api": API_VERSION,
         "name": cfg.name,
         "version": env!("CARGO_PKG_VERSION"),
+        "hosts": hosts,
     }))
     .into_response()
 }
