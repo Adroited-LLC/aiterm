@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
+  sessionRename,
 } from "../ipc";
 import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import {
-  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Play, RefreshCw, Search,
+  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Pencil, Play, RefreshCw, Search,
   Settings as SettingsIcon, Trash2, X,
 } from "lucide-react";
 import { agentTint } from "../brand";
@@ -202,6 +203,9 @@ export default function SessionsPanel({
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  /** Row whose title is being edited in place, and the text so far. */
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   // Resuming a session that's still running stops it first, which throws away
   // whatever it was mid-way through — worth one click of confirmation.
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
@@ -881,9 +885,39 @@ export default function SessionsPanel({
                 <Icon of={GitFork} size="sm" />
               </span>
             )}
-            <span className="session-title" title={renameRows && librarian.store.sessions[s.id] ? s.title : undefined}>
-              {(renameRows && librarian.store.sessions[s.id]?.name) || s.title}
-            </span>
+            {renamingId === s.id ? (
+              <input
+                className="session-rename-input"
+                value={renameDraft}
+                autoFocus
+                onChange={(e) => setRenameDraft(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter") {
+                    const t = renameDraft.trim();
+                    if (t && t !== s.title) sessionRename(s.id, t).catch(() => {});
+                    setRenamingId(null);
+                  }
+                  // Escape resets the draft first so a stray blur commits nothing.
+                  if (e.key === "Escape") { setRenameDraft(s.title); setRenamingId(null); }
+                }}
+                onBlur={() => {
+                  const t = renameDraft.trim();
+                  if (t && t !== s.title) sessionRename(s.id, t).catch(() => {});
+                  setRenamingId(null);
+                }}
+              />
+            ) : (
+              <span
+                className="session-title"
+                title={renameRows && librarian.store.sessions[s.id] ? s.title : undefined}
+                onDoubleClick={(e) => { e.stopPropagation(); setRenamingId(s.id); setRenameDraft(s.title); }}
+              >
+                {(renameRows && librarian.store.sessions[s.id]?.name) || s.title}
+              </span>
+            )}
             {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
           {(opts.showPath || (opts.showBranch && s.branch)) && (
@@ -995,6 +1029,11 @@ export default function SessionsPanel({
                   onClick={() => onFork(s)}
                 ><Icon of={GitFork} size="sm" /></button>
               )}
+              <button
+                className="act-btn"
+                title="Rename this session (or double-click its title)"
+                onClick={() => { setRenamingId(s.id); setRenameDraft(s.title); }}
+              ><Icon of={Pencil} size="sm" /></button>
               {/* aiterm's own clear — same end shape as typing /clear, built
                   like ⑂: no claude machinery, just a fresh process on a
                   minted id. Needs this session's own live terminal to act on,

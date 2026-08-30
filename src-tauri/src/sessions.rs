@@ -3925,10 +3925,60 @@ pub async fn list_sessions() -> Vec<Session> {
 
 fn list_sessions_sync() -> Vec<Session> {
     // Adding an agent means adding a backend in `agents.rs` and nothing here.
+    let titles = load_titles();
     crate::agents::scan_all_with_paths()
         .into_iter()
-        .map(|(s, _)| s)
+        .map(|(mut s, _)| {
+            if let Some(t) = titles.get(&s.id) {
+                s.title = t.clone();
+            }
+            s
+        })
         .collect()
+}
+
+/// Person-chosen session titles, id → title, kept beside the config. Every
+/// engine names sessions its own way (or not at all — "Quick check", "AI-OS");
+/// a name the person typed wins over all of them, uniformly, without
+/// touching any harness's own files.
+fn titles_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("aiterm").join("titles.json"))
+}
+
+fn load_titles() -> std::collections::HashMap<String, String> {
+    titles_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Rename a session. An empty (or whitespace) title removes the override,
+/// letting the engine's own name show again.
+pub fn rename_session(session_id: &str, title: &str) -> Result<(), String> {
+    let Some(p) = titles_path() else { return Err("no data dir".into()) };
+    let mut m = load_titles();
+    let t = title.trim();
+    if t.is_empty() {
+        m.remove(session_id);
+    } else {
+        m.insert(session_id.to_string(), t.to_string());
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text = serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?;
+    std::fs::write(&p, text).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn session_rename(app: tauri::AppHandle, session_id: String, title: String) -> Result<(), String> {
+    rename_session(&session_id, &title)?;
+    // Both UIs list the same sessions; tell them the list moved. (The
+    // transcript watcher can't see titles.json, so say it ourselves.)
+    crate::remote::notify(&app, crate::remote::Event::SessionsChanged);
+    use tauri::Emitter;
+    let _ = app.emit("sessions://changed", ());
+    Ok(())
 }
 
 #[cfg(test)]

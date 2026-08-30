@@ -3981,3 +3981,12 @@ input[type="range"]::-webkit-slider-thumb {
   cursor: default;
 }
 .media-peek-note { color: #ddd; font-size: 13px; }
+
+/* Inline session rename: same footprint as the title it replaces. */
+.session-rename-input {
+  flex: 1; min-width: 0;
+  font: inherit; font-size: 13px; color: var(--fg, #ddd);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--accent, #7aa2f7); border-radius: 4px;
+  padding: 1px 5px; outline: none;
+}

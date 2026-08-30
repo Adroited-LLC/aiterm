@@ -128,6 +128,9 @@ export interface SessionDetail {
 }
 export const sessionDetail = (sessionId: string) =>
   invoke<SessionDetail | null>("session_detail", { sessionId });
+/** A person-chosen title for the session; empty restores the engine's own. */
+export const sessionRename = (sessionId: string, title: string) =>
+  invoke<void>("session_rename", { sessionId, title });
 export const sessionDelete = (sessionId: string) =>
   invoke<void>("session_delete", { sessionId });
 

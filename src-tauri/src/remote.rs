@@ -637,6 +637,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/sessions/{id}/conversation", get(conversation))
         .route("/v1/sessions/{id}/open", post(open))
         .route("/v1/sessions/{id}/input", post(input))
+        .route("/v1/sessions/{id}/rename", post(rename))
         .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop_session))
         .route("/v1/events", get(events))
@@ -1166,6 +1167,24 @@ async fn input(State(ctx): State<Ctx>, Path(id): Path<String>, Json(body): Json<
 
 /// Escape: what stops an agent's current turn in every TUI here, without
 /// ending the session. A stop is a different, heavier thing (below).
+#[derive(Deserialize)]
+struct RenameBody {
+    title: String,
+}
+
+/// Rename a session from the phone. The same override store the desktop
+/// writes; both UIs hear about it and re-read.
+async fn rename(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<RenameBody>) -> Response {
+    match crate::sessions::rename_session(&id, &b.title) {
+        Ok(()) => {
+            notify(&ctx.app, Event::SessionsChanged);
+            let _ = ctx.app.emit("sessions://changed", ());
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 async fn interrupt(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
     let ptys = ctx.app.state::<crate::pty::PtyManager>();
     let Some(pty) = ptys.pty_for_session(&id) else {
