@@ -3187,8 +3187,17 @@ impl StrictArchiveEntry {
 
     fn remove_exact_after_with_hook(
         &self,
+        validate: impl FnMut() -> Result<(), String>,
+        after_name_check: impl FnOnce(),
+    ) -> Result<(), String> {
+        self.remove_exact_after_with_hooks(validate, after_name_check, || {})
+    }
+
+    fn remove_exact_after_with_hooks(
+        &self,
         mut validate: impl FnMut() -> Result<(), String>,
         after_name_check: impl FnOnce(),
+        before_destructive_retirement: impl FnOnce(),
     ) -> Result<(), String> {
         self.verify()?;
         let recovery = self.publish_recovery_link()?;
@@ -3240,6 +3249,7 @@ impl StrictArchiveEntry {
         }
         self.verify()?;
         self.archive.verify("restore archive")?;
+        before_destructive_retirement();
         self.archive
             .file
             .set_len(0)
@@ -7206,6 +7216,79 @@ mod tests {
                     .map(|bytes| bytes.starts_with(SIDECAR_ARCHIVE_MAGIC))
                     .unwrap_or(false)
         }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_restore_retains_full_archive_when_destination_swaps_at_retirement_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-restore-destination-retirement-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source_parent = root.join("sidecars");
+        let source = source_parent.join("session");
+        let trash_path = root.join("trash");
+        let restored_root = root.join("restored");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::create_dir_all(&restored_root).unwrap();
+        std::fs::write(source.join("entry"), b"archive survives retirement").unwrap();
+        let verified = verified_directory_entry(&source_parent, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, "session.tasks".into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        let archive_path = trash_path.join("session.tasks");
+        let restored_path = restored_root.join("session");
+        let displaced = restored_root.join("displaced-exact-restore");
+
+        let error = {
+            let archive = StrictArchiveEntry::open(&archive_path).unwrap();
+            let restored = restore_sidecar_archive_from_file(
+                &archive.archive.file,
+                &restored_root,
+                OsStr::new("session"),
+            )
+            .unwrap();
+            archive
+                .remove_exact_after_with_hooks(
+                    || restored.verify(),
+                    || {},
+                    || {
+                        std::fs::rename(&restored_path, &displaced).unwrap();
+                        std::fs::create_dir(&restored_path).unwrap();
+                        std::fs::write(restored_path.join("entry"), b"replacement").unwrap();
+                    },
+                )
+                .unwrap_err()
+        };
+
+        assert!(error.contains("restored entry changed"), "{error}");
+        assert_eq!(std::fs::read(restored_path.join("entry")).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(displaced.join("entry")).unwrap(),
+            b"archive survives retirement"
+        );
+        let retained = std::fs::read_dir(&trash_path)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aiterm-restored-archive-")
+            })
+            .expect("strict restore must retain a full-byte descriptor-bound recovery object")
+            .path();
+        assert!(std::fs::read(retained)
+            .unwrap()
+            .starts_with(SIDECAR_ARCHIVE_MAGIC));
         std::fs::remove_dir_all(root).unwrap();
     }
 
