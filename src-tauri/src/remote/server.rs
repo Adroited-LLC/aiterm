@@ -16,7 +16,7 @@ use crate::tabs::{
 };
 use crate::terminal::model::{Revision, ScreenDiff, ScreenSnapshot};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::routing::get;
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
@@ -369,7 +369,7 @@ impl RemoteGateway {
         let server = axum_server::from_tcp_rustls(listener, tls)
             .map_err(GatewayError::io)?
             .handle(run_handle)
-            .serve(router.into_make_service());
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>());
         let task = tokio::spawn(server);
         Ok(GatewayHandle {
             local_addr,
@@ -422,6 +422,7 @@ impl Drop for GatewayHandle {
 async fn websocket_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<GatewayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> impl axum::response::IntoResponse {
     ws.max_message_size(MAX_MESSAGE_SIZE)
         .max_frame_size(MAX_MESSAGE_SIZE)
@@ -430,7 +431,7 @@ async fn websocket_upgrade(
                 close_socket(&mut socket).await;
                 return;
             };
-            authenticate_socket(socket, state).await;
+            authenticate_socket(socket, state, peer).await;
             drop(permit);
         })
 }
@@ -489,7 +490,7 @@ struct PairDeniedReply {
     kind: &'static str,
 }
 
-async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
+async fn authenticate_socket(mut socket: WebSocket, state: GatewayState, peer: SocketAddr) {
     let mut nonce = vec![0u8; 32];
     OsRng.fill_bytes(&mut nonce);
     if send_cbor(
@@ -520,7 +521,7 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
         }
     };
     if frame_kind.kind == "pair.request" {
-        handle_pairing(socket, state, &message).await;
+        handle_pairing(socket, state, peer.ip(), &message).await;
         return;
     }
     let proof: AuthProof = match decode_exact(message.as_ref()) {
@@ -533,7 +534,13 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
     if proof.kind != "auth.proof"
         || state
             .devices
-            .verify_proof(&proof.device_id, &nonce, &proof.signature_der)
+            .verify_proof_from_at(
+                &proof.device_id,
+                &nonce,
+                &proof.signature_der,
+                peer.ip(),
+                SystemTime::now(),
+            )
             .is_err()
     {
         let _ = send_cbor(
@@ -3772,7 +3779,7 @@ mod request_guard_tests {
     }
 }
 
-async fn handle_pairing(mut socket: WebSocket, state: GatewayState, bytes: &[u8]) {
+async fn handle_pairing(mut socket: WebSocket, state: GatewayState, peer_ip: IpAddr, bytes: &[u8]) {
     let request: PairRequest = match decode_exact::<PairRequest>(bytes) {
         Ok(request) if request.kind == "pair.request" => request,
         _ => {
@@ -3780,10 +3787,11 @@ async fn handle_pairing(mut socket: WebSocket, state: GatewayState, bytes: &[u8]
             return;
         }
     };
-    let pending = match state.devices.submit_pairing_at(
+    let pending = match state.devices.submit_pairing_from_at(
         &request.enrollment_secret,
         &request.device_name,
         &request.public_key,
+        peer_ip,
         SystemTime::now(),
     ) {
         Ok(pending) => pending,

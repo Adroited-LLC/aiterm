@@ -516,7 +516,7 @@ async fn authenticated_device_completes_a_real_tls_websocket_handshake() {
         TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
     let gateway = RemoteGateway::start(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        store,
+        store.clone(),
         identity,
         services(),
     )
@@ -545,6 +545,11 @@ async fn authenticated_device_completes_a_real_tls_websocket_handshake() {
     };
     let reply: AuthReply = decode(&bytes);
     assert_eq!(reply.kind, "auth.ok");
+    assert_eq!(
+        store.list_devices()[0].last_ip.as_deref(),
+        Some("127.0.0.1"),
+        "the gateway must pass the socket peer IP to successful authentication",
+    );
 
     gateway.stop().await.unwrap();
     std::fs::remove_dir_all(root).ok();
@@ -2975,6 +2980,11 @@ async fn qr_pairing_waits_for_explicit_desktop_approval_before_issuing_device_id
     let device = store
         .approve_pairing_at(&pending.request_id, std::time::SystemTime::now())
         .unwrap();
+    assert_eq!(
+        device.last_ip.as_deref(),
+        Some("127.0.0.1"),
+        "desktop approval must retain the pairing socket's peer IP",
+    );
     let Message::Binary(bytes) = socket.next().await.unwrap().unwrap() else {
         panic!("approved pairing reply should be binary CBOR");
     };

@@ -5,6 +5,9 @@ import {
   fingerprintLabel,
   inviteCountdownSeconds,
   inviteToShow,
+  listenerAddressOptions,
+  preferredListenerConfig,
+  rebindListener,
   lastSeenLabel,
   nextRevokeStep,
   type PairingInvite,
@@ -83,6 +86,7 @@ test("a phone that has never connected does not read as recently seen", () => {
     fingerprint: "abc",
     created_at: now / 1000 - 10,
     last_seen_at: null,
+    last_ip: null,
   };
   assert.equal(lastSeenLabel(never, now), "never connected");
   assert.equal(
@@ -113,4 +117,60 @@ test("the invite exposes drawn geometry, never the pairing payload", () => {
     "an invite must not grow a field that holds the secret as text",
   );
   assert.match(shown.svg, /^<svg/, "the invite is an image, not a URL");
+});
+
+test("the listener selector restores the live or saved address instead of the first interface", () => {
+  const interfaces = ["192.168.1.10", "10.8.0.4"];
+  const saved = { address: "10.8.0.4", port: 9443 };
+
+  assert.deepEqual(
+    preferredListenerConfig(
+      { enabled: false, address: null, port: null, fingerprint: null },
+      interfaces,
+      saved,
+    ),
+    saved,
+  );
+  assert.deepEqual(
+    preferredListenerConfig(
+      { enabled: true, address: "10.8.0.4", port: 8555, fingerprint: "pin" },
+      interfaces,
+      { address: "192.168.1.10", port: 8443 },
+    ),
+    { address: "10.8.0.4", port: 8555 },
+    "the socket that is actually listening is authoritative",
+  );
+});
+
+test("the active listener remains selectable if interface discovery no longer returns it", () => {
+  assert.deepEqual(
+    listenerAddressOptions("10.8.0.4", ["192.168.1.10"]),
+    ["10.8.0.4", "192.168.1.10"],
+  );
+  assert.deepEqual(
+    listenerAddressOptions("192.168.1.10", ["192.168.1.10"]),
+    ["192.168.1.10"],
+  );
+});
+
+test("changing a running listener restores the old address when the new bind fails", async () => {
+  let active = "192.168.1.10:8443";
+  const current = { address: "192.168.1.10", port: 8443 };
+  const target = { address: "10.8.0.4", port: 9443 };
+
+  await assert.rejects(
+    rebindListener(
+      current,
+      target,
+      async () => { active = ""; },
+      async (config) => {
+        if (config.address === target.address) throw new Error("address unavailable");
+        active = `${config.address}:${config.port}`;
+        return { enabled: true, ...config, fingerprint: "pin" };
+      },
+    ),
+    /address unavailable/,
+  );
+
+  assert.equal(active, "192.168.1.10:8443");
 });

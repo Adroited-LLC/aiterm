@@ -6,7 +6,11 @@ import {
   inviteToShow,
   lastSeenLabel,
   listenerLabel,
+  listenerAddressOptions,
   nextRevokeStep,
+  preferredListenerConfig,
+  rebindListener,
+  type ListenerConfig,
   type PairingInvite,
   type PendingPairing,
   type RemoteStatus,
@@ -26,6 +30,28 @@ import {
 } from "../ipc";
 
 const DEFAULT_PORT = 8443;
+const LISTENER_PREFERENCE_KEY = "aiterm.remote.listener";
+
+function loadListenerPreference(): ListenerConfig | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(LISTENER_PREFERENCE_KEY) ?? "null");
+    if (
+      typeof value?.address === "string" &&
+      Number.isInteger(value?.port) &&
+      value.port >= 1024 &&
+      value.port <= 65535
+    ) {
+      return value;
+    }
+  } catch { /* A corrupt renderer preference falls back to live discovery. */ }
+  return null;
+}
+
+function saveListenerPreference(config: ListenerConfig) {
+  try {
+    localStorage.setItem(LISTENER_PREFERENCE_KEY, JSON.stringify(config));
+  } catch { /* Private mode only makes the selection session-local. */ }
+}
 
 /**
  * Remote Access: the desktop side of phone pairing.
@@ -54,20 +80,30 @@ export default function RemoteAccessSettings() {
   // element, and it only ticks while an invite is outstanding.
   const [now, setNow] = useState(() => Date.now());
 
-  const refresh = useCallback(() => {
-    remoteStatus().then(setStatus).catch(() => setStatus(null));
+  const refresh = useCallback(async () => {
+    const nextStatus = await remoteStatus();
+    setStatus(nextStatus);
     remoteDevices().then(setDevices).catch(() => setDevices([]));
     remotePendingPairings().then(setPending).catch(() => setPending([]));
+    return nextStatus;
   }, []);
 
   useEffect(() => {
-    refresh();
-    remoteInterfaces()
-      .then((found) => {
+    Promise.all([refresh(), remoteInterfaces()])
+      .then(([currentStatus, found]) => {
         setAddresses(found);
-        setAddress((current) => current || found[0] || "");
+        const initial = preferredListenerConfig(
+          currentStatus,
+          found,
+          loadListenerPreference(),
+        );
+        setAddress(initial.address);
+        setPort(initial.port);
       })
-      .catch(() => setAddresses([]));
+      .catch(() => {
+        setStatus(null);
+        setAddresses([]);
+      });
   }, [refresh]);
 
   // A phone that scans the QR appears here only once the desktop notices it,
@@ -82,15 +118,19 @@ export default function RemoteAccessSettings() {
   }, [invite]);
 
   const shownInvite = status ? inviteToShow(status, invite, now) : null;
+  const addressOptions = listenerAddressOptions(address, addresses);
   // Drop a spent invite from state as well as from the screen, so the next
   // "Pair phone" starts clean rather than flashing the dead one.
   useEffect(() => {
     if (invite && !shownInvite) setInvite(null);
   }, [invite, shownInvite]);
 
-  const run = (work: Promise<unknown>) => {
+  const run = (work: Promise<unknown>, onSuccess?: () => void) => {
     setError(null);
-    work.then(refresh).catch((cause) => setError(String(cause)));
+    work
+      .then(() => onSuccess?.())
+      .catch((cause) => setError(String(cause)))
+      .finally(() => { refresh().catch(() => setStatus(null)); });
   };
 
   if (!status) {
@@ -109,25 +149,62 @@ export default function RemoteAccessSettings() {
             <button
               className="set-recheck"
               onClick={() =>
-                run(status.enabled ? remoteStop() : remoteStart(address, port))
+                run(
+                  status.enabled ? remoteStop() : remoteStart(address, port),
+                  () => saveListenerPreference({ address, port }),
+                )
               }
               disabled={!status.enabled && !address}
             >
               {status.enabled ? "Turn off" : "Turn on"}
             </button>
           </Row>
-          <Row label="Address" desc="Loopback is not offered: a phone cannot reach it.">
-            <select
-              className="set-select"
-              value={address}
-              disabled={status.enabled}
-              onChange={(e) => setAddress(e.target.value)}
-            >
-              {addresses.length === 0 && <option value="">No LAN or VPN address</option>}
-              {addresses.map((candidate) => (
-                <option key={candidate} value={candidate}>{candidate}</option>
-              ))}
-            </select>
+          <Row
+            label="Address"
+            desc="Choose a LAN or VPN address. Applying a live change briefly reconnects phones."
+          >
+            <div className="remote-listener-control">
+              <select
+                className="set-select mono"
+                value={address}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setAddress(next);
+                  if (!status.enabled) saveListenerPreference({ address: next, port });
+                }}
+              >
+                {addressOptions.length === 0 && <option value="">No LAN or VPN address</option>}
+                {addressOptions.map((candidate) => (
+                  <option key={candidate} value={candidate}>{candidate}</option>
+                ))}
+              </select>
+              {status.enabled && status.address && status.port !== null &&
+                (address !== status.address || port !== status.port) && (
+                  <button
+                    className="set-recheck"
+                    disabled={!address}
+                    onClick={() => {
+                      const current = { address: status.address!, port: status.port! };
+                      const target = { address, port };
+                      setError(null);
+                      rebindListener(
+                        current,
+                        target,
+                        remoteStop,
+                        (config) => remoteStart(config.address, config.port),
+                      )
+                        .then(() => saveListenerPreference(target))
+                        .catch((cause) => {
+                          setAddress(current.address);
+                          setPort(current.port);
+                          saveListenerPreference(current);
+                          setError(String(cause));
+                        })
+                        .finally(() => { refresh().catch(() => setStatus(null)); });
+                    }}
+                  >Apply</button>
+                )}
+            </div>
           </Row>
           <Row label="Port">
             <input
@@ -136,8 +213,11 @@ export default function RemoteAccessSettings() {
               min={1024}
               max={65535}
               value={port}
-              disabled={status.enabled}
-              onChange={(e) => setPort(Number(e.target.value) || DEFAULT_PORT)}
+              onChange={(e) => {
+                const next = Number(e.target.value) || DEFAULT_PORT;
+                setPort(next);
+                if (!status.enabled) saveListenerPreference({ address, port: next });
+              }}
             />
           </Row>
           <Row label="Status">
@@ -221,7 +301,10 @@ export default function RemoteAccessSettings() {
                   <div className="agent-text">
                     <div className="agent-name">{device.name}</div>
                     <div className="srow-desc">
-                      {lastSeenLabel(device, now)} — key {fingerprintLabel(device.fingerprint)}
+                      {lastSeenLabel(device, now)} — IP {device.last_ip ?? "not recorded"}
+                    </div>
+                    <div className="srow-desc">
+                      Key {fingerprintLabel(device.fingerprint)}
                     </div>
                   </div>
                   <button

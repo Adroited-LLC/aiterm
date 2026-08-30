@@ -22,6 +22,62 @@ export interface RemoteStatus {
   fingerprint: string | null;
 }
 
+export interface ListenerConfig {
+  address: string;
+  port: number;
+}
+
+/** Keep the authoritative live address visible even during a transient
+ * interface scan that no longer reports it. */
+export function listenerAddressOptions(
+  selected: string,
+  discovered: string[],
+): string[] {
+  return selected && !discovered.includes(selected)
+    ? [selected, ...discovered]
+    : discovered;
+}
+
+/** Resolve the control values without letting interface discovery overwrite
+ * either the live socket or a still-valid saved choice. */
+export function preferredListenerConfig(
+  status: RemoteStatus,
+  addresses: string[],
+  saved: ListenerConfig | null,
+): ListenerConfig {
+  if (status.enabled && status.address && status.port !== null) {
+    return { address: status.address, port: status.port };
+  }
+  const savedAddress = saved && addresses.includes(saved.address) ? saved.address : null;
+  return {
+    address: savedAddress ?? addresses[0] ?? "",
+    port: saved?.port ?? 8443,
+  };
+}
+
+/** Move a live listener while keeping the old socket recoverable if the new
+ * interface disappeared between discovery and bind. */
+export async function rebindListener(
+  current: ListenerConfig,
+  target: ListenerConfig,
+  stop: () => Promise<unknown>,
+  start: (config: ListenerConfig) => Promise<RemoteStatus>,
+): Promise<RemoteStatus> {
+  await stop();
+  try {
+    return await start(target);
+  } catch (targetError) {
+    try {
+      await start(current);
+    } catch (rollbackError) {
+      throw new Error(
+        `${String(targetError)}; restoring ${current.address}:${current.port} also failed: ${String(rollbackError)}`,
+      );
+    }
+    throw targetError;
+  }
+}
+
 export interface PairingInvite {
   /**
    * The QR as an SVG, rendered by the desktop backend.
@@ -44,6 +100,7 @@ export interface TrustedDevice {
   /** Epoch seconds, matching the Rust store. */
   created_at: number;
   last_seen_at: number | null;
+  last_ip: string | null;
 }
 
 export interface PendingPairing {

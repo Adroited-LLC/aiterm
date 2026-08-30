@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +27,8 @@ pub struct TrustedDevice {
     pub fingerprint: String,
     pub created_at: u64,
     pub last_seen_at: Option<u64>,
+    #[serde(default)]
+    pub last_ip: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,6 +62,7 @@ struct PendingDevice {
     view: PendingPairing,
     public_key: String,
     expires_at: SystemTime,
+    last_ip: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +136,28 @@ impl DeviceStore {
         public_key: &[u8],
         now: SystemTime,
     ) -> Result<PendingPairing, AuthError> {
+        self.submit_pairing_with_ip_at(secret, device_name, public_key, None, now)
+    }
+
+    pub fn submit_pairing_from_at(
+        &self,
+        secret: &[u8],
+        device_name: &str,
+        public_key: &[u8],
+        peer_ip: IpAddr,
+        now: SystemTime,
+    ) -> Result<PendingPairing, AuthError> {
+        self.submit_pairing_with_ip_at(secret, device_name, public_key, Some(peer_ip), now)
+    }
+
+    fn submit_pairing_with_ip_at(
+        &self,
+        secret: &[u8],
+        device_name: &str,
+        public_key: &[u8],
+        peer_ip: Option<IpAddr>,
+        now: SystemTime,
+    ) -> Result<PendingPairing, AuthError> {
         let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
         prune_pairings(&mut state, now);
         let Some(position) = state
@@ -177,6 +203,7 @@ impl DeviceStore {
             view: view.clone(),
             public_key: URL_SAFE_NO_PAD.encode(canonical_bytes),
             expires_at: now + PAIRING_RETENTION,
+            last_ip: peer_ip.map(|ip| ip.to_string()),
         });
         Ok(view)
     }
@@ -201,6 +228,7 @@ impl DeviceStore {
             fingerprint: pending.view.fingerprint,
             created_at: unix_seconds(now),
             last_seen_at: None,
+            last_ip: pending.last_ip,
         };
         let stored = StoredDevice {
             view: view.clone(),
@@ -310,6 +338,28 @@ impl DeviceStore {
         signature_der: &[u8],
         now: SystemTime,
     ) -> Result<(), AuthError> {
+        self.verify_proof_with_ip_at(device_id, nonce, signature_der, None, now)
+    }
+
+    pub fn verify_proof_from_at(
+        &self,
+        device_id: &str,
+        nonce: &[u8],
+        signature_der: &[u8],
+        peer_ip: IpAddr,
+        now: SystemTime,
+    ) -> Result<(), AuthError> {
+        self.verify_proof_with_ip_at(device_id, nonce, signature_der, Some(peer_ip), now)
+    }
+
+    fn verify_proof_with_ip_at(
+        &self,
+        device_id: &str,
+        nonce: &[u8],
+        signature_der: &[u8],
+        peer_ip: Option<IpAddr>,
+        now: SystemTime,
+    ) -> Result<(), AuthError> {
         let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
         let position = state
             .devices
@@ -331,9 +381,15 @@ impl DeviceStore {
         // the attempt instead would let anyone who knows a device id keep the
         // settings panel showing a phone as freshly connected.
         let seen = unix_seconds(now);
-        if state.devices[position].view.last_seen_at != Some(seen) {
+        let last_ip = peer_ip
+            .map(|ip| ip.to_string())
+            .or_else(|| state.devices[position].view.last_ip.clone());
+        if state.devices[position].view.last_seen_at != Some(seen)
+            || state.devices[position].view.last_ip != last_ip
+        {
             let mut devices = state.devices.clone();
             devices[position].view.last_seen_at = Some(seen);
+            devices[position].view.last_ip = last_ip;
             persist_devices(&self.root.join(DEVICES_FILE), &devices)?;
             state.devices = devices;
         }

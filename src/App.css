@@ -2532,6 +2532,9 @@ button.acty-row:hover { background: var(--bg-hover); }
 }
 .set-select:focus { border-color: var(--accent); }
 .set-select.mono { font-family: var(--font-mono); }
+.remote-listener-control { display: flex; align-items: center; gap: 6px; width: 100%; }
+.remote-listener-control .set-select { flex: 1; min-width: 0; width: auto; }
+.remote-listener-control .set-recheck { flex-shrink: 0; padding-block: 6px; }
 
 input[type="range"] {
   -webkit-appearance: none;

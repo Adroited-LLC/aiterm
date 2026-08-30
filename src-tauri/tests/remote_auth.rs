@@ -287,6 +287,79 @@ fn a_successful_proof_records_when_the_device_was_last_seen() {
 }
 
 #[test]
+fn desktop_approval_records_and_persists_the_pairing_ip() {
+    let root = private_test_dir("pairing-ip");
+    let store = DeviceStore::open(&root).expect("empty device store should open");
+    let paired_at = UNIX_EPOCH + Duration::from_secs(2_000);
+    let enrollment = store.begin_enrollment_at(paired_at).unwrap();
+    let key = SigningKey::random(&mut OsRng);
+    let pending = store
+        .submit_pairing_from_at(
+            enrollment.secret(),
+            "Pixel",
+            &public_key_bytes(&key),
+            "192.168.1.77".parse().unwrap(),
+            paired_at,
+        )
+        .expect("a valid pairing request should retain its socket IP");
+    let approved = store.approve_pairing_at(&pending.id, paired_at).unwrap();
+
+    assert_eq!(approved.last_ip.as_deref(), Some("192.168.1.77"));
+    drop(store);
+    let reopened = DeviceStore::open(&root).expect("trusted devices should reopen");
+    assert_eq!(
+        reopened.list_devices()[0].last_ip.as_deref(),
+        Some("192.168.1.77"),
+        "the paired-phone row must retain its IP after a desktop restart",
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn successful_authentication_updates_the_last_ip_but_a_bad_signature_does_not() {
+    let root = private_test_dir("authenticated-ip");
+    let store = DeviceStore::open(&root).expect("empty device store should open");
+    let paired_at = UNIX_EPOCH + Duration::from_secs(3_000);
+    let key = SigningKey::random(&mut OsRng);
+    let device = store
+        .approve_at(
+            store.begin_enrollment_at(paired_at).unwrap().secret(),
+            "Pixel",
+            &public_key_bytes(&key),
+            paired_at,
+        )
+        .unwrap();
+    let valid: Signature = key.sign(b"nonce");
+    store
+        .verify_proof_from_at(
+            &device.id,
+            b"nonce",
+            valid.to_der().as_bytes(),
+            "10.8.0.22".parse().unwrap(),
+            paired_at + Duration::from_secs(60),
+        )
+        .expect("the paired key should update its authenticated IP");
+
+    let impostor = SigningKey::random(&mut OsRng);
+    let invalid: Signature = impostor.sign(b"nonce-2");
+    store
+        .verify_proof_from_at(
+            &device.id,
+            b"nonce-2",
+            invalid.to_der().as_bytes(),
+            "203.0.113.9".parse().unwrap(),
+            paired_at + Duration::from_secs(120),
+        )
+        .expect_err("an invalid signature must not change trusted metadata");
+
+    assert_eq!(
+        store.list_devices()[0].last_ip.as_deref(),
+        Some("10.8.0.22")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn a_failed_proof_does_not_record_a_sighting() {
     let root = private_test_dir("last-seen-failure");
     let store = DeviceStore::open(&root).expect("empty device store should open");
