@@ -1269,6 +1269,9 @@ fn purge_directory_fd(directory: &File, cutoff: std::time::SystemTime) -> Result
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
+        if is_retained_restore_recovery_bytes(name.to_bytes()) {
+            continue;
+        }
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe {
             libc::fstatat(
@@ -1591,13 +1594,27 @@ struct ExactFileRetirement {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct DirectoryEntryIdentity {
     name: std::ffi::OsString,
     device: u64,
     inode: u64,
     mode: u32,
+    size: u64,
 }
+
+#[cfg(target_os = "linux")]
+impl PartialEq for DirectoryEntryIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.device == other.device
+            && self.inode == other.inode
+            && self.mode == other.mode
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for DirectoryEntryIdentity {}
 
 #[cfg(target_os = "linux")]
 struct ExactDirectoryRetirement {
@@ -1833,6 +1850,7 @@ fn snapshot_directory_entries(directory: &File) -> Result<Vec<DirectoryEntryIden
             device: stat.st_dev as u64,
             inode: stat.st_ino as u64,
             mode: stat.st_mode as u32,
+            size: stat.st_size.max(0) as u64,
         });
         Ok(())
     })?;
@@ -3181,6 +3199,86 @@ impl StrictArchiveEntry {
         self.remove_exact_after(|| Ok(()))
     }
 
+    fn retire_after_restore(
+        &self,
+        validate: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.retire_after_restore_with_hooks(validate, || {}, || {})
+    }
+
+    fn retire_after_restore_with_hooks(
+        &self,
+        mut validate: impl FnMut() -> Result<(), String>,
+        after_name_check: impl FnOnce(),
+        before_final_validation: impl FnOnce(),
+    ) -> Result<(), String> {
+        self.verify()?;
+        let recovery = self.publish_recovery_link()?;
+        if !directory_entry_is_exact_object(&self.parent, &self.name, &self.archive.file)? {
+            return Err(format!(
+                "archive name changed before restore retirement; exact archive is recoverable at {}",
+                recovery.path.display()
+            ));
+        }
+        if let Err(error) = validate() {
+            return Err(format!(
+                "{error}; exact archive is recoverable at {}",
+                recovery.path.display()
+            ));
+        }
+        after_name_check();
+        let retained_name = format!(".aiterm-restored-archive-{}", uuid::Uuid::new_v4());
+        let retained = CString::new(retained_name.as_bytes()).unwrap();
+        let retained_path = self
+            .display_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&retained_name);
+        rename_noreplace(
+            self.parent.as_raw_fd(),
+            &self.name,
+            self.parent.as_raw_fd(),
+            &retained,
+        )?;
+        if !directory_entry_is_exact_object(&self.parent, &retained, &self.archive.file)? {
+            let _ = rename_noreplace(
+                self.parent.as_raw_fd(),
+                &retained,
+                self.parent.as_raw_fd(),
+                &self.name,
+            );
+            return Err(format!(
+                "archive name changed during restore retirement; exact archive is recoverable at {} and the moved entry at {}",
+                recovery.path.display(),
+                retained_path.display()
+            ));
+        }
+        if let Err(error) = validate() {
+            return Err(format!(
+                "{error}; exact archive is recoverable at {} and {}",
+                recovery.path.display(),
+                retained_path.display()
+            ));
+        }
+        self.verify()?;
+        before_final_validation();
+        if let Err(error) = validate() {
+            return Err(format!(
+                "{error}; exact archive is recoverable at {} and {}",
+                recovery.path.display(),
+                retained_path.display()
+            ));
+        }
+        if !directory_entry_is_exact_object(&self.parent, &retained, &self.archive.file)? {
+            return Err(format!(
+                "retained restore archive changed at {}; exact archive is also recoverable at {}",
+                retained_path.display(),
+                recovery.path.display()
+            ));
+        }
+        self.parent.sync_all().map_err(|error| error.to_string())
+    }
+
     fn remove_exact_after(&self, validate: impl FnMut() -> Result<(), String>) -> Result<(), String> {
         self.remove_exact_after_with_hook(validate, || {})
     }
@@ -3293,6 +3391,25 @@ fn is_purge_tombstone(name: &OsStr) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn is_retained_restore_recovery(name: &OsStr) -> bool {
+    is_retained_restore_recovery_bytes(name.as_bytes())
+}
+
+#[cfg(target_os = "linux")]
+fn is_effective_purge_tombstone(entry: &DirectoryEntryIdentity) -> bool {
+    is_purge_tombstone(&entry.name)
+        || (is_retained_restore_recovery(&entry.name)
+            && entry.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
+            && entry.size == 0)
+}
+
+#[cfg(unix)]
+fn is_retained_restore_recovery_bytes(name: &[u8]) -> bool {
+    name.starts_with(b".aiterm-restored-archive-")
+        || name.starts_with(b".aiterm-restore-recovery-")
+}
+
+#[cfg(target_os = "linux")]
 enum PreparedTrashEntry {
     File(StrictArchiveEntry),
     Directory(PreparedTrashDirectory),
@@ -3347,9 +3464,10 @@ impl PreparedTrashDirectory {
         }
         let snapshot = snapshot_directory_entries(&directory)?;
         let mut entries = Vec::with_capacity(snapshot.len().min(16));
+        let mut retained_inodes = Vec::new();
         let display_path = display_parent.join(name);
         for entry in &snapshot {
-            if is_purge_tombstone(&entry.name) {
+            if is_effective_purge_tombstone(entry) {
                 continue;
             }
             *budget = budget.checked_add(1).ok_or("trash purge budget overflow")?;
@@ -3360,6 +3478,14 @@ impl PreparedTrashDirectory {
                 CString::new(entry.name.as_bytes()).map_err(|_| "invalid trash child name")?;
             let kind = entry.mode & libc::S_IFMT;
             if kind == libc::S_IFREG as u32 {
+                if is_retained_restore_recovery(&entry.name)
+                    && retained_inodes.contains(&(entry.device, entry.inode))
+                {
+                    continue;
+                }
+                if is_retained_restore_recovery(&entry.name) {
+                    retained_inodes.push((entry.device, entry.inode));
+                }
                 entries.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
                     &directory,
                     &display_path,
@@ -3414,7 +3540,7 @@ impl PreparedTrashDirectory {
         }
         if snapshot_directory_entries(&self.directory)?
             .iter()
-            .any(|entry| !is_purge_tombstone(&entry.name))
+            .any(|entry| !is_effective_purge_tombstone(entry))
             || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)? {
             return Err(format!(
                 "trash directory changed during permanent purge at {}",
@@ -3639,7 +3765,7 @@ fn restore_sidecar_archive_and_remove_with_hook(
     let restored = restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)?;
     archive.verify()?;
     before_remove();
-    archive.remove_exact_after(|| restored.verify())
+    archive.retire_after_restore(|| restored.verify())
 }
 
 #[cfg(target_os = "linux")]
@@ -3805,7 +3931,7 @@ fn restore_file_set_archive_and_remove(
     let archive = StrictArchiveEntry::open(archive_path)?;
     let restored = restore_file_set_archive_from_file(&archive.archive.file, destination_root)?;
     archive.verify()?;
-    archive.remove_exact_after(|| restored.verify())
+    archive.retire_after_restore(|| restored.verify())
 }
 
 #[cfg(target_os = "linux")]
@@ -4530,18 +4656,27 @@ fn trash_empty_in_directory(trash_path: &Path) -> Result<(), String> {
     let snapshot = snapshot_directory_entries(&trash.file)?;
     let mut budget = snapshot
         .iter()
-        .filter(|entry| !is_purge_tombstone(&entry.name))
+        .filter(|entry| !is_effective_purge_tombstone(entry))
         .count();
     if budget > MAX_EXACT_ARCHIVE_ENTRIES {
         return Err("trash purge exceeds entry limit".into());
     }
     let mut prepared = Vec::with_capacity(snapshot.len().min(16));
+    let mut retained_inodes = Vec::new();
     for entry in &snapshot {
-        if is_purge_tombstone(&entry.name) {
+        if is_effective_purge_tombstone(entry) {
             continue;
         }
         let kind = entry.mode & libc::S_IFMT as u32;
         if kind == libc::S_IFREG as u32 {
+            if is_retained_restore_recovery(&entry.name)
+                && retained_inodes.contains(&(entry.device, entry.inode))
+            {
+                continue;
+            }
+            if is_retained_restore_recovery(&entry.name) {
+                retained_inodes.push((entry.device, entry.inode));
+            }
             prepared.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
                 &trash.file,
                 trash_path,
@@ -4572,7 +4707,7 @@ fn trash_empty_in_directory(trash_path: &Path) -> Result<(), String> {
     }
     if snapshot_directory_entries(&trash.file)?
         .iter()
-        .any(|entry| !is_purge_tombstone(&entry.name))
+        .any(|entry| !is_effective_purge_tombstone(entry))
     {
         return Err("trash directory changed during permanent purge".into());
     }
@@ -7191,13 +7326,14 @@ mod tests {
             )
             .unwrap();
             archive
-                .remove_exact_after_with_hook(
+                .retire_after_restore_with_hooks(
                     || restored.verify(),
                     || {
                         std::fs::rename(&restored_path, &displaced).unwrap();
                         std::fs::create_dir(&restored_path).unwrap();
                         std::fs::write(restored_path.join("entry"), b"replacement").unwrap();
                     },
+                    || {},
                 )
                 .unwrap_err()
         };
@@ -7257,7 +7393,7 @@ mod tests {
             )
             .unwrap();
             archive
-                .remove_exact_after_with_hooks(
+                .retire_after_restore_with_hooks(
                     || restored.verify(),
                     || {},
                     || {
@@ -7279,16 +7415,86 @@ mod tests {
             .unwrap()
             .flatten()
             .find(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".aiterm-restored-archive-")
+                is_retained_restore_recovery(&entry.file_name())
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".aiterm-restored-archive-")
             })
             .expect("strict restore must retain a full-byte descriptor-bound recovery object")
             .path();
         assert!(std::fs::read(retained)
             .unwrap()
             .starts_with(SIDECAR_ARCHIVE_MAGIC));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_restore_archive_is_full_bounded_and_only_exact_purge_can_zero_it() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-retained-restore-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source_parent = root.join("sidecars");
+        let source = source_parent.join("session");
+        let trash_path = root.join("trash");
+        let restored_root = root.join("restored");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&trash_path).unwrap();
+        std::fs::create_dir_all(&restored_root).unwrap();
+        std::fs::write(source.join("entry"), b"retained recovery bytes").unwrap();
+        let verified = verified_directory_entry(&source_parent, &source).unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        archive_verified_entries_with_hooks(
+            &trash,
+            vec![(verified, "session.tasks".into())],
+            ArchiveLimits::default(),
+            || {},
+            || Ok(()),
+        )
+        .unwrap();
+        let public_archive = trash_path.join("session.tasks");
+
+        restore_sidecar_archive_and_remove_with_hook(
+            &public_archive,
+            &restored_root,
+            OsStr::new("session"),
+            || {},
+        )
+        .unwrap();
+
+        assert!(!public_archive.exists());
+        let retained = std::fs::read_dir(&trash_path)
+            .unwrap()
+            .flatten()
+            .filter(|entry| is_retained_restore_recovery(&entry.file_name()))
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), 2);
+        assert!(retained.iter().all(|entry| {
+            entry.file_name().as_bytes().len() <= 96
+                && std::fs::read(entry.path())
+                    .map(|bytes| bytes.starts_with(SIDECAR_ARCHIVE_MAGIC))
+                    .unwrap_or(false)
+        }));
+        trash
+            .purge_older_than(std::time::SystemTime::now() + std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(&trash_path)
+                .unwrap()
+                .flatten()
+                .filter(|entry| is_retained_restore_recovery(&entry.file_name()))
+                .count(),
+            2
+        );
+
+        trash_empty_in_directory(&trash_path).unwrap();
+        let final_snapshot = snapshot_directory_entries(&trash.file).unwrap();
+        assert!(final_snapshot.iter().all(is_effective_purge_tombstone));
+        assert!(final_snapshot.iter().all(|entry| {
+            !is_retained_restore_recovery(&entry.name) || entry.size == 0
+        }));
         std::fs::remove_dir_all(root).unwrap();
     }
 
