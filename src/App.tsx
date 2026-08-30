@@ -25,8 +25,6 @@ import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
-import { useLibrarian } from "./librarian";
-import { LIBRARIAN_DIR_SUFFIX } from "./ipc";
 import {
   FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
 } from "lucide-react";
@@ -484,13 +482,6 @@ export default function App() {
     setSettingsTarget({ tab: "models", provider: provider ?? null });
     setShowSettingsModal(true);
   };
-  const openLibrarian = () => {
-    setSettingsTarget({ tab: "librarian", provider: null });
-    setShowSettingsModal(true);
-  };
-  /** The librarian: names, tags and threads for the session list, written
-   *  by whatever small model Settings chose. */
-  const librarian = useLibrarian(settings.librarian, sessions);
   useEffect(() => {
     applySettings(settings);
     saveSettings(settings);
@@ -652,9 +643,7 @@ export default function App() {
 
   // List-only refresh: cheap, safe to run on every fs event.
   const refreshSessionList = useCallback(() => {
-    listSessions()
-      .then((list) => setSessions(list.filter((s) => !s.project_path.endsWith(LIBRARIAN_DIR_SUFFIX))))
-      .catch(console.error);
+    listSessions().then(setSessions).catch(console.error);
     listProjects().then(setProjects).catch(console.error);
     trashList().then(setTrashed).catch(() => setTrashed([]));
   }, []);
@@ -2150,7 +2139,6 @@ export default function App() {
         return null;
       }
     }
-    return null;
   }, [openTab]);
 
   /** The empty pane's own source/model/effort, so its button starts the same
@@ -2359,10 +2347,6 @@ export default function App() {
                 onTrashDelete={deleteTrashed}
                 onTrashEmpty={emptyTrash}
                 onTrashSessions={trashSessions}
-                librarian={librarian}
-                renameRows={settings.librarian.enabled && settings.librarian.renameRows}
-                showThreads={settings.librarian.enabled}
-                onOpenLibrarian={openLibrarian}
               />
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
@@ -2756,7 +2740,6 @@ export default function App() {
           activeProject={activeProject}
           initialTab={settingsTarget?.tab}
           focusProvider={settingsTarget?.provider}
-          librarian={librarian}
         />
       )}
     </div>

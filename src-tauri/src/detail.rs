@@ -101,7 +101,7 @@ pub async fn session_detail(session_id: String) -> Option<SessionDetail> {
     crate::run_blocking(move || session_detail_sync(session_id)).await
 }
 
-pub(crate) fn session_detail_sync(session_id: String) -> Option<SessionDetail> {
+fn session_detail_sync(session_id: String) -> Option<SessionDetail> {
     let list = crate::agents::backends();
     let (backend, path) = crate::agents::owner_in(&list, &session_id)?;
     if let Some(d) = backend.sessions().detail(&session_id) {

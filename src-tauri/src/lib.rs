@@ -11,7 +11,6 @@ pub mod grok;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;
-pub mod librarian;
 pub mod mcp;
 pub mod notify;
 pub mod opencode;
@@ -73,14 +72,6 @@ pub fn run() {
             tabs::tab_resize,
             tabs::tab_take_focus,
             tabs::tab_close,
-            librarian::librarian_state,
-            librarian::librarian_run,
-            librarian::librarian_pending,
-            librarian::librarian_forget,
-            librarian::librarian_rename_thread,
-            librarian::librarian_tidy,
-            librarian::librarian_tag,
-            librarian::librarian_default_prompts,
             agents::detect_agents,
             agents::agent_caps,
             rendercost::renderer_probe,
