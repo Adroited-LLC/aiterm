@@ -38,6 +38,15 @@ class DesktopListViewModel(private val store: PairedDesktopStore) : ViewModel() 
         }
     }
 
+    fun forget(deviceId: String) {
+        try {
+            store.remove(deviceId)
+            refresh()
+        } catch (_: PairedDesktopStoreException) {
+            _uiState.value = _uiState.value.copy(storageFailure = true)
+        }
+    }
+
     companion object {
         fun factory(store: PairedDesktopStore): ViewModelProvider.Factory = viewModelFactory {
             initializer { DesktopListViewModel(store) }
