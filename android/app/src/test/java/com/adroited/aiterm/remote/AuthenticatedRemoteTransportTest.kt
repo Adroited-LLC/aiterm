@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -378,6 +379,24 @@ class AuthenticatedRemoteTransportTest {
         runCurrent()
 
         assertTrue(socket.closed)
+        assertEquals(64, withTimeout(1_000) { transport.events.toList() }.size)
+    }
+
+    @Test
+    fun revocationWithAFullEventQueueStillTerminatesCollectors() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+        repeat(64) {
+            transport.acceptEnvelopeForTest(RemoteEventEnvelope(0, "tab.changed", byteArrayOf()))
+        }
+
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(0, "auth.revoked", byteArrayOf()))
+        runCurrent()
+
+        assertTrue(socket.closed)
+        val terminalEvents = withTimeout(1_000) { transport.events.toList() }
+        assertTrue(terminalEvents.size == 64 || terminalEvents.lastOrNull() == RemoteServerEvent.Revoked)
     }
 
     private fun authenticatedSocket() = FakeBinarySocket().apply {
