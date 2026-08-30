@@ -166,7 +166,7 @@ class AuthenticatedRemoteTransportTest {
         transport.connect()
 
         val response = async {
-            transport.request(RemoteRequest(1, "tab.list", byteArrayOf()))
+            transport.request("tab.list", byteArrayOf()).await()
         }
         runCurrent()
         socket.incoming.send(
@@ -196,19 +196,16 @@ class AuthenticatedRemoteTransportTest {
             appLock = unlockedAppLock(),
             dialer = FakeDialer(socket),
             scope = backgroundScope,
-            dispatcher = StandardTestDispatcher(testScheduler),
+            dispatcher = kotlinx.coroutines.Dispatchers.Default,
         )
         transport.connect()
 
-        val first = async(kotlinx.coroutines.Dispatchers.Default) {
-            transport.request(RemoteRequest(1, "tab.list", byteArrayOf()))
-        }
+        val first = transport.request("tab.list", byteArrayOf())
         assertTrue(socket.firstRequestEntered.await(2, TimeUnit.SECONDS))
-        val second = async(kotlinx.coroutines.Dispatchers.Default) {
-            transport.request(RemoteRequest(2, "agent.list", byteArrayOf()))
-        }
-        assertTrue(socket.secondRequestSent.await(2, TimeUnit.SECONDS))
+        val second = transport.request("agent.list", byteArrayOf())
+        assertFalse(socket.secondRequestSent.await(100, TimeUnit.MILLISECONDS))
         socket.releaseFirstRequest.countDown()
+        assertTrue(socket.secondRequestSent.await(2, TimeUnit.SECONDS))
 
         assertEquals(listOf(1, 2), socket.requestSendOrder)
         transport.close()
@@ -231,17 +228,17 @@ class AuthenticatedRemoteTransportTest {
             dispatcher = StandardTestDispatcher(testScheduler),
         )
         transport.connect()
-        val response = async { transport.request(RemoteRequest(7, "terminal.attach", byteArrayOf())) }
+        val response = transport.request("terminal.attach", byteArrayOf())
         val delivered = async { transport.events.first() }
         runCurrent()
 
-        transport.acceptEnvelopeForTest(RemoteEventEnvelope(7, "terminal.attach", byteArrayOf()))
-        transport.acceptEnvelopeForTest(RemoteEventEnvelope(7, "terminal.snapshot", terminalSnapshotFixture(7)))
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "terminal.attach", byteArrayOf()))
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "terminal.snapshot", terminalSnapshotFixture(1)))
         runCurrent()
         response.await()
         assertFalse(delivered.isCompleted)
 
-        transport.completeAttachment(7, true)
+        transport.completeAttachment(1, true)
         runCurrent()
         assertTrue(delivered.await() is RemoteServerEvent.TerminalChunk)
         transport.close()

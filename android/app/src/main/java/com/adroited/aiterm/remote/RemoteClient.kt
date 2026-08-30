@@ -3,7 +3,7 @@ package com.adroited.aiterm.remote
 import com.adroited.aiterm.terminal.TerminalScreenStore
 import com.adroited.aiterm.terminal.ApplyResult
 import com.adroited.aiterm.terminal.ScreenRow
-import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
@@ -82,7 +82,8 @@ sealed interface RemoteServerEvent {
 interface RemoteTransport {
     val events: Flow<RemoteServerEvent>
     suspend fun connect()
-    suspend fun request(request: RemoteRequest): RemoteResponse
+    /** Enqueues in caller order; the transport assigns the wire id when its writer dequeues it. */
+    fun request(kind: String, payload: ByteArray): Deferred<RemoteResponse>
     fun completeAttachment(requestId: Long, publishEvents: Boolean) = Unit
     fun close()
 }
@@ -99,7 +100,6 @@ class RemoteClient(
     val screen = screenStore.screen
     private val mutableScrollback = MutableStateFlow<List<ScreenRow>>(emptyList())
     val scrollback: StateFlow<List<ScreenRow>> = mutableScrollback.asStateFlow()
-    private val nextRequestId = AtomicLong(1)
     private val lifecycleLock = Any()
     private val selectionMutex = Mutex()
     private val transfers = linkedSetOf<String>()
@@ -480,17 +480,17 @@ class RemoteClient(
             val active = transport ?: return
             RequestContext(lifecycleGeneration, active)
         }
-        val request = RemoteRequest(nextRequestId.getAndIncrement(), kind, payload)
+        val response = requestContext.transport.request(kind, payload)
         launchOwned(requestContext.lifecycleGeneration) {
             try {
-                when (val response = requestContext.transport.request(request)) {
+                when (val result = response.await()) {
                     is RemoteResponse.Error -> accept(
                         requestContext.lifecycleGeneration,
-                        RemoteServerEvent.Failure(response.code, response.message),
+                        RemoteServerEvent.Failure(result.code, result.message),
                     )
                     is RemoteResponse.Success -> synchronized(lifecycleLock) {
                         if (isCurrent(requestContext.lifecycleGeneration, requestContext.transport)) {
-                            onSuccess(response.payload)
+                            onSuccess(result.payload)
                         }
                     }
                 }
@@ -560,18 +560,17 @@ class RemoteClient(
         if (!isUnlocked() || attachmentId == null || recoveryRequested) return
         recoveryRequested = true
         val revision = screenStore.screen.value?.revision ?: 0
-        val request = RemoteRequest(
-            nextRequestId.getAndIncrement(),
+        val response = active.request(
             "terminal.resume",
             RemoteWireCodec.encodeTerminalResumePayload(tabId, attachmentId, revision),
         )
         val generation = lifecycleGeneration
         launchOwned(generation) {
             try {
-                when (val response = active.request(request)) {
+                when (val result = response.await()) {
                     is RemoteResponse.Error -> accept(
                         generation,
-                        RemoteServerEvent.Failure(response.code, response.message),
+                        RemoteServerEvent.Failure(result.code, result.message),
                     )
                     is RemoteResponse.Success -> Unit
                 }
@@ -656,10 +655,8 @@ class RemoteClient(
             )
         }
         if (!isSelectionCurrent(selection)) return
-        val attachRequestId = nextRequestId.getAndIncrement()
-        val response = selection.transport.request(
-            RemoteRequest(attachRequestId, "terminal.attach", RemoteCommands.tab(selection.tabId)),
-        )
+        val response = selection.transport.request("terminal.attach", RemoteCommands.tab(selection.tabId)).await()
+        val attachRequestId = response.requestId
         if (response is RemoteResponse.Error) {
             selection.transport.completeAttachment(attachRequestId, false)
             accept(
@@ -705,7 +702,7 @@ class RemoteClient(
 
     private suspend fun requestIgnoringError(transport: RemoteTransport, kind: String, payload: ByteArray) {
         try {
-            transport.request(RemoteRequest(nextRequestId.getAndIncrement(), kind, payload))
+            transport.request(kind, payload).await()
         } catch (error: kotlinx.coroutines.CancellationException) {
             throw error
         } catch (_: Exception) {

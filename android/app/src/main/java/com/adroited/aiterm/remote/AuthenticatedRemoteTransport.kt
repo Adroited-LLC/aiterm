@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -43,6 +44,7 @@ class AuthenticatedRemoteTransport(
         onBufferOverflow = BufferOverflow.SUSPEND,
     )
     override val events: Flow<RemoteServerEvent> = eventChannel.receiveAsFlow()
+    private val outbound = Channel<OutboundRequest>(MAX_PENDING_REQUESTS)
 
     private val stateLock = Any()
     private val pending = LinkedHashMap<Long, PendingRequest>()
@@ -51,6 +53,9 @@ class AuthenticatedRemoteTransport(
     private var socket: RemoteBinarySocket? = null
     private var connectingSocket: RemoteBinarySocket? = null
     private var readerJob: Job? = null
+    private var writerJob: Job? = null
+    private var nextRequestId = 1L
+    private var queuedRequests = 0
     private var started = false
     private var closed = false
 
@@ -97,6 +102,7 @@ class AuthenticatedRemoteTransport(
                 connectingSocket = null
                 socket = candidate
             }
+            writerJob = scope.launch(dispatcher) { writeLoop() }
             readerJob = scope.launch(dispatcher) { readLoop(candidate) }
         } catch (error: Exception) {
             synchronized(stateLock) {
@@ -108,42 +114,77 @@ class AuthenticatedRemoteTransport(
         }
     }
 
-    override suspend fun request(request: RemoteRequest): RemoteResponse {
+    override fun request(kind: String, payload: ByteArray): CompletableDeferred<RemoteResponse> {
         val deferred = CompletableDeferred<RemoteResponse>()
-        val active = synchronized(stateLock) {
-            if (request.requestId <= 0 || pending.containsKey(request.requestId) ||
-                completed.contains(request.requestId) || pending.size >= MAX_PENDING_REQUESTS
-            ) {
-                throw RemoteProtocolException("invalid or over-bound remote request")
+        val accepted = synchronized(stateLock) {
+            if (closed || socket == null || pending.size + queuedRequests >= MAX_PENDING_REQUESTS) false
+            else {
+                queuedRequests += 1
+                true
             }
-            val current = socket ?: throw RemoteProtocolException("remote transport is disconnected")
-            pending[request.requestId] = PendingRequest(request.kind, deferred)
-            if (request.kind == "terminal.attach") heldAttachments[request.requestId] = HeldAttachment()
-            current
         }
-        val encoded = RemoteWireCodec.encodeRequest(request)
-        val sent = try {
-            active.send(encoded)
-        } finally {
-            encoded.fill(0)
+        if (!accepted || outbound.trySend(OutboundRequest(kind, payload.copyOf(), deferred)).isFailure) {
+            synchronized(stateLock) { if (accepted) queuedRequests -= 1 }
+            deferred.completeExceptionally(RemoteProtocolException("invalid or over-bound remote request"))
         }
-        if (!sent) {
+        return deferred
+    }
+
+    private suspend fun writeLoop() {
+        for (outgoing in outbound) {
+            val prepared = synchronized(stateLock) {
+                queuedRequests -= 1
+                val active = socket
+                if (closed || active == null) null
+                else {
+                    val requestId = nextRequestId++
+                    pending[requestId] = PendingRequest(outgoing.kind, outgoing.deferred)
+                    if (outgoing.kind == "terminal.attach") heldAttachments[requestId] = HeldAttachment()
+                    Triple(active, requestId, RemoteRequest(requestId, outgoing.kind, outgoing.payload))
+                }
+            }
+            if (prepared == null) {
+                outgoing.deferred.completeExceptionally(RemoteProtocolException("remote transport is disconnected"))
+                continue
+            }
+            val (active, requestId, request) = prepared
+            val encoded = RemoteWireCodec.encodeRequest(request)
+            val sent = try {
+                active.send(encoded)
+            } finally {
+                encoded.fill(0)
+                outgoing.payload.fill(0)
+            }
+            if (!sent) {
+                failPendingSend(requestId, "remote request send failed")
+                continue
+            }
+            val timeout = scope.launch(dispatcher) {
+                delay(REQUEST_TIMEOUT_MILLIS)
+                timeoutPending(requestId)
+            }
             synchronized(stateLock) {
-                pending.remove(request.requestId)
-                heldAttachments.remove(request.requestId)
+                val current = pending[requestId]
+                if (current == null) timeout.cancel() else current.timeout = timeout
             }
-            throw RemoteProtocolException("remote request send failed")
         }
-        return try {
-            withTimeout(REQUEST_TIMEOUT_MILLIS) { deferred.await() }
-        } finally {
-            val abandoned = synchronized(stateLock) {
-                val removed = pending.remove(request.requestId) != null
-                if (removed) heldAttachments.remove(request.requestId)
-                removed
-            }
-            if (abandoned) rememberCompleted(request.requestId)
+    }
+
+    private fun failPendingSend(requestId: Long, message: String) {
+        val request = synchronized(stateLock) {
+            heldAttachments.remove(requestId)
+            pending.remove(requestId)
         }
+        request?.deferred?.completeExceptionally(RemoteProtocolException(message))
+    }
+
+    private fun timeoutPending(requestId: Long) {
+        val request = synchronized(stateLock) {
+            heldAttachments.remove(requestId)
+            pending.remove(requestId)
+        } ?: return
+        rememberCompleted(requestId)
+        request.deferred.completeExceptionally(RemoteProtocolException("remote request timed out"))
     }
 
     override fun close() {
@@ -153,14 +194,23 @@ class AuthenticatedRemoteTransport(
             closed = true
             readerJob?.cancel()
             readerJob = null
+            writerJob?.cancel()
+            writerJob = null
             connectingSocket?.close()
             connectingSocket = null
             socket?.close()
             socket = null
+            pending.values.forEach { it.timeout?.cancel() }
             toFail = pending.values.map(PendingRequest::deferred)
             pending.clear()
+            queuedRequests = 0
             completed.clear()
             heldAttachments.clear()
+        }
+        while (true) {
+            val queued = outbound.tryReceive().getOrNull() ?: break
+            queued.deferred.completeExceptionally(failure)
+            queued.payload.fill(0)
         }
         toFail.forEach { it.completeExceptionally(failure) }
     }
@@ -211,6 +261,7 @@ class AuthenticatedRemoteTransport(
             protocolFailure()
         }
         if (event.kind != request.kind) protocolFailure()
+        request.timeout?.cancel()
         rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Success(event.requestId, event.kind, event.payload))
     }
@@ -222,6 +273,7 @@ class AuthenticatedRemoteTransport(
             protocolFailure()
         }
         if (request.kind != "terminal.scrollback") protocolFailure()
+        request.timeout?.cancel()
         rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Success(event.requestId, request.kind, event.payload))
     }
@@ -238,6 +290,7 @@ class AuthenticatedRemoteTransport(
             protocolFailure()
         }
         synchronized(stateLock) { heldAttachments.remove(event.requestId) }
+        request.timeout?.cancel()
         rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Error(event.requestId, error.code, error.message))
     }
@@ -296,6 +349,12 @@ class AuthenticatedRemoteTransport(
 
     private data class PendingRequest(
         val kind: String,
+        val deferred: CompletableDeferred<RemoteResponse>,
+        var timeout: Job? = null,
+    )
+    private data class OutboundRequest(
+        val kind: String,
+        val payload: ByteArray,
         val deferred: CompletableDeferred<RemoteResponse>,
     )
     private data class HeldAttachment(

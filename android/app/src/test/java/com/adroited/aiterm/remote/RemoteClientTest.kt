@@ -98,7 +98,8 @@ class RemoteClientTest {
         val transport = object : RemoteTransport {
             override val events = MutableSharedFlow<RemoteServerEvent>()
             override suspend fun connect() = throw RemoteAccessRevokedException()
-            override suspend fun request(request: RemoteRequest): RemoteResponse = error("not connected")
+            override fun request(kind: String, payload: ByteArray) =
+                CompletableDeferred<RemoteResponse>().also { it.completeExceptionally(IllegalStateException("not connected")) }
             override fun close() = Unit
         }
         val client = RemoteClient(
@@ -379,14 +380,17 @@ private class FakeRemoteTransport : RemoteTransport {
 
     override suspend fun connect() = Unit
 
-    override suspend fun request(request: RemoteRequest): RemoteResponse {
+    private var nextRequestId = 1L
+
+    override fun request(kind: String, payload: ByteArray): CompletableDeferred<RemoteResponse> {
+        val request = RemoteRequest(nextRequestId++, kind, payload)
         requests += request
-        val payload = if (request.kind == "terminal.attach") {
+        val responsePayload = if (request.kind == "terminal.attach") {
             attachedPayload("tab-1", "attachment-1")
         } else {
             byteArrayOf()
         }
-        return RemoteResponse.Success(request.requestId, request.kind, payload)
+        return CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, responsePayload))
     }
 
     override fun close() {
@@ -399,20 +403,22 @@ private class DeferredRemoteTransport(connectImmediately: Boolean = true) : Remo
     val requests = mutableListOf<RemoteRequest>()
     val allowConnect = CompletableDeferred<Unit>().also { if (connectImmediately) it.complete(Unit) }
     private val attaches = ArrayDeque<Pair<RemoteRequest, CompletableDeferred<RemoteResponse>>>()
+    private var nextRequestId = 1L
     var closed = false
 
     override suspend fun connect() {
         allowConnect.await()
     }
 
-    override suspend fun request(request: RemoteRequest): RemoteResponse {
+    override fun request(kind: String, payload: ByteArray): CompletableDeferred<RemoteResponse> {
+        val request = RemoteRequest(nextRequestId++, kind, payload)
         requests += request
         if (request.kind != "terminal.attach") {
-            return RemoteResponse.Success(request.requestId, request.kind, byteArrayOf())
+            return CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
         }
         val response = CompletableDeferred<RemoteResponse>()
         attaches += request to response
-        return response.await()
+        return response
     }
 
     fun pendingAttachCount(): Int = attaches.size
