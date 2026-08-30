@@ -660,7 +660,9 @@ async fn authenticated_roster_snapshot_is_a_bounded_complete_ordered_transfer() 
     }
 
     assert!(total > 1, "the oversized roster must exercise chunking");
-    assert!(chunks.iter().all(|chunk| chunk.transfer_id == chunks[0].transfer_id));
+    assert!(chunks
+        .iter()
+        .all(|chunk| chunk.transfer_id == chunks[0].transfer_id));
     assert_eq!(
         chunks.iter().map(|chunk| chunk.index).collect::<Vec<_>>(),
         (0..total).collect::<Vec<_>>(),
@@ -711,7 +713,10 @@ async fn sustained_registry_events_cannot_starve_a_correlated_inbound_request() 
         let mut sequence = 0u64;
         while flood_flag.load(Ordering::SeqCst) {
             flood_registry
-                .update(&flood_tab, TabUpdate::new().title(format!("title-{sequence}")))
+                .update(
+                    &flood_tab,
+                    TabUpdate::new().title(format!("title-{sequence}")),
+                )
                 .unwrap();
             sequence += 1;
             tokio::task::yield_now().await;
@@ -774,7 +779,10 @@ async fn idle_authenticated_connection_continues_past_each_registry_fairness_bud
 
     for sequence in 0..12 {
         registry
-            .update(&tab, TabUpdate::new().title(format!("idle-title-{sequence}")))
+            .update(
+                &tab,
+                TabUpdate::new().title(format!("idle-title-{sequence}")),
+            )
             .unwrap();
     }
     let received = tokio::time::timeout(Duration::from_secs(2), async {
@@ -792,7 +800,10 @@ async fn idle_authenticated_connection_continues_past_each_registry_fairness_bud
     registry.close(&tab).ok();
     gateway.stop().await.unwrap();
     std::fs::remove_dir_all(root).ok();
-    assert_eq!(received.expect("idle clients must receive registry events after the fairness turn"), 12);
+    assert_eq!(
+        received.expect("idle clients must receive registry events after the fairness turn"),
+        12
+    );
 }
 
 #[tokio::test]

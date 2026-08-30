@@ -406,15 +406,30 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState) {
         }
     };
     if proof.kind != "auth.proof"
-        || state.devices.verify_proof(&proof.device_id, &nonce, &proof.signature_der).is_err()
+        || state
+            .devices
+            .verify_proof(&proof.device_id, &nonce, &proof.signature_der)
+            .is_err()
     {
-        let _ = send_cbor(&mut socket, &AuthReply { kind: "auth.denied" }).await;
+        let _ = send_cbor(
+            &mut socket,
+            &AuthReply {
+                kind: "auth.denied",
+            },
+        )
+        .await;
         close_socket(&mut socket).await;
         return;
     }
     let revocations = state.devices.subscribe_revocations();
     if !state.devices.is_trusted(&proof.device_id) {
-        let _ = send_cbor(&mut socket, &AuthReply { kind: "auth.denied" }).await;
+        let _ = send_cbor(
+            &mut socket,
+            &AuthReply {
+                kind: "auth.denied",
+            },
+        )
+        .await;
         close_socket(&mut socket).await;
         return;
     }
@@ -1092,9 +1107,9 @@ fn project_remote_descriptor(descriptor: TabDescriptor, owns_input: bool) -> Rem
 }
 
 const MAX_REGISTRY_EVENT_BURST: usize = 8;
-const MAX_ROSTER_TRANSFER_BYTES: usize =
-    crate::tabs::MAX_TAB_ROSTER_ENTRIES * crate::tabs::MAX_TAB_DESCRIPTOR_TEXT_BYTES
-        + super::terminal::MAX_WIRE_FRAME_BYTES;
+const MAX_ROSTER_TRANSFER_BYTES: usize = crate::tabs::MAX_TAB_ROSTER_ENTRIES
+    * crate::tabs::MAX_TAB_DESCRIPTOR_TEXT_BYTES
+    + super::terminal::MAX_WIRE_FRAME_BYTES;
 
 fn state_snapshot_responses(
     revision: u64,
@@ -1196,7 +1211,8 @@ fn registry_event_responses(
                     tab: Some(live_remote_descriptor(tab, attachments)),
                     requested: None,
                 },
-            ).map(|event| vec![event])
+            )
+            .map(|event| vec![event])
         }
         TabRegistryEvent::Changed { revision, tab } => {
             let tab_id = tab.id().clone();
@@ -1210,7 +1226,8 @@ fn registry_event_responses(
                     tab: Some(live_remote_descriptor(tab, attachments)),
                     requested: None,
                 },
-            ).map(|event| vec![event])
+            )
+            .map(|event| vec![event])
         }
         TabRegistryEvent::Removed {
             revision,
@@ -1226,7 +1243,8 @@ fn registry_event_responses(
                 tab: None,
                 requested: Some(requested),
             },
-        ).map(|event| vec![event]),
+        )
+        .map(|event| vec![event]),
     }
 }
 
@@ -1408,9 +1426,7 @@ impl RemoteServices {
                     None if matches.len() > 1 => return Err("session.tab_ambiguous"),
                     None => matches[0].id().clone(),
                 };
-                self.terminal
-                    .close(&tab_id)
-                    .map_err(|error| error.code())?;
+                self.terminal.close(&tab_id).map_err(|error| error.code())?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "session.close",
@@ -1506,10 +1522,7 @@ impl RemoteServices {
                             .clone()
                             .unwrap_or_else(|| format!("agent:{}", uuid::Uuid::new_v4()));
                         let launch = launch_from_plan(title, cwd, slot_id, plan.clone(), size);
-                        let tab_id = self
-                            .terminal
-                            .open(launch)
-                            .map_err(|error| error.code())?;
+                        let tab_id = self.terminal.open(launch).map_err(|error| error.code())?;
                         Ok(DispatchOutcome::frames(vec![response(
                             request_id,
                             "agent.action",
@@ -2905,53 +2918,67 @@ async fn run_authenticated_socket(
     let mut registry_event_burst = 0usize;
     'socket: loop {
         reap_finished_attachments(&mut attachments, &mut closed_attachments).await;
-        let message = tokio::select! {
-            biased;
-            changed = revocations.changed() => {
-                if changed.is_err() || !devices.is_trusted(&device_id) {
-                    if let Ok(event) = response(0, "auth.revoked", &()) {
-                        let _ = enqueue_event(&outbound, event).await;
+        let fair_inbound = if registry_event_burst >= MAX_REGISTRY_EVENT_BURST {
+            registry_event_burst = 0;
+            match inbound_messages.try_recv() {
+                Ok(message) => Some(message),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        } else {
+            None
+        };
+        let message = if fair_inbound.is_some() {
+            fair_inbound
+        } else {
+            tokio::select! {
+                biased;
+                changed = revocations.changed() => {
+                    if changed.is_err() || !devices.is_trusted(&device_id) {
+                        if let Ok(event) = response(0, "auth.revoked", &()) {
+                            let _ = enqueue_event(&outbound, event).await;
+                        }
+                        break;
                     }
-                    break;
+                    continue;
                 }
-                continue;
-            }
-            completed = completed_attachments.recv() => {
-                if let Some(id) = completed {
-                    if let Some(attachment) = attachments.remove(&id) {
-                        let tab_id = attachment.tab_id.clone();
-                        let lifecycle = attachment.lifecycle.clone();
-                        let transfers = attachment.transfers.clone();
-                        shutdown_attachment(attachment).await;
-                        closed_attachments.insert(id, tab_id, lifecycle, transfers);
+                completed = completed_attachments.recv() => {
+                    if let Some(id) = completed {
+                        if let Some(attachment) = attachments.remove(&id) {
+                            let tab_id = attachment.tab_id.clone();
+                            let lifecycle = attachment.lifecycle.clone();
+                            let transfers = attachment.transfers.clone();
+                            shutdown_attachment(attachment).await;
+                            closed_attachments.insert(id, tab_id, lifecycle, transfers);
+                        }
                     }
+                    continue;
                 }
-                continue;
-            }
-            registry_event = registry_events.recv_async(), if registry_event_burst < MAX_REGISTRY_EVENT_BURST => {
-                let Some(registry_event) = registry_event else { break; };
-                let Ok(events) = registry_event_responses(registry_event, &attachments) else {
-                    let _ = cancelled.send(true);
-                    let _ = outbound.controls.try_send(EgressControl::Close);
-                    break;
-                };
-                registry_event_burst = registry_event_burst.saturating_add(events.len());
-                for event in events {
-                    if enqueue_event(&outbound, event).await.is_err() {
-                        break 'socket;
+                registry_event = registry_events.recv_async(), if registry_event_burst < MAX_REGISTRY_EVENT_BURST => {
+                    let Some(registry_event) = registry_event else { break; };
+                    let Ok(events) = registry_event_responses(registry_event, &attachments) else {
+                        let _ = cancelled.send(true);
+                        let _ = outbound.controls.try_send(EgressControl::Close);
+                        break;
+                    };
+                    registry_event_burst = registry_event_burst.saturating_add(events.len());
+                    for event in events {
+                        if enqueue_event(&outbound, event).await.is_err() {
+                            break 'socket;
+                        }
                     }
+                    continue;
                 }
-                continue;
+                message = inbound_messages.recv() => {
+                    registry_event_burst = 0;
+                    message
+                },
+                changed = cancellation.changed() => {
+                    if changed.is_err() || *cancellation.borrow() { break; }
+                    continue;
+                }
+                _ = reap_tick.tick() => continue,
             }
-            message = inbound_messages.recv() => {
-                registry_event_burst = 0;
-                message
-            },
-            changed = cancellation.changed() => {
-                if changed.is_err() || *cancellation.borrow() { break; }
-                continue;
-            }
-            _ = reap_tick.tick() => continue,
         };
         let Some(message) = message else {
             break;
@@ -2979,12 +3006,9 @@ async fn run_authenticated_socket(
                         } else {
                             (error.code(), error.message())
                         };
-                        if enqueue_event(
-                            &outbound,
-                            error_response(request_id, code, message),
-                        )
-                        .await
-                        .is_err()
+                        if enqueue_event(&outbound, error_response(request_id, code, message))
+                            .await
+                            .is_err()
                         {
                             break;
                         }
