@@ -210,10 +210,12 @@ class AuthenticatedRemoteTransport(
         request.deferred.completeExceptionally(RemoteProtocolException("remote request timed out"))
     }
 
-    override fun close() {
+    override fun close() = closeWithOutcome(null)
+
+    private fun closeWithOutcome(outcome: RemoteTransportTerminalOutcome?) {
         val failure = RemoteProtocolException("remote transport disconnected")
-        val toFail: List<CompletableDeferred<RemoteResponse>>
-        synchronized(stateLock) {
+        val toFail = synchronized(stateLock) {
+            if (closed) return
             closed = true
             outbound.close()
             readerJob?.cancel()
@@ -225,12 +227,13 @@ class AuthenticatedRemoteTransport(
             socket?.close()
             socket = null
             pending.values.forEach { it.timeout?.cancel() }
-            toFail = acceptedRequests.toList()
+            val accepted = acceptedRequests.toList()
             acceptedRequests.clear()
             pending.clear()
             queuedRequests = 0
             completed.clear()
             heldAttachments.clear()
+            accepted
         }
         while (true) {
             val queued = outbound.tryReceive().getOrNull() ?: break
@@ -238,7 +241,7 @@ class AuthenticatedRemoteTransport(
             queued.payload.fill(0)
         }
         toFail.forEach { it.completeExceptionally(failure) }
-        eventChannel.close()
+        eventChannel.close(outcome?.let(::RemoteTransportTerminatedException))
     }
 
     private suspend fun readLoop(active: RemoteBinarySocket) {
@@ -247,8 +250,8 @@ class AuthenticatedRemoteTransport(
         } catch (_: CancellationException) {
             // Explicit close/lock owns teardown.
         } catch (error: Exception) {
-            eventChannel.trySend(
-                RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+            closeWithOutcome(
+                RemoteTransportTerminalOutcome.Recoverable(error.message ?: "Connection ended"),
             )
         } finally {
             if (synchronized(stateLock) { !closed }) close()
@@ -266,11 +269,7 @@ class AuthenticatedRemoteTransport(
             }
             "auth.revoked" -> {
                 if (event.requestId != 0L) protocolFailure()
-                try {
-                    eventChannel.trySend(RemoteServerEvent.Revoked)
-                } finally {
-                    close()
-                }
+                closeWithOutcome(RemoteTransportTerminalOutcome.Revoked)
             }
             "error" -> acceptError(event)
             "session.changed", "agent.changed", "tab.changed", "terminal.exited",

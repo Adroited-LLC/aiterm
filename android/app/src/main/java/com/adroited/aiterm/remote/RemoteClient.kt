@@ -79,6 +79,20 @@ sealed interface RemoteServerEvent {
     data object Revoked : RemoteServerEvent
 }
 
+sealed interface RemoteTransportTerminalOutcome {
+    data class Recoverable(val message: String) : RemoteTransportTerminalOutcome
+    data object Revoked : RemoteTransportTerminalOutcome
+}
+
+class RemoteTransportTerminatedException(
+    val outcome: RemoteTransportTerminalOutcome,
+) : Exception(
+    when (outcome) {
+        is RemoteTransportTerminalOutcome.Recoverable -> outcome.message
+        RemoteTransportTerminalOutcome.Revoked -> "remote access was revoked"
+    },
+)
+
 interface RemoteTransport {
     val events: Flow<RemoteServerEvent>
     suspend fun connect()
@@ -147,7 +161,24 @@ class RemoteClient(
                 return false
             }
             val collector = scope.launch(dispatcher, start = CoroutineStart.LAZY) {
-                candidate.events.collect { event -> accept(generation, event) }
+                try {
+                    candidate.events.collect { event -> accept(generation, event) }
+                    acceptTerminalOutcome(
+                        generation,
+                        candidate,
+                        RemoteTransportTerminalOutcome.Recoverable("Connection ended"),
+                    )
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
+                } catch (error: RemoteTransportTerminatedException) {
+                    acceptTerminalOutcome(generation, candidate, error.outcome)
+                } catch (error: Exception) {
+                    acceptTerminalOutcome(
+                        generation,
+                        candidate,
+                        RemoteTransportTerminalOutcome.Recoverable(error.message ?: "Connection ended"),
+                    )
+                }
             }
             val published = synchronized(lifecycleLock) {
                 if (!isCurrent(generation, candidate)) {
@@ -419,6 +450,40 @@ class RemoteClient(
 
     internal fun acceptForTest(event: RemoteServerEvent) = accept(null, event)
 
+    private fun acceptTerminalOutcome(
+        expectedGeneration: Long,
+        candidate: RemoteTransport,
+        outcome: RemoteTransportTerminalOutcome,
+    ) {
+        var closing: ClosingTransport? = null
+        var reconnect = false
+        synchronized(lifecycleLock) {
+            if (!isCurrent(expectedGeneration, candidate)) return
+            reconnectJob?.cancel()
+            reconnectJob = null
+            closing = detachTransportLocked()
+            clearActiveTerminalLocked()
+            when (outcome) {
+                is RemoteTransportTerminalOutcome.Recoverable -> {
+                    mutableState.value = mutableState.value.copy(
+                        connection = ConnectionState.Reconnecting,
+                        focus = FocusOwner.Unowned,
+                        readOnly = true,
+                        showTakeFocus = false,
+                        pendingTransfers = 0,
+                        lastError = outcome.message,
+                    )
+                    reconnect = true
+                }
+                RemoteTransportTerminalOutcome.Revoked -> {
+                    mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
+                }
+            }
+        }
+        closing?.let(::finishTransportClose)
+        if (reconnect) scheduleReconnect()
+    }
+
     private fun accept(expectedGeneration: Long?, event: RemoteServerEvent) {
         var closing: ClosingTransport? = null
         var reconnect = false
@@ -471,6 +536,7 @@ class RemoteClient(
                     )
                     if (disconnected) {
                         closing = detachTransportLocked()
+                        clearActiveTerminalLocked()
                         reconnect = true
                     }
                 }
@@ -478,14 +544,7 @@ class RemoteClient(
                     reconnectJob?.cancel()
                     reconnectJob = null
                     closing = detachTransportLocked()
-                    transfers.clear()
-                    terminalAssembler.clear()
-                    rosterAssembler.clear()
-                    recoveryRequested = false
-                    activeAttachmentId = null
-                    activeAttachmentTabId = null
-                    screenStore.clear()
-                    mutableScrollback.value = emptyList()
+                    clearActiveTerminalLocked()
                     mutableState.value = RemoteClientState(connection = ConnectionState.Revoked)
                 }
             }
@@ -673,6 +732,18 @@ class RemoteClient(
         activeAttachmentId = null
         activeAttachmentTabId = null
         return ClosingTransport(active, jobs)
+    }
+
+    private fun clearActiveTerminalLocked() {
+        transfers.clear()
+        terminalAssembler.clear()
+        rosterAssembler.clear()
+        recoveryRequested = false
+        scrollbackRequest = null
+        activeAttachmentId = null
+        activeAttachmentTabId = null
+        screenStore.clear()
+        mutableScrollback.value = emptyList()
     }
 
     private fun finishTransportClose(closing: ClosingTransport) {

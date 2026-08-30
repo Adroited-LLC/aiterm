@@ -456,7 +456,12 @@ class AuthenticatedRemoteTransportTest {
         runCurrent()
 
         assertTrue(socket.closed)
-        assertEquals(64, withTimeout(1_000) { transport.events.toList() }.size)
+        val delivered = mutableListOf<RemoteServerEvent>()
+        val terminal = runCatching {
+            withTimeout(1_000) { transport.events.toList(delivered) }
+        }.exceptionOrNull() as RemoteTransportTerminatedException
+        assertEquals(64, delivered.size)
+        assertTrue(terminal.outcome is RemoteTransportTerminalOutcome.Recoverable)
     }
 
     @Test
@@ -472,8 +477,12 @@ class AuthenticatedRemoteTransportTest {
         runCurrent()
 
         assertTrue(socket.closed)
-        val terminalEvents = withTimeout(1_000) { transport.events.toList() }
-        assertTrue(terminalEvents.size == 64 || terminalEvents.lastOrNull() == RemoteServerEvent.Revoked)
+        val delivered = mutableListOf<RemoteServerEvent>()
+        val terminal = runCatching {
+            withTimeout(1_000) { transport.events.toList(delivered) }
+        }.exceptionOrNull() as RemoteTransportTerminatedException
+        assertEquals(64, delivered.size)
+        assertEquals(RemoteTransportTerminalOutcome.Revoked, terminal.outcome)
     }
 
     private fun authenticatedSocket() = FakeBinarySocket().apply {
