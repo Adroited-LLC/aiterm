@@ -2,7 +2,7 @@
 
 ## Status
 
-`DONE — Fix Round 1 automated verification complete; live first-pair smoke is user-interactive`
+`DONE — Fix Round 2 automated verification complete; live first-pair smoke is user-interactive`
 
 Task 9 now has the seven binding Rust prerequisites, a remembered-device
 authenticated Android WebSocket client, descriptor-bound roster and terminal
@@ -352,4 +352,120 @@ adb -s 10.0.0.115:37713 shell am force-stop com.adroited.aiterm
 adb -s 10.0.0.115:37713 shell am start -W \
   -n com.adroited.aiterm/.MainActivity
 Status: ok; LaunchState: COLD; TotalTime: 746 ms
+```
+
+## Fix Round 2
+
+All review claims were reproduced or confirmed against the current code before
+implementation. The seven automated findings are fixed; the live pairing smoke
+remains explicitly user-interactive.
+
+1. **CRITICAL archive recovery cleanup — accepted and fixed.** The durable
+   descriptor-derived recovery link now remains until the final public archive
+   binding validates. A swap at that boundary fails closed and retains the
+   recovery object. Covering test: `src-tauri/src/sessions.rs`,
+   `archive_recovery_survives_public_unlink_at_final_release_boundary`.
+   Focused command: `CARGO_TARGET_DIR=<isolated> cargo test --lib
+   archive_recovery_survives_public_unlink_at_final_release_boundary --
+   --exact --nocapture`; output: `1 passed, 0 failed`.
+2. **CRITICAL restore validation-to-truncate — accepted and redesigned.** Linux
+   offers no atomic multi-path validation-and-deletion transaction. Strict
+   restore therefore retains a bounded-name, descriptor-bound full-byte hidden
+   recovery object, known to the internal recovery contract and removable only
+   by explicit exact-object purge. Destination bindings remain held and are
+   revalidated through archive capture. Covering tests in `sessions.rs`:
+   `strict_restore_retains_full_archive_when_destination_swaps_at_retirement_boundary`
+   and `retained_restore_archive_is_full_bounded_and_only_exact_purge_can_zero_it`.
+   Focused command: `CARGO_TARGET_DIR=<isolated> cargo test --lib
+   strict_restore_retains_full_archive_when_destination_swaps_at_retirement_boundary
+   -- --exact --nocapture`; output: `1 passed, 0 failed`. The disk cost is
+   intentional: successful restore retains recovery bytes and directory
+   metadata so a concurrent pathname mutation cannot cause unrecoverable loss.
+3. **IMPORTANT full event queue close — accepted and fixed.** Transport close
+   now closes `eventChannel`; termination does not depend on successfully
+   enqueueing a failure or revocation event into an already-full queue. Queued
+   events drain and collectors then complete. Covering tests in
+   `AuthenticatedRemoteTransportTest.kt`:
+   `protocolFailureClosesEvenWhenFailureNotificationCannotBeQueued` and
+   `revocationWithAFullEventQueueStillTerminatesCollectors`. Command:
+   `./gradlew :app:testDebugUnitTest --tests
+   com.adroited.aiterm.remote.AuthenticatedRemoteTransportTest`; output:
+   `BUILD SUCCESSFUL`, with both tests passing.
+4. **IMPORTANT scrollback selection cleanup — accepted and fixed.** Tab
+   selection clears ownership of the prior tab's in-flight scrollback request;
+   late A chunks cannot affect B or block B paging. Covering test:
+   `RemoteClientTest.kt`,
+   `selectingBDiscardsAPagingTransactionAndAllowsBPaging`. Command:
+   `./gradlew :app:testDebugUnitTest --tests
+   com.adroited.aiterm.remote.RemoteClientTest`; output: `BUILD SUCCESSFUL`.
+5. **IMPORTANT render-area sizing — accepted and fixed.** The exact padded
+   `BoxWithConstraints` content bounds now drive both advertised viewport
+   dimensions and drawing. Covering instrumentation test:
+   `TerminalScreenTest.kt`,
+   `advertisedViewportUsesTheFontScaledPaddedRenderBoundsAcrossRotation`.
+   Focused command: `ANDROID_SERIAL=10.0.0.115:37713 ./gradlew
+   :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.adroited.aiterm.ui.TerminalScreenTest#advertisedViewportUsesTheFontScaledPaddedRenderBoundsAcrossRotation`;
+   output: `1/1 passed on Pixel 10 Pro XL; BUILD SUCCESSFUL`.
+6. **IMPORTANT live smoke — USER-INTERACTIVE.** Live QR enrollment, desktop
+   approval, device unlock, Unicode/input, resize, focus, reconnect, and revoke
+   still require the user. No automation weakened credentials, biometric/device
+   credential policy, approval, trust, or remote-access settings.
+7. **IMPORTANT outbound enqueue/close race — accepted and fixed.** Request
+   acceptance and outbound enqueue are one `stateLock`-linearized transition;
+   close closes the outbound channel and exceptionally completes every accepted
+   deferred. Covering test: `AuthenticatedRemoteTransportTest.kt`,
+   `closeRacingAnAcceptedEnqueueCompletesTheDeferredExceptionally`. Command:
+   the focused transport-test command in item 3; output: `BUILD SUCCESSFUL`.
+8. **IMPORTANT transport/client lock inversion — accepted and fixed.** The
+   writer invokes assignment callbacks only after releasing transport state;
+   client teardown detaches under `lifecycleLock` but cancels jobs and closes
+   transport only after releasing it. Covering tests:
+   `AuthenticatedRemoteTransportTest.kt`,
+   `requestAssignmentCallbackNeverRunsUnderTransportStateLock`, and
+   `RemoteClientTest.kt`,
+   `disconnectClosesTransportOutsideTheClientLifecycleLock`. Commands: the
+   focused transport and client commands above; output: `BUILD SUCCESSFUL`.
+
+Previously addressed serialized request IDs, exact source/tombstone purge,
+fair registry budgeting, and held attachment drain/correlation remain covered
+by the aggregate suites. Mouse is still a future typed-contract addition; the
+eager mixed drawer remains the accepted deferred minor.
+
+### Fresh Fix Round 2 verification
+
+Rust commands used the fresh isolated target
+`/tmp/aiterm-task9-round2.VMrDFy`. The unsafe real-HOME backend target was not
+run, HOME was not repurposed, preserved dumps were not inspected, and
+`src/App.css` was not changed.
+
+```text
+CARGO_TARGET_DIR=/tmp/aiterm-task9-round2.VMrDFy \
+  cargo test --lib -- --test-threads=1
+432 passed, 0 failed, 7 ignored (439 total)
+
+CARGO_TARGET_DIR=/tmp/aiterm-task9-round2.VMrDFy cargo test \
+  --test remote_auth --test remote_desktop --test remote_operations \
+  --test remote_protocol --test remote_server --test remote_terminal \
+  --test tab_registry --test terminal_screen -- --test-threads=1
+210 passed, 0 failed
+
+CARGO_TARGET_DIR=/tmp/aiterm-task9-round2.VMrDFy cargo check
+passed
+
+./gradlew :app:testDebugUnitTest --rerun-tasks
+111 passed, 0 failed, 0 errors, 0 skipped; BUILD SUCCESSFUL
+
+./gradlew :app:assembleDebug :app:lintDebug
+assemble passed; lint passed; BUILD SUCCESSFUL
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:connectedDebugAndroidTest
+17/17 passed on Pixel 10 Pro XL; BUILD SUCCESSFUL
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:installDebug
+Installed on exactly one device; BUILD SUCCESSFUL
+
+adb -s 10.0.0.115:37713 shell am force-stop com.adroited.aiterm
+adb -s 10.0.0.115:37713 shell am start -W \
+  -n com.adroited.aiterm/.MainActivity
+Status: ok; Activity: com.adroited.aiterm/.MainActivity
 ```

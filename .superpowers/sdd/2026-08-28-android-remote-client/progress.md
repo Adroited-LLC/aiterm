@@ -19,8 +19,8 @@
 - Device ruling: the only permitted ADB target is `10.0.0.115:37713`, verified as Google Pixel 10 Pro XL, API 37, 1344×2992. Every ADB command must use `-s 10.0.0.115:37713`; Gradle instrumentation must set `ANDROID_SERIAL=10.0.0.115:37713`. Never use an unqualified device command because a watch may also advertise wireless debugging.
 - Ruling: Task 9 uses the typed `TerminalScreenStore` snapshot/diff contract documented in the plan; references to a native byte emulator are superseded. Cost if wrong: Android rendering would be implemented against an obsolete raw-byte architecture forbidden by the spec.
 - Safety ruling: never run the desktop backend target against real HOME and never repurpose HOME. The KDE interactive desktop smoke remains human-only.
-- Task 9 is complete through `c692f62`: all seven mandatory Rust
-  prerequisites are closed; Android has unlock-gated pinned authentication,
+- Task 9 implementation is complete through `c692f62` and its formal review
+  loop is active: all seven mandatory Rust prerequisites are closed; Android has unlock-gated pinned authentication,
   bounded reconnect/correlation, descriptor and terminal transfer recovery,
   generation-owned cancellation, linearized lock/signing, bounded
   attach-event publication, exact tab/attachment selection and stale detach
@@ -29,8 +29,29 @@
   Fresh evidence is 425 Rust library tests/7 ignored, 209 safe Rust integrations,
   75 desktop UI tests/build, 98 Android JVM tests, and 14/14 pinned-Pixel
   instrumentation tests; assemble, lint, install, and cold launch also pass.
-  Only the user-interactive live pairing smoke remains a handoff step. Mouse reporting remains a future
-  typed Rust-mode/RPC addition; Android does not synthesize raw mouse bytes.
+  Mouse reporting remains a future typed Rust-mode/RPC addition; Android does
+  not synthesize raw mouse bytes.
+- Task 9: minor (deferred): the eager mixed drawer can push session actions
+  offscreen near the 128-tab bound; use one lazy drawer list in a later polish
+  pass unless another Task 9 fix naturally touches it.
+- Task 9: fix round 1/5 (4 addressed, 8 open — archive recovery cleanup
+  timing; restore check-to-truncate; full-queue terminal notification;
+  scrollback selection cleanup; render-area sizing; user-interactive live
+  smoke; outbound enqueue/close race; transport/client lock inversion;
+  commits `ed8f0a0`..`49b2894`).
+- Binding strict-restore ruling: Linux cannot atomically validate multiple
+  destination path bindings and destructively retire an archive. Successful
+  strict restore therefore retains a bounded-name, descriptor-bound, full-byte
+  hidden recovery object discoverable by the internal restore contract. It is
+  removable only by explicit exact-object purge. Cost: retained recovery data
+  and directory metadata consume disk after restore; benefit: concurrent path
+  mutation cannot turn a reported restore into unrecoverable transcript loss.
+- Task 9: fix round 2/5 (7 automated findings addressed, 1 deliberately open —
+  the user-interactive live QR/Unicode/resize/reconnect/focus/revoke smoke;
+  commits `397df02`..`df5a9f4`). Fresh evidence: 432 Rust library tests/7
+  ignored, 210 safe Rust integrations, 111 Android JVM tests, and 17/17
+  pinned-Pixel instrumentation tests; cargo check, assemble, lint, install,
+  and cold launch also pass.
 
 ## Task 5 review breaker rulings
 
