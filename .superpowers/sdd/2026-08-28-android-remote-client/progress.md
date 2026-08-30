@@ -70,8 +70,17 @@
   deferred minor and mouse remains the future typed-contract gap.
 - Task 9 automated review gate: clean through `4ced20b`; all automated
   Critical/Important findings are addressed with no new breakage. Task 9
-  remains pending only the security-sensitive, user-interactive live pairing
-  and interoperability smoke.
+  subsequently exposed a live TLS hostname-coverage defect during the
+  security-sensitive, user-interactive pairing smoke.
+- Task 9: fix round 5/5 (live stale-certificate SAN defect addressed;
+  user-interactive QR/approval/Unicode/resize/focus/reconnect/revoke retry still
+  open; RED `00b1ddb`, GREEN `54ea0c1`). Listener start now freezes one bounded
+  host list for both certificate and invites, and certificate refresh retains
+  the existing private key/SPKI pin with fail-closed validation and durable
+  atomic persistence. Fresh evidence: frozen-state unit 1/1, remote desktop and
+  server 50/50, 435 Rust library tests/7 ignored, 214 safe Rust integrations,
+  and `cargo check` passed. Task 9 is not complete until the rebuilt desktop and
+  pinned Pixel pass the full live interoperability smoke.
 
 ## Task 5 review breaker rulings
 

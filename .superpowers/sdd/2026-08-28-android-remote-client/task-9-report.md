@@ -2,7 +2,7 @@
 
 ## Status
 
-`DONE — Fix Round 4 automated verification complete; live first-pair smoke is user-interactive`
+`PENDING — Fix Round 5 automated verification complete; live pairing/interoperability retry required`
 
 Task 9 now has the seven binding Rust prerequisites, a remembered-device
 authenticated Android WebSocket client, descriptor-bound roster and terminal
@@ -659,3 +659,168 @@ adb -s 10.0.0.115:37713 shell am start -W \
   -n com.adroited.aiterm/.MainActivity
 Status: ok; LaunchState: COLD; TotalTime: 826 ms
 ```
+
+## Fix Round 5
+
+The live first-pair attempt exposed one desktop TLS identity interoperability
+defect after the automated round-four gate. The secure desktop fix is committed
+and verified; Task 9 remains pending deployment and a complete live retry.
+
+### Root-cause evidence
+
+- The desktop first bound `192.168.1.99` and persisted a self-signed gateway
+  certificate with SANs `IP Address:192.168.1.99, DNS:localhost`.
+- The listener was later rebound to the phone-reachable `10.0.0.151`. The Pixel
+  at `10.0.0.115` could ping the desktop and establish TCP to port `8443`, but
+  Android correctly reported `UNREACHABLE`. `openssl s_client` against the live
+  listener proved its certificate still omitted `10.0.0.151`.
+- `remote_start` supplied only the selected bind IP to
+  `TlsIdentity::load_or_create`, which returned an existing valid identity
+  without refreshing its certificate. `remote_begin_pairing` independently
+  rescanned interfaces later and advertised the bound IP plus then-current
+  local addresses. The QR could therefore name hosts absent from the live
+  certificate. Android retained OkHttp's default hostname verifier, so its
+  refusal was the intended secure outcome.
+
+### Secure correction
+
+- Listener start now creates one preferred-order host vector: the selected bind
+  address first, followed by every current shareable LAN/VPN address, with
+  exact-IP deduplication. More than 16 unique hosts fails validation instead of
+  creating an unbounded certificate or QR. `PairingUri` also rejects more than
+  16 host fields.
+- That vector is passed unchanged to `TlsIdentity` and stored in `RemoteState`
+  for the gateway lifetime. `remote_begin_pairing` builds its payload only from
+  this stored vector and never calls `local_addresses`; `remote_stop` clears it.
+  An interface change therefore takes effect only after an explicit listener
+  restart, keeping certificate SANs and every invite identical.
+- A complete existing certificate/key pair is first parsed and validated by
+  the established rustls server-config path, including public-key matching.
+  Malformed, incomplete, or mismatched identity state returns an error before
+  any write. A valid certificate is reissued only when rustls hostname
+  validation finds a required IP or `localhost` missing, using the exact
+  existing PKCS#8 private key. The SHA-256 SPKI fingerprint and key bytes remain
+  unchanged, so remembered phones keep the same pin.
+- The validated replacement certificate is persisted as a same-directory
+  owner-only temporary file: create-new mode `0600`, write, file `fsync`, atomic
+  rename over the certificate, then parent-directory `fsync` on Unix. Failure
+  cleanup removes and syncs the temp namespace where possible. The private key
+  is never opened for writing during refresh, and a write/rename failure leaves
+  the prior certificate/key pair intact.
+- The rustls listener remains explicitly TLS 1.3-only. No Android trust,
+  hostname-verification, pinning, frame-limit, or authentication code changed.
+
+### TDD checkpoints
+
+RED checkpoint `00b1ddb` was followed by `sync`. The direct `x509-parser 0.18`
+dev dependency supports real certificate SAN assertions.
+
+```text
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-red.SzEJum \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 --test remote_server \
+  tls_identity_refreshes_certificate_sans_without_rotating_the_spki_pin \
+  -- --exact --nocapture
+FAILED: reissuing for a rebound listener must add the phone-reachable IP SAN
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-red.SzEJum \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 --lib \
+  pairing_invite_hosts_are_the_exact_frozen_start_host_list \
+  -- --exact --nocapture
+compile failed as intended: advertised_hosts function, Inner.advertised_hosts,
+and Inner::pairing_payload were absent
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-red.SzEJum \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 \
+  --test remote_server tls_identity_rejects_more_than_sixteen_unique_advertised_hosts \
+  -- --exact --nocapture
+FAILED: an unbounded certificate identity must be rejected
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-red.SzEJum \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 \
+  --test remote_desktop a_pairing_uri_refuses_more_than_sixteen_advertised_hosts \
+  -- --exact --nocapture
+FAILED: the trust payload parser must not accept an unbounded host list
+```
+
+The fail-closed characterization
+`mismatched_existing_certificate_and_key_fail_closed_before_san_refresh`
+already passed at RED and remained green:
+
+```text
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-red.SzEJum \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 --test remote_server \
+  mismatched_existing_certificate_and_key_fail_closed_before_san_refresh \
+  -- --exact --nocapture
+1 passed, 0 failed
+```
+
+GREEN checkpoint `54ea0c1` was followed by `sync`.
+
+```text
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-red.SzEJum \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 \
+  --lib pairing_invite_hosts_are_the_exact_frozen_start_host_list -- --nocapture
+1 passed, 0 failed
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-red.SzEJum \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 \
+  --test remote_desktop --test remote_server -- --test-threads=1
+remote_desktop: 8 passed, 0 failed
+remote_server: 42 passed, 0 failed
+```
+
+### Fresh Fix Round 5 verification
+
+All final Rust commands used the newly created isolated target
+`/var/tmp/aiterm-task9-round5-green.FfeNvE`, with incremental artifacts and
+debug information disabled. The unsafe real-HOME backend target was not run,
+HOME was not repurposed, preserved dumps were not inspected, and no desktop
+listener, trust store, Android source, or `src/App.css` was touched.
+
+```text
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-green.FfeNvE \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 --lib \
+  pairing_invite_hosts_are_the_exact_frozen_start_host_list -- --nocapture
+1 passed, 0 failed
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-green.FfeNvE \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 \
+  --test remote_desktop --test remote_server -- --test-threads=1
+remote_desktop: 8 passed, 0 failed
+remote_server: 42 passed, 0 failed
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-green.FfeNvE \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 --lib -- --test-threads=1
+435 passed, 0 failed, 7 ignored (442 total)
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-green.FfeNvE \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  cargo test -j 2 \
+  --test remote_auth --test remote_desktop --test remote_operations \
+  --test remote_protocol --test remote_server --test remote_terminal \
+  --test tab_registry --test terminal_screen -- --test-threads=1
+214 passed, 0 failed
+
+CARGO_TARGET_DIR=/var/tmp/aiterm-task9-round5-green.FfeNvE \
+  CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 cargo check -j 2
+passed
+```
+
+An initial disposable target under `/tmp` hit that filesystem's quota during
+dependency compilation before a test ran. It was deleted, and every required
+RED/GREEN/final result above was rerun successfully under `/var/tmp`.
+
+The desktop must now be rebuilt/restarted so its existing private key can issue
+a certificate covering the frozen current hosts. Live QR scan and approval,
+Unicode/input, resize/rotation, focus takeover, disconnect/reconnect, and device
+revocation must all be retried before Task 9 can be marked complete.
