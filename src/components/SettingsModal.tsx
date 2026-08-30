@@ -305,6 +305,20 @@ export default function SettingsModal({
                     ))}
                   </div>
                 </Row>
+                <Row label="Time zone" desc="The zone clock times are written in — useful when this machine is read from somewhere else">
+                  <select
+                    className="srow-select"
+                    value={settings.timeZone}
+                    onChange={(e) => set({ timeZone: e.target.value })}
+                  >
+                    <option value="">This machine&apos;s zone</option>
+                    <option value="America/New_York">Eastern (New York)</option>
+                    <option value="America/Chicago">Central (Chicago)</option>
+                    <option value="America/Denver">Mountain (Denver)</option>
+                    <option value="America/Los_Angeles">Pacific (Los Angeles)</option>
+                    <option value="UTC">UTC</option>
+                  </select>
+                </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
                     <button

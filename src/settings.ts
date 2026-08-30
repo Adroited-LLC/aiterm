@@ -1,5 +1,6 @@
 /** App-wide appearance settings: theme, fonts, per-panel sizing. */
 import type { TimeFormat } from "./timefmt";
+import { setDisplayZone } from "./timefmt";
 
 export interface PanelScales {
   sessions: number;
@@ -73,6 +74,8 @@ export interface AppSettings {
   /** How "last active" and the like are written: "3h ago", or the clock
    *  time. See `timefmt.ts`. */
   timeFormat: TimeFormat;
+  /** IANA zone id stamps are written in; "" = this machine's own. */
+  timeZone: string;
   librarian: LibrarianSettings;
 }
 
@@ -91,6 +94,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
   iconSize: 16,
   timeFormat: "relative",
+  timeZone: "",
   librarian: {
     enabled: false,
     engine: "claude",
@@ -291,6 +295,7 @@ const MONO_FALLBACK = `"JetBrainsMono Nerd Font", "JetBrains Mono", "Fira Code",
 
 /** Push the current theme + fonts into CSS custom properties on :root. */
 export function applySettings(s: AppSettings) {
+  setDisplayZone(s.timeZone);
   const t = themeById(s.themeId);
   const r = document.documentElement.style;
   r.setProperty("--bg", t.vars.bg);

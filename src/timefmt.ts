@@ -24,18 +24,31 @@ export function useTimeFormat() {
 
 const DAY = 86_400_000;
 
-function startOfToday(): number {
-  const n = new Date();
-  return new Date(n.getFullYear(), n.getMonth(), n.getDate()).getTime();
+/** The zone every stamp is written in; undefined = this machine's own.
+ *  Set from settings — a laptop read from another time zone can keep its
+ *  own clock. */
+let zone: string | undefined;
+export function setDisplayZone(z?: string) {
+  zone = z && z !== "" ? z : undefined;
+}
+
+/** Which calendar day a moment falls on, in the display zone. */
+function dayKey(ms: number): string {
+  return new Date(ms).toLocaleDateString("en-CA", { timeZone: zone });
+}
+
+function yearOf(ms: number): string {
+  return new Date(ms).toLocaleDateString([], { timeZone: zone, year: "numeric" });
 }
 
 function clock(d: Date): string {
-  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return d.toLocaleTimeString([], { timeZone: zone, hour: "numeric", minute: "2-digit" });
 }
 
 /** The full stamp, for tooltips: "Fri, Aug 28, 2026, 10:31 PM". */
 export function fullTime(ms: number): string {
   return new Date(ms).toLocaleString([], {
+    timeZone: zone,
     weekday: "short", month: "short", day: "numeric", year: "numeric",
     hour: "numeric", minute: "2-digit",
   });
@@ -44,13 +57,13 @@ export function fullTime(ms: number): string {
 /** Clock time for today, the weekday within the week, the date beyond it. */
 export function absTime(ms: number): string {
   const d = new Date(ms);
-  const today = startOfToday();
-  if (ms >= today) return clock(d);
-  if (ms >= today - 6 * DAY) return `${d.toLocaleDateString([], { weekday: "short" })} ${clock(d)}`;
-  if (d.getFullYear() === new Date().getFullYear()) {
-    return `${d.toLocaleDateString([], { month: "short", day: "numeric" })}, ${clock(d)}`;
+  const now = Date.now();
+  if (dayKey(ms) === dayKey(now)) return clock(d);
+  if (now - ms < 6 * DAY) return `${d.toLocaleDateString([], { timeZone: zone, weekday: "short" })} ${clock(d)}`;
+  if (yearOf(ms) === yearOf(now)) {
+    return `${d.toLocaleDateString([], { timeZone: zone, month: "short", day: "numeric" })}, ${clock(d)}`;
   }
-  return `${d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}, ${clock(d)}`;
+  return `${d.toLocaleDateString([], { timeZone: zone, month: "short", day: "numeric", year: "numeric" })}, ${clock(d)}`;
 }
 
 /** The same, squeezed for a row corner: "10:31p", "Tue 10:31p",
@@ -59,13 +72,13 @@ export function absTime(ms: number): string {
  *  cannot. */
 export function absTimeShort(ms: number): string {
   const d = new Date(ms);
-  const today = startOfToday();
+  const now = Date.now();
   const c = clock(d).replace(/\s?AM$/i, "a").replace(/\s?PM$/i, "p");
-  if (ms >= today) return c;
-  if (ms >= today - 6 * DAY) return `${d.toLocaleDateString([], { weekday: "short" })} ${c}`;
-  const day = d.toLocaleDateString([], { month: "short", day: "numeric" });
-  if (d.getFullYear() === new Date().getFullYear()) return `${day} ${c}`;
-  return `${day} '${String(d.getFullYear()).slice(-2)} ${c}`;
+  if (dayKey(ms) === dayKey(now)) return c;
+  if (now - ms < 6 * DAY) return `${d.toLocaleDateString([], { timeZone: zone, weekday: "short" })} ${c}`;
+  const day = d.toLocaleDateString([], { timeZone: zone, month: "short", day: "numeric" });
+  if (yearOf(ms) === yearOf(now)) return `${day} ${c}`;
+  return `${day} '${yearOf(ms).slice(-2)} ${c}`;
 }
 
 /** "5m ago" / "3h ago" / "2d ago". */
