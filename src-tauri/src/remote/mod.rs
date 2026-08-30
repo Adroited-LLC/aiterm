@@ -456,3 +456,51 @@ pub async fn remote_revoke_device(
         .revoke(&device_id)
         .map_err(|error| error.to_string())
 }
+
+#[cfg(test)]
+mod listener_advertisement_tests {
+    use super::*;
+
+    #[test]
+    fn pairing_invite_hosts_are_the_exact_frozen_start_host_list() {
+        let selected: IpAddr = "10.0.0.151".parse().unwrap();
+        let frozen = advertised_hosts(
+            selected,
+            vec![
+                "192.168.1.99".parse().unwrap(),
+                "10.8.0.2".parse().unwrap(),
+                selected,
+                "10.8.0.2".parse().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut inner = Inner {
+            bound: Some(SocketAddr::new(selected, 8443)),
+            fingerprint: Some("stable-spki-pin".to_string()),
+            ..Inner::default()
+        };
+        inner.advertised_hosts = Some(frozen);
+
+        // This represents a later interface scan after the listener is live.
+        // It must not change an invite produced from the listener's state.
+        let later_scan = advertised_hosts(
+            selected,
+            vec![selected, "172.16.40.7".parse().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            later_scan,
+            vec![selected, "172.16.40.7".parse().unwrap()]
+        );
+
+        let payload = inner
+            .pairing_payload(b"enrollment-secret", "desktop")
+            .unwrap();
+        let invite = PairingUri::parse(&payload).unwrap();
+        assert_eq!(
+            invite.hosts,
+            vec!["10.0.0.151", "192.168.1.99", "10.8.0.2"],
+            "an invite must use only the deduplicated hosts frozen at listener start"
+        );
+    }
+}

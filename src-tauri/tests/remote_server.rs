@@ -23,6 +23,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio_tungstenite::{
     connect_async_tls_with_config, tungstenite::Message, Connector, MaybeTlsStream, WebSocketStream,
 };
+use x509_parser::extensions::GeneralName;
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -3141,5 +3142,133 @@ fn tls_identity_and_pin_survive_a_desktop_restart() {
         TlsIdentity::load_or_create(&tls_root, &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
     assert_eq!(second.certificate_der(), first_certificate);
     assert_eq!(second.spki_fingerprint(), first_fingerprint);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn tls_identity_refreshes_certificate_sans_without_rotating_the_spki_pin() {
+    let root = private_test_dir("identity-address-refresh");
+    let tls_root = root.join("tls");
+    let original_address = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
+    let rebound_address = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 151));
+
+    let first = TlsIdentity::load_or_create(&tls_root, &[original_address]).unwrap();
+    let first_fingerprint = first.spki_fingerprint().to_string();
+    let first_private_key = std::fs::read(tls_root.join("gateway-key.der")).unwrap();
+    drop(first);
+
+    let refreshed =
+        TlsIdentity::load_or_create(&tls_root, &[original_address, rebound_address]).unwrap();
+    let (_, certificate) = x509_parser::parse_x509_certificate(refreshed.certificate_der())
+        .expect("the persisted gateway certificate must remain valid DER");
+    let subject_alt_names = certificate
+        .subject_alternative_name()
+        .expect("the certificate must have one valid SAN extension")
+        .expect("the certificate must have a SAN extension");
+
+    assert!(
+        subject_alt_names
+            .value
+            .general_names
+            .contains(&GeneralName::IPAddress([10, 0, 0, 151].as_ref())),
+        "reissuing for a rebound listener must add the phone-reachable IP SAN"
+    );
+    assert_eq!(
+        refreshed.spki_fingerprint(),
+        first_fingerprint,
+        "reissuing the certificate must retain the remembered phone's SPKI pin"
+    );
+    assert_eq!(
+        std::fs::read(tls_root.join("gateway-key.der")).unwrap(),
+        first_private_key,
+        "certificate refresh must not rewrite or rotate the persisted private key"
+    );
+    assert_eq!(
+        std::fs::read(tls_root.join("gateway-cert.der")).unwrap(),
+        refreshed.certificate_der(),
+        "the validated refreshed certificate must be the durable identity on disk"
+    );
+    assert_eq!(
+        std::fs::read_dir(&tls_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .count(),
+        2,
+        "a successful refresh must clean its same-directory temporary file"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(tls_root.join("gateway-cert.der"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the atomically replaced certificate must remain private"
+        );
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn tls_identity_rejects_more_than_sixteen_unique_advertised_hosts() {
+    let root = private_test_dir("identity-host-bound");
+    let hosts = (1..=17)
+        .map(|last| IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)))
+        .collect::<Vec<_>>();
+
+    let error = TlsIdentity::load_or_create(root.join("tls"), &hosts)
+        .err()
+        .expect("an unbounded certificate identity must be rejected");
+    assert_eq!(error.code(), "gateway.too_many_advertised_hosts");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn mismatched_existing_certificate_and_key_fail_closed_before_san_refresh() {
+    let root = private_test_dir("identity-mismatch-refresh");
+    let first_root = root.join("first");
+    let second_root = root.join("second");
+    TlsIdentity::load_or_create(
+        &first_root,
+        &[IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))],
+    )
+    .unwrap();
+    TlsIdentity::load_or_create(
+        &second_root,
+        &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 151))],
+    )
+    .unwrap();
+    let original_certificate = std::fs::read(first_root.join("gateway-cert.der")).unwrap();
+    let mismatched_private_key = std::fs::read(second_root.join("gateway-key.der")).unwrap();
+    std::fs::write(first_root.join("gateway-key.der"), &mismatched_private_key).unwrap();
+
+    let error = TlsIdentity::load_or_create(
+        &first_root,
+        &[
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 151)),
+        ],
+    )
+    .err()
+    .expect("a mismatched persisted identity must not be repaired by rotating its key");
+
+    assert_eq!(error.code(), "gateway.tls_failed");
+    assert_eq!(
+        std::fs::read(first_root.join("gateway-cert.der")).unwrap(),
+        original_certificate,
+        "failed identity validation must not replace the last certificate"
+    );
+    assert_eq!(
+        std::fs::read(first_root.join("gateway-key.der")).unwrap(),
+        mismatched_private_key,
+        "failed identity validation must never replace the persisted private key"
+    );
+
     std::fs::remove_dir_all(root).ok();
 }

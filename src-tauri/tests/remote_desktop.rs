@@ -82,6 +82,19 @@ fn a_payload_missing_a_trust_field_is_refused() {
 }
 
 #[test]
+fn a_pairing_uri_refuses_more_than_sixteen_advertised_hosts() {
+    let hosts = (1..=17)
+        .map(|last| IpAddr::V4(Ipv4Addr::new(10, 0, 0, last)))
+        .collect::<Vec<_>>();
+    let payload = pairing_payload(&hosts, 8443, "fp", b"secret", "desktop");
+
+    assert!(
+        PairingUri::parse(&payload).is_none(),
+        "the trust payload parser must not accept an unbounded host list"
+    );
+}
+
+#[test]
 fn loopback_and_unusable_addresses_are_never_offered_as_bind_candidates() {
     let candidates = shareable_addresses(vec![
         IpAddr::V4(Ipv4Addr::LOCALHOST),
