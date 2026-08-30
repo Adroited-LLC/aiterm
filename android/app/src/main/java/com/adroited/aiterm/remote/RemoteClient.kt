@@ -215,6 +215,7 @@ class RemoteClient(
             activeAttachmentTabId = null
             screenStore.clear()
             mutableScrollback.value = emptyList()
+            scrollbackRequest = null
             terminalAssembler.clear()
             recoveryRequested = false
             mutableState.value = mutableState.value.copy(
