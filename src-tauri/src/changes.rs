@@ -395,10 +395,32 @@ fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
         .session_roots
         .iter()
         .filter(|(_, root)| path.starts_with(root))
+        // A file inside a *nested* repository is another project's file.
+        // ~/AI-OS holds projects/* with their own .git; a session running
+        // in ~/AI-OS — however busy its terminal — is not the author of an
+        // edit landing in one of them. Only a session rooted at (or inside)
+        // that inner repo can claim it.
+        .filter(|(_, root)| !inside_nested_repo(path, root))
         .map(|(id, _)| id)
         .filter(|id| active.contains(*id) || inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT))
         .cloned()
         .collect()
+}
+
+/// Is there a `.git` strictly between `path` and `root`? Then the file
+/// belongs to a nested repository, not to `root`'s project.
+fn inside_nested_repo(path: &Path, root: &Path) -> bool {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d == root {
+            return false;
+        }
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// A session's changes, newest first, one row per path (its latest state).
