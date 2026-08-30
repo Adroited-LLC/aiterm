@@ -6,7 +6,9 @@ pub mod terminal;
 use auth::{DeviceStore, PendingPairing, TrustedDevice};
 use qrcode::{EcLevel, QrCode};
 use serde::Serialize;
-use server::{GatewayHandle, RemoteGateway, RemoteServices, TlsIdentity};
+use server::{
+    GatewayHandle, RemoteGateway, RemoteServices, TlsIdentity, MAX_ADVERTISED_HOSTS,
+};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,7 +53,12 @@ impl PairingUri {
             let value = percent_decode(value)?;
             match key {
                 "v" => version = value.parse::<u8>().ok(),
-                "h" => hosts.push(value),
+                "h" => {
+                    if hosts.len() == MAX_ADVERTISED_HOSTS {
+                        return None;
+                    }
+                    hosts.push(value);
+                }
                 "p" => port = value.parse::<u16>().ok(),
                 "f" => fingerprint = Some(value),
                 "s" => {
@@ -182,13 +189,7 @@ fn percent_decode(value: &str) -> Option<String> {
 pub fn shareable_addresses(found: Vec<IpAddr>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for address in found {
-        let usable = match address {
-            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
-            IpAddr::V6(v6) => {
-                !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
-            }
-        };
-        if !usable {
+        if !is_shareable_address(address) {
             continue;
         }
         let text = address.to_string();
@@ -197,6 +198,37 @@ pub fn shareable_addresses(found: Vec<IpAddr>) -> Vec<String> {
         }
     }
     out
+}
+
+fn is_shareable_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// Freeze the exact, preferred-order hosts a listener certificate and every
+/// invite created during that listener's lifetime will share.
+fn advertised_hosts(selected: IpAddr, found: Vec<IpAddr>) -> Result<Vec<IpAddr>, String> {
+    if !is_shareable_address(selected) {
+        return Err("remote access will not bind loopback or a link-local address".into());
+    }
+
+    let mut hosts = vec![selected];
+    for candidate in found {
+        if !is_shareable_address(candidate) || hosts.contains(&candidate) {
+            continue;
+        }
+        if hosts.len() == MAX_ADVERTISED_HOSTS {
+            return Err(format!(
+                "remote access found more than {MAX_ADVERTISED_HOSTS} shareable addresses"
+            ));
+        }
+        hosts.push(candidate);
+    }
+    Ok(hosts)
 }
 
 fn local_addresses() -> Vec<IpAddr> {
@@ -250,6 +282,7 @@ struct Inner {
     gateway: Option<GatewayHandle>,
     bound: Option<SocketAddr>,
     fingerprint: Option<String>,
+    advertised_hosts: Option<Vec<IpAddr>>,
     starting: bool,
 }
 
@@ -278,6 +311,29 @@ impl Inner {
             fingerprint: self.fingerprint.clone(),
         }
     }
+
+    fn pairing_payload(&self, secret: &[u8], name: &str) -> Result<String, String> {
+        let (Some(bound), Some(fingerprint), Some(hosts)) = (
+            self.bound,
+            self.fingerprint.as_deref(),
+            self.advertised_hosts.as_deref(),
+        ) else {
+            return Err("turn remote access on before pairing a phone".into());
+        };
+        if hosts.is_empty()
+            || hosts.len() > MAX_ADVERTISED_HOSTS
+            || hosts.first().copied() != Some(bound.ip())
+        {
+            return Err("remote listener advertisement state is inconsistent".into());
+        }
+        Ok(pairing_payload(
+            hosts,
+            bound.port(),
+            fingerprint,
+            secret,
+            name,
+        ))
+    }
 }
 
 #[tauri::command]
@@ -305,7 +361,7 @@ pub async fn remote_start(
     let ip: IpAddr = address
         .parse()
         .map_err(|_| format!("{address} is not an address this desktop can bind"))?;
-    if shareable_addresses(vec![ip]).is_empty() {
+    if !is_shareable_address(ip) {
         return Err("remote access will not bind loopback or a link-local address".into());
     }
     let devices = {
@@ -325,8 +381,16 @@ pub async fn remote_start(
             }
         }
     };
+    let advertised_hosts = match advertised_hosts(ip, local_addresses()) {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            state.inner.lock().await.starting = false;
+            return Err(error);
+        }
+    };
     let identity = match state_root().and_then(|root| {
-        TlsIdentity::load_or_create(root.join("tls"), &[ip]).map_err(|e| e.to_string())
+        TlsIdentity::load_or_create(root.join("tls"), &advertised_hosts)
+            .map_err(|e| e.to_string())
     }) {
         Ok(identity) => identity,
         Err(error) => {
@@ -346,6 +410,7 @@ pub async fn remote_start(
     let gateway = started.map_err(|error| error.to_string())?;
     inner.bound = Some(gateway.local_addr());
     inner.fingerprint = Some(gateway.spki_fingerprint().to_string());
+    inner.advertised_hosts = Some(advertised_hosts);
     inner.gateway = Some(gateway);
     Ok(inner.status())
 }
@@ -359,6 +424,7 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
         }
         inner.bound = None;
         inner.fingerprint = None;
+        inner.advertised_hosts = None;
         inner.gateway.take()
     };
     // Closing the listener is not a statement about any phone: trusted
@@ -374,32 +440,15 @@ pub async fn remote_begin_pairing(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
     let mut inner = state.inner.lock().await;
-    let (Some(bound), Some(fingerprint)) = (inner.bound, inner.fingerprint.clone()) else {
+    if inner.gateway.is_none() {
         return Err("turn remote access on before pairing a phone".into());
-    };
+    }
     let devices = inner.devices()?;
     let now = SystemTime::now();
     let enrollment = devices
         .begin_enrollment_at(now)
         .map_err(|error| error.to_string())?;
-
-    // The bound address first, then the rest, so a phone on the same network
-    // as the listener succeeds on its first attempt.
-    let mut hosts: Vec<IpAddr> = vec![bound.ip()];
-    for candidate in local_addresses() {
-        if shareable_addresses(vec![candidate]).is_empty() || hosts.contains(&candidate) {
-            continue;
-        }
-        hosts.push(candidate);
-    }
-
-    let payload = pairing_payload(
-        &hosts,
-        bound.port(),
-        &fingerprint,
-        enrollment.secret(),
-        &desktop_name(),
-    );
+    let payload = inner.pairing_payload(enrollment.secret(), &desktop_name())?;
     let svg = pairing_qr_svg(&payload).ok_or("the pairing payload could not be rendered")?;
     Ok(PairingInviteView {
         svg,

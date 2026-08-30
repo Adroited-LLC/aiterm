@@ -24,7 +24,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use rand_core::{OsRng, RngCore};
 use rcgen::PublicKeyData;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 const CERT_FILE: &str = "gateway-cert.der";
 const KEY_FILE: &str = "gateway-key.der";
+pub const MAX_ADVERTISED_HOSTS: usize = 16;
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUESTS_PER_SECOND: f64 = 120.0;
@@ -72,6 +73,7 @@ impl TlsIdentity {
         root: impl AsRef<Path>,
         subject_alt_ips: &[IpAddr],
     ) -> Result<Self, GatewayError> {
+        let subject_alt_ips = bounded_subject_alt_ips(subject_alt_ips)?;
         let root = root.as_ref();
         std::fs::create_dir_all(root).map_err(GatewayError::io)?;
         set_private_permissions(root, 0o700).map_err(GatewayError::io)?;
@@ -79,11 +81,20 @@ impl TlsIdentity {
         let key_path = root.join(KEY_FILE);
         match (cert_path.exists(), key_path.exists()) {
             (true, true) => {
-                let certificate_der = std::fs::read(cert_path).map_err(GatewayError::io)?;
+                let certificate_der = std::fs::read(&cert_path).map_err(GatewayError::io)?;
                 let private_key_der = std::fs::read(key_path).map_err(GatewayError::io)?;
-                Self::from_parts(certificate_der, private_key_der)
+                // Validate the complete persisted identity before deciding whether
+                // its certificate needs a broader SAN set. A corrupt certificate,
+                // key, or mismatched pair must never turn into an implicit key
+                // rotation that invalidates remembered phone pins.
+                let identity = Self::from_parts(certificate_der, private_key_der)?;
+                if identity.covers(&subject_alt_ips)? {
+                    Ok(identity)
+                } else {
+                    Self::reissue_certificate(&cert_path, identity, &subject_alt_ips)
+                }
             }
-            (false, false) => Self::generate(root, subject_alt_ips),
+            (false, false) => Self::generate(root, &subject_alt_ips),
             _ => Err(GatewayError::new(
                 "gateway.incomplete_identity",
                 "gateway certificate and private key must both exist",
@@ -92,17 +103,30 @@ impl TlsIdentity {
     }
 
     fn generate(root: &Path, subject_alt_ips: &[IpAddr]) -> Result<Self, GatewayError> {
-        let mut names = vec!["localhost".to_string()];
-        names.extend(subject_alt_ips.iter().map(ToString::to_string));
-        names.sort();
-        names.dedup();
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(names).map_err(GatewayError::tls)?;
-        let certificate_der = cert.der().to_vec();
+        let signing_key = rcgen::KeyPair::generate().map_err(GatewayError::tls)?;
+        let certificate_der = issue_certificate(&signing_key, subject_alt_ips)?;
         let private_key_der = signing_key.serialize_der();
         write_private_file(&root.join(CERT_FILE), &certificate_der).map_err(GatewayError::io)?;
         write_private_file(&root.join(KEY_FILE), &private_key_der).map_err(GatewayError::io)?;
         Self::from_parts(certificate_der, private_key_der)
+    }
+
+    fn reissue_certificate(
+        certificate_path: &Path,
+        identity: Self,
+        subject_alt_ips: &[IpAddr],
+    ) -> Result<Self, GatewayError> {
+        let signing_key = rcgen::KeyPair::try_from(identity.private_key_der.as_slice())
+            .map_err(GatewayError::tls)?;
+        let certificate_der = issue_certificate(&signing_key, subject_alt_ips)?;
+        let refreshed = Self::from_parts(certificate_der, identity.private_key_der)?;
+
+        // The replacement is written and validated before the public name is
+        // changed. A failed temp write or rename leaves the last valid identity
+        // intact, and the private key is never opened for writing.
+        replace_private_file(certificate_path, refreshed.certificate_der())
+            .map_err(GatewayError::io)?;
+        Ok(refreshed)
     }
 
     fn from_parts(
@@ -131,12 +155,109 @@ impl TlsIdentity {
         &self.spki_fingerprint
     }
 
+    fn covers(&self, subject_alt_ips: &[IpAddr]) -> Result<bool, GatewayError> {
+        let certificate_der = CertificateDer::from(self.certificate_der.as_slice());
+        let parsed = rustls::server::ParsedCertificate::try_from(&certificate_der)
+            .map_err(GatewayError::tls)?;
+        let localhost = ServerName::try_from("localhost").map_err(GatewayError::tls)?;
+        let names = std::iter::once(localhost)
+            .chain(subject_alt_ips.iter().copied().map(ServerName::from));
+
+        for name in names {
+            match rustls::client::verify_server_name(&parsed, &name) {
+                Ok(()) => {}
+                Err(rustls::Error::InvalidCertificate(error))
+                    if matches!(
+                        error,
+                        rustls::CertificateError::NotValidForName
+                            | rustls::CertificateError::NotValidForNameContext { .. }
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(GatewayError::tls(error)),
+            }
+        }
+        Ok(true)
+    }
+
     fn rustls_config(&self) -> Result<RustlsConfig, GatewayError> {
         Ok(RustlsConfig::from_config(Arc::new(build_server_config(
             &self.certificate_der,
             &self.private_key_der,
         )?)))
     }
+}
+
+fn bounded_subject_alt_ips(subject_alt_ips: &[IpAddr]) -> Result<Vec<IpAddr>, GatewayError> {
+    let mut unique = Vec::with_capacity(subject_alt_ips.len().min(MAX_ADVERTISED_HOSTS));
+    for address in subject_alt_ips.iter().copied() {
+        if unique.contains(&address) {
+            continue;
+        }
+        if unique.len() == MAX_ADVERTISED_HOSTS {
+            return Err(GatewayError::new(
+                "gateway.too_many_advertised_hosts",
+                format!("a gateway may advertise at most {MAX_ADVERTISED_HOSTS} unique hosts"),
+            ));
+        }
+        unique.push(address);
+    }
+    Ok(unique)
+}
+
+fn issue_certificate(
+    signing_key: &rcgen::KeyPair,
+    subject_alt_ips: &[IpAddr],
+) -> Result<Vec<u8>, GatewayError> {
+    let mut names = Vec::with_capacity(subject_alt_ips.len() + 1);
+    names.push("localhost".to_string());
+    names.extend(subject_alt_ips.iter().map(ToString::to_string));
+    let params = rcgen::CertificateParams::new(names).map_err(GatewayError::tls)?;
+    let certificate = params.self_signed(signing_key).map_err(GatewayError::tls)?;
+    Ok(certificate.der().to_vec())
+}
+
+fn replace_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "gateway certificate path has no parent directory",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "gateway certificate path has no file name",
+        )
+    })?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = (|| {
+        write_private_file(&temp, bytes)?;
+        std::fs::rename(&temp, path)?;
+        sync_directory(parent)
+    })();
+    if result.is_err() && std::fs::remove_file(&temp).is_ok() {
+        // Make cleanup durable too; failure here cannot supersede the original
+        // write/rename error, but the best effort prevents a stale cert temp.
+        sync_directory(parent).ok();
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn build_server_config(
