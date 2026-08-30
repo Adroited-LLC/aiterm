@@ -3452,12 +3452,6 @@ impl ExactPurgeFile {
     }
 
     fn remove_exact(&self) -> Result<(), String> {
-        if !directory_entry_is_exact_object(&self.parent, &self.name, &self.file)? {
-            return Err(format!(
-                "strict purge object changed before removal at {}",
-                self.display_path.display()
-            ));
-        }
         let archive =
             HeldWriteLease::existing(self.file.try_clone().map_err(|error| error.to_string())?)?;
         StrictArchiveEntry {
