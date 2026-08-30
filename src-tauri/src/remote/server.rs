@@ -1641,6 +1641,7 @@ impl RemoteServices {
                                 agent_id,
                                 model,
                                 effort,
+                                prompt: None,
                             })
                             .map_err(|error| error.code())?;
                         let slot_id = plan

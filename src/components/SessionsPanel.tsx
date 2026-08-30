@@ -14,18 +14,12 @@ import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
 import { followRekey } from "../selection";
+import ThreadsView from "./ThreadsView";
+import { LibrarianCtl } from "../librarian";
 
-/** Compact relative time for the row corner: "now", "5m", "3h", "2d". */
-function shortTime(ms: number): string {
-  const s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 60) return "now";
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  if (s < 30 * 86400) return `${Math.floor(s / 86400)}d`;
-  return `${Math.floor(s / (30 * 86400))}mo`;
-}
+import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 
-type ViewMode = "recent" | "project" | "date";
+type ViewMode = "recent" | "project" | "date" | "threads";
 
 function dateBucket(ms: number): string {
   const now = new Date();
@@ -188,6 +182,12 @@ interface Props {
    *  project or group header. The panel has already excluded anything a per-row
    *  🗑 would refuse. */
   onTrashSessions: (sessions: Session[]) => void;
+  /** The librarian's store and controls — the Threads tab, and the names it
+   *  has written where `renameRows` says to use them. */
+  librarian: LibrarianCtl;
+  renameRows: boolean;
+  showThreads: boolean;
+  onOpenLibrarian: () => void;
 }
 
 export default function SessionsPanel({
@@ -197,6 +197,7 @@ export default function SessionsPanel({
   onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
+  librarian, renameRows, showThreads, onOpenLibrarian,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
@@ -287,6 +288,8 @@ export default function SessionsPanel({
   const [ftResults, setFtResults] = useState<Session[] | null>(null);
 
   useEffect(() => localStorage.setItem("aiterm.viewMode", viewMode), [viewMode]);
+  // The Threads tab switched off while it was the one showing: fall back.
+  useEffect(() => { if (!showThreads && viewMode === "threads") setViewMode("recent"); }, [showThreads, viewMode]);
 
   // Debounced full-text search (tantivy index over titles + message text).
   useEffect(() => {
@@ -520,6 +523,7 @@ export default function SessionsPanel({
   }
 
   const toggle = (k: keyof SessionDisplayOpts) => onOptsChange({ ...opts, [k]: !opts[k] });
+  const { format: timeFormat, setFormat: setTimeFormat } = useTimeFormat();
 
   const filteredTrash = useMemo(() => {
     const q = query.toLowerCase();
@@ -718,7 +722,7 @@ export default function SessionsPanel({
       <div className="session-text">
         <div className="session-title-row">
           <span className="session-title">{t.title}</span>
-          <span className="session-time">{shortTime(t.deleted_at)}</span>
+          <span className="session-time" title={fullTime(t.deleted_at)}>{fmtTimeShort(t.deleted_at, timeFormat)}</span>
         </div>
         <div className="session-meta">
           <span className="session-sub">
@@ -877,8 +881,10 @@ export default function SessionsPanel({
                 <Icon of={GitFork} size="sm" />
               </span>
             )}
-            <span className="session-title">{s.title}</span>
-            {opts.showTime && <span className="session-time">{shortTime(s.last_active)}</span>}
+            <span className="session-title" title={renameRows && librarian.store.sessions[s.id] ? s.title : undefined}>
+              {(renameRows && librarian.store.sessions[s.id]?.name) || s.title}
+            </span>
+            {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
           {(opts.showPath || (opts.showBranch && s.branch)) && (
             <div className="session-meta">
@@ -1187,6 +1193,13 @@ export default function SessionsPanel({
               <label><input type="checkbox" checked={opts.showPath} onChange={() => toggle("showPath")} /> Project path</label>
               <label><input type="checkbox" checked={opts.showBranch} onChange={() => toggle("showBranch")} /> Git branch</label>
               <label><input type="checkbox" checked={opts.showTime} onChange={() => toggle("showTime")} /> Last active</label>
+              <label title="Clock time instead of “3h” — the same setting as Settings → Appearance">
+                <input
+                  type="checkbox"
+                  checked={timeFormat === "absolute"}
+                  onChange={() => setTimeFormat(timeFormat === "absolute" ? "relative" : "absolute")}
+                /> As clock time
+              </label>
             </div>
           )}
         </div>
@@ -1203,16 +1216,29 @@ export default function SessionsPanel({
         />
       )}
       <div className="view-tabs">
-        {(["recent", "project", "date"] as ViewMode[]).map((m) => (
+        {(["recent", "project", "date", ...(showThreads ? ["threads" as const] : [])] as ViewMode[]).map((m) => (
           <button
             key={m}
             className={"view-tab" + (viewMode === m ? " on" : "")}
             onClick={() => setViewMode(m)}
           >
-            {m === "recent" ? "Recent" : m === "project" ? "Project" : "Date"}
+            {m === "recent" ? "Recent" : m === "project" ? "Project" : m === "date" ? "Date" : "Threads"}
           </button>
         ))}
       </div>
+      {viewMode === "threads" && !searchList ? (
+        <div className="sessions-list">
+          <ThreadsView
+            lib={librarian}
+            sessions={sessions}
+            liveIds={liveSlots}
+            onSelect={onSelect}
+            onResume={onResume}
+            onOpenSettings={onOpenLibrarian}
+            canResume={(s) => capsOf(s.agent).resume}
+          />
+        </div>
+      ) : (
       <div className="sessions-list">
         {/* Above every view and outside the search filter: a session you just
             started is the one row you are certainly looking for, and it has no
@@ -1445,6 +1471,7 @@ export default function SessionsPanel({
           </div>
         )}
       </div>
+      )}
       {menu && (
         // The backdrop is what closes it on a click anywhere else, including a
         // right-click somewhere new.

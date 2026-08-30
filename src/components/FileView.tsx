@@ -7,6 +7,42 @@ import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
 import { classHighlighter } from "@lezer/highlight";
 import { languages } from "@codemirror/language-data";
 import { homeAbbrev, openPath, readTextFile, writeTextFile } from "../ipc";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+import Icon from "./Icon";
+import { Code, Eye } from "lucide-react";
+
+/** Files that have a rendered form worth looking at. */
+export function isMarkdown(path: string): boolean {
+  return /\.(md|markdown|mdx)$/i.test(path);
+}
+
+export type FileMode = "code" | "preview";
+const MODE_KEY = "aiterm.markdownMode";
+
+/** The mode markdown files open in: whatever was chosen last, anywhere.
+ *  One setting, not per file — the preference is "I read markdown rendered"
+ *  (or not), and a file is not the unit of that. Preview until chosen
+ *  otherwise: a markdown file is written to be read, and the toggle is one
+ *  click away when it is not. */
+export function loadMarkdownMode(): FileMode {
+  try {
+    return localStorage.getItem(MODE_KEY) === "code" ? "code" : "preview";
+  } catch {
+    return "preview";
+  }
+}
+function saveMarkdownMode(m: FileMode) {
+  try { localStorage.setItem(MODE_KEY, m); } catch { /* private mode */ }
+}
+
+/** Markdown → HTML the page can show. GFM (tables, task lists, strike), and
+ *  sanitised — a file under a project is exactly the kind of thing an agent
+ *  writes, so its HTML is not trusted with the window. */
+function renderMarkdown(src: string): string {
+  const html = marked.parse(src, { gfm: true, breaks: false, async: false }) as string;
+  return DOMPurify.sanitize(html, { USE_PROFILES: { html: true }, ADD_ATTR: ["target"] });
+}
 
 /**
  * A file open in a center tab — CodeMirror over the real file on disk.
@@ -44,6 +80,29 @@ export default function FileView({
   const [conflict, setConflict] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
+
+  // ---- code / preview ----
+  // Only a markdown file has a preview; every other file is always code.
+  // The mode is read from the buffer, not the disk, so an edit made in code
+  // shows in preview the moment you flip — and the editor stays mounted
+  // underneath, hidden, so flipping back costs nothing and loses nothing.
+  const md = isMarkdown(path);
+  const [mode, setModeState] = useState<FileMode>(() => (md ? loadMarkdownMode() : "code"));
+  const modeRef = useRef(mode);
+  const [previewHtml, setPreviewHtml] = useState("");
+  const renderPreview = useCallback(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    setPreviewHtml(renderMarkdown(view.state.doc.toString()));
+  }, []);
+  const setMode = useCallback((m: FileMode) => {
+    modeRef.current = m;
+    setModeState(m);
+    saveMarkdownMode(m);
+    if (m === "preview") renderPreview();
+    else requestAnimationFrame(() => { viewRef.current?.requestMeasure(); viewRef.current?.focus(); });
+  }, [renderPreview]);
+  const toggleMode = useCallback(() => setMode(modeRef.current === "preview" ? "code" : "preview"), [setMode]);
 
   const markDirty = useCallback((d: boolean) => {
     dirtyRef.current = d;
@@ -119,6 +178,8 @@ export default function FileView({
             if (u.docChanged && !settingRef.current && !dirtyRef.current) {
               markDirty(true);
             }
+            // A disk reload while previewing must show the new text.
+            if (u.docChanged && modeRef.current === "preview") renderPreview();
           }),
         ],
       }),
@@ -133,6 +194,7 @@ export default function FileView({
         settingRef.current = true;
         view.dispatch({ changes: { from: 0, insert: f.content } });
         settingRef.current = false;
+        if (modeRef.current === "preview") renderPreview();
         if (f.truncated) {
           // A truncated read must not be saved back: it IS data loss.
           view.dispatch({
@@ -194,11 +256,53 @@ export default function FileView({
     if (active) viewRef.current?.requestMeasure();
   }, [active]);
 
+  // Ctrl+Shift+V flips the mode (the convention editors use for a markdown
+  // preview), and Ctrl+S still saves from the preview, where the editor's own
+  // keymap is not listening.
+  useEffect(() => {
+    if (!active || !md) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "v") {
+        e.preventDefault();
+        toggleMode();
+      } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "s" && modeRef.current === "preview") {
+        e.preventDefault();
+        saveRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active, md, toggleMode]);
+
+  /** Links in the preview go to the system browser; the page must not
+   *  navigate away from the app. */
+  const onPreviewClick = (e: React.MouseEvent) => {
+    const a = (e.target as HTMLElement).closest("a");
+    if (!a) return;
+    e.preventDefault();
+    const href = a.getAttribute("href") ?? "";
+    if (/^https?:\/\//i.test(href)) openPath(href).catch(() => {});
+  };
+
   return (
     <div className="file-view">
       <div className="file-bar">
         <span className="file-bar-path" title={path}>{homeAbbrev(path)}</span>
         {truncated && <span className="file-bar-note">first 2 MB — read-only</span>}
+        {md && (
+          <div className="file-mode" role="group" aria-label="View as">
+            <button
+              className={"file-mode-btn" + (mode === "code" ? " on" : "")}
+              title="Code (Ctrl+Shift+V toggles)"
+              onClick={() => setMode("code")}
+            ><Icon of={Code} size="sm" /> Code</button>
+            <button
+              className={"file-mode-btn" + (mode === "preview" ? " on" : "")}
+              title="Preview (Ctrl+Shift+V toggles)"
+              onClick={() => setMode("preview")}
+            ><Icon of={Eye} size="sm" /> Preview</button>
+          </div>
+        )}
         <button
           className="tui-plain file-bar-btn"
           disabled={!dirty || truncated}
@@ -233,7 +337,18 @@ export default function FileView({
           Can't open {homeAbbrev(path)}: {err}
         </div>
       ) : (
-        <div className="file-editor" ref={hostRef} />
+        <>
+          <div className="file-editor" ref={hostRef} hidden={mode === "preview"} />
+          {mode === "preview" && (
+            <div
+              className="md-preview"
+              onClick={onPreviewClick}
+              onDoubleClick={() => setMode("code")}
+              title="Double-click to edit"
+              dangerouslySetInnerHTML={{ __html: previewHtml }}
+            />
+          )}
+        </>
       )}
     </div>
   );

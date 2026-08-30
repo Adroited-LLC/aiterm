@@ -294,14 +294,24 @@ fn pinned_note(model: &str, order: &[String], provider_answered: bool) -> Option
 /// How a chat comes into being: fresh under a minted id, or resumed from a
 /// transcript that already knows its provider and model.
 pub enum Start {
-    Fresh { provider_id: String, model: String, session_id: Option<String> },
+    Fresh {
+        provider_id: String,
+        model: String,
+        session_id: Option<String>,
+        /// A first message to send before reading any — the home screen's
+        /// prompt box. Echoed at the prompt so the transcript on screen reads
+        /// as if it had been typed.
+        prompt: Option<String>,
+    },
     Resume { session_id: String },
 }
 
 /// Entry point for the `chat` argv mode. Never returns to Tauri.
 pub fn run(start: Start) -> i32 {
+    let mut pending = None;
     let (provider_id, mut model, session_id, mut messages, cleared) = match start {
-        Start::Fresh { provider_id, model, session_id } => {
+        Start::Fresh { provider_id, model, session_id, prompt } => {
+            pending = prompt.filter(|p| !p.trim().is_empty());
             (provider_id, model, session_id, Vec::new(), 0)
         }
         Start::Resume { session_id } => {
@@ -361,7 +371,12 @@ pub fn run(start: Start) -> i32 {
         // types on Shift+Enter. The message sends when a line ends plainly.
         let mut buf = String::new();
         let mut ended = false;
-        loop {
+        // The first turn may already be written: show it where typing would
+        // have put it, then send it exactly as a typed line would be.
+        if let Some(first) = pending.take() {
+            println!("{first}");
+            buf = first;
+        } else { loop {
             let mut line = String::new();
             match stdin.lock().read_line(&mut line) {
                 Ok(0) | Err(_) => {
@@ -383,7 +398,7 @@ pub fn run(start: Start) -> i32 {
                     break;
                 }
             }
-        }
+        } }
         if ended && buf.trim().is_empty() {
             break;
         }

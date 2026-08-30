@@ -1,10 +1,40 @@
 /** App-wide appearance settings: theme, fonts, per-panel sizing. */
+import type { TimeFormat } from "./timefmt";
 
 export interface PanelScales {
   sessions: number;
   explorer: number;
   git: number;
   agent: number;
+}
+
+/** The librarian: a small model that names, tags and threads sessions. Off
+ *  until a provider and model are chosen — it spends money, a little. */
+export interface LibrarianSettings {
+  /** The master switch. Off: no runs, no Threads tab, no names in the
+   *  list, and the rest of the pane is not shown. What was catalogued
+   *  stays on disk for when it is turned back on. */
+  enabled: boolean;
+  /** How the model is reached: an installed CLI in its print mode — which
+   *  runs on the plan already paid for — or an API provider. */
+  engine: "claude" | "codex" | "grok" | "api";
+  /** Provider id from Model access; only for `engine: "api"`. */
+  providerId: string;
+  /** Model id in the engine's spelling; "" means the CLI's default. */
+  model: string;
+  /** Catalogue new sessions on its own, a little after they go quiet. */
+  auto: boolean;
+  /** After a run, take one look at everything and merge threads that are
+   *  the same work. Sessions are read eight at a time, so without this the
+   *  same project ends up in several threads. */
+  tidyAfterRun: boolean;
+  /** Show the librarian's names in the session list, in place of the raw
+   *  first prompt. The original stays in the tooltip. */
+  renameRows: boolean;
+  /** The system prompt for reading sessions; "" means the one shipped. */
+  promptCatalogue: string;
+  /** The system prompt for the tidy pass; "" means the one shipped. */
+  promptTidy: string;
 }
 
 export interface AppSettings {
@@ -40,6 +70,10 @@ export interface AppSettings {
   /** Pixel size of the toolbar and panel icons (Lucide set). Row actions and
    *  inline marks scale with it, a step under. */
   iconSize: number;
+  /** How "last active" and the like are written: "3h ago", or the clock
+   *  time. See `timefmt.ts`. */
+  timeFormat: TimeFormat;
+  librarian: LibrarianSettings;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -56,6 +90,18 @@ export const DEFAULT_SETTINGS: AppSettings = {
   termRenderer: "gpu",
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
   iconSize: 16,
+  timeFormat: "relative",
+  librarian: {
+    enabled: false,
+    engine: "claude",
+    providerId: "",
+    model: "haiku",
+    auto: true,
+    tidyAfterRun: true,
+    renameRows: true,
+    promptCatalogue: "",
+    promptTidy: "",
+  },
 };
 
 /** Weights offered for terminal text, and what to call them.
@@ -88,6 +134,7 @@ export function loadSettings(): AppSettings {
       ...DEFAULT_SETTINGS,
       ...parsed,
       panelScale: { ...DEFAULT_SETTINGS.panelScale, ...(parsed.panelScale ?? {}) },
+      librarian: { ...DEFAULT_SETTINGS.librarian, ...(parsed.librarian ?? {}) },
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -264,7 +311,13 @@ export function applySettings(s: AppSettings) {
   r.setProperty("--magenta", t.term.magenta);
   r.setProperty("--font-ui", s.uiFont ? `"${s.uiFont}", ${UI_FALLBACK}` : UI_FALLBACK);
   r.setProperty("--font-mono", s.termFont ? `"${s.termFont}", ${MONO_FALLBACK}` : MONO_FALLBACK);
+  // Three plain pixel values rather than one and a calc(): WebKitGTK does not
+  // apply calc() as an SVG root's width, and an unapplied width leaves the
+  // element at the 24px Lucide writes on it — every small icon drawn larger
+  // than the large ones.
   r.setProperty("--icon-size", `${s.iconSize}px`);
+  r.setProperty("--icon-size-sm", `${Math.round(s.iconSize * 0.8)}px`);
+  r.setProperty("--icon-size-lg", `${Math.round(s.iconSize * 1.2)}px`);
 }
 
 export function termFontFamily(s: AppSettings): string {

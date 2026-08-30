@@ -25,12 +25,18 @@ pub enum LaunchRequest {
         agent_id: String,
         model: Option<String>,
         effort: Option<String>,
+        /// The first message, typed before the session started. Absent for
+        /// the ＋ menu, which opens an empty session.
+        #[serde(default)]
+        prompt: Option<String>,
     },
     /// A model from Model access. Which engine runs it is this module's answer,
     /// not the caller's.
     ApiModel {
         provider_id: String,
         model_id: String,
+        #[serde(default)]
+        prompt: Option<String>,
     },
     /// Reopen an existing session where it left off.
     Resume { session_id: String },
@@ -125,13 +131,14 @@ pub fn resolve_in(
     request: LaunchRequest,
 ) -> Option<LaunchPlan> {
     match request {
-        LaunchRequest::Agent { agent_id, model, effort } => {
+        LaunchRequest::Agent { agent_id, model, effort, prompt } => {
             let backend = list.iter().find(|b| b.id() == agent_id)?;
             let spec = LaunchSpec {
                 model,
                 effort,
                 session_id: mint_for(&**backend),
                 provider: None,
+                prompt,
             };
             Some(LaunchPlan {
                 command: backend.launch(&spec),
@@ -143,7 +150,7 @@ pub fn resolve_in(
             })
         }
 
-        LaunchRequest::ApiModel { provider_id, model_id } => {
+        LaunchRequest::ApiModel { provider_id, model_id, prompt } => {
             let provider = providers.iter().find(|p| p.id == provider_id)?;
             // First willing engine in registry order. `ChatBackend` is last and
             // accepts everything, so this only fails if the registry is empty.
@@ -158,6 +165,7 @@ pub fn resolve_in(
                 effort: None,
                 session_id: mint_for(&**backend),
                 provider: Some(provider_id.clone()),
+                prompt,
             };
             Some(LaunchPlan {
                 command: backend.launch(&spec),
@@ -546,6 +554,7 @@ mod tests {
                 agent_id: "claude".into(),
                 model: Some("opus".into()),
                 effort: Some("high".into()),
+                prompt: None,
             },
         )
         .expect("no plan");
@@ -561,7 +570,7 @@ mod tests {
         assert!(resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "ghost".into(), model: None, effort: None },
+            LaunchRequest::Agent { agent_id: "ghost".into(), model: None, effort: None, prompt: None },
         )
         .is_none());
     }
@@ -576,6 +585,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "openrouter".into(),
                 model_id: "anthropic/claude-sonnet-5".into(),
+                prompt: None,
             },
         )
         .expect("no plan");
@@ -597,6 +607,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "openrouter".into(),
                 model_id: "anthropic/claude-sonnet-5".into(),
+                prompt: None,
             },
         )
         .expect("no plan");
@@ -616,6 +627,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "local".into(),
                 model_id: "some-local-model".into(),
+                prompt: None,
             },
         )
         .expect("no plan");
@@ -631,6 +643,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "deleted".into(),
                 model_id: "m".into(),
+                prompt: None,
             },
         )
         .is_none());
@@ -650,6 +663,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "openrouter".into(),
                 model_id: "m".into(),
+                prompt: None,
             },
         )
         .unwrap();
@@ -662,6 +676,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "openrouter".into(),
                 model_id: "m".into(),
+                prompt: None,
             },
         )
         .unwrap();
@@ -680,6 +695,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "openrouter".into(),
                 model_id: "z-ai/glm-5.2".into(),
+                prompt: None,
             },
         )
         .unwrap();
@@ -693,6 +709,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "openrouter".into(),
                 model_id: "z-ai/glm-5.2".into(),
+                prompt: None,
             },
         )
         .unwrap();
@@ -707,7 +724,7 @@ mod tests {
         let minting = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None },
+            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None },
         )
         .unwrap();
         let id = minting.session_id.expect("claude mints an id");
@@ -719,6 +736,7 @@ mod tests {
             LaunchRequest::ApiModel {
                 provider_id: "openrouter".into(),
                 model_id: "m".into(),
+                prompt: None,
             },
         )
         .unwrap();
@@ -733,7 +751,8 @@ mod tests {
             agent_id: "claude".into(),
             model: None,
             effort: None,
-        };
+    prompt: None,
+};
         let a = resolve_in(&list, &[], req()).unwrap().session_id;
         let b = resolve_in(&list, &[], req()).unwrap().session_id;
         assert!(a.is_some() && a != b, "the same id twice: {a:?}");
@@ -964,7 +983,7 @@ mod tests {
         )
         .expect("agent");
         assert!(
-            matches!(agent, LaunchRequest::Agent { agent_id, model, effort }
+            matches!(agent, LaunchRequest::Agent { agent_id, model, effort, .. }
                 if agent_id == "claude" && model.as_deref() == Some("opus")
                     && effort.as_deref() == Some("high")),
         );
@@ -973,7 +992,7 @@ mod tests {
             r#"{"kind":"apiModel","providerId":"openrouter","modelId":"a/b"}"#,
         )
         .expect("apiModel");
-        assert!(matches!(api, LaunchRequest::ApiModel { provider_id, model_id }
+        assert!(matches!(api, LaunchRequest::ApiModel { provider_id, model_id, .. }
             if provider_id == "openrouter" && model_id == "a/b"));
 
         for (json, ok) in [
@@ -1009,7 +1028,7 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None },
+            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None },
         )
         .unwrap();
         let v: serde_json::Value = serde_json::to_value(&plan).unwrap();
@@ -1038,7 +1057,7 @@ mod tests {
         let plan = resolve_in(
             &crate::agents::backends(),
             &[local()],
-            LaunchRequest::ApiModel { provider_id: "local".into(), model_id: "m".into() },
+            LaunchRequest::ApiModel { provider_id: "local".into(), model_id: "m".into(), prompt: None },
         )
         .expect("no engine would run an API model");
         assert_eq!(plan.agent_id, "api");

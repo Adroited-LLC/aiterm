@@ -7,6 +7,8 @@ import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
 import RemoteAccessSettings from "./RemoteAccessSettings";
+import LibrarianPane from "./LibrarianPane";
+import { LibrarianCtl } from "../librarian";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
@@ -33,6 +35,8 @@ interface Props {
   /** With `initialTab: "models"`: the provider to open the model browser on
    *  straight away, so the step that was missing is the one on screen. */
   focusProvider?: string | null;
+  /** The librarian's state and controls, for its pane. */
+  librarian: LibrarianCtl;
 }
 
 const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
@@ -48,6 +52,7 @@ export type SettingsTab =
   | "agents"
   | "models"
   | "remote"
+  | "librarian"
   | "diagnostics";
 type Tab = SettingsTab;
 
@@ -57,6 +62,7 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "agents", label: "Agents" },
   { key: "models", label: "Model access" },
   { key: "remote", label: "Remote access" },
+  { key: "librarian", label: "Librarian" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
 
@@ -110,7 +116,7 @@ function Switch({ checked, onChange, label }: {
 const SIZE_KEY = "aiterm.settingsModalSize";
 
 export default function SettingsModal({
-  settings, onChange, onClose, capsOf, activeProject, initialTab, focusProvider,
+  settings, onChange, onClose, capsOf, activeProject, initialTab, focusProvider, librarian,
 }: Props) {
   const [tab, setTab] = useState<Tab>(initialTab ?? "appearance");
   // Resizable via the CSS corner grip; the size carries over to the next
@@ -294,6 +300,17 @@ export default function SettingsModal({
                     onChange={(e) => set({ iconSize: +e.target.value })}
                   />
                   <span className="srow-value">{settings.iconSize}px</span>
+                </Row>
+                <Row label="Times" desc="How “last active” is written in the session list, the home screen, and the agent panel">
+                  <div className="seg">
+                    {([["relative", "3h ago"], ["absolute", "Clock time"]] as const).map(([v, name]) => (
+                      <button
+                        key={v}
+                        className={"seg-btn" + (settings.timeFormat === v ? " on" : "")}
+                        onClick={() => set({ timeFormat: v })}
+                      >{name}</button>
+                    ))}
+                  </div>
                 </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
@@ -514,6 +531,14 @@ export default function SettingsModal({
 
             {tab === "remote" && <RemoteAccessSettings />}
 
+            {tab === "librarian" && (
+              <LibrarianPane
+                cfg={settings.librarian}
+                onChange={(l) => onChange({ ...settings, librarian: l })}
+                lib={librarian}
+                onOpenModelAccess={() => setTab("models")}
+              />
+            )}
             {tab === "agents" && configFor && (
               <ClaudeConfig agent={configFor} project={activeProject} onBack={() => setConfigFor(null)} />
             )}

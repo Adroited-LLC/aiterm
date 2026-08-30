@@ -11,9 +11,12 @@
 //! One pass over the file, no JSON kept: transcripts run to tens of megabytes
 //! and the hover has to answer while the pointer is still there. Claude's
 //! shape is read in full; Codex's for what it records (session meta, turn
-//! context, token counts, function calls); every other engine through its
-//! provider's `messages()`, which gives the conversation and nothing else —
-//! counts and the first and last exchange are still worth having.
+//! context, token counts, function calls); aiterm's own API chats for their
+//! meta records. An engine whose format is its own — grok's session
+//! directory, OpenCode's database — answers through its provider's
+//! `detail()`; one that offers only `messages()` gets the conversation and
+//! nothing else, and counts plus the first and last exchange are still
+//! worth having.
 
 use crate::sessions::{is_system_meta_prompt, line_may_hold_message, line_message, strip_system_tags};
 use serde::Serialize;
@@ -76,7 +79,7 @@ fn clip(text: &str, max: usize) -> String {
     s
 }
 
-fn push_unique(v: &mut Vec<String>, s: &str) {
+pub(crate) fn push_unique(v: &mut Vec<String>, s: &str) {
     if !s.is_empty() && !v.iter().any(|x| x == s) {
         v.push(s.to_string());
     }
@@ -84,7 +87,7 @@ fn push_unique(v: &mut Vec<String>, s: &str) {
 
 /// Most recent first, no repeats, capped — a file edited ten times is one
 /// line, and it is the one at the top.
-fn touch_file(files: &mut Vec<String>, path: &str) {
+pub(crate) fn touch_file(files: &mut Vec<String>, path: &str) {
     if path.is_empty() {
         return;
     }
@@ -98,9 +101,12 @@ pub async fn session_detail(session_id: String) -> Option<SessionDetail> {
     crate::run_blocking(move || session_detail_sync(session_id)).await
 }
 
-fn session_detail_sync(session_id: String) -> Option<SessionDetail> {
+pub(crate) fn session_detail_sync(session_id: String) -> Option<SessionDetail> {
     let list = crate::agents::backends();
     let (backend, path) = crate::agents::owner_in(&list, &session_id)?;
+    if let Some(d) = backend.sessions().detail(&session_id) {
+        return Some(d);
+    }
     if let Some(msgs) = backend.sessions().messages(&session_id) {
         return Some(from_messages(session_id, msgs));
     }
@@ -128,13 +134,13 @@ fn is_bookkeeping(line: &str) -> bool {
     [
         "\"permission-mode\"", "\"ai-title\"", "\"pr-link\"", "\"compact_boundary\"",
         "\"session_meta\"", "\"turn_context\"", "\"token_count\"", "\"task_started\"",
-        "\"function_call\"",
+        "\"function_call\"", "\"custom_tool_call\"", "\"aiterm-chat",
     ]
     .iter()
     .any(|k| line.contains(k))
 }
 
-fn top_tools(tools: HashMap<String, u32>) -> Vec<ToolCount> {
+pub(crate) fn top_tools(tools: HashMap<String, u32>) -> Vec<ToolCount> {
     let mut v: Vec<ToolCount> =
         tools.into_iter().map(|(name, count)| ToolCount { name, count }).collect();
     v.sort_by(|a, b| b.count.cmp(&a.count).then(a.name.cmp(&b.name)));
@@ -150,14 +156,63 @@ fn u64_at(v: &serde_json::Value, ptr: &str) -> Option<u64> {
     v.pointer(ptr).and_then(|x| x.as_u64())
 }
 
+/// Unix millis as the ISO string the transcripts write, so a record that
+/// keeps a number (aiterm's chats, OpenCode's rows) reads the same as one
+/// that keeps a string. Hand-rolled: nothing else in the crate needs a
+/// calendar, and this is thirty lines against a dependency.
+pub(crate) fn iso_from_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60,
+        ms % 1000
+    )
+}
+
+fn note_stamp(d: &mut SessionDetail, ts: &str) {
+    if d.started.is_none() {
+        d.started = Some(ts.to_string());
+    }
+    d.last_active = Some(ts.to_string());
+}
+
+/// Files named in an `apply_patch` body: `*** Update File: path` and its
+/// Add/Delete siblings, each once.
+fn patch_files(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|l| {
+            ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+                .iter()
+                .find_map(|p| l.strip_prefix(p))
+        })
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
 /// One transcript line into the running detail. Claude's and Codex's shapes
 /// both land here; a line that is neither is a no-op.
 pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>, v: &serde_json::Value) {
     if let Some(ts) = str_at(v, "/timestamp") {
-        if d.started.is_none() {
-            d.started = Some(ts.to_string());
-        }
-        d.last_active = Some(ts.to_string());
+        note_stamp(d, ts);
+    } else if let Some(ms) = u64_at(v, "/at") {
+        // aiterm's own chats stamp lines with millis, not a string.
+        note_stamp(d, &iso_from_ms(ms));
     }
     if let Some(c) = str_at(v, "/cwd") {
         d.cwd = Some(c.to_string());
@@ -194,6 +249,21 @@ pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>,
                 d.compactions += 1;
             }
         }
+        // ---- aiterm's API chats (chat.rs): meta first, then claude-shaped turns ----
+        "aiterm-chat" => {
+            if let Some(m) = str_at(v, "/model") {
+                push_unique(&mut d.models, m);
+            }
+            if let Some(p) = str_at(v, "/provider") {
+                d.permission_mode = Some(format!("via {p}"));
+            }
+        }
+        "aiterm-chat-model" => {
+            if let Some(m) = str_at(v, "/model") {
+                push_unique(&mut d.models, m);
+            }
+        }
+        "aiterm-chat-clear" => d.compactions += 1,
         // ---- codex bookkeeping ----
         "session_meta" => {
             if let Some(c) = str_at(v, "/payload/cwd") {
@@ -235,10 +305,25 @@ pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>,
             _ => {}
         },
         "response_item" => {
-            if str_at(v, "/payload/type") == Some("function_call") {
+            // `function_call` is a declared tool; `custom_tool_call` is the
+            // freeform kind — codex's `exec` and `apply_patch` arrive so.
+            if matches!(str_at(v, "/payload/type"), Some("function_call" | "custom_tool_call")) {
                 d.tool_calls += 1;
                 let name = str_at(v, "/payload/name").unwrap_or("tool");
                 *tools.entry(name.to_string()).or_insert(0) += 1;
+                if name == "apply_patch" {
+                    let body = str_at(v, "/payload/input")
+                        .map(String::from)
+                        .or_else(|| {
+                            str_at(v, "/payload/arguments")
+                                .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                                .and_then(|a| str_at(&a, "/input").map(String::from))
+                        })
+                        .unwrap_or_default();
+                    for f in patch_files(&body) {
+                        touch_file(&mut d.files, &f);
+                    }
+                }
             }
         }
         _ => {}
@@ -291,7 +376,7 @@ pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>,
     }
 }
 
-fn note_message(d: &mut SessionDetail, role: &str, text: &str) {
+pub(crate) fn note_message(d: &mut SessionDetail, role: &str, text: &str) {
     match role {
         "user" => {
             if is_system_meta_prompt(text) {
@@ -401,6 +486,46 @@ mod tests {
         assert_eq!(d.tools, vec![ToolCount { name: "shell".into(), count: 1 }]);
         assert_eq!(d.first_prompt.as_deref(), Some("hi"));
         assert_eq!(d.last_assistant.as_deref(), Some("Hey John!"));
+    }
+
+    #[test]
+    fn codex_custom_tool_calls_count_and_patches_name_files() {
+        let d = feed(&[
+            json!({"timestamp":"2026-08-17T16:13:43Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.exec_command({cmd:\"ls\"})"}}),
+            json!({"timestamp":"2026-08-17T16:13:44Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** Add File: src/b.rs\n+z\n*** End Patch"}}),
+            json!({"timestamp":"2026-08-17T16:13:45Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: src/a.rs\\n*** End Patch\"}"}}),
+        ]);
+        assert_eq!(d.tool_calls, 3);
+        assert_eq!(d.tools, vec![ToolCount { name: "apply_patch".into(), count: 2 }, ToolCount { name: "exec".into(), count: 1 }]);
+        assert_eq!(d.files, vec!["src/a.rs", "src/b.rs"], "most recent touch first");
+    }
+
+    #[test]
+    fn api_chat_transcript_yields_model_provider_and_times() {
+        let d = feed(&[
+            json!({"type":"aiterm-chat","id":"x","provider":"openrouter","model":"a/b","cwd":"/c","at":1_700_000_000_000u64}),
+            json!({"type":"user","message":{"role":"user","content":"hi"},"at":1_700_000_001_000u64}),
+            json!({"type":"assistant","message":{"role":"assistant","content":"hello"},"at":1_700_000_002_000u64}),
+            json!({"type":"aiterm-chat-model","model":"c/d"}),
+            json!({"type":"aiterm-chat-clear"}),
+            json!({"type":"user","message":{"role":"user","content":"again"},"at":1_700_000_003_000u64}),
+        ]);
+        assert_eq!(d.cwd.as_deref(), Some("/c"));
+        assert_eq!(d.models, vec!["a/b", "c/d"]);
+        assert_eq!(d.permission_mode.as_deref(), Some("via openrouter"));
+        assert_eq!(d.started.as_deref(), Some("2023-11-14T22:13:20.000Z"));
+        assert_eq!(d.last_active.as_deref(), Some("2023-11-14T22:13:23.000Z"));
+        assert_eq!((d.user_messages, d.assistant_messages), (2, 1));
+        assert_eq!(d.compactions, 1, "a /clear is the chat's compaction");
+        assert_eq!(d.first_prompt.as_deref(), Some("hi"));
+        assert_eq!(d.last_user.as_deref(), Some("again"));
+    }
+
+    #[test]
+    fn iso_from_ms_matches_the_transcripts() {
+        assert_eq!(iso_from_ms(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_from_ms(1_787_967_144_650), "2026-08-29T01:32:24.650Z");
+        assert_eq!(iso_from_ms(951_782_400_000), "2000-02-29T00:00:00.000Z");
     }
 
     #[test]

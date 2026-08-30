@@ -84,6 +84,7 @@ impl AgentService {
             agent_id,
             model,
             effort,
+            ..
         } = &request
         {
             let choices = self.operations.list();

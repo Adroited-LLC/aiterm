@@ -360,6 +360,92 @@ pub fn parse_artifacts(text: &str) -> Vec<crate::sessions::Artifact> {
         .collect()
 }
 
+/// What the flyout shows for a grok session, from the two files that hold
+/// it. `summary.json` says the model, the effort, the sandbox, the branch
+/// and when — from the first frame, before a word is exchanged — and
+/// `chat_history.jsonl` says the rest: every assistant line carries its
+/// `model_id` and `reasoning_effort`, and its `tool_calls` name the tool
+/// and, for `write`/`search_replace`, the file. Both shapes as read off
+/// grok 1.0.5. Grok records no token counts and no per-line timestamps, so
+/// context stays unknown rather than invented.
+pub fn parse_detail(id: &str, summary: &str, chat: &str) -> crate::detail::SessionDetail {
+    use crate::detail::{note_message, push_unique, top_tools, touch_file, SessionDetail};
+    let mut d = SessionDetail { id: id.to_string(), ..Default::default() };
+    let mut summary_model = None;
+    if let Ok(s) = serde_json::from_str::<serde_json::Value>(summary) {
+        let str_of = |k: &str| s.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(String::from);
+        d.started = str_of("created_at");
+        d.last_active = str_of("updated_at");
+        d.cwd = s.pointer("/info/cwd").and_then(|v| v.as_str()).map(String::from);
+        d.branch = str_of("head_branch");
+        d.title = str_of("session_summary");
+        d.effort = str_of("reasoning_effort");
+        d.permission_mode = str_of("sandbox_profile").map(|p| format!("sandbox {p}"));
+        summary_model = str_of("current_model_id");
+    }
+    let mut tools: std::collections::HashMap<String, u32> = Default::default();
+    for line in chat.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(kind) = v.get("type").and_then(|t| t.as_str()) else { continue };
+        if kind != "user" && kind != "assistant" {
+            continue;
+        }
+        if kind == "assistant" {
+            if let Some(m) = v.get("model_id").and_then(|m| m.as_str()) {
+                push_unique(&mut d.models, m);
+            }
+            if let Some(e) = v.get("reasoning_effort").and_then(|e| e.as_str()) {
+                d.effort = Some(e.to_string());
+            }
+            for call in v.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten() {
+                d.tool_calls += 1;
+                let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                *tools.entry(name.to_string()).or_insert(0) += 1;
+                if matches!(name, "write" | "create_file" | "search_replace" | "edit_file" | "apply_patch") {
+                    if let Some(fp) = call
+                        .get("arguments")
+                        .and_then(|a| a.as_str())
+                        .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+                        .and_then(|a| a.get("file_path").and_then(|f| f.as_str()).map(String::from))
+                    {
+                        touch_file(&mut d.files, &fp);
+                    }
+                }
+            }
+        } else if v.get("synthetic_reason").is_some() {
+            // The engine talking to itself in the user's seat.
+            continue;
+        }
+        let body = match v.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        // The first user line is often a preamble alone — `<user_info>`,
+        // `<git_status>`, `<rules>` — with no query in it; stripped, it is
+        // nothing, and nothing is what it should count as.
+        let body = if kind == "user" {
+            crate::sessions::strip_system_tags(&user_query(&body))
+        } else {
+            body
+        };
+        if !body.trim().is_empty() {
+            note_message(&mut d, kind, &body);
+        }
+    }
+    if d.models.is_empty() {
+        if let Some(m) = summary_model {
+            d.models.push(m);
+        }
+    }
+    d.tools = top_tools(tools);
+    d
+}
+
 impl SessionProvider for GrokSessions {
     fn scan_with_paths(&self) -> Vec<(Session, PathBuf)> {
         sessions_root().map(|r| scan_dir(&r)).unwrap_or_default()
@@ -385,6 +471,13 @@ impl SessionProvider for GrokSessions {
         let dir = session_dir(session_id)?;
         let text = std::fs::read_to_string(dir.join("chat_history.jsonl")).ok()?;
         Some(parse_messages(&text))
+    }
+
+    fn detail(&self, session_id: &str) -> Option<crate::detail::SessionDetail> {
+        let dir = session_dir(session_id)?;
+        let summary = std::fs::read_to_string(dir.join("summary.json")).ok()?;
+        let chat = std::fs::read_to_string(dir.join("chat_history.jsonl")).unwrap_or_default();
+        Some(parse_detail(session_id, &summary, &chat))
     }
 
     fn tasks(&self, session_id: &str) -> Option<Vec<crate::sessions::SessionTask>> {
@@ -517,7 +610,61 @@ impl AgentBackend for GrokBackend {
         if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --session-id {}", q(id)));
         }
+        if let Some(p) = crate::agents::prompt_of(spec) {
+            cmd.push_str(&format!(" {}", q(p)));
+        }
         cmd
+    }
+}
+
+#[cfg(test)]
+mod detail_tests {
+    use super::*;
+
+    #[test]
+    fn the_flyout_gets_the_lot() {
+        let summary = r#"{"info":{"id":"89fc","cwd":"/home/admin/AI-OS"},"session_summary":"Closing House research",
+            "created_at":"2026-08-29T01:32:24.650674083Z","updated_at":"2026-08-29T01:40:00.000000000Z",
+            "num_chat_messages":2,"current_model_id":"grok-4.6","git_root_dir":"/home/admin/AI-OS/",
+            "head_commit":"6137e27","head_branch":"master","agent_name":"grok-build-plan","sandbox_profile":"off","reasoning_effort":"high"}"#;
+        let chat = [
+            r#"{"type":"system","content":"You are Grok."}"#,
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: linux\n</user_info>\n\n<rules>\n<user_rule>be brief</user_rule>\n</rules>"}]}"#,
+            r#"{"type":"user","content":"<user_query>look at closing.house</user_query>","prompt_index":0}"#,
+            r#"{"type":"reasoning","encrypted_content":"x","id":"r1","status":"completed","summary":[],"type":"reasoning"}"#,
+            r#"{"type":"assistant","content":"I'll start with the site.","tool_calls":[{"id":"c1","name":"web_fetch","arguments":"{\"url\":\"https://closing.house\"}"}],"model_id":"grok-4.6-build","model_fingerprint":"fp","reasoning_effort":"high"}"#,
+            r#"{"type":"tool_result","content":"<html>","tool_call_id":"c1"}"#,
+            r#"{"type":"user","content":"(subagent finished)","synthetic_reason":"subagent"}"#,
+            r#"{"type":"assistant","content":"","tool_calls":[{"id":"c2","name":"write","arguments":"{\"file_path\":\"/home/admin/AI-OS/a.md\",\"content\":\"x\"}"},{"id":"c3","name":"search_replace","arguments":"{\"file_path\":\"/home/admin/AI-OS/b.md\"}"},{"id":"c4","name":"write","arguments":"{\"file_path\":\"/home/admin/AI-OS/a.md\"}"}],"model_id":"grok-4.6-build","reasoning_effort":"high"}"#,
+            r#"{"type":"assistant","content":"Here is what I took from closing.house.","model_id":"grok-4.6-build","reasoning_effort":"high"}"#,
+        ].join("\n");
+        let d = parse_detail("89fc", summary, &chat);
+        assert_eq!(d.started.as_deref(), Some("2026-08-29T01:32:24.650674083Z"));
+        assert_eq!(d.last_active.as_deref(), Some("2026-08-29T01:40:00.000000000Z"));
+        assert_eq!(d.cwd.as_deref(), Some("/home/admin/AI-OS"));
+        assert_eq!(d.branch.as_deref(), Some("master"));
+        assert_eq!(d.title.as_deref(), Some("Closing House research"));
+        assert_eq!(d.models, vec!["grok-4.6-build"], "the transcript's model, not the summary's");
+        assert_eq!(d.effort.as_deref(), Some("high"));
+        assert_eq!(d.permission_mode.as_deref(), Some("sandbox off"));
+        assert_eq!((d.user_messages, d.assistant_messages), (1, 2), "the preamble, synthetic user turns and empty assistant turns are not the conversation");
+        assert_eq!(d.tool_calls, 4);
+        assert_eq!(d.tools[0].name, "write");
+        assert_eq!(d.tools[0].count, 2);
+        assert_eq!(d.files, vec!["/home/admin/AI-OS/a.md", "/home/admin/AI-OS/b.md"], "most recent touch first, once each");
+        assert_eq!(d.first_prompt.as_deref(), Some("look at closing.house"));
+        assert_eq!(d.last_assistant.as_deref(), Some("Here is what I took from closing.house."));
+        assert_eq!(d.context_tokens, None, "grok records no usage; nothing is invented");
+    }
+
+    #[test]
+    fn an_empty_session_still_says_model_and_when() {
+        let summary = r#"{"info":{"id":"x","cwd":"/w"},"session_summary":"","created_at":"2026-08-29T01:32:24Z","updated_at":"2026-08-29T01:32:24Z","current_model_id":"grok-4.6","sandbox_profile":"off","reasoning_effort":"medium"}"#;
+        let d = parse_detail("x", summary, "");
+        assert_eq!(d.models, vec!["grok-4.6"]);
+        assert_eq!(d.effort.as_deref(), Some("medium"));
+        assert_eq!(d.title, None);
+        assert_eq!(d.user_messages, 0);
     }
 }
 
@@ -623,6 +770,7 @@ mod tests {
             effort: Some("xhigh".into()),
             session_id: Some("e63b0f22-7d69-4084-aaf3-733816255e8e".into()),
             provider: None,
+            prompt: None,
         });
         assert_eq!(
             cmd,
