@@ -3174,21 +3174,30 @@ impl StrictArchiveEntry {
     }
 
     fn remove_exact_after(&self, validate: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        self.remove_exact_after_with_hook(validate, || {})
+    }
+
+    fn remove_exact_after_with_hook(
+        &self,
+        validate: impl FnOnce() -> Result<(), String>,
+        after_name_check: impl FnOnce(),
+    ) -> Result<(), String> {
         self.verify()?;
         let recovery = self.publish_recovery_link()?;
-        if let Err(error) = validate() {
-            return Err(format!(
-                "{error}; exact archive is recoverable at {}",
-                recovery.path.display()
-            ));
-        }
         if !directory_entry_is_exact_object(&self.parent, &self.name, &self.archive.file)? {
             return Err(format!(
                 "archive name changed before removal; exact archive is recoverable at {}",
                 recovery.path.display()
             ));
         }
-        let quarantine_name = format!(".aiterm-restore-remove-{}", uuid::Uuid::new_v4());
+        if let Err(error) = validate() {
+            return Err(format!(
+                "{error}; exact archive is recoverable at {}",
+                recovery.path.display()
+            ));
+        }
+        after_name_check();
+        let quarantine_name = format!(".aiterm-purged-file-{}", uuid::Uuid::new_v4());
         let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
         let quarantine_path = self
             .display_path
@@ -3202,6 +3211,12 @@ impl StrictArchiveEntry {
             &quarantine,
         )?;
         if !directory_entry_is_exact_object(&self.parent, &quarantine, &self.archive.file)? {
+            let _ = rename_noreplace(
+                self.parent.as_raw_fd(),
+                &quarantine,
+                self.parent.as_raw_fd(),
+                &self.name,
+            );
             return Err(format!(
                 "archive name changed during removal; exact archive is recoverable at {} and the moved entry at {}",
                 recovery.path.display(),
@@ -3224,18 +3239,17 @@ impl StrictArchiveEntry {
                 quarantine_path.display()
             ));
         }
-        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), quarantine.as_ptr(), 0) } != 0 {
-            return Err(format!(
-                "purged restore archive remains at {}: {}",
-                quarantine_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
         if unsafe { libc::unlinkat(self.parent.as_raw_fd(), recovery.name.as_ptr(), 0) } != 0 {
             return Err(format!(
                 "purged restore recovery link remains at {}: {}",
                 recovery.path.display(),
                 std::io::Error::last_os_error()
+            ));
+        }
+        if !directory_entry_is_exact_object(&self.parent, &quarantine, &self.archive.file)? {
+            return Err(format!(
+                "exact zeroed purge tombstone changed at {}",
+                quarantine_path.display()
             ));
         }
         self.parent.sync_all().map_err(|error| error.to_string())
@@ -3246,6 +3260,11 @@ impl StrictArchiveEntry {
 struct ArchiveRecoveryLink {
     name: CString,
     path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn is_purge_tombstone(name: &OsStr) -> bool {
+    name.as_bytes().starts_with(b".aiterm-purged-")
 }
 
 #[cfg(target_os = "linux")]
@@ -3305,6 +3324,9 @@ impl PreparedTrashDirectory {
         let mut entries = Vec::with_capacity(snapshot.len().min(16));
         let display_path = display_parent.join(name);
         for entry in &snapshot {
+            if is_purge_tombstone(&entry.name) {
+                continue;
+            }
             *budget = budget.checked_add(1).ok_or("trash purge budget overflow")?;
             if *budget > MAX_EXACT_ARCHIVE_ENTRIES {
                 return Err("trash directory exceeds purge entry limit".into());
@@ -3350,6 +3372,10 @@ impl PreparedTrashDirectory {
     }
 
     fn remove_exact(&self) -> Result<(), String> {
+        self.remove_exact_with_hook(|| {})
+    }
+
+    fn remove_exact_with_hook(&self, after_final_check: impl FnOnce()) -> Result<(), String> {
         if snapshot_directory_entries(&self.directory)? != self.snapshot
             || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)?
         {
@@ -3361,26 +3387,44 @@ impl PreparedTrashDirectory {
         for entry in &self.entries {
             entry.remove_exact()?;
         }
-        if !snapshot_directory_entries(&self.directory)?.is_empty()
-            || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)?
-        {
+        if snapshot_directory_entries(&self.directory)?
+            .iter()
+            .any(|entry| !is_purge_tombstone(&entry.name))
+            || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)? {
             return Err(format!(
                 "trash directory changed during permanent purge at {}",
                 self.display_path.display()
             ));
         }
-        if unsafe {
-            libc::unlinkat(
-                self.parent.as_raw_fd(),
-                self.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        } != 0
-        {
+        let tombstone_name = format!(".aiterm-purged-directory-{}", uuid::Uuid::new_v4());
+        let tombstone = CString::new(tombstone_name.as_bytes()).unwrap();
+        after_final_check();
+        if let Err(error) = rename_noreplace(
+            self.parent.as_raw_fd(),
+            &self.name,
+            self.parent.as_raw_fd(),
+            &tombstone,
+        ) {
             return Err(format!(
                 "could not remove purged trash directory at {}: {}",
                 self.display_path.display(),
-                std::io::Error::last_os_error()
+                error
+            ));
+        }
+        if !directory_entry_is_exact_object(&self.parent, &tombstone, &self.directory)? {
+            let _ = rename_noreplace(
+                self.parent.as_raw_fd(),
+                &tombstone,
+                self.parent.as_raw_fd(),
+                &self.name,
+            );
+            return Err(format!(
+                "purged directory tombstone changed at {}",
+                self.display_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(tombstone_name)
+                    .display()
             ));
         }
         self.parent.sync_all().map_err(|error| error.to_string())
@@ -4459,12 +4503,18 @@ fn trash_empty_sync() -> Result<(), String> {
 fn trash_empty_in_directory(trash_path: &Path) -> Result<(), String> {
     let trash = VerifiedDirectory::open(trash_path)?;
     let snapshot = snapshot_directory_entries(&trash.file)?;
-    let mut budget = snapshot.len();
+    let mut budget = snapshot
+        .iter()
+        .filter(|entry| !is_purge_tombstone(&entry.name))
+        .count();
     if budget > MAX_EXACT_ARCHIVE_ENTRIES {
         return Err("trash purge exceeds entry limit".into());
     }
     let mut prepared = Vec::with_capacity(snapshot.len().min(16));
     for entry in &snapshot {
+        if is_purge_tombstone(&entry.name) {
+            continue;
+        }
         let kind = entry.mode & libc::S_IFMT as u32;
         if kind == libc::S_IFREG as u32 {
             prepared.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
@@ -4495,7 +4545,10 @@ fn trash_empty_in_directory(trash_path: &Path) -> Result<(), String> {
     for entry in &prepared {
         entry.remove_exact()?;
     }
-    if !snapshot_directory_entries(&trash.file)?.is_empty() {
+    if snapshot_directory_entries(&trash.file)?
+        .iter()
+        .any(|entry| !is_purge_tombstone(&entry.name))
+    {
         return Err("trash directory changed during permanent purge".into());
     }
     trash.file.sync_all().map_err(|error| error.to_string())
@@ -7155,6 +7208,87 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".aiterm-restore-recovery-")
         }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_file_purge_restores_replacement_swapped_after_name_check() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-strict-file-final-swap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let archive = root.join("archive.tasks");
+        let displaced = root.join("displaced-exact");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&archive, b"exact archive").unwrap();
+
+        let error = {
+            let strict = StrictArchiveEntry::open(&archive).unwrap();
+            strict
+                .remove_exact_after_with_hook(
+                    || Ok(()),
+                    || {
+                        std::fs::rename(&archive, &displaced).unwrap();
+                        std::fs::write(&archive, b"replacement must survive").unwrap();
+                    },
+                )
+                .unwrap_err()
+        };
+
+        assert!(error.contains("archive name changed during removal"), "{error}");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"replacement must survive");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"exact archive");
+        assert!(std::fs::read_dir(&root).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aiterm-restore-recovery-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recursive_purge_restores_directory_replacement_swapped_after_final_check() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-strict-directory-final-swap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let trash_path = root.join("trash");
+        let exact = trash_path.join("session.tasks");
+        let displaced = trash_path.join("displaced-exact");
+        std::fs::create_dir_all(&exact).unwrap();
+        std::fs::write(exact.join("task"), b"purge target").unwrap();
+        let trash = VerifiedDirectory::open(&trash_path).unwrap();
+        let mut budget = 0;
+        let prepared = PreparedTrashDirectory::open_in(
+            &trash.file,
+            &trash_path,
+            OsStr::new("session.tasks"),
+            &mut budget,
+            0,
+        )
+        .unwrap();
+
+        let error = prepared
+            .remove_exact_with_hook(|| {
+                std::fs::rename(&exact, &displaced).unwrap();
+                std::fs::create_dir(&exact).unwrap();
+                std::fs::write(exact.join("replacement"), b"must survive").unwrap();
+            })
+            .unwrap_err();
+
+        assert!(error.contains("purged directory tombstone changed"), "{error}");
+        assert_eq!(
+            std::fs::read(exact.join("replacement")).unwrap(),
+            b"must survive"
+        );
+        assert!(displaced.is_dir());
+        assert!(std::fs::read_dir(&displaced)
+            .unwrap()
+            .flatten()
+            .all(|entry| is_purge_tombstone(&entry.file_name())));
         std::fs::remove_dir_all(root).unwrap();
     }
 
