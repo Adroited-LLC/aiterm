@@ -440,6 +440,19 @@ pub fn for_session(app: &AppHandle, session_id: &str) -> Vec<Change> {
     out
 }
 
+/// Session ids with at least one recorded artifact — straight off the
+/// in-memory ledger, cheap enough to ride along on every session list.
+pub fn sessions_with_files(app: &AppHandle) -> HashSet<String> {
+    let ledger = app.state::<ChangeLedger>();
+    let inner = ledger.inner.lock().unwrap();
+    inner
+        .entries
+        .iter()
+        .filter(|c| c.kind != "deleted")
+        .filter_map(|c| c.session_id.clone())
+        .collect()
+}
+
 /// Per-harness output directories for one session: codex's
 /// `~/.codex/generated_images/<session id>/`, and grok's
 /// `~/.grok/sessions/<url-encoded cwd>/<session id>/images/` — the encoded

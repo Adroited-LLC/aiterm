@@ -757,11 +757,14 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
             *e = "working".into();
         }
     }
+    // Which sessions produced files, for the phone's "has files" filter.
+    let with_files: Vec<String> = crate::changes::sessions_with_files(&ctx.app).into_iter().collect();
     Json(serde_json::json!({
         "sessions": sessions,
         "running": running,
         "open": open,
         "activity": activity,
+        "with_files": with_files,
     }))
     .into_response()
 }
