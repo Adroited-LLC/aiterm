@@ -25,11 +25,6 @@ import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
-import { useLibrarian } from "./librarian";
-import { useRelay } from "./relay";
-import BringIn from "./components/BringIn";
-import { Users } from "lucide-react";
-import { LIBRARIAN_DIR_SUFFIX } from "./ipc";
 import {
   FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
 } from "lucide-react";
@@ -58,7 +53,10 @@ import {
   desktopNotify, desktopNotifyClose,
   Refusal, sessionRefusal, opencodeDispatch, opencodeDefaultTarget,
   claudeModelDefault, restoreClaudeModelDefault, sessionPreview,
+  TabDescriptor, TabId, TabRegistryEvent, tabClose, tabList, tabOpen,
+  tabRegistrySnapshot, tabUpdate,
 } from "./ipc";
+import { createTabRegistryRecovery, reconcileTabs } from "./tabModel";
 import RefusalBanner from "./components/RefusalBanner";
 import { nextAdoptionDelay } from "./adoption";
 import "./App.css";
@@ -147,7 +145,7 @@ function describeEnd(why: EndedWhy | undefined): string {
 /** A file open in the center strip, pinned to the terminal tab it was
  *  opened beside — switching sessions switches to that session's files. */
 /** The owner of a file tab: a terminal key, a preview, or home (null). */
-type FileScope = number | string | null;
+type FileScope = TabId | null;
 
 interface FileTab {
   key: number;
@@ -169,6 +167,16 @@ interface OpenTabOpts {
   agentId?: string;
   /** The session this tab was opened to reopen — see `TermTab.resumedId`. */
   resumedId?: string;
+}
+
+function reconcileTermTabs(
+  current: TermTab[], authoritative: TabDescriptor[],
+): TermTab[] {
+  const projected = reconcileTabs(
+    current.map((tab) => ({ ...tab, id: tab.key })),
+    authoritative,
+  );
+  return projected.map(({ id, ...tab }) => ({ ...tab, key: id }));
 }
 
 function loadJSON<T>(key: string, fallback: T): T {
@@ -208,9 +216,9 @@ export default function App() {
     return () => clearTimeout(t);
   }, [notice]);
   const [tabs, setTabs] = useState<TermTab[]>([]);
-  const [activeTab, setActiveTab] = useState<number | null>(null);
+  const [activeTab, setActiveTab] = useState<TabId | null>(null);
   const [previewSession, setPreviewSession] = useState<Session | null>(null);
-  const nextKey = useRef(1);
+  const nextFileKey = useRef(1);
   const [gitRefresh, setGitRefresh] = useState(0);
   const [explorerRefresh, setExplorerRefresh] = useState(0);
   // Center file tabs — the browser-tab strip beside the (locked) terminal.
@@ -225,29 +233,39 @@ export default function App() {
   const fileCloseTimer = useRef<number | null>(null);
 
   // Tabs whose terminal rang the bell while not being looked at.
-  const [attention, setAttention] = useState<Set<number>>(new Set());
+  const [attention, setAttention] = useState<Set<TabId>>(new Set());
   /** The message behind a badge, when the program sent one (OSC 9). */
-  const [notices, setNotices] = useState<Map<number, string>>(new Map());
+  const [notices, setNotices] = useState<Map<TabId, string>>(new Map());
   /** Long-running work a tab is reporting (OSC 9;4). */
-  const [progress, setProgress] = useState<Map<number, TermProgress>>(new Map());
+  const [progress, setProgress] = useState<Map<TabId, TermProgress>>(new Map());
   /** When each waiting tab started waiting — the bell lists oldest first, and
    *  "waiting 20m" is the part that decides which one to open. */
-  const [alertAt, setAlertAt] = useState<Map<number, number>>(new Map());
+  const [alertAt, setAlertAt] = useState<Map<TabId, number>>(new Map());
   // Tabs whose process died on its own, and the exit code it died with. These
   // keep their row: the tab going away used to be the *only* sign anything had
   // happened, which is no help at all when the thing that killed it was
   // somewhere else entirely — `claude agents` in another terminal, or a phone.
-  const [ended, setEnded] = useState<Map<number, EndedWhy>>(new Map());
-  const activeTabRef = useRef<number | null>(null);
+  const [ended, setEnded] = useState<Map<TabId, EndedWhy>>(new Map());
+  const activeTabRef = useRef<TabId | null>(null);
   // Latest tabs, read without putting `tabs` in an effect's deps (which would
   // re-run it on every tab change).
   const tabsRef = useRef<TermTab[]>(tabs);
   tabsRef.current = tabs;
+  const tabRegistryProjection = useRef<{
+    revision: number | null;
+    tabs: TabDescriptor[];
+  }>({ revision: null, tabs: [] });
+  const appAlive = useRef(true);
+  const pendingOpens = useRef(new Map<string, { cancelled: boolean }>());
+  useEffect(() => () => {
+    appAlive.current = false;
+    for (const pending of pendingOpens.current.values()) pending.cancelled = true;
+  }, []);
   // Codex changes its session id in-place for `/clear` but has no hook that
   // reports that transition. A terminal's submitted command is the missing
   // provenance: only a tab that explicitly sent `/clear` may adopt a newly
   // written session row.
-  const clearIntents = useRef(new Map<number, {
+  const clearIntents = useRef(new Map<TabId, {
     previousId: string;
     cwd: string;
     since: number;
@@ -291,8 +309,8 @@ export default function App() {
   const sessionsRef = useRef<Session[]>(sessions);
   sessionsRef.current = sessions;
 
-  const handles = useRef<Map<number, TermHandle>>(new Map());
-  const lastOutput = useRef<Map<number, number>>(new Map());
+  const handles = useRef<Map<TabId, TermHandle>>(new Map());
+  const lastOutput = useRef<Map<TabId, number>>(new Map());
 
   // Which panels are open. These were plain state, so every restart threw the
   // layout away and you rebuilt it by hand — the sizes and fonts beside them
@@ -347,7 +365,7 @@ export default function App() {
   // terminal — always ends with the keyboard back in the terminal. Whatever
   // happens next is typed there, and leaving focus on a button that just
   // disappeared makes the first keystroke go nowhere.
-  const dismissTui = useCallback((tab: number) => {
+  const dismissTui = useCallback((tab: TabId) => {
     setTuiDismissed(true);
     handles.current.get(tab)?.focus();
   }, []);
@@ -464,24 +482,6 @@ export default function App() {
     setSettingsTarget({ tab: "models", provider: provider ?? null });
     setShowSettingsModal(true);
   };
-  const openLibrarian = () => {
-    setSettingsTarget({ tab: "librarian", provider: null });
-    setShowSettingsModal(true);
-  };
-  /** The librarian: names, tags and threads for the session list, written
-   *  by whatever small model Settings chose. */
-  const librarian = useLibrarian(settings.librarian, sessions);
-  /** A second agent brought into the active session — see `relay.ts`. */
-  const progressRef = useRef(progress);
-  progressRef.current = progress;
-  const relayCtl = useRelay({
-    tabs: () => tabsRef.current,
-    handle: (key) => handles.current.get(key),
-    quietFor: (key) => Date.now() - (lastOutput.current.get(key) ?? 0),
-    busy: (key) => progressRef.current.has(key),
-    open: (cwd, choice, prompt) => newSession(cwd, choice, prompt),
-  });
-  const [showBringIn, setShowBringIn] = useState(false);
   useEffect(() => {
     applySettings(settings);
     saveSettings(settings);
@@ -643,9 +643,7 @@ export default function App() {
 
   // List-only refresh: cheap, safe to run on every fs event.
   const refreshSessionList = useCallback(() => {
-    listSessions()
-      .then((list) => setSessions(list.filter((s) => !s.project_path.endsWith(LIBRARIAN_DIR_SUFFIX))))
-      .catch(console.error);
+    listSessions().then(setSessions).catch(console.error);
     listProjects().then(setProjects).catch(console.error);
     trashList().then(setTrashed).catch(() => setTrashed([]));
   }, []);
@@ -716,9 +714,110 @@ export default function App() {
   // session id to the newest transcript in its family on read, so the Agents
   // and Tasks panels already follow without anything rewriting the tab.
 
+  const applyTabDescriptor = useCallback((descriptor: TabDescriptor) => {
+    setTabs((current) => {
+      const next = current.map((tab) =>
+        tab.key === descriptor.id ? { ...tab, ...descriptor, key: descriptor.id } : tab);
+      tabsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    let unlisten: (() => void) | null = null;
+    let recoveryTimer: number | null = null;
+
+    const applyRegistryProjection = (projection: { revision: number | null; tabs: TabDescriptor[] }) => {
+      if (stopped) return;
+      const before = tabsRef.current;
+      tabRegistryProjection.current = projection;
+      setTabs((current) => {
+        const next = reconcileTermTabs(current, projection.tabs);
+        tabsRef.current = next;
+        setActiveTab((active) =>
+          active !== null && next.some((tab) => tab.key === active)
+            ? active
+            : next[next.length - 1]?.key ?? null);
+        return next;
+      });
+
+      const live = new Set(projection.tabs.map((tab) => tab.id));
+      const removed = new Set(before.filter((tab) => !live.has(tab.key)).map((tab) => tab.key));
+      if (removed.size === 0) return;
+      setFileTabs((files) => {
+        const dropped = files.filter((file) => file.termKey !== null && removed.has(file.termKey));
+        if (dropped.length === 0) return files;
+        const droppedKeys = new Set(dropped.map((file) => file.key));
+        setDirtyFiles((dirty) => {
+          const clean = new Set(dirty);
+          droppedKeys.forEach((key) => clean.delete(key));
+          return clean;
+        });
+        setActiveFileTab((active) =>
+          active !== null && droppedKeys.has(active) ? null : active);
+        return files.filter((file) => file.termKey === null || !removed.has(file.termKey));
+      });
+      setEnded((endedTabs) => {
+        const remaining = new Map(endedTabs);
+        removed.forEach((key) => remaining.delete(key));
+        return remaining;
+      });
+    };
+
+    const recovery = createTabRegistryRecovery(
+      tabRegistryProjection.current,
+      tabRegistrySnapshot,
+      applyRegistryProjection,
+    );
+
+    const recover = () => {
+      if (stopped) return;
+      void recovery.recover().catch(() => {
+        if (!stopped && recoveryTimer === null) {
+          recoveryTimer = window.setTimeout(() => {
+            recoveryTimer = null;
+            recover();
+          }, 250);
+        }
+      });
+    };
+
+    const acceptRegistryChange = (change: TabRegistryEvent) => {
+      const pending = recovery.accept(change);
+      if (pending !== null) {
+        void pending.catch(() => {
+          if (!stopped && recoveryTimer === null) {
+            recoveryTimer = window.setTimeout(() => {
+              recoveryTimer = null;
+              recover();
+            }, 250);
+          }
+        });
+      }
+    };
+
+    void (async () => {
+      const stop = await listen<TabRegistryEvent>("tab://registry", (event) => {
+        acceptRegistryChange(event.payload);
+      });
+      if (stopped) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      recover();
+    })();
+    return () => {
+      stopped = true;
+      if (recoveryTimer !== null) clearTimeout(recoveryTimer);
+      unlisten?.();
+    };
+  }, []);
+
   const openTab = useCallback(
     (title: string, cwd: string | null, command: string | null, slotId: string,
-     opts: OpenTabOpts = {}): number => {
+     opts: OpenTabOpts = {}): Promise<TabId | null> => {
       setPreviewSession(null);
       // Opening a terminal on a slot is the deliberate act of going back to
       // it — if its id was on the vacated list (green dot suppressed), it has
@@ -729,15 +828,61 @@ export default function App() {
         next.delete(slotId);
         return next;
       });
-      const existing = tabsRef.current.find((x) => x.slotId === slotId);
+      const existing = tabsRef.current.find((tab) => tab.slotId === slotId);
       if (existing) {
         setActiveTab(existing.key);
-        return existing.key;
+        return Promise.resolve(existing.key);
       }
-      const key = nextKey.current++;
-      setActiveTab(key);
-      setTabs((t) => [...t, { key, title, cwd, command, slotId, ...opts }]);
-      return key;
+      if (pendingOpens.current.has(slotId)) return Promise.resolve(null);
+
+      const pending = { cancelled: false };
+      pendingOpens.current.set(slotId, pending);
+      return (async () => {
+        let descriptor: TabDescriptor | null = null;
+        try {
+          const { adopt, ...registryOpts } = opts;
+          descriptor = await tabOpen({
+            title, cwd, command, slotId, ...registryOpts,
+            size: { cols: 80, rows: 24 },
+          });
+          if (pending.cancelled || !appAlive.current) {
+            await tabClose(descriptor.id).catch(() => {});
+            return null;
+          }
+          const authoritative = await tabList().catch(() => [descriptor!]);
+          if (pending.cancelled || !appAlive.current) {
+            await tabClose(descriptor.id).catch(() => {});
+            return null;
+          }
+          setTabs((current) => reconcileTermTabs(current, authoritative).map((tab) =>
+            tab.key === descriptor!.id ? { ...tab, adopt } : tab));
+          setActiveTab(descriptor.id);
+          if (descriptor.state === "exited") {
+            const why = descriptor.exit;
+            if (why?.code === 0 || why?.requested) {
+              await tabClose(descriptor.id).catch(() => {});
+              setTabs((current) => current.filter((tab) => tab.key !== descriptor!.id));
+              setActiveTab((active) => active === descriptor!.id ? null : active);
+            } else {
+              setEnded((current) => new Map(current).set(descriptor!.id, {
+                code: why?.code ?? null,
+                signal: why?.signal ?? null,
+              }));
+            }
+          }
+          return descriptor.id;
+        } catch (error) {
+          uiLog(`tab open failed for ${slotId}: ${String(error)}`);
+          if (descriptor && (pending.cancelled || !appAlive.current)) {
+            await tabClose(descriptor.id).catch(() => {});
+          }
+          return null;
+        } finally {
+          if (pendingOpens.current.get(slotId) === pending) {
+            pendingOpens.current.delete(slotId);
+          }
+        }
+      })();
     },
     [],
   );
@@ -793,7 +938,7 @@ export default function App() {
         setActiveFileTab(existing.key);
         return list;
       }
-      const key = nextKey.current++;
+      const key = nextFileKey.current++;
       setActiveFileTab(key);
       return [...list, { key, termKey: term, path }];
     });
@@ -835,7 +980,7 @@ export default function App() {
     });
   }, [dirtyFiles, fileCloseArm]);
 
-  const registerHandle = useCallback((key: number, handle: TermHandle | null) => {
+  const registerHandle = useCallback((key: TabId, handle: TermHandle | null) => {
     if (handle) handles.current.set(key, handle);
     else handles.current.delete(key);
   }, []);
@@ -884,7 +1029,7 @@ export default function App() {
 
   /** Daemon ids of popups currently on screen, by tab. A ref, not state: these
    *  are the desktop's business, and re-rendering over them would be noise. */
-  const popups = useRef<Map<number, number>>(new Map());
+  const popups = useRef<Map<TabId, number>>(new Map());
 
   // A popup only when aiterm is not the window you are looking at — if it is,
   // the bell is right there and a notification would be telling you something
@@ -914,17 +1059,17 @@ export default function App() {
   // Picking one there means going to it; the window was already raised by the
   // backend before this fires.
   useEffect(() => {
-    const un = listen<number>("tray-alert", (e) => setActiveTab(e.payload));
+    const un = listen<TabId>("tray-alert", (e) => setActiveTab(e.payload));
     return () => {
       un.then((f) => f()).catch(() => {});
     };
   }, []);
 
-  const noteActivity = useCallback((key: number) => {
+  const noteActivity = useCallback((key: TabId) => {
     lastOutput.current.set(key, Date.now());
   }, []);
 
-  const noteLineSubmit = useCallback((key: number, line: string) => {
+  const noteLineSubmit = useCallback((key: TabId, line: string) => {
     const tab = tabsRef.current.find((t) => t.key === key);
     if (
       line.trim() !== "/clear" || tab?.agentId !== "codex" || !tab.sessionId || !tab.cwd
@@ -950,7 +1095,7 @@ export default function App() {
     setClearIntentRevision((revision) => revision + 1);
   }, []);
 
-  const noteAttention = useCallback((key: number, on: boolean) => {
+  const noteAttention = useCallback((key: TabId, on: boolean) => {
     // A bell on the tab you're actively looking at isn't news.
     if (on && key === activeTabRef.current && document.hasFocus()) return;
     setAttention((prev) => {
@@ -985,14 +1130,14 @@ export default function App() {
   }, []);
 
   /** What a tab asked for, in its own words (OSC 9), keyed like `attention`. */
-  const noteNotify = useCallback((key: number, message: string) => {
+  const noteNotify = useCallback((key: TabId, message: string) => {
     setNotices((prev) => {
       if (prev.get(key) === message) return prev;
       return new Map(prev).set(key, message);
     });
   }, []);
 
-  const noteProgress = useCallback((key: number, p: TermProgress | null) => {
+  const noteProgress = useCallback((key: TabId, p: TermProgress | null) => {
     setProgress((prev) => {
       if (p === null) {
         if (!prev.has(key)) return prev;
@@ -1141,13 +1286,13 @@ export default function App() {
             t.adopt.agentId, t.cwd, t.adopt.since, t.adopt.known,
           );
           if (stop || !id) continue;
-          setTabs((list) =>
-            list.map((x) =>
-              x.key === t.key
-                ? { ...x, sessionId: id, slotId: id, fresh: false, adopt: undefined }
-                : x,
-            ),
-          );
+          const descriptor = await tabUpdate(t.key, {
+            sessionId: id, slotId: id, fresh: false,
+          });
+          if (stop) continue;
+          setTabs((list) => list.map((x) => x.key === t.key
+            ? { ...x, ...descriptor, key: descriptor.id, adopt: undefined }
+            : x));
           uiLog(`adopted ${t.adopt.agentId} session ${id} for tab ${t.key}`);
           refreshSessionList();
         } catch {
@@ -1205,17 +1350,14 @@ export default function App() {
             intent.inFlight = false;
             continue;
           }
-          setTabs((list) =>
-            list.map((item) => item.key === key
-              ? {
-                  ...item,
-                  sessionId: successor,
-                  slotId: successor,
-                  fresh: false,
-                  title: basename(item.cwd ?? "") || item.title,
-                }
-              : item),
-          );
+          const descriptor = await tabUpdate(key, {
+            sessionId: successor,
+            slotId: successor,
+            fresh: false,
+            title: basename(tab.cwd ?? "") || tab.title,
+          });
+          if (stop || clearIntents.current.get(key) !== intent) continue;
+          applyTabDescriptor(descriptor);
           noteRekey(intent.previousId, successor);
           setVacated((previous) => new Set(previous).add(intent.previousId));
           clearIntents.current.delete(key);
@@ -1239,7 +1381,7 @@ export default function App() {
       stop = true;
       window.clearInterval(interval);
     };
-  }, [clearIntentRevision, noteRekey, refreshSessionList]);
+  }, [applyTabDescriptor, clearIntentRevision, noteRekey, refreshSessionList]);
 
   // A conversation can change its session id while staying in this same pty.
   // Two things do it: moving to the daemon (all that opening the agents view
@@ -1317,19 +1459,14 @@ export default function App() {
         // normal stop instead.) `fresh` + retitle for the cleared kind mirror
         // the hook path above, and for the same reasons.
         const cleared = moved.kind === "cleared";
-        setTabs((ts) =>
-          ts.map((x) =>
-            x.key === key
-              ? {
-                  ...x,
-                  sessionId: moved.id,
-                  slotId: moved.id,
-                  fresh: cleared ? true : x.fresh,
-                  title: cleared ? basename(x.cwd ?? "") || x.title : x.title,
-                }
-              : x,
-          ),
-        );
+        const descriptor = await tabUpdate(key, {
+          sessionId: moved.id,
+          slotId: moved.id,
+          fresh: cleared ? true : activeTabObj?.fresh,
+          title: cleared ? basename(activeTabObj?.cwd ?? "") || title : title,
+        });
+        if (stop) return;
+        applyTabDescriptor(descriptor);
         noteRekey(pinned, moved.id);
         setVacated((prev) => new Set(prev).add(pinned));
         setNotice(
@@ -1364,11 +1501,11 @@ export default function App() {
     };
   }, [activeTabObj?.key, activeTabObj?.sessionId, activeTabObj?.title,
       activeTabObj?.resumedId, freshUnwritten, activeCaps.tui_drive,
-      refreshSessionList, agentsView]);
+      applyTabDescriptor, refreshSessionList, agentsView]);
 
   // The exact channel: every claude aiterm launches carries a SessionStart
   // hook (see hooklink.rs) that reports its session id, its cause and its pid
-  // into a spool. Drained here, each event lands on the tab whose pty owns
+  // into a spool. Drained here, each event lands on the tab whose process owns
   // that pid — so a `/clear` re-keys within two seconds, on any tab, active
   // or not, with no inference anywhere in the path. The watcher above stays:
   // it alone sees daemon moves, and it covers claudes with no hook — one
@@ -1385,10 +1522,7 @@ export default function App() {
       }
       if (stop) return;
       for (const evt of events) {
-        const entry = [...handles.current.entries()].find(
-          ([, h]) => h.ptyId === evt.ptyId,
-        );
-        const tab = entry && tabsRef.current.find((t) => t.key === entry[0]);
+        const tab = tabsRef.current.find((candidate) => candidate.key === evt.tabId);
         if (!tab) continue;
         // A session starting (again) under an id is the definition of "not
         // vacated" — however it left, it's back.
@@ -1410,29 +1544,7 @@ export default function App() {
         // branch, hook source "fork", and nothing on disk links the two.)
         const newConversation = evt.source === "clear" || evt.source === "fork";
         uiLog(`hook: tab ${tab.key} ${old} -> ${evt.sessionId} (${evt.source})`);
-        setTabs((ts) =>
-          ts.map((x) =>
-            x.key === tab.key
-              ? {
-                  ...x,
-                  sessionId: evt.sessionId,
-                  slotId: evt.sessionId,
-                  // A new conversation has no sidebar row until its first real
-                  // prompt lands (meta-only transcripts aren't listed), which
-                  // left the highlight orphaned — you looked "still clicked"
-                  // on the old row. `fresh` is the existing answer: the
-                  // placeholder row names this tab, highlighted, until the
-                  // real row appears under the same id and takes over.
-                  fresh: newConversation ? true : x.fresh,
-                  // And it isn't the old conversation, so it sheds the old
-                  // title rather than impersonating it in the sidebar.
-                  title: newConversation
-                    ? basename(x.cwd ?? "") || x.title
-                    : x.title,
-                }
-              : x,
-          ),
-        );
+        applyTabDescriptor(evt.tab);
         noteRekey(old, evt.sessionId);
         if (newConversation) {
           // The roster keeps listing the old id while the client process
@@ -1455,13 +1567,13 @@ export default function App() {
       stop = true;
       clearInterval(iv);
     };
-  }, [refreshSessionList]);
+  }, [applyTabDescriptor, refreshSessionList]);
   // The composer's status line is gone, and with it three pollers that existed
   // only to feed it: a 1s "working" pulse, a 5s `session_status` call, and a
   // `git_repo_state` call per project change. Claude's own footer already says
   // all three things. Removed rather than left running for nobody to read.
 
-  const closeTab = useCallback((key: number) => {
+  const closeTab = useCallback(async (key: TabId) => {
     setFileTabs((list) => {
       const dropped = list.filter((f) => f.termKey === key).map((f) => f.key);
       if (dropped.length) {
@@ -1486,6 +1598,15 @@ export default function App() {
       setActiveTab((cur) => (cur === key ? (next[next.length - 1]?.key ?? null) : cur));
       return next;
     });
+    try {
+      await tabClose(key);
+    } catch (error) {
+      uiLog(`tab close failed for ${key}: ${String(error)}`);
+    }
+    const authoritative = await tabList().catch(() => null);
+    if (authoritative) {
+      setTabs((current) => reconcileTermTabs(current, authoritative));
+    }
   }, []);
 
   /** Show the start view with the open sessions left running behind it —
@@ -1497,9 +1618,9 @@ export default function App() {
   }, []);
 
   /** Tab strip reordering: drop `from` where `to` sits, shifting the rest. */
-  const dragKey = useRef<number | null>(null);
-  const [dragOver, setDragOver] = useState<number | null>(null);
-  const moveTab = useCallback((from: number | null, to: number) => {
+  const dragKey = useRef<TabId | null>(null);
+  const [dragOver, setDragOver] = useState<TabId | null>(null);
+  const moveTab = useCallback((from: TabId | null, to: TabId) => {
     if (from === null || from === to) return;
     setTabs((t) => {
       const a = t.findIndex((x) => x.key === from);
@@ -1545,9 +1666,9 @@ export default function App() {
    *  notice that it happened and leaves the transcript — still on disk, still
    *  resumable — to be found by hand. So the tab stays and says so. */
   const handleTermExit = useCallback(
-    (key: number, code: number | null, signal: string | null) => {
+    (key: TabId, code: number | null, signal: string | null) => {
       if (code === 0) {
-        closeTab(key);
+        void closeTab(key);
         return;
       }
       setEnded((m) => new Map(m).set(key, { code, signal }));
@@ -1558,10 +1679,10 @@ export default function App() {
   /** Put an ended tab back, resuming its conversation where it stopped. The
    *  slot is reused so the sidebar row it belongs to stays the same row. */
   const restartEnded = useCallback(
-    async (key: number) => {
+    async (key: TabId) => {
       const t = tabsRef.current.find((x) => x.key === key);
       if (!t) return;
-      closeTab(key);
+      await closeTab(key);
       // A tab with no session id has no conversation to continue — a shell, or
       // an engine that never named itself — so it reopens on the command it
       // was launched with. So does one whose engine declines to reopen: the
@@ -1602,8 +1723,10 @@ export default function App() {
     setActiveTab(t.key);
   }, []);
   const closeSlot = useCallback((slotId: string) => {
+    const pending = pendingOpens.current.get(slotId);
+    if (pending) pending.cancelled = true;
     const t = tabsRef.current.find((x) => x.slotId === slotId);
-    if (t) closeTab(t.key);
+    if (t) void closeTab(t.key);
   }, [closeTab]);
 
   const selectSession = (s: Session) => {
@@ -1716,9 +1839,9 @@ export default function App() {
     }
     // Match on both ids: a tab opened before a compaction is slotted under the
     // row's pinned id, not the continuation `liveId` resolves to.
-    for (const t of tabsRef.current) {
-      if (t.slotId === liveId || t.slotId === s.id) closeTab(t.key);
-    }
+    await Promise.all(tabsRef.current
+      .filter((t) => t.slotId === liveId || t.slotId === s.id)
+      .map((t) => closeTab(t.key)));
     try {
       await stopSession(liveId);
       if (liveId !== s.id) await stopSession(s.id);
@@ -1785,7 +1908,7 @@ export default function App() {
       setNotice(`Clearing isn't available for "${s.title}".`);
       return;
     }
-    closeTab(t.key);
+    await closeTab(t.key);
     // The client process is going down, but the roster reports it for a beat
     // longer — same suppress-until-reopened rule as a hook-observed move.
     setVacated((prev) => new Set(prev).add(s.id));
@@ -1799,7 +1922,7 @@ export default function App() {
   // claude process). The transcript stays on disk, so it's resumable later.
   const exitSession = (s: Session) => {
     const live = tabs.find((t) => t.slotId === s.id);
-    if (live) closeTab(live.key);
+    if (live) void closeTab(live.key);
   };
   const newShell = (s: Session) => {
     setActiveProject(s.project_path);
@@ -1930,7 +2053,7 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string): Promise<{ key: number; sessionId?: string } | null> => {
+  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string): Promise<{ key: TabId; sessionId?: string } | null> => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
     // the two are presented differently: a model tab is titled by its model
@@ -1962,12 +2085,13 @@ export default function App() {
           // tab's environment — set only for an engine that has said it
           // authenticates no other way. `env_model` names the model whose
           // routing goes in beside it; the routing is compiled in Rust.
-          const key = openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = await openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             envProvider: plan.env_provider ?? undefined,
             envModel: plan.env_model ?? undefined,
             agentId: plan.agent_id,
           });
+          if (key === null) return null;
           return { key, sessionId: plan.session_id ?? undefined };
         } catch (e) {
           setNotice(`Couldn't start ${choice.modelId}: ${e}`);
@@ -1990,7 +2114,7 @@ export default function App() {
           // placeholder row keeps the tab reachable, but nothing is keyed to it
           // as a session, because there is no session by that name and never
           // will be.
-          const key = openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = await openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             fresh: true,
             agentId: plan.agent_id,
@@ -2007,6 +2131,7 @@ export default function App() {
                     .map((s) => s.id),
                 },
           });
+          if (key === null) return null;
           return { key, sessionId: plan.session_id ?? undefined };
         } catch (e) {
           setNotice(`Couldn't start ${choice.agentId}: ${e}`);
@@ -2014,7 +2139,6 @@ export default function App() {
         return null;
       }
     }
-    return null;
   }, [openTab]);
 
   /** The empty pane's own source/model/effort, so its button starts the same
@@ -2223,10 +2347,6 @@ export default function App() {
                 onTrashDelete={deleteTrashed}
                 onTrashEmpty={emptyTrash}
                 onTrashSessions={trashSessions}
-                librarian={librarian}
-                renameRows={settings.librarian.enabled && settings.librarian.renameRows}
-                showThreads={settings.librarian.enabled}
-                onOpenLibrarian={openLibrarian}
               />
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
@@ -2298,50 +2418,7 @@ export default function App() {
                   </button>
                 );
               })}
-              {/* Right side: bring a second agent into the session in front. */}
-              {activeTabObj?.sessionId && !previewSession && (
-                <div className="strip-right">
-                  {relayCtl.relay && relayCtl.relay.aKey === activeTab || relayCtl.relay && relayCtl.relay.bKey === activeTab ? (
-                    <span className={"relay-pill " + relayCtl.relay!.phase} title={relayCtl.relay!.note || undefined}>
-                      <Icon of={Users} size="sm" />
-                      {relayCtl.relay!.phase === "opening" && `bringing in ${relayCtl.relay!.bName}…`}
-                      {relayCtl.relay!.phase === "waitB" && `round ${relayCtl.relay!.round}/${relayCtl.relay!.rounds} · waiting on ${relayCtl.relay!.bName}`}
-                      {relayCtl.relay!.phase === "waitA" && `round ${relayCtl.relay!.round}/${relayCtl.relay!.rounds} · waiting on ${relayCtl.relay!.aName}`}
-                      {relayCtl.relay!.phase === "done" && `done — ${relayCtl.relay!.note}`}
-                      {relayCtl.relay!.phase === "stopped" && "stopped"}
-                      {relayCtl.relay!.phase === "error" && `stopped: ${relayCtl.relay!.note}`}
-                      {(relayCtl.relay!.phase === "waitA" || relayCtl.relay!.phase === "waitB" || relayCtl.relay!.phase === "opening") ? (
-                        <button className="relay-x" title="Stop relaying" onClick={() => relayCtl.stop()}><Icon of={X} size="sm" /></button>
-                      ) : (
-                        <button className="relay-x" title="Dismiss" onClick={relayCtl.clear}><Icon of={X} size="sm" /></button>
-                      )}
-                      {relayCtl.relay!.bKey >= 0 && (
-                        <button className="relay-jump" onClick={() => setActiveTab(activeTab === relayCtl.relay!.aKey ? relayCtl.relay!.bKey : relayCtl.relay!.aKey)}>
-                          {activeTab === relayCtl.relay!.aKey ? "their tab" : "first tab"}
-                        </button>
-                      )}
-                    </span>
-                  ) : (
-                    <button className="strip-btn" title="Bring a second agent into this session — they talk to each other, you decide" onClick={() => setShowBringIn((v) => !v)}>
-                      <Icon of={Users} size="sm" /> Bring in…
-                    </button>
-                  )}
-                </div>
-              )}
             </div>
-          )}
-          {/* The bring-in popover hangs off the strip but lives outside it:
-              the strip scrolls sideways, and a scroll container clips
-              anything positioned inside it. */}
-          {showBringIn && activeTabObj?.sessionId && (
-            <BringIn
-              onClose={() => setShowBringIn(false)}
-              onOpenModelAccess={openModelAccess}
-              onGo={(choice, focus, rounds) => {
-                setShowBringIn(false);
-                if (activeTab !== null) void relayCtl.start({ aKey: activeTab, choice, focus, rounds });
-              }}
-            />
           )}
           {/* The session's own files, in a row of their own under the strip:
               what this session opened travels with it, and the leftmost tab
@@ -2663,7 +2740,6 @@ export default function App() {
           activeProject={activeProject}
           initialTab={settingsTarget?.tab}
           focusProvider={settingsTarget?.provider}
-          librarian={librarian}
         />
       )}
     </div>

@@ -14,6 +14,7 @@
  */
 import { KeyboardEvent, ReactNode, useState } from "react";
 import { Session, homeAbbrev } from "../ipc";
+import type { TabId } from "../ipc";
 import { fmtTime, fullTime, useTimeFormat } from "../timefmt";
 import { Alert } from "./AlertBell";
 import AgentIcon from "./AgentIcon";
@@ -30,7 +31,7 @@ export default function HomeDashboard({
   alerts: Alert[];
   onSelect: (s: Session) => void;
   onResume: (s: Session) => void;
-  onGoTab: (key: number) => void;
+  onGoTab: (key: TabId) => void;
   /** The engine / model / effort pickers — shared with the ＋ menu. */
   controls: ReactNode;
   /** Whether there is anything to start; the box still takes typing. */

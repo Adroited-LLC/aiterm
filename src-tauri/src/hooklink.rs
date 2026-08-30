@@ -154,13 +154,12 @@ pub fn hook_report() {
     }
 }
 
-/// A session start the hook reported, resolved to the pty it happened in.
+/// A session start the hook reported, resolved to its authoritative Rust tab.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionEvent {
-    /// The pty whose child tree contains the reporting claude — the tab, as
-    /// far as the frontend is concerned.
-    pub pty_id: u32,
+    pub tab_id: crate::tabs::TabId,
+    pub tab: crate::tabs::TabDescriptor,
     pub session_id: String,
     /// What began the session: "startup", "resume", "clear", "compact".
     pub source: String,
@@ -175,7 +174,9 @@ pub struct SessionEvent {
 /// discarded. Polled by the frontend; reading an empty directory is the whole
 /// cost of the quiet case.
 #[tauri::command]
-pub fn drain_session_events(state: tauri::State<'_, crate::pty::PtyManager>) -> Vec<SessionEvent> {
+pub fn drain_session_events(
+    state: tauri::State<'_, std::sync::Arc<crate::tabs::TabRegistry>>,
+) -> Vec<SessionEvent> {
     let Some(dir) = spool_dir() else {
         return Vec::new();
     };
@@ -202,11 +203,40 @@ pub fn drain_session_events(state: tauri::State<'_, crate::pty::PtyManager>) -> 
                 .to_string();
             Some((pid, session_id, source))
         });
-        match event.and_then(|(pid, sid, src)| {
-            state.pty_for_descendant(pid).map(|pty| (pty, sid, src))
+        match event.and_then(|(pid, session_id, source)| {
+            let tab_id = state.tab_for_descendant(pid)?;
+            let current = state.get(&tab_id).ok()?;
+            let tab = if current.session_id().is_some()
+                && current.session_id() != Some(session_id.as_str())
+            {
+                let new_conversation = source == "clear" || source == "fork";
+                let mut update = crate::tabs::TabUpdate::new()
+                    .session_id(session_id.clone())
+                    .slot_id(session_id.clone());
+                if new_conversation {
+                    update = update.fresh(true);
+                    if let Some(title) = current
+                        .cwd()
+                        .and_then(|cwd| std::path::Path::new(cwd).file_name())
+                        .and_then(|name| name.to_str())
+                        .filter(|name| !name.is_empty())
+                    {
+                        update = update.title(title);
+                    }
+                }
+                state.update(&tab_id, update).ok()?
+            } else {
+                current
+            };
+            Some(SessionEvent {
+                tab_id,
+                tab,
+                session_id,
+                source,
+            })
         }) {
-            Some((pty_id, session_id, source)) => {
-                out.push(SessionEvent { pty_id, session_id, source });
+            Some(event) => {
+                out.push(event);
                 let _ = std::fs::remove_file(&path);
             }
             None => {
@@ -224,7 +254,13 @@ pub fn drain_session_events(state: tauri::State<'_, crate::pty::PtyManager>) -> 
         }
     }
     for e in &out {
-        crate::diag!("hook", "session {} started ({}) in pty {}", e.session_id, e.source, e.pty_id);
+        crate::diag!(
+            "hook",
+            "session {} started ({}) in tab {}",
+            e.session_id,
+            e.source,
+            e.tab_id
+        );
     }
     out
 }

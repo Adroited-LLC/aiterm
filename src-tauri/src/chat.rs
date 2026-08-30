@@ -125,6 +125,13 @@ fn now_ms() -> u64 {
 /// Header-read only, like the codex scanner: one line per file, never the
 /// conversation itself.
 pub fn scan_chats() -> Vec<(crate::sessions::Session, std::path::PathBuf)> {
+    let mut budget = crate::sessions::DiscoveryBudget::new();
+    scan_chats_bounded(&mut budget)
+}
+
+pub(crate) fn scan_chats_bounded(
+    budget: &mut crate::sessions::DiscoveryBudget,
+) -> Vec<(crate::sessions::Session, std::path::PathBuf)> {
     let Some(dir) = chats_dir() else {
         return vec![];
     };
@@ -134,6 +141,10 @@ pub fn scan_chats() -> Vec<(crate::sessions::Session, std::path::PathBuf)> {
     entries
         .flatten()
         .filter_map(|e| {
+            let file_type = e.file_type().ok()?;
+            if file_type.is_symlink() || !file_type.is_file() || !budget.claim_file() {
+                return None;
+            }
             let path = e.path();
             if path.extension().is_none_or(|x| x != "jsonl") {
                 return None;

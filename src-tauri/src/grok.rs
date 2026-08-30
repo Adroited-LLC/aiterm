@@ -162,20 +162,36 @@ fn read_row(dir: &Path) -> Option<(Session, PathBuf)> {
 /// The body of [`GrokSessions::scan_with_paths`], over an explicit root so it
 /// can be tested against a directory built for the purpose.
 pub fn scan_dir(root: &Path) -> Vec<(Session, PathBuf)> {
+    let mut budget = crate::sessions::DiscoveryBudget::new();
+    scan_dir_bounded(root, &mut budget)
+}
+
+pub(crate) fn scan_dir_bounded(
+    root: &Path,
+    budget: &mut crate::sessions::DiscoveryBudget,
+) -> Vec<(Session, PathBuf)> {
     let Ok(cwds) = std::fs::read_dir(root) else {
         return vec![];
     };
     let mut out = Vec::new();
     for cwd in cwds.flatten() {
+        if budget.remaining() == 0 {
+            break;
+        }
         // `session_search.sqlite` sits beside the cwd directories.
-        if !cwd.path().is_dir() {
+        let Ok(cwd_type) = cwd.file_type() else { continue };
+        if cwd_type.is_symlink() || !cwd_type.is_dir() {
             continue;
         }
         let Ok(sessions) = std::fs::read_dir(cwd.path()) else {
             continue;
         };
         for e in sessions.flatten() {
-            if e.path().is_dir() {
+            if budget.remaining() == 0 {
+                break;
+            }
+            let Ok(file_type) = e.file_type() else { continue };
+            if !file_type.is_symlink() && file_type.is_dir() && budget.claim_file() {
                 if let Some(row) = read_row(&e.path()) {
                     out.push(row);
                 }
@@ -433,6 +449,15 @@ pub fn parse_detail(id: &str, summary: &str, chat: &str) -> crate::detail::Sessi
 impl SessionProvider for GrokSessions {
     fn scan_with_paths(&self) -> Vec<(Session, PathBuf)> {
         sessions_root().map(|r| scan_dir(&r)).unwrap_or_default()
+    }
+
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut crate::sessions::DiscoveryBudget,
+    ) -> Vec<(Session, PathBuf)> {
+        sessions_root()
+            .map(|root| scan_dir_bounded(&root, budget))
+            .unwrap_or_default()
     }
 
     fn find_session_file(&self, session_id: &str) -> Option<PathBuf> {

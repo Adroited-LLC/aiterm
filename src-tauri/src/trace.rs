@@ -106,8 +106,11 @@ pub fn init() {
     let env_asked = std::env::var_os("AITERM_TRACE").is_some();
     let start_on = cfg!(debug_assertions) || env_asked;
 
-    let (filter_layer, handle) =
-        reload::Layer::new(if start_on { active_filter() } else { off_filter() });
+    let (filter_layer, handle) = reload::Layer::new(if start_on {
+        active_filter()
+    } else {
+        off_filter()
+    });
 
     // `FmtSpan::CLOSE` is what turns instrumented functions into timings: each
     // span reports its own elapsed time when it ends, which is the difference
@@ -118,7 +121,12 @@ pub fn init() {
         .with_ansi(false)
         .with_writer(Sink);
 
-    if Registry::default().with(filter_layer).with(fmt_layer).try_init().is_err() {
+    if Registry::default()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .try_init()
+        .is_err()
+    {
         return; // someone beat us to it (tests); leave theirs alone
     }
     let _ = RELOAD.set(handle);
@@ -181,7 +189,11 @@ pub fn trace_set(on: bool) -> Result<Option<String>, String> {
     } else {
         // Debug builds fall back to stderr chatter rather than to silence —
         // the toggle governs the file, not the dev console.
-        let resting = if cfg!(debug_assertions) { active_filter() } else { off_filter() };
+        let resting = if cfg!(debug_assertions) {
+            active_filter()
+        } else {
+            off_filter()
+        };
         handle.reload(resting).map_err(|e| e.to_string())?;
         CAPTURING.store(false, Ordering::Relaxed);
         if let Ok(mut guard) = FILE.lock() {
@@ -204,12 +216,13 @@ pub fn trace_set(on: bool) -> Result<Option<String>, String> {
 /// the `enabled!` check and nothing else — the argument formatting is behind
 /// it.
 ///
-/// Arguments are logged as their JSON. That is the point of the middleware,
-/// and it means a command carrying something private would log it: today none
-/// do (the credential paths take an id and read the secret themselves — see
-/// `providers.rs`), and the log stays on this machine. Worth re-checking if a
-/// command is ever given a secret as a parameter.
-pub fn log_invokes<R, F>(handler: F) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
+/// Ordinary arguments are logged as bounded JSON. Commands that carry input,
+/// terminal-derived output, credentials, or configuration contents are
+/// summarized here instead. This boundary is fail-closed: adding fields to a
+/// sensitive command cannot make their values appear in the trace.
+pub fn log_invokes<R, F>(
+    handler: F,
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
 where
     R: tauri::Runtime,
     F: Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static,
@@ -217,23 +230,148 @@ where
     move |invoke| {
         if tracing::enabled!(target: "aiterm::ipc", tracing::Level::DEBUG) {
             let cmd = invoke.message.command().to_string();
-            // InvokeBody is either JSON or a raw byte payload; a pty write is
-            // the raw kind and its length is all anyone wants to see of it.
             let args = match invoke.message.payload() {
-                tauri::ipc::InvokeBody::Json(v) => {
-                    let s = v.to_string();
-                    // Long enough for an id and a path, short enough that a
-                    // transcript-sized argument cannot flood the log.
-                    if s.len() > 300 {
-                        format!("{}… ({} bytes)", &s[..300], s.len())
-                    } else {
-                        s
-                    }
-                }
+                tauri::ipc::InvokeBody::Json(v) => format_json_invoke(&cmd, v),
                 tauri::ipc::InvokeBody::Raw(bytes) => format!("<{} raw bytes>", bytes.len()),
             };
             tracing::debug!(target: "aiterm::ipc", "→ {cmd} {args}");
         }
         handler(invoke)
+    }
+}
+
+fn format_json_invoke(command: &str, value: &serde_json::Value) -> String {
+    match command {
+        "tab_write" => {
+            let tab_id = opaque_id(value, "tabId");
+            let attachment_id = opaque_id(value, "attachmentId");
+            let data = value
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .map(|data| format!("{} utf-8 bytes", data.len()))
+                .unwrap_or_else(|| "redacted terminal input".to_string());
+            format!("{{tabId:{tab_id}, attachmentId:{attachment_id}, data:<{data}>}}")
+        }
+        "provider_save" | "provider_management_key_set" => {
+            "<provider credentials redacted>".to_string()
+        }
+        "claude_save_layer" | "claude_set_key" => "<configuration contents redacted>".to_string(),
+        "write_text_file" => "<file contents redacted>".to_string(),
+        "opencode_dispatch" => "<prompt contents redacted>".to_string(),
+        "desktop_notify" | "tray_alerts" => {
+            "<terminal-derived notification contents redacted>".to_string()
+        }
+        "ui_log" => "<renderer diagnostic message redacted>".to_string(),
+        _ => bounded_json(value),
+    }
+}
+
+fn opaque_id(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+        .unwrap_or("<invalid opaque id>")
+        .to_string()
+}
+
+fn bounded_json(value: &serde_json::Value) -> String {
+    let json = value.to_string();
+    if json.len() <= 300 {
+        return json;
+    }
+    let mut end = 300.min(json.len());
+    while !json.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes)", &json[..end], json.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn terminal_input_is_never_formatted_into_the_invoke_trace() {
+        let canary = "TERMINAL-SECRET-MUST-NEVER-REACH-TRACE";
+        let rendered = format_json_invoke(
+            "tab_write",
+            &json!({
+                "tabId": "550e8400-e29b-41d4-a716-446655440000",
+                "attachmentId": "d9428888-122b-11e1-b85c-61cd3cbb3210",
+                "data": canary,
+            }),
+        );
+
+        assert!(
+            !rendered.contains(canary),
+            "terminal input leaked: {rendered}"
+        );
+        assert!(rendered.contains("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(rendered.contains("d9428888-122b-11e1-b85c-61cd3cbb3210"));
+        assert!(rendered.contains(&canary.len().to_string()));
+
+        let unicode = format_json_invoke(
+            "tab_write",
+            &json!({
+                "tabId": "550e8400-e29b-41d4-a716-446655440000",
+                "attachmentId": "d9428888-122b-11e1-b85c-61cd3cbb3210",
+                "data": "🔐",
+            }),
+        );
+        assert!(
+            unicode.contains("4 utf-8 bytes"),
+            "wrong byte length: {unicode}"
+        );
+
+        let invalid_ids = format_json_invoke(
+            "tab_write",
+            &json!({ "tabId": canary, "attachmentId": canary, "data": canary }),
+        );
+        assert!(
+            !invalid_ids.contains(canary),
+            "unvalidated identifiers bypassed fail-closed formatting: {invalid_ids}"
+        );
+    }
+
+    #[test]
+    fn sensitive_registered_commands_fail_closed_before_formatting() {
+        let canary = "CREDENTIAL-OR-CONFIG-CANARY-MUST-NOT-APPEAR";
+        for (command, payload) in [
+            ("provider_save", json!({ "id": "host", "apiKey": canary })),
+            (
+                "provider_management_key_set",
+                json!({ "id": "host", "key": canary }),
+            ),
+            (
+                "claude_save_layer",
+                json!({ "path": "/tmp/settings", "newText": canary, "loadedText": canary }),
+            ),
+            (
+                "claude_set_key",
+                json!({ "path": "/tmp/settings", "value": canary, "loadedText": canary }),
+            ),
+            (
+                "write_text_file",
+                json!({ "path": "/tmp/file", "content": canary }),
+            ),
+            (
+                "desktop_notify",
+                json!({ "summary": "terminal", "body": canary }),
+            ),
+            (
+                "tray_alerts",
+                json!({ "alerts": [{ "key": "tab", "message": canary }] }),
+            ),
+            ("opencode_dispatch", json!({ "prompt": canary })),
+            ("ui_log", json!({ "msg": canary })),
+        ] {
+            let rendered = format_json_invoke(command, &payload);
+            assert!(
+                !rendered.contains(canary),
+                "{command} leaked sensitive content: {rendered}"
+            );
+        }
     }
 }

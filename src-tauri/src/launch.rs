@@ -79,14 +79,33 @@ pub struct LaunchPlan {
 /// commands; this thin wrapper is where the machine's stored choice enters, so
 /// it is deliberately the untested half, exactly like it was before.
 pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
+    resolve_result(request).ok()
+}
+
+/// Resolve a desktop launch with the same detailed error the existing Tauri
+/// command presents. Kept transport-independent so the remote agent/session
+/// adapters and desktop command cannot drift in launch semantics.
+pub fn resolve_result(request: LaunchRequest) -> Result<LaunchPlan, String> {
     let list = crate::agents::backends();
-    let plan = resolve_in(&list, &crate::providers::load_providers(), request)?;
+    let providers = crate::providers::load_providers();
+    resolve_result_with(&list, &providers, request, |backend| {
+        crate::permissions::flags_for(backend)
+    })
+}
+
+fn resolve_result_with(
+    list: &[Box<dyn AgentBackend>],
+    providers: &[Provider],
+    request: LaunchRequest,
+    permission_flags: impl Fn(&dyn AgentBackend) -> String,
+) -> Result<LaunchPlan, String> {
+    let plan = resolve_in(list, providers, request.clone()).ok_or_else(|| explain(list, &request))?;
     let flags = list
         .iter()
-        .find(|b| b.id() == plan.agent_id)
-        .map(|b| crate::permissions::flags_for(&**b))
+        .find(|backend| backend.id() == plan.agent_id)
+        .map(|backend| permission_flags(&**backend))
         .unwrap_or_default();
-    Some(with_permission(plan, &flags))
+    Ok(with_permission(plan, &flags))
 }
 
 /// Append an engine's permission flags to a resolved command. The single point
@@ -286,17 +305,23 @@ fn explain(list: &[Box<dyn AgentBackend>], request: &LaunchRequest) -> String {
 /// store and probes PATH for the API case, and a plain `#[tauri::command]`
 /// would do all of that on the GTK main loop.
 #[tauri::command]
-pub async fn resolve_launch(request: LaunchRequest) -> Result<LaunchPlan, String> {
-    crate::run_blocking(move || {
-        let list = crate::agents::backends();
-        let providers = crate::providers::load_providers();
-        // The registry is built once and used for both the answer and, when
-        // there is none, the explanation — otherwise the two could disagree
-        // about which engines exist.
-        resolve_in(&list, &providers, request.clone())
-            .ok_or_else(|| explain(&list, &request))
-    })
-    .await
+pub async fn resolve_launch(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+    request: LaunchRequest,
+) -> Result<LaunchPlan, String> {
+    let services = services.inner().clone();
+    crate::run_blocking(move || resolve_launch_from(&services, request)).await
+}
+
+#[doc(hidden)]
+pub fn resolve_launch_from(
+    services: &crate::services::ApplicationServices,
+    request: LaunchRequest,
+) -> Result<LaunchPlan, String> {
+    services
+        .agents
+        .resolve(request)
+        .map_err(|error| error.message().to_owned())
 }
 
 #[cfg(test)]
@@ -324,6 +349,21 @@ mod tests {
         // not disturb it.
         assert!(stamped.command.contains("--resume 'abc'"));
         assert_eq!(with_permission(plan.clone(), "").command, plan.command);
+    }
+
+    #[test]
+    fn detailed_resolver_applies_the_same_permission_stamp() {
+        let list = vec![claude_like(vec!["abc"])];
+        let plan = resolve_result_with(
+            &list,
+            &[],
+            LaunchRequest::Resume {
+                session_id: "abc".into(),
+            },
+            |_| "--permission-mode plan".into(),
+        )
+        .unwrap();
+        assert_eq!(plan.command, "claude --resume abc --permission-mode plan");
     }
 
     /* ---- fakes, in the shape agents.rs already uses ---------------------- */

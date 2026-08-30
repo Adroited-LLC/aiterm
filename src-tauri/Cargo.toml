@@ -1,6 +1,6 @@
 [package]
 name = "aiterm"
-version = "0.10.58"
+version = "0.10.60"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -21,9 +21,23 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 # preserve_order: rewriting a settings file must not reorder the keys the user
 # put there. Without it serde_json sorts them alphabetically on the way out.
 serde_json = { version = "1", features = ["preserve_order"] }
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+base64 = "0.22"
+subtle = "2.6"
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+futures-util = "0.3"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 portable-pty = "0.9.0"
 git2 = "0.21.0"
 dirs = "6.0.0"
@@ -35,9 +49,18 @@ libc = "0.2"
 # whether an id will name a real session. Already in the tree via Tauri, so
 # this turns on a feature rather than adding a dependency.
 uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
 tauri-plugin-dialog = "2"
 # No `release_max_level_off`: the Diagnostics panel can switch tracing on in
 # release builds, so the macros must survive into them. Off = a cached filter
 # check per event site, which is the cost of having the switch at all.
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt"] }
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+if-addrs = "0.15.0"
+alacritty_terminal = "=0.26.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+x509-parser = "0.18"

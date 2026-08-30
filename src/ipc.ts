@@ -179,16 +179,17 @@ export interface SessionMove {
 export const sessionMovedTo = (sessionId: string) =>
   invoke<SessionMove | null>("session_moved_to", { sessionId });
 /** A session start one of our claudes reported through its SessionStart hook,
- *  already resolved to the pty it happened in. `source` is claude's own word
+ *  already resolved to the authoritative tab it happened in. `source` is claude's own word
  *  for why: "startup", "resume", "clear", "compact". */
 export interface SessionEvent {
-  ptyId: number;
+  tabId: TabId;
+  tab: TabDescriptor;
   sessionId: string;
   source: string;
 }
 // Collect (and consume) the hook reports since last asked. The exact
 // counterpart to the sessionMovedTo heuristic: no inference, just what each
-// claude process said about itself, tied to the pty aiterm ran it in.
+// claude process said about itself, tied to the tab aiterm ran it in.
 export const drainSessionEvents = () =>
   invoke<SessionEvent[]>("drain_session_events");
 /** Whether verbose trace capture is on (Settings → Diagnostics). */
@@ -406,55 +407,115 @@ export const searchSessions = (query: string) =>
 export const reindexSessions = () =>
   invoke<{ indexed: number; total: number }>("reindex_sessions");
 
-// PTY output streams over a binary Channel (raw bytes → ArrayBuffer), not the
-// JSON event bus. Caller passes a Channel whose onmessage receives each chunk.
-export const ptySpawn = (
-  cwd: string | null, command: string | null, cols: number, rows: number,
-  onOutput: Channel<ArrayBuffer>,
-  /** Provider id whose API key the backend injects as process environment
-   *  (OPENROUTER_API_KEY) — the key itself never reaches the frontend. */
-  envProvider?: string,
-  /** Model id whose routing the backend compiles into the same environment
-   *  (OPENCODE_CONFIG_CONTENT). The id only: the routing is read from the
-   *  provider store in Rust, so no routing decision crosses IPC. */
-  envModel?: string,
-) => invoke<number>("pty_spawn", {
-  cwd, command, cols, rows, onOutput,
-  envProvider: envProvider ?? null, envModel: envModel ?? null,
-});
-// `pty_write` and `pty_resize` are async commands, so they run on the runtime
-// rather than the GTK main thread — which is what stops a keystroke queueing
-// behind a frame. The cost of that is that two calls are two tasks, and nothing
-// says tasks are polled in the order they were spawned. Both go through a
-// per-pty queue so only one is ever in flight: input keeps its order, and a
-// burst or a paste merges into a single crossing of the IPC boundary.
-export const ptyWrite = makeWriteQueue((id, data) =>
-  invoke<void>("pty_write", { id, data }));
+export type TabId = string;
+export type AttachmentId = string;
 
-/** Latest size wins — the sizes a window drag passes through on the way are of
- *  no interest, and an out-of-order pair would leave the pty on the wrong one. */
-const pendingSize = new Map<number, { cols: number; rows: number }>();
-const resizing = new Map<number, Promise<void>>();
-export const ptyResize = (id: number, cols: number, rows: number): Promise<void> => {
-  pendingSize.set(id, { cols, rows });
-  const running = resizing.get(id);
+export interface TabDescriptor {
+  id: TabId;
+  title: string;
+  cwd: string | null;
+  command: string | null;
+  sessionId?: string;
+  resumedId?: string;
+  agentId?: string;
+  slotId: string;
+  fresh?: boolean;
+  envProvider?: string;
+  envModel?: string;
+  size?: { cols: number; rows: number };
+  /** Safe process-wide focus projection; never contains an attachment id. */
+  focus?: "desktop" | "remote" | "unowned";
+  state?: "running" | "exited";
+  exit?: { code: number | null; signal: string | null; requested: boolean };
+}
+
+export interface TabRegistrySnapshot {
+  revision: number;
+  tabs: TabDescriptor[];
+}
+
+export type TabRegistryEvent =
+  | { change: "snapshot"; revision: number; tabs: TabDescriptor[] }
+  | { change: "opened" | "changed"; revision: number; tabId: TabId; tab: TabDescriptor }
+  | { change: "removed"; revision: number; tabId: TabId; requested: boolean };
+
+export interface TabLaunch {
+  title: string;
+  cwd: string | null;
+  command: string | null;
+  sessionId?: string;
+  resumedId?: string;
+  agentId?: string;
+  slotId: string;
+  fresh?: boolean;
+  envProvider?: string;
+  envModel?: string;
+  size: { cols: number; rows: number };
+}
+
+export interface TabUpdate {
+  title?: string;
+  sessionId?: string;
+  resumedId?: string;
+  agentId?: string;
+  slotId?: string;
+  fresh?: boolean;
+}
+
+export const tabOpen = (launch: TabLaunch) =>
+  invoke<TabDescriptor>("tab_open", { launch });
+export const tabList = () => invoke<TabDescriptor[]>("tab_list");
+export const tabRegistrySnapshot = () =>
+  invoke<TabRegistrySnapshot>("tab_registry_snapshot");
+export const tabUpdate = (tabId: TabId, update: TabUpdate) =>
+  invoke<TabDescriptor>("tab_update", { tabId, update });
+export const tabAttachDesktop = (
+  tabId: TabId, onOutput: Channel<ArrayBuffer>,
+) => invoke<AttachmentId>("tab_attach_desktop", { tabId, onOutput });
+export const tabDetach = (tabId: TabId, attachmentId: AttachmentId) =>
+  invoke<void>("tab_detach", { tabId, attachmentId });
+
+type TabWriteTarget = { tabId: TabId; attachmentId: AttachmentId };
+const queuedTabWrite = makeWriteQueue<TabWriteTarget>(
+  (target, data) => invoke<void>("tab_write", { ...target, data }),
+  (target) => `${target.tabId}\0${target.attachmentId}`,
+);
+export const tabWrite = (tabId: TabId, attachmentId: AttachmentId, data: string) =>
+  queuedTabWrite({ tabId, attachmentId }, data);
+
+const pendingTabSize = new Map<string, {
+  target: TabWriteTarget;
+  cols: number;
+  rows: number;
+}>();
+const tabResizing = new Map<string, Promise<void>>();
+export const tabResize = (
+  tabId: TabId, attachmentId: AttachmentId, cols: number, rows: number,
+): Promise<void> => {
+  const identity = `${tabId}\0${attachmentId}`;
+  pendingTabSize.set(identity, { target: { tabId, attachmentId }, cols, rows });
+  const running = tabResizing.get(identity);
   if (running) return running;
   const chain = (async () => {
     try {
       for (;;) {
-        const next = pendingSize.get(id);
+        const next = pendingTabSize.get(identity);
         if (!next) return;
-        pendingSize.delete(id);
-        await invoke<void>("pty_resize", { id, cols: next.cols, rows: next.rows });
+        pendingTabSize.delete(identity);
+        await invoke<void>("tab_resize", { ...next.target, cols: next.cols, rows: next.rows });
       }
     } finally {
-      resizing.delete(id);
+      tabResizing.delete(identity);
     }
   })();
-  resizing.set(id, chain);
+  tabResizing.set(identity, chain);
   return chain;
 };
-export const ptyKill = (id: number) => invoke<void>("pty_kill", { id });
+
+export const tabTakeFocus = (
+  tabId: TabId, attachmentId: AttachmentId, cols: number, rows: number,
+) => invoke<void>("tab_take_focus", { tabId, attachmentId, cols, rows });
+export const tabClose = (tabId: TabId) => invoke<void>("tab_close", { tabId });
 
 export const gitRepoState = (path: string) => invoke<RepoState>("git_repo_state", { path });
 export const gitStatus = (path: string) => invoke<FileStatus[]>("git_status", { path });
@@ -838,7 +899,7 @@ export const desktopNotify = (summary: string, body: string, replaces: number) =
 export const desktopNotifyClose = (id: number) =>
   invoke<void>("desktop_notify_close", { id });
 
-export const trayAlerts = (alerts: { key: number; title: string; message?: string }[]) =>
+export const trayAlerts = (alerts: { key: TabId; title: string; message?: string }[]) =>
   invoke<void>("tray_alerts", { alerts });
 
 
@@ -855,10 +916,10 @@ export type LaunchRequest =
 /** Everything a tab needs to open, and nothing about who produced it. */
 export interface LaunchPlan {
   command: string;
-  /** Provider id whose key `pty_spawn` injects into the tab environment.
+  /** Provider id whose key tab opening injects into the tab environment.
    *  `null` means no key is needed. */
   env_provider: string | null;
-  /** Model id whose routing `pty_spawn` compiles into the tab environment,
+  /** Model id whose routing tab opening compiles into the tab environment,
    *  in the provider catalog's spelling. Set only alongside `env_provider`. */
   env_model: string | null;
   /** Non-null = a real session id panels may key to. `null` = the tab needs a
@@ -955,82 +1016,55 @@ export const diagLogTail = (lines: number) => invoke<string>("diag_log_tail", { 
  *  "it is behaving oddly" conversation, answered without a scavenger hunt. */
 export const diagEnvironment = () => invoke<[string, string][]>("diag_environment");
 
-/* ---- the librarian: names, tags and threads written by a small model ---- */
+// --- Remote Access -----------------------------------------------------
+//
+// The phone gateway. Every one of these is a desktop-only decision: the
+// gateway deliberately exposes no way for a paired phone to enable itself,
+// approve another device, or revoke one. Trust is granted at this keyboard.
 
-/** What the librarian wrote about one session — see `librarian.rs`. */
-export interface LibEntry {
-  name: string;
-  tags: string[];
-  /** Id into `LibStore.threads`; "" for a session filed under no thread. */
-  thread: string;
-  summary: string;
-  next: string;
-  /** The session's `last_active` when this was written. */
-  seen: number;
-  at: number;
-  model: string;
-  /** Tags the person set by hand — kept apart from the model's, and shown
-   *  to it as facts. */
-  user_tags: string[];
-}
-export interface LibThread {
-  name: string;
-  description: string;
-  tags: string[];
-  created: number;
-  user_tags: string[];
-}
-export interface LibStore {
-  sessions: Record<string, LibEntry>;
-  threads: Record<string, LibThread>;
-  spent: number;
-  /** How many sessions the store held at the last tidy — see `librarianTidy`. */
-  tidied_sessions: number;
-  tidied_at: number;
-}
-export interface LibTidyReport {
-  threads_before: number;
-  threads_after: number;
-  filed: number;
-  cost: number;
-}
-export interface LibRunReport {
-  done: number;
-  remaining: number;
-  cost: number;
-  errors: string[];
-}
-export const EMPTY_LIB: LibStore = { sessions: {}, threads: {}, spent: 0, tidied_sessions: 0, tidied_at: 0 };
+export type {
+  RemoteStatus,
+  PairingInvite,
+  PendingPairing,
+  TrustedDevice,
+} from "./remoteAccess.ts";
+import type {
+  RemoteStatus,
+  PairingInvite,
+  PendingPairing,
+  TrustedDevice,
+} from "./remoteAccess.ts";
 
-export const librarianState = () => invoke<LibStore>("librarian_state");
-/** Mirrors `librarian::Engine`. */
-export type LibEngine =
-  | { kind: "api"; providerId: string; model: string }
-  | { kind: "cli"; agent: string; model: string | null };
-export const librarianRun = (
-  engine: LibEngine, sessions: { id: string; lastActive: number }[], max: number, prompt: string | null,
-) => invoke<LibRunReport>("librarian_run", { engine, sessions, max, prompt });
-/** Where the librarian runs the CLIs — a transcript one of them keeps in
- *  print mode lands here, and the session list skips it. Kept in step with
- *  `lib_dir()` in `librarian.rs`. */
-export const LIBRARIAN_DIR_SUFFIX = "/.config/aiterm/librarian";
-/** The second pass: one look at every thread and session, and the final
- *  organisation — threads that are the same work merged, loose sessions
- *  filed. Run after a catalogue run, and on demand. */
-export const librarianTidy = (engine: LibEngine, prompt: string | null) =>
-  invoke<LibTidyReport>("librarian_tidy", { engine, prompt });
-/** The system prompts as shipped — what the editor shows, and resets to. */
-export const librarianDefaultPrompts = () =>
-  invoke<{ catalogue: string; tidy: string }>("librarian_default_prompts");
-export const librarianForget = () => invoke<void>("librarian_forget");
-export const librarianRenameThread = (id: string, name: string) =>
-  invoke<void>("librarian_rename_thread", { id, name });
-/** Set or clear one hand-set tag on a thread or a session. */
-export const librarianTag = (target: { kind: "thread" | "session"; id: string }, tag: string, on: boolean) =>
-  invoke<void>("librarian_tag", { target, tag, on });
+/** Whether the gateway is listening, and on what, with its pinned fingerprint. */
+export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
 
-/** A session's conversation as ordered (role, text) turns — what a second
- *  agent is handed when brought in. Trimmed from the front to `maxChars`,
- *  the opening ask kept. */
-export const sessionConversation = (sessionId: string, maxChars: number) =>
-  invoke<[string, string][]>("session_conversation", { sessionId, maxChars });
+/** Addresses the gateway may bind. Loopback is excluded: a phone cannot reach
+ *  it, so offering it would only ever be a mistake the user has to debug. */
+export const remoteInterfaces = () => invoke<string[]>("remote_interfaces");
+
+export const remoteStart = (address: string, port: number) =>
+  invoke<RemoteStatus>("remote_start", { address, port });
+
+/** Closes the listener and every live connection. Does not revoke devices —
+ *  turning remote access off is not the same statement as distrusting a phone. */
+export const remoteStop = () => invoke<RemoteStatus>("remote_stop");
+
+/** A single-use, five-minute enrollment QR, rendered to SVG by the backend so
+ *  the secret never exists as a string in this process. */
+export const remoteBeginPairing = () => invoke<PairingInvite>("remote_begin_pairing");
+
+/** Phones that have scanned a QR and are waiting for a decision here. */
+export const remotePendingPairings = () =>
+  invoke<PendingPairing[]>("remote_pending_pairings");
+
+export const remoteApproveDevice = (requestId: string) =>
+  invoke<TrustedDevice>("remote_approve_device", { requestId });
+
+export const remoteDenyDevice = (requestId: string) =>
+  invoke<boolean>("remote_deny_device", { requestId });
+
+export const remoteDevices = () => invoke<TrustedDevice[]>("remote_devices");
+
+/** Forgets the device's key and drops its live connections. */
+export const remoteRevokeDevice = (deviceId: string) =>
+  invoke<boolean>("remote_revoke_device", { deviceId });

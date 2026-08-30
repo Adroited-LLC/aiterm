@@ -6,8 +6,7 @@ import { X } from "lucide-react";
 import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
-import LibrarianPane from "./LibrarianPane";
-import { LibrarianCtl } from "../librarian";
+import RemoteAccessSettings from "./RemoteAccessSettings";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
 import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
@@ -34,8 +33,6 @@ interface Props {
   /** With `initialTab: "models"`: the provider to open the model browser on
    *  straight away, so the step that was missing is the one on screen. */
   focusProvider?: string | null;
-  /** The librarian's state and controls, for its pane. */
-  librarian: LibrarianCtl;
 }
 
 const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
@@ -45,7 +42,13 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
   { key: "agent", label: "Agent" },
 ];
 
-export type SettingsTab = "appearance" | "fonts" | "agents" | "models" | "librarian" | "diagnostics";
+export type SettingsTab =
+  | "appearance"
+  | "fonts"
+  | "agents"
+  | "models"
+  | "remote"
+  | "diagnostics";
 type Tab = SettingsTab;
 
 const NAV: { key: Tab; label: string }[] = [
@@ -53,7 +56,7 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "fonts", label: "Fonts" },
   { key: "agents", label: "Agents" },
   { key: "models", label: "Model access" },
-  { key: "librarian", label: "Librarian" },
+  { key: "remote", label: "Remote access" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
 
@@ -107,7 +110,7 @@ function Switch({ checked, onChange, label }: {
 const SIZE_KEY = "aiterm.settingsModalSize";
 
 export default function SettingsModal({
-  settings, onChange, onClose, capsOf, activeProject, initialTab, focusProvider, librarian,
+  settings, onChange, onClose, capsOf, activeProject, initialTab, focusProvider,
 }: Props) {
   const [tab, setTab] = useState<Tab>(initialTab ?? "appearance");
   // Resizable via the CSS corner grip; the size carries over to the next
@@ -520,14 +523,7 @@ export default function SettingsModal({
               </Group>
             </>}
 
-            {tab === "librarian" && (
-              <LibrarianPane
-                cfg={settings.librarian}
-                onChange={(l) => onChange({ ...settings, librarian: l })}
-                lib={librarian}
-                onOpenModelAccess={() => setTab("models")}
-              />
-            )}
+            {tab === "remote" && <RemoteAccessSettings />}
             {tab === "agents" && configFor && (
               <ClaudeConfig agent={configFor} project={activeProject} onBack={() => setConfigFor(null)} />
             )}

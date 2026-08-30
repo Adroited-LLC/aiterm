@@ -48,3 +48,11 @@ CONVENTIONS.md
 .github/copilot-instructions.md
 .cursor/
 .aider*
+
+# Android companion app build output. The Gradle wrapper (gradlew, gradlew.bat,
+# gradle/wrapper/*) is committed on purpose so a clone builds without a local
+# Gradle install.
+android/build/
+android/app/build/
+android/.gradle/
+android/local.properties

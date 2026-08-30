@@ -572,7 +572,13 @@ fn parse_codex_header(first_line: &str) -> Option<CodexHeader> {
 
 fn codex_root() -> Option<std::path::PathBuf> {
     let dir = dirs::home_dir()?.join(".codex/sessions");
-    dir.is_dir().then_some(dir)
+    let kind = std::fs::symlink_metadata(&dir).ok()?.file_type();
+    (kind.is_dir() && !kind.is_symlink()).then_some(dir)
+}
+
+struct PinnedCodexRollout {
+    file: std::fs::File,
+    path: std::path::PathBuf,
 }
 
 /// Every `*.jsonl` under `dir`, recursively.
@@ -580,18 +586,52 @@ fn codex_root() -> Option<std::path::PathBuf> {
 /// Codex files them by date, so the depth is fixed at three today — but a
 /// walk costs the same as three nested reads and does not break the day that
 /// changes.
-fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn codex_rollouts_bounded(
+    dir: &crate::sessions::PinnedDiscoveryDirectory,
+    depth: usize,
+    budget: &mut crate::sessions::DiscoveryBudget,
+    out: &mut Vec<PinnedCodexRollout>,
+) {
+    if budget.remaining() == 0 || !budget.enter_pinned_directory(dir.file(), depth) {
+        return;
+    }
+    let Some(entries) = dir.entries() else {
         return;
     };
     for e in entries.flatten() {
-        let path = e.path();
-        if path.is_dir() {
-            codex_rollouts(&path, out);
-        } else if path.extension().is_some_and(|x| x == "jsonl") {
-            out.push(path);
+        if budget.remaining() == 0 {
+            break;
+        }
+        let name = e.file_name();
+        if let Some(child) = dir.open_directory(&name) {
+            codex_rollouts_bounded(&child, depth + 1, budget, out);
+        } else if std::path::Path::new(&name)
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            let Some(file) = dir.open_file(&name) else {
+                continue;
+            };
+            if budget.claim_file() {
+                out.push(PinnedCodexRollout {
+                    file,
+                    path: dir.child_path(&name),
+                });
+            }
         }
     }
+}
+
+fn pinned_codex_rollouts_bounded(
+    root: &std::path::Path,
+    budget: &mut crate::sessions::DiscoveryBudget,
+) -> Vec<PinnedCodexRollout> {
+    let Some(root) = crate::sessions::PinnedDiscoveryDirectory::open(root) else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    codex_rollouts_bounded(&root, 0, budget, &mut output);
+    output
 }
 
 /// The body of [`CodexSessions::scan_with_paths`], over an explicit root.
@@ -601,8 +641,15 @@ fn codex_rollouts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// `~/.codex/sessions`, which makes the test say different things on different
 /// machines — and pass vacuously on any machine that has never run Codex.
 fn scan_codex_dir(root: &std::path::Path) -> Vec<(Session, std::path::PathBuf)> {
-    let mut files = Vec::new();
-    codex_rollouts(root, &mut files);
+    let mut budget = crate::sessions::DiscoveryBudget::new();
+    scan_codex_dir_bounded(root, &mut budget)
+}
+
+fn scan_codex_dir_bounded(
+    root: &std::path::Path,
+    budget: &mut crate::sessions::DiscoveryBudget,
+) -> Vec<(Session, std::path::PathBuf)> {
+    let files = pinned_codex_rollouts_bounded(root, budget);
     // Newer Codex writes MANY rollout files per conversation — one per turn or
     // thread, each with its own `id` in the filename, all sharing the original
     // conversation's `session_id` (and `parent_thread_id`) in their headers. A
@@ -613,8 +660,8 @@ fn scan_codex_dir(root: &std::path::Path) -> Vec<(Session, std::path::PathBuf)> 
     // fork rows and OpenCode child sessions are collapsed elsewhere.
     let mut by_session: std::collections::HashMap<String, (Session, std::path::PathBuf)> =
         std::collections::HashMap::new();
-    for path in files {
-        let Some((session, path)) = read_codex_row(&path) else {
+    for rollout in files {
+        let Some((session, path)) = read_codex_row_from(rollout.file, &rollout.path) else {
             continue;
         };
         match by_session.get(&session.id) {
@@ -640,12 +687,12 @@ pub fn codex_session_files(session_id: &str) -> Vec<std::path::PathBuf> {
 /// The body of [`codex_session_files`], over an explicit root so it can be
 /// tested against a directory built for the purpose.
 fn codex_session_files_in(root: &std::path::Path, session_id: &str) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    codex_rollouts(root, &mut files);
+    let mut budget = crate::sessions::DiscoveryBudget::new();
+    let files = pinned_codex_rollouts_bounded(root, &mut budget);
     let mut mine: Vec<(u64, std::path::PathBuf)> = files
-        .iter()
-        .filter_map(|p| {
-            let (s, path) = read_codex_row(p)?;
+        .into_iter()
+        .filter_map(|rollout| {
+            let (s, path) = read_codex_row_from(rollout.file, &rollout.path)?;
             (s.id == session_id).then_some((s.last_active, path))
         })
         .collect();
@@ -657,14 +704,17 @@ fn codex_session_files_in(root: &std::path::Path, session_id: &str) -> Vec<std::
 /// rollout. The unit both [`scan_codex_dir`] and [`CodexSessions::find_session_file`]
 /// build on, so the row a click selects and the file a delete moves are read
 /// the same way.
-fn read_codex_row(path: &std::path::Path) -> Option<(Session, std::path::PathBuf)> {
-    let file = std::fs::File::open(path).ok()?;
+fn read_codex_row_from(
+    file: std::fs::File,
+    path: &std::path::Path,
+) -> Option<(Session, std::path::PathBuf)> {
+    let metadata = file.metadata().ok()?;
     let mut first = String::new();
     std::io::BufRead::read_line(&mut std::io::BufReader::new(file), &mut first).ok()?;
     let h = parse_codex_header(&first)?;
-    let last_active = std::fs::metadata(path)
+    let last_active = metadata
+        .modified()
         .ok()
-        .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
@@ -995,6 +1045,15 @@ impl SessionProvider for CodexSessions {
         codex_root().map(|r| scan_codex_dir(&r)).unwrap_or_default()
     }
 
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut crate::sessions::DiscoveryBudget,
+    ) -> Vec<(Session, std::path::PathBuf)> {
+        codex_root()
+            .map(|root| scan_codex_dir_bounded(&root, budget))
+            .unwrap_or_default()
+    }
+
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
         // The id lives in the filename, but only for a conversation's ROOT
         // rollout — the per-turn files that share its session_id carry their own
@@ -1227,6 +1286,12 @@ impl SessionProvider for ChatSessions {
     fn scan_with_paths(&self) -> Vec<(Session, std::path::PathBuf)> {
         crate::chat::scan_chats()
     }
+    fn scan_with_paths_bounded(
+        &self,
+        budget: &mut crate::sessions::DiscoveryBudget,
+    ) -> Vec<(Session, std::path::PathBuf)> {
+        crate::chat::scan_chats_bounded(budget)
+    }
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
         crate::chat::chat_file_if_exists(session_id)
     }
@@ -1458,12 +1523,13 @@ pub fn scan_all_with_paths() -> Vec<(Session, std::path::PathBuf)> {
 /// otherwise nothing to compose, and the interesting behaviour would go
 /// unexercised until the day a second one is added.
 fn scan_backends(list: &[Box<dyn AgentBackend>]) -> Vec<(Session, std::path::PathBuf)> {
+    let mut budget = crate::sessions::DiscoveryBudget::new();
     let mut all: Vec<(Session, std::path::PathBuf)> = list
         .iter()
         .flat_map(|b| {
             let id = b.id();
             b.sessions()
-                .scan_with_paths()
+                .scan_with_paths_bounded(&mut budget)
                 .into_iter()
                 .map(move |(mut s, path)| {
                     s.agent = id.to_string();
@@ -1536,8 +1602,15 @@ pub fn backend_messages(agent_id: &str, session_id: &str) -> Option<Vec<(String,
 /// main thread and would freeze the window for every one of them. Same reason
 /// `usage.rs` and `fonts.rs` are `async`.
 #[tauri::command(async)]
-pub fn detect_agents() -> Vec<Detection> {
-    backends().iter().map(|b| b.detect()).collect()
+pub fn detect_agents(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+) -> Vec<Detection> {
+    detect_agents_from(services.inner())
+}
+
+#[doc(hidden)]
+pub fn detect_agents_from(services: &crate::services::ApplicationServices) -> Vec<Detection> {
+    services.agents.detect()
 }
 
 /// What every registered engine supports, keyed by id.
@@ -1555,11 +1628,17 @@ pub fn detect_agents() -> Vec<Detection> {
 /// appears, present or not — a row from an uninstalled engine still has to know
 /// what it can offer.
 #[tauri::command]
-pub fn agent_caps() -> std::collections::HashMap<String, Caps> {
-    backends()
-        .iter()
-        .map(|b| (b.id().to_string(), b.caps()))
-        .collect()
+pub fn agent_caps(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+) -> std::collections::HashMap<String, Caps> {
+    agent_caps_from(services.inner())
+}
+
+#[doc(hidden)]
+pub fn agent_caps_from(
+    services: &crate::services::ApplicationServices,
+) -> std::collections::HashMap<String, Caps> {
+    services.agents.caps()
 }
 
 /// What a new session can be started as: the agents that are actually here,
@@ -1576,17 +1655,17 @@ pub struct AgentChoice {
 /// `async` for the same reason as [`detect_agents`], plus `models()`, which for
 /// Codex shells out again to read its model list.
 #[tauri::command(async)]
-pub fn agent_choices() -> Vec<AgentChoice> {
-    backends()
-        .iter()
-        .filter(|b| b.offered() && b.detect().available)
-        .map(|b| AgentChoice {
-            id: b.id().to_string(),
-            display_name: b.display_name().to_string(),
-            models: b.models(),
-            mints_session_id: b.mints_session_id(),
-        })
-        .collect()
+pub fn agent_choices(
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+) -> Vec<AgentChoice> {
+    agent_choices_from(services.inner())
+}
+
+#[doc(hidden)]
+pub fn agent_choices_from(
+    services: &crate::services::ApplicationServices,
+) -> Vec<AgentChoice> {
+    services.agents.list()
 }
 
 /// The id of the session `agent_id` just started in `cwd`, once it exists.
@@ -1910,6 +1989,37 @@ mod tests {
                 .any(|(id, _)| *id == session_id)
                 .then(|| std::path::PathBuf::from(format!("/fake/{session_id}")))
         }
+
+        fn scan_with_paths_bounded(
+            &self,
+            budget: &mut crate::sessions::DiscoveryBudget,
+        ) -> Vec<(Session, std::path::PathBuf)> {
+            let take = budget.remaining().min(self.rows.len());
+            let rows = self.rows[..take]
+                .iter()
+                .map(|(id, at)| {
+                    (
+                        Session {
+                            id: (*id).to_string(),
+                            agent: "WRONG".into(),
+                            title: (*id).to_string(),
+                            project_path: "/p".into(),
+                            group_path: "/p".into(),
+                            branch: None,
+                            forked: false,
+                            background: false,
+                            fork_parent: None,
+                            last_active: *at,
+                        },
+                        std::path::PathBuf::from(format!("/fake/{id}")),
+                    )
+                })
+                .collect();
+            for _ in 0..take {
+                let _ = budget.claim_file();
+            }
+            rows
+        }
     }
 
     struct FakeBackend {
@@ -1944,6 +2054,18 @@ mod tests {
 
     fn fake(id: &'static str, rows: Vec<(&'static str, u64)>) -> Box<dyn AgentBackend> {
         Box::new(FakeBackend { id, provider: FakeProvider { rows } })
+    }
+
+    #[test]
+    fn production_composition_applies_one_global_discovery_budget_across_providers() {
+        let list = vec![
+            fake("first", vec![("a", 1); 3_000]),
+            fake("second", vec![("b", 2); 3_000]),
+        ];
+        let rows = scan_backends(&list);
+        assert_eq!(rows.len(), crate::sessions::MAX_DISCOVERED_SESSION_FILES);
+        assert_eq!(rows.iter().filter(|(session, _)| session.agent == "first").count(), 3_000);
+        assert_eq!(rows.iter().filter(|(session, _)| session.agent == "second").count(), 1_096);
     }
 
     /// The whole point of the registry: two agents, one list.
@@ -2242,11 +2364,36 @@ mod tests {
         assert!(scan_codex_dir(std::path::Path::new("/nonexistent/codex")).is_empty());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_codex_discovery_rejects_a_symlink_provider_root() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = std::env::temp_dir().join(format!(
+            "aiterm-codex-discovery-root-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = fixture.join("outside");
+        std::fs::create_dir_all(outside.join("2026/08/29")).unwrap();
+        let sentinel = outside.join("2026/08/29/rollout-sentinel.jsonl");
+        std::fs::write(
+            &sentinel,
+            "{\"payload\":{\"session_id\":\"outside\",\"cwd\":\"/outside\"}}\n",
+        )
+        .unwrap();
+        let linked_root = fixture.join("sessions");
+        symlink(&outside, &linked_root).unwrap();
+
+        assert!(scan_codex_dir(&linked_root).is_empty());
+        assert!(sentinel.exists());
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
     /// The registry must report agents that are absent, not omit them — the
     /// settings panel exists to say "not installed".
     #[test]
     fn detection_covers_every_registered_backend() {
-        let found = detect_agents();
+        let found = detect_agents_from(&crate::services::ApplicationServices::desktop());
         assert_eq!(found.len(), backends().len(), "a backend went unreported");
         assert!(found.iter().any(|d| d.id == "claude"));
         assert!(found.iter().any(|d| d.id == "codex"));
@@ -2274,7 +2421,9 @@ mod tests {
     /// its door, so agent_choices must never offer it as a source.
     #[test]
     fn opencode_is_never_offered_as_a_source() {
-        assert!(agent_choices().iter().all(|c| c.id != "opencode"));
+        assert!(agent_choices_from(&crate::services::ApplicationServices::desktop())
+            .iter()
+            .all(|c| c.id != "opencode"));
     }
 
     /// OpenCode launches bare or with a model slug; a minted session id must
@@ -2500,7 +2649,9 @@ mod tests {
         assert!(d.available);
         assert_eq!(d.id, "api");
         assert!(!ChatBackend.offered());
-        assert!(agent_choices().iter().all(|c| c.id != "api"));
+        assert!(agent_choices_from(&crate::services::ApplicationServices::desktop())
+            .iter()
+            .all(|c| c.id != "api"));
     }
 
     /// Chats reach the sidebar through the registry now. They used to be
@@ -2603,7 +2754,7 @@ mod tests {
     /// exactly the half-added state the registry exists to prevent.
     #[test]
     fn every_backend_publishes_its_capabilities_to_the_ui() {
-        let map = agent_caps();
+        let map = agent_caps_from(&crate::services::ApplicationServices::desktop());
         for b in backends() {
             assert_eq!(
                 map.get(b.id()),
@@ -2749,7 +2900,7 @@ mod tests {
 
     #[test]
     fn agent_choices_only_offers_agents_that_are_here() {
-        for c in agent_choices() {
+        for c in agent_choices_from(&crate::services::ApplicationServices::desktop()) {
             let backend = backends().into_iter().find(|b| b.id() == c.id).unwrap();
             assert!(backend.detect().available, "{} offered but not installed", c.id);
         }
