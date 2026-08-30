@@ -748,6 +748,54 @@ async fn sustained_registry_events_cannot_starve_a_correlated_inbound_request() 
 }
 
 #[tokio::test]
+async fn idle_authenticated_connection_continues_past_each_registry_fairness_budget() {
+    let root = private_test_dir("idle-registry-events");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let tab = registry
+        .open_desktop(TabLaunch::new(
+            "idle-flood",
+            "idle-flood",
+            TerminalSize::try_new(80, 24).unwrap(),
+        ))
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+
+    for sequence in 0..12 {
+        registry
+            .update(&tab, TabUpdate::new().title(format!("idle-title-{sequence}")))
+            .unwrap();
+    }
+    let received = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut titles = 0usize;
+        while titles < 12 {
+            let event = response(&mut socket).await;
+            if event.kind == "tab.changed" {
+                titles += 1;
+            }
+        }
+        titles
+    })
+    .await;
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+    assert_eq!(received.expect("idle clients must receive registry events after the fairness turn"), 12);
+}
+
+#[tokio::test]
 async fn desktop_open_and_update_emit_authenticated_remote_tab_changes() {
     let root = private_test_dir("desktop-tab-changes");
     let (store, key, device_id) = paired_store(&root);
