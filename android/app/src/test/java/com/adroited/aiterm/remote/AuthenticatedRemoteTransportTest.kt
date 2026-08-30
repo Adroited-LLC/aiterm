@@ -26,6 +26,8 @@ import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AuthenticatedRemoteTransportTest {
@@ -216,6 +218,37 @@ class AuthenticatedRemoteTransportTest {
         transport.close()
         first.cancel()
         second.cancel()
+    }
+
+    @Test
+    fun closeRacingAnAcceptedEnqueueCompletesTheDeferredExceptionally() = runTest {
+        val accepted = CountDownLatch(1)
+        val releaseEnqueue = CountDownLatch(1)
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(),
+            deviceKeys = RecordingDeviceKeys(),
+            appLock = unlockedAppLock(),
+            dialer = FakeDialer(authenticatedSocket()),
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+            afterRequestAccepted = {
+                accepted.countDown()
+                releaseEnqueue.await(2, TimeUnit.SECONDS)
+            },
+        )
+        transport.connect()
+        val response = AtomicReference<CompletableDeferred<RemoteResponse>>()
+        val requester = thread(start = true) {
+            response.set(transport.request("tab.list", byteArrayOf()))
+        }
+        assertTrue(accepted.await(2, TimeUnit.SECONDS))
+
+        transport.close()
+        releaseEnqueue.countDown()
+        requester.join(2_000)
+
+        val failure = runCatching { withTimeout(1_000) { response.get().await() } }.exceptionOrNull()
+        assertTrue("accepted request must fail on close, got $failure", failure is RemoteProtocolException)
     }
 
     @Test

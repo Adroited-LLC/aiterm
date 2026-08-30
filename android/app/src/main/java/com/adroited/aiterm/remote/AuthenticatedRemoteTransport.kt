@@ -40,6 +40,7 @@ class AuthenticatedRemoteTransport(
     private val dialer: RemoteSocketDialer,
     private val scope: CoroutineScope,
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val afterRequestAccepted: () -> Unit = {},
 ) : RemoteTransport {
     private val eventChannel = Channel<RemoteServerEvent>(
         capacity = MAX_EVENTS,
@@ -130,6 +131,7 @@ class AuthenticatedRemoteTransport(
                 true
             }
         }
+        if (accepted) afterRequestAccepted()
         if (!accepted || outbound.trySend(OutboundRequest(kind, payload.copyOf(), onAssigned, deferred)).isFailure) {
             synchronized(stateLock) { if (accepted) queuedRequests -= 1 }
             deferred.completeExceptionally(RemoteProtocolException("invalid or over-bound remote request"))
