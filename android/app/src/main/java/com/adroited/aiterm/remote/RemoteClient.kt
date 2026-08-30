@@ -162,7 +162,7 @@ class RemoteClient(
             }
             val collector = scope.launch(dispatcher, start = CoroutineStart.LAZY) {
                 try {
-                    candidate.events.collect { event -> accept(generation, event) }
+                    candidate.events.collect { event -> accept(generation, event, candidate) }
                     acceptTerminalOutcome(
                         generation,
                         candidate,
@@ -199,7 +199,7 @@ class RemoteClient(
         } catch (error: Exception) {
             candidate.close()
             if (error is RemoteAccessRevokedException) {
-                accept(generation, RemoteServerEvent.Revoked)
+                accept(generation, RemoteServerEvent.Revoked, candidate)
                 return false
             }
             synchronized(lifecycleLock) {
@@ -265,9 +265,10 @@ class RemoteClient(
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error
             } catch (error: Exception) {
-                accept(
+                acceptRequestFailure(
                     selection.lifecycleGeneration,
-                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                    selection.transport,
+                    error,
                 )
             }
         }
@@ -316,6 +317,7 @@ class RemoteClient(
                         accept(
                             context.lifecycleGeneration,
                             RemoteServerEvent.Failure(result.code, result.message),
+                            context.transport,
                         )
                     }
                     is RemoteResponse.Success -> Unit
@@ -326,9 +328,10 @@ class RemoteClient(
                 synchronized(lifecycleLock) {
                     if (scrollbackRequest === context) scrollbackRequest = null
                 }
-                accept(
+                acceptRequestFailure(
                     context.lifecycleGeneration,
-                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                    context.transport,
+                    error,
                 )
             }
         }
@@ -484,11 +487,18 @@ class RemoteClient(
         if (reconnect) scheduleReconnect()
     }
 
-    private fun accept(expectedGeneration: Long?, event: RemoteServerEvent) {
+    private fun accept(
+        expectedGeneration: Long?,
+        event: RemoteServerEvent,
+        expectedTransport: RemoteTransport? = null,
+    ) {
         var closing: ClosingTransport? = null
         var reconnect = false
         synchronized(lifecycleLock) {
-            if (expectedGeneration != null && expectedGeneration != lifecycleGeneration) return
+            if (expectedGeneration != null &&
+                (expectedGeneration != lifecycleGeneration ||
+                    expectedTransport != null && transport !== expectedTransport)
+            ) return
             when (event) {
                 is RemoteServerEvent.FocusChanged -> mutableState.value = mutableState.value.copy(
                     focus = event.focus,
@@ -604,6 +614,7 @@ class RemoteClient(
                     is RemoteResponse.Error -> accept(
                         requestContext.lifecycleGeneration,
                         RemoteServerEvent.Failure(result.code, result.message),
+                        requestContext.transport,
                     )
                     is RemoteResponse.Success -> synchronized(lifecycleLock) {
                         if (isCurrent(requestContext.lifecycleGeneration, requestContext.transport)) {
@@ -614,11 +625,28 @@ class RemoteClient(
             } catch (_: kotlinx.coroutines.CancellationException) {
                 throw kotlinx.coroutines.CancellationException("remote request canceled")
             } catch (error: Exception) {
-                accept(
+                acceptRequestFailure(
                     requestContext.lifecycleGeneration,
-                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                    requestContext.transport,
+                    error,
                 )
             }
+        }
+    }
+
+    private fun acceptRequestFailure(
+        expectedGeneration: Long,
+        candidate: RemoteTransport,
+        error: Exception,
+    ) {
+        if (error is RemoteTransportTerminatedException) {
+            acceptTerminalOutcome(expectedGeneration, candidate, error.outcome)
+        } else {
+            accept(
+                expectedGeneration,
+                RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                candidate,
+            )
         }
     }
 
@@ -698,15 +726,17 @@ class RemoteClient(
                     is RemoteResponse.Error -> accept(
                         generation,
                         RemoteServerEvent.Failure(result.code, result.message),
+                        active,
                     )
                     is RemoteResponse.Success -> Unit
                 }
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error
             } catch (error: Exception) {
-                accept(
+                acceptRequestFailure(
                     generation,
-                    RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+                    active,
+                    error,
                 )
             }
         }
@@ -809,6 +839,7 @@ class RemoteClient(
             accept(
                 selection.lifecycleGeneration,
                 RemoteServerEvent.Failure(response.code, response.message),
+                selection.transport,
             )
             return
         }

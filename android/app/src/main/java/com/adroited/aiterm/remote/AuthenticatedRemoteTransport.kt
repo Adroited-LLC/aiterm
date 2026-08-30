@@ -213,7 +213,8 @@ class AuthenticatedRemoteTransport(
     override fun close() = closeWithOutcome(null)
 
     private fun closeWithOutcome(outcome: RemoteTransportTerminalOutcome?) {
-        val failure = RemoteProtocolException("remote transport disconnected")
+        val terminalFailure = outcome?.let(::RemoteTransportTerminatedException)
+        val requestFailure = terminalFailure ?: RemoteProtocolException("remote transport disconnected")
         val toFail = synchronized(stateLock) {
             if (closed) return
             closed = true
@@ -237,11 +238,12 @@ class AuthenticatedRemoteTransport(
         }
         while (true) {
             val queued = outbound.tryReceive().getOrNull() ?: break
-            queued.deferred.completeExceptionally(failure)
             queued.payload.fill(0)
         }
-        toFail.forEach { it.completeExceptionally(failure) }
-        eventChannel.close(outcome?.let(::RemoteTransportTerminatedException))
+        // Commit the connection generation's terminal classification before
+        // any request waiter can interpret teardown as an ordinary disconnect.
+        eventChannel.close(terminalFailure)
+        toFail.forEach { it.completeExceptionally(requestFailure) }
     }
 
     private suspend fun readLoop(active: RemoteBinarySocket) {
