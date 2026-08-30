@@ -122,7 +122,14 @@ fn deletes_session_to_trash() {
     std::fs::create_dir_all(&dir).unwrap();
     let id = "00000000-0000-4000-8000-aitermdelete";
     let file = dir.join(format!("{id}.jsonl"));
-    std::fs::write(&file, "{\"type\":\"user\",\"cwd\":\"/tmp\"}\n").unwrap();
+    std::fs::write(
+        &file,
+        concat!(
+            r#"{"type":"user","cwd":"/aiterm-delete-test","message":{"role":"user","content":"delete this synthetic session"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
 
     call(aiterm_lib::sessions::session_delete(id.into())).expect("delete should succeed");
     assert!(!file.exists(), "transcript should leave the project dir");
@@ -148,10 +155,12 @@ fn deletes_session_to_trash() {
     );
     call(aiterm_lib::sessions::trash_restore(id.into())).expect("restore should succeed");
     assert!(!trashed.exists(), "restore should empty the trash entry");
-    let restored = home.join(".claude/projects/-tmp").join(format!("{id}.jsonl"));
-    assert!(restored.exists(), "cwd /tmp flattens to projects/-tmp");
+    let restored = dir.join(format!("{id}.jsonl"));
+    assert!(
+        restored.exists(),
+        "restore should derive the original project from cwd"
+    );
     let _ = std::fs::remove_file(&restored);
-    let _ = std::fs::remove_dir(home.join(".claude/projects/-tmp"));
     let _ = std::fs::remove_dir(&dir);
 }
 
