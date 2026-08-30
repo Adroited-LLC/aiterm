@@ -2796,6 +2796,21 @@ struct RestoreBinding {
 }
 
 #[cfg(target_os = "linux")]
+struct PreparedRestore {
+    bindings: Vec<RestoreBinding>,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedRestore {
+    fn verify(&self) -> Result<(), String> {
+        for binding in &self.bindings {
+            binding.verify()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl RestoreBinding {
     fn new(parent: &File, name: CString, object: &File) -> Result<Self, String> {
         if !directory_entry_is_exact_object(parent, &name, object)? {
@@ -2985,7 +3000,7 @@ impl StrictArchiveEntry {
         Ok(())
     }
 
-    fn publish_recovery_link(&self) -> Result<std::path::PathBuf, String> {
+    fn publish_recovery_link(&self) -> Result<ArchiveRecoveryLink, String> {
         let recovery_name = format!(".aiterm-restore-recovery-{}", uuid::Uuid::new_v4());
         let recovery = CString::new(recovery_name.as_bytes()).unwrap();
         if unsafe {
@@ -3004,20 +3019,33 @@ impl StrictArchiveEntry {
             ));
         }
         self.parent.sync_all().map_err(|error| error.to_string())?;
-        Ok(self
-            .display_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(recovery_name))
+        Ok(ArchiveRecoveryLink {
+            name: recovery,
+            path: self
+                .display_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(recovery_name),
+        })
     }
 
     fn remove_exact(&self) -> Result<(), String> {
+        self.remove_exact_after(|| Ok(()))
+    }
+
+    fn remove_exact_after(&self, validate: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         self.verify()?;
+        let recovery = self.publish_recovery_link()?;
+        if let Err(error) = validate() {
+            return Err(format!(
+                "{error}; exact archive is recoverable at {}",
+                recovery.path.display()
+            ));
+        }
         if !directory_entry_is_exact_object(&self.parent, &self.name, &self.archive.file)? {
-            let recovery = self.publish_recovery_link()?;
             return Err(format!(
                 "archive name changed before removal; exact archive is recoverable at {}",
-                recovery.display()
+                recovery.path.display()
             ));
         }
         let quarantine_name = format!(".aiterm-restore-remove-{}", uuid::Uuid::new_v4());
@@ -3034,10 +3062,9 @@ impl StrictArchiveEntry {
             &quarantine,
         )?;
         if !directory_entry_is_exact_object(&self.parent, &quarantine, &self.archive.file)? {
-            let recovery = self.publish_recovery_link()?;
             return Err(format!(
                 "archive name changed during removal; exact archive is recoverable at {} and the moved entry at {}",
-                recovery.display(),
+                recovery.path.display(),
                 quarantine_path.display()
             ));
         }
@@ -3064,8 +3091,21 @@ impl StrictArchiveEntry {
                 std::io::Error::last_os_error()
             ));
         }
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), recovery.name.as_ptr(), 0) } != 0 {
+            return Err(format!(
+                "purged restore recovery link remains at {}: {}",
+                recovery.path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
         self.parent.sync_all().map_err(|error| error.to_string())
     }
+}
+
+#[cfg(target_os = "linux")]
+struct ArchiveRecoveryLink {
+    name: CString,
+    path: std::path::PathBuf,
 }
 
 #[cfg(target_os = "linux")]
@@ -3236,7 +3276,7 @@ fn restore_sidecar_archive_from_file(
     archive: &File,
     destination_root: &Path,
     root_name: &OsStr,
-) -> Result<(), String> {
+) -> Result<PreparedRestore, String> {
     use std::io::Write;
     use std::os::unix::fs::FileExt;
 
@@ -3365,7 +3405,8 @@ fn restore_sidecar_archive_from_file(
     destination
         .file
         .sync_all()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedRestore { bindings })
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -3375,7 +3416,7 @@ fn restore_sidecar_archive(
     root_name: &OsStr,
 ) -> Result<(), String> {
     let archive = StrictArchiveEntry::open(archive_path)?;
-    restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)
+    restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name).map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -3386,10 +3427,10 @@ fn restore_sidecar_archive_and_remove_with_hook(
     before_remove: impl FnOnce(),
 ) -> Result<(), String> {
     let archive = StrictArchiveEntry::open(archive_path)?;
-    restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)?;
+    let restored = restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)?;
     archive.verify()?;
     before_remove();
-    archive.remove_exact()
+    archive.remove_exact_after(|| restored.verify())
 }
 
 #[cfg(target_os = "linux")]
@@ -3453,7 +3494,7 @@ fn open_matching_existing_rollout(
 fn restore_file_set_archive_from_file(
     archive: &File,
     destination_root: &Path,
-) -> Result<(), String> {
+) -> Result<PreparedRestore, String> {
     use std::io::Write;
     use std::os::unix::fs::FileExt;
 
@@ -3535,13 +3576,16 @@ fn restore_file_set_archive_from_file(
     destination
         .file
         .sync_all()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedRestore {
+        bindings: tree.bindings,
+    })
 }
 
 #[cfg(all(target_os = "linux", test))]
 fn restore_file_set_archive(archive_path: &Path, destination_root: &Path) -> Result<(), String> {
     let archive = StrictArchiveEntry::open(archive_path)?;
-    restore_file_set_archive_from_file(&archive.archive.file, destination_root)
+    restore_file_set_archive_from_file(&archive.archive.file, destination_root).map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -3550,9 +3594,9 @@ fn restore_file_set_archive_and_remove(
     destination_root: &Path,
 ) -> Result<(), String> {
     let archive = StrictArchiveEntry::open(archive_path)?;
-    restore_file_set_archive_from_file(&archive.archive.file, destination_root)?;
+    let restored = restore_file_set_archive_from_file(&archive.archive.file, destination_root)?;
     archive.verify()?;
-    archive.remove_exact()
+    archive.remove_exact_after(|| restored.verify())
 }
 
 #[cfg(target_os = "linux")]
