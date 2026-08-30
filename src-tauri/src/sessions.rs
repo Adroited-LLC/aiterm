@@ -1829,8 +1829,19 @@ fn for_each_directory_entry(
 
 #[cfg(target_os = "linux")]
 fn snapshot_directory_entries(directory: &File) -> Result<Vec<DirectoryEntryIdentity>, String> {
+    snapshot_directory_entries_bounded(directory, usize::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_directory_entries_bounded(
+    directory: &File,
+    max_entries: usize,
+) -> Result<Vec<DirectoryEntryIdentity>, String> {
     let mut entries = Vec::new();
     for_each_directory_entry(directory, |name| {
+        if entries.len() >= max_entries {
+            return Err("trash purge exceeds name limit".into());
+        }
         let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid sidecar entry name")?;
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe {
@@ -3381,6 +3392,90 @@ impl StrictArchiveEntry {
     }
 }
 
+/// An exact purge preflight keeps the inode descriptor-bound without consuming
+/// one Linux write lease per trash object. Removal converts one entry at a time
+/// into the same leased transaction used by strict archive deletion.
+#[cfg(target_os = "linux")]
+struct ExactPurgeFile {
+    parent: std::sync::Arc<File>,
+    name: CString,
+    display_path: std::path::PathBuf,
+    file: File,
+    hash: [u8; 32],
+    size: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ExactPurgeFile {
+    fn open_in(
+        parent: &std::sync::Arc<File>,
+        display_parent: &Path,
+        file_name: &OsStr,
+    ) -> Result<Self, String> {
+        let name = CString::new(file_name.as_bytes()).map_err(|_| "invalid strict archive name")?;
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file.metadata().map_err(|error| error.to_string())?;
+        if !metadata.is_file() || !directory_entry_is_exact_object(parent, &name, &file)? {
+            return Err("strict purge object changed while it was opened".into());
+        }
+        let archive_bound = u64::try_from(ArchiveLimits::default().entries)
+            .ok()
+            .and_then(|entries| entries.checked_mul(8192))
+            .and_then(|overhead| ArchiveLimits::default().bytes.checked_add(overhead))
+            .ok_or("archive bound overflow")?;
+        let (hash, size) = hash_exact_file_bounded(&file, archive_bound)?;
+        Ok(Self {
+            parent: std::sync::Arc::clone(parent),
+            name,
+            display_path: display_parent.join(file_name),
+            file,
+            hash,
+            size,
+        })
+    }
+
+    fn identity(&self) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self.file.metadata().map_err(|error| error.to_string())?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    fn remove_exact(&self) -> Result<(), String> {
+        if !directory_entry_is_exact_object(&self.parent, &self.name, &self.file)? {
+            return Err(format!(
+                "strict purge object changed before removal at {}",
+                self.display_path.display()
+            ));
+        }
+        let archive =
+            HeldWriteLease::existing(self.file.try_clone().map_err(|error| error.to_string())?)?;
+        StrictArchiveEntry {
+            parent: self
+                .parent
+                .as_ref()
+                .try_clone()
+                .map_err(|error| error.to_string())?,
+            name: self.name.clone(),
+            display_path: self.display_path.clone(),
+            archive,
+            hash: self.hash,
+            size: self.size,
+        }
+        .remove_exact()
+    }
+}
+
 #[cfg(target_os = "linux")]
 struct ArchiveRecoveryLink {
     name: CString,
@@ -3412,15 +3507,64 @@ fn is_retained_restore_recovery_bytes(name: &[u8]) -> bool {
 
 #[cfg(target_os = "linux")]
 enum PreparedTrashEntry {
-    File(StrictArchiveEntry),
+    File(ExactPurgeFile),
     Directory(PreparedTrashDirectory),
+}
+
+#[cfg(target_os = "linux")]
+const MAX_EXACT_PURGE_NAMES: usize = MAX_EXACT_ARCHIVE_ENTRIES * 8;
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct ExactPurgeBudget {
+    objects: usize,
+    names: usize,
+    retained_inodes: Vec<(u64, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl ExactPurgeBudget {
+    fn remaining_names(&self) -> usize {
+        MAX_EXACT_PURGE_NAMES.saturating_sub(self.names)
+    }
+
+    fn add_names(&mut self, count: usize) -> Result<(), String> {
+        self.names = self
+            .names
+            .checked_add(count)
+            .ok_or("trash purge name budget overflow")?;
+        if self.names > MAX_EXACT_PURGE_NAMES {
+            return Err("trash purge exceeds name limit".into());
+        }
+        Ok(())
+    }
+
+    fn add_object(&mut self) -> Result<(), String> {
+        self.objects = self
+            .objects
+            .checked_add(1)
+            .ok_or("trash purge budget overflow")?;
+        if self.objects > MAX_EXACT_ARCHIVE_ENTRIES {
+            return Err("trash purge exceeds entry limit".into());
+        }
+        Ok(())
+    }
+
+    fn remember_retained(&mut self, identity: (u64, u64)) -> bool {
+        if self.retained_inodes.contains(&identity) {
+            false
+        } else {
+            self.retained_inodes.push(identity);
+            true
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 struct PreparedTrashDirectory {
     parent: File,
     name: CString,
-    directory: File,
+    directory: std::sync::Arc<File>,
     display_path: std::path::PathBuf,
     entries: Vec<PreparedTrashEntry>,
     snapshot: Vec<DirectoryEntryIdentity>,
@@ -3442,7 +3586,7 @@ impl PreparedTrashDirectory {
         parent: &File,
         display_parent: &Path,
         name: &OsStr,
-        budget: &mut usize,
+        budget: &mut ExactPurgeBudget,
         depth: usize,
     ) -> Result<Self, String> {
         if depth > MAX_SESSION_DISCOVERY_DEPTH {
@@ -3459,40 +3603,32 @@ impl PreparedTrashDirectory {
         if descriptor < 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let directory = unsafe { File::from_raw_fd(descriptor) };
+        let directory = std::sync::Arc::new(unsafe { File::from_raw_fd(descriptor) });
         if !directory_entry_is_exact_object(parent, &name_c, &directory)? {
             return Err("trash directory changed while it was opened".into());
         }
-        let snapshot = snapshot_directory_entries(&directory)?;
+        let snapshot = snapshot_directory_entries_bounded(&directory, budget.remaining_names())?;
+        budget.add_names(snapshot.len())?;
         let mut entries = Vec::with_capacity(snapshot.len().min(16));
-        let mut retained_inodes = Vec::new();
         let display_path = display_parent.join(name);
         for entry in &snapshot {
             if is_effective_purge_tombstone(entry) {
                 continue;
             }
-            *budget = budget.checked_add(1).ok_or("trash purge budget overflow")?;
-            if *budget > MAX_EXACT_ARCHIVE_ENTRIES {
-                return Err("trash directory exceeds purge entry limit".into());
-            }
             let entry_name =
                 CString::new(entry.name.as_bytes()).map_err(|_| "invalid trash child name")?;
             let kind = entry.mode & libc::S_IFMT;
             if kind == libc::S_IFREG as u32 {
+                let archive = ExactPurgeFile::open_in(&directory, &display_path, &entry.name)?;
                 if is_retained_restore_recovery(&entry.name)
-                    && retained_inodes.contains(&(entry.device, entry.inode))
+                    && !budget.remember_retained(archive.identity()?)
                 {
                     continue;
                 }
-                if is_retained_restore_recovery(&entry.name) {
-                    retained_inodes.push((entry.device, entry.inode));
-                }
-                entries.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
-                    &directory,
-                    &display_path,
-                    &entry.name,
-                )?));
+                budget.add_object()?;
+                entries.push(PreparedTrashEntry::File(archive));
             } else if kind == libc::S_IFDIR as u32 {
+                budget.add_object()?;
                 entries.push(PreparedTrashEntry::Directory(Self::open_in(
                     &directory,
                     &display_path,
@@ -4553,7 +4689,7 @@ fn prepare_named_trash_entry(
     name: &OsStr,
     allow_directory: bool,
     required: bool,
-    budget: &mut usize,
+    budget: &mut ExactPurgeBudget,
 ) -> Result<Option<PreparedTrashEntry>, String> {
     let name_c = CString::new(name.as_bytes()).map_err(|_| "invalid trash entry name")?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -4572,17 +4708,19 @@ fn prepare_named_trash_entry(
         }
         return Err(error.to_string());
     }
-    *budget = budget.checked_add(1).ok_or("trash purge budget overflow")?;
-    if *budget > MAX_EXACT_ARCHIVE_ENTRIES {
-        return Err("trash purge exceeds entry limit".into());
-    }
+    budget.add_names(1)?;
+    budget.add_object()?;
     let stat = unsafe { stat.assume_init() };
     match stat.st_mode & libc::S_IFMT {
-        libc::S_IFREG => Ok(Some(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
-            &trash.file,
-            display_trash,
-            name,
-        )?))),
+        libc::S_IFREG => {
+            let parent =
+                std::sync::Arc::new(trash.file.try_clone().map_err(|error| error.to_string())?);
+            Ok(Some(PreparedTrashEntry::File(ExactPurgeFile::open_in(
+                &parent,
+                display_trash,
+                name,
+            )?)))
+        }
         libc::S_IFDIR if allow_directory => Ok(Some(PreparedTrashEntry::Directory(
             PreparedTrashDirectory::open_in(&trash.file, display_trash, name, budget, 0)?,
         ))),
@@ -4606,7 +4744,7 @@ fn trash_delete_in_directory_with_hook(
 ) -> Result<(), String> {
     valid_id(session_id)?;
     let trash = VerifiedDirectory::open(trash_path)?;
-    let mut budget = 0usize;
+    let mut budget = ExactPurgeBudget::default();
     let mut optional = Vec::new();
     for (suffix, allow_directory) in [
         ("origin", false),
@@ -4657,36 +4795,28 @@ fn trash_empty_sync() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn trash_empty_in_directory(trash_path: &Path) -> Result<(), String> {
     let trash = VerifiedDirectory::open(trash_path)?;
-    let snapshot = snapshot_directory_entries(&trash.file)?;
-    let mut budget = snapshot
-        .iter()
-        .filter(|entry| !is_effective_purge_tombstone(entry))
-        .count();
-    if budget > MAX_EXACT_ARCHIVE_ENTRIES {
-        return Err("trash purge exceeds entry limit".into());
-    }
+    let mut budget = ExactPurgeBudget::default();
+    let snapshot = snapshot_directory_entries_bounded(&trash.file, budget.remaining_names())?;
+    budget.add_names(snapshot.len())?;
     let mut prepared = Vec::with_capacity(snapshot.len().min(16));
-    let mut retained_inodes = Vec::new();
+    let trash_parent =
+        std::sync::Arc::new(trash.file.try_clone().map_err(|error| error.to_string())?);
     for entry in &snapshot {
         if is_effective_purge_tombstone(entry) {
             continue;
         }
         let kind = entry.mode & libc::S_IFMT as u32;
         if kind == libc::S_IFREG as u32 {
+            let archive = ExactPurgeFile::open_in(&trash_parent, trash_path, &entry.name)?;
             if is_retained_restore_recovery(&entry.name)
-                && retained_inodes.contains(&(entry.device, entry.inode))
+                && !budget.remember_retained(archive.identity()?)
             {
                 continue;
             }
-            if is_retained_restore_recovery(&entry.name) {
-                retained_inodes.push((entry.device, entry.inode));
-            }
-            prepared.push(PreparedTrashEntry::File(StrictArchiveEntry::open_in(
-                &trash.file,
-                trash_path,
-                &entry.name,
-            )?));
+            budget.add_object()?;
+            prepared.push(PreparedTrashEntry::File(archive));
         } else if kind == libc::S_IFDIR as u32 {
+            budget.add_object()?;
             prepared.push(PreparedTrashEntry::Directory(
                 PreparedTrashDirectory::open_in(
                     &trash.file,
@@ -4703,13 +4833,13 @@ fn trash_empty_in_directory(trash_path: &Path) -> Result<(), String> {
             ));
         }
     }
-    if snapshot_directory_entries(&trash.file)? != snapshot {
+    if snapshot_directory_entries_bounded(&trash.file, MAX_EXACT_PURGE_NAMES)? != snapshot {
         return Err("trash directory changed during purge preparation".into());
     }
     for entry in &prepared {
         entry.remove_exact()?;
     }
-    if snapshot_directory_entries(&trash.file)?
+    if snapshot_directory_entries_bounded(&trash.file, MAX_EXACT_PURGE_NAMES)?
         .iter()
         .any(|entry| !is_effective_purge_tombstone(entry))
     {
@@ -7539,14 +7669,17 @@ mod tests {
 
         trash_empty_in_directory(&trash).unwrap();
 
-        let snapshot = snapshot_directory_entries(&VerifiedDirectory::open(&trash).unwrap().file)
-            .unwrap();
+        let snapshot =
+            snapshot_directory_entries(&VerifiedDirectory::open(&trash).unwrap().file).unwrap();
         assert!(snapshot.iter().all(is_effective_purge_tombstone));
         assert!(snapshot
             .iter()
             .filter(|entry| is_retained_restore_recovery(&entry.name))
             .all(|entry| entry.size == 0));
-        assert_eq!(std::fs::read(&outside).unwrap(), b"different object must survive");
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"different object must survive"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7724,7 +7857,7 @@ mod tests {
         std::fs::create_dir_all(&exact).unwrap();
         std::fs::write(exact.join("task"), b"purge target").unwrap();
         let trash = VerifiedDirectory::open(&trash_path).unwrap();
-        let mut budget = 0;
+        let mut budget = ExactPurgeBudget::default();
         let prepared = PreparedTrashDirectory::open_in(
             &trash.file,
             &trash_path,
