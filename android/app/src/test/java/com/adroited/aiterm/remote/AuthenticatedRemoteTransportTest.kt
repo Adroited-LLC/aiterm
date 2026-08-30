@@ -9,7 +9,11 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.runCurrent
@@ -244,6 +248,74 @@ class AuthenticatedRemoteTransportTest {
         transport.close()
     }
 
+    @Test
+    fun maximumValidEventBurstBackpressuresWithoutClosingTheTransport() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+
+        val produced = async {
+            repeat(128) {
+                transport.acceptEnvelopeForTest(RemoteEventEnvelope(0, "tab.changed", byteArrayOf()))
+            }
+        }
+        val received = async { transport.events.take(128).toList() }
+        runCurrent()
+
+        assertEquals(128, received.await().size)
+        produced.await()
+        assertFalse(socket.closed)
+        transport.close()
+    }
+
+    @Test
+    fun attachmentCorrelationRemainsPinnedPastCompletedRequestEviction() = runTest {
+        val transport = transport(
+            authenticatedSocket(),
+            backgroundScope,
+            StandardTestDispatcher(testScheduler),
+        )
+        transport.connect()
+        val attachment = transport.request("terminal.attach", byteArrayOf())
+        runCurrent()
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "terminal.attach", byteArrayOf()))
+        transport.acceptEnvelopeForTest(
+            RemoteEventEnvelope(1, "terminal.snapshot", terminalSnapshotFixture(1, index = 0, total = 2)),
+        )
+
+        repeat(65) { index ->
+            val response = transport.request("tab.list", byteArrayOf())
+            runCurrent()
+            val requestId = index.toLong() + 2
+            transport.acceptEnvelopeForTest(RemoteEventEnvelope(requestId, "tab.list", byteArrayOf()))
+            response.await()
+        }
+
+        transport.acceptEnvelopeForTest(
+            RemoteEventEnvelope(1, "terminal.snapshot", terminalSnapshotFixture(1, index = 1, total = 2)),
+        )
+        assertEquals(1L, attachment.await().requestId)
+        transport.close()
+    }
+
+    private fun authenticatedSocket() = FakeBinarySocket().apply {
+        incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+        incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+    }
+
+    private fun transport(
+        socket: RemoteBinarySocket,
+        scope: CoroutineScope,
+        dispatcher: CoroutineDispatcher,
+    ) = AuthenticatedRemoteTransport(
+        desktop = desktop(),
+        deviceKeys = RecordingDeviceKeys(),
+        appLock = unlockedAppLock(),
+        dialer = FakeDialer(socket),
+        scope = scope,
+        dispatcher = dispatcher,
+    )
+
     private fun desktop() = PairedDesktop(
         deviceId = "device-1",
         displayName = "Desktop",
@@ -259,7 +331,7 @@ class AuthenticatedRemoteTransportTest {
         value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }
 
-private fun terminalSnapshotFixture(requestId: Int): ByteArray {
+private fun terminalSnapshotFixture(requestId: Int, index: Int = 0, total: Int = 1): ByteArray {
     val attributes = linkedMapOf(
         "bold" to false, "faint" to false, "italic" to false, "underline" to false,
         "inverse" to false, "hidden" to false, "strikethrough" to false,
@@ -284,7 +356,7 @@ private fun terminalSnapshotFixture(requestId: Int): ByteArray {
             "transfer_id" to "transfer-1", "tab_id" to "tab-1",
             "attachment_id" to "attachment-1", "kind" to "snapshot",
             "base_revision" to 1, "final_revision" to 1, "row_start" to 0,
-            "row_end" to 1, "index" to 0, "total" to 1,
+            "row_end" to 1, "index" to index, "total" to total,
             "request_id" to requestId, "payload" to part,
         ),
     )
