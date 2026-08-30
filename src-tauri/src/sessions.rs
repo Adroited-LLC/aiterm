@@ -2376,7 +2376,10 @@ fn preserve_prepared_source(
             std::io::Error::last_os_error()
         ));
     }
-    source.parent.sync_all().map_err(|error| error.to_string())?;
+    source
+        .parent
+        .sync_all()
+        .map_err(|error| error.to_string())?;
     Ok(Some(ArchiveRecoveryLink {
         name,
         path: source.display_parent.join(recovery_name),
@@ -2409,11 +2412,8 @@ fn preserve_prepared_archive(
         .file
         .sync_all()
         .map_err(|error| error.to_string())?;
-    let parent = std::fs::read_link(format!(
-        "/proc/self/fd/{}",
-        destination.file.as_raw_fd()
-    ))
-    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let parent = std::fs::read_link(format!("/proc/self/fd/{}", destination.file.as_raw_fd()))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
     Ok(ArchiveRecoveryLink {
         name,
         path: parent.join(recovery_name),
@@ -2434,7 +2434,13 @@ fn quarantine_prepared_source(
         let recoverable = recovery
             .as_ref()
             .map(|link| link.path.display().to_string())
-            .unwrap_or_else(|| source.display_parent.join(&source.name).display().to_string());
+            .unwrap_or_else(|| {
+                source
+                    .display_parent
+                    .join(&source.name)
+                    .display()
+                    .to_string()
+            });
         return Err(format!(
             "source name changed before quarantine; exact source remains recoverable at {}",
             recoverable
@@ -2478,7 +2484,10 @@ fn quarantine_prepared_source(
                 std::io::Error::last_os_error()
             ));
         }
-        source.parent.sync_all().map_err(|error| error.to_string())?;
+        source
+            .parent
+            .sync_all()
+            .map_err(|error| error.to_string())?;
         if !directory_entry_is_exact_object(&source.parent, &quarantine, &source.object)? {
             return Err(format!(
                 "source quarantine changed while releasing recovery; exact source was at {}",
@@ -3279,23 +3288,17 @@ impl StrictArchiveEntry {
         self.parent.sync_all().map_err(|error| error.to_string())
     }
 
-    fn remove_exact_after(&self, validate: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+    fn remove_exact_after(
+        &self,
+        validate: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         self.remove_exact_after_with_hook(validate, || {})
     }
 
     fn remove_exact_after_with_hook(
         &self,
-        validate: impl FnMut() -> Result<(), String>,
-        after_name_check: impl FnOnce(),
-    ) -> Result<(), String> {
-        self.remove_exact_after_with_hooks(validate, after_name_check, || {})
-    }
-
-    fn remove_exact_after_with_hooks(
-        &self,
         mut validate: impl FnMut() -> Result<(), String>,
         after_name_check: impl FnOnce(),
-        before_destructive_retirement: impl FnOnce(),
     ) -> Result<(), String> {
         self.verify()?;
         let recovery = self.publish_recovery_link()?;
@@ -3347,7 +3350,6 @@ impl StrictArchiveEntry {
         }
         self.verify()?;
         self.archive.verify("restore archive")?;
-        before_destructive_retirement();
         self.archive
             .file
             .set_len(0)
@@ -3405,8 +3407,7 @@ fn is_effective_purge_tombstone(entry: &DirectoryEntryIdentity) -> bool {
 
 #[cfg(unix)]
 fn is_retained_restore_recovery_bytes(name: &[u8]) -> bool {
-    name.starts_with(b".aiterm-restored-archive-")
-        || name.starts_with(b".aiterm-restore-recovery-")
+    name.starts_with(b".aiterm-restored-archive-") || name.starts_with(b".aiterm-restore-recovery-")
 }
 
 #[cfg(target_os = "linux")]
@@ -3541,7 +3542,8 @@ impl PreparedTrashDirectory {
         if snapshot_directory_entries(&self.directory)?
             .iter()
             .any(|entry| !is_effective_purge_tombstone(entry))
-            || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)? {
+            || !directory_entry_is_exact_object(&self.parent, &self.name, &self.directory)?
+        {
             return Err(format!(
                 "trash directory changed during permanent purge at {}",
                 self.display_path.display()
@@ -3751,7 +3753,8 @@ fn restore_sidecar_archive(
     root_name: &OsStr,
 ) -> Result<(), String> {
     let archive = StrictArchiveEntry::open(archive_path)?;
-    restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name).map(|_| ())
+    restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)
+        .map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -3762,7 +3765,8 @@ fn restore_sidecar_archive_and_remove_with_hook(
     before_remove: impl FnOnce(),
 ) -> Result<(), String> {
     let archive = StrictArchiveEntry::open(archive_path)?;
-    let restored = restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)?;
+    let restored =
+        restore_sidecar_archive_from_file(&archive.archive.file, destination_root, root_name)?;
     archive.verify()?;
     before_remove();
     archive.retire_after_restore(|| restored.verify())
@@ -7279,12 +7283,18 @@ mod tests {
             std::fs::read(displaced.join("entry")).unwrap(),
             b"archived bytes"
         );
-        assert!(archive.exists() || std::fs::read_dir(&trash_path).unwrap().flatten().any(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".aiterm-restore-recovery-")
-        }));
+        assert!(
+            archive.exists()
+                || std::fs::read_dir(&trash_path)
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".aiterm-restore-recovery-")
+                    })
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7343,15 +7353,23 @@ mod tests {
             std::fs::read(restored_path.join("entry")).unwrap(),
             b"replacement"
         );
-        assert_eq!(std::fs::read(displaced.join("entry")).unwrap(), b"archived bytes");
-        assert!(std::fs::read_dir(&trash_path).unwrap().flatten().any(|entry| {
-            let name = entry.file_name();
-            (name.to_string_lossy().starts_with(".aiterm-restore-recovery-")
-                || name.to_string_lossy().starts_with(".aiterm-purged-file-"))
-                && std::fs::read(entry.path())
-                    .map(|bytes| bytes.starts_with(SIDECAR_ARCHIVE_MAGIC))
-                    .unwrap_or(false)
-        }));
+        assert_eq!(
+            std::fs::read(displaced.join("entry")).unwrap(),
+            b"archived bytes"
+        );
+        assert!(std::fs::read_dir(&trash_path)
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                let name = entry.file_name();
+                (name
+                    .to_string_lossy()
+                    .starts_with(".aiterm-restore-recovery-")
+                    || name.to_string_lossy().starts_with(".aiterm-purged-file-"))
+                    && std::fs::read(entry.path())
+                        .map(|bytes| bytes.starts_with(SIDECAR_ARCHIVE_MAGIC))
+                        .unwrap_or(false)
+            }));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7406,7 +7424,10 @@ mod tests {
         };
 
         assert!(error.contains("restored entry changed"), "{error}");
-        assert_eq!(std::fs::read(restored_path.join("entry")).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(restored_path.join("entry")).unwrap(),
+            b"replacement"
+        );
         assert_eq!(
             std::fs::read(displaced.join("entry")).unwrap(),
             b"archive survives retirement"
@@ -7492,9 +7513,9 @@ mod tests {
         trash_empty_in_directory(&trash_path).unwrap();
         let final_snapshot = snapshot_directory_entries(&trash.file).unwrap();
         assert!(final_snapshot.iter().all(is_effective_purge_tombstone));
-        assert!(final_snapshot.iter().all(|entry| {
-            !is_retained_restore_recovery(&entry.name) || entry.size == 0
-        }));
+        assert!(final_snapshot
+            .iter()
+            .all(|entry| { !is_retained_restore_recovery(&entry.name) || entry.size == 0 }));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -7606,8 +7627,14 @@ mod tests {
                 .unwrap_err()
         };
 
-        assert!(error.contains("archive name changed during removal"), "{error}");
-        assert_eq!(std::fs::read(&archive).unwrap(), b"replacement must survive");
+        assert!(
+            error.contains("archive name changed during removal"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            b"replacement must survive"
+        );
         assert_eq!(std::fs::read(&displaced).unwrap(), b"exact archive");
         assert!(std::fs::read_dir(&root).unwrap().flatten().any(|entry| {
             entry
@@ -7649,7 +7676,10 @@ mod tests {
             })
             .unwrap_err();
 
-        assert!(error.contains("purged directory tombstone changed"), "{error}");
+        assert!(
+            error.contains("purged directory tombstone changed"),
+            "{error}"
+        );
         assert_eq!(
             std::fs::read(exact.join("replacement")).unwrap(),
             b"must survive"
