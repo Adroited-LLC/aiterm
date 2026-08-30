@@ -221,6 +221,7 @@ class AuthenticatedRemoteTransport(
             queued.payload.fill(0)
         }
         toFail.forEach { it.completeExceptionally(failure) }
+        eventChannel.close()
     }
 
     private suspend fun readLoop(active: RemoteBinarySocket) {
