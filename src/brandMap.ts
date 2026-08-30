@@ -84,7 +84,10 @@ export function brandAccent(name: string): string | null {
 /** Agent ids as the backends name them. */
 const AGENT_BRAND: Record<string, string> = {
   claude: "claude",
-  codex: "codex",
+  // The Codex mark in the set is an app-icon tile (white box, blob inside);
+  // beside the other marks it reads as a sticker. OpenAI's own mark is the
+  // one people know, and it sits with Claude's and Grok's at any size.
+  codex: "openai",
   openai: "openai",
   grok: "grok",
   opencode: "opencode",
@@ -250,7 +253,8 @@ export function brandForUrl(url: string | null | undefined): string | null {
  *  mark, the CLIs their own, and an API provider whatever its name resolves to. */
 export function brandForUsageSource(id: string, name: string): string | null {
   if (id === "anthropic") return "claude";
-  if (id === "codex" || id === "grok") return id;
+  if (id === "codex") return "openai";
+  if (id === "grok") return "grok";
   if (id.startsWith("provider:")) return brandForName(name) ?? brandForName(id.slice(9));
   return brandForName(id) ?? brandForName(name);
 }
