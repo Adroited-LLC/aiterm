@@ -2656,7 +2656,6 @@ fn archive_verified_inputs_with_transaction_hooks(
             }
         }
     }
-    before_retirement(&prepared)?;
     verify_prepared_archives(&prepared, destination, limits, false, true).map_err(|error| {
         let locations = recovery
             .iter()
@@ -2667,6 +2666,10 @@ fn archive_verified_inputs_with_transaction_hooks(
             "durable session archives exist but final retirement validation failed; recoverable quarantines: {locations}: {error}"
         )
     })?;
+    // The test/transaction hook is deliberately at the last external boundary:
+    // everything above has validated, and no source may be truncated until the
+    // archive bindings are checked again below.
+    before_retirement(&prepared)?;
     for archive in &prepared {
         if let Err(error) = retire_exact_files(&archive.retirements) {
             let locations = recovery
