@@ -343,6 +343,49 @@ class RemoteClientTest {
         assertEquals(listOf("old"), client.scrollback.value.map(ScreenRow::plainText))
         client.lock()
     }
+
+    @Test
+    fun rapidScrollbackPagingKeepsOnlyOneRequestForTheExpectedOffset() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+
+        assertTrue(client.requestNextScrollbackPage(128))
+        assertFalse(client.requestNextScrollbackPage(128))
+        assertEquals(1, transport.requests.count { it.kind == "terminal.scrollback" })
+        client.lock()
+    }
+
+    @Test
+    fun unexpectedScrollbackCorrelationCannotPublishOutOfOrderRows() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        assertTrue(client.requestNextScrollbackPage(128))
+        val expectedId = transport.requests.last { it.kind == "terminal.scrollback" }.requestId
+
+        client.acceptForTest(scrollbackChunk(expectedId + 1, "later"))
+        assertEquals(emptyList<ScreenRow>(), client.scrollback.value)
+        client.acceptForTest(scrollbackChunk(expectedId, "expected"))
+        assertEquals(listOf("expected"), client.scrollback.value.map(ScreenRow::plainText))
+        client.lock()
+    }
 }
 
 private fun snapshotChunk(
@@ -369,6 +412,25 @@ private fun snapshotChunk(
             visible = listOf(ScreenRow(text.map { ScreenCell(it.toString()) })),
             cursor = CursorState(0, 0, true),
             modes = com.adroited.aiterm.terminal.TerminalModes(),
+        ),
+    ),
+)
+
+private fun scrollbackChunk(requestId: Long, text: String) = RemoteServerEvent.TerminalChunk(
+    TerminalTransferChunk(
+        transferId = "history-$requestId",
+        tabId = "tab-1",
+        attachmentId = "attachment-1",
+        kind = TerminalTransferKind.Scrollback,
+        baseRevision = 1,
+        finalRevision = 1,
+        rowStart = 0,
+        rowEnd = 1,
+        index = 0,
+        total = 1,
+        requestId = requestId,
+        part = TerminalTransferPart.Scrollback(
+            listOf(ScreenRow(text.map { ScreenCell(it.toString()) })),
         ),
     ),
 )
