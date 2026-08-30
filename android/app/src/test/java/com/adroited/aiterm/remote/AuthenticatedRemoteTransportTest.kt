@@ -269,6 +269,35 @@ class AuthenticatedRemoteTransportTest {
     }
 
     @Test
+    fun maximumValidHeldAttachmentBurstDrainsWithoutClosingTheTransport() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+        val attachment = transport.request("terminal.attach", byteArrayOf())
+        runCurrent()
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "terminal.attach", byteArrayOf()))
+        repeat(512) { index ->
+            transport.acceptEnvelopeForTest(
+                RemoteEventEnvelope(
+                    1,
+                    "terminal.snapshot",
+                    terminalSnapshotFixture(1, index = index, total = 512),
+                ),
+            )
+        }
+
+        val received = async { transport.events.take(512).toList() }
+        val drain = async { transport.completeAttachment(1, true) }
+        runCurrent()
+
+        assertEquals(512, received.await().size)
+        drain.await()
+        attachment.await()
+        assertFalse(socket.closed)
+        transport.close()
+    }
+
+    @Test
     fun attachmentCorrelationRemainsPinnedPastCompletedRequestEviction() = runTest {
         val transport = transport(
             authenticatedSocket(),
