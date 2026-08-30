@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
-  sessionRename,
+  sessionRename, sessionTitles,
 } from "../ipc";
 import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
@@ -206,6 +207,23 @@ export default function SessionsPanel({
   /** Row whose title is being edited in place, and the text so far. */
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  /** Person-chosen titles, id → name. A name the person typed outranks
+   *  every other naming layer — the librarian's labels included — and the
+   *  row can only rank what it can see, so the map rides along. */
+  const [titleOverrides, setTitleOverrides] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const load = () => sessionTitles().then(setTitleOverrides).catch(() => {});
+    load();
+    const un = listen("sessions://changed", load);
+    return () => { un.then((f) => f()); };
+  }, []);
+  const commitTitle = (s: Session, draft: string) => {
+    const t = draft.trim();
+    setRenamingId(null);
+    if (!t || t === (titleOverrides[s.id] ?? s.title)) return;
+    setTitleOverrides((prev) => ({ ...prev, [s.id]: t }));
+    sessionRename(s.id, t).catch(() => {});
+  };
   // Resuming a session that's still running stops it first, which throws away
   // whatever it was mid-way through — worth one click of confirmation.
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
@@ -354,6 +372,15 @@ export default function SessionsPanel({
   };
   const flyHold = () => {
     if (flyClose.current) { window.clearTimeout(flyClose.current); flyClose.current = null; }
+  };
+  /** Begin editing a row's title. The preview card would sit right on top
+   *  of the input, so it goes away — immediately, not on the leave timer. */
+  const startRename = (s: Session) => {
+    if (flyTimer.current) { window.clearTimeout(flyTimer.current); flyTimer.current = null; }
+    if (flyClose.current) { window.clearTimeout(flyClose.current); flyClose.current = null; }
+    setFly(null);
+    setRenamingId(s.id);
+    setRenameDraft(titleOverrides[s.id] ?? s.title);
   };
   useEffect(() => {
     // Anything that moves the row from under the pointer closes the card —
@@ -812,7 +839,7 @@ export default function SessionsPanel({
         key={s.id}
         data-item={container ? s.id : undefined}
         data-container={container}
-        onMouseEnter={(e) => { if (!isDragging) flyEnter(s, e.currentTarget, isRunning); }}
+        onMouseEnter={(e) => { if (!isDragging && renamingId === null) flyEnter(s, e.currentTarget, isRunning); }}
         onMouseLeave={flyLeave}
         onPointerDown={(e) => {
           if (e.button !== 0 || !container || searchList) return;
@@ -895,27 +922,19 @@ export default function SessionsPanel({
                 onPointerDown={(e) => e.stopPropagation()}
                 onKeyDown={(e) => {
                   e.stopPropagation();
-                  if (e.key === "Enter") {
-                    const t = renameDraft.trim();
-                    if (t && t !== s.title) sessionRename(s.id, t).catch(() => {});
-                    setRenamingId(null);
-                  }
+                  if (e.key === "Enter") commitTitle(s, renameDraft);
                   // Escape resets the draft first so a stray blur commits nothing.
-                  if (e.key === "Escape") { setRenameDraft(s.title); setRenamingId(null); }
+                  if (e.key === "Escape") { setRenameDraft(titleOverrides[s.id] ?? s.title); setRenamingId(null); }
                 }}
-                onBlur={() => {
-                  const t = renameDraft.trim();
-                  if (t && t !== s.title) sessionRename(s.id, t).catch(() => {});
-                  setRenamingId(null);
-                }}
+                onBlur={() => commitTitle(s, renameDraft)}
               />
             ) : (
               <span
                 className="session-title"
                 title={renameRows && librarian.store.sessions[s.id] ? s.title : undefined}
-                onDoubleClick={(e) => { e.stopPropagation(); setRenamingId(s.id); setRenameDraft(s.title); }}
+                onDoubleClick={(e) => { e.stopPropagation(); startRename(s); }}
               >
-                {(renameRows && librarian.store.sessions[s.id]?.name) || s.title}
+                {titleOverrides[s.id] ?? ((renameRows && librarian.store.sessions[s.id]?.name) || s.title)}
               </span>
             )}
             {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
@@ -1032,7 +1051,7 @@ export default function SessionsPanel({
               <button
                 className="act-btn"
                 title="Rename this session (or double-click its title)"
-                onClick={() => { setRenamingId(s.id); setRenameDraft(s.title); }}
+                onClick={() => startRename(s)}
               ><Icon of={Pencil} size="sm" /></button>
               {/* aiterm's own clear — same end shape as typing /clear, built
                   like ⑂: no claude machinery, just a fresh process on a

@@ -131,6 +131,9 @@ export const sessionDetail = (sessionId: string) =>
 /** A person-chosen title for the session; empty restores the engine's own. */
 export const sessionRename = (sessionId: string, title: string) =>
   invoke<void>("session_rename", { sessionId, title });
+/** Every person-chosen title, id → name. */
+export const sessionTitles = () =>
+  invoke<Record<string, string>>("session_titles");
 export const sessionDelete = (sessionId: string) =>
   invoke<void>("session_delete", { sessionId });
 

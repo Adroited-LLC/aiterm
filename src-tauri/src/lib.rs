@@ -114,6 +114,7 @@ pub fn run() {
             providers::provider_management_key_set,
             sessions::list_sessions,
             sessions::session_rename,
+            sessions::session_titles,
             sessions::session_status,
             sessions::session_preview,
             detail::session_detail,

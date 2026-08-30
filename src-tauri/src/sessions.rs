@@ -3970,6 +3970,14 @@ pub fn rename_session(session_id: &str, title: &str) -> Result<(), String> {
     std::fs::write(&p, text).map_err(|e| e.to_string())
 }
 
+/// The override map itself, for the UI: a person-chosen name must outrank
+/// every other naming layer (the librarian's labels included), and the row
+/// can only rank what it can see.
+#[tauri::command]
+pub fn session_titles() -> std::collections::HashMap<String, String> {
+    load_titles()
+}
+
 #[tauri::command]
 pub fn session_rename(app: tauri::AppHandle, session_id: String, title: String) -> Result<(), String> {
     rename_session(&session_id, &title)?;
