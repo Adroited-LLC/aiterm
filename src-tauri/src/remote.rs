@@ -834,7 +834,8 @@ const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git", ".cache", ".gradl
 /// whose tool calls we parse. Newest first.
 async fn session_files(Path(id): Path<String>) -> Response {
     let wrote = crate::sessions::session_artifacts(id.clone()).await;
-    let detail = crate::detail::session_detail(id).await;
+    let detail = crate::detail::session_detail(id.clone()).await;
+    let sid = id;
     let out = crate::run_blocking(move || {
         let mut seen = std::collections::HashSet::new();
         let mut out: Vec<FileEntry> = Vec::new();
@@ -844,6 +845,15 @@ async fn session_files(Path(id): Path<String>) -> Response {
                     out.push(e);
                 }
             }
+        }
+        // Where a harness puts what it makes outside the project: Codex's
+        // image generation writes to its own directory, keyed by session.
+        for dir in harness_output_dirs(&sid) {
+            walk_recent(&dir, 0, 0, &mut |e| {
+                if out.len() < FILES_CAP && seen.insert(e.path.clone()) {
+                    out.push(FileEntry { via: "made".into(), ..e });
+                }
+            });
         }
         if let Some(d) = detail {
             let since = d.started.as_deref().and_then(parse_iso_secs).unwrap_or(0);
@@ -860,6 +870,19 @@ async fn session_files(Path(id): Path<String>) -> Response {
     })
     .await;
     Json(out).into_response()
+}
+
+/// Per-harness output directories for one session. Codex is the only one
+/// with such a place today (`~/.codex/generated_images/<session id>/`).
+fn harness_output_dirs(session_id: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        let codex = home.join(".codex").join("generated_images").join(session_id);
+        if codex.is_dir() {
+            out.push(codex);
+        }
+    }
+    out
 }
 
 fn file_entry(path: &std::path::Path, via: &str) -> Option<FileEntry> {
@@ -949,9 +972,16 @@ async fn file(Query(q): Query<FileQuery>, req: Request) -> Response {
 }
 
 async fn file_is_allowed(real: &std::path::Path) -> bool {
+    let mut always: Vec<PathBuf> = Vec::new();
     if let Some(up) = dirs::data_dir().map(|d| d.join("aiterm").join("uploads")) {
-        if let Ok(up) = up.canonicalize() {
-            if real.starts_with(&up) {
+        always.push(up);
+    }
+    if let Some(home) = dirs::home_dir() {
+        always.push(home.join(".codex").join("generated_images"));
+    }
+    for dir in always {
+        if let Ok(dir) = dir.canonicalize() {
+            if real.starts_with(&dir) {
                 return true;
             }
         }
