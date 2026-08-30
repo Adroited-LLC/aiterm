@@ -126,9 +126,12 @@ class TerminalScreenTest {
             }
         }
 
-        val wide = compose.onNodeWithTag("terminal-cell-0-0").fetchSemanticsNode().boundsInRoot
-        val combining = compose.onNodeWithTag("terminal-cell-0-2").fetchSemanticsNode().boundsInRoot
-        val cursor = compose.onNodeWithTag("terminal-cursor").fetchSemanticsNode().boundsInRoot
+        val wide = compose.onNodeWithTag("terminal-cell-0-0", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val combining = compose.onNodeWithTag("terminal-cell-0-2", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val cursor = compose.onNodeWithTag("terminal-cursor", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
         assertTrue(kotlin.math.abs(wide.width - combining.width * 2f) < 2f)
         assertTrue(kotlin.math.abs(cursor.left - combining.left) < 2f)
         assertTrue(kotlin.math.abs(cursor.height - combining.height) < 2f)
@@ -158,7 +161,8 @@ class TerminalScreenTest {
         }
 
         compose.onNodeWithTag("terminal-grid").assertIsDisplayed()
-        val composedRows = compose.onAllNodesWithTag("terminal-row").fetchSemanticsNodes().size
+        val composedRows = compose.onAllNodesWithTag("terminal-row", useUnmergedTree = true)
+            .fetchSemanticsNodes().size
         assertTrue(composedRows > 0)
         assertTrue("composed $composedRows rows", composedRows < 100)
         assertEquals(5_000, history.size)

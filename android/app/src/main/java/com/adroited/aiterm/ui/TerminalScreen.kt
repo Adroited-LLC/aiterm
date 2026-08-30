@@ -1,10 +1,8 @@
 package com.adroited.aiterm.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -16,10 +14,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
@@ -49,10 +50,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
@@ -68,6 +68,7 @@ import androidx.compose.ui.semantics.text
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -75,6 +76,7 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.adroited.aiterm.remote.ConnectionState
@@ -154,6 +156,7 @@ fun TerminalScreenContent(
     var cols by remember { mutableIntStateOf(screen?.cols ?: 80) }
     var rows by remember { mutableIntStateOf(screen?.rows ?: 24) }
     var deleteTarget by remember { mutableStateOf<RemoteSession?>(null) }
+    val terminalMetrics = rememberTerminalMetrics()
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -207,8 +210,8 @@ fun TerminalScreenContent(
             Column(Modifier.fillMaxSize().padding(padding)) {
                 ConnectionRail(state, onReconnect)
                 BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                    val measuredCols = (maxWidth / 8.4.dp).toInt().coerceIn(1, 512)
-                    val measuredRows = (maxHeight / 17.dp).toInt().coerceIn(1, 512)
+                    val measuredCols = (maxWidth / terminalMetrics.cellWidth).toInt().coerceIn(1, 512)
+                    val measuredRows = (maxHeight / terminalMetrics.lineHeight).toInt().coerceIn(1, 512)
                     LaunchedEffect(measuredCols, measuredRows, screen?.tabId) {
                         cols = measuredCols
                         rows = measuredRows
@@ -219,6 +222,7 @@ fun TerminalScreenContent(
                         scrollback = scrollback,
                         modifier = Modifier.fillMaxSize(),
                         onInput = onInput,
+                        metrics = terminalMetrics,
                     )
                     if (screen == null) {
                         Text(
@@ -391,15 +395,18 @@ private fun TerminalGrid(
     scrollback: List<ScreenRow>,
     modifier: Modifier,
     onInput: (String) -> Unit,
+    metrics: TerminalMetrics,
 ) {
     val focusRequester = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
-    val scrollState = rememberScrollState()
+    val terminalRows = remember(scrollback, screen?.visible) {
+        scrollback.asReversed() + (screen?.visible ?: emptyList())
+    }
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = scrollback.size.coerceAtMost(terminalRows.lastIndex.coerceAtLeast(0)),
+    )
     var imeValue by remember { mutableStateOf(TextFieldValue()) }
     val density = LocalDensity.current
-    val cellWidth = with(density) { 8.4.dp.toPx() }
-    val lineHeight = with(density) { 16.sp.toPx() }
-    val cursorThickness = with(density) { 2.dp.toPx() }
     Box(
         modifier.background(Color(0xFF07111B)).clickable {
             focusRequester.requestFocus()
@@ -407,39 +414,43 @@ private fun TerminalGrid(
         }.padding(horizontal = 4.dp, vertical = 3.dp).testTag("terminal-grid"),
     ) {
         SelectionContainer {
-            Column(Modifier.verticalScroll(scrollState)) {
-                scrollback.asReversed().forEach { row ->
-                    TerminalRowGrid(row)
-                }
-                screen?.visible?.forEach { row ->
-                    TerminalRowGrid(row)
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                itemsIndexed(
+                    terminalRows,
+                    key = { index, _ -> "${screen?.tabId ?: "none"}:$index" },
+                ) { index, row ->
+                    TerminalRowGrid(row, index, metrics)
                 }
             }
         }
-        Canvas(Modifier.fillMaxSize()) {
-            val cursor = screen?.cursor ?: return@Canvas
-            if (!cursor.visible) return@Canvas
-            val x = cursor.col * cellWidth
-            val y = (scrollback.size + cursor.row) * lineHeight - scrollState.value
-            if (y + lineHeight < 0 || y > size.height) return@Canvas
+        val cursor = screen?.cursor
+        val cursorIndex = cursor?.let { scrollback.size + it.row }
+        val cursorItem = cursorIndex?.let { wanted ->
+            listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == wanted }
+        }
+        if (cursor != null && cursor.visible && cursorItem != null) {
             val color = Color(0xFF63D3E1)
-            when (cursor.shape) {
-                CursorShape.Block -> drawRect(
-                    color.copy(alpha = 0.35f),
-                    topLeft = Offset(x, y),
-                    size = Size(cellWidth, lineHeight),
-                )
-                CursorShape.Beam -> drawRect(
-                    color,
-                    topLeft = Offset(x, y),
-                    size = Size(cursorThickness, lineHeight),
-                )
-                CursorShape.Underline -> drawRect(
-                    color,
-                    topLeft = Offset(x, y + lineHeight - cursorThickness),
-                    size = Size(cellWidth, cursorThickness),
-                )
-            }
+            Box(
+                Modifier
+                    .offset(
+                        x = metrics.cellWidth * cursor.col,
+                        y = with(density) { cursorItem.offset.toDp() },
+                    )
+                    .size(metrics.cellWidth, metrics.lineHeight)
+                    .testTag("terminal-cursor")
+                    .drawBehind {
+                        val thickness = 2.dp.toPx()
+                        when (cursor.shape) {
+                            CursorShape.Block -> drawRect(color.copy(alpha = 0.35f))
+                            CursorShape.Beam -> drawRect(color, size = androidx.compose.ui.geometry.Size(thickness, size.height))
+                            CursorShape.Underline -> drawRect(
+                                color,
+                                topLeft = androidx.compose.ui.geometry.Offset(0f, size.height - thickness),
+                                size = androidx.compose.ui.geometry.Size(size.width, thickness),
+                            )
+                        }
+                    },
+            )
         }
         BasicTextField(
             value = imeValue,
@@ -465,7 +476,7 @@ private fun TerminalGrid(
 }
 
 @Composable
-private fun TerminalRowGrid(row: ScreenRow) {
+private fun TerminalRowGrid(row: ScreenRow, rowIndex: Int, metrics: TerminalMetrics) {
     val uriHandler = LocalUriHandler.current
     val plain = row.plainText()
     val links = SAFE_LINK.findAll(plain).mapNotNull { match ->
@@ -475,9 +486,12 @@ private fun TerminalRowGrid(row: ScreenRow) {
         }
     }.toList()
     var textOffset = 0
-    Row(Modifier.height(16.dp).semantics(mergeDescendants = true) { text = AnnotatedString(plain) }) {
-        row.cells.forEach { cell ->
-            if (cell.continuation) return@forEach
+    Row(
+        Modifier.height(metrics.lineHeight).testTag("terminal-row")
+            .semantics(mergeDescendants = true) { text = AnnotatedString(plain) },
+    ) {
+        row.cells.forEachIndexed { cellIndex, cell ->
+            if (cell.continuation) return@forEachIndexed
             val cellRange = textOffset until (textOffset + cell.text.length)
             val link = links.firstOrNull { (range, _) ->
                 cellRange.first < range.last + 1 && range.first < cellRange.last + 1
@@ -487,17 +501,18 @@ private fun TerminalRowGrid(row: ScreenRow) {
                 cell.attributes.inverse -> cell.foreground.color(Color(0xFFD8E6EF))
                 else -> cell.background.color(Color.Transparent)
             }
-            var slot = Modifier.width((8.4f * cell.width).dp).height(16.dp).background(slotBackground)
+            var slot = Modifier.width(metrics.cellWidth * cell.width).height(metrics.lineHeight)
+                .background(slotBackground).testTag("terminal-cell-$rowIndex-$cellIndex")
             if (link != null) slot = slot.clickable { uriHandler.openUri(link) }
             Box(slot) {
-                TerminalCellText(cell, linked = link != null)
+                TerminalCellText(cell, linked = link != null, metrics = metrics)
             }
         }
     }
 }
 
 @Composable
-private fun TerminalCellText(cell: ScreenCell, linked: Boolean) {
+private fun TerminalCellText(cell: ScreenCell, linked: Boolean, metrics: TerminalMetrics) {
     val text = buildAnnotatedString {
         val foreground = cell.foreground.color(default = Color(0xFFD8E6EF))
         val background = cell.background.color(default = Color.Transparent)
@@ -524,14 +539,40 @@ private fun TerminalCellText(cell: ScreenCell, linked: Boolean) {
     }
     BasicText(
         text = text,
-        style = TextStyle(
+        style = metrics.textStyle,
+        maxLines = 1,
+        softWrap = false,
+    )
+}
+
+private data class TerminalMetrics(
+    val cellWidth: Dp,
+    val lineHeight: Dp,
+    val textStyle: TextStyle,
+)
+
+@Composable
+private fun rememberTerminalMetrics(): TerminalMetrics {
+    val density = LocalDensity.current
+    val measurer = rememberTextMeasurer()
+    val textStyle = remember(density.density, density.fontScale) {
+        TextStyle(
             color = Color(0xFFD8E6EF),
             fontFamily = FontFamily.Monospace,
             fontSize = 13.sp,
             lineHeight = 16.sp,
-        ),
+        )
+    }
+    val measured = measurer.measure(
+        text = AnnotatedString("M"),
+        style = textStyle,
         maxLines = 1,
         softWrap = false,
+    )
+    return TerminalMetrics(
+        cellWidth = with(density) { measured.size.width.toDp() },
+        lineHeight = with(density) { measured.size.height.toDp() },
+        textStyle = textStyle,
     )
 }
 
