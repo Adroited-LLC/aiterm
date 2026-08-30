@@ -3,12 +3,16 @@ package com.adroited.aiterm.ui
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -22,6 +26,7 @@ import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.ScreenSnapshot
 import com.adroited.aiterm.testing.ComposeTestActivity
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -92,5 +97,70 @@ class TerminalScreenTest {
 
         compose.onNodeWithText("rotate").assertIsDisplayed()
         assertTrue(sizes.any { it != initial })
+    }
+
+    @Test
+    fun measuredGridKeepsWideCombiningAndCursorOnTheSameFontScaledGeometry() {
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, 1.6f)) {
+                TerminalScreenContent(
+                    state = RemoteClientState(connection = ConnectionState.Connected),
+                    screen = ScreenSnapshot(
+                        tabId = "tab-geometry",
+                        revision = 1,
+                        cols = 3,
+                        rows = 1,
+                        visible = listOf(
+                            ScreenRow(
+                                listOf(
+                                    ScreenCell("界", width = 2),
+                                    ScreenCell("", continuation = true),
+                                    ScreenCell("e\u0301"),
+                                ),
+                            ),
+                        ),
+                        cursor = CursorState(2, 0, true),
+                    ),
+                )
+            }
+        }
+
+        val wide = compose.onNodeWithTag("terminal-cell-0-0").fetchSemanticsNode().boundsInRoot
+        val combining = compose.onNodeWithTag("terminal-cell-0-2").fetchSemanticsNode().boundsInRoot
+        val cursor = compose.onNodeWithTag("terminal-cursor").fetchSemanticsNode().boundsInRoot
+        assertTrue(kotlin.math.abs(wide.width - combining.width * 2f) < 2f)
+        assertTrue(kotlin.math.abs(cursor.left - combining.left) < 2f)
+        assertTrue(kotlin.math.abs(cursor.height - combining.height) < 2f)
+        compose.onNodeWithText("界é").assertIsDisplayed()
+    }
+
+    @Test
+    fun largeScrollbackComposesOnlyTheBoundedVisibleRowWindow() {
+        val history = List(5_000) { index ->
+            ScreenRow("history-$index".map { ScreenCell(it.toString()) })
+        }
+        compose.setContent {
+            Box(Modifier.size(400.dp, 800.dp)) {
+                TerminalScreenContent(
+                    state = RemoteClientState(connection = ConnectionState.Connected),
+                    screen = ScreenSnapshot(
+                        tabId = "tab-history",
+                        revision = 1,
+                        cols = 4,
+                        rows = 1,
+                        visible = listOf(ScreenRow("live".map { ScreenCell(it.toString()) })),
+                        cursor = CursorState(0, 0, true),
+                    ),
+                    scrollback = history,
+                )
+            }
+        }
+
+        compose.onNodeWithTag("terminal-grid").assertIsDisplayed()
+        val composedRows = compose.onAllNodesWithTag("terminal-row").fetchSemanticsNodes().size
+        assertTrue(composedRows > 0)
+        assertTrue("composed $composedRows rows", composedRows < 100)
+        assertEquals(5_000, history.size)
     }
 }
