@@ -68,6 +68,10 @@
   instrumentation tests; assemble, lint, one-device install, and cold launch
   also pass. The retained-recovery ruling remains binding; eager drawer is the
   deferred minor and mouse remains the future typed-contract gap.
+- Task 9 automated review gate: clean through `4ced20b`; all automated
+  Critical/Important findings are addressed with no new breakage. Task 9
+  remains pending only the security-sensitive, user-interactive live pairing
+  and interoperability smoke.
 
 ## Task 5 review breaker rulings
 
