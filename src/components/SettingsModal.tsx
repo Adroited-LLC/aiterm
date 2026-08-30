@@ -7,6 +7,7 @@ import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
 import LibrarianPane from "./LibrarianPane";
+import RemotePane from "./RemotePane";
 import { LibrarianCtl } from "../librarian";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
 import {
@@ -45,7 +46,7 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
   { key: "agent", label: "Agent" },
 ];
 
-export type SettingsTab = "appearance" | "fonts" | "agents" | "models" | "librarian" | "diagnostics";
+export type SettingsTab = "appearance" | "fonts" | "agents" | "models" | "librarian" | "remote" | "diagnostics";
 type Tab = SettingsTab;
 
 const NAV: { key: Tab; label: string }[] = [
@@ -54,6 +55,7 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "agents", label: "Agents" },
   { key: "models", label: "Model access" },
   { key: "librarian", label: "Librarian" },
+  { key: "remote", label: "Remote" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
 
@@ -527,6 +529,11 @@ export default function SettingsModal({
                 lib={librarian}
                 onOpenModelAccess={() => setTab("models")}
               />
+            )}
+            {tab === "remote" && (
+              <Group title="Phone">
+                <RemotePane />
+              </Group>
             )}
             {tab === "agents" && configFor && (
               <ClaudeConfig agent={configFor} project={activeProject} onBack={() => setConfigFor(null)} />

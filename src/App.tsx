@@ -2235,6 +2235,29 @@ export default function App() {
     setFormat: (f: AppSettings["timeFormat"]) => setSettings((s) => ({ ...s, timeFormat: f })),
   }), [settings.timeFormat]);
 
+  // ---- Remote access: a phone asks, the desktop opens. The tab appears here
+  // too, so both screens agree about what is running. Refs, not deps: the
+  // handlers below are recreated every render and the listener must not be.
+  const remoteRef = useRef({ resumeSession, newSession });
+  remoteRef.current = { resumeSession, newSession };
+  useEffect(() => {
+    const unOpen = listen<{ sessionId: string }>("remote://open-session", async (e) => {
+      const id = e.payload.sessionId;
+      // The phone's list can be newer than ours — read fresh rather than trust state.
+      const list = sessionsRef.current.find((x) => x.id === id) ? sessionsRef.current : await listSessions();
+      const s = list.find((x) => x.id === id);
+      if (s) remoteRef.current.resumeSession(s);
+      else setNotice(`The phone asked for a session that is not listed: ${id.slice(0, 8)}…`);
+    });
+    const unNew = listen<{ agentId: string; cwd: string; prompt: string | null }>("remote://new-session", (e) => {
+      const { agentId, cwd, prompt } = e.payload;
+      remoteRef.current.newSession(cwd, { kind: "agent", agentId, model: null, effort: null }, prompt ?? undefined);
+    });
+    return () => {
+      unOpen.then((f) => f());
+      unNew.then((f) => f());
+    };
+  }, []);
   return (
     <TimeFormatContext.Provider value={timeFormatCtx}>
     <div className="app">

@@ -1034,3 +1034,32 @@ export const librarianTag = (target: { kind: "thread" | "session"; id: string },
  *  the opening ask kept. */
 export const sessionConversation = (sessionId: string, maxChars: number) =>
   invoke<[string, string][]>("session_conversation", { sessionId, maxChars });
+
+// ---------------------------------------------------------------- remote access
+
+/** Tell the backend which session a tab runs — remote input finds it by this. */
+export const ptyBindSession = (id: number, sessionId: string) =>
+  invoke<void>("pty_bind_session", { id, sessionId });
+
+export interface RemoteStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  name: string;
+  /** Addresses a phone might reach this machine on, best first. */
+  addresses: string[];
+  error: string | null;
+}
+export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
+export const remoteSetEnabled = (on: boolean) =>
+  invoke<RemoteStatus>("remote_set_enabled", { on });
+/** Forget every paired phone: a new token, so each must scan again. */
+export const remoteRotateToken = () => invoke<RemoteStatus>("remote_rotate_token");
+export const remoteSetName = (name: string) =>
+  invoke<RemoteStatus>("remote_set_name", { name });
+export interface PairPayload {
+  uri: string;
+  /** The QR, as SVG markup from the backend — the token never becomes a string here. */
+  svg: string;
+}
+export const remotePairPayload = () => invoke<PairPayload>("remote_pair_payload");

@@ -41,3 +41,10 @@ tauri-plugin-dialog = "2"
 # check per event site, which is the cost of having the switch at all.
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry", "fmt"] }
+# Remote access (`remote.rs`): a phone as a second client of the session
+# model. Plain HTTP + WebSocket behind a bearer token; the LAN or the VPN is
+# the transport security, deliberately — see the module doc.
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["net", "macros", "sync", "time", "rt-multi-thread"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+if-addrs = "0.15"

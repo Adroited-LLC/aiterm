@@ -5,7 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { ptySpawn, ptyWrite, ptyResize, ptyKill } from "../ipc";
+import { ptySpawn, ptyWrite, ptyResize, ptyKill, ptyBindSession } from "../ipc";
 import { boldWeightFor } from "../settings";
 import { TerminalInputLine } from "../terminalInput";
 import "@xterm/xterm/css/xterm.css";
@@ -173,6 +173,13 @@ export default function TerminalView({
   const started = useRef(false);
   const fitRef = useRef<FitAddon | null>(null);
   const ptyIdRef = useRef<number | null>(null);
+  // The backend keeps a tab → session map for remote input. A fresh launch
+  // learns its id after spawning (the SessionStart hook reports it), and a
+  // compaction can move it, so the binding follows the tab's own record.
+  useEffect(() => {
+    const id = ptyIdRef.current;
+    if (id !== null && tab.sessionId) ptyBindSession(id, tab.sessionId);
+  }, [tab.sessionId]);
   const termRef = useRef<Terminal | null>(null);
   /** The live WebGL addon, when one is attached. Held because switching back to
    *  the DOM renderer is done by disposing it. */
@@ -242,6 +249,7 @@ export default function TerminalView({
         return;
       }
       ptyIdRef.current = id;
+      if (tab.sessionId) ptyBindSession(id, tab.sessionId);
       unlistenExit = await listen<{
         id: number;
         code: number | null;

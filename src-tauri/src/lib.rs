@@ -19,6 +19,7 @@ pub mod permissions;
 pub mod providers;
 pub mod rendercost;
 pub mod pty;
+pub mod remote;
 pub mod detail;
 pub mod sessions;
 pub mod taskbar;
@@ -45,6 +46,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty::PtyManager::default())
+        .manage(remote::RemoteState::default())
         .manage(watcher::WatchState::default())
         // Wrapped so a debug build logs every IPC call before it dispatches.
         // In release `log_invokes` is the identity function and the generated
@@ -60,6 +62,12 @@ pub fn run() {
             librarian::librarian_default_prompts,
             detail::session_conversation,
             pty::pty_spawn,
+            pty::pty_bind_session,
+            remote::remote_status,
+            remote::remote_set_enabled,
+            remote::remote_rotate_token,
+            remote::remote_set_name,
+            remote::remote_pair_payload,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
@@ -179,6 +187,9 @@ pub fn run() {
             if let Err(e) = watcher::watch_claude_projects(app.handle().clone()) {
                 crate::diag!("start", "transcript watcher not running: {e}");
             }
+
+            // A phone paired earlier expects the desktop to answer again.
+            remote::autostart(app.handle());
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.

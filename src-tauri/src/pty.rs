@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::ipc::{Channel, InvokeResponseBody};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct PtyInstance {
     master: Box<dyn MasterPty + Send>,
@@ -14,12 +14,65 @@ pub struct PtyInstance {
     /// The pty's direct child — the login shell, not the command it runs.
     /// Killing only this leaves the real process orphaned; see `pty_kill`.
     child_pid: Option<u32>,
+    /// The session this tab runs, once the renderer knows it — set at spawn
+    /// for a resume, later for a fresh launch whose id the hook reports.
+    /// It is how remote input finds the right tab (`remote.rs`).
+    session_id: Option<String>,
 }
 
 #[derive(Default)]
 pub struct PtyManager {
     ptys: Mutex<HashMap<u32, PtyInstance>>,
     next_id: AtomicU32,
+}
+
+impl PtyManager {
+    /// Write to a pty by id. The same path `pty_write` takes, for callers
+    /// that are not Tauri commands.
+    pub fn write_str(&self, id: u32, data: &str) -> Result<(), String> {
+        let mut ptys = self.ptys.lock().unwrap();
+        let pty = ptys.get_mut(&id).ok_or("no such pty")?;
+        pty.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())
+    }
+
+    /// Tie a pty to a session. One session, one tab: a second pty claiming
+    /// the same id takes it over, since the older tab has moved on.
+    pub fn bind_session(&self, id: u32, session_id: &str) {
+        let mut ptys = self.ptys.lock().unwrap();
+        for p in ptys.values_mut() {
+            if p.session_id.as_deref() == Some(session_id) {
+                p.session_id = None;
+            }
+        }
+        if let Some(p) = ptys.get_mut(&id) {
+            p.session_id = Some(session_id.to_string());
+        }
+    }
+
+    pub fn pty_for_session(&self, session_id: &str) -> Option<u32> {
+        self.ptys
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, p)| p.session_id.as_deref() == Some(session_id))
+            .map(|(id, _)| *id)
+    }
+
+    pub fn session_of(&self, id: u32) -> Option<String> {
+        self.ptys.lock().unwrap().get(&id).and_then(|p| p.session_id.clone())
+    }
+
+    /// Every session a desktop tab is currently running.
+    pub fn bound_sessions(&self) -> Vec<String> {
+        self.ptys.lock().unwrap().values().filter_map(|p| p.session_id.clone()).collect()
+    }
+}
+
+/// The renderer tells the backend which session a tab runs, whenever it
+/// learns or changes it. See `PtyInstance::session_id`.
+#[tauri::command]
+pub fn pty_bind_session(state: State<'_, PtyManager>, id: u32, session_id: String) {
+    state.bind_session(id, &session_id);
 }
 
 #[derive(Clone, Serialize)]
@@ -189,6 +242,7 @@ pub fn pty_spawn(
             writer,
             killer,
             child_pid,
+            session_id: None,
         },
     );
 
@@ -217,6 +271,8 @@ pub fn pty_spawn(
         let status = child.wait().ok();
         let code = status.as_ref().map(|s| s.exit_code());
         let signal = status.as_ref().and_then(|s| s.signal().map(String::from));
+        let session_id = app_reader.state::<PtyManager>().session_of(id);
+        crate::remote::notify(&app_reader, crate::remote::Event::SessionExit { session_id, code });
         let _ = app_reader.emit("pty://exit", PtyExit { id, code, signal });
     });
 
@@ -237,11 +293,7 @@ pub fn pty_spawn(
 /// this cannot block the runtime either.
 #[tauri::command]
 pub async fn pty_write(state: State<'_, PtyManager>, id: u32, data: String) -> Result<(), String> {
-    let mut ptys = state.ptys.lock().unwrap();
-    let pty = ptys.get_mut(&id).ok_or("no such pty")?;
-    pty.writer
-        .write_all(data.as_bytes())
-        .map_err(|e| e.to_string())
+    state.write_str(id, &data)
 }
 
 /// Off the main thread for the same reason as [`pty_write`]: a resize arrives
