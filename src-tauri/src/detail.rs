@@ -595,6 +595,176 @@ fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)
     out
 }
 
+/// The conversation with the work shown: every message, plus each tool
+/// call as a turn named for the tool, and (Codex) reasoning summaries as
+/// "thinking". This is what a phone renders while an agent works — the
+/// desktop's own preview stays on the message-only parser above.
+pub async fn conversation_rich(session_id: String, max_chars: usize) -> Vec<(String, String)> {
+    crate::run_blocking(move || conversation_rich_sync(&session_id, max_chars)).await
+}
+
+fn conversation_rich_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)> {
+    let list = crate::agents::backends();
+    let Some((backend, path)) = crate::agents::owner_in(&list, session_id) else { return vec![] };
+    let mut turns: Vec<(String, String)> = match backend.sessions().messages(session_id) {
+        Some(m) => m,
+        None => {
+            let Ok(file) = File::open(&path) else { return vec![] };
+            BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|l| l.contains("\"type\""))
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+                .filter(|v| v.get("isSidechain").and_then(|b| b.as_bool()) != Some(true))
+                .flat_map(|v| line_events(&v))
+                .collect()
+        }
+    };
+    turns.retain(|(_, t)| !crate::sessions::is_only_system_block(t) && !t.trim().is_empty());
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (role, text) in turns {
+        match merged.last_mut() {
+            // Same speaker twice in a row reads as one; tool calls stay separate.
+            Some((r, t)) if *r == role && (role == "user" || role == "assistant" || role == "thinking") => {
+                t.push_str("\n\n");
+                t.push_str(&text);
+            }
+            _ => merged.push((role, text)),
+        }
+    }
+    let total: usize = merged.iter().map(|(_, t)| t.len()).sum();
+    if total <= max_chars || merged.len() < 3 {
+        return merged;
+    }
+    let first = merged.remove(0);
+    let mut budget = max_chars.saturating_sub(first.1.len());
+    let mut tail: Vec<(String, String)> = Vec::new();
+    for turn in merged.into_iter().rev() {
+        if turn.1.len() > budget {
+            break;
+        }
+        budget -= turn.1.len();
+        tail.push(turn);
+    }
+    tail.reverse();
+    let mut out = vec![first, ("system".into(), "[… earlier turns omitted for length …]".into())];
+    out.extend(tail);
+    out
+}
+
+const TOOL_TEXT_CAP: usize = 600;
+
+fn cap(s: &str) -> String {
+    if s.len() <= TOOL_TEXT_CAP {
+        return s.to_string();
+    }
+    let mut end = TOOL_TEXT_CAP;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// One transcript line → zero or more turns. Claude's assistant lines carry
+/// text and tool_use blocks side by side; Codex writes each item on its own
+/// line. Tool results and outputs are left out — the call says what
+/// happened, the output is mostly noise at phone size.
+fn line_events(v: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some(r @ ("user" | "assistant")) => {
+            let Some(content) = v.pointer("/message/content") else { return out };
+            match content {
+                serde_json::Value::String(s) => out.push((r.to_string(), s.clone())),
+                serde_json::Value::Array(blocks) => {
+                    let mut text = String::new();
+                    for b in blocks {
+                        match b.get("type").and_then(|t| t.as_str()) {
+                            Some("tool_use") => {
+                                if !text.trim().is_empty() {
+                                    out.push((r.to_string(), std::mem::take(&mut text)));
+                                }
+                                let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                                out.push((name.to_string(), cap(&tool_input_summary(b.get("input")))));
+                            }
+                            Some("tool_result") => {}
+                            _ => {
+                                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(t);
+                                }
+                            }
+                        }
+                    }
+                    if !text.trim().is_empty() {
+                        out.push((r.to_string(), text));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some("response_item") => {
+            let Some(p) = v.get("payload") else { return out };
+            match p.get("type").and_then(|t| t.as_str()) {
+                Some("message") => {
+                    if let Some(t) = crate::sessions::line_message(v) {
+                        out.push(t);
+                    }
+                }
+                Some("custom_tool_call") | Some("function_call") => {
+                    let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                    let input = p
+                        .get("input")
+                        .or_else(|| p.get("arguments"))
+                        .map(|i| match i {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default();
+                    out.push((name.to_string(), cap(&input)));
+                }
+                Some("reasoning") => {
+                    let mut text = String::new();
+                    if let Some(items) = p.get("summary").and_then(|s| s.as_array()) {
+                        for it in items {
+                            if let Some(t) = it.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    if !text.trim().is_empty() {
+                        out.push(("thinking".into(), text));
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// A tool call's input, as a person would skim it: the command for Bash,
+/// the path for file tools, the pattern for searches, else the JSON.
+fn tool_input_summary(input: Option<&serde_json::Value>) -> String {
+    let Some(i) = input else { return String::new() };
+    for key in ["command", "file_path", "path", "pattern", "query", "description", "prompt", "url"] {
+        if let Some(s) = i.get(key).and_then(|s| s.as_str()) {
+            let extra = i.get("description").and_then(|d| d.as_str()).filter(|_| key != "description");
+            return match extra {
+                Some(d) => format!("{s}\n{d}"),
+                None => s.to_string(),
+            };
+        }
+    }
+    i.to_string()
+}
+
 #[cfg(test)]
 mod conversation_tests {
     /// Print a real session's conversation as the relay would hand it over.

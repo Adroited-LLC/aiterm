@@ -233,10 +233,14 @@ export default function TerminalView({
     // Uint8Array straight to xterm (it keeps a persistent UTF-8 decoder, so
     // multibyte chars split across chunks are reassembled correctly). Set
     // onmessage before spawning so no early output is missed.
+    // Assigned once the terminal exists (below); output arrives before then only
+    // in theory, and a no-op is the right answer if it does.
+    let cadence: () => void = () => {};
     const onOutput = new Channel<ArrayBuffer>();
     onOutput.onmessage = (chunk) => {
       term.write(new Uint8Array(chunk));
       onActivity(tab.key);
+      cadence();
     };
 
     (async () => {
@@ -277,6 +281,31 @@ export default function TerminalView({
       // a person, and typing (or progress ending) means neither.
       const report = (a: TabActivity) => { if (ptyIdRef.current !== null) ptySetActivity(ptyIdRef.current, a); };
       term.onBell(() => { onAttention(tab.key, true); report("attention"); });
+      // A TUI that never sends progress (Codex, Grok) still animates while it
+      // works, so output that keeps coming is the signal: two bursts inside a
+      // second and a half means working; two and a half seconds of quiet
+      // means done. An agent that does send progress overrides this.
+      let oscSeen = false;
+      let cadenceWorking = false;
+      let firstBurst = 0;
+      let quiet: ReturnType<typeof setTimeout> | null = null;
+      cadence = () => {
+        if (oscSeen) return;
+        const now = Date.now();
+        if (!cadenceWorking) {
+          if (firstBurst && now - firstBurst > 200 && now - firstBurst < 1500) {
+            cadenceWorking = true;
+            report("working");
+          } else if (!firstBurst || now - firstBurst >= 1500) {
+            firstBurst = now;
+          }
+        }
+        if (quiet) clearTimeout(quiet);
+        quiet = setTimeout(() => {
+          if (cadenceWorking) { cadenceWorking = false; report("idle"); }
+          firstBurst = 0;
+        }, 2500);
+      };
 
       // Returning true claims the sequence. Nothing else in aiterm reads OSC 9,
       // and an unclaimed sequence is passed through to be printed, which would
@@ -284,6 +313,7 @@ export default function TerminalView({
       term.parser.registerOscHandler(9, (data) => {
         const parsed = parseOsc9(data);
         if (parsed?.kind === "progress") {
+          oscSeen = true;
           onProgress(tab.key, parsed.progress);
           report(parsed.progress ? "working" : "idle");
         } else if (parsed?.kind === "message") {

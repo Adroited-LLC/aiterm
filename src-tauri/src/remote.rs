@@ -728,7 +728,20 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     let running = crate::sessions::running_session_ids().await;
     let ptys = ctx.app.state::<crate::pty::PtyManager>();
     let open = ptys.bound_sessions();
-    let activity: HashMap<String, String> = ptys.activities().into_iter().collect();
+    let mut activity: HashMap<String, String> = ptys.activities().into_iter().collect();
+    // A terminal that reports nothing (Codex has no progress sequence) is
+    // not idle — ask its transcript. Only for sessions with a live process.
+    let candidates: Vec<String> = open.iter().chain(running.iter()).cloned().collect();
+    let busy = crate::run_blocking(move || {
+        candidates.into_iter().filter(|id| transcript_busy(id)).collect::<Vec<String>>()
+    })
+    .await;
+    for id in busy {
+        let e = activity.entry(id).or_insert_with(|| "idle".into());
+        if e == "idle" {
+            *e = "working".into();
+        }
+    }
     Json(serde_json::json!({
         "sessions": sessions,
         "running": running,
@@ -736,6 +749,61 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
         "activity": activity,
     }))
     .into_response()
+}
+
+/// Does the transcript say a turn is in progress? Codex writes
+/// `task_started` and `task_complete` events; Claude's last message is the
+/// person's until the assistant answers. Reads only the tail of the file.
+fn transcript_busy(session_id: &str) -> bool {
+    let list = crate::agents::backends();
+    let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return false };
+    let Ok(mut f) = std::fs::File::open(&path) else { return false };
+    use std::io::{Read, Seek, SeekFrom};
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(128 * 1024);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut buf = String::new();
+    if f.read_to_string(&mut buf).is_err() {
+        return false;
+    }
+    let mut state: Option<bool> = None;
+    for line in buf.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+            continue;
+        }
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("event_msg") => match v.pointer("/payload/type").and_then(|t| t.as_str()) {
+                Some("task_started") => state = Some(true),
+                Some("task_complete") | Some("turn_aborted") => state = Some(false),
+                _ => {}
+            },
+            Some("user") => {
+                // A tool result is Claude talking to itself, not a new ask.
+                let is_result = v
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|a| a.iter().all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")));
+                if !is_result {
+                    state = Some(true);
+                } else {
+                    state = Some(true); // mid-turn: the model has a result to act on
+                }
+            }
+            Some("assistant") => {
+                // Text without a tool call ends the turn; a tool call means more to come.
+                let calls_tool = v
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|a| a.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use")));
+                state = Some(calls_tool);
+            }
+            _ => {}
+        }
+    }
+    state.unwrap_or(false)
 }
 
 /// The same numbers the desktop's usage strip shows: plan limits per engine
@@ -1021,7 +1089,7 @@ struct Turn {
 }
 
 async fn conversation(Path(id): Path<String>, Query(q): Query<ConversationQuery>) -> Response {
-    let turns = crate::detail::session_conversation(id, q.max_chars.unwrap_or(60_000)).await;
+    let turns = crate::detail::conversation_rich(id, q.max_chars.unwrap_or(60_000)).await;
     let turns: Vec<Turn> = turns.into_iter().map(|(role, text)| Turn { role, text }).collect();
     Json(turns).into_response()
 }
