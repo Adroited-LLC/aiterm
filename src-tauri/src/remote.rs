@@ -1225,7 +1225,16 @@ async fn interrupt(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
     }
 }
 
-async fn stop_session(Path(id): Path<String>) -> Response {
+async fn stop_session(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    // A session open in a terminal tab is stopped by ending that tab's
+    // process — the roster only knows Claude's daemon sessions, so going
+    // through it for a tab (any engine) stopped nothing at all.
+    let pty = ctx.app.state::<crate::pty::PtyManager>().pty_for_session(&id);
+    if let Some(pty_id) = pty {
+        let app = ctx.app.clone();
+        crate::run_blocking(move || app.state::<crate::pty::PtyManager>().kill_now(pty_id)).await;
+        return StatusCode::NO_CONTENT.into_response();
+    }
     match crate::sessions::stop_session(id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(StatusCode::CONFLICT, e),

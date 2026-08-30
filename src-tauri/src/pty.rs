@@ -531,14 +531,15 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
     !tree.iter().any(|&p| pid_alive(p))
 }
 
-#[tauri::command]
-pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
-    // Take the instance out under the lock, then release it: the kill below
-    // can block for over a second, and holding the map would stall every other
-    // tab's writes and resizes for that whole time.
-    let taken = state.ptys.lock().unwrap().remove(&id);
-    if let Some(mut pty) = taken {
-        crate::run_blocking(move || {
+impl PtyManager {
+    /// End a tab's process tree and forget the pty. Shared by the desktop's
+    /// close-tab command and the phone's stop — blocking, up to ~1.6s.
+    pub fn kill_now(&self, id: u32) {
+        // Take the instance out under the lock, then release it: the kill
+        // below can block for over a second, and holding the map would stall
+        // every other tab's writes and resizes for that whole time.
+        let taken = self.ptys.lock().unwrap().remove(&id);
+        if let Some(mut pty) = taken {
             // `killer.kill()` only reaches the pty's direct child — the login
             // shell. zsh forks the command rather than exec'ing it, so killing the
             // shell orphaned every `claude` aiterm ever launched: they stayed in
@@ -548,9 +549,24 @@ pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), Strin
                 kill_tree(pid, std::time::Duration::from_millis(1500));
             }
             let _ = pty.killer.kill();
-            // Closing a tab is one of the few things that changes the roster from
-            // inside aiterm. Say so, rather than letting the sidebar keep showing
-            // the session as running for the rest of the cache window.
+            // Ending a tab's process is one of the few things that changes the
+            // roster from inside aiterm. Say so, rather than letting the
+            // sidebar keep showing the session as running for the rest of the
+            // cache window.
+            crate::sessions::invalidate_roster();
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn pty_kill(state: State<'_, PtyManager>, id: u32) -> Result<(), String> {
+    let taken = state.ptys.lock().unwrap().remove(&id);
+    if let Some(mut pty) = taken {
+        crate::run_blocking(move || {
+            if let Some(pid) = pty.child_pid {
+                kill_tree(pid, std::time::Duration::from_millis(1500));
+            }
+            let _ = pty.killer.kill();
             crate::sessions::invalidate_roster();
         })
         .await;
