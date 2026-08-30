@@ -1,5 +1,6 @@
 package com.adroited.aiterm.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -42,6 +43,7 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -71,6 +73,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.text
 import androidx.compose.ui.text.AnnotatedString
@@ -160,9 +163,20 @@ fun TerminalScreenContent(
     val terminalMetrics = rememberTerminalMetrics()
     val inputFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
-    var inputMode by remember(screen?.tabId) { mutableStateOf(TerminalInputMode.Text) }
-    var textInput by remember(screen?.tabId) { mutableStateOf(TextFieldValue()) }
-    var rawInput by remember(screen?.tabId) { mutableStateOf(TextFieldValue()) }
+    val density = LocalDensity.current
+    var composer by remember(screen?.tabId) { mutableStateOf(TerminalComposerState()) }
+    var composerHeight by remember(screen?.tabId, density) { mutableStateOf(72.dp) }
+
+    BackHandler(enabled = composer.expanded) {
+        composer = composer.close()
+        keyboard?.hide()
+    }
+    LaunchedEffect(composer.expanded, state.focus, screen?.tabId) {
+        if (composer.expanded && state.focus == FocusOwner.Self && screen != null) {
+            inputFocus.requestFocus()
+            keyboard?.show()
+        }
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -217,8 +231,10 @@ fun TerminalScreenContent(
                         .background(Color(0xFF07111B))
                         .padding(horizontal = 4.dp, vertical = 3.dp),
                 ) {
+                    val composerInset = if (composer.expanded) composerHeight else 0.dp
+                    val renderHeight = (maxHeight - composerInset).coerceAtLeast(terminalMetrics.lineHeight)
                     val measuredCols = (maxWidth / terminalMetrics.cellWidth).toInt().coerceIn(1, 512)
-                    val measuredRows = (maxHeight / terminalMetrics.lineHeight).toInt().coerceIn(1, 512)
+                    val measuredRows = (renderHeight / terminalMetrics.lineHeight).toInt().coerceIn(1, 512)
                     LaunchedEffect(measuredCols, measuredRows, screen?.tabId) {
                         cols = measuredCols
                         rows = measuredRows
@@ -227,11 +243,10 @@ fun TerminalScreenContent(
                     TerminalGrid(
                         screen = screen,
                         scrollback = scrollback,
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier.fillMaxSize().padding(bottom = composerInset),
                         onRequestKeyboard = {
                             if (state.focus == FocusOwner.Self) {
-                                inputFocus.requestFocus()
-                                keyboard?.show()
+                                composer = composer.open()
                             }
                         },
                         metrics = terminalMetrics,
@@ -243,33 +258,36 @@ fun TerminalScreenContent(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                }
-                if (screen != null) {
-                    TerminalInputBar(
-                        mode = inputMode,
-                        onModeChange = { inputMode = it },
-                        value = if (inputMode == TerminalInputMode.Text) textInput else rawInput,
-                        onValueChange = { next ->
-                            if (inputMode == TerminalInputMode.Text) {
-                                textInput = next
-                            } else if (next.composition == null && next.text.isNotEmpty()) {
-                                onInput(next.text.replace("\n", "\r"))
-                                rawInput = TextFieldValue()
-                            } else {
-                                rawInput = next
-                            }
-                        },
-                        onSend = {
-                            if (textInput.text.isNotEmpty()) {
-                                onInput(textInput.text + "\r")
-                                textInput = TextFieldValue()
-                            }
-                        },
-                        onRawKey = onInput,
-                        focusRequester = inputFocus,
-                        enabled = state.focus == FocusOwner.Self,
-                        applicationCursor = screen.modes.applicationCursor,
-                    )
+                    if (screen != null && composer.expanded) {
+                        Box(
+                            Modifier.align(Alignment.BottomCenter)
+                                .fillMaxWidth()
+                                .onSizeChanged { composerHeight = with(density) { it.height.toDp() } }
+                                .testTag("terminal-composer-overlay")
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                        ) {
+                            TerminalInputBar(
+                                direct = composer.direct,
+                                onToggleDirect = { composer = composer.toggleDirect() },
+                                value = composer.visibleValue,
+                                onValueChange = { next ->
+                                    val update = composer.updateValue(next)
+                                    composer = update.state
+                                    update.outbound?.let(onInput)
+                                },
+                                onSend = {
+                                    val update = composer.sendText()
+                                    composer = update.state
+                                    update.outbound?.let(onInput)
+                                    if (!update.state.expanded) keyboard?.hide()
+                                },
+                                onDirectKey = onInput,
+                                focusRequester = inputFocus,
+                                enabled = state.focus == FocusOwner.Self,
+                                applicationCursor = screen.modes.applicationCursor,
+                            )
+                        }
+                    }
                 }
                 if (state.showTakeFocus && screen != null) {
                     Button(
@@ -283,7 +301,12 @@ fun TerminalScreenContent(
                         modifier = Modifier.fillMaxWidth().height(36.dp).testTag("load-scrollback"),
                     ) { Text("Load older history · ${scrollback.size} rows") }
                 }
-                ExtraKeys(screen, scrollback, onInput)
+                ExtraKeys(
+                    screen = screen,
+                    scrollback = scrollback,
+                    onInput = onInput,
+                    onOpenComposer = { if (screen != null) composer = composer.open() },
+                )
             }
         }
     }
@@ -449,96 +472,94 @@ private fun TerminalGrid(
     }
 }
 
-private enum class TerminalInputMode { Text, Raw }
-
 @Composable
 private fun TerminalInputBar(
-    mode: TerminalInputMode,
-    onModeChange: (TerminalInputMode) -> Unit,
+    direct: Boolean,
+    onToggleDirect: () -> Unit,
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     onSend: () -> Unit,
-    onRawKey: (String) -> Unit,
+    onDirectKey: (String) -> Unit,
     focusRequester: FocusRequester,
     enabled: Boolean,
     applicationCursor: Boolean,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth()
-            .background(Color(0xFF0B1A26))
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        color = Color(0xFF0B1A26),
+        tonalElevation = 4.dp,
+        shadowElevation = 8.dp,
     ) {
-        InputModeButton(
-            label = "Text",
-            selected = mode == TerminalInputMode.Text,
-            enabled = enabled,
-            tag = "input-mode-text",
-        ) { onModeChange(TerminalInputMode.Text) }
-        InputModeButton(
-            label = "Raw",
-            selected = mode == TerminalInputMode.Raw,
-            enabled = enabled,
-            tag = "input-mode-raw",
-        ) { onModeChange(TerminalInputMode.Raw) }
-        BasicTextField(
-            value = value,
-            onValueChange = onValueChange,
-            modifier = Modifier.weight(1f).heightIn(min = 42.dp)
-                .border(1.dp, Color(0xFF315269), MaterialTheme.shapes.small)
-                .background(Color(0xFF07111B), MaterialTheme.shapes.small)
-                .padding(horizontal = 12.dp, vertical = 10.dp)
-                .focusRequester(focusRequester)
-                .onPreviewKeyEvent { event ->
-                    if (mode != TerminalInputMode.Raw || event.type != KeyEventType.KeyDown) {
-                        return@onPreviewKeyEvent false
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                modifier = Modifier.weight(1f).heightIn(min = 44.dp)
+                    .focusRequester(focusRequester)
+                    .onPreviewKeyEvent { event ->
+                        if (!direct || event.type != KeyEventType.KeyDown) {
+                            return@onPreviewKeyEvent false
+                        }
+                        terminalKeySequence(event.key, applicationCursor)?.let { sequence ->
+                            onDirectKey(sequence)
+                            onValueChange(TextFieldValue())
+                            true
+                        } ?: false
                     }
-                    terminalKeySequence(event.key, applicationCursor)?.let { sequence ->
-                        onRawKey(sequence)
-                        onValueChange(TextFieldValue())
-                        true
-                    } ?: false
-                }
-                .testTag("terminal-composer"),
-            enabled = enabled,
-            singleLine = true,
-            textStyle = MaterialTheme.typography.bodyMedium.copy(
-                color = Color(0xFFD8E6EF),
-                fontFamily = FontFamily.Monospace,
-            ),
-            cursorBrush = SolidColor(Color(0xFF63D3E1)),
-            keyboardOptions = KeyboardOptions(
-                capitalization = if (mode == TerminalInputMode.Text) {
-                    KeyboardCapitalization.Sentences
-                } else {
-                    KeyboardCapitalization.None
+                    .testTag("terminal-composer"),
+                enabled = enabled,
+                singleLine = true,
+                textStyle = MaterialTheme.typography.bodyMedium.copy(
+                    color = Color(0xFFD8E6EF),
+                    fontFamily = FontFamily.Monospace,
+                ),
+                cursorBrush = SolidColor(Color(0xFF63D3E1)),
+                keyboardOptions = KeyboardOptions(
+                    capitalization = if (direct) KeyboardCapitalization.None else KeyboardCapitalization.Sentences,
+                    autoCorrectEnabled = !direct,
+                    keyboardType = if (direct) KeyboardType.Ascii else KeyboardType.Text,
+                    imeAction = if (direct) ImeAction.None else ImeAction.Send,
+                ),
+                keyboardActions = KeyboardActions(onSend = { onSend() }),
+                decorationBox = { inner ->
+                    Box(
+                        Modifier.fillMaxSize()
+                            .border(1.dp, Color(0xFF315269), MaterialTheme.shapes.small)
+                            .background(Color(0xFF07111B), MaterialTheme.shapes.small)
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (value.text.isEmpty()) {
+                            Text(
+                                when {
+                                    !enabled -> "Take focus to type"
+                                    direct -> "Direct keys send immediately"
+                                    else -> "Type a command or prompt…"
+                                },
+                                color = Color(0xFF6F8798),
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        inner()
+                    }
                 },
-                autoCorrectEnabled = mode == TerminalInputMode.Text,
-                keyboardType = if (mode == TerminalInputMode.Text) KeyboardType.Text else KeyboardType.Ascii,
-                imeAction = if (mode == TerminalInputMode.Text) ImeAction.Send else ImeAction.None,
-            ),
-            keyboardActions = KeyboardActions(onSend = { onSend() }),
-            decorationBox = { inner ->
-                Box(contentAlignment = Alignment.CenterStart) {
-                    if (value.text.isEmpty()) {
-                        Text(
-                            when {
-                                !enabled -> "Take focus to type"
-                                mode == TerminalInputMode.Text -> "Type a command or prompt…"
-                                else -> "Raw keys send immediately"
-                            },
-                            color = Color(0xFF6F8798),
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
-                    inner()
+            )
+            InputModeButton(
+                label = "Direct",
+                selected = direct,
+                enabled = enabled,
+                tag = "input-mode-direct",
+                onClick = onToggleDirect,
+            )
+            if (!direct) {
+                Button(onClick = onSend, enabled = enabled && value.text.isNotEmpty()) {
+                    Text("Send")
                 }
-            },
-        )
-        if (mode == TerminalInputMode.Text) {
-            Button(onClick = onSend, enabled = enabled && value.text.isNotEmpty()) {
-                Text("Send")
             }
         }
     }
@@ -668,7 +689,12 @@ private fun rememberTerminalMetrics(): TerminalMetrics {
 }
 
 @Composable
-private fun ExtraKeys(screen: ScreenSnapshot?, scrollback: List<ScreenRow>, onInput: (String) -> Unit) {
+private fun ExtraKeys(
+    screen: ScreenSnapshot?,
+    scrollback: List<ScreenRow>,
+    onInput: (String) -> Unit,
+    onOpenComposer: () -> Unit,
+) {
     var control by remember { mutableStateOf(false) }
     var alt by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
@@ -690,6 +716,7 @@ private fun ExtraKeys(screen: ScreenSnapshot?, scrollback: List<ScreenRow>, onIn
             .testTag("extra-keys"),
         horizontalArrangement = Arrangement.spacedBy(3.dp),
     ) {
+        ExtraKey("Type", onOpenComposer)
         ExtraKey("Esc") { send("\u001b") }
         ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
         ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }

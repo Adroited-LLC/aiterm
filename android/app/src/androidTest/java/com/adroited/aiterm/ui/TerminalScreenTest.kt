@@ -68,6 +68,8 @@ class TerminalScreenTest {
             )
         }
 
+        assertTrue(compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithText("Type").performClick()
         val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
         composer.assertIsDisplayed().performTextInput("hello phone")
         composer.assertTextEquals("hello phone")
@@ -76,7 +78,61 @@ class TerminalScreenTest {
         composer.performImeAction()
 
         compose.runOnIdle { assertEquals(listOf("hello phone\r"), sent) }
-        composer.assertTextEquals("")
+        assertTrue(compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithText("Type").assertIsDisplayed()
+    }
+
+    @Test
+    fun composerFloatsOverTheTerminalWithoutCoveringItsRenderArea() {
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    focus = FocusOwner.Self,
+                    activeTabId = "tab-overlay",
+                ),
+                screen = ScreenSnapshot(
+                    tabId = "tab-overlay",
+                    revision = 1,
+                    cols = 1,
+                    rows = 1,
+                    visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
+                    cursor = CursorState(0, 0, true),
+                ),
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        compose.waitForIdle()
+
+        val terminal = compose.onNodeWithTag("terminal-grid").fetchSemanticsNode().boundsInRoot
+        val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val overlay = compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val field = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val placeholder = compose.onNodeWithText("Type a command or prompt…", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+
+        assertTrue("composer must float inside the terminal", overlay.top < terminal.bottom)
+        assertTrue("terminal content must end above the composer", render.bottom <= overlay.top + 1f)
+        assertTrue(
+            "placeholder must be vertically centered in the input",
+            kotlin.math.abs(field.center.y - placeholder.center.y) < 2f,
+        )
+
+        compose.onNodeWithTag("input-mode-direct").performClick()
+        compose.waitForIdle()
+        val directField = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val directPlaceholder = compose.onNodeWithText("Direct keys send immediately", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        assertTrue("input height must stay stable between modes", kotlin.math.abs(field.height - directField.height) < 1f)
+        assertTrue(
+            "direct placeholder must be vertically centered in the input",
+            kotlin.math.abs(directField.center.y - directPlaceholder.center.y) < 2f,
+        )
     }
 
     @Test
@@ -99,6 +155,7 @@ class TerminalScreenTest {
             )
         }
 
+        compose.onNodeWithText("Type").performClick()
         val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
         composer.performClick().performTextInput("visible")
         compose.waitUntil(5_000) {
@@ -117,7 +174,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun rawModeSendsCommittedTextImmediately() {
+    fun directModeSendsCommittedTextImmediately() {
         val sent = mutableListOf<String>()
         compose.setContent {
             TerminalScreenContent(
@@ -138,7 +195,8 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithTag("input-mode-raw").performClick()
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("input-mode-direct").performClick()
         val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
         composer.performTextInput("x")
 
@@ -147,7 +205,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun rawModeForwardsHardwareTerminalKeys() {
+    fun directModeForwardsHardwareTerminalKeys() {
         val sent = mutableListOf<String>()
         compose.setContent {
             TerminalScreenContent(
@@ -168,7 +226,8 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithTag("input-mode-raw").performClick()
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("input-mode-direct").performClick()
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
             .performClick()
             .performKeyInput { pressKey(Key.DirectionUp) }
