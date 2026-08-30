@@ -2,7 +2,7 @@
 
 ## Status
 
-`DONE — Fix Round 3 automated verification complete; live first-pair smoke is user-interactive`
+`DONE — Fix Round 4 automated verification complete; live first-pair smoke is user-interactive`
 
 Task 9 now has the seven binding Rust prerequisites, a remembered-device
 authenticated Android WebSocket client, descriptor-bound roster and terminal
@@ -568,4 +568,94 @@ adb -s 10.0.0.115:37713 shell am force-stop com.adroited.aiterm
 adb -s 10.0.0.115:37713 shell am start -W \
   -n com.adroited.aiterm/.MainActivity
 Status: ok; LaunchState: COLD; TotalTime: 858 ms
+```
+
+## Fix Round 4
+
+The remaining automated review finding was reproduced against the round-three
+code and is fixed. The live interoperability smoke remains explicitly
+user-interactive.
+
+1. **IMPORTANT terminal-cause ordering — accepted and fixed.** The transport
+   now commits its typed terminal cause to the event channel before completing
+   accepted requests. Every request still completes, but terminal teardown
+   completes it with the same `RemoteTransportTerminatedException` carrying
+   `Revoked` or `Recoverable`, rather than an earlier unclassified disconnect.
+   Client request waiters route that typed result through the exact originating
+   generation and transport; ordinary send/timeout failures are likewise
+   generation-and-transport scoped. Whichever continuation runs first therefore
+   applies one authoritative policy: revocation purges and stops, recoverable
+   termination purges and schedules one bounded reconnect, and a late outcome
+   is stale only after the same policy has already advanced the generation.
+   Explicit close/lock still advances and cancels ownership before closing the
+   transport. Channel closure and deferred completion remain outside the
+   transport state lock, while transport job cancellation/close remains outside
+   the client lifecycle lock.
+
+   The deterministic combined client/real-transport regression is
+   `android/app/src/test/java/com/adroited/aiterm/remote/RemoteClientTest.kt`,
+   `pendingRequestFailureCannotWinBeforeFullQueueRevocationOutcome`. It gates
+   the client collector ahead of the real transport flow, fills all 64 event
+   slots, proves a request was sent and remains unanswered, then delivers
+   `auth.revoked`. RED checkpoint `d7d690e`; GREEN checkpoint `7afe008`; both
+   were followed by `sync`.
+
+   RED command and output:
+
+   ```text
+   ./gradlew :app:testDebugUnitTest --tests \
+     'com.adroited.aiterm.remote.RemoteClientTest.pendingRequestFailureCannotWinBeforeFullQueueRevocationOutcome'
+   1 test completed, 1 failed
+   expected:<Revoked> but was:<Reconnecting>
+   BUILD FAILED
+   ```
+
+   GREEN focused command and output:
+
+   ```text
+   ./gradlew :app:testDebugUnitTest --tests \
+     'com.adroited.aiterm.remote.RemoteClientTest' --tests \
+     'com.adroited.aiterm.remote.AuthenticatedRemoteTransportTest'
+   RemoteClientTest: 17 passed, 0 failed, 0 errors
+   AuthenticatedRemoteTransportTest: 16 passed, 0 failed, 0 errors
+   BUILD SUCCESSFUL
+   ```
+
+   Existing focused coverage also reconfirmed recoverable full-queue reconnect
+   (`fullQueueProtocolFailureCompletionPurgesStateAndReconnects`), explicit
+   lock/late-connect suppression (`lockCancelsPendingRequestsTransfersAndConnection`,
+   `lockDuringConnectCannotPublishTheLateConnection`), accepted-deferred close
+   completion (`closeRacingAnAcceptedEnqueueCompletesTheDeferredExceptionally`),
+   and both sides of the lock-order contract
+   (`requestAssignmentCallbackNeverRunsUnderTransportStateLock`,
+   `disconnectClosesTransportOutsideTheClientLifecycleLock`).
+
+2. **IMPORTANT live smoke — USER-INTERACTIVE.** Live QR enrollment, desktop
+   approval, app/device unlock, Unicode/input, resize, focus, reconnect, and
+   revoke still require the user. No automation weakened or changed QR,
+   biometric/device credential, approval, trust, or remote-access settings.
+
+Previously addressed Rust purge/recovery and Android lifecycle work were not
+modified. The retained-recovery ruling remains binding; mouse is still a future
+typed-contract addition, and the eager mixed drawer remains the deferred minor.
+`src/App.css` was not changed. The unsafe real-HOME backend target was not run,
+HOME was not repurposed, and preserved dumps were not inspected.
+
+### Fresh Fix Round 4 verification
+
+```text
+./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug --rerun-tasks
+114 passed, 0 failed, 0 errors, 0 skipped
+assemble passed; lint passed; BUILD SUCCESSFUL
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:connectedDebugAndroidTest
+17/17 passed on Pixel 10 Pro XL / API 37; BUILD SUCCESSFUL
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:installDebug
+Installed on exactly one device; BUILD SUCCESSFUL
+
+adb -s 10.0.0.115:37713 shell am force-stop com.adroited.aiterm
+adb -s 10.0.0.115:37713 shell am start -W \
+  -n com.adroited.aiterm/.MainActivity
+Status: ok; LaunchState: COLD; TotalTime: 826 ms
 ```

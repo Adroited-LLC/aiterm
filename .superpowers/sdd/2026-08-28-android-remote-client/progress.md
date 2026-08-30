@@ -54,12 +54,20 @@
   ignored, 210 safe Rust integrations, 111 Android JVM tests, and 17/17
   pinned-Pixel instrumentation tests; cargo check, assemble, lint, install,
   and cold launch also pass.
-- Task 9: fix round 3/5 (2 automated findings addressed, 1 deliberately open —
-  the user-interactive live QR/approval/unlock/Unicode/resize/focus/reconnect/
-  revoke smoke; commits `fceeb7b`..`24787f9`). Fresh evidence: 434 Rust
+- Task 9: fix round 3/5 (1 addressed, 2 open — terminal-cause ordering lets
+  pending-request failure reconnect before a queued Revoked outcome; the
+  user-interactive live QR/approval/unlock/Unicode/resize/focus/reconnect/
+  revoke smoke; commits `b751f45`..`72b89d5`). Fresh evidence: 434 Rust
   library tests/7 ignored, 210 safe Rust integrations, 113 Android JVM tests,
   and 17/17 pinned-Pixel instrumentation tests; isolated cargo check, assemble,
   lint, install, and cold launch also pass.
+- Task 9: fix round 4/5 (1 automated finding addressed, 1 deliberately open —
+  the user-interactive live QR/approval/unlock/Unicode/resize/focus/reconnect/
+  revoke smoke; commits `d7d690e`..`7afe008`). Fresh evidence: 33/33 focused
+  transport/client tests, 114/114 Android JVM tests, and 17/17 pinned-Pixel
+  instrumentation tests; assemble, lint, one-device install, and cold launch
+  also pass. The retained-recovery ruling remains binding; eager drawer is the
+  deferred minor and mouse remains the future typed-contract gap.
 
 ## Task 5 review breaker rulings
 
