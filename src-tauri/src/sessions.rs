@@ -2335,16 +2335,54 @@ fn prepare_generated_archive(
 }
 
 #[cfg(target_os = "linux")]
-fn quarantine_prepared_source(source: &VerifiedSessionFile) -> Result<std::path::PathBuf, String> {
+fn preserve_prepared_source(
+    source: &VerifiedSessionFile,
+) -> Result<Option<ArchiveRecoveryLink>, String> {
+    if !matches!(source.kind, VerifiedEntryKind::File) {
+        return Ok(None);
+    }
+    let recovery_name = format!(".aiterm-source-recovery-{}", uuid::Uuid::new_v4());
+    let name = CString::new(recovery_name.as_bytes()).unwrap();
+    if unsafe {
+        libc::linkat(
+            source.object.as_raw_fd(),
+            c"".as_ptr(),
+            source.parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "could not preserve exact source before quarantine: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    source.parent.sync_all().map_err(|error| error.to_string())?;
+    Ok(Some(ArchiveRecoveryLink {
+        name,
+        path: source.display_parent.join(recovery_name),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_prepared_source(
+    source: &VerifiedSessionFile,
+    recovery: Option<ArchiveRecoveryLink>,
+) -> Result<std::path::PathBuf, String> {
     let source_name =
         CString::new(source.name.as_bytes()).map_err(|_| "invalid session entry name")?;
     let quarantine_name = format!(".aiterm-quarantine-{}", uuid::Uuid::new_v4());
     let quarantine = CString::new(quarantine_name.as_bytes()).unwrap();
     let quarantine_path = source.display_parent.join(&quarantine_name);
     if !directory_entry_is_exact_object(&source.parent, &source_name, &source.object)? {
+        let recoverable = recovery
+            .as_ref()
+            .map(|link| link.path.display().to_string())
+            .unwrap_or_else(|| source.display_parent.join(&source.name).display().to_string());
         return Err(format!(
             "source name changed before quarantine; exact source remains recoverable at {}",
-            source.display_parent.join(&source.name).display()
+            recoverable
         ));
     }
     rename_noreplace(
@@ -2376,6 +2414,22 @@ fn quarantine_prepared_source(source: &VerifiedSessionFile) -> Result<std::path:
                 quarantine_path.display()
             )),
         };
+    }
+    if let Some(recovery) = recovery {
+        if unsafe { libc::unlinkat(source.parent.as_raw_fd(), recovery.name.as_ptr(), 0) } != 0 {
+            return Err(format!(
+                "source quarantine succeeded but recovery link remains at {}: {}",
+                recovery.path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        source.parent.sync_all().map_err(|error| error.to_string())?;
+        if !directory_entry_is_exact_object(&source.parent, &quarantine, &source.object)? {
+            return Err(format!(
+                "source quarantine changed while releasing recovery; exact source was at {}",
+                quarantine_path.display()
+            ));
+        }
     }
     Ok(quarantine_path)
 }
@@ -2571,12 +2625,23 @@ fn archive_verified_inputs_with_transaction_hooks(
         .map_err(|error| format!("could not make session archives durable: {error}"))?;
     after_publish()?;
     verify_prepared_archives(&prepared, destination, limits, true, true)?;
+    let mut source_recoveries = prepared
+        .iter()
+        .map(|archive| {
+            archive
+                .sources
+                .iter()
+                .map(preserve_prepared_source)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     before_quarantine(&prepared)?;
     verify_prepared_archives(&prepared, destination, limits, true, true)?;
     let mut recovery = Vec::new();
-    for archive in &prepared {
-        for source in &archive.sources {
-            match quarantine_prepared_source(source) {
+    for (archive_index, archive) in prepared.iter().enumerate() {
+        for (source_index, source) in archive.sources.iter().enumerate() {
+            let source_recovery = source_recoveries[archive_index][source_index].take();
+            match quarantine_prepared_source(source, source_recovery) {
                 Ok(path) => recovery.push(path),
                 Err(error) => {
                     let locations = recovery
