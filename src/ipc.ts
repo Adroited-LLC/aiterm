@@ -1073,6 +1073,25 @@ export interface RemoteClient {
 }
 export const remoteSetPort = (port: number) =>
   invoke<RemoteStatus>("remote_set_port", { port });
+
+// ---------------------------------------------------------------- changes on disk
+
+/** A file an agent created, modified or deleted, as the filesystem saw it. */
+export interface Change {
+  path: string;
+  name: string;
+  kind: "created" | "modified" | "deleted" | string;
+  /** Unix seconds. */
+  at: number;
+  session_id: string | null;
+  bytes: number;
+}
+export const sessionChanges = (sessionId: string) =>
+  invoke<Change[]>("session_changes", { sessionId });
+export const readFileBase64 = (path: string) =>
+  invoke<{ mime: string; data: string }>("read_file_base64", { path });
+export const isImagePath = (p: string) => /\.(png|jpe?g|webp|gif|svg)$/i.test(p);
+export const isVideoPath = (p: string) => /\.(mp4|webm|m4v)$/i.test(p);
 export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
 export const remoteSetEnabled = (on: boolean) =>
   invoke<RemoteStatus>("remote_set_enabled", { on });

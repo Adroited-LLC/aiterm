@@ -2830,6 +2830,7 @@ export default function App() {
                         tab, which is the truth. */}
                     <AgentPanel
                       sessionId={activeCaps.tasks ? activeSessionId : null}
+                      changesSessionId={activeSessionId}
                       onOpenFile={openFileTab}
                     />
                   </div>

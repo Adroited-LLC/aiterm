@@ -97,6 +97,9 @@ impl PtyManager {
 #[tauri::command]
 pub fn pty_set_activity(app: AppHandle, state: State<'_, PtyManager>, id: u32, activity: String) {
     if let Some(session_id) = state.set_activity(id, &activity) {
+        if activity != "idle" {
+            crate::changes::touch(&app, &session_id);
+        }
         crate::remote::notify(&app, crate::remote::Event::Activity { session_id, activity });
     }
 }
@@ -106,6 +109,7 @@ pub fn pty_set_activity(app: AppHandle, state: State<'_, PtyManager>, id: u32, a
 #[tauri::command]
 pub fn pty_bind_session(app: AppHandle, state: State<'_, PtyManager>, id: u32, session_id: String) {
     state.bind_session(id, &session_id);
+    crate::changes::track(&app, session_id);
     crate::remote::notify(&app, crate::remote::Event::SessionsChanged);
 }
 

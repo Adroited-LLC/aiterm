@@ -20,6 +20,7 @@ pub mod providers;
 pub mod rendercost;
 pub mod pty;
 pub mod remote;
+pub mod changes;
 pub mod detail;
 pub mod sessions;
 pub mod taskbar;
@@ -47,6 +48,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty::PtyManager::default())
         .manage(remote::RemoteState::default())
+        .manage(changes::ChangeLedger::default())
         .manage(watcher::WatchState::default())
         // Wrapped so a debug build logs every IPC call before it dispatches.
         // In release `log_invokes` is the identity function and the generated
@@ -70,6 +72,8 @@ pub fn run() {
             remote::remote_set_name,
             remote::remote_set_port,
             remote::remote_pair_payload,
+            changes::session_changes,
+            changes::read_file_base64,
             pty::pty_write,
             pty::pty_resize,
             pty::pty_kill,
@@ -190,6 +194,8 @@ pub fn run() {
                 crate::diag!("start", "transcript watcher not running: {e}");
             }
 
+            // What agents change on disk, for the panel and the phone.
+            changes::start(app.handle());
             // A phone paired earlier expects the desktop to answer again.
             remote::autostart(app.handle());
 

@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { fmtTime, fullTime, useTimeFormat } from "../timefmt";
 import {
-  AgentRun, Artifact, SessionTask, homeAbbrev, openPath,
-  sessionAgents, sessionArtifacts, sessionTasks,
+  AgentRun, Artifact, Change, SessionTask, homeAbbrev, openPath,
+  isImagePath, isVideoPath, readFileBase64,
+  sessionAgents, sessionArtifacts, sessionChanges, sessionTasks,
 } from "../ipc";
 import Icon from "./Icon";
 import { Ban, Circle, CircleCheck } from "lucide-react";
@@ -11,8 +13,85 @@ interface Props {
   /** Session id of the active terminal tab, when its engine records tasks
    *  and artifacts aiterm can read (`caps.tasks`). */
   sessionId: string | null;
+  /** The active tab's session for the Changes tab — every engine, since the
+   *  filesystem watcher does not care which one wrote the file. */
+  changesSessionId?: string | null;
   /** Open an artifact in a center file tab instead of the system app. */
   onOpenFile?: (path: string) => void;
+}
+
+/** A thumbnail for an image the agent made, read on demand. */
+function Thumb({ path }: { path: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let stop = false;
+    readFileBase64(path).then((f) => !stop && setSrc(`data:${f.mime};base64,${f.data}`)).catch(() => {});
+    return () => { stop = true; };
+  }, [path]);
+  return src ? <img className="change-thumb" src={src} alt="" /> : <span className="change-thumb blank" />;
+}
+
+function ChangesList({ sessionId, onOpenFile }: { sessionId: string; onOpenFile?: (path: string) => void }) {
+  const { format: timeFormat } = useTimeFormat();
+  const [changes, setChanges] = useState<Change[]>([]);
+  const [big, setBig] = useState<string | null>(null);
+  useEffect(() => {
+    let stop = false;
+    const load = () => sessionChanges(sessionId).then((c) => !stop && setChanges(c)).catch(() => {});
+    load();
+    const un = listen<Change>("changes://file", (e) => { if (e.payload.session_id === sessionId) load(); });
+    return () => { stop = true; un.then((f) => f()); };
+  }, [sessionId]);
+  if (changes.length === 0) {
+    return <div className="empty-note">Nothing changed on disk in this session yet. Files it creates or edits — any engine, any tool — show up here as they land.</div>;
+  }
+  return (
+    <div className="tasks-body">
+      {changes.map((c) => (
+        <div
+          key={c.path}
+          className={"task-row artifact-row change-row " + c.kind}
+          title={`${c.path} — ${c.kind} ${fullTime(c.at * 1000)}`}
+          onClick={() => {
+            if (c.kind === "deleted") return;
+            if (isImagePath(c.path) || isVideoPath(c.path)) setBig(big === c.path ? null : c.path);
+            else if (onOpenFile) onOpenFile(c.path);
+            else openPath(c.path).catch(() => {});
+          }}
+        >
+          {isImagePath(c.path) && c.kind !== "deleted" ? <Thumb path={c.path} /> : (
+            <span className={"artifact-tool " + (c.kind === "created" ? "write" : c.kind === "deleted" ? "gone" : "edit")}>
+              {c.kind === "created" ? "+" : c.kind === "deleted" ? "×" : "~"}
+            </span>
+          )}
+          <span className="task-subject">
+            {c.name}
+            <span className="change-meta"> · {fmtTime(c.at * 1000, timeFormat)} · {homeAbbrev(c.path.slice(0, c.path.lastIndexOf("/")))}</span>
+          </span>
+        </div>
+      ))}
+      {big && (
+        <div className="change-big" onClick={() => setBig(null)}>
+          {isVideoPath(big) ? <BigVideo path={big} /> : <BigImage path={big} />}
+          <div className="change-big-actions">
+            <button className="act-btn" onClick={(e) => { e.stopPropagation(); openPath(big).catch(() => {}); }}>Open in app</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BigImage({ path }: { path: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => { readFileBase64(path).then((f) => setSrc(`data:${f.mime};base64,${f.data}`)).catch(() => {}); }, [path]);
+  return src ? <img src={src} alt="" /> : <span className="empty-note">Loading…</span>;
+}
+
+function BigVideo({ path }: { path: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => { readFileBase64(path).then((f) => setSrc(`data:${f.mime};base64,${f.data}`)).catch(() => {}); }, [path]);
+  return src ? <video src={src} controls autoPlay /> : <span className="empty-note">Loading…</span>;
 }
 
 function statusIcon(t: SessionTask) {
@@ -22,9 +101,9 @@ function statusIcon(t: SessionTask) {
   return <span className="task-icon"><Icon of={Circle} size="sm" /></span>;
 }
 
-export default function AgentPanel({ sessionId, onOpenFile }: Props) {
+export default function AgentPanel({ sessionId, changesSessionId, onOpenFile }: Props) {
   const { format: timeFormat } = useTimeFormat();
-  const [tab, setTab] = useState<"tasks" | "artifacts">("tasks");
+  const [tab, setTab] = useState<"tasks" | "artifacts" | "changes">("tasks");
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [agents, setAgents] = useState<AgentRun[]>([]);
@@ -51,6 +130,17 @@ export default function AgentPanel({ sessionId, onOpenFile }: Props) {
   }, [sessionId]);
 
   if (!sessionId) {
+    // No task-recording engine, but the filesystem still has a word.
+    if (changesSessionId) {
+      return (
+        <>
+          <div className="git-tabs agent-tabs">
+            <button className="git-tab on">Changes</button>
+          </div>
+          <ChangesList sessionId={changesSessionId} onOpenFile={onOpenFile} />
+        </>
+      );
+    }
     return (
       <div className="empty-note">
         Tasks and artifacts appear here for engines that record them —
@@ -99,8 +189,14 @@ export default function AgentPanel({ sessionId, onOpenFile }: Props) {
           className={"git-tab" + (tab === "artifacts" ? " on" : "")}
           onClick={() => setTab("artifacts")}
         >Artifacts{artifacts.length ? ` (${artifacts.length})` : ""}</button>
+        <button
+          className={"git-tab" + (tab === "changes" ? " on" : "")}
+          onClick={() => setTab("changes")}
+        >Changes</button>
       </div>
-      {tab === "tasks" ? (
+      {tab === "changes" ? (
+        <ChangesList sessionId={changesSessionId ?? sessionId} onOpenFile={onOpenFile} />
+      ) : tab === "tasks" ? (
         tasks.length === 0 ? (
           <div className="empty-note">No tasks in this session yet</div>
         ) : (

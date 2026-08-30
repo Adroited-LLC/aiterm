@@ -126,6 +126,8 @@ pub enum Event {
     Attention { title: String, body: String },
     /// A tab's activity changed: "working" | "attention" | "idle".
     Activity { session_id: String, activity: String },
+    /// A file in a session's workspace was created, modified or deleted.
+    FileChanged { session_id: String, path: String, kind: String },
     Ping,
 }
 
@@ -629,6 +631,8 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/sessions", get(sessions).post(new_session))
         .route("/v1/sessions/{id}/artifacts", get(artifacts))
         .route("/v1/sessions/{id}/files", get(session_files))
+        .route("/v1/sessions/{id}/changes", get(session_changes))
+        .route("/v1/browse", get(browse))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/conversation", get(conversation))
         .route("/v1/sessions/{id}/open", post(open))
@@ -900,15 +904,27 @@ const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git", ".cache", ".gradl
 /// session itself. The second list is what makes this work for any
 /// harness — Codex, a shell script, an image model — not only the ones
 /// whose tool calls we parse. Newest first.
-async fn session_files(Path(id): Path<String>) -> Response {
+async fn session_files(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
     let wrote = crate::sessions::session_artifacts(id.clone()).await;
     let detail = crate::detail::session_detail(id.clone()).await;
+    let ledger = crate::changes::for_session(&ctx.app, &id);
     let sid = id;
     let out = crate::run_blocking(move || {
         let mut seen = std::collections::HashSet::new();
         let mut out: Vec<FileEntry> = Vec::new();
         for a in wrote {
             if let Some(e) = file_entry(std::path::Path::new(&a.path), "wrote") {
+                if seen.insert(e.path.clone()) {
+                    out.push(e);
+                }
+            }
+        }
+        // The ledger's word first: what the filesystem saw this session do.
+        for c in ledger {
+            if c.kind == "deleted" {
+                continue;
+            }
+            if let Some(e) = file_entry(std::path::Path::new(&c.path), if c.kind == "created" { "made" } else { "edited" }) {
                 if seen.insert(e.path.clone()) {
                     out.push(e);
                 }
@@ -940,7 +956,7 @@ async fn session_files(Path(id): Path<String>) -> Response {
         }
         // What the agent made or said it wrote comes first; the folder's
         // other changes follow. Newest first within each.
-        let rank = |v: &str| match v { "made" => 0, "wrote" => 1, _ => 2 };
+        let rank = |v: &str| match v { "made" => 0, "edited" => 1, "wrote" => 2, _ => 3 };
         out.sort_by(|a, b| rank(&a.via).cmp(&rank(&b.via)).then(b.modified.cmp(&a.modified)));
         out
     })
@@ -1021,6 +1037,27 @@ fn parse_iso_secs(s: &str) -> Option<u64> {
     let days = era * 146097 + doe - 719468;
     let secs = days * 86400 + h * 3600 + mi * 60 + sec;
     u64::try_from(secs).ok()
+}
+
+/// The ledger's word on a session: every file it created, modified or
+/// deleted, as the filesystem saw it. Newest first.
+async fn session_changes(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    Json(crate::changes::for_session(&ctx.app, &id)).into_response()
+}
+
+/// One directory of a workspace, for the phone's explorer. Same guard as
+/// files: only inside a project folder that has sessions.
+async fn browse(Query(q): Query<FileQuery>) -> Response {
+    let Ok(real) = std::path::PathBuf::from(&q.path).canonicalize() else {
+        return err(StatusCode::NOT_FOUND, "no such folder");
+    };
+    if !real.is_dir() || !file_is_allowed(&real).await {
+        return err(StatusCode::FORBIDDEN, "not a workspace folder");
+    }
+    match crate::fsx::list_dir(real.to_string_lossy().into_owned()).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
 #[derive(Deserialize)]
