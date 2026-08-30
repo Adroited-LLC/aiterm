@@ -170,6 +170,24 @@ fun PairingScreen(
     viewModel: PairingViewModel = viewModel(factory = PairingViewModel.factory(repository)),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val localNetworkPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) viewModel.confirm()
+    }
+    val confirmWithLocalNetworkAccess = {
+        val granted = Build.VERSION.SDK_INT < 37 ||
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_LOCAL_NETWORK,
+            ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            viewModel.confirm()
+        } else {
+            localNetworkPermission.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -188,7 +206,7 @@ fun PairingScreen(
     ) { innerPadding ->
         PairingContent(
             state = state,
-            onConfirm = viewModel::confirm,
+            onConfirm = confirmWithLocalNetworkAccess,
             onCancel = {
                 viewModel.discardPendingCode()
                 onBack()

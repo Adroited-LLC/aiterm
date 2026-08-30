@@ -1,6 +1,8 @@
 package com.adroited.aiterm.pairing
 
 import android.os.Build
+import android.util.Log
+import com.adroited.aiterm.BuildConfig
 import com.adroited.aiterm.security.DeviceKeyException
 import com.adroited.aiterm.security.DeviceKeys
 import com.adroited.aiterm.security.PinnedSpkiTrustManager
@@ -198,17 +200,21 @@ class OkHttpPairingTransport internal constructor(
         devicePublicKey: ByteArray,
         onPending: () -> Unit,
     ): EnrollmentOutcome {
+        pairingDiagnostic("candidate ${endpoint.host}:${endpoint.port}")
         val pinnedClient = try {
             pinnedClient(serverSpkiFingerprint)
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            pairingDiagnostic("TLS client setup failed: ${error.javaClass.name}")
             return EnrollmentOutcome.Unreachable("TLS 1.3 is unavailable")
         }
         val request = try {
             Request.Builder().url(webSocketUrl(endpoint)).build()
-        } catch (_: IllegalArgumentException) {
+        } catch (error: IllegalArgumentException) {
+            pairingDiagnostic("candidate URL rejected: ${error.javaClass.name}")
             return EnrollmentOutcome.Unreachable("invalid candidate endpoint")
         }
 
+        pairingDiagnostic("opening WebSocket ${endpoint.host}:${endpoint.port}")
         return coroutineScope {
             val requestMayHaveBeenSent = CompletableDeferred<Unit>()
             val attempt = async(start = CoroutineStart.UNDISPATCHED) {
@@ -317,6 +323,7 @@ class OkHttpPairingTransport internal constructor(
 
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                pairingDiagnostic("WebSocket opened")
                 socket.compareAndSet(null, webSocket)
                 if (!state.compareAndSet(State.WAITING_FOR_OPEN, State.WAITING_FOR_CHALLENGE)) {
                     finish(EnrollmentOutcome.ProtocolFailure("duplicate open callback"))
@@ -410,6 +417,9 @@ class OkHttpPairingTransport internal constructor(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                pairingDiagnostic(
+                    "WebSocket failed: ${t.javaClass.name}; HTTP=${response?.code ?: "none"}",
+                )
                 state.set(State.FINISHED)
                 finish(
                     failureOutcome(t, secretSent.get(), pinMismatchObserved()),
@@ -487,6 +497,10 @@ class OkHttpPairingTransport internal constructor(
         // its terminal pair.expired frame wins the boundary race.
         private const val APPROVAL_TIMEOUT_MILLIS = (5 * 60 + 15) * 1_000L
     }
+}
+
+private fun pairingDiagnostic(message: String) {
+    if (BuildConfig.DEBUG && isAndroidRuntime()) Log.i("AITermPairing", message)
 }
 
 internal fun tls13Context(): SSLContext {

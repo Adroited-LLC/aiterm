@@ -1,14 +1,29 @@
 package com.adroited.aiterm.ui
 
+import android.Manifest
+import android.content.Context
+import android.os.Build
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.adroited.aiterm.pairing.EnrollmentOutcome
+import com.adroited.aiterm.pairing.EnrollmentSecret
+import com.adroited.aiterm.pairing.PairedDesktop
+import com.adroited.aiterm.pairing.PairedDesktopStore
+import com.adroited.aiterm.pairing.PairingEndpoint
 import com.adroited.aiterm.pairing.PairingFailure
+import com.adroited.aiterm.pairing.PairingRepository
+import com.adroited.aiterm.pairing.PairingTransport
+import com.adroited.aiterm.security.DeviceKeys
 import com.adroited.aiterm.testing.ComposeTestActivity
+import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -67,6 +82,45 @@ class PairingScreenTest {
     }
 
     @Test
+    fun api37PairingDoesNotReachTheTransportBeforeLocalNetworkAccessIsGranted() {
+        assumeTrue(Build.VERSION.SDK_INT >= 37)
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        instrumentation.uiAutomation.revokeRuntimePermission(
+            context.packageName,
+            Manifest.permission.ACCESS_LOCAL_NETWORK,
+        )
+        val transport = CountingTransport()
+        val viewModel = PairingViewModel(
+            repository = PairingRepository(
+                transport = transport,
+                deviceKeys = StaticDeviceKeys,
+                store = EmptyDesktopStore,
+            ),
+            clock = { 1_700_000_000_000L },
+            deviceName = { "Pixel test" },
+        )
+        viewModel.onQrCode(pairingUri())
+
+        try {
+            compose.setContent {
+                PairingScreen(
+                    repository = PairingRepository(transport, StaticDeviceKeys, EmptyDesktopStore),
+                    onBack = {},
+                    onPaired = {},
+                    viewModel = viewModel,
+                )
+            }
+            compose.onNodeWithText("Pair").performClick()
+            compose.waitForIdle()
+
+            assertEquals(0, transport.attempts)
+        } finally {
+            instrumentation.uiAutomation.executeShellCommand("input keyevent BACK").close()
+        }
+    }
+
+    @Test
     fun waitingState_tellsTheUserToApproveOnTheDesktop() {
         compose.setContent { PairingContent(state = PairingUiState.AwaitingApproval("Workshop PC")) }
 
@@ -106,5 +160,40 @@ class PairingScreenTest {
                 it.name.contains("secret", ignoreCase = true)
             },
         )
+    }
+
+    private fun pairingUri(): String {
+        val encoder = Base64.getUrlEncoder().withoutPadding()
+        val fingerprint = encoder.encodeToString(ByteArray(32) { 7 })
+        val secret = encoder.encodeToString(ByteArray(32) { it.toByte() })
+        return "aiterm://pair?v=1&h=10.0.0.151&p=8443&f=$fingerprint&s=$secret&n=Desktop"
+    }
+
+    private class CountingTransport : PairingTransport {
+        var attempts: Int = 0
+            private set
+
+        override suspend fun enroll(
+            endpoint: PairingEndpoint,
+            serverSpkiFingerprint: String,
+            enrollmentSecret: EnrollmentSecret,
+            deviceName: String,
+            devicePublicKey: ByteArray,
+            onPending: () -> Unit,
+        ): EnrollmentOutcome {
+            attempts++
+            return EnrollmentOutcome.Unreachable("test transport")
+        }
+    }
+
+    private object StaticDeviceKeys : DeviceKeys {
+        override fun devicePublicKey(): ByteArray = ByteArray(33) { 2 }
+        override fun signChallenge(nonce: ByteArray): ByteArray = error("not used")
+    }
+
+    private object EmptyDesktopStore : PairedDesktopStore {
+        override fun all(): List<PairedDesktop> = emptyList()
+        override fun save(desktop: PairedDesktop) = Unit
+        override fun remove(deviceId: String) = Unit
     }
 }

@@ -39,6 +39,7 @@ struct RequestEnvelope {
     version: u16,
     request_id: u64,
     kind: String,
+    #[serde(with = "serde_bytes")]
     payload: Vec<u8>,
 }
 
@@ -124,6 +125,7 @@ pub struct RemoteEvent {
     pub version: u16,
     pub request_id: u64,
     pub kind: String,
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
 

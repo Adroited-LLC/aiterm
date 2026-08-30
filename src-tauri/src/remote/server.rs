@@ -438,6 +438,7 @@ async fn websocket_upgrade(
 #[derive(Serialize)]
 struct AuthChallenge {
     kind: &'static str,
+    #[serde(with = "serde_bytes")]
     nonce: Vec<u8>,
 }
 
@@ -446,6 +447,7 @@ struct AuthChallenge {
 struct AuthProof {
     kind: String,
     device_id: String,
+    #[serde(with = "serde_bytes")]
     signature_der: Vec<u8>,
 }
 
@@ -458,8 +460,10 @@ struct ClientFrameKind {
 #[serde(deny_unknown_fields)]
 struct PairRequest {
     kind: String,
+    #[serde(with = "serde_bytes")]
     enrollment_secret: Vec<u8>,
     device_name: String,
+    #[serde(with = "serde_bytes")]
     public_key: Vec<u8>,
 }
 
@@ -889,6 +893,7 @@ struct AttachmentPayload {
 struct InputPayload {
     tab_id: TabId,
     attachment_id: AttachmentId,
+    #[serde(with = "serde_bytes")]
     data: Vec<u8>,
 }
 
@@ -3715,6 +3720,54 @@ mod request_guard_tests {
             guard.admit(request_id, later).unwrap();
         }
         assert_eq!(guard.admit(133, later), Err("protocol.rate_limited"));
+    }
+
+    #[test]
+    fn auth_challenge_encodes_nonce_as_an_android_cbor_byte_string() {
+        let encoded = encode_terminal_frame(&AuthChallenge {
+            kind: "auth.challenge",
+            nonce: vec![7; 32],
+        })
+        .unwrap();
+        let value: ciborium::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
+        let ciborium::Value::Map(fields) = value else {
+            panic!("challenge must be a CBOR map");
+        };
+        let nonce = fields
+            .into_iter()
+            .find_map(|(key, value)| (key == ciborium::Value::Text("nonce".into())).then_some(value))
+            .expect("challenge must contain nonce");
+
+        assert_eq!(nonce, ciborium::Value::Bytes(vec![7; 32]));
+    }
+
+    #[test]
+    fn pair_request_decodes_android_cbor_byte_strings() {
+        let value = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("kind".into()),
+                ciborium::Value::Text("pair.request".into()),
+            ),
+            (
+                ciborium::Value::Text("enrollment_secret".into()),
+                ciborium::Value::Bytes(vec![3; 32]),
+            ),
+            (
+                ciborium::Value::Text("device_name".into()),
+                ciborium::Value::Text("Pixel".into()),
+            ),
+            (
+                ciborium::Value::Text("public_key".into()),
+                ciborium::Value::Bytes(vec![2; 33]),
+            ),
+        ]);
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&value, &mut encoded).unwrap();
+
+        let request = decode_exact::<PairRequest>(&encoded)
+            .expect("Android byte strings must decode as a pairing request");
+        assert_eq!(request.enrollment_secret, vec![3; 32]);
+        assert_eq!(request.public_key, vec![2; 33]);
     }
 }
 

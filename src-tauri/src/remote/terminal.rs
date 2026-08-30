@@ -569,6 +569,7 @@ pub struct TransferChunk {
     pub index: u32,
     pub total: u32,
     pub request_id: u64,
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
 
