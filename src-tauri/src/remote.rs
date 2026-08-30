@@ -628,6 +628,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/files", get(file))
         .route("/v1/sessions", get(sessions).post(new_session))
         .route("/v1/sessions/{id}/artifacts", get(artifacts))
+        .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/conversation", get(conversation))
         .route("/v1/sessions/{id}/open", post(open))
@@ -808,6 +809,119 @@ async fn search(Query(q): Query<SearchQuery>) -> Response {
 /// Files a session wrote, by tool and time — what the desktop's panel lists.
 async fn artifacts(Path(id): Path<String>) -> Response {
     Json(crate::sessions::session_artifacts(id).await).into_response()
+}
+
+#[derive(Serialize)]
+struct FileEntry {
+    path: String,
+    name: String,
+    bytes: u64,
+    /// Unix seconds, last modified.
+    modified: u64,
+    /// How we know about it: "wrote" (a tool call in the transcript) or
+    /// "changed" (newer than the session in its folder).
+    via: String,
+}
+
+const FILES_CAP: usize = 300;
+const FILES_DEPTH: usize = 6;
+const SKIP_DIRS: &[&str] = &["node_modules", "target", ".git", ".cache", ".gradle", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".kotlin"];
+
+/// Everything a session produced, as best the desktop can tell: files its
+/// transcript says it wrote, plus every file in its folder newer than the
+/// session itself. The second list is what makes this work for any
+/// harness — Codex, a shell script, an image model — not only the ones
+/// whose tool calls we parse. Newest first.
+async fn session_files(Path(id): Path<String>) -> Response {
+    let wrote = crate::sessions::session_artifacts(id.clone()).await;
+    let detail = crate::detail::session_detail(id).await;
+    let out = crate::run_blocking(move || {
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<FileEntry> = Vec::new();
+        for a in wrote {
+            if let Some(e) = file_entry(std::path::Path::new(&a.path), "wrote") {
+                if seen.insert(e.path.clone()) {
+                    out.push(e);
+                }
+            }
+        }
+        if let Some(d) = detail {
+            let since = d.started.as_deref().and_then(parse_iso_secs).unwrap_or(0);
+            if let Some(cwd) = d.cwd.as_deref() {
+                walk_recent(std::path::Path::new(cwd), since, 0, &mut |e| {
+                    if out.len() < FILES_CAP && seen.insert(e.path.clone()) {
+                        out.push(e);
+                    }
+                });
+            }
+        }
+        out.sort_by(|a, b| b.modified.cmp(&a.modified));
+        out
+    })
+    .await;
+    Json(out).into_response()
+}
+
+fn file_entry(path: &std::path::Path, via: &str) -> Option<FileEntry> {
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() {
+        return None;
+    }
+    let modified = md.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(FileEntry {
+        path: path.to_string_lossy().into_owned(),
+        name: path.file_name()?.to_string_lossy().into_owned(),
+        bytes: md.len(),
+        modified,
+        via: via.into(),
+    })
+}
+
+fn walk_recent(dir: &std::path::Path, since: u64, depth: usize, push: &mut dyn FnMut(FileEntry)) {
+    if depth > FILES_DEPTH {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            walk_recent(&path, since, depth + 1, push);
+        } else if ft.is_file() {
+            if let Some(e) = file_entry(&path, "changed") {
+                if e.modified >= since {
+                    push(e);
+                }
+            }
+        }
+    }
+}
+
+/// "2026-08-29T14:36:55.009Z" → seconds. Enough of ISO 8601 for a
+/// transcript's own timestamps; anything else is "since forever".
+fn parse_iso_secs(s: &str) -> Option<u64> {
+    let (date, rest) = s.split_once('T')?;
+    let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let time = rest.trim_end_matches('Z');
+    let time = time.split(['+', '-']).next().unwrap_or(time);
+    let mut t = time.split(':');
+    let (h, mi) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+    let sec = t.next().and_then(|x| x.split('.').next()).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+    // Days from civil (Howard Hinnant), no calendar crate needed.
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + h * 3600 + mi * 60 + sec;
+    u64::try_from(secs).ok()
 }
 
 #[derive(Deserialize)]
@@ -1037,6 +1151,12 @@ mod tests {
         let der = b"\x30\x03\x02\x01\x05";
         let pem = "-----BEGIN CERTIFICATE-----\nMAMCAQU=\n-----END CERTIFICATE-----\n";
         assert_eq!(pem_to_der(pem.as_bytes()).unwrap(), der);
+    }
+
+    #[test]
+    fn iso_timestamps_become_unix_seconds() {
+        assert_eq!(parse_iso_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso_secs("2026-08-29T14:36:55.009Z"), Some(1788014215));
     }
 
     #[test]
