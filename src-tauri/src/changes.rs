@@ -264,8 +264,8 @@ fn record(app: &AppHandle, path: PathBuf, kind: &str) {
 
 /// Which session(s) a change belongs to. A harness output directory names
 /// its session in the path. Otherwise: sessions whose workspace holds the
-/// file, narrowed to those whose terminal showed work in the last while;
-/// if that leaves several, the change is theirs jointly.
+/// file and whose terminal showed work in the last while; several at once
+/// share the credit, none at all means nobody's agent did it.
 fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
     let s = path.to_string_lossy();
     if let Some(rest) = s.split("/.codex/generated_images/").nth(1) {
@@ -273,30 +273,24 @@ fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
             return vec![sid.to_string()];
         }
     }
-    let mut candidates: Vec<&String> = inner
+    // Only a session that is working, or was a moment ago, gets the credit.
+    // An idle tab in the folder does not — the person editing in another
+    // window, or another tool entirely, is not the agent's doing.
+    let active: HashSet<String> = app
+        .state::<crate::pty::PtyManager>()
+        .activities()
+        .into_iter()
+        .filter(|(_, a)| a != "idle")
+        .map(|(id, _)| id)
+        .collect();
+    inner
         .session_roots
         .iter()
         .filter(|(_, root)| path.starts_with(root))
         .map(|(id, _)| id)
-        .collect();
-    if candidates.len() > 1 {
-        let active: HashSet<String> = app
-            .state::<crate::pty::PtyManager>()
-            .activities()
-            .into_iter()
-            .filter(|(_, a)| a != "idle")
-            .map(|(id, _)| id)
-            .collect();
-        let live: Vec<&String> = candidates
-            .iter()
-            .copied()
-            .filter(|id| active.contains(*id) || inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT))
-            .collect();
-        if !live.is_empty() {
-            candidates = live;
-        }
-    }
-    candidates.into_iter().cloned().collect()
+        .filter(|id| active.contains(*id) || inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT))
+        .cloned()
+        .collect()
 }
 
 /// A session's changes, newest first, one row per path (its latest state).
