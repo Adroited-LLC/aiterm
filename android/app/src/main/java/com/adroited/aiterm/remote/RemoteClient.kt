@@ -84,7 +84,7 @@ interface RemoteTransport {
     suspend fun connect()
     /** Enqueues in caller order; the transport assigns the wire id when its writer dequeues it. */
     fun request(kind: String, payload: ByteArray): Deferred<RemoteResponse>
-    fun completeAttachment(requestId: Long, publishEvents: Boolean) = Unit
+    suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) = Unit
     fun close()
 }
 

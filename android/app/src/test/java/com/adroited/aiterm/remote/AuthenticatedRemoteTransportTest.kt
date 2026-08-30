@@ -298,6 +298,59 @@ class AuthenticatedRemoteTransportTest {
         transport.close()
     }
 
+    @Test
+    fun attachmentDrainCannotBeOvertakenByANewChunk() = runTest {
+        val transport = transport(
+            authenticatedSocket(),
+            backgroundScope,
+            StandardTestDispatcher(testScheduler),
+        )
+        transport.connect()
+        val attachment = transport.request("terminal.attach", byteArrayOf())
+        runCurrent()
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "terminal.attach", byteArrayOf()))
+        transport.acceptEnvelopeForTest(
+            RemoteEventEnvelope(1, "terminal.snapshot", terminalSnapshotFixture(1, index = 0, total = 2)),
+        )
+        repeat(64) {
+            transport.acceptEnvelopeForTest(RemoteEventEnvelope(0, "tab.changed", byteArrayOf()))
+        }
+
+        val drain = async { transport.completeAttachment(1, true) }
+        val arrival = async {
+            transport.acceptEnvelopeForTest(
+                RemoteEventEnvelope(1, "terminal.snapshot", terminalSnapshotFixture(1, index = 1, total = 2)),
+            )
+        }
+        runCurrent()
+        val received = async { transport.events.take(66).toList() }
+        runCurrent()
+
+        assertEquals(
+            listOf(0, 1),
+            received.await().filterIsInstance<RemoteServerEvent.TerminalChunk>().map { it.chunk.index },
+        )
+        drain.await()
+        arrival.await()
+        attachment.await()
+        transport.close()
+    }
+
+    @Test
+    fun protocolFailureClosesEvenWhenFailureNotificationCannotBeQueued() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+        repeat(64) {
+            transport.acceptEnvelopeForTest(RemoteEventEnvelope(0, "tab.changed", byteArrayOf()))
+        }
+
+        socket.incoming.send(byteArrayOf(0xff.toByte()))
+        runCurrent()
+
+        assertTrue(socket.closed)
+    }
+
     private fun authenticatedSocket() = FakeBinarySocket().apply {
         incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
         incoming.trySend(hex("a1646b696e6467617574682e6f6b"))

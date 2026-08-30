@@ -18,6 +18,8 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 
 interface RemoteBinarySocket {
@@ -47,6 +49,7 @@ class AuthenticatedRemoteTransport(
     private val outbound = Channel<OutboundRequest>(MAX_PENDING_REQUESTS)
 
     private val stateLock = Any()
+    private val publicationMutex = Mutex()
     private val pending = LinkedHashMap<Long, PendingRequest>()
     private val completed = LinkedHashSet<Long>()
     private val heldAttachments = LinkedHashMap<Long, HeldAttachment>()
@@ -221,37 +224,42 @@ class AuthenticatedRemoteTransport(
         } catch (_: CancellationException) {
             // Explicit close/lock owns teardown.
         } catch (error: Exception) {
-            emitOrClose(RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"))
-            close()
+            eventChannel.trySend(
+                RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
+            )
+        } finally {
+            if (synchronized(stateLock) { !closed }) close()
         }
     }
 
-    private fun accept(event: RemoteEventEnvelope) {
+    private suspend fun accept(event: RemoteEventEnvelope) {
         when (event.kind) {
             "terminal.snapshot", "terminal.diff", "terminal.scrollback" -> {
-                requireKnownCorrelation(event.requestId)
-                if (!holdAttachmentEvent(event)) emitTerminalEvent(event)
+                publicationMutex.withLock { acceptTerminalEvent(event) }
             }
             "state.snapshot" -> {
                 if (event.requestId != 0L) protocolFailure()
-                emitOrClose(RemoteServerEvent.RosterChunk(RemoteWireCodec.decodeStateSnapshot(event.payload)))
+                emit(RemoteServerEvent.RosterChunk(RemoteWireCodec.decodeStateSnapshot(event.payload)))
             }
             "auth.revoked" -> {
                 if (event.requestId != 0L) protocolFailure()
-                emitOrClose(RemoteServerEvent.Revoked)
-                close()
+                try {
+                    eventChannel.trySend(RemoteServerEvent.Revoked)
+                } finally {
+                    close()
+                }
             }
             "error" -> acceptError(event)
             "session.changed", "agent.changed", "tab.changed", "terminal.exited",
             "terminal.title", "terminal.focus_changed" -> {
                 requireKnownCorrelation(event.requestId)
-                emitOrClose(RemoteServerEvent.Raw(event.kind, event.payload))
+                emit(RemoteServerEvent.Raw(event.kind, event.payload))
             }
             else -> acceptResponse(event)
         }
     }
 
-    internal fun acceptEnvelopeForTest(event: RemoteEventEnvelope) = accept(event)
+    internal suspend fun acceptEnvelopeForTest(event: RemoteEventEnvelope) = accept(event)
 
     private fun acceptResponse(event: RemoteEventEnvelope) {
         if (event.requestId <= 0) protocolFailure()
@@ -278,10 +286,10 @@ class AuthenticatedRemoteTransport(
         request.deferred.complete(RemoteResponse.Success(event.requestId, request.kind, event.payload))
     }
 
-    private fun acceptError(event: RemoteEventEnvelope) {
+    private suspend fun acceptError(event: RemoteEventEnvelope) {
         val error = RemoteWireCodec.decodeError(event.payload)
         if (event.requestId == 0L) {
-            emitOrClose(RemoteServerEvent.Failure(error.code, error.message))
+            emit(RemoteServerEvent.Failure(error.code, error.message))
             return
         }
         val request = synchronized(stateLock) { pending.remove(event.requestId) }
@@ -297,7 +305,9 @@ class AuthenticatedRemoteTransport(
 
     private fun requireKnownCorrelation(requestId: Long) {
         if (requestId == 0L) return
-        val known = synchronized(stateLock) { pending.containsKey(requestId) || completed.contains(requestId) }
+        val known = synchronized(stateLock) {
+            pending.containsKey(requestId) || completed.contains(requestId) || heldAttachments.containsKey(requestId)
+        }
         if (!known) protocolFailure()
     }
 
@@ -308,32 +318,54 @@ class AuthenticatedRemoteTransport(
         }
     }
 
-    private fun emitOrClose(event: RemoteServerEvent) {
-        if (eventChannel.trySend(event).isFailure) {
-            throw RemoteProtocolException("remote event queue overflow")
+    private suspend fun emit(event: RemoteServerEvent) = eventChannel.send(event)
+
+    override suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) {
+        publicationMutex.withLock {
+            val held = synchronized(stateLock) { heldAttachments[requestId] } ?: return@withLock
+            held.decision = if (publishEvents) AttachmentDecision.Publish else AttachmentDecision.Discard
+            val frames = synchronized(stateLock) {
+                held.frames.toList().also {
+                    held.frames.clear()
+                    held.bytes = 0
+                }
+            }
+            if (publishEvents) frames.forEach { emitTerminalEvent(it) }
+            if (held.complete) synchronized(stateLock) { heldAttachments.remove(requestId) }
         }
     }
 
-    override fun completeAttachment(requestId: Long, publishEvents: Boolean) {
-        val frames = synchronized(stateLock) {
-            heldAttachments.remove(requestId)?.frames?.toList().orEmpty()
-        }
-        if (publishEvents) frames.forEach(::emitTerminalEvent)
-    }
-
-    private fun holdAttachmentEvent(event: RemoteEventEnvelope): Boolean = synchronized(stateLock) {
-        val held = heldAttachments[event.requestId] ?: return@synchronized false
-        if (held.frames.size >= MAX_HELD_ATTACH_FRAMES ||
-            held.bytes + event.payload.size > MAX_HELD_ATTACH_BYTES
-        ) protocolFailure()
-        held.frames += event
-        held.bytes += event.payload.size
-        true
-    }
-
-    private fun emitTerminalEvent(event: RemoteEventEnvelope) {
+    private suspend fun acceptTerminalEvent(event: RemoteEventEnvelope) {
+        requireKnownCorrelation(event.requestId)
         val chunk = RemoteWireCodec.decodeTerminalChunk(event.payload, event.requestId)
-        emitOrClose(RemoteServerEvent.TerminalChunk(chunk))
+        val held = synchronized(stateLock) { heldAttachments[event.requestId] }
+        if (held == null) {
+            emitTerminalEvent(event, chunk)
+            return
+        }
+        val complete = chunk.index + 1 == chunk.total
+        held.complete = held.complete || complete
+        when (held.decision) {
+            AttachmentDecision.Pending -> synchronized(stateLock) {
+                if (held.frames.size >= MAX_HELD_ATTACH_FRAMES ||
+                    held.bytes + event.payload.size > MAX_HELD_ATTACH_BYTES
+                ) protocolFailure()
+                held.frames += event
+                held.bytes += event.payload.size
+            }
+            AttachmentDecision.Publish -> emitTerminalEvent(event, chunk)
+            AttachmentDecision.Discard -> Unit
+        }
+        if (complete && held.decision != AttachmentDecision.Pending) {
+            synchronized(stateLock) { heldAttachments.remove(event.requestId) }
+        }
+    }
+
+    private suspend fun emitTerminalEvent(
+        event: RemoteEventEnvelope,
+        chunk: TerminalTransferChunk = RemoteWireCodec.decodeTerminalChunk(event.payload, event.requestId),
+    ) {
+        emit(RemoteServerEvent.TerminalChunk(chunk))
         if (chunk.kind == TerminalTransferKind.Scrollback && chunk.index + 1 == chunk.total &&
             event.requestId > 0
         ) completeTransferOnlyRequest(event)
@@ -360,7 +392,10 @@ class AuthenticatedRemoteTransport(
     private data class HeldAttachment(
         val frames: MutableList<RemoteEventEnvelope> = mutableListOf(),
         var bytes: Int = 0,
+        var complete: Boolean = false,
+        var decision: AttachmentDecision = AttachmentDecision.Pending,
     )
+    private enum class AttachmentDecision { Pending, Publish, Discard }
 
     private companion object {
         const val AUTH_TIMEOUT_MILLIS = 10_000L
