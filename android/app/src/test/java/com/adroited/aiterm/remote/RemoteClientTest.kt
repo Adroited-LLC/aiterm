@@ -18,6 +18,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class RemoteClientTest {
@@ -148,6 +150,32 @@ class RemoteClientTest {
         assertEquals(null, store.screen.value)
         client.acceptForTest(snapshotChunk("current", "tab-b", "attachment-b", "RIGHT"))
         assertEquals("RIGHT", store.screen.value?.visible?.single()?.plainText())
+        client.lock()
+    }
+
+    @Test
+    fun disconnectClosesTransportOutsideTheClientLifecycleLock() = runTest {
+        lateinit var client: RemoteClient
+        val closeObservedUnlockedClient = AtomicBoolean(false)
+        val transport = FakeRemoteTransport(
+            onClose = {
+                val probe = thread(start = true) { client.requestNextScrollbackPage() }
+                probe.join(1_000)
+                closeObservedUnlockedClient.set(!probe.isAlive)
+            },
+        )
+        client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+
+        client.acceptForTest(RemoteServerEvent.Failure("transport.disconnected", "lost"))
+
+        assertTrue("transport close ran while lifecycleLock was held", closeObservedUnlockedClient.get())
         client.lock()
     }
 
@@ -485,7 +513,7 @@ private fun scrollbackChunk(
     ),
 )
 
-private class FakeRemoteTransport : RemoteTransport {
+private class FakeRemoteTransport(private val onClose: () -> Unit = {}) : RemoteTransport {
     override val events = MutableSharedFlow<RemoteServerEvent>(extraBufferCapacity = 8)
     val requests = mutableListOf<RemoteRequest>()
     var closed = false
@@ -511,6 +539,7 @@ private class FakeRemoteTransport : RemoteTransport {
     }
 
     override fun close() {
+        onClose()
         closed = true
     }
 }

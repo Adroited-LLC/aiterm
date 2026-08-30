@@ -27,6 +27,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -249,6 +251,48 @@ class AuthenticatedRemoteTransportTest {
 
         val failure = runCatching { withTimeout(1_000) { response.get().await() } }.exceptionOrNull()
         assertTrue("accepted request must fail on close, got $failure", failure is RemoteProtocolException)
+    }
+
+    @Test
+    fun requestAssignmentCallbackNeverRunsUnderTransportStateLock() = runTest {
+        val clientLock = ReentrantLock()
+        val closerHasClientLock = CountDownLatch(1)
+        val callbackEntered = CountDownLatch(1)
+        val callbackFinished = CountDownLatch(1)
+        val callbackAcquiredClientLock = AtomicBoolean(false)
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(),
+            deviceKeys = RecordingDeviceKeys(),
+            appLock = unlockedAppLock(),
+            dialer = FakeDialer(authenticatedSocket()),
+            scope = backgroundScope,
+            dispatcher = kotlinx.coroutines.Dispatchers.Default,
+        )
+        transport.connect()
+        val closer = thread(start = true) {
+            clientLock.lock()
+            try {
+                closerHasClientLock.countDown()
+                callbackEntered.await(2, TimeUnit.SECONDS)
+                transport.close()
+            } finally {
+                clientLock.unlock()
+            }
+        }
+        assertTrue(closerHasClientLock.await(2, TimeUnit.SECONDS))
+
+        val response = transport.request("tab.list", byteArrayOf()) {
+            callbackEntered.countDown()
+            val acquired = clientLock.tryLock(1, TimeUnit.SECONDS)
+            callbackAcquiredClientLock.set(acquired)
+            if (acquired) clientLock.unlock()
+            callbackFinished.countDown()
+        }
+
+        assertTrue(callbackFinished.await(3, TimeUnit.SECONDS))
+        closer.join(3_000)
+        response.cancel()
+        assertTrue("assignment callback was lock-inverted with close", callbackAcquiredClientLock.get())
     }
 
     @Test
