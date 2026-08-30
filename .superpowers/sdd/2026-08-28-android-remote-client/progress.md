@@ -46,12 +46,20 @@
   removable only by explicit exact-object purge. Cost: retained recovery data
   and directory metadata consume disk after restore; benefit: concurrent path
   mutation cannot turn a reported restore into unrecoverable transcript loss.
-- Task 9: fix round 2/5 (7 automated findings addressed, 1 deliberately open —
-  the user-interactive live QR/Unicode/resize/reconnect/focus/revoke smoke;
-  commits `397df02`..`df5a9f4`). Fresh evidence: 432 Rust library tests/7
+- Task 9: fix round 2/5 (6 addressed, 3 open — full-queue transport
+  completion must clear stale client state; retained restore aliases exhaust
+  the exact-purge enumeration bound; user-interactive live
+  QR/Unicode/resize/reconnect/focus/revoke smoke; commits
+  `49b2894`..`b751f45`). Fresh evidence: 432 Rust library tests/7
   ignored, 210 safe Rust integrations, 111 Android JVM tests, and 17/17
   pinned-Pixel instrumentation tests; cargo check, assemble, lint, install,
   and cold launch also pass.
+- Task 9: fix round 3/5 (2 automated findings addressed, 1 deliberately open —
+  the user-interactive live QR/approval/unlock/Unicode/resize/focus/reconnect/
+  revoke smoke; commits `fceeb7b`..`24787f9`). Fresh evidence: 434 Rust
+  library tests/7 ignored, 210 safe Rust integrations, 113 Android JVM tests,
+  and 17/17 pinned-Pixel instrumentation tests; isolated cargo check, assemble,
+  lint, install, and cold launch also pass.
 
 ## Task 5 review breaker rulings
 

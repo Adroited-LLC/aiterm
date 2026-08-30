@@ -2,7 +2,7 @@
 
 ## Status
 
-`DONE — Fix Round 2 automated verification complete; live first-pair smoke is user-interactive`
+`DONE — Fix Round 3 automated verification complete; live first-pair smoke is user-interactive`
 
 Task 9 now has the seven binding Rust prerequisites, a remembered-device
 authenticated Android WebSocket client, descriptor-bound roster and terminal
@@ -468,4 +468,104 @@ adb -s 10.0.0.115:37713 shell am force-stop com.adroited.aiterm
 adb -s 10.0.0.115:37713 shell am start -W \
   -n com.adroited.aiterm/.MainActivity
 Status: ok; Activity: com.adroited.aiterm/.MainActivity
+```
+
+## Fix Round 3
+
+Both automated review claims were reproduced against the round-two code before
+implementation and are fixed. The live pairing smoke remains explicitly
+user-interactive.
+
+1. **IMPORTANT full-queue/channel-completion client state — accepted and
+   fixed.** Transport shutdown now closes the event channel with an out-of-band
+   typed terminal cause (`Revoked` or `Recoverable`) that cannot be displaced by
+   a full event queue. The generation-owned client collector handles normal
+   unexpected completion and typed causes, clears active attachment state,
+   screen, scrollback, assemblers, and transfers, then either enters bounded
+   reconnect or remains revoked. Explicit close advances/cancels the generation
+   and cannot resurrect reconnect. Covering tests:
+   `android/app/src/test/java/com/adroited/aiterm/remote/RemoteClientTest.kt`,
+   `fullQueueRevocationCompletionPurgesStateAndNeverReconnects` and
+   `fullQueueProtocolFailureCompletionPurgesStateAndReconnects`; transport
+   terminal-cause coverage remains in
+   `AuthenticatedRemoteTransportTest.kt`,
+   `protocolFailureClosesEvenWhenFailureNotificationCannotBeQueued` and
+   `revocationWithAFullEventQueueStillTerminatesCollectors`. Focused command:
+   `./gradlew :app:testDebugUnitTest --tests
+   'com.adroited.aiterm.remote.RemoteClientTest' --tests
+   'com.adroited.aiterm.remote.AuthenticatedRemoteTransportTest'`; output:
+   `32 passed, 0 failed; BUILD SUCCESSFUL`.
+2. **IMPORTANT retained-recovery purge exhaustion — accepted and fixed.** Exact
+   purge now applies separate bounded physical-name and unique-object budgets.
+   Retained aliases are opened and deduplicated by the held descriptor's
+   `(device,inode)` identity before the unique-object limit is enforced. Purge
+   preflight retains exact FDs and bounded hashes without installing hundreds
+   of simultaneous Linux leases; each exact object acquires the established
+   write lease immediately before its quarantine/truncation transaction.
+   Descriptor parents are shared so the 512-object bound does not exhaust file
+   descriptors. Path/name/depth/archive-byte bounds and final directory
+   identity checks remain in force. Covering tests in
+   `src-tauri/src/sessions.rs`:
+   `exact_purge_deduplicates_more_than_257_retained_restore_alias_pairs`
+   creates 258 distinct retained objects with 516 hardlink aliases and proves
+   exact purge succeeds without touching a different outside object;
+   `exact_purge_counts_distinct_retained_inodes_before_destructive_work`
+   proves 513 distinct inodes are rejected before destructive work. Focused
+   commands and outputs:
+   `CARGO_TARGET_DIR=/tmp/aiterm-task9-round3-red.M1rGKQ cargo test --lib
+   exact_purge_deduplicates_more_than_257_retained_restore_alias_pairs --
+   --nocapture` — `1 passed, 0 failed`; the equivalent distinct-inode command —
+   `1 passed, 0 failed`; and `cargo test --lib purge -- --nocapture` —
+   `6 passed, 0 failed`. The existing deterministic pathname-replacement test
+   also confirmed the displaced inode receives a durable recovery link before
+   the mismatch is reported.
+3. **IMPORTANT live smoke — USER-INTERACTIVE.** Live QR enrollment, desktop
+   approval, app/device unlock, Unicode/input, resize, focus, reconnect, and
+   revoke still require the user. No automation weakened or changed QR,
+   biometric/device credential, approval, trust, or remote-access settings.
+
+Previously addressed archive recovery lifetime, non-destructive strict restore
+recovery, accept/close linearization, lock ordering, selection-owned scrollback,
+exact padded geometry, serialized wire IDs, and attachment draining remain
+covered by the aggregate suites. The retained-recovery ruling remains in force;
+mouse is a future typed-contract addition and the eager mixed drawer remains the
+deferred minor.
+
+### Fresh Fix Round 3 verification
+
+Rust commands used the isolated target
+`/tmp/aiterm-task9-round3-red.M1rGKQ`. The unsafe real-HOME backend target was
+not run, HOME was not repurposed, preserved dumps were not inspected, and
+`src/App.css` was not changed.
+
+```text
+CARGO_TARGET_DIR=/tmp/aiterm-task9-round3-red.M1rGKQ \
+  cargo test --lib -- --test-threads=1
+434 passed, 0 failed, 7 ignored (441 total)
+
+CARGO_TARGET_DIR=/tmp/aiterm-task9-round3-red.M1rGKQ cargo test \
+  --test remote_auth --test remote_desktop --test remote_operations \
+  --test remote_protocol --test remote_server --test remote_terminal \
+  --test tab_registry --test terminal_screen -- --test-threads=1
+210 passed, 0 failed
+
+CARGO_TARGET_DIR=/tmp/aiterm-task9-round3-red.M1rGKQ cargo check
+passed
+
+./gradlew :app:testDebugUnitTest --rerun-tasks
+113 passed, 0 failed, 0 errors, 0 skipped; BUILD SUCCESSFUL
+
+./gradlew :app:assembleDebug :app:lintDebug
+assemble passed; lint passed; BUILD SUCCESSFUL
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:connectedDebugAndroidTest
+17/17 passed on Pixel 10 Pro XL; BUILD SUCCESSFUL
+
+ANDROID_SERIAL=10.0.0.115:37713 ./gradlew :app:installDebug
+Installed on exactly one device; BUILD SUCCESSFUL
+
+adb -s 10.0.0.115:37713 shell am force-stop com.adroited.aiterm
+adb -s 10.0.0.115:37713 shell am start -W \
+  -n com.adroited.aiterm/.MainActivity
+Status: ok; LaunchState: COLD; TotalTime: 858 ms
 ```
