@@ -81,6 +81,15 @@
   server 50/50, 435 Rust library tests/7 ignored, 214 safe Rust integrations,
   and `cargo check` passed. Task 9 is not complete until the rebuilt desktop and
   pinned Pixel pass the full live interoperability smoke.
+- Task 9 breaker Ruling: the live QR/approval/Unicode/resize/focus/reconnect/
+  revoke smoke is real and load-bearing, so perform it interactively before
+  completing Task 9. Cost if wrong: unit/instrumentation coverage could hide a
+  real cross-device incompatibility.
+- Task 9 parked/carry-to-Task-10 Ruling: desktop bounds advertised hosts at 16
+  while Android accepts/stores at most 8. The current two-address live smoke is
+  unaffected, but align the protocol bound before merge. Cost if wrong: a
+  desktop with 9–16 shareable interfaces can generate an invite Android
+  rejects.
 
 ## Task 5 review breaker rulings
 
