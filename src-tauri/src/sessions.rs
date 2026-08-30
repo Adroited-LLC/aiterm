@@ -7268,6 +7268,18 @@ mod tests {
         assert!(error.contains("source name changed"), "{error}");
         assert_eq!(std::fs::read(&source).unwrap(), b"unarchived replacement");
         assert_eq!(std::fs::read(&displaced).unwrap(), b"archived original");
+        let recovery = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aiterm-source-recovery-")
+            })
+            .expect("the exact held source must gain a durable recovery link")
+            .path();
+        assert_eq!(std::fs::read(recovery).unwrap(), b"archived original");
         assert!(!std::fs::read_dir(&project)
             .unwrap()
             .flatten()
