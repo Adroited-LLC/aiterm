@@ -1229,7 +1229,9 @@ async fn tab_list_and_focus_projection_never_serialize_internal_attachment_ids()
                 "private-ids-test",
                 TerminalSize::try_new(20, 2).unwrap(),
             )
-            .with_command("sleep 5"),
+            // Keep the fixture alive through TLS setup even on a loaded test
+            // host. The registry closes it explicitly at teardown.
+            .with_command("sleep 300"),
         )
         .unwrap();
     let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
