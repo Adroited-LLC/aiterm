@@ -2746,19 +2746,6 @@ fn archive_verified_inputs_with_transaction_hooks(
             "durable session archives exist but post-retirement identity validation failed; recoverable quarantines: {locations}: {error}"
         )
     })?;
-    for recovery in &archive_recoveries {
-        if unsafe { libc::unlinkat(destination.file.as_raw_fd(), recovery.name.as_ptr(), 0) } != 0 {
-            return Err(format!(
-                "archive recovery link remains at {}: {}",
-                recovery.path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        destination
-            .file
-            .sync_all()
-            .map_err(|error| error.to_string())?;
-    }
     before_recovery_release(&prepared)?;
     for (archive, recovery) in prepared.iter().zip(&archive_recoveries) {
         if !directory_entry_is_exact_object(
@@ -2772,6 +2759,19 @@ fn archive_verified_inputs_with_transaction_hooks(
             ));
         }
     }
+    for recovery in &archive_recoveries {
+        if unsafe { libc::unlinkat(destination.file.as_raw_fd(), recovery.name.as_ptr(), 0) } != 0 {
+            return Err(format!(
+                "archive recovery link remains at {}: {}",
+                recovery.path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    destination
+        .file
+        .sync_all()
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
