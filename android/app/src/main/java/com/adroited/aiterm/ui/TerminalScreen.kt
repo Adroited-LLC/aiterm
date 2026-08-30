@@ -209,7 +209,11 @@ fun TerminalScreenContent(
         ) { padding ->
             Column(Modifier.fillMaxSize().padding(padding)) {
                 ConnectionRail(state, onReconnect)
-                BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                BoxWithConstraints(
+                    Modifier.weight(1f).fillMaxWidth()
+                        .background(Color(0xFF07111B))
+                        .padding(horizontal = 4.dp, vertical = 3.dp),
+                ) {
                     val measuredCols = (maxWidth / terminalMetrics.cellWidth).toInt().coerceIn(1, 512)
                     val measuredRows = (maxHeight / terminalMetrics.lineHeight).toInt().coerceIn(1, 512)
                     LaunchedEffect(measuredCols, measuredRows, screen?.tabId) {
@@ -408,10 +412,10 @@ private fun TerminalGrid(
     var imeValue by remember { mutableStateOf(TextFieldValue()) }
     val density = LocalDensity.current
     Box(
-        modifier.background(Color(0xFF07111B)).clickable {
+        modifier.clickable {
             focusRequester.requestFocus()
             keyboard?.show()
-        }.padding(horizontal = 4.dp, vertical = 3.dp).testTag("terminal-grid"),
+        }.testTag("terminal-grid"),
     ) {
         SelectionContainer {
             LazyColumn(
