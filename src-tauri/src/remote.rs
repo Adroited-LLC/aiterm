@@ -856,16 +856,24 @@ async fn session_files(Path(id): Path<String>) -> Response {
             });
         }
         if let Some(d) = detail {
+            // Files changed while the session was alive — from its start to
+            // a little after its last word. A session that ended yesterday
+            // does not get credit for what another one did today in the
+            // same folder; a session running now keeps gaining files.
             let since = d.started.as_deref().and_then(parse_iso_secs).unwrap_or(0);
+            let until = d.last_active.as_deref().and_then(parse_iso_secs).map(|t| t + 15 * 60).unwrap_or(u64::MAX);
             if let Some(cwd) = d.cwd.as_deref() {
                 walk_recent(std::path::Path::new(cwd), since, 0, &mut |e| {
-                    if out.len() < FILES_CAP && seen.insert(e.path.clone()) {
+                    if e.modified <= until && out.len() < FILES_CAP && seen.insert(e.path.clone()) {
                         out.push(e);
                     }
                 });
             }
         }
-        out.sort_by(|a, b| b.modified.cmp(&a.modified));
+        // What the agent made or said it wrote comes first; the folder's
+        // other changes follow. Newest first within each.
+        let rank = |v: &str| match v { "made" => 0, "wrote" => 1, _ => 2 };
+        out.sort_by(|a, b| rank(&a.via).cmp(&rank(&b.via)).then(b.modified.cmp(&a.modified)));
         out
     })
     .await;
