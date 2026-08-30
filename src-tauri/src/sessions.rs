@@ -7521,6 +7521,72 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn exact_purge_deduplicates_more_than_257_retained_restore_alias_pairs() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-retained-alias-purge-bound-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let trash = root.join("trash");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::write(&outside, b"different object must survive").unwrap();
+        for index in 0..258 {
+            let recovery = trash.join(format!(".aiterm-restore-recovery-{index:04}"));
+            let retired = trash.join(format!(".aiterm-restored-archive-{index:04}"));
+            std::fs::write(&recovery, format!("retained-{index}")).unwrap();
+            std::fs::hard_link(&recovery, &retired).unwrap();
+        }
+
+        trash_empty_in_directory(&trash).unwrap();
+
+        let snapshot = snapshot_directory_entries(&VerifiedDirectory::open(&trash).unwrap().file)
+            .unwrap();
+        assert!(snapshot.iter().all(is_effective_purge_tombstone));
+        assert!(snapshot
+            .iter()
+            .filter(|entry| is_retained_restore_recovery(&entry.name))
+            .all(|entry| entry.size == 0));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"different object must survive");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_purge_counts_distinct_retained_inodes_before_destructive_work() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-distinct-retained-purge-bound-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let trash = root.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        for index in 0..=MAX_EXACT_ARCHIVE_ENTRIES {
+            std::fs::write(
+                trash.join(format!(".aiterm-restored-archive-{index:04}")),
+                format!("distinct-{index}"),
+            )
+            .unwrap();
+        }
+
+        let error = trash_empty_in_directory(&trash).unwrap_err();
+
+        assert!(error.contains("entry limit"), "{error}");
+        assert_eq!(
+            std::fs::read(trash.join(".aiterm-restored-archive-0000")).unwrap(),
+            b"distinct-0"
+        );
+        assert_eq!(
+            std::fs::read(trash.join(format!(
+                ".aiterm-restored-archive-{:04}",
+                MAX_EXACT_ARCHIVE_ENTRIES
+            )))
+            .unwrap(),
+            format!("distinct-{}", MAX_EXACT_ARCHIVE_ENTRIES).as_bytes()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn permanent_trash_delete_removes_strict_codex_rollout_task_and_job_archives() {
         let root = std::env::temp_dir().join(format!(
             "aiterm-strict-trash-purge-{}",
