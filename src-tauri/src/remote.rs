@@ -633,6 +633,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}/changes", get(session_changes))
         .route("/v1/browse", get(browse))
+        .route("/v1/dirs", post(make_dir))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/conversation", get(conversation))
         .route("/v1/sessions/{id}/open", post(open))
@@ -1054,12 +1055,37 @@ async fn browse(Query(q): Query<FileQuery>) -> Response {
     let Ok(real) = std::path::PathBuf::from(&q.path).canonicalize() else {
         return err(StatusCode::NOT_FOUND, "no such folder");
     };
-    if !real.is_dir() || !file_is_allowed(&real).await {
-        return err(StatusCode::FORBIDDEN, "not a workspace folder");
+    // Directory listings are allowed anywhere under home — picking where a
+    // NEW session lives means walking the tree, not only where sessions
+    // already are. Serving file *contents* stays gated the strict way.
+    if !real.is_dir() || !(under_home(&real) || file_is_allowed(&real).await) {
+        return err(StatusCode::FORBIDDEN, "not a browsable folder");
     }
     match crate::fsx::list_dir(real.to_string_lossy().into_owned()).await {
         Ok(entries) => Json(entries).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+fn under_home(p: &std::path::Path) -> bool {
+    dirs::home_dir().map(|h| p.starts_with(h)).unwrap_or(false)
+}
+
+#[derive(Deserialize)]
+struct DirBody {
+    path: String,
+}
+
+/// Make a directory (and its parents) under home — the phone's "new
+/// project folder". Textual check on top of the home guard: no `..`.
+async fn make_dir(Json(b): Json<DirBody>) -> Response {
+    let path = std::path::PathBuf::from(&b.path);
+    if b.path.contains("..") || !under_home(&path) {
+        return err(StatusCode::FORBIDDEN, "only under the home folder");
+    }
+    match std::fs::create_dir_all(&path) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
