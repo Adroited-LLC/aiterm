@@ -116,11 +116,32 @@ pub fn start(app: &AppHandle) {
     let ledger = app.state::<ChangeLedger>();
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let sender = tx.clone();
-    let watcher = notify::recommended_watcher(move |res| {
-        let _ = sender.send(res);
+    let seen = std::sync::atomic::AtomicU32::new(0);
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        // Reads are not changes, and a big tree is read constantly — by the
+        // dev server, by git, by builds. Forward only what can matter, or the
+        // pump never sees a quiet moment to settle a burst.
+        let Ok(ev) = res else { return };
+        if matches!(ev.kind, notify::EventKind::Access(_) | notify::EventKind::Other | notify::EventKind::Any) {
+            return;
+        }
+        if ev.paths.iter().all(|p| {
+            let s = p.to_string_lossy();
+            SKIP.iter().any(|k| s.contains(k))
+        }) {
+            return;
+        }
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 3 {
+            crate::diag!("changes", "event: {:?} {:?}", ev.kind, ev.paths.first());
+        }
+        if sender.send(Ok(ev)).is_err() {
+            crate::diag!("changes", "callback: pump gone");
+        }
     });
     match watcher {
         Ok(w) => {
+            crate::diag!("changes", "watcher ready");
             ledger.inner.lock().unwrap().watcher = Some(w);
             *ledger.tx.lock().unwrap() = Some(tx);
         }
@@ -179,7 +200,10 @@ fn pump(app: AppHandle, rx: mpsc::Receiver<notify::Result<notify::Event>>) {
     loop {
         let first = match rx.recv() {
             Ok(v) => v,
-            Err(_) => break,
+            Err(_) => {
+                crate::diag!("changes", "pump: channel closed");
+                break;
+            }
         };
         // Coalesce a burst: an editor writes a temp file, renames, touches.
         let mut pending: HashMap<PathBuf, &'static str> = HashMap::new();
@@ -205,9 +229,16 @@ fn pump(app: AppHandle, rx: mpsc::Receiver<notify::Result<notify::Event>>) {
             }
         };
         note(first);
-        while let Ok(ev) = rx.recv_timeout(SETTLE) {
+        // Settle, but not forever: a tree that is never quiet still gets
+        // its changes recorded, two seconds at a time.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Ok(ev) = rx.recv_timeout(SETTLE.min(deadline.saturating_duration_since(Instant::now()))) {
             note(ev);
+            if Instant::now() >= deadline {
+                break;
+            }
         }
+        crate::diag!("changes", "burst: {} path(s)", pending.len());
         for (path, kind) in pending {
             record(&app, path, kind);
         }
