@@ -1,5 +1,10 @@
 package com.adroited.aiterm.remote
 
+import com.adroited.aiterm.pairing.AuthChallengeFrame
+import com.adroited.aiterm.pairing.PairedDesktop
+import com.adroited.aiterm.pairing.PairingFrames
+import com.adroited.aiterm.security.AppLock
+import com.adroited.aiterm.security.DeviceKeys
 import com.adroited.aiterm.terminal.DefaultTerminalScreenStore
 import com.adroited.aiterm.terminal.CursorState
 import com.adroited.aiterm.terminal.ScreenCell
@@ -8,6 +13,7 @@ import com.adroited.aiterm.terminal.ScreenSnapshot
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -117,6 +123,85 @@ class RemoteClientTest {
         advanceTimeBy(32_000)
         runCurrent()
         assertEquals(ConnectionState.Revoked, client.state.value.connection)
+    }
+
+    @Test
+    fun fullQueueRevocationCompletionPurgesStateAndNeverReconnects() = runTest {
+        val socket = roundThreeAuthenticatedSocket()
+        val transport = roundThreeAuthenticatedTransport(
+            socket,
+            backgroundScope,
+            StandardTestDispatcher(testScheduler),
+        )
+        var factoryCalls = 0
+        val store = DefaultTerminalScreenStore()
+        val client = RemoteClient(
+            transportFactory = {
+                factoryCalls += 1
+                transport
+            },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        assertTrue(client.connect())
+        store.replace(roundThreeScreen())
+        client.acceptForTest(RemoteServerEvent.TransferStarted("stale-transfer"))
+        repeat(64) {
+            transport.acceptEnvelopeForTest(RemoteEventEnvelope(0, "error", roundThreeBusyError()))
+        }
+
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(0, "auth.revoked", byteArrayOf()))
+        runCurrent()
+
+        assertEquals(ConnectionState.Revoked, client.state.value.connection)
+        assertEquals(null, store.screen.value)
+        assertEquals(0, client.state.value.pendingTransfers)
+        advanceTimeBy(32_000)
+        runCurrent()
+        assertEquals(1, factoryCalls)
+    }
+
+    @Test
+    fun fullQueueProtocolFailureCompletionPurgesStateAndReconnects() = runTest {
+        val socket = roundThreeAuthenticatedSocket()
+        val first = roundThreeAuthenticatedTransport(
+            socket,
+            backgroundScope,
+            StandardTestDispatcher(testScheduler),
+        )
+        val replacement = FakeRemoteTransport()
+        var factoryCalls = 0
+        val store = DefaultTerminalScreenStore()
+        val client = RemoteClient(
+            transportFactory = {
+                factoryCalls += 1
+                if (factoryCalls == 1) first else replacement
+            },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        assertTrue(client.connect())
+        store.replace(roundThreeScreen())
+        client.acceptForTest(RemoteServerEvent.TransferStarted("stale-transfer"))
+        repeat(64) {
+            first.acceptEnvelopeForTest(RemoteEventEnvelope(0, "error", roundThreeBusyError()))
+        }
+        socket.incoming.send(byteArrayOf(0xff.toByte()))
+
+        runCurrent()
+
+        assertEquals(ConnectionState.Reconnecting, client.state.value.connection)
+        assertEquals(null, store.screen.value)
+        assertEquals(0, client.state.value.pendingTransfers)
+        advanceTimeBy(1_000)
+        runCurrent()
+        assertEquals(2, factoryCalls)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        client.lock()
     }
 
     @Test
@@ -597,4 +682,63 @@ private fun attachedPayload(tabId: String, attachmentId: String): ByteArray {
         text("attachment_id") + text(attachmentId) +
         text("has_focus") + "f4" + text("title") + text(tabId)
     return encoded.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+}
+
+private fun roundThreeScreen() = ScreenSnapshot(
+    tabId = "tab-1",
+    revision = 1,
+    cols = 1,
+    rows = 1,
+    visible = listOf(ScreenRow(listOf(ScreenCell("x")))),
+    cursor = CursorState(0, 0, true),
+)
+
+private fun roundThreeAuthenticatedSocket() = RoundThreeBinarySocket().apply {
+    incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+    incoming.trySend(byteArrayOf(0xa1.toByte(), 0x64, 0x6b, 0x69, 0x6e, 0x64, 0x67, 0x61, 0x75, 0x74, 0x68, 0x2e, 0x6f, 0x6b))
+}
+
+private fun roundThreeBusyError() = byteArrayOf(
+    0xa2.toByte(),
+    0x64, 0x63, 0x6f, 0x64, 0x65,
+    0x64, 0x62, 0x75, 0x73, 0x79,
+    0x67, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65,
+    0x64, 0x77, 0x61, 0x69, 0x74,
+)
+
+private fun roundThreeAuthenticatedTransport(
+    socket: RoundThreeBinarySocket,
+    scope: kotlinx.coroutines.CoroutineScope,
+    dispatcher: kotlinx.coroutines.CoroutineDispatcher,
+) = AuthenticatedRemoteTransport(
+    desktop = PairedDesktop(
+        deviceId = "device-1",
+        displayName = "Desktop",
+        hosts = listOf("desktop.local"),
+        port = 43871,
+        serverSpkiFingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        lastSeenEpochMillis = null,
+    ),
+    deviceKeys = object : DeviceKeys {
+        override fun devicePublicKey(): ByteArray = ByteArray(33)
+        override fun signChallenge(nonce: ByteArray): ByteArray = byteArrayOf(1, 2, 3)
+    },
+    appLock = AppLock(clock = { 0L }),
+    dialer = object : RemoteSocketDialer {
+        override suspend fun open(desktop: PairedDesktop): RemoteBinarySocket = socket
+    },
+    scope = scope,
+    dispatcher = dispatcher,
+)
+
+private class RoundThreeBinarySocket : RemoteBinarySocket {
+    val incoming = Channel<ByteArray>(Channel.UNLIMITED)
+    var closed = false
+
+    override suspend fun receive(): ByteArray = incoming.receive()
+    override fun send(bytes: ByteArray): Boolean = true
+    override fun close() {
+        closed = true
+        incoming.close()
+    }
 }
