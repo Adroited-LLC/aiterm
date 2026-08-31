@@ -19,6 +19,7 @@ import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -35,6 +36,7 @@ import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.ScreenSnapshot
 import com.adroited.aiterm.terminal.TerminalModes
 import com.adroited.aiterm.testing.ComposeTestActivity
+import kotlin.math.roundToInt
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -132,6 +134,87 @@ class TerminalScreenTest {
         compose.runOnIdle {
             assertEquals(listOf("\u001b[200~hello phone\u001b[201~", "\r"), sent)
         }
+    }
+
+    @Test
+    fun terminalKeyEnterSubmitsAnOrdinaryComposerDraft() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-key-enter-ordinary"),
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .performTextInput("status")
+        compose.onNodeWithText("Enter").performScrollTo().performClick()
+
+        compose.runOnIdle { assertEquals(listOf("status", "\r"), sent) }
+        assertTrue(
+            compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true)
+                .fetchSemanticsNodes().isEmpty(),
+        )
+    }
+
+    @Test
+    fun terminalKeyEnterSubmitsBracketedDraftBeforeCarriageReturn() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-key-enter-bracketed").copy(
+                    modes = TerminalModes(bracketedPaste = true),
+                ),
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .performTextInput("git status")
+        compose.onNodeWithText("Enter").performScrollTo().performClick()
+
+        compose.runOnIdle {
+            assertEquals(listOf("\u001b[200~git status\u001b[201~", "\r"), sent)
+        }
+    }
+
+    @Test
+    fun terminalKeyEnterSendsRawCarriageReturnWhenComposerIsClosed() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-key-enter-closed"),
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithText("Enter").performScrollTo().performClick()
+
+        compose.runOnIdle { assertEquals(listOf("\r"), sent) }
+    }
+
+    @Test
+    fun terminalKeyEnterKeepsAnEmptyComposerOpenAfterRawCarriageReturn() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-key-enter-empty"),
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Enter").performScrollTo().performClick()
+
+        compose.runOnIdle { assertEquals(listOf("\r"), sent) }
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed()
     }
 
     @Test
@@ -513,6 +596,80 @@ class TerminalScreenTest {
                 sizes.last().second,
             )
         }
+    }
+
+    @Test
+    fun sideNavigationInsetsKeepRenderedAndAdvertisedColumnsInsideTheSafeWidth() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        val leftNavigationPx = 47
+        val rightNavigationPx = 79
+        compose.setContent {
+            Box(Modifier.size(400.dp, 480.dp)) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = oneCellScreen("tab-side-navigation"),
+                    onResize = { cols, rows -> sizes += cols to rows },
+                    imeInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
+                    navigationInsets = androidx.compose.foundation.layout.WindowInsets(
+                        leftNavigationPx,
+                        0,
+                        rightNavigationPx,
+                        0,
+                    ),
+                )
+            }
+        }
+
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
+        val surface = compose.onNodeWithTag("terminal-surface", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val cellWidthPx = compose.onNodeWithTag("terminal-cell-0-0", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot.width.toInt()
+        val viewportPaddingPx = (4f * compose.activity.resources.displayMetrics.density)
+            .roundToInt()
+        val surfaceWidthPx = surface.width.roundToInt()
+        val expectedColumns = (
+            surfaceWidthPx - leftNavigationPx - rightNavigationPx - 2 * viewportPaddingPx
+        ) / cellWidthPx
+        val unsafeFullWidthColumns = (surfaceWidthPx - 2 * viewportPaddingPx) / cellWidthPx
+
+        assertTrue(
+            "fixture must distinguish side-safe columns from full-width columns",
+            expectedColumns < unsafeFullWidthColumns,
+        )
+        compose.runOnIdle { assertEquals(expectedColumns, sizes.last().first) }
+        assertEquals(surface.left + leftNavigationPx + viewportPaddingPx, render.left, 1f)
+        assertEquals(surface.right - rightNavigationPx - viewportPaddingPx, render.right, 1f)
+    }
+
+    @Test
+    fun navigationBarOnlyObstructionLimitsRowsWhileImeIsHidden() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        compose.setContent {
+            Box(Modifier.size(400.dp, 800.dp)) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = oneCellScreen("tab-navigation-only"),
+                    onResize = { cols, rows -> sizes += cols to rows },
+                    imeInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
+                    navigationInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 61),
+                )
+            }
+        }
+
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
+        val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val rowHeightPx = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot.height.roundToInt()
+        val visibleHeightPx = (chrome.top - render.top).roundToInt()
+        val expectedRows = (visibleHeightPx / rowHeightPx).coerceIn(1, 512)
+
+        compose.runOnIdle { assertEquals(expectedRows, sizes.last().second) }
     }
 
     @Test

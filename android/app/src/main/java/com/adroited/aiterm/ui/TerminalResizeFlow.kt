@@ -10,4 +10,6 @@ internal const val TERMINAL_RESIZE_SETTLE_MILLIS = 150L
 
 @OptIn(FlowPreview::class)
 internal fun Flow<TerminalSize>.settledTerminalSizes(): Flow<TerminalSize> =
-    distinctUntilChanged().debounce(TERMINAL_RESIZE_SETTLE_MILLIS)
+    distinctUntilChanged()
+        .debounce(TERMINAL_RESIZE_SETTLE_MILLIS)
+        .distinctUntilChanged()

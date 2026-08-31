@@ -6,6 +6,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -66,9 +67,9 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
@@ -164,6 +165,8 @@ fun TerminalScreenContent(
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
     onResize: (Int, Int) -> Unit = { _, _ -> },
     onLoadScrollback: () -> Unit = {},
+    imeInsets: WindowInsets = WindowInsets.ime,
+    navigationInsets: WindowInsets = WindowInsets.navigationBars,
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
@@ -174,10 +177,13 @@ fun TerminalScreenContent(
     val inputFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     val density = LocalDensity.current
+    val layoutDirection = LocalLayoutDirection.current
     var composer by remember(screen?.tabId) { mutableStateOf(TerminalComposerState()) }
     var chromeInteractiveHeightPx by remember(screen?.tabId) { mutableIntStateOf(0) }
-    val bottomInsets = WindowInsets.ime.union(WindowInsets.navigationBars)
+    val bottomInsets = imeInsets.union(navigationInsets)
     val bottomInsetPx = bottomInsets.getBottom(density)
+    val navigationLeftInsetPx = navigationInsets.getLeft(density, layoutDirection)
+    val navigationRightInsetPx = navigationInsets.getRight(density, layoutDirection)
     val onViewportSizeChanged = remember {
         { size: TerminalSize ->
             cols = size.cols
@@ -190,6 +196,13 @@ fun TerminalScreenContent(
                 composer = composer.open()
             }
         }
+    }
+    fun submitComposer() {
+        val activeScreen = screen ?: return
+        val update = composer.sendText(activeScreen.modes.bracketedPaste)
+        composer = update.state
+        update.outbound.forEach(onInput)
+        if (!update.state.expanded) keyboard?.hide()
     }
 
     BackHandler(enabled = composer.expanded) {
@@ -258,6 +271,8 @@ fun TerminalScreenContent(
                         scrollback = scrollback,
                         metrics = terminalMetrics,
                         bottomObstructionPx = bottomInsetPx + chromeInteractiveHeightPx,
+                        leftObstructionPx = navigationLeftInsetPx,
+                        rightObstructionPx = navigationRightInsetPx,
                         modifier = Modifier.weight(1f).fillMaxWidth(),
                         emptyMessage = if (state.tabs.isEmpty()) {
                             "No remote tabs are open."
@@ -290,12 +305,7 @@ fun TerminalScreenContent(
                                         composer = update.state
                                         update.outbound.forEach(onInput)
                                     },
-                                    onSend = {
-                                        val update = composer.sendText(screen.modes.bracketedPaste)
-                                        composer = update.state
-                                        update.outbound.forEach(onInput)
-                                        if (!update.state.expanded) keyboard?.hide()
-                                    },
+                                    onSend = ::submitComposer,
                                     focusRequester = inputFocus,
                                     enabled = state.focus == FocusOwner.Self,
                                 )
@@ -320,6 +330,8 @@ fun TerminalScreenContent(
                             onExpandedChange = onKeyBarExpandedChange,
                             onInput = onInput,
                             onOpenComposer = { if (screen != null) composer = composer.open() },
+                            submitComposerDraft = composer.expanded && composer.value.text.isNotEmpty(),
+                            onSubmitComposer = ::submitComposer,
                         )
                     }
                 }
@@ -349,6 +361,8 @@ private fun TerminalViewport(
     scrollback: List<ScreenRow>,
     metrics: TerminalMetrics,
     bottomObstructionPx: Int,
+    leftObstructionPx: Int,
+    rightObstructionPx: Int,
     modifier: Modifier,
     emptyMessage: String,
     onViewportSizeChanged: (TerminalSize) -> Unit,
@@ -356,19 +370,21 @@ private fun TerminalViewport(
     onRequestKeyboard: () -> Unit,
 ) {
     val density = LocalDensity.current
-    val viewportVerticalPadding = 3.dp
+    val horizontalPaddingPx = with(density) { 4.dp.roundToPx() }
+    val verticalPaddingPx = with(density) { 3.dp.roundToPx() }
     BoxWithConstraints(
-        modifier.background(Color(0xFF07111B))
-            .padding(horizontal = 4.dp, vertical = viewportVerticalPadding),
+        modifier.background(Color(0xFF07111B)),
     ) {
-        val bottomObstruction = with(density) { bottomObstructionPx.toDp() }
-        val obstructionWithinRender = (bottomObstruction - viewportVerticalPadding)
-            .coerceAtLeast(0.dp)
-        val availableHeight = (maxHeight - obstructionWithinRender)
-            .coerceAtLeast(metrics.lineHeight)
-        val measuredSize = TerminalSize(
-            cols = (maxWidth / metrics.cellWidth).toInt().coerceIn(1, 512),
-            rows = (availableHeight / metrics.lineHeight).toInt().coerceIn(1, 512),
+        val measuredSize = terminalViewportSizePx(
+            viewportWidthPx = constraints.maxWidth,
+            viewportHeightPx = constraints.maxHeight,
+            leftObstructionPx = leftObstructionPx,
+            rightObstructionPx = rightObstructionPx,
+            bottomObstructionPx = bottomObstructionPx,
+            horizontalPaddingPx = horizontalPaddingPx,
+            verticalPaddingPx = verticalPaddingPx,
+            cellWidthPx = metrics.cellWidthPx,
+            lineHeightPx = metrics.lineHeightPx,
         )
         val currentMeasuredSize by rememberUpdatedState(measuredSize)
         val currentOnResize by rememberUpdatedState(onResize)
@@ -382,19 +398,28 @@ private fun TerminalViewport(
                     .collect { size -> currentOnResize(size.cols, size.rows) }
             }
         }
-        TerminalGrid(
-            screen = screen,
-            scrollback = scrollback,
-            modifier = Modifier.fillMaxSize(),
-            onRequestKeyboard = onRequestKeyboard,
-            metrics = metrics,
-        )
-        if (screen == null) {
-            Text(
-                emptyMessage,
-                modifier = Modifier.align(Alignment.Center),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+        Box(
+            Modifier.fillMaxSize().absolutePadding(
+                left = with(density) { (leftObstructionPx + horizontalPaddingPx).toDp() },
+                top = with(density) { verticalPaddingPx.toDp() },
+                right = with(density) { (rightObstructionPx + horizontalPaddingPx).toDp() },
+                bottom = with(density) { verticalPaddingPx.toDp() },
+            ),
+        ) {
+            TerminalGrid(
+                screen = screen,
+                scrollback = scrollback,
+                modifier = Modifier.fillMaxSize(),
+                onRequestKeyboard = onRequestKeyboard,
+                metrics = metrics,
             )
+            if (screen == null) {
+                Text(
+                    emptyMessage,
+                    modifier = Modifier.align(Alignment.Center),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -680,6 +705,8 @@ private fun TerminalCellText(cell: ScreenCell, linked: Boolean, metrics: Termina
 private data class TerminalMetrics(
     val cellWidth: Dp,
     val lineHeight: Dp,
+    val cellWidthPx: Int,
+    val lineHeightPx: Int,
     val textStyle: TextStyle,
 )
 
@@ -704,6 +731,8 @@ private fun rememberTerminalMetrics(): TerminalMetrics {
     return TerminalMetrics(
         cellWidth = with(density) { measured.size.width.toDp() },
         lineHeight = with(density) { measured.size.height.toDp() },
+        cellWidthPx = measured.size.width,
+        lineHeightPx = measured.size.height,
         textStyle = textStyle,
     )
 }
@@ -716,6 +745,8 @@ private fun ExtraKeys(
     onExpandedChange: (Boolean) -> Unit,
     onInput: (String) -> Unit,
     onOpenComposer: () -> Unit,
+    submitComposerDraft: Boolean,
+    onSubmitComposer: () -> Unit,
 ) {
     var control by remember { mutableStateOf(false) }
     var alt by remember { mutableStateOf(false) }
@@ -749,7 +780,15 @@ private fun ExtraKeys(
                 ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
                 ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
                 ExtraKey("Tab") { send("\t") }
-                ExtraKey("Enter") { send("\r") }
+                ExtraKey("Enter") {
+                    if (submitComposerDraft) {
+                        onSubmitComposer()
+                        control = false
+                        alt = false
+                    } else {
+                        send("\r")
+                    }
+                }
                 ExtraKey("⌫") { send("\u007f") }
                 ExtraKey("←") { send(if (applicationCursor) "\u001bOD" else "\u001b[D") }
                 ExtraKey("↑") { send(if (applicationCursor) "\u001bOA" else "\u001b[A") }
@@ -826,18 +865,6 @@ internal fun terminalIndexedColor(index: Int): Color {
     }
     val gray = 8 + (value - 232) * 10
     return Color(gray, gray, gray)
-}
-
-internal fun terminalKeySequence(key: Key, applicationCursor: Boolean): String? = when (key) {
-    Key.Backspace -> "\u007f"
-    Key.Enter, Key.NumPadEnter -> "\r"
-    Key.Tab -> "\t"
-    Key.Escape -> "\u001b"
-    Key.DirectionLeft -> if (applicationCursor) "\u001bOD" else "\u001b[D"
-    Key.DirectionUp -> if (applicationCursor) "\u001bOA" else "\u001b[A"
-    Key.DirectionDown -> if (applicationCursor) "\u001bOB" else "\u001b[B"
-    Key.DirectionRight -> if (applicationCursor) "\u001bOC" else "\u001b[C"
-    else -> null
 }
 
 private fun Color.ifTransparent(fallback: Color): Color = if (alpha == 0f) fallback else this

@@ -50,4 +50,24 @@ class TerminalResizeFlowTest {
 
         assertEquals(listOf(TerminalSize(80, 24)), seen)
     }
+
+    @Test
+    fun returningToTheLastPublishedSizeWithinTheSettlingWindowDoesNotRepublishIt() = runTest {
+        val source = MutableSharedFlow<TerminalSize>(extraBufferCapacity = 3)
+        val seen = mutableListOf<TerminalSize>()
+        backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) {
+            source.settledTerminalSizes().toList(seen)
+        }
+
+        source.tryEmit(TerminalSize(80, 24))
+        advanceTimeBy(150)
+        runCurrent()
+        source.tryEmit(TerminalSize(80, 20))
+        advanceTimeBy(50)
+        source.tryEmit(TerminalSize(80, 24))
+        advanceTimeBy(150)
+        runCurrent()
+
+        assertEquals(listOf(TerminalSize(80, 24)), seen)
+    }
 }
