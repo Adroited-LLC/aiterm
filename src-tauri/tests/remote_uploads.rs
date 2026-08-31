@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
 
 struct UploadFixture {
@@ -164,6 +165,29 @@ fn publish_at(fixture: &mut UploadFixture, jpeg: &[u8], now: SystemTime) -> Path
         .finish_at(&began.upload_id, now)
         .unwrap()
         .path
+}
+
+#[test]
+fn a_cancelled_finish_never_publishes_an_attachment() {
+    let mut fixture = UploadFixture::new("cancelled-finish");
+    let jpeg = fixture.jpeg(64, 48);
+    let began = fixture
+        .uploads
+        .begin(Some(&fixture.cwd), fixture.begin(jpeg.len(), digest(&jpeg)))
+        .unwrap();
+    fixture.uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
+
+    let cancellation = AtomicBool::new(true);
+    let error = fixture
+        .uploads
+        .finish_cancellable(&began.upload_id, &cancellation)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), UploadErrorKind::Cancelled);
+    assert!(fixture.uploads.target(&began.upload_id).is_none());
+    fixture.store.maintain(SystemTime::now()).unwrap();
+    assert!(fixture.part_files().is_empty());
+    assert!(files_with_extension(&fixture.cwd.join(".aiterm/attachments"), "jpg").is_empty());
 }
 
 #[test]

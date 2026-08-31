@@ -32,7 +32,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -162,8 +162,8 @@ impl TlsIdentity {
         let parsed = rustls::server::ParsedCertificate::try_from(&certificate_der)
             .map_err(GatewayError::tls)?;
         let localhost = ServerName::try_from("localhost").map_err(GatewayError::tls)?;
-        let names = std::iter::once(localhost)
-            .chain(subject_alt_ips.iter().copied().map(ServerName::from));
+        let names =
+            std::iter::once(localhost).chain(subject_alt_ips.iter().copied().map(ServerName::from));
 
         for name in names {
             match rustls::client::verify_server_name(&parsed, &name) {
@@ -381,7 +381,11 @@ impl RemoteGateway {
             .handle(run_handle)
             .serve(router.into_make_service_with_connect_info::<SocketAddr>());
         let task = tokio::spawn(server);
-        let maintenance = tokio::spawn(maintain_attachment_store(attachment_store));
+        let (maintenance_shutdown, maintenance_cancellation) = tokio::sync::watch::channel(false);
+        let maintenance = tokio::spawn(maintain_attachment_store(
+            attachment_store,
+            maintenance_cancellation,
+        ));
         Ok(GatewayHandle {
             local_addr,
             certificate_der,
@@ -389,6 +393,7 @@ impl RemoteGateway {
             server_handle,
             task: Some(task),
             maintenance: Some(maintenance),
+            maintenance_shutdown,
         })
     }
 }
@@ -400,6 +405,7 @@ pub struct GatewayHandle {
     server_handle: axum_server::Handle<SocketAddr>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     maintenance: Option<tokio::task::JoinHandle<()>>,
+    maintenance_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl GatewayHandle {
@@ -417,8 +423,8 @@ impl GatewayHandle {
 
     pub async fn stop(mut self) -> Result<(), GatewayError> {
         self.server_handle.shutdown();
+        self.maintenance_shutdown.send_replace(true);
         if let Some(maintenance) = self.maintenance.take() {
-            maintenance.abort();
             let _ = maintenance.await;
         }
         let Some(task) = self.task.take() else {
@@ -433,29 +439,75 @@ impl GatewayHandle {
 impl Drop for GatewayHandle {
     fn drop(&mut self) {
         self.server_handle.shutdown();
-        if let Some(maintenance) = self.maintenance.take() {
-            maintenance.abort();
+        self.maintenance_shutdown.send_replace(true);
+    }
+}
+
+async fn maintain_attachment_store(
+    store: AttachmentStore,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(ATTACHMENT_MAINTENANCE_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::select! {
+        changed = shutdown.changed() => {
+            let _ = changed;
+            return;
+        }
+        _ = interval.tick() => {}
+    }
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return;
+            }
+            _ = interval.tick() => {
+                let maintenance_store = store.clone();
+                let mut task = tokio::task::spawn_blocking(move || {
+                    maintenance_store.maintain(SystemTime::now())
+                });
+                if await_attachment_maintenance(&mut task, &mut shutdown).await {
+                    return;
+                }
+            }
         }
     }
 }
 
-async fn maintain_attachment_store(store: AttachmentStore) {
-    let mut interval = tokio::time::interval(ATTACHMENT_MAINTENANCE_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
-    loop {
-        interval.tick().await;
-        let maintenance_store = store.clone();
-        match tokio::task::spawn_blocking(move || maintenance_store.maintain(SystemTime::now()))
-            .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(error = %error, "terminal attachment maintenance failed")
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "terminal attachment maintenance task failed")
-            }
+/// Wait for a running blocking maintenance call even after shutdown was
+/// requested. The caller may then return knowing no detached maintenance work
+/// can mutate attachment storage after gateway shutdown completes.
+async fn await_attachment_maintenance(
+    task: &mut tokio::task::JoinHandle<Result<(), UploadError>>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        log_attachment_maintenance(task.await);
+        return true;
+    }
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            let _ = changed;
+            log_attachment_maintenance((&mut *task).await);
+            true
+        }
+        result = &mut *task => {
+            log_attachment_maintenance(result);
+            false
+        }
+    }
+}
+
+fn log_attachment_maintenance(result: Result<Result<(), UploadError>, tokio::task::JoinError>) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "terminal attachment maintenance failed")
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "terminal attachment maintenance task failed")
         }
     }
 }
@@ -1511,8 +1563,9 @@ impl RemoteServices {
         request: &RemoteRequest,
         attachments: &HashMap<AttachmentId, OwnedAttachment>,
         upload_set: &Arc<Mutex<UploadSet>>,
+        cancelled: &AtomicBool,
     ) -> DispatchOutcome {
-        let result = self.dispatch_authorized(request, attachments, upload_set);
+        let result = self.dispatch_authorized(request, attachments, upload_set, cancelled);
         match result {
             Ok(outcome) => outcome,
             Err(code) => DispatchOutcome::frames(vec![error_response(
@@ -1528,6 +1581,7 @@ impl RemoteServices {
         request: &RemoteRequest,
         attachments: &HashMap<AttachmentId, OwnedAttachment>,
         upload_set: &Arc<Mutex<UploadSet>>,
+        cancelled: &AtomicBool,
     ) -> Result<DispatchOutcome, &'static str> {
         let request_id = request.request_id();
         match request.kind() {
@@ -1978,7 +2032,7 @@ impl RemoteServices {
                 let (tab_id, attachment_id) = upload_target(&upload_set, &body.upload_id)?;
                 authorize_attachment(attachments, &tab_id, &attachment_id)?;
                 let published = upload_set
-                    .finish(&body.upload_id)
+                    .finish_cancellable(&body.upload_id, cancelled)
                     .map_err(upload_error_code)?;
                 let path = published.path.to_str().ok_or("terminal.upload_failed")?;
                 bounded(path, MAX_PATH_BYTES)?;
@@ -2099,6 +2153,7 @@ fn upload_target(
 
 fn upload_error_code(error: UploadError) -> &'static str {
     match error.kind() {
+        UploadErrorKind::Cancelled => "terminal.upload_cancelled",
         UploadErrorKind::NotFound => "terminal.upload_not_found",
         UploadErrorKind::TooLarge | UploadErrorKind::Capacity => "terminal.upload_too_large",
         UploadErrorKind::OutOfOrder => "terminal.upload_out_of_order",
@@ -2613,7 +2668,7 @@ fn spawn_screen_work(
             ScreenWork::Snapshot(snapshot) => snapshot.revision(),
             ScreenWork::Diff(diff) => diff.revision(),
         };
-        let planned = remote_blocking(&services, &mut cancellation, move || match work {
+        let planned = remote_blocking(&services, &mut cancellation, move |_| match work {
             ScreenWork::Snapshot(snapshot) => {
                 plan_snapshot_for_attachment(0, &tab_id, Some(&attachment_id), snapshot)
             }
@@ -2805,7 +2860,7 @@ async fn attachment_actor(
                         let emission = remote_blocking(
                             &planning_services,
                             &mut planning_cancellation,
-                            move || build_resume_emission(
+                            move |_| build_resume_emission(
                                 resume_terminal,
                                 request_id,
                                 tab_id,
@@ -2913,7 +2968,7 @@ async fn attachment_actor(
                             let planned = remote_blocking(
                                 &final_services,
                                 &mut final_cancellation,
-                                move || plan_shared_snapshot_for_attachment(
+                                move |_| plan_shared_snapshot_for_attachment(
                                     0,
                                     &plan_tab,
                                     Some(&plan_attachment),
@@ -3208,7 +3263,20 @@ async fn remote_blocking<T, F>(
 ) -> Result<T, ()>
 where
     T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
+{
+    remote_blocking_with_timeout(services, cancellation, REMOTE_OPERATION_TIMEOUT, operation).await
+}
+
+async fn remote_blocking_with_timeout<T, F>(
+    services: &RemoteServices,
+    cancellation: &mut tokio::sync::watch::Receiver<bool>,
+    operation_timeout: Duration,
+    operation: F,
+) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> T + Send + 'static,
 {
     if *cancellation.borrow() {
         return Err(());
@@ -3222,25 +3290,39 @@ where
         permit = services.blocking_operations.clone().acquire_owned() => {
             permit.map_err(|_| ())?
         }
-        _ = tokio::time::sleep(REMOTE_OPERATION_TIMEOUT) => return Err(()),
+        _ = tokio::time::sleep(operation_timeout) => return Err(()),
     };
+    let operation_cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = operation_cancelled.clone();
     let mut task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        operation()
+        operation(worker_cancelled)
     });
     tokio::select! {
         biased;
         changed = cancellation.changed() => {
             let _ = changed;
-            task.abort();
+            operation_cancelled.store(true, Ordering::Release);
+            let _ = task.await;
             Err(())
         }
         result = &mut task => result.map_err(|_| ()),
-        _ = tokio::time::sleep(REMOTE_OPERATION_TIMEOUT) => {
-            task.abort();
+        _ = tokio::time::sleep(operation_timeout) => {
+            operation_cancelled.store(true, Ordering::Release);
+            let _ = task.await;
             Err(())
         }
     }
+}
+
+async fn cancel_connection_uploads(upload_set: Arc<Mutex<UploadSet>>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut upload_set = upload_set
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        upload_set.cancel_all();
+    })
+    .await;
 }
 
 async fn run_authenticated_socket(
@@ -3253,7 +3335,33 @@ async fn run_authenticated_socket(
 ) {
     let mut guard = RequestGuard::new(Instant::now());
     let (socket_sink, socket_stream) = socket.split();
-    let (cancelled, mut cancellation) = tokio::sync::watch::channel(false);
+    let (cancelled, mut socket_cancellation) = tokio::sync::watch::channel(false);
+    let (operation_cancelled, mut cancellation) = tokio::sync::watch::channel(false);
+    let mut revocation_watcher = tokio::spawn({
+        let mut connection_end = cancelled.subscribe();
+        let operation_cancelled = operation_cancelled.clone();
+        let devices = devices.clone();
+        let device_id = device_id.clone();
+        let mut revocation_updates = revocations.clone();
+        async move {
+            loop {
+                tokio::select! {
+                    changed = connection_end.changed() => {
+                        if changed.is_err() || *connection_end.borrow() {
+                            operation_cancelled.send_replace(true);
+                            return;
+                        }
+                    }
+                    changed = revocation_updates.changed() => {
+                        if changed.is_err() || !devices.is_trusted(&device_id) {
+                            operation_cancelled.send_replace(true);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
     let (inbound, mut inbound_messages) = tokio::sync::mpsc::channel(INBOUND_QUEUE);
     let mut reader = tokio::spawn(socket_reader(socket_stream, inbound, cancelled.clone()));
     let (controls, control_receiver) = tokio::sync::mpsc::channel(EGRESS_CONTROL_QUEUE);
@@ -3337,8 +3445,8 @@ async fn run_authenticated_socket(
                     registry_event_burst = 0;
                     message
                 },
-                changed = cancellation.changed() => {
-                    if changed.is_err() || *cancellation.borrow() { break; }
+                changed = socket_cancellation.changed() => {
+                    if changed.is_err() || *socket_cancellation.borrow() { break; }
                     continue;
                 }
                 _ = reap_tick.tick() => continue,
@@ -3416,9 +3524,18 @@ async fn run_authenticated_socket(
                 let dispatch_services = services.clone();
                 let dispatch_request = request.clone();
                 let dispatch_upload_set = upload_set.clone();
-                let outcome = match remote_blocking(&services, &mut cancellation, move || {
-                    dispatch_services.dispatch(&dispatch_request, &owned, &dispatch_upload_set)
-                })
+                let outcome = match remote_blocking(
+                    &services,
+                    &mut cancellation,
+                    move |operation_cancelled| {
+                        dispatch_services.dispatch(
+                            &dispatch_request,
+                            &owned,
+                            &dispatch_upload_set,
+                            &operation_cancelled,
+                        )
+                    },
+                )
                 .await
                 {
                     Ok(outcome) => outcome,
@@ -3626,10 +3743,10 @@ async fn run_authenticated_socket(
             InboundMessage::Pong => {}
         }
     }
-    let _ = cancelled.send(true);
-    if let Ok(mut upload_set) = upload_set.lock() {
-        upload_set.cancel_all();
-    }
+    cancelled.send_replace(true);
+    operation_cancelled.send_replace(true);
+    let _ = (&mut revocation_watcher).await;
+    cancel_connection_uploads(upload_set.clone()).await;
     for (_, attachment) in attachments {
         shutdown_attachment(attachment).await;
     }
@@ -3706,7 +3823,7 @@ async fn reap_finished_attachments(
 mod request_guard_tests {
     use super::*;
     use crate::terminal::model::{CursorState, ScreenSnapshot, TerminalModes};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Barrier, Condvar};
 
     fn tagged_test_transfer(
@@ -3904,13 +4021,16 @@ mod request_guard_tests {
             let blocked = gate.clone();
             let mut cancellation = cancelled.subscribe();
             tasks.push(tokio::spawn(async move {
-                remote_blocking(&service, &mut cancellation, move || {
+                remote_blocking(&service, &mut cancellation, move |operation_cancelled| {
                     let now = current.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
                     let (lock, changed) = &*blocked;
                     let mut released = lock.lock().unwrap();
-                    while !*released {
-                        released = changed.wait(released).unwrap();
+                    while !*released && !operation_cancelled.load(Ordering::Acquire) {
+                        let (next, _) = changed
+                            .wait_timeout(released, Duration::from_millis(10))
+                            .unwrap();
+                        released = next;
                     }
                     current.fetch_sub(1, Ordering::SeqCst);
                 })
@@ -3938,6 +4058,131 @@ mod request_guard_tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_blocking_cancellation_waits_for_the_running_operation() {
+        let services = RemoteServices::new(Arc::new(TabRegistry::default()));
+        let entered = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (cancelled, mut cancellation) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn({
+            let entered = entered.clone();
+            let gate = gate.clone();
+            async move {
+                remote_blocking(&services, &mut cancellation, move |_| {
+                    entered.store(true, Ordering::Release);
+                    let (lock, changed) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = changed.wait(released).unwrap();
+                    }
+                })
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::Acquire) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+
+        cancelled.send_replace(true);
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "remote_blocking must await a started blocking operation after cancellation"
+        );
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_blocking_timeout_waits_for_the_running_operation() {
+        let services = RemoteServices::new(Arc::new(TabRegistry::default()));
+        let entered = Arc::new(AtomicBool::new(false));
+        let timeout_observed = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (_cancelled, mut cancellation) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn({
+            let entered = entered.clone();
+            let timeout_observed = timeout_observed.clone();
+            let gate = gate.clone();
+            async move {
+                remote_blocking_with_timeout(
+                    &services,
+                    &mut cancellation,
+                    Duration::from_millis(10),
+                    move |operation_cancelled| {
+                        entered.store(true, Ordering::Release);
+                        while !operation_cancelled.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        timeout_observed.store(true, Ordering::Release);
+                        let (lock, changed) = &*gate;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = changed.wait(released).unwrap();
+                        }
+                    },
+                )
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::Acquire) || !timeout_observed.load(Ordering::Acquire) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "remote_blocking must await the started blocking operation after timeout"
+        );
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+        assert!(task.await.unwrap().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_shutdown_waits_for_a_started_blocking_maintenance_call() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (shutdown, mut shutdown_receiver) = tokio::sync::watch::channel(false);
+        let mut maintenance = tokio::task::spawn_blocking({
+            let entered = entered.clone();
+            let gate = gate.clone();
+            move || {
+                entered.store(true, Ordering::Release);
+                let (lock, changed) = &*gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+                Ok::<(), UploadError>(())
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !entered.load(Ordering::Acquire) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+
+        shutdown.send_replace(true);
+        let waiter = tokio::spawn(async move {
+            await_attachment_maintenance(&mut maintenance, &mut shutdown_receiver).await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "gateway maintenance shutdown must wait for a started blocking call"
+        );
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+        assert!(waiter.await.unwrap());
     }
 
     #[test]
@@ -3977,7 +4222,9 @@ mod request_guard_tests {
         };
         let nonce = fields
             .into_iter()
-            .find_map(|(key, value)| (key == ciborium::Value::Text("nonce".into())).then_some(value))
+            .find_map(|(key, value)| {
+                (key == ciborium::Value::Text("nonce".into())).then_some(value)
+            })
             .expect("challenge must contain nonce");
 
         assert_eq!(nonce, ciborium::Value::Bytes(vec![7; 32]));

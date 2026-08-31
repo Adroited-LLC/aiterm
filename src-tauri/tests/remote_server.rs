@@ -276,8 +276,23 @@ struct UploadChunkRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct UploadChunkRequestWithUnknownField<'a> {
+    upload_id: &'a str,
+    index: u32,
+    #[serde(with = "serde_bytes")]
+    data: &'a [u8],
+    unexpected: bool,
+}
+
+#[derive(Serialize)]
 struct UploadIdRequest<'a> {
     upload_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct UploadIdRequestWithUnknownField<'a> {
+    upload_id: &'a str,
+    unexpected: bool,
 }
 
 #[derive(Deserialize)]
@@ -3594,6 +3609,44 @@ async fn terminal_upload_begin_requires_focus_and_payloads_are_strict_and_bounde
         "terminal.upload_invalid_submission"
     );
 
+    for (request_id, kind, payload) in [
+        (
+            19,
+            "terminal.upload.chunk",
+            encode(&UploadChunkRequestWithUnknownField {
+                upload_id: "unknown",
+                index: 0,
+                data: &[],
+                unexpected: true,
+            }),
+        ),
+        (
+            20,
+            "terminal.upload.finish",
+            encode(&UploadIdRequestWithUnknownField {
+                upload_id: "unknown",
+                unexpected: true,
+            }),
+        ),
+        (
+            21,
+            "terminal.upload.cancel",
+            encode(&UploadIdRequestWithUnknownField {
+                upload_id: "unknown",
+                unexpected: true,
+            }),
+        ),
+    ] {
+        socket
+            .send(request(request_id, kind, &payload))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
+            "protocol.invalid_payload"
+        );
+    }
+
     registry.close(&tab).ok();
     gateway.stop().await.unwrap();
     std::fs::remove_dir_all(root).ok();
@@ -4081,16 +4134,9 @@ fn mismatched_existing_certificate_and_key_fail_closed_before_san_refresh() {
     let root = private_test_dir("identity-mismatch-refresh");
     let first_root = root.join("first");
     let second_root = root.join("second");
-    TlsIdentity::load_or_create(
-        &first_root,
-        &[IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))],
-    )
-    .unwrap();
-    TlsIdentity::load_or_create(
-        &second_root,
-        &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 151))],
-    )
-    .unwrap();
+    TlsIdentity::load_or_create(&first_root, &[IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))])
+        .unwrap();
+    TlsIdentity::load_or_create(&second_root, &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 151))]).unwrap();
     let original_certificate = std::fs::read(first_root.join("gateway-cert.der")).unwrap();
     let mismatched_private_key = std::fs::read(second_root.join("gateway-key.der")).unwrap();
     std::fs::write(first_root.join("gateway-key.der"), &mismatched_private_key).unwrap();

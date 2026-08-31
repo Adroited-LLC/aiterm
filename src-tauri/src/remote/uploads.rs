@@ -15,6 +15,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -36,6 +37,7 @@ const MANIFEST_NAME: &str = "attachments.json";
 const MANIFEST_LOCK_NAME: &str = ".attachments.lock";
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_MANIFEST_RECORDS: usize = 4096;
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug)]
 pub struct UploadBegin {
@@ -68,6 +70,7 @@ pub struct PublishedUpload {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UploadErrorKind {
+    Cancelled,
     NotFound,
     TooLarge,
     OutOfOrder,
@@ -414,13 +417,36 @@ impl UploadSet {
     }
 
     pub fn finish(&mut self, upload_id: &str) -> Result<PublishedUpload, UploadError> {
-        self.finish_at(upload_id, SystemTime::now())
+        self.finish_cancellable_at(upload_id, SystemTime::now(), &NEVER_CANCELLED)
     }
 
     pub fn finish_at(
         &mut self,
         upload_id: &str,
         now: SystemTime,
+    ) -> Result<PublishedUpload, UploadError> {
+        self.finish_cancellable_at(upload_id, now, &NEVER_CANCELLED)
+    }
+
+    /// Complete an upload unless its owning connection has been cancelled.
+    ///
+    /// The cancellation predicate is checked through the exact-inode
+    /// publication transaction. A caller that signals it and waits for this
+    /// method to return is guaranteed that an in-flight completion did not
+    /// leave a newly published attachment behind.
+    pub fn finish_cancellable(
+        &mut self,
+        upload_id: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<PublishedUpload, UploadError> {
+        self.finish_cancellable_at(upload_id, SystemTime::now(), cancelled)
+    }
+
+    pub fn finish_cancellable_at(
+        &mut self,
+        upload_id: &str,
+        now: SystemTime,
+        cancelled: &AtomicBool,
     ) -> Result<PublishedUpload, UploadError> {
         let mut upload = self
             .uploads
@@ -431,10 +457,18 @@ impl UploadSet {
         }
         let submission_id = upload.submission_id.clone();
 
-        let result = finish_upload(&mut upload, now).and_then(|published| {
+        let result = finish_upload_cancellable(&mut upload, now, cancelled).and_then(|published| {
+            if cancelled.load(Ordering::Acquire) {
+                upload.staged.remove_published()?;
+                return Err(upload_cancelled());
+            }
             if let Err(error) = self.store.maintain(now) {
                 let _ = upload.staged.remove_published();
                 return Err(error);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                upload.staged.remove_published()?;
+                return Err(upload_cancelled());
             }
             Ok(published)
         });
@@ -715,27 +749,50 @@ fn validate_begin(request: &UploadBegin) -> Result<(), UploadError> {
     Ok(())
 }
 
-fn finish_upload(
+fn finish_upload_cancellable(
     upload: &mut ActiveUpload,
     now: SystemTime,
+    cancelled: &AtomicBool,
 ) -> Result<PublishedUpload, UploadError> {
-    finish_upload_with_hook(upload, now, |_| Ok(()))
+    finish_upload_with_hook_cancellable(upload, now, cancelled, |_| Ok(()))
 }
 
+#[cfg(test)]
 fn finish_upload_with_hook(
     upload: &mut ActiveUpload,
     now: SystemTime,
     hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
 ) -> Result<PublishedUpload, UploadError> {
-    finish_upload_with_hooks(upload, now, hook, |_| Ok(()))
+    finish_upload_with_hook_cancellable(upload, now, &NEVER_CANCELLED, hook)
 }
 
+fn finish_upload_with_hook_cancellable(
+    upload: &mut ActiveUpload,
+    now: SystemTime,
+    cancelled: &AtomicBool,
+    hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
+) -> Result<PublishedUpload, UploadError> {
+    finish_upload_with_hooks_cancellable(upload, now, cancelled, hook, |_| Ok(()))
+}
+
+#[cfg(test)]
 fn finish_upload_with_hooks(
     upload: &mut ActiveUpload,
     now: SystemTime,
     hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
     faults: impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
 ) -> Result<PublishedUpload, UploadError> {
+    finish_upload_with_hooks_cancellable(upload, now, &NEVER_CANCELLED, hook, faults)
+}
+
+fn finish_upload_with_hooks_cancellable(
+    upload: &mut ActiveUpload,
+    now: SystemTime,
+    cancelled: &AtomicBool,
+    hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
+    faults: impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
+) -> Result<PublishedUpload, UploadError> {
+    ensure_not_cancelled(cancelled)?;
     upload
         .staged
         .file
@@ -746,6 +803,7 @@ fn finish_upload_with_hooks(
         .file
         .sync_all()
         .map_err(|error| UploadError::storage("sync staged attachment", error))?;
+    ensure_not_cancelled(cancelled)?;
 
     if upload.written != upload.declared_length {
         return Err(UploadError::new(
@@ -774,6 +832,7 @@ fn finish_upload_with_hooks(
     }
 
     validate_strict_jpeg(&contents)?;
+    ensure_not_cancelled(cancelled)?;
     let publication = upload.staged.publication_snapshot(&contents)?;
     let publication_contents = read_exact_file(&publication, upload.declared_length)?;
     let publication_digest: [u8; 32] = Sha256::digest(&publication_contents).into();
@@ -784,15 +843,36 @@ fn finish_upload_with_hooks(
         ));
     }
     validate_strict_jpeg(&publication_contents)?;
+    ensure_not_cancelled(cancelled)?;
 
     let manifest = upload.staged.manifest.clone();
-    manifest.publish_staged_with_hooks(&mut upload.staged, &publication, now, hook, faults)?;
+    manifest.publish_staged_with_hooks(
+        &mut upload.staged,
+        &publication,
+        now,
+        cancelled,
+        hook,
+        faults,
+    )?;
     let path = upload
         .staged
         .directory
         .path
         .join(&upload.staged.published_name);
     Ok(PublishedUpload { path })
+}
+
+fn upload_cancelled() -> UploadError {
+    UploadError::new(
+        UploadErrorKind::Cancelled,
+        "upload completion was cancelled before publication",
+    )
+}
+
+fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), UploadError> {
+    (!cancelled.load(Ordering::Acquire))
+        .then_some(())
+        .ok_or_else(upload_cancelled)
 }
 
 fn validate_strict_jpeg(contents: &[u8]) -> Result<(), UploadError> {
@@ -1556,9 +1636,11 @@ impl ManifestStorage {
         staged: &mut StagedFile,
         validated: &File,
         now: SystemTime,
+        cancelled: &AtomicBool,
         mut hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
         mut faults: impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
     ) -> Result<(), UploadError> {
+        ensure_not_cancelled(cancelled)?;
         let held_publication = validated
             .try_clone()
             .map_err(|error| UploadError::storage("hold published attachment", error))?;
@@ -1597,6 +1679,7 @@ impl ManifestStorage {
             .directory
             .require_entry_absent(&staged.published_name)?;
         staged.verify_bound_entry()?;
+        ensure_not_cancelled(cancelled)?;
         staged.directory.unlink(&staged.part_name)?;
         let part_unlink_sync = faults(StorageFaultPoint::PartUnlinkDirectorySync)
             .and_then(|()| staged.directory.sync());
@@ -1615,8 +1698,17 @@ impl ManifestStorage {
         record.inode = publication_identity.inode;
         self.persist_manifest(&manifest, &mut expected)?;
         hook(PublicationBoundary::IntentPersisted)?;
+        if cancelled.load(Ordering::Acquire) {
+            return self.rollback_cancelled_unpublished_intent(
+                staged,
+                record_index,
+                &mut manifest,
+                &mut expected,
+            );
+        }
 
         staged.directory.verify_current_path()?;
+        ensure_not_cancelled(cancelled)?;
         if let Err(error) = staged
             .directory
             .link_held_noreplace(validated, &staged.published_name)
@@ -1658,6 +1750,14 @@ impl ManifestStorage {
             return Err(error);
         }
         hook(PublicationBoundary::PublishedLinked)?;
+        if cancelled.load(Ordering::Acquire) {
+            return self.rollback_cancelled_publication(
+                staged,
+                validated,
+                &mut manifest,
+                &mut expected,
+            );
+        }
 
         manifest.records[record_index].state = ManifestState::Complete;
         manifest.records[record_index].created_unix_millis = system_time_millis(now)?;
@@ -1687,10 +1787,70 @@ impl ManifestStorage {
             return Err(error);
         }
         hook(PublicationBoundary::CompletePersisted)?;
+        if cancelled.load(Ordering::Acquire) {
+            return self.rollback_cancelled_publication(
+                staged,
+                validated,
+                &mut manifest,
+                &mut expected,
+            );
+        }
 
         staged.file = held_publication;
         staged.published = true;
         Ok(())
+    }
+
+    fn rollback_cancelled_publication(
+        &self,
+        staged: &mut StagedFile,
+        validated: &File,
+        manifest: &mut AttachmentManifest,
+        expected: &mut Option<FileIdentity>,
+    ) -> Result<(), UploadError> {
+        let mut no_faults = |_| Ok(());
+        if let Err(error) = cleanup_owned_entry_with_faults(
+            &staged.directory,
+            &staged.published_name,
+            validated,
+            CleanupContext::FinalLinkRollback,
+            &mut no_faults,
+        ) {
+            // The durable final intent remains for maintenance when an exact
+            // cleanup cannot be completed. Drop must not mistake it for a
+            // partial `.part` entry.
+            staged.published = true;
+            return Err(error);
+        }
+        if let Err(error) = self.remove_record_after_cleanup(
+            manifest,
+            &staged.record_id,
+            expected,
+            CleanupContext::FinalLinkRollback,
+            &mut no_faults,
+        ) {
+            staged.published = true;
+            return Err(error);
+        }
+        Err(upload_cancelled())
+    }
+
+    fn rollback_cancelled_unpublished_intent(
+        &self,
+        staged: &mut StagedFile,
+        record_index: usize,
+        manifest: &mut AttachmentManifest,
+        expected: &mut Option<FileIdentity>,
+    ) -> Result<(), UploadError> {
+        manifest.records.remove(record_index);
+        if let Err(error) = self.persist_manifest(manifest, expected) {
+            // The final intent is deliberately retained for maintenance if it
+            // cannot be durably removed. There is no linked final inode yet.
+            staged.published = true;
+            return Err(error);
+        }
+        staged.published = true;
+        Err(upload_cancelled())
     }
 
     fn cancel_staged(&self, staged: &StagedFile) -> Result<(), UploadError> {
@@ -3511,6 +3671,69 @@ mod tests {
         drop(upload);
         drop(uploads);
         (root, part, published, store)
+    }
+
+    #[test]
+    fn cancellation_at_the_prepublication_boundary_leaves_no_final_attachment() {
+        let root =
+            std::env::temp_dir().join(format!("aiterm-publication-cancel-{}", Uuid::new_v4()));
+        let cwd = root.join("project");
+        let cache = root.join("cache");
+        fs::create_dir_all(&cwd).unwrap();
+        let store = AttachmentStore::new_at(cache.clone(), UNIX_EPOCH).unwrap();
+        let jpeg = normalized_test_jpeg();
+        let mut uploads = store.upload_set();
+        let request = UploadBegin {
+            tab_id: TabId::new(),
+            attachment_id: AttachmentId::new(),
+            submission_id: Uuid::new_v4().hyphenated().to_string(),
+            submission_count: 1,
+            submission_bytes: jpeg.len() as u64,
+            length: jpeg.len() as u64,
+            sha256: Sha256::digest(&jpeg).into(),
+        };
+        let began = uploads.begin_at(Some(&cwd), request, UNIX_EPOCH).unwrap();
+        uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
+        let mut upload = uploads.uploads.remove(&began.upload_id).unwrap();
+        let published = upload
+            .staged
+            .directory
+            .path
+            .join(&upload.staged.published_name);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let boundary_reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let signal = std::thread::spawn({
+            let cancelled = cancelled.clone();
+            let boundary_reached = boundary_reached.clone();
+            let release = release.clone();
+            move || {
+                boundary_reached.wait();
+                cancelled.store(true, Ordering::Release);
+                release.wait();
+            }
+        });
+
+        let error =
+            finish_upload_with_hook_cancellable(&mut upload, UNIX_EPOCH, &cancelled, |observed| {
+                if observed == PublicationBoundary::IntentPersisted {
+                    boundary_reached.wait();
+                    release.wait();
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        signal.join().unwrap();
+
+        assert_eq!(error.kind(), UploadErrorKind::Cancelled);
+        assert!(!published.exists());
+        assert_eq!(manifest_record_count(&cache), 0);
+        drop(upload);
+        drop(uploads);
+        store.maintain(UNIX_EPOCH).unwrap();
+        assert!(!published.exists());
+        assert_eq!(manifest_record_count(&cache), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
