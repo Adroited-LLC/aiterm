@@ -996,6 +996,24 @@ fn failed_atomic_git_exclude_update_preserves_existing_bytes() {
     assert_eq!(fs::read(exclude).unwrap(), original);
 }
 
+#[test]
+fn oversized_git_exclude_is_rejected_before_staging() {
+    let mut fixture = UploadFixture::new("oversized-git-exclude");
+    let repository = git2::Repository::init(&fixture.cwd).unwrap();
+    let exclude = repository.commondir().join("info/exclude");
+    fs::write(&exclude, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    let jpeg = fixture.jpeg(64, 48);
+    let request = fixture.begin(jpeg.len(), digest(&jpeg));
+
+    let error = fixture
+        .uploads
+        .begin(Some(&fixture.cwd), request)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), UploadErrorKind::Capacity);
+    assert!(fixture.part_files().is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn fifo_git_exclude_is_rejected_without_blocking() {

@@ -28,6 +28,7 @@ pub const MAX_SUBMISSION_BYTES: u64 = 48 * 1024 * 1024;
 pub const ATTACHMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const ATTACHMENT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CLOSED_SUBMISSIONS: usize = 64;
+const MAX_GIT_EXCLUDE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct UploadBegin {
@@ -737,7 +738,10 @@ fn finish_upload(upload: &mut ActiveUpload) -> Result<PublishedUpload, UploadErr
 fn validate_strict_jpeg(contents: &[u8]) -> Result<(), UploadError> {
     let strict_dimensions = validate_complete_baseline_jpeg(contents)?;
     let mut cursor = Cursor::new(contents);
-    let options = DecoderOptions::default().set_strict_mode(true);
+    let options = DecoderOptions::default()
+        .set_strict_mode(true)
+        .set_max_width(MAX_IMAGE_EDGE as usize)
+        .set_max_height(MAX_IMAGE_EDGE as usize);
     let info = {
         let mut decoder = JpegDecoder::new_with_options(&mut cursor, options);
         decoder.decode().map_err(|_| {
@@ -982,7 +986,11 @@ fn parse_baseline_frame(
     let height = u32::from(u16::from_be_bytes([segment[1], segment[2]]));
     let width = u32::from(u16::from_be_bytes([segment[3], segment[4]]));
     let count = usize::from(segment[5]);
-    if width == 0 || height == 0 || !matches!(count, 1 | 3) || segment.len() != 6 + count * 3 {
+    if !(1..=MAX_IMAGE_EDGE).contains(&width)
+        || !(1..=MAX_IMAGE_EDGE).contains(&height)
+        || !matches!(count, 1 | 3)
+        || segment.len() != 6 + count * 3
+    {
         return Err(invalid_jpeg());
     }
     let mut components = Vec::with_capacity(count);
@@ -1004,6 +1012,15 @@ fn parse_baseline_frame(
             horizontal_sampling,
             vertical_sampling,
         });
+    }
+    let aggregate_sampling: u32 = components
+        .iter()
+        .map(|component| {
+            u32::from(component.horizontal_sampling) * u32::from(component.vertical_sampling)
+        })
+        .sum();
+    if aggregate_sampling > 10 {
+        return Err(invalid_jpeg());
     }
     Ok(((width, height), components))
 }
@@ -1028,6 +1045,13 @@ fn parse_huffman_tables(
         position += 16;
         let mut counts = [0_u8; 16];
         counts.copy_from_slice(counts_slice);
+        let mut available_codes = 1_i32;
+        for count in counts {
+            available_codes = available_codes * 2 - i32::from(count);
+            if available_codes < 0 {
+                return Err(invalid_jpeg());
+            }
+        }
         let symbol_count: usize = counts.iter().map(|count| usize::from(*count)).sum();
         if symbol_count == 0 || symbol_count > 256 {
             return Err(invalid_jpeg());
@@ -1503,8 +1527,9 @@ impl StableDirectory {
     fn read_optional_file(
         &self,
         name: &OsStr,
+        max_bytes: u64,
     ) -> Result<(Vec<u8>, Option<FileIdentity>), UploadError> {
-        let mut file = match self.open_file(name) {
+        let file = match self.open_file(name) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((Vec::new(), None))
@@ -1518,14 +1543,35 @@ impl StableDirectory {
                 "stable optional entry is not a regular file",
             ));
         }
+        let metadata_length = file
+            .metadata()
+            .map_err(|error| UploadError::storage("inspect stable optional file", error))?
+            .len();
+        if metadata_length > max_bytes {
+            return Err(UploadError::new(
+                UploadErrorKind::Capacity,
+                "Git info/exclude exceeds the 1 MiB safety limit",
+            ));
+        }
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
             .map_err(|error| UploadError::storage("read stable optional file", error))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(UploadError::new(
+                UploadErrorKind::Capacity,
+                "Git info/exclude exceeds the 1 MiB safety limit",
+            ));
+        }
         Ok((bytes, Some(identity)))
     }
 
     #[cfg(not(unix))]
-    fn read_optional_file(&self, _name: &OsStr) -> Result<(Vec<u8>, Option<()>), UploadError> {
+    fn read_optional_file(
+        &self,
+        _name: &OsStr,
+        _max_bytes: u64,
+    ) -> Result<(Vec<u8>, Option<()>), UploadError> {
         Err(unsupported_stable_filesystem())
     }
 
@@ -1800,7 +1846,8 @@ fn update_local_git_exclude(cwd: &Path) -> Result<(), UploadError> {
     })?;
     let common = StableDirectory::open_existing_absolute(&commondir)?;
     let info = common.open_or_create_child(OsStr::new("info"), false)?;
-    let (mut bytes, original_identity) = info.read_optional_file(OsStr::new("exclude"))?;
+    let (mut bytes, original_identity) =
+        info.read_optional_file(OsStr::new("exclude"), MAX_GIT_EXCLUDE_BYTES)?;
 
     if bytes.split(|byte| *byte == b'\n').any(|line| {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -1904,6 +1951,149 @@ fn upload_not_found() -> UploadError {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    fn append_segment(output: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+        output.extend_from_slice(&[0xff, marker]);
+        output.extend_from_slice(&u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+        output.extend_from_slice(payload);
+    }
+
+    fn compact_baseline_jpeg(width: u16, restart_interval: Option<u16>) -> Vec<u8> {
+        let mut jpeg = vec![0xff, 0xd8];
+        append_segment(
+            &mut jpeg,
+            0xc0,
+            &[8, 0, 1, (width >> 8) as u8, width as u8, 1, 1, 0x11, 0],
+        );
+        let mut huffman = Vec::new();
+        huffman.push(0x00);
+        huffman.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        huffman.push(0x00);
+        huffman.push(0x10);
+        huffman.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        huffman.push(0x00);
+        append_segment(&mut jpeg, 0xc4, &huffman);
+        if let Some(interval) = restart_interval {
+            append_segment(&mut jpeg, 0xdd, &interval.to_be_bytes());
+        }
+        append_segment(&mut jpeg, 0xda, &[1, 1, 0, 0, 63, 0]);
+        let mcu_count = u32::from(width).div_ceil(8);
+        for mcu in 0..mcu_count {
+            jpeg.push(0x3f);
+            if let Some(interval) = restart_interval {
+                if (mcu + 1) % u32::from(interval) == 0 && mcu + 1 < mcu_count {
+                    jpeg.extend_from_slice(&[0xff, 0xd0 + ((mcu / u32::from(interval)) % 8) as u8]);
+                }
+            }
+        }
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+        jpeg
+    }
+
+    #[test]
+    fn oversized_sof_is_rejected_before_entropy_tables_are_needed() {
+        let oversized_sof = [8, 0, 1, 0x10, 0x01, 1, 1, 0x11, 0];
+
+        let Err(error) = parse_baseline_frame(&oversized_sof) else {
+            panic!("oversized SOF was accepted")
+        };
+
+        assert_eq!(error.kind(), UploadErrorKind::InvalidImage);
+    }
+
+    #[test]
+    fn aggregate_sampling_factor_above_baseline_limit_is_rejected() {
+        let oversized_sampling = [8, 0, 1, 0, 1, 3, 1, 0x22, 0, 2, 0x22, 0, 3, 0x22, 0];
+
+        let Err(error) = parse_baseline_frame(&oversized_sampling) else {
+            panic!("oversized aggregate sampling was accepted")
+        };
+
+        assert_eq!(error.kind(), UploadErrorKind::InvalidImage);
+    }
+
+    #[test]
+    fn oversubscribed_huffman_table_is_rejected_during_dht_parsing() {
+        let mut malformed = vec![0x00, 3];
+        malformed.extend_from_slice(&[0; 15]);
+        malformed.extend_from_slice(&[0, 1, 2]);
+        let mut dc_tables: [Option<StrictHuffmanTable>; 4] = Default::default();
+        let mut ac_tables: [Option<StrictHuffmanTable>; 4] = Default::default();
+
+        let error = parse_huffman_tables(&malformed, &mut dc_tables, &mut ac_tables).unwrap_err();
+
+        assert_eq!(error.kind(), UploadErrorKind::InvalidImage);
+    }
+
+    #[test]
+    fn malformed_sof_and_sos_segments_fail_closed() {
+        let Err(frame_error) = parse_baseline_frame(&[8, 0, 1, 0, 1, 2]) else {
+            panic!("malformed SOF was accepted")
+        };
+        assert_eq!(frame_error.kind(), UploadErrorKind::InvalidImage);
+        let frame = vec![BaselineComponent {
+            id: 1,
+            horizontal_sampling: 1,
+            vertical_sampling: 1,
+        }];
+        assert_eq!(
+            parse_baseline_scan(&[1, 1, 0, 1, 63, 0], &frame)
+                .unwrap_err()
+                .kind(),
+            UploadErrorKind::InvalidImage
+        );
+    }
+
+    #[test]
+    fn restart_markers_must_follow_the_declared_sequence() {
+        let valid = compact_baseline_jpeg(9, Some(1));
+        validate_complete_baseline_jpeg(&valid).unwrap();
+        let mut wrong_restart = valid;
+        let restart = wrong_restart
+            .windows(2)
+            .position(|pair| pair == [0xff, 0xd0])
+            .unwrap();
+        wrong_restart[restart + 1] = 0xd1;
+
+        assert_eq!(
+            validate_complete_baseline_jpeg(&wrong_restart)
+                .unwrap_err()
+                .kind(),
+            UploadErrorKind::InvalidImage
+        );
+    }
+
+    #[test]
+    fn non_one_entropy_padding_is_rejected() {
+        let mut malformed = compact_baseline_jpeg(1, None);
+        let entropy = malformed.len() - 3;
+        assert_eq!(malformed[entropy], 0x3f);
+        malformed[entropy] = 0x00;
+
+        assert_eq!(
+            validate_complete_baseline_jpeg(&malformed)
+                .unwrap_err()
+                .kind(),
+            UploadErrorKind::InvalidImage
+        );
+    }
+
+    #[test]
+    fn sos_referencing_undefined_huffman_tables_is_rejected() {
+        let mut malformed = compact_baseline_jpeg(1, None);
+        let sos = malformed
+            .windows(2)
+            .position(|pair| pair == [0xff, 0xda])
+            .unwrap();
+        malformed[sos + 6] = 0x11;
+
+        assert_eq!(
+            validate_complete_baseline_jpeg(&malformed)
+                .unwrap_err()
+                .kind(),
+            UploadErrorKind::InvalidImage
+        );
+    }
 
     #[test]
     fn publication_links_the_held_inode_when_part_name_changes_after_validation() {
