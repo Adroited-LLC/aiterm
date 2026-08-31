@@ -572,17 +572,6 @@ impl StagedFile {
         ))
     }
 
-    fn publish_with_hook(
-        &mut self,
-        validated: &File,
-        now: SystemTime,
-        hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
-    ) -> Result<PathBuf, UploadError> {
-        let manifest = self.manifest.clone();
-        manifest.publish_staged_with_hook(self, validated, now, hook)?;
-        Ok(self.directory.path.join(&self.published_name))
-    }
-
     fn remove_published(&mut self) -> Result<(), UploadError> {
         if !self.published {
             return Ok(());
@@ -738,6 +727,15 @@ fn finish_upload_with_hook(
     now: SystemTime,
     hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
 ) -> Result<PublishedUpload, UploadError> {
+    finish_upload_with_hooks(upload, now, hook, |_| Ok(()))
+}
+
+fn finish_upload_with_hooks(
+    upload: &mut ActiveUpload,
+    now: SystemTime,
+    hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
+    faults: impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
+) -> Result<PublishedUpload, UploadError> {
     upload
         .staged
         .file
@@ -787,7 +785,13 @@ fn finish_upload_with_hook(
     }
     validate_strict_jpeg(&publication_contents)?;
 
-    let path = upload.staged.publish_with_hook(&publication, now, hook)?;
+    let manifest = upload.staged.manifest.clone();
+    manifest.publish_staged_with_hooks(&mut upload.staged, &publication, now, hook, faults)?;
+    let path = upload
+        .staged
+        .directory
+        .path
+        .join(&upload.staged.published_name);
     Ok(PublishedUpload { path })
 }
 
@@ -1295,6 +1299,24 @@ enum PublicationBoundary {
     CompletePersisted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanupContext {
+    PartialLinkRollback,
+    FinalLinkRollback,
+    CompletePersistRollback,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageFaultPoint {
+    PartUnlinkDirectorySync,
+    PostLinkDirectorySync(CleanupContext),
+    CompleteManifestPersist,
+    CleanupUnlink(CleanupContext),
+    CleanupDirectorySync(CleanupContext),
+    CleanupManifestPersist(CleanupContext),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ManifestRecord {
@@ -1453,7 +1475,35 @@ impl ManifestStorage {
         identity: FileIdentity,
         staged_directory: &StableDirectory,
         staged_file: &File,
+        hook: impl FnMut(StageBoundary) -> Result<(), UploadError>,
+    ) -> Result<(), UploadError> {
+        self.record_partial_and_link_with_hooks(
+            id,
+            root,
+            name,
+            length,
+            now,
+            identity,
+            staged_directory,
+            staged_file,
+            hook,
+            |_| Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_partial_and_link_with_hooks(
+        &self,
+        id: &str,
+        root: &Path,
+        name: &OsStr,
+        length: u64,
+        now: SystemTime,
+        identity: FileIdentity,
+        staged_directory: &StableDirectory,
+        staged_file: &File,
         mut hook: impl FnMut(StageBoundary) -> Result<(), UploadError>,
+        mut faults: impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
     ) -> Result<(), UploadError> {
         let _process_guard = self
             .process_lock
@@ -1475,24 +1525,39 @@ impl ManifestStorage {
         }
         let linked = staged_directory
             .verify_entry_identity(name, staged_file)
+            .and_then(|()| {
+                faults(StorageFaultPoint::PostLinkDirectorySync(
+                    CleanupContext::PartialLinkRollback,
+                ))
+            })
             .and_then(|()| staged_directory.sync());
         if let Err(error) = linked {
-            let _ = staged_directory
-                .verify_entry_identity(name, staged_file)
-                .and_then(|()| staged_directory.unlink(name));
-            manifest.records.retain(|record| record.id != id);
-            self.persist_manifest(&manifest, &mut expected)?;
+            cleanup_owned_entry_with_faults(
+                staged_directory,
+                name,
+                staged_file,
+                CleanupContext::PartialLinkRollback,
+                &mut faults,
+            )?;
+            self.remove_record_after_cleanup(
+                &mut manifest,
+                id,
+                &mut expected,
+                CleanupContext::PartialLinkRollback,
+                &mut faults,
+            )?;
             return Err(error);
         }
         hook(StageBoundary::PartLinked)
     }
 
-    fn publish_staged_with_hook(
+    fn publish_staged_with_hooks(
         &self,
         staged: &mut StagedFile,
         validated: &File,
         now: SystemTime,
         mut hook: impl FnMut(PublicationBoundary) -> Result<(), UploadError>,
+        mut faults: impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
     ) -> Result<(), UploadError> {
         let held_publication = validated
             .try_clone()
@@ -1533,7 +1598,15 @@ impl ManifestStorage {
             .require_entry_absent(&staged.published_name)?;
         staged.verify_bound_entry()?;
         staged.directory.unlink(&staged.part_name)?;
-        staged.directory.sync()?;
+        let part_unlink_sync = faults(StorageFaultPoint::PartUnlinkDirectorySync)
+            .and_then(|()| staged.directory.sync());
+        if let Err(error) = part_unlink_sync {
+            // The unlink is not durable until the containing directory syncs.
+            // Leave Drop disarmed so the partial intent can cover a name that
+            // may reappear after a crash and maintenance can retry safely.
+            staged.published = true;
+            return Err(error);
+        }
         hook(PublicationBoundary::PartUnlinked)?;
 
         let record = &mut manifest.records[record_index];
@@ -1555,27 +1628,62 @@ impl ManifestStorage {
         let linked = staged
             .directory
             .verify_entry_identity(&staged.published_name, validated)
+            .and_then(|()| {
+                faults(StorageFaultPoint::PostLinkDirectorySync(
+                    CleanupContext::FinalLinkRollback,
+                ))
+            })
             .and_then(|()| staged.directory.sync());
         if let Err(error) = linked {
-            let _ = staged
-                .directory
-                .verify_entry_identity(&staged.published_name, validated)
-                .and_then(|()| staged.directory.unlink(&staged.published_name));
-            manifest.records.remove(record_index);
-            self.persist_manifest(&manifest, &mut expected)?;
+            if let Err(rollback_error) = cleanup_owned_entry_with_faults(
+                &staged.directory,
+                &staged.published_name,
+                validated,
+                CleanupContext::FinalLinkRollback,
+                &mut faults,
+            ) {
+                staged.published = true;
+                return Err(rollback_error);
+            }
+            if let Err(rollback_error) = self.remove_record_after_cleanup(
+                &mut manifest,
+                &staged.record_id,
+                &mut expected,
+                CleanupContext::FinalLinkRollback,
+                &mut faults,
+            ) {
+                staged.published = true;
+                return Err(rollback_error);
+            }
             return Err(error);
         }
         hook(PublicationBoundary::PublishedLinked)?;
 
         manifest.records[record_index].state = ManifestState::Complete;
         manifest.records[record_index].created_unix_millis = system_time_millis(now)?;
-        if let Err(error) = self.persist_manifest(&manifest, &mut expected) {
-            let _ = staged
-                .directory
-                .verify_entry_identity(&staged.published_name, validated)
-                .and_then(|()| staged.directory.unlink(&staged.published_name));
-            manifest.records.remove(record_index);
-            let _ = self.persist_manifest(&manifest, &mut expected);
+        let complete_persist = faults(StorageFaultPoint::CompleteManifestPersist)
+            .and_then(|()| self.persist_manifest(&manifest, &mut expected));
+        if let Err(error) = complete_persist {
+            if let Err(rollback_error) = cleanup_owned_entry_with_faults(
+                &staged.directory,
+                &staged.published_name,
+                validated,
+                CleanupContext::CompletePersistRollback,
+                &mut faults,
+            ) {
+                staged.published = true;
+                return Err(rollback_error);
+            }
+            if let Err(rollback_error) = self.remove_record_after_cleanup(
+                &mut manifest,
+                &staged.record_id,
+                &mut expected,
+                CleanupContext::CompletePersistRollback,
+                &mut faults,
+            ) {
+                staged.published = true;
+                return Err(rollback_error);
+            }
             return Err(error);
         }
         hook(PublicationBoundary::CompletePersisted)?;
@@ -1586,6 +1694,14 @@ impl ManifestStorage {
     }
 
     fn cancel_staged(&self, staged: &StagedFile) -> Result<(), UploadError> {
+        self.cancel_staged_with_faults(staged, |_| Ok(()))
+    }
+
+    fn cancel_staged_with_faults(
+        &self,
+        staged: &StagedFile,
+        mut faults: impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
+    ) -> Result<(), UploadError> {
         let _process_guard = self
             .process_lock
             .lock()
@@ -1593,16 +1709,33 @@ impl ManifestStorage {
         let _file_guard = self.directory.lock_manifest()?;
         self.directory.verify_current_path()?;
         let (mut manifest, mut expected) = self.load_or_rebuild()?;
-        let removal = staged
-            .directory
-            .verify_entry_identity(&staged.part_name, &staged.file)
-            .and_then(|()| staged.directory.unlink(&staged.part_name))
-            .and_then(|()| staged.directory.sync());
-        manifest
-            .records
-            .retain(|record| record.id != staged.record_id);
-        self.persist_manifest(&manifest, &mut expected)?;
-        removal
+        cleanup_owned_entry_with_faults(
+            &staged.directory,
+            &staged.part_name,
+            &staged.file,
+            CleanupContext::Cancel,
+            &mut faults,
+        )?;
+        self.remove_record_after_cleanup(
+            &mut manifest,
+            &staged.record_id,
+            &mut expected,
+            CleanupContext::Cancel,
+            &mut faults,
+        )
+    }
+
+    fn remove_record_after_cleanup(
+        &self,
+        manifest: &mut AttachmentManifest,
+        id: &str,
+        expected: &mut Option<FileIdentity>,
+        context: CleanupContext,
+        faults: &mut impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
+    ) -> Result<(), UploadError> {
+        manifest.records.retain(|record| record.id != id);
+        faults(StorageFaultPoint::CleanupManifestPersist(context))?;
+        self.persist_manifest(manifest, expected)
     }
 
     fn remove_published(&self, staged: &mut StagedFile) -> Result<(), UploadError> {
@@ -1712,6 +1845,36 @@ impl ManifestStorage {
         )?;
         self.directory.sync()
     }
+}
+
+fn cleanup_owned_entry_with_faults(
+    directory: &StableDirectory,
+    name: &OsStr,
+    held: &File,
+    context: CleanupContext,
+    faults: &mut impl FnMut(StorageFaultPoint) -> Result<(), UploadError>,
+) -> Result<(), UploadError> {
+    match directory.verify_entry_identity(name, held) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                UploadErrorKind::NotFound | UploadErrorKind::UnsafePath
+            ) =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(error),
+    }
+
+    faults(StorageFaultPoint::CleanupUnlink(context))?;
+    match directory.unlink(name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == UploadErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    faults(StorageFaultPoint::CleanupDirectorySync(context))?;
+    directory.sync()
 }
 
 fn manifest_total(manifest: &AttachmentManifest) -> Result<u64, UploadError> {
@@ -2241,12 +2404,16 @@ impl StableDirectory {
                 std::io::Error::last_os_error(),
             ));
         }
+        #[cfg(test)]
+        manifest_lock_test_before_flock()?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(UploadError::storage(
                 "lock attachment manifest",
                 std::io::Error::last_os_error(),
             ));
         }
+        #[cfg(test)]
+        manifest_lock_test_after_flock()?;
         Ok(file)
     }
 
@@ -2632,6 +2799,42 @@ fn path_operation_error(action: &str, error: std::io::Error) -> UploadError {
     }
 }
 
+#[cfg(test)]
+fn manifest_lock_test_before_flock() -> Result<(), UploadError> {
+    let Some(before) = std::env::var_os("AITERM_UPLOAD_UNIT_LOCK_BEFORE") else {
+        return Ok(());
+    };
+    let allow = std::env::var_os("AITERM_UPLOAD_UNIT_LOCK_ALLOW").ok_or_else(|| {
+        UploadError::new(
+            UploadErrorKind::Storage,
+            "manifest lock test boundary is missing its release path",
+        )
+    })?;
+    fs::write(before, b"at flock boundary")
+        .map_err(|error| UploadError::storage("signal manifest lock test boundary", error))?;
+    let allow = PathBuf::from(allow);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if allow.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(UploadError::new(
+        UploadErrorKind::Storage,
+        "timed out at manifest lock test boundary",
+    ))
+}
+
+#[cfg(test)]
+fn manifest_lock_test_after_flock() -> Result<(), UploadError> {
+    let Some(acquired) = std::env::var_os("AITERM_UPLOAD_UNIT_LOCK_ACQUIRED") else {
+        return Ok(());
+    };
+    fs::write(acquired, b"inside flock boundary")
+        .map_err(|error| UploadError::storage("signal acquired manifest test lock", error))
+}
+
 #[cfg(not(unix))]
 fn unsupported_stable_filesystem() -> UploadError {
     UploadError::new(
@@ -2982,6 +3185,234 @@ mod tests {
         UploadError::new(UploadErrorKind::Storage, "injected crash boundary")
     }
 
+    fn injected_storage_fault(point: StorageFaultPoint) -> UploadError {
+        UploadError::new(
+            UploadErrorKind::Storage,
+            format!("injected storage fault at {point:?}"),
+        )
+    }
+
+    fn cleanup_faults(context: CleanupContext) -> [StorageFaultPoint; 3] {
+        [
+            StorageFaultPoint::CleanupUnlink(context),
+            StorageFaultPoint::CleanupDirectorySync(context),
+            StorageFaultPoint::CleanupManifestPersist(context),
+        ]
+    }
+
+    #[test]
+    fn staging_link_rollback_failures_retain_the_partial_intent_for_maintenance() {
+        let context = CleanupContext::PartialLinkRollback;
+        for cleanup_fault in cleanup_faults(context) {
+            let root = std::env::temp_dir().join(format!(
+                "aiterm-stage-rollback-{cleanup_fault:?}-{}",
+                Uuid::new_v4()
+            ));
+            let cwd = root.join("project");
+            let cache = root.join("cache");
+            fs::create_dir_all(&cwd).unwrap();
+            let store = AttachmentStore::new_at(cache.clone(), UNIX_EPOCH).unwrap();
+            let canonical = canonical_project_cwd(&cwd).unwrap();
+            let directory = project_attachment_directory(&canonical).unwrap();
+            let file = directory.create_anonymous_file().unwrap();
+            file.sync_all().unwrap();
+            let id = Uuid::new_v4().hyphenated().to_string();
+            let part_name = OsString::from(format!("{id}.jpg.part"));
+            let part_path = directory.path.join(&part_name);
+
+            let error = store
+                .manifest
+                .record_partial_and_link_with_hooks(
+                    &id,
+                    &directory.path,
+                    &part_name,
+                    1,
+                    UNIX_EPOCH,
+                    FileIdentity::of(&file).unwrap(),
+                    &directory,
+                    &file,
+                    |_| Ok(()),
+                    |point| {
+                        if point == StorageFaultPoint::PostLinkDirectorySync(context)
+                            || point == cleanup_fault
+                        {
+                            Err(injected_storage_fault(point))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .unwrap_err();
+
+            assert_eq!(error.kind(), UploadErrorKind::Storage);
+            assert_eq!(manifest_record_count(&cache), 1);
+            drop(file);
+            store
+                .maintain(UNIX_EPOCH + PARTIAL_ATTACHMENT_TTL + Duration::from_secs(1))
+                .unwrap();
+            assert!(!part_path.exists());
+            assert_eq!(manifest_record_count(&cache), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn rollback_upload_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        AttachmentStore,
+        UploadSet,
+        ActiveUpload,
+        PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!("aiterm-{label}-{}", Uuid::new_v4()));
+        let cwd = root.join("project");
+        let cache = root.join("cache");
+        fs::create_dir_all(&cwd).unwrap();
+        let store = AttachmentStore::new_at(cache.clone(), UNIX_EPOCH).unwrap();
+        let jpeg = normalized_test_jpeg();
+        let mut uploads = store.upload_set();
+        let request = UploadBegin {
+            tab_id: TabId::new(),
+            attachment_id: AttachmentId::new(),
+            submission_id: Uuid::new_v4().hyphenated().to_string(),
+            submission_count: 1,
+            submission_bytes: jpeg.len() as u64,
+            length: jpeg.len() as u64,
+            sha256: Sha256::digest(&jpeg).into(),
+        };
+        let began = uploads.begin_at(Some(&cwd), request, UNIX_EPOCH).unwrap();
+        uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
+        let upload = uploads.uploads.remove(&began.upload_id).unwrap();
+        let published = upload
+            .staged
+            .directory
+            .path
+            .join(&upload.staged.published_name);
+        (root, cache, store, uploads, upload, published)
+    }
+
+    #[test]
+    fn publication_rollbacks_retain_the_final_intent_for_maintenance() {
+        for context in [
+            CleanupContext::FinalLinkRollback,
+            CleanupContext::CompletePersistRollback,
+        ] {
+            for cleanup_fault in cleanup_faults(context) {
+                let (root, cache, store, uploads, mut upload, published) = rollback_upload_fixture(
+                    &format!("publish-rollback-{context:?}-{cleanup_fault:?}"),
+                );
+                let primary_fault = match context {
+                    CleanupContext::FinalLinkRollback => {
+                        StorageFaultPoint::PostLinkDirectorySync(context)
+                    }
+                    CleanupContext::CompletePersistRollback => {
+                        StorageFaultPoint::CompleteManifestPersist
+                    }
+                    _ => unreachable!(),
+                };
+
+                let error = finish_upload_with_hooks(
+                    &mut upload,
+                    UNIX_EPOCH,
+                    |_| Ok(()),
+                    |point| {
+                        if point == primary_fault || point == cleanup_fault {
+                            Err(injected_storage_fault(point))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .unwrap_err();
+
+                assert_eq!(error.kind(), UploadErrorKind::Storage);
+                assert_eq!(manifest_record_count(&cache), 1);
+                upload.staged.published = true;
+                drop(upload);
+                drop(uploads);
+                store
+                    .maintain(UNIX_EPOCH + PARTIAL_ATTACHMENT_TTL + Duration::from_secs(1))
+                    .unwrap();
+                assert!(!published.exists());
+                assert_eq!(manifest_record_count(&cache), 0);
+                fs::remove_dir_all(root).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn part_unlink_sync_failure_disarms_drop_and_retains_the_partial_intent() {
+        let (root, cache, store, uploads, mut upload, _published) =
+            rollback_upload_fixture("part-unlink-sync");
+        let part = upload.staged.directory.path.join(&upload.staged.part_name);
+
+        let error = finish_upload_with_hooks(
+            &mut upload,
+            UNIX_EPOCH,
+            |_| Ok(()),
+            |point| {
+                if point == StorageFaultPoint::PartUnlinkDirectorySync {
+                    Err(injected_storage_fault(point))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), UploadErrorKind::Storage);
+        assert!(!part.exists());
+        drop(upload);
+        drop(uploads);
+        assert_eq!(manifest_record_count(&cache), 1);
+        store
+            .maintain(UNIX_EPOCH + PARTIAL_ATTACHMENT_TTL + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(manifest_record_count(&cache), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_cleanup_failures_retain_the_partial_intent_for_maintenance() {
+        let context = CleanupContext::Cancel;
+        for cleanup_fault in cleanup_faults(context) {
+            let root = std::env::temp_dir().join(format!(
+                "aiterm-cancel-rollback-{cleanup_fault:?}-{}",
+                Uuid::new_v4()
+            ));
+            let cwd = root.join("project");
+            let cache = root.join("cache");
+            fs::create_dir_all(&cwd).unwrap();
+            let store = AttachmentStore::new_at(cache.clone(), UNIX_EPOCH).unwrap();
+            let mut staged = store.stage(Some(&cwd), 1, UNIX_EPOCH).unwrap();
+            let part_path = staged.directory.path.join(&staged.part_name);
+
+            let error = store
+                .manifest
+                .cancel_staged_with_faults(&staged, |point| {
+                    if point == cleanup_fault {
+                        Err(injected_storage_fault(point))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+
+            assert_eq!(error.kind(), UploadErrorKind::Storage);
+            assert_eq!(manifest_record_count(&cache), 1);
+            staged.published = true;
+            drop(staged);
+            store
+                .maintain(UNIX_EPOCH + PARTIAL_ATTACHMENT_TTL + Duration::from_secs(1))
+                .unwrap();
+            assert!(!part_path.exists());
+            assert_eq!(manifest_record_count(&cache), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn stage_crash_boundaries_leave_only_manifest_owned_partial_state() {
         for boundary in [StageBoundary::IntentPersisted, StageBoundary::PartLinked] {
@@ -3125,5 +3556,117 @@ mod tests {
         assert!(!published.exists());
         assert_eq!(manifest_record_count(&root.join("cache")), 0);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn wait_for_path_for(path: &Path, duration: Duration) -> bool {
+        let deadline = std::time::Instant::now() + duration;
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        path.exists()
+    }
+
+    #[test]
+    fn subprocess_writer_reaches_the_production_lock_boundary_but_not_the_inside_while_held() {
+        use std::process::{Command, Stdio};
+
+        let root =
+            std::env::temp_dir().join(format!("aiterm-manifest-lock-boundary-{}", Uuid::new_v4()));
+        let cache = root.join("cache");
+        let ready = root.join("holder-ready");
+        let release = root.join("holder-release");
+        let before = root.join("writer-before-flock");
+        let allow = root.join("writer-allow-flock");
+        let acquired = root.join("writer-acquired-flock");
+        fs::create_dir_all(&root).unwrap();
+        AttachmentStore::new(cache.clone()).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let lock = cache.join("remote-attachments/.attachments.lock");
+        let holder = Command::new(&executable)
+            .arg("--exact")
+            .arg("remote::uploads::tests::manifest_lock_boundary_holder_helper")
+            .arg("--ignored")
+            .env("AITERM_UPLOAD_UNIT_LOCK_PATH", &lock)
+            .env("AITERM_UPLOAD_UNIT_LOCK_READY", &ready)
+            .env("AITERM_UPLOAD_UNIT_LOCK_RELEASE", &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(wait_for_path_for(&ready, Duration::from_secs(5)));
+        let writer = Command::new(&executable)
+            .arg("--exact")
+            .arg("remote::uploads::tests::manifest_lock_boundary_writer_helper")
+            .arg("--ignored")
+            .env("AITERM_UPLOAD_UNIT_LOCK_CACHE", &cache)
+            .env("AITERM_UPLOAD_UNIT_LOCK_BEFORE", &before)
+            .env("AITERM_UPLOAD_UNIT_LOCK_ALLOW", &allow)
+            .env("AITERM_UPLOAD_UNIT_LOCK_ACQUIRED", &acquired)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let reached_boundary = wait_for_path_for(&before, Duration::from_secs(5));
+        fs::write(&allow, b"enter flock").unwrap();
+        let bypassed_lock = wait_for_path_for(&acquired, Duration::from_millis(500));
+        fs::write(&release, b"release flock").unwrap();
+        let holder_output = holder.wait_with_output().unwrap();
+        let writer_output = writer.wait_with_output().unwrap();
+
+        assert!(
+            reached_boundary,
+            "writer never reached the production manifest lock boundary: {}",
+            String::from_utf8_lossy(&writer_output.stderr)
+        );
+        assert!(
+            !bypassed_lock,
+            "writer crossed the production manifest lock boundary while another process held it"
+        );
+        assert!(
+            holder_output.status.success(),
+            "lock holder failed: {}",
+            String::from_utf8_lossy(&holder_output.stderr)
+        );
+        assert!(
+            writer_output.status.success(),
+            "lock writer failed: {}",
+            String::from_utf8_lossy(&writer_output.stderr)
+        );
+        assert!(acquired.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for the production manifest lock-boundary test"]
+    fn manifest_lock_boundary_holder_helper() {
+        use std::os::fd::AsRawFd;
+
+        let Some(lock_path) = std::env::var_os("AITERM_UPLOAD_UNIT_LOCK_PATH") else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var_os("AITERM_UPLOAD_UNIT_LOCK_READY").unwrap());
+        let release = PathBuf::from(std::env::var_os("AITERM_UPLOAD_UNIT_LOCK_RELEASE").unwrap());
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        fs::write(ready, b"locked").unwrap();
+        assert!(wait_for_path_for(&release, Duration::from_secs(10)));
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for the production manifest lock-boundary test"]
+    fn manifest_lock_boundary_writer_helper() {
+        let Some(cache) = std::env::var_os("AITERM_UPLOAD_UNIT_LOCK_CACHE") else {
+            return;
+        };
+        AttachmentStore::new(PathBuf::from(cache)).unwrap();
     }
 }
