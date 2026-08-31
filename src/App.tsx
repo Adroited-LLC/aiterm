@@ -1996,7 +1996,7 @@ export default function App() {
    */
   const newSession = useCallback(async (
     cwd: string, choice: StartChoice, prompt?: string,
-    extra: { parentKey?: number; title?: string } = {},
+    extra: { parentKey?: number; title?: string; permissionFlags?: string } = {},
   ): Promise<{ key: number; sessionId?: string } | null> => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
@@ -2052,6 +2052,7 @@ export default function App() {
             model: choice.model,
             effort: choice.effort,
             prompt: prompt || null,
+            permissionFlags: extra.permissionFlags ?? null,
           });
           // No session id on the plan means the engine would not take one —
           // Codex has no `--session-id` — so the slot is a tab handle: the

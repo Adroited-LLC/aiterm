@@ -1079,7 +1079,7 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     .await;
     for (id, st) in busy {
         let e = activity.entry(id).or_insert_with(|| "idle".into());
-        if e == "idle" {
+        if transcript_outranks(e, st) {
             *e = st.into();
         }
     }
@@ -1186,6 +1186,20 @@ fn grok_events_state(text: &str) -> Option<Option<&'static str>> {
         return Some(Some("attention"));
     }
     saw_bracket.then(|| open_turn.then_some("working"))
+}
+
+/// When the transcript's verdict replaces what the terminal reported.
+/// Cadence may promote to working, but it must not HOLD working against a
+/// transcript that says a person is being waited on: codex's TUI keeps
+/// animating (a ticking elapsed counter) while its approval dialog is up,
+/// so cadence never goes quiet and, left alone, a session mid-approval
+/// reads "working" forever — a brought-in codex sat exactly there
+/// [observed: codex-cli 0.150.1]. Idle from cadence yields to any
+/// transcript verdict (the old rule); attention beats working (this one).
+/// A cadence "working" is never demoted to idle from here — output is
+/// output.
+fn transcript_outranks(terminal: &str, transcript: &str) -> bool {
+    terminal == "idle" || (transcript == "attention" && terminal == "working")
 }
 
 /// `Some("working")`, `Some("attention")` — codex mid-approval, or a grok
@@ -1875,6 +1889,20 @@ async fn stream_events(mut socket: WebSocket, mut rx: broadcast::Receiver<Event>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Attention from the transcript must beat a cadence "working": codex's
+    /// TUI animates through its approval dialog, so cadence alone holds
+    /// "working" forever. Idle yields to anything; working is never demoted
+    /// to idle from the transcript side.
+    #[test]
+    fn transcript_attention_outranks_cadence_working() {
+        assert!(transcript_outranks("working", "attention"));
+        assert!(transcript_outranks("idle", "attention"));
+        assert!(transcript_outranks("idle", "working"));
+        assert!(!transcript_outranks("working", "working"));
+        assert!(!transcript_outranks("working", "idle"));
+        assert!(!transcript_outranks("attention", "working"));
+    }
 
     #[test]
     fn a_token_is_64_hex_chars_and_never_repeats() {

@@ -37,6 +37,23 @@ const POLL_MS = 2_000;
 /** How much of the first conversation the second agent sees. */
 const CONTEXT_CHARS = 24_000;
 
+/**
+ * What the second agent launches with, per engine: read anything, ask nothing.
+ * Its opening brief forbids edits, so read-only covers the whole job — and an
+ * engine left on its stored default can park on an approval prompt that no
+ * surface shows (a brought-in codex sat exactly there: its TUI dialog is
+ * invisible to the phone, and its ticking spinner kept the state on
+ * "working"). Codex: `-a never` auto-approves inside a read-only sandbox
+ * [observed: codex-cli 0.150.1]. Claude and grok: plan mode reads without
+ * asking [observed: Claude Code 2.1.251, grok 1.0.13]. An engine not listed
+ * keeps its stored mode.
+ */
+const RELAY_PERMISSIONS: Record<string, string> = {
+  codex: "-a never -s read-only",
+  claude: "--permission-mode plan --allow-dangerously-skip-permissions",
+  grok: "--permission-mode plan",
+};
+
 function engineName(agentId: string | undefined, model?: string | null): string {
   const base = agentId === "claude" ? "Claude Code" : agentId === "codex" ? "Codex" : agentId === "grok" ? "Grok" : agentId ?? "the other agent";
   return model ? `${base} (${model})` : base;
@@ -50,7 +67,7 @@ export function useRelay(io: {
   /** Whether the tab is reporting progress (a turn in flight). */
   busy: (key: number) => boolean;
   /** Start a session; resolves with the tab opened. */
-  open: (cwd: string, choice: StartChoice, prompt: string, extra: { parentKey: number; title: string }) => Promise<{ key: number; sessionId?: string } | null>;
+  open: (cwd: string, choice: StartChoice, prompt: string, extra: { parentKey: number; title: string; permissionFlags?: string }) => Promise<{ key: number; sessionId?: string } | null>;
 }) {
   const [relay, setRelay] = useState<RelayState | null>(null);
   const timer = useRef<number | null>(null);
@@ -121,7 +138,11 @@ export function useRelay(io: {
     const short = opts.choice.kind === "agent"
       ? (opts.choice.model || engineName(opts.choice.agentId))
       : (opts.choice.modelId.split("/").pop() || opts.choice.modelId);
-    const opened = await ioRef.current.open(a.cwd, opts.choice, opening, { parentKey: a.key, title: short });
+    const opened = await ioRef.current.open(a.cwd, opts.choice, opening, {
+      parentKey: a.key,
+      title: short,
+      permissionFlags: opts.choice.kind === "agent" ? RELAY_PERMISSIONS[opts.choice.agentId] : undefined,
+    });
     if (myGen !== gen.current) return;
     if (!opened) { setRelay((r) => r && { ...r, phase: "error", note: "could not start the second agent" }); return; }
     const bKey = opened.key;

@@ -29,6 +29,14 @@ pub enum LaunchRequest {
         /// the ＋ menu, which opens an empty session.
         #[serde(default)]
         prompt: Option<String>,
+        /// Permission flags that replace the engine's stored mode for THIS
+        /// launch only. The relay uses it to start a brought-in second agent
+        /// read-only and never-asking (codex `-a never -s read-only`, plan
+        /// mode elsewhere) — its opening brief forbids edits, and an engine
+        /// left on its stored default can park on an approval prompt nobody
+        /// was shown. Absent = the stored mode, as ever.
+        #[serde(default)]
+        permission_flags: Option<String>,
     },
     /// A model from Model access. Which engine runs it is this module's answer,
     /// not the caller's.
@@ -126,15 +134,16 @@ pub fn resolve_with(
     request: LaunchRequest,
     flags: impl Fn(&dyn AgentBackend) -> String,
 ) -> Option<LaunchPlan> {
-    let finish = |backend: &dyn AgentBackend, mut plan: LaunchPlan, prompt: Option<&str>| {
-        plan = with_permission(plan, &flags(backend));
+    let finish = |backend: &dyn AgentBackend, mut plan: LaunchPlan, prompt: Option<&str>, perm_override: Option<&str>| {
+        let perm = perm_override.map(str::to_string).unwrap_or_else(|| flags(backend));
+        plan = with_permission(plan, &perm);
         if let Some(p) = prompt.map(str::trim).filter(|p| !p.is_empty()) {
             plan.command = format!("{} {}", plan.command, backend.prompt_arg(p));
         }
         plan
     };
     match request {
-        LaunchRequest::Agent { agent_id, model, effort, prompt } => {
+        LaunchRequest::Agent { agent_id, model, effort, prompt, permission_flags } => {
             let backend = list.iter().find(|b| b.id() == agent_id)?;
             let spec = LaunchSpec {
                 model,
@@ -151,7 +160,7 @@ pub fn resolve_with(
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
             };
-            Some(finish(&**backend, plan, prompt.as_deref()))
+            Some(finish(&**backend, plan, prompt.as_deref(), permission_flags.as_deref()))
         }
 
         LaunchRequest::ApiModel { provider_id, model_id, prompt } => {
@@ -185,7 +194,7 @@ pub fn resolve_with(
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
             };
-            Some(finish(&**backend, plan, prompt.as_deref()))
+            Some(finish(&**backend, plan, prompt.as_deref(), None))
         }
 
         // Restart is a resume: the tab ended, and continuing the conversation
@@ -193,7 +202,7 @@ pub fn resolve_with(
         LaunchRequest::Resume { session_id } | LaunchRequest::Restart { session_id } => {
             let plan = reopen(list, providers, &session_id, |b, id| b.resume(id))?;
             let backend = list.iter().find(|b| b.id() == plan.agent_id)?;
-            Some(finish(&**backend, plan, None))
+            Some(finish(&**backend, plan, None, None))
         }
 
         // Clear is not a reopen, and the difference is the whole feature: the
@@ -213,7 +222,7 @@ pub fn resolve_with(
                 agent_id: backend.id().to_string(),
                 caps: backend.caps(),
             };
-            Some(finish(backend, plan, None))
+            Some(finish(backend, plan, None, None))
         }
     }
 }
@@ -337,14 +346,29 @@ mod tests {
         let list = vec![claude_like(vec![])];
         let flags = |_: &dyn AgentBackend| "--permission-mode auto".to_string();
         let plan = resolve_with(&list, &[], LaunchRequest::Agent {
-            agent_id: "claude".into(), model: Some("haiku".into()), effort: None, prompt: Some("  write it  ".into()),
+            agent_id: "claude".into(), model: Some("haiku".into()), effort: None, prompt: Some("  write it  ".into()), permission_flags: None,
         }, flags).unwrap();
         assert!(plan.command.ends_with("--permission-mode auto 'write it'"), "{}", plan.command);
         assert!(plan.command.contains("--model haiku"), "{}", plan.command);
         let none = resolve_with(&list, &[], LaunchRequest::Agent {
-            agent_id: "claude".into(), model: None, effort: None, prompt: Some("   ".into()),
+            agent_id: "claude".into(), model: None, effort: None, prompt: Some("   ".into()), permission_flags: None,
         }, flags).unwrap();
         assert!(none.command.ends_with("--permission-mode auto"), "{}", none.command);
+    }
+
+    /// A per-launch permission override replaces the stored mode entirely:
+    /// the relay starts a brought-in second agent read-only and never-asking
+    /// regardless of what Settings says for that engine.
+    #[test]
+    fn a_permission_override_replaces_the_stored_mode() {
+        let list = vec![claude_like(vec![])];
+        let stored = |_: &dyn AgentBackend| "--permission-mode auto".to_string();
+        let plan = resolve_with(&list, &[], LaunchRequest::Agent {
+            agent_id: "claude".into(), model: None, effort: None, prompt: Some("look around".into()),
+            permission_flags: Some("--permission-mode plan".into()),
+        }, stored).unwrap();
+        assert!(plan.command.ends_with("--permission-mode plan 'look around'"), "{}", plan.command);
+        assert!(!plan.command.contains("auto"), "{}", plan.command);
     }
 
     /// Print the command a claude/haiku launch with a prompt resolves to on
@@ -353,7 +377,7 @@ mod tests {
     #[ignore]
     fn what_would_launch() {
         let plan = resolve(LaunchRequest::Agent {
-            agent_id: "claude".into(), model: Some("haiku".into()), effort: None, prompt: Some("hello there".into()),
+            agent_id: "claude".into(), model: Some("haiku".into()), effort: None, prompt: Some("hello there".into()), permission_flags: None,
         }).expect("a plan");
         println!("COMMAND: {}", plan.command);
     }
@@ -570,6 +594,7 @@ mod tests {
                 model: Some("opus".into()),
                 effort: Some("high".into()),
                 prompt: None,
+                permission_flags: None,
             },
         )
         .expect("no plan");
@@ -585,7 +610,7 @@ mod tests {
         assert!(resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "ghost".into(), model: None, effort: None, prompt: None },
+            LaunchRequest::Agent { agent_id: "ghost".into(), model: None, effort: None, prompt: None, permission_flags: None },
         )
         .is_none());
     }
@@ -739,7 +764,7 @@ mod tests {
         let minting = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None },
+            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None, permission_flags: None },
         )
         .unwrap();
         let id = minting.session_id.expect("claude mints an id");
@@ -767,6 +792,7 @@ mod tests {
             model: None,
             effort: None,
     prompt: None,
+    permission_flags: None,
 };
         let a = resolve_in(&list, &[], req()).unwrap().session_id;
         let b = resolve_in(&list, &[], req()).unwrap().session_id;
@@ -1043,7 +1069,7 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None },
+            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None, permission_flags: None },
         )
         .unwrap();
         let v: serde_json::Value = serde_json::to_value(&plan).unwrap();
