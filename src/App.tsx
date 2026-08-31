@@ -2415,6 +2415,9 @@ export default function App() {
         <div className="panel terminal-panel">
           {(tabs.length > 0 || previewSession || fileTabs.some(showsFile)) && (
             <div className="center-tabs">
+              {/* defined inline: a tab's label follows its session's CURRENT
+                  name — the sidebar's word, renames included — rather than
+                  whatever the tab was called the moment it opened. */}
               {/* Leftmost, always: the way back to the start view — or the
                   preview that stands in for it — so a file or a session is
                   never a dead end. */}
@@ -2468,7 +2471,9 @@ export default function App() {
                     {t.agentId
                       ? <AgentIcon agent={t.agentId} size={13} />
                       : <span className="center-tab-shell">❯</span>}
-                    <span className="center-tab-name">{t.title}</span>
+                    <span className="center-tab-name">
+                      {(t.sessionId && sessions.find((x) => x.id === t.sessionId)?.title) || t.title}
+                    </span>
                     {wants && !on && <span className="center-tab-dot" title="Waiting for you" />}
                     <span
                       className="center-tab-close"
