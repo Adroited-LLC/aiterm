@@ -27,6 +27,8 @@ data class AttachedTerminal(
     val title: String,
 )
 
+data class RemoteUploadBegan(val uploadId: String, val nextChunk: Int)
+
 data class RemoteFocusEvent(
     val tabId: String,
     val attachmentId: String,
@@ -74,6 +76,13 @@ data class RemoteAgentRoster(
 
 @OptIn(ExperimentalSerializationApi::class)
 object RemoteCommands {
+    const val MAX_UPLOAD_BYTES = 12 * 1_024 * 1_024L
+    const val MAX_UPLOAD_CHUNK_BYTES = 256 * 1_024
+    const val MAX_UPLOADS_PER_SUBMISSION = 4
+    const val MAX_SUBMISSION_BYTES = 48 * 1_024 * 1_024L
+    const val MAX_IDENTIFIER_BYTES = 4 * 1_024
+    const val MAX_PATH_BYTES = 4 * 1_024
+
     private val cbor = Cbor {
         encodeDefaults = true
         ignoreUnknownKeys = false
@@ -109,6 +118,67 @@ object RemoteCommands {
         AgentStartPayload.serializer(),
         AgentStartPayload(agentId = agentId, model = model, effort = effort, cwd = cwd, title = title, size = size),
     )
+
+    fun uploadBegin(
+        tabId: String,
+        attachmentId: String,
+        submissionId: String,
+        submissionCount: Int,
+        submissionBytes: Long,
+        length: Long,
+        sha256: ByteArray,
+    ): ByteArray {
+        requireIdentifier(tabId)
+        requireIdentifier(attachmentId)
+        requireIdentifier(submissionId)
+        if (submissionCount !in 1..MAX_UPLOADS_PER_SUBMISSION ||
+            submissionBytes !in 1..MAX_SUBMISSION_BYTES ||
+            length !in 1..MAX_UPLOAD_BYTES ||
+            length > submissionBytes ||
+            sha256.size != 32
+        ) malformed()
+        return encode(
+            UploadBeginPayload.serializer(),
+            UploadBeginPayload(
+                tabId = tabId,
+                attachmentId = attachmentId,
+                submissionId = submissionId,
+                submissionCount = submissionCount,
+                submissionBytes = submissionBytes,
+                length = length,
+                sha256 = sha256,
+            ),
+        )
+    }
+
+    fun uploadChunk(uploadId: String, index: Int, data: ByteArray): ByteArray {
+        requireIdentifier(uploadId)
+        if (index < 0 || data.isEmpty() || data.size > MAX_UPLOAD_CHUNK_BYTES) malformed()
+        return encode(UploadChunkPayload.serializer(), UploadChunkPayload(uploadId, index, data))
+    }
+
+    fun uploadFinish(uploadId: String): ByteArray {
+        requireIdentifier(uploadId)
+        return encode(UploadIdPayload.serializer(), UploadIdPayload(uploadId))
+    }
+
+    fun uploadCancel(uploadId: String): ByteArray = uploadFinish(uploadId)
+
+    fun uploadBegan(payload: ByteArray): RemoteUploadBegan =
+        decode(UploadBeginReply.serializer(), payload).let {
+            if (it.uploadId.isBlank() || it.uploadId.encodeToByteArray().size > MAX_IDENTIFIER_BYTES ||
+                it.nextChunk < 0
+            ) malformed()
+            RemoteUploadBegan(it.uploadId, it.nextChunk)
+        }
+
+    fun uploadedPath(payload: ByteArray): String = decode(UploadFinishReply.serializer(), payload).path.also {
+        if (it.isBlank() || it.encodeToByteArray().size > MAX_PATH_BYTES) malformed()
+    }
+
+    fun uploadAcknowledged(payload: ByteArray) {
+        if (!decode(UploadSuccessReply.serializer(), payload).ok) malformed()
+    }
 
     fun sessions(payload: ByteArray): List<RemoteSession> =
         decode(SessionListReply.serializer(), payload).sessions.also { sessions ->
@@ -179,6 +249,10 @@ object RemoteCommands {
 
     private fun malformed(): Nothing = throw RemoteProtocolException("invalid remote operation payload")
 
+    private fun requireIdentifier(value: String) {
+        if (value.isBlank() || value.encodeToByteArray().size > MAX_IDENTIFIER_BYTES) malformed()
+    }
+
     @Serializable private data class TabIdPayload(@SerialName("tab_id") val tabId: String)
     @Serializable private data class AttachmentPayload(
         @SerialName("tab_id") val tabId: String,
@@ -224,6 +298,28 @@ object RemoteCommands {
         val title: String,
         val size: TerminalSize,
     )
+    @Serializable private data class UploadBeginPayload(
+        @SerialName("tab_id") val tabId: String,
+        @SerialName("attachment_id") val attachmentId: String,
+        @SerialName("submission_id") val submissionId: String,
+        @SerialName("submission_count") val submissionCount: Int,
+        @SerialName("submission_bytes") val submissionBytes: Long,
+        val length: Long,
+        @SerialName("media_type") val mediaType: String = "image/jpeg",
+        @ByteString val sha256: ByteArray,
+    )
+    @Serializable private data class UploadChunkPayload(
+        @SerialName("upload_id") val uploadId: String,
+        val index: Int,
+        @ByteString val data: ByteArray,
+    )
+    @Serializable private data class UploadIdPayload(@SerialName("upload_id") val uploadId: String)
+    @Serializable private data class UploadBeginReply(
+        @SerialName("upload_id") val uploadId: String,
+        @SerialName("next_chunk") val nextChunk: Int,
+    )
+    @Serializable private data class UploadFinishReply(val path: String)
+    @Serializable private data class UploadSuccessReply(val ok: Boolean)
     @Serializable private data class SessionListReply(val sessions: List<RemoteSession>)
     @Serializable private data class SessionPreviewReply(val messages: List<RemotePreviewMessage>)
     @Serializable private data class TabListReply(val tabs: List<RemoteTab>)

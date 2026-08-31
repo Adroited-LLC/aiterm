@@ -9,6 +9,7 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -18,7 +19,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import java.io.File
+import java.io.FileInputStream
+import java.util.UUID
 
 @Serializable
 data class TerminalSize(val cols: Int, val rows: Int) {
@@ -48,6 +53,18 @@ data class RemoteClientState(
 )
 
 data class RemoteRequest(val requestId: Long, val kind: String, val payload: ByteArray)
+
+data class RemoteUploadSource(
+    val id: String,
+    val file: File,
+    val length: Long,
+    val sha256: ByteArray,
+)
+
+data class RemoteUploadProgress(val sourceId: String, val sent: Long, val total: Long)
+
+class RemoteUploadException(val code: String?, message: String, cause: Throwable? = null) :
+    Exception(message, cause)
 
 sealed interface RemoteResponse {
     val requestId: Long
@@ -230,6 +247,93 @@ class RemoteClient(
         if (data.size > MAX_INPUT_BYTES) return false
         launchRequest("terminal.input", RemoteCommands.input(target.first, target.second, data))
         return true
+    }
+
+    /**
+     * Stages normalized local images on the active desktop terminal without writing terminal input.
+     * The caller owns prompt submission and local draft-file deletion after this succeeds.
+     */
+    suspend fun uploadImages(
+        sources: List<RemoteUploadSource>,
+        onProgress: (RemoteUploadProgress) -> Unit = {},
+    ): Result<List<String>> = withContext(dispatcher) {
+        val context = synchronized(lifecycleLock) { activeUploadContext() }
+            ?: return@withContext Result.failure(RemoteUploadException(null, "terminal focus is required to upload images"))
+        val activeUploadIds = linkedSetOf<String>()
+        try {
+            validateUploadSources(sources)
+            val submissionId = UUID.randomUUID().toString()
+            val submissionCount = sources.size
+            val submissionBytes = sources.sumOf(RemoteUploadSource::length)
+            val paths = ArrayList<String>(sources.size)
+
+            for (source in sources) {
+                requireCurrentUploadContext(context)
+                val beganPayload = requestUpload(
+                    context,
+                    "terminal.upload.begin",
+                    RemoteCommands.uploadBegin(
+                        tabId = context.tabId,
+                        attachmentId = context.attachmentId,
+                        submissionId = submissionId,
+                        submissionCount = submissionCount,
+                        submissionBytes = submissionBytes,
+                        length = source.length,
+                        sha256 = source.sha256,
+                    ),
+                )
+                val began = RemoteCommands.uploadBegan(beganPayload)
+                activeUploadIds += began.uploadId
+                if (began.nextChunk != 0) {
+                    throw RemoteProtocolException("new terminal image upload unexpectedly starts after chunk zero")
+                }
+                onProgress(RemoteUploadProgress(source.id, 0, source.length))
+
+                FileInputStream(source.file).use { input ->
+                    val buffer = ByteArray(RemoteCommands.MAX_UPLOAD_CHUNK_BYTES)
+                    var sent = 0L
+                    var index = began.nextChunk
+                    while (sent < source.length) {
+                        requireCurrentUploadContext(context)
+                        val requested = minOf(buffer.size.toLong(), source.length - sent).toInt()
+                        val count = input.read(buffer, 0, requested)
+                        if (count <= 0) {
+                            throw RemoteUploadException(null, "the selected image changed while it was uploading")
+                        }
+                        val data = buffer.copyOf(count)
+                        val chunkPayload = requestUpload(
+                            context,
+                            "terminal.upload.chunk",
+                            RemoteCommands.uploadChunk(began.uploadId, index, data),
+                        )
+                        RemoteCommands.uploadAcknowledged(chunkPayload)
+                        sent += count
+                        index += 1
+                        onProgress(RemoteUploadProgress(source.id, sent, source.length))
+                    }
+                    if (input.read() != -1) {
+                        throw RemoteUploadException(null, "the selected image changed while it was uploading")
+                    }
+                }
+
+                requireCurrentUploadContext(context)
+                val finishedPayload = requestUpload(
+                    context,
+                    "terminal.upload.finish",
+                    RemoteCommands.uploadFinish(began.uploadId),
+                )
+                paths += RemoteCommands.uploadedPath(finishedPayload)
+                activeUploadIds -= began.uploadId
+            }
+            Result.success(paths)
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            // A caller cancellation must leave its local draft intact, but should still stop desktop staging.
+            withContext(NonCancellable) { cancelBegunUploads(context, activeUploadIds) }
+            throw error
+        } catch (error: Exception) {
+            cancelBegunUploads(context, activeUploadIds)
+            Result.failure(error)
+        }
     }
 
     fun selectTab(tabId: String) {
@@ -888,6 +992,84 @@ class RemoteClient(
         }
     }
 
+    private fun activeUploadContext(): UploadContext? {
+        if (mutableState.value.connection != ConnectionState.Connected || mutableState.value.focus != FocusOwner.Self) {
+            return null
+        }
+        val (tabId, attachmentId) = activeTarget() ?: return null
+        val active = transport ?: return null
+        return UploadContext(lifecycleGeneration, active, tabId, attachmentId)
+    }
+
+    private fun validateUploadSources(sources: List<RemoteUploadSource>) {
+        if (sources.isEmpty() || sources.size > RemoteCommands.MAX_UPLOADS_PER_SUBMISSION) {
+            throw RemoteUploadException(null, "choose between one and four images")
+        }
+        val ids = hashSetOf<String>()
+        var total = 0L
+        for (source in sources) {
+            if (source.id.isBlank() || source.id.encodeToByteArray().size > RemoteCommands.MAX_IDENTIFIER_BYTES ||
+                !ids.add(source.id) || !source.file.isFile || source.file.length() != source.length ||
+                source.length !in 1..RemoteCommands.MAX_UPLOAD_BYTES || source.sha256.size != 32
+            ) {
+                throw RemoteUploadException(null, "the selected image is invalid or changed")
+            }
+            total += source.length
+            if (total > RemoteCommands.MAX_SUBMISSION_BYTES) {
+                throw RemoteUploadException(null, "selected images exceed the 48 MiB upload limit")
+            }
+        }
+    }
+
+    private fun requireCurrentUploadContext(context: UploadContext) {
+        val current = synchronized(lifecycleLock) {
+            isCurrent(context.lifecycleGeneration, context.transport) &&
+                mutableState.value.connection == ConnectionState.Connected &&
+                mutableState.value.focus == FocusOwner.Self &&
+                activeTarget() == (context.tabId to context.attachmentId)
+        }
+        if (!current) throw RemoteUploadException(null, "terminal focus changed while images were uploading")
+    }
+
+    private suspend fun requestUpload(context: UploadContext, kind: String, payload: ByteArray): ByteArray {
+        requireCurrentUploadContext(context)
+        return when (val response = context.transport.request(kind, payload).await()) {
+            is RemoteResponse.Success -> {
+                if (response.kind != kind) {
+                    throw RemoteProtocolException("unexpected terminal image upload response")
+                }
+                response.payload
+            }
+            is RemoteResponse.Error -> throw RemoteUploadException(response.code, response.message)
+        }
+    }
+
+    private suspend fun cancelBegunUploads(context: UploadContext, uploadIds: Set<String>) {
+        for (uploadId in uploadIds.toList()) {
+            val sameConnection = synchronized(lifecycleLock) {
+                isCurrent(context.lifecycleGeneration, context.transport)
+            }
+            if (!sameConnection) return
+            try {
+                when (val response = context.transport.request(
+                    "terminal.upload.cancel",
+                    RemoteCommands.uploadCancel(uploadId),
+                ).await()) {
+                    is RemoteResponse.Success -> {
+                        if (response.kind == "terminal.upload.cancel") {
+                            RemoteCommands.uploadAcknowledged(response.payload)
+                        }
+                    }
+                    is RemoteResponse.Error -> Unit
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // Best-effort cancellation must not replace the original cancellation or failure.
+            } catch (_: Exception) {
+                // The disconnected transport owns server-side cleanup when a cancel frame cannot be delivered.
+            }
+        }
+    }
+
     private fun activeTarget(): Pair<String, String>? {
         val tabId = mutableState.value.activeTabId ?: return null
         if (activeAttachmentTabId != tabId) return null
@@ -905,6 +1087,12 @@ class RemoteClient(
     }
 
     private data class RequestContext(val lifecycleGeneration: Long, val transport: RemoteTransport)
+    private data class UploadContext(
+        val lifecycleGeneration: Long,
+        val transport: RemoteTransport,
+        val tabId: String,
+        val attachmentId: String,
+    )
     private data class ClosingTransport(val transport: RemoteTransport?, val jobs: List<Job>)
     private data class ScrollbackRequest(
         val lifecycleGeneration: Long,
