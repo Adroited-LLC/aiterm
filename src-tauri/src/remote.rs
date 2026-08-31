@@ -1572,6 +1572,7 @@ pub fn relay_report(
     rounds: u32,
     note: String,
 ) {
+    crate::diag!("relay", "{phase} r{round}/{rounds} a={} b={:?} ({b_name}) {note}", &session_id[..8.min(session_id.len())], b_session_id.as_deref().map(|b| &b[..8.min(b.len())]));
     if let Some(b) = b_session_id.as_deref() {
         crate::sessions::record_brought_in(b, &session_id);
     }
