@@ -181,7 +181,7 @@ pub fn resolve_in(
                 .iter()
                 .find(|b| b.accepts_api(provider) && b.detect().available)?;
             let spec = LaunchSpec {
-                model: Some(backend.api_model_slug(&model_id)),
+                model: Some(backend.api_model_slug(provider, &model_id)),
                 effort: None,
                 session_id: mint_for(&**backend),
                 provider: Some(provider_id.clone()),
@@ -516,7 +516,7 @@ mod tests {
         fn accepts_api(&self, provider: &Provider) -> bool {
             self.accepts_anything || (self.accepts_openrouter_only && provider.is_openrouter())
         }
-        fn api_model_slug(&self, model_id: &str) -> String {
+        fn api_model_slug(&self, _provider: &Provider, model_id: &str) -> String {
             if self.prefix_models {
                 format!("openrouter/{model_id}")
             } else {

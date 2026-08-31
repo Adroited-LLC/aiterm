@@ -242,6 +242,16 @@ impl PtyManager {
             {
                 if p.is_openrouter() && !p.api_key.is_empty() {
                     cmd.env("OPENROUTER_API_KEY", &p.api_key);
+                } else if !p.api_key.is_empty() {
+                    // A provider OpenCode knows from its own config may read its
+                    // key from an env var (`apiKey: "{env:NAME}"`). Resolve NAME
+                    // from opencode.json and hand it aiterm's stored key for that
+                    // provider — the var is in no rc file on this machine, so a
+                    // tab that does not get it handed over 401s against the local
+                    // router. [observed: opencode.json + ~/.bashrc, 2026-08-31]
+                    if let Some((_, Some(env_name))) = crate::agents::opencode_provider_matching(p) {
+                        cmd.env(env_name, &p.api_key);
+                    }
                 }
                 if let Some(model) = spec.env_model.as_deref() {
                     if let Some(cfg) = crate::providers::opencode_config_content(p, model) {
