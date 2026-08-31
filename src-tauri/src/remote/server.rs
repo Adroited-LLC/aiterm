@@ -3335,6 +3335,20 @@ async fn cancel_connection_uploads(upload_set: Arc<Mutex<UploadSet>>) {
     .await;
 }
 
+async fn cancel_attachment_uploads(
+    upload_set: Arc<Mutex<UploadSet>>,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
+) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let mut upload_set = upload_set
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        upload_set.cancel_attachment(&tab_id, &attachment_id);
+    })
+    .await;
+}
+
 async fn notify_revoked_if_needed(
     devices: &DeviceStore,
     device_id: &str,
@@ -3675,6 +3689,12 @@ async fn run_authenticated_socket(
                         .await;
                         match outcome {
                             AttachmentCommandOutcome::Completed(Ok(())) => {
+                                cancel_attachment_uploads(
+                                    upload_set.clone(),
+                                    closed_tab.clone(),
+                                    attachment_id.clone(),
+                                )
+                                .await;
                                 if let Some(attachment) = attachments.remove(&attachment_id) {
                                     shutdown_attachment(attachment).await;
                                 }

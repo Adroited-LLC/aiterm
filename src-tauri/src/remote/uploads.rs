@@ -539,6 +539,18 @@ impl UploadSet {
         }
     }
 
+    /// Cancel the active submission owned by an attachment that is closing.
+    /// Repeated detach or connection cleanup is an idempotent no-op.
+    pub fn cancel_attachment(&mut self, tab_id: &TabId, attachment_id: &AttachmentId) {
+        let submission_id = self.submission.as_ref().and_then(|group| {
+            (&group.tab_id == tab_id && &group.attachment_id == attachment_id)
+                .then(|| group.submission_id.clone())
+        });
+        if let Some(submission_id) = submission_id {
+            self.abort_submission(&submission_id);
+        }
+    }
+
     pub fn target(&self, upload_id: &str) -> Option<(&TabId, &AttachmentId)> {
         self.uploads
             .get(upload_id)
