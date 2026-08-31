@@ -78,3 +78,46 @@ version the behavior was read off, and re-verify on upgrades.
 An adapter claim is either (a) read off real files produced by a real
 session during the work, with the version noted, or (b) not made. The
 reference for tone and rigor is `grok.rs`.
+
+## The state machine (why desktop and mobile must not disagree)
+
+The desktop terminal is a window — it can't be wrong. Every remote surface
+is a *reconstruction*, and it must come from ONE resolver with explicit
+precedence, not from whichever signal spoke last:
+
+1. **Explicit terminal signals** (OSC 9;4 progress, bell) — always
+   believed, immediately.
+2. **Transcript facts** — an open turn bracket (codex task_started
+   without task_complete), an unanswered tool call, whose message is
+   last. These outrank cadence: an engine mid tool call is silent AND
+   busy.
+3. **Output cadence** — a tiebreaker only. Quiet may propose idle;
+   the transcript gets a veto before idle is announced
+   (`pty_set_activity` → `transcript_state`).
+
+Rule of thumb: cadence may promote to working, never demote to idle on
+its own. "Needs you" comes from the bell where the engine rings one, and
+from the unanswered-call + stale-transcript inference where it doesn't.
+
+## Onboarding a new harness (deepseek CLI, qwen CLI, whoever's next)
+
+The acceptance test, run against a REAL session of the new engine:
+
+1. Start it in a tab. Does a sidebar row appear with the right title,
+   cwd, time? (discovery)
+2. Ask something that uses a tool. Does the phone say **working** the
+   whole time — including during a long, silent tool call? (state)
+3. Does it ask a question / want approval? Does the phone say
+   **needs you** within a minute? (attention)
+4. Have it write a file in the workspace and one image/artifact wherever
+   it likes. Do both appear in the session's Files, attributed? (ledger)
+5. Open the conversation on the phone. Readable turns, no harness
+   preamble, tool calls summarized in one line each? (parsing)
+6. Send a message from the phone. Does it land? Stop from the phone.
+   Does it die? (lifecycle)
+7. Stamp every adapter answer with the CLI version observed.
+
+Fail any step → that surface's contract answer is wrong for this engine;
+fix the adapter, not the resolver. Many new CLIs are forks of codex or
+gemini-cli — check whether an existing adapter's shapes match before
+writing new ones.

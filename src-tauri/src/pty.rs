@@ -99,8 +99,28 @@ pub fn pty_set_activity(app: AppHandle, state: State<'_, PtyManager>, id: u32, a
     if let Some(session_id) = state.set_activity(id, &activity) {
         if activity != "idle" {
             crate::changes::touch(&app, &session_id);
+            crate::remote::notify(&app, crate::remote::Event::Activity { session_id, activity });
+            return;
         }
-        crate::remote::notify(&app, crate::remote::Event::Activity { session_id, activity });
+        // A quiet terminal is weak evidence — an engine mid tool call
+        // (image generation, a long build) is silent and busy, and codex
+        // says task_started/task_complete outright. The transcript
+        // outranks cadence: idle is only announced when it agrees.
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let sid = session_id.clone();
+            let verdict = crate::run_blocking(move || crate::remote::transcript_state(&sid)).await;
+            let announced = verdict.map(str::to_string).unwrap_or_else(|| "idle".into());
+            // Only speak if the terminal hasn't said something newer since.
+            let still_idle = app2
+                .state::<PtyManager>()
+                .activities()
+                .into_iter()
+                .any(|(id2, a)| id2 == session_id && a == "idle");
+            if still_idle {
+                crate::remote::notify(&app2, crate::remote::Event::Activity { session_id, activity: announced });
+            }
+        });
     }
 }
 

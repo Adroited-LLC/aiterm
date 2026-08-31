@@ -1072,10 +1072,12 @@ fn transcript_busy(session_id: &str) -> bool {
 }
 
 /// `Some("working")`, `Some("attention")` — codex mid-approval — or `None`.
+/// Public within the crate: the pty layer consults it before believing a
+/// quiet terminal means an idle session.
 /// Codex writes nothing while its approval prompt is up, so "waiting on a
 /// person" is read as: a turn in progress whose last act is a tool call
 /// with no output, and a transcript that has gone quiet.
-fn transcript_state(session_id: &str) -> Option<&'static str> {
+pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
     let list = crate::agents::backends();
     let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return None };
     let stale = std::fs::metadata(&path)
