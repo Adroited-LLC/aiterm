@@ -9,6 +9,8 @@ import com.adroited.aiterm.pairing.PairedDesktop
 import com.adroited.aiterm.remote.AuthenticatedRemoteTransport
 import com.adroited.aiterm.remote.OkHttpRemoteSocketDialer
 import com.adroited.aiterm.remote.RemoteClient
+import com.adroited.aiterm.remote.RemoteUploadProgress
+import com.adroited.aiterm.remote.RemoteUploadSource
 import com.adroited.aiterm.remote.TerminalSize
 import com.adroited.aiterm.security.AppLock
 import com.adroited.aiterm.security.DeviceKeys
@@ -21,6 +23,8 @@ class RemoteTerminalViewModel(
     deviceKeys: DeviceKeys,
     private val appLock: AppLock,
 ) : ViewModel() {
+    /** Survives terminal tab changes and configuration changes for this ViewModel's lifetime. */
+    internal val terminalDrafts = TerminalDraftStore()
     private val screenStore = DefaultTerminalScreenStore()
     private val dialer = OkHttpRemoteSocketDialer()
     val client = RemoteClient(
@@ -62,6 +66,20 @@ class RemoteTerminalViewModel(
 
     fun selectTab(tabId: String) = client.selectTab(tabId)
     fun sendInput(text: String) = client.sendInput(text)
+    /**
+     * Uploads normalized drafts only. Prompt formatting and terminal input stay in the UI submit
+     * path so failed uploads can never inject a partial prompt.
+     */
+    suspend fun uploadImages(
+        images: List<NormalizedTerminalImage>,
+        onProgress: (RemoteUploadProgress) -> Unit = {},
+    ): Result<List<String>> = client.uploadImages(images.map(::remoteUploadSource), onProgress)
+
+    /** Upload counterpart for the immutable images retained by [terminalDrafts]. */
+    internal suspend fun uploadDraftImages(
+        images: List<TerminalAttachmentImage>,
+        onProgress: (RemoteUploadProgress) -> Unit = {},
+    ): Result<List<String>> = client.uploadImages(images.map { it.asRemoteUploadSource() }, onProgress)
     fun takeFocus(cols: Int, rows: Int) = client.takeFocus(TerminalSize(cols, rows))
     fun resize(cols: Int, rows: Int) = client.resize(TerminalSize(cols, rows))
     fun loadOlderScrollback() = client.requestNextScrollbackPage()
@@ -98,3 +116,10 @@ class RemoteTerminalViewModel(
         }
     }
 }
+
+internal fun remoteUploadSource(image: NormalizedTerminalImage): RemoteUploadSource = RemoteUploadSource(
+    id = image.id,
+    file = image.file,
+    length = image.length,
+    sha256 = image.sha256.copyOf(),
+)

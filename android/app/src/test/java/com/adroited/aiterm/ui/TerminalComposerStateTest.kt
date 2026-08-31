@@ -8,6 +8,43 @@ import org.junit.Test
 
 class TerminalComposerStateTest {
     @Test
+    fun attachmentSubmissionFormatsTextPathsAndBracketsOnlyThePaste() {
+        val pathA = "/project/.aiterm/attachments/a.jpg"
+        val pathB = "/project/.aiterm/attachments/b.jpg"
+
+        assertEquals(
+            listOf(
+                "\u001b[200~Describe the issue\n\nAttached images:\n- $pathA\n- $pathB\u001b[201~",
+                "\r",
+            ),
+            formatTerminalSubmission("Describe the issue", listOf(pathA, pathB), bracketedPaste = true),
+        )
+    }
+
+    @Test
+    fun attachmentOnlySubmissionUsesAnExplicitPrompt() {
+        assertEquals(
+            listOf(
+                "Please inspect the attached image(s):\n\nAttached images:\n- /tmp/one.jpg",
+                "\r",
+            ),
+            formatTerminalSubmission("", listOf("/tmp/one.jpg")),
+        )
+    }
+
+    @Test
+    fun textOnlySubmissionKeepsExistingTerminalBehavior() {
+        assertEquals(
+            listOf("hello", "\r"),
+            formatTerminalSubmission("hello", emptyList(), bracketedPaste = false),
+        )
+        assertEquals(
+            listOf("\u001b[200~hello\u001b[201~", "\r"),
+            formatTerminalSubmission("hello", emptyList(), bracketedPaste = true),
+        )
+    }
+
+    @Test
     fun textDraftSurvivesClosingTheOverlayUntilItIsSent() {
         val initial = TerminalComposerState()
         assertFalse(initial.expanded)
