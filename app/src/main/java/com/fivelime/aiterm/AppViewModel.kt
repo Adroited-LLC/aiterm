@@ -35,7 +35,10 @@ enum class SessionState { Working, NeedsYou, OnDesktop, Running, Idle }
 class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val store = Store(app)
 
-    var desktop by mutableStateOf(store.load()); private set
+    /** Every desktop this phone is paired with, in pairing order. */
+    var desktops by mutableStateOf(store.loadAll()); private set
+    /** The one being shown. Everything below caches its state. */
+    var desktop by mutableStateOf(desktops.find { it.fingerprint == store.activeFingerprint } ?: desktops.firstOrNull()); private set
     var connected by mutableStateOf(false); private set
     var pairing by mutableStateOf(false); private set
     var sessions by mutableStateOf<List<Session>>(emptyList()); private set
@@ -113,6 +116,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var foreground = false
     private var refreshJob: Job? = null
     private var connectJob: Job? = null
+    /** Bumped by every connect(); a late better-route switch from an older
+     *  connect must not clobber a newer one. */
+    private var connectGen = 0
     private val api: Api? get() = desktop?.let { Api(it.baseUrl, it.token, it.fingerprint) }
 
     /** The default network changing (home Wi‑Fi ↔ cellular) is the one moment
@@ -144,7 +150,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var timeZone by mutableStateOf(store.timeZone); private set
     var biometric by mutableStateOf(store.biometric); private set
     /** The app is showing its lock screen; a successful prompt clears it. */
-    var locked by mutableStateOf(store.biometric && store.load() != null)
+    var locked by mutableStateOf(store.biometric && store.loadAll().isNotEmpty())
     private var pausedAt = 0L
 
     fun setBiometricEnabled(on: Boolean) {
@@ -166,20 +172,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- pairing
 
+    /** The pair screen is up over an already-paired app, to add a desktop. */
+    var showPair by mutableStateOf(false)
+
     fun pair(raw: String) {
         val link = PairLink.parse(raw)
         if (link == null) { notice = "That is not an AITerm pairing code"; return }
         viewModelScope.launch {
             pairing = true
             try {
-                for (url in link.candidates) {
-                    val status = try { Api(url, link.token, link.fingerprint).status() } catch (e: IOException) { continue } catch (e: ApiError) {
+                // The QR's addresses, then — when the desktop has one — its
+                // iroh node id via the local bridge, so pairing succeeds even
+                // on a network where no address is reachable at all.
+                val bridge = if (link.iroh.isNotEmpty()) IrohBridge.urlFor(getApplication(), link.iroh) else null
+                val candidates = link.candidates + listOfNotNull(bridge)
+                for (url in candidates) {
+                    // The bridge deserves more patience than an address: its
+                    // first reach includes discovery and the relay handshake.
+                    val patience = if (url == bridge) 15L else 4L
+                    val t0 = System.currentTimeMillis()
+                    val status = try { Api(url, link.token, link.fingerprint, patience).status() } catch (e: IOException) {
+                        android.util.Log.i("Aiterm", "pair probe $url → ${e.javaClass.simpleName}: ${e.message} in ${System.currentTimeMillis() - t0}ms")
+                        continue
+                    } catch (e: ApiError) {
                         notice = if (e.code == 401) "The desktop refused this code — show a fresh QR" else e.message; return@launch
                     }
+                    android.util.Log.i("Aiterm", "pair probe $url → ok in ${System.currentTimeMillis() - t0}ms")
                     if (status.api != 1) { notice = "This desktop speaks a newer protocol — update the app"; return@launch }
-                    val d = Desktop(url, link.token, status.name, link.candidates, link.fingerprint)
-                    store.save(d); desktop = d
-                    connect()
+                    val d = Desktop(url, link.token, status.name, link.candidates, link.fingerprint, link.iroh)
+                    adopt(d)
                     return@launch
                 }
                 notice = "Could not reach ${link.name} at ${link.hosts.joinToString()} — same Wi‑Fi or Tailscale?"
@@ -204,10 +225,58 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun forget() {
+    /** A fresh pairing: remember it (re-pairing the same desktop replaces
+     *  its entry — the fingerprint is the identity) and show it. */
+    private fun adopt(d: Desktop) {
         disconnect()
-        store.clear()
-        desktop = null; sessions = emptyList(); selected = null; turns = emptyList()
+        desktops = desktops.filter { it.fingerprint != d.fingerprint } + d
+        store.saveAll(desktops)
+        store.activeFingerprint = d.fingerprint
+        desktop = d
+        showPair = false
+        resetDesktopState()
+        connect()
+    }
+
+    /** Show another paired desktop. Everything cached belongs to the old
+     *  one, so it all goes; the connect re-reads the new one's truth. */
+    fun switchTo(d: Desktop) {
+        if (d.fingerprint == desktop?.fingerprint) return
+        disconnect()
+        store.activeFingerprint = d.fingerprint
+        desktop = desktops.find { it.fingerprint == d.fingerprint } ?: d
+        resetDesktopState()
+        connect()
+    }
+
+    /** Unpair one desktop. Forgetting the shown one falls back to the next;
+     *  forgetting the last returns the app to the pair screen. */
+    fun forget(d: Desktop? = null) {
+        val gone = d ?: desktop ?: return
+        desktops = desktops.filter { it.fingerprint != gone.fingerprint }
+        store.saveAll(desktops)
+        if (gone.fingerprint == desktop?.fingerprint) {
+            disconnect()
+            desktop = desktops.firstOrNull()
+            store.activeFingerprint = desktop?.fingerprint ?: ""
+            resetDesktopState()
+            if (desktop != null) connect()
+        }
+    }
+
+    /** Every cache below the desktop, back to empty — the screens must never
+     *  show one desktop's sessions under another's name. */
+    private fun resetDesktopState() {
+        sessions = emptyList(); running = emptySet(); open = emptySet(); activity = emptyMap()
+        usage = emptyList(); query = ""; results = null; searchJob?.cancel()
+        files = emptyList(); loadingFiles = false; viewing = null; opening = null; showFiles = false
+        browsing = false; browsePath = ""; browseEntries = emptyList()
+        composingNew = false; attachments = emptyList()
+        sentAt = 0L; turnsWhenSent = -1
+        agents = emptyList(); selected = null; turns = emptyList(); loadingTurns = false
+        relays = emptyMap(); previewUrl = null; inlineFiles = emptyMap()
+        withFiles = emptySet(); ports = emptyMap(); stars = emptySet(); broughtIn = emptyMap()
+        agentFilter = null; filesOnly = false; activeOnly = false
     }
 
     // ---- connection lifecycle: the activity calls these
@@ -245,8 +314,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         connectJob = viewModelScope.launch {
             // The desktop may be on a different address than last time — home
             // Wi‑Fi, USB, Tailscale. Probe every known address at once and
-            // commit to the most local one that answers.
-            val urls = d.ordered.sortedBy { rank(it) }
+            // commit to the most local one that answers. The iroh bridge is
+            // the always-answering last resort: anything more direct wins.
+            val bridge = if (d.iroh.isNotEmpty())
+                runCatching { IrohBridge.urlFor(getApplication(), d.iroh) }.getOrNull() else null
+            // The route that won last time goes FIRST, whatever its rank: on
+            // client-isolated office Wi‑Fi the bridge answers in ~0.7s while
+            // the doomed LAN probe eats its full 4s timeout — and rank-order
+            // committing made every office connect pay that wait [observed:
+            // probe log 2026-08-31, LAN 4015ms timeout vs bridge 665ms ok].
+            // Locality still wins the day: losing probes keep running below,
+            // and a more local answer switches the connection live.
+            val myGen = ++connectGen
+            val urls = (listOf(d.baseUrl) + d.ordered.drop(1).sortedBy { rank(it) } + listOfNotNull(bridge)).distinct()
             // Probes live on the outer scope, not this coroutine: a losing
             // probe blocks in OkHttp until its own timeout, and it must not
             // hold up committing to the address that already answered.
@@ -260,22 +340,51 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             var chosen: Pair<String, Status>? = null
             for ((i, p) in probes.withIndex()) { val s = p.await(); if (s != null) { chosen = urls[i] to s; break } }
-            probes.forEach { it.cancel() }
+            // Probes past the winner stay alive — see the better-route watch
+            // at the bottom of this function.
             if (chosen == null) { android.util.Log.i("Aiterm", "no address reachable; retry in 3s"); connected = false; scheduleRetry(); return@launch }
             val (reachable, status) = chosen
             android.util.Log.i("Aiterm", "using $reachable")
             // The desktop reports every address it answers on right now;
             // adopt that list so a DHCP move or new public IP never strands
             // us with only the addresses the QR knew at pairing time.
-            val port = reachable.substringAfterLast(':')
+            // The bridge answers on a loopback port, not the desktop's own;
+            // fresh addresses keep the desktop's real port instead.
+            val port = if (reachable == bridge)
+                (listOf(d.baseUrl) + d.candidates).firstOrNull { !it.contains("//127.0.0.1:") }?.substringAfterLast(':')
+                    ?: reachable.substringAfterLast(':')
+            else reachable.substringAfterLast(':')
             val fresh = status.hosts.map { "https://$it:$port" }
             val candidates = (fresh.ifEmpty { d.candidates } + reachable).distinct()
-            if (reachable != d.baseUrl || candidates != d.candidates) {
-                val nd = d.copy(baseUrl = reachable, candidates = candidates)
-                store.save(nd); desktop = nd
+            val iroh = status.iroh ?: d.iroh
+            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh) {
+                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh)
+                desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
+                store.saveAll(desktops)
+                desktop = nd
             }
             if (!foreground) return@launch // backgrounded while probing
             openEvents(Api(reachable, d.token, d.fingerprint))
+            // Better-route watch: the remembered winner got us on fast, but a
+            // strictly more local route that answers late (LAN at home, after
+            // the office bridge won the sprint) takes over — connection and
+            // remembered winner both. One switch at most; a newer connect()
+            // makes this one stand down.
+            for ((i, p) in probes.withIndex()) {
+                val s = runCatching { p.await() }.getOrNull() ?: continue
+                val url = urls[i]
+                if (url == reachable || rank(url) >= rank(reachable)) continue
+                if (myGen != connectGen || !foreground) return@launch
+                android.util.Log.i("Aiterm", "more local $url answered after commit; switching from $reachable")
+                val cur = desktops.find { it.fingerprint == d.fingerprint } ?: return@launch
+                val nd2 = cur.copy(baseUrl = url)
+                desktops = desktops.map { if (it.fingerprint == nd2.fingerprint) nd2 else it }
+                store.saveAll(desktops)
+                if (desktop?.fingerprint == nd2.fingerprint) desktop = nd2
+                ws?.cancel()
+                openEvents(Api(url, d.token, d.fingerprint))
+                return@launch
+            }
         }
     }
 
@@ -363,6 +472,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         try {
             val r = a.sessions()
             sessions = r.sessions.sortedByDescending { it.last_active }
+            // The session this phone just started: open it the moment
+            // discovery shows it, rather than leaving a new top row to be
+            // scrolled for. Same seconds-or-millis fold as relativeTime.
+            pendingOpen?.let { po ->
+                if (System.currentTimeMillis() - po.at > 30_000) {
+                    pendingOpen = null
+                    if (starting != null) { starting = null; notice = "The desktop did not report the session — check its list" }
+                    return@let
+                }
+                val born = sessions.find { s ->
+                    val ms = if (s.last_active > 100_000_000_000L) s.last_active else s.last_active * 1000
+                    s.project_path.trimEnd('/') == po.cwd.trimEnd('/') &&
+                        ms >= po.at - 5_000 &&
+                        (po.agentId.startsWith("api:") || s.agent == po.agentId)
+                }
+                if (born != null && selected == null && !composingNew) {
+                    pendingOpen = null
+                    starting = null
+                    select(born)
+                }
+            }
             running = r.running.toSet()
             open = r.open.toSet()
             activity = r.activity
@@ -596,8 +726,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Guards the per-selection conversation poller: bumped on every select,
+     *  so a stale poller stands down instead of writing over a newer one. */
+    private var selectGen = 0
+
     fun select(s: Session?) {
         selected = s
+        selectGen++
         turns = emptyList()
         files = emptyList()
         showFiles = false
@@ -606,15 +741,58 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         browseEntries = emptyList()
         viewing = null
         if (s == null) return
+        val myGen = selectGen
         viewModelScope.launch {
             loadingTurns = true
-            try { turns = api?.conversation(s.id) ?: emptyList() } catch (e: Exception) { notice = describe(e) }
+            // The opening fetch used to be one shot: one relay hiccup and the
+            // screen sat on "Nothing here yet" until some event happened to
+            // reload it — a person opening a mid-turn session saw its whole
+            // HISTORY as blank [observed 2026-08-31]. Retry, briefly.
+            for (attempt in 1..3) {
+                try { turns = api?.conversation(s.id) ?: emptyList(); break }
+                catch (e: Exception) { if (attempt == 3) notice = describe(e) else delay(1200) }
+            }
             loadingTurns = false
+            // While this session is on screen, follow its transcript: codex
+            // and claude write a message per completed step, so a working
+            // turn streams in step by step instead of arriving as one block
+            // at the end. Cheap — the desktop answers in ~10ms gzipped.
+            while (myGen == selectGen && selected?.id == s.id) {
+                delay(3000)
+                if (myGen != selectGen || selected?.id != s.id) break
+                val fresh = runCatching { api?.conversation(s.id) }.getOrNull() ?: continue
+                if (fresh != turns) {
+                    turns = fresh
+                    // A new message usually means new files — and a scratchpad
+                    // write gets no file_changed event (the watcher covers
+                    // workspaces, not /tmp scratchpads), so the globe for a
+                    // built page never appeared until reopen [observed
+                    // 2026-08-31: car-listing.html, via "wrote", invisible].
+                    loadFiles()
+                }
+            }
         }
         loadFiles() // the conversation shows what the session made, inline
     }
 
     // ---- acting
+
+    /** Brought-in agents of this session currently waiting on a person —
+     *  the master's screen shows them, because their own dialog is invisible
+     *  here and "working" was what a parked approval used to read as. */
+    fun crewNeedsYou(master: Session): List<Session> =
+        broughtIn.filterValues { it == master.id }.keys
+            .filter { activity[it] == "attention" }
+            .mapNotNull { id -> sessions.find { it.id == id } }
+
+    /** Raw keystrokes for the terminal's own dialogs. No Enter is appended —
+     *  Enter is a key here ("\r"). */
+    fun sendKeys(s: Session, keys: String) {
+        val a = api ?: return
+        viewModelScope.launch {
+            try { a.inputKeys(s.id, keys) } catch (e: Exception) { notice = describe(e) }
+        }
+    }
 
     fun send(text: String) {
         val s = selected ?: return
@@ -684,12 +862,47 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Escape: ends the agent's turn, keeps the session. */
     fun interrupt(s: Session) = act { it.interrupt(s.id); turnsWhenSent = -1 }
     fun stop(s: Session) = act { it.stop(s.id); refresh() }
+    /** A session this phone just asked for: the next refresh that shows a
+     *  session born in that folder (for that agent, when the id names one —
+     *  an api:<provider> launch surfaces under whichever engine ran it)
+     *  opens it directly, instead of leaving the person to spot a new row
+     *  at the top of the list seconds later. */
+    private data class PendingOpen(val agentId: String, val cwd: String, val at: Long)
+    private var pendingOpen: PendingOpen? = null
+
+    /** What the screen shows between "start" tapped and the session existing
+     *  on disk — the engine needs a few seconds to be discoverable, and dead
+     *  air reads as broken. The ask is echoed like a sent message; the real
+     *  session replaces this the moment discovery finds it. */
+    data class Starting(val agentId: String, val agentName: String, val cwd: String, val prompt: String?, val at: Long)
+    var starting by mutableStateOf<Starting?>(null); private set
+    /** Back from the starting screen. The desktop still starts the session —
+     *  only the wait is dismissed; the row lands in the list as ever. */
+    fun cancelStarting() { starting = null; pendingOpen = null }
+
     fun newSession(agentId: String, cwd: String, prompt: String?, model: String?, effort: String?, title: String?) = act {
         val text = withAttachments(prompt ?: "").takeIf { p -> p.isNotBlank() }
         it.newSession(agentId, cwd, text, model, effort, title?.takeIf { t -> t.isNotBlank() })
         attachments = emptyList()
         composingNew = false
-        notice = "Starting on ${desktop?.name}"
+        pendingOpen = PendingOpen(agentId, cwd, System.currentTimeMillis())
+        starting = Starting(
+            agentId,
+            agents.find { a -> a.id == agentId }?.display_name ?: agentId.removePrefix("api:"),
+            cwd,
+            text,
+            System.currentTimeMillis(),
+        )
+        refresh()
+        // Poll while the starting screen is up: the swap to the real session
+        // must not hinge on catching one sessions_changed event. Cheap now —
+        // a warm sessions poll is ~70ms on the desktop's side.
+        viewModelScope.launch {
+            while (starting != null) {
+                delay(1500)
+                if (starting != null) refreshNow()
+            }
+        }
     }
 
     private fun act(block: suspend (Api) -> Unit) {

@@ -2,6 +2,8 @@ package com.fivelime.aiterm.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -177,6 +179,14 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
         bottomBar = {
             Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
             vm.relays[s.id]?.let { r -> RelayBanner(vm, s, r) }
+            // A brought-in agent parked on a prompt is invisible from here —
+            // its dialog lives in its own terminal. Say so on the master's
+            // screen, where the person actually is, and take them there.
+            vm.crewNeedsYou(s).forEach { c -> CrewNeedsYouBanner(c) { vm.select(c) } }
+            // This session itself is waiting on a person: the dialog is a TUI
+            // the conversation view cannot render, so offer the keys that
+            // answer one. Raw, no Enter appended — Enter is one of the keys.
+            if (state == SessionState.NeedsYou) QuickKeysBar { k -> vm.sendKeys(s, k) }
             AttachmentChips(vm)
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
@@ -229,6 +239,100 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                 if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
                 if (working) item(key = "working") { WorkingRow(s.agent) }
             }
+        }
+    }
+}
+
+/** The gap between "start" tapped and the session existing on disk, made to
+ *  look like the conversation it is about to become: the ask echoed as a
+ *  sent bubble, the engine "working" underneath. The real session replaces
+ *  this screen the moment discovery finds it. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun StartingScreen(vm: AppViewModel, s: AppViewModel.Starting, outer: PaddingValues) {
+    Scaffold(
+        modifier = Modifier.padding(outer),
+        containerColor = Bg,
+        topBar = {
+            TopAppBar(
+                navigationIcon = { IconButton(onClick = { vm.cancelStarting() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        AgentIcon(s.agentId.removePrefix("api:"), 26.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text("Starting ${s.agentName}", style = MaterialTheme.typography.titleMedium)
+                            Text(folderName(s.cwd), style = MaterialTheme.typography.labelSmall, color = Muted)
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Bg),
+            )
+        },
+    ) { padding ->
+        Column(
+            Modifier.fillMaxSize().padding(padding).padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (!s.prompt.isNullOrBlank()) {
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+                    Box(
+                        Modifier.widthIn(max = 320.dp)
+                            .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp))
+                            .padding(12.dp),
+                    ) { Text(s.prompt, color = MaterialTheme.colorScheme.onPrimaryContainer) }
+                }
+            }
+            WorkingRow(s.agentName)
+        }
+    }
+}
+
+/** A brought-in agent is waiting on a person. Its approval dialog lives in
+ *  its own terminal, so the master's screen names it and a tap goes there. */
+@Composable
+private fun CrewNeedsYouBanner(c: com.fivelime.aiterm.Session, onOpen: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onOpen)
+            .background(Amber.copy(alpha = 0.12f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        AgentIcon(c.agent, 20.dp)
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "${c.agent} needs you — tap to answer",
+            style = MaterialTheme.typography.labelMedium, color = Amber,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+/** The keys that answer a terminal dialog, for a session in "needs you":
+ *  approve/deny shortcuts, digits for numbered pickers, arrows and Enter for
+ *  selection lists, Esc to back out. Sent raw — the dialog reads keystrokes,
+ *  not messages. */
+@Composable
+private fun QuickKeysBar(onKey: (String) -> Unit) {
+    val keys = listOf(
+        "Enter" to "\r", "y" to "y", "n" to "n",
+        "1" to "1", "2" to "2", "3" to "3",
+        "↑" to "\u001B[A", "↓" to "\u001B[B", "Esc" to "\u001B",
+    )
+    Row(
+        Modifier.fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("Answer:", style = MaterialTheme.typography.labelSmall, color = Muted)
+        keys.forEach { (label, seq) ->
+            Box(
+                Modifier.background(Amber.copy(alpha = 0.15f), RoundedCornerShape(12.dp))
+                    .clickable { onKey(seq) }
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+            ) { Text(label, style = MaterialTheme.typography.labelMedium, color = Amber) }
         }
     }
 }
