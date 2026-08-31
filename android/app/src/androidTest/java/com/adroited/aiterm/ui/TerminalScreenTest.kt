@@ -328,6 +328,56 @@ class TerminalScreenTest {
     }
 
     @Test
+    fun delayedImageSubmissionUsesTheLatestSameTabBracketedPasteMode() {
+        val store = TerminalDraftStore()
+        val image = normalizedImage("mode-change")
+        store.updateComposer("tab-mode-change") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("inspect mode")).state
+        }
+        store.updateAttachments("tab-mode-change") { it.add(image).draft }
+        val currentScreen = mutableStateOf(
+            oneCellScreen("tab-mode-change").copy(
+                modes = TerminalModes(bracketedPaste = true),
+            ),
+        )
+        val upload = CompletableDeferred<Result<List<String>>>()
+        val accepted = mutableListOf<Pair<String, List<String>>>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = currentScreen.value,
+                draftStore = store,
+                onUploadImages = { _, _, _ -> upload.await() },
+                onInputBatch = { tabId, inputs -> accepted += tabId to inputs; true },
+            )
+        }
+
+        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.waitUntil(5_000) { store.draftFor("tab-mode-change").attachments.submitting }
+        compose.runOnIdle {
+            currentScreen.value = currentScreen.value.copy(
+                revision = currentScreen.value.revision + 1,
+                modes = TerminalModes(bracketedPaste = false),
+            )
+        }
+        compose.waitForIdle()
+        upload.complete(Result.success(listOf("/project/current-mode.jpg")))
+        compose.waitUntil(5_000) { accepted.isNotEmpty() }
+
+        compose.runOnIdle {
+            assertEquals(
+                listOf(
+                    "tab-mode-change" to listOf(
+                        "inspect mode\n\nAttached images:\n- /project/current-mode.jpg",
+                        "\r",
+                    ),
+                ),
+                accepted,
+            )
+        }
+    }
+
+    @Test
     fun attachmentOnlySubmissionUsesSharedEnterPathAndLocalRejectionKeepsTheDraft() {
         val store = TerminalDraftStore()
         val image = normalizedImage("only")

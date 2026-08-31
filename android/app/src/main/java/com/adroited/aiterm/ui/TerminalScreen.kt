@@ -202,6 +202,7 @@ internal fun TerminalScreenContent(
     val localDraftStore = remember { TerminalDraftStore() }
     val activeDraftStore = draftStore ?: localDraftStore
     val allDrafts by activeDraftStore.drafts.collectAsStateWithLifecycle()
+    val latestScreen by rememberUpdatedState(screen)
     val activeTabId = screen?.tabId
     val tabDraft = activeTabId?.let { allDrafts[it] } ?: TerminalTabDraft()
     val composer = tabDraft.composer
@@ -330,10 +331,18 @@ internal fun TerminalScreenContent(
                     return@launch
                 }
                 val latest = activeDraftStore.draftFor(tabId)
+                val submissionScreen = latestScreen
+                if (submissionScreen?.tabId != tabId) {
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.failSubmission("Terminal tab changed while images were uploading. Try again.")
+                    }
+                    uploadBegan = false
+                    return@launch
+                }
                 val outbound = formatTerminalSubmission(
                     text = latest.composer.value.text,
                     paths = paths,
-                    bracketedPaste = activeScreen.modes.bracketedPaste,
+                    bracketedPaste = submissionScreen.modes.bracketedPaste,
                 )
                 val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
                     outbound.forEach(onInput)
