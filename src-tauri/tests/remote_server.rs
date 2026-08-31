@@ -4,6 +4,9 @@ use aiterm_lib::remote::model::TerminalSize;
 use aiterm_lib::remote::server::{
     RemoteGateway, RemoteServices, TlsIdentity, MAX_SCROLLBACK_PAGE_ROWS, MAX_TERMINAL_INPUT_BYTES,
 };
+use aiterm_lib::remote::uploads::{
+    MAX_SUBMISSION_BYTES, MAX_UPLOADS_PER_SUBMISSION, MAX_UPLOAD_CHUNK_BYTES,
+};
 use aiterm_lib::services::agents::AgentService;
 use aiterm_lib::services::sessions::{SessionRoots, SessionService};
 use aiterm_lib::tabs::{
@@ -14,6 +17,7 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand_core::OsRng;
 use rustls::pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -237,6 +241,65 @@ struct InputRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct UploadBeginRequest<'a> {
+    tab_id: &'a aiterm_lib::tabs::TabId,
+    attachment_id: &'a str,
+    submission_id: &'a str,
+    submission_count: u8,
+    submission_bytes: u64,
+    length: u64,
+    media_type: &'a str,
+    #[serde(with = "serde_bytes")]
+    sha256: &'a [u8],
+}
+
+#[derive(Serialize)]
+struct UploadBeginRequestWithUnknownField<'a> {
+    tab_id: &'a aiterm_lib::tabs::TabId,
+    attachment_id: &'a str,
+    submission_id: &'a str,
+    submission_count: u8,
+    submission_bytes: u64,
+    length: u64,
+    media_type: &'a str,
+    #[serde(with = "serde_bytes")]
+    sha256: &'a [u8],
+    unexpected: bool,
+}
+
+#[derive(Serialize)]
+struct UploadChunkRequest<'a> {
+    upload_id: &'a str,
+    index: u32,
+    #[serde(with = "serde_bytes")]
+    data: &'a [u8],
+}
+
+#[derive(Serialize)]
+struct UploadIdRequest<'a> {
+    upload_id: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadBeginReply {
+    upload_id: String,
+    next_chunk: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadFinishReply {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuccessReply {
+    ok: bool,
+}
+
+#[derive(Serialize)]
 struct ScrollbackRequest<'a> {
     tab_id: &'a aiterm_lib::tabs::TabId,
     attachment_id: &'a str,
@@ -301,6 +364,37 @@ fn encode<T: Serialize>(value: &T) -> Vec<u8> {
 
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> T {
     ciborium::from_reader(bytes).unwrap()
+}
+
+fn test_jpeg() -> Vec<u8> {
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+    use std::io::Cursor;
+
+    let image = ImageBuffer::from_pixel(16, 12, Rgb([19_u8, 71_u8, 113_u8]));
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, ImageFormat::Jpeg)
+        .unwrap();
+    bytes.into_inner()
+}
+
+fn upload_begin<'a>(
+    tab_id: &'a aiterm_lib::tabs::TabId,
+    attachment_id: &'a str,
+    submission_id: &'a str,
+    bytes: &'a [u8],
+    digest: &'a [u8],
+) -> UploadBeginRequest<'a> {
+    UploadBeginRequest {
+        tab_id,
+        attachment_id,
+        submission_id,
+        submission_count: 1,
+        submission_bytes: bytes.len() as u64,
+        length: bytes.len() as u64,
+        media_type: "image/jpeg",
+        sha256: digest,
+    }
 }
 
 fn tls_client(cert: &[u8], versions: &[&'static rustls::SupportedProtocolVersion]) -> Connector {
@@ -2861,6 +2955,747 @@ async fn attachment_input_scrollback_command_and_path_limits_are_enforced() {
             "protocol.value_too_large"
         );
     }
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn terminal_upload_round_trip_survives_focus_loss_and_is_connection_scoped() {
+    let root = private_test_dir("upload-round-trip");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let tab = registry
+        .open(
+            TabLaunch::new(
+                "Uploads",
+                "upload-round-trip",
+                TerminalSize::try_new(20, 2).unwrap(),
+            )
+            .with_cwd(project.to_string_lossy())
+            .with_command("sleep 300"),
+        )
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply =
+        decode(&response_kind(&mut socket, "terminal.attach").await.payload);
+    let _snapshot = response_kind(&mut socket, "terminal.snapshot").await;
+    socket
+        .send(request(
+            2,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let _focused = response_kind(&mut socket, "terminal.focus").await;
+
+    let jpeg = test_jpeg();
+    let digest = Sha256::digest(&jpeg);
+    socket
+        .send(request(
+            3,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "round-trip",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let began = response_kind(&mut socket, "terminal.upload.begin").await;
+    let began: UploadBeginReply = decode(&began.payload);
+    assert_eq!(began.next_chunk, 0);
+
+    let mut other = connect(&gateway).await;
+    authenticate(&mut other, &key, &device_id).await;
+    other
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let other_attached: AttachedReply =
+        decode(&response_kind(&mut other, "terminal.attach").await.payload);
+    let _other_snapshot = response_kind(&mut other, "terminal.snapshot").await;
+
+    other
+        .send(request(
+            2,
+            "terminal.upload.chunk",
+            &encode(&UploadChunkRequest {
+                upload_id: &began.upload_id,
+                index: 0,
+                data: &jpeg,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decode::<ErrorReply>(&response_kind(&mut other, "error").await.payload).code,
+        "terminal.upload_not_found"
+    );
+
+    other
+        .send(request(
+            3,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &other_attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let _other_focused = response_kind(&mut other, "terminal.focus").await;
+
+    socket
+        .send(request(
+            4,
+            "terminal.upload.chunk",
+            &encode(&UploadChunkRequest {
+                upload_id: &began.upload_id,
+                index: 0,
+                data: &jpeg,
+            }),
+        ))
+        .await
+        .unwrap();
+    let chunk: SuccessReply = decode(
+        &response_kind(&mut socket, "terminal.upload.chunk")
+            .await
+            .payload,
+    );
+    assert!(
+        chunk.ok,
+        "focus loss must not interrupt an authorized upload"
+    );
+
+    socket
+        .send(request(
+            5,
+            "terminal.upload.finish",
+            &encode(&UploadIdRequest {
+                upload_id: &began.upload_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let finished: UploadFinishReply = decode(
+        &response_kind(&mut socket, "terminal.upload.finish")
+            .await
+            .payload,
+    );
+    let published = PathBuf::from(&finished.path);
+    assert!(published.starts_with(project.join(".aiterm/attachments")));
+    assert_eq!(std::fs::read(&published).unwrap(), jpeg);
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn terminal_upload_cancel_remains_authorized_after_focus_loss() {
+    let root = private_test_dir("upload-cancel-focus-loss");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let tab = registry
+        .open(
+            TabLaunch::new(
+                "Uploads",
+                "upload-cancel-focus-loss",
+                TerminalSize::try_new(20, 2).unwrap(),
+            )
+            .with_cwd(project.to_string_lossy())
+            .with_command("sleep 300"),
+        )
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply =
+        decode(&response_kind(&mut socket, "terminal.attach").await.payload);
+    let _ = response_kind(&mut socket, "terminal.snapshot").await;
+    socket
+        .send(request(
+            2,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let _ = response_kind(&mut socket, "terminal.focus").await;
+    let jpeg = test_jpeg();
+    let digest = Sha256::digest(&jpeg);
+    socket
+        .send(request(
+            3,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "cancel-focus-loss",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let began: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+
+    let desktop = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    registry
+        .take_focus(&tab, &desktop.id, TerminalSize::try_new(20, 2).unwrap())
+        .unwrap();
+    socket
+        .send(request(
+            4,
+            "terminal.upload.cancel",
+            &encode(&UploadIdRequest {
+                upload_id: &began.upload_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cancelled: SuccessReply = decode(
+        &response_kind(&mut socket, "terminal.upload.cancel")
+            .await
+            .payload,
+    );
+    assert!(cancelled.ok);
+    assert!(std::fs::read_dir(project.join(".aiterm/attachments"))
+        .unwrap()
+        .all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            != Some("part")));
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn terminal_upload_begin_requires_focus_and_payloads_are_strict_and_bounded() {
+    let root = private_test_dir("upload-validation");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let tab = registry
+        .open(
+            TabLaunch::new(
+                "Uploads",
+                "upload-validation",
+                TerminalSize::try_new(20, 2).unwrap(),
+            )
+            .with_cwd(project.to_string_lossy())
+            .with_command("sleep 300"),
+        )
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply =
+        decode(&response_kind(&mut socket, "terminal.attach").await.payload);
+    let _ = response_kind(&mut socket, "terminal.snapshot").await;
+    let jpeg = test_jpeg();
+    let digest = Sha256::digest(&jpeg);
+
+    socket
+        .send(request(
+            2,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "no-focus",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
+        "terminal.input_not_owned"
+    );
+
+    socket
+        .send(request(
+            3,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let _ = response_kind(&mut socket, "terminal.focus").await;
+
+    let invalid_requests = [
+        (
+            4,
+            encode(&UploadBeginRequestWithUnknownField {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                submission_id: "unknown-field",
+                submission_count: 1,
+                submission_bytes: jpeg.len() as u64,
+                length: jpeg.len() as u64,
+                media_type: "image/jpeg",
+                sha256: digest.as_slice(),
+                unexpected: true,
+            }),
+            "protocol.invalid_payload",
+        ),
+        (
+            5,
+            encode(&UploadBeginRequest {
+                media_type: "image/png",
+                ..upload_begin(
+                    &tab,
+                    &attached.attachment_id,
+                    "bad-media",
+                    &jpeg,
+                    digest.as_slice(),
+                )
+            }),
+            "terminal.upload_invalid_image",
+        ),
+        (
+            6,
+            encode(&UploadBeginRequest {
+                sha256: &[0; 31],
+                ..upload_begin(
+                    &tab,
+                    &attached.attachment_id,
+                    "bad-digest",
+                    &jpeg,
+                    digest.as_slice(),
+                )
+            }),
+            "terminal.upload_invalid_image",
+        ),
+        (
+            7,
+            encode(&UploadBeginRequest {
+                submission_count: (MAX_UPLOADS_PER_SUBMISSION + 1) as u8,
+                ..upload_begin(
+                    &tab,
+                    &attached.attachment_id,
+                    "fifth-image",
+                    &jpeg,
+                    digest.as_slice(),
+                )
+            }),
+            "terminal.upload_too_large",
+        ),
+        (
+            8,
+            encode(&UploadBeginRequest {
+                submission_bytes: MAX_SUBMISSION_BYTES + 1,
+                ..upload_begin(
+                    &tab,
+                    &attached.attachment_id,
+                    "huge-submission",
+                    &jpeg,
+                    digest.as_slice(),
+                )
+            }),
+            "terminal.upload_too_large",
+        ),
+    ];
+    for (request_id, payload, expected) in invalid_requests {
+        socket
+            .send(request(request_id, "terminal.upload.begin", &payload))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
+            expected
+        );
+    }
+
+    socket
+        .send(request(
+            9,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "chunk-limits",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let began: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+    socket
+        .send(request(
+            10,
+            "terminal.upload.chunk",
+            &encode(&UploadChunkRequest {
+                upload_id: &began.upload_id,
+                index: 1,
+                data: &jpeg,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
+        "terminal.upload_out_of_order"
+    );
+
+    socket
+        .send(request(
+            11,
+            "terminal.upload.begin",
+            &encode(&UploadBeginRequest {
+                submission_id: "oversize-chunk",
+                submission_bytes: (MAX_UPLOAD_CHUNK_BYTES + 1) as u64,
+                length: (MAX_UPLOAD_CHUNK_BYTES + 1) as u64,
+                sha256: &[0; 32],
+                ..upload_begin(
+                    &tab,
+                    &attached.attachment_id,
+                    "oversize-chunk",
+                    &jpeg,
+                    digest.as_slice(),
+                )
+            }),
+        ))
+        .await
+        .unwrap();
+    let began: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+    socket
+        .send(request(
+            12,
+            "terminal.upload.chunk",
+            &encode(&UploadChunkRequest {
+                upload_id: &began.upload_id,
+                index: 0,
+                data: &vec![0; MAX_UPLOAD_CHUNK_BYTES + 1],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
+        "terminal.upload_too_large"
+    );
+
+    socket
+        .send(request(
+            13,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "completed-submission",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let completed: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+    socket
+        .send(request(
+            14,
+            "terminal.upload.chunk",
+            &encode(&UploadChunkRequest {
+                upload_id: &completed.upload_id,
+                index: 0,
+                data: &jpeg,
+            }),
+        ))
+        .await
+        .unwrap();
+    let _: SuccessReply = decode(
+        &response_kind(&mut socket, "terminal.upload.chunk")
+            .await
+            .payload,
+    );
+    socket
+        .send(request(
+            15,
+            "terminal.upload.finish",
+            &encode(&UploadIdRequest {
+                upload_id: &completed.upload_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let _: UploadFinishReply = decode(
+        &response_kind(&mut socket, "terminal.upload.finish")
+            .await
+            .payload,
+    );
+    socket
+        .send(request(
+            16,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "completed-submission",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
+        "terminal.upload_invalid_submission"
+    );
+
+    socket
+        .send(request(
+            17,
+            "terminal.upload.begin",
+            &encode(&UploadBeginRequest {
+                submission_id: "inconsistent-submission",
+                submission_count: 2,
+                submission_bytes: (jpeg.len() * 2) as u64,
+                ..upload_begin(
+                    &tab,
+                    &attached.attachment_id,
+                    "inconsistent-submission",
+                    &jpeg,
+                    digest.as_slice(),
+                )
+            }),
+        ))
+        .await
+        .unwrap();
+    let _: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+    socket
+        .send(request(
+            18,
+            "terminal.upload.begin",
+            &encode(&UploadBeginRequest {
+                submission_id: "inconsistent-submission",
+                submission_count: 1,
+                submission_bytes: jpeg.len() as u64,
+                ..upload_begin(
+                    &tab,
+                    &attached.attachment_id,
+                    "inconsistent-submission",
+                    &jpeg,
+                    digest.as_slice(),
+                )
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
+        "terminal.upload_invalid_submission"
+    );
+
+    registry.close(&tab).ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn terminal_upload_disconnect_removes_unfinished_staging_files() {
+    let root = private_test_dir("upload-disconnect");
+    let project = root.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let registry = Arc::new(TabRegistry::with_backend(Arc::new(TestPty::default())));
+    let tab = registry
+        .open(
+            TabLaunch::new(
+                "Uploads",
+                "upload-disconnect",
+                TerminalSize::try_new(20, 2).unwrap(),
+            )
+            .with_cwd(project.to_string_lossy())
+            .with_command("sleep 300"),
+        )
+        .unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store,
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let attached: AttachedReply =
+        decode(&response_kind(&mut socket, "terminal.attach").await.payload);
+    let _ = response_kind(&mut socket, "terminal.snapshot").await;
+    socket
+        .send(request(
+            2,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let _ = response_kind(&mut socket, "terminal.focus").await;
+    let jpeg = test_jpeg();
+    let digest = Sha256::digest(&jpeg);
+    socket
+        .send(request(
+            3,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "disconnect",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let _ = response_kind(&mut socket, "terminal.upload.begin").await;
+    let directory = project.join(".aiterm/attachments");
+    assert!(std::fs::read_dir(&directory).unwrap().any(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .and_then(|value| value.to_str())
+        == Some("part")));
+
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if std::fs::read_dir(&directory).unwrap().all(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    != Some("part")
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must cancel every connection-local upload");
 
     registry.close(&tab).ok();
     gateway.stop().await.unwrap();

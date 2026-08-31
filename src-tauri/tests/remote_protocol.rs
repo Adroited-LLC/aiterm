@@ -108,6 +108,21 @@ fn accepts_tab_and_scrollback_requests() {
     }
 }
 
+#[test]
+fn accepts_terminal_upload_requests() {
+    for kind in [
+        "terminal.upload.begin",
+        "terminal.upload.chunk",
+        "terminal.upload.finish",
+        "terminal.upload.cancel",
+    ] {
+        let request = RemoteRequest::decode(&cbor_request(1, kind, b""))
+            .expect("image uploads are part of the version-one terminal protocol");
+
+        assert_eq!(request.kind(), kind);
+    }
+}
+
 #[derive(Serialize)]
 struct EnvelopeWithUnknownField<'a> {
     version: u16,
