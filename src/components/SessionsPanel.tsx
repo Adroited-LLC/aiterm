@@ -215,7 +215,18 @@ export default function SessionsPanel({
   const [stars, setStars] = useState<Set<string>>(new Set());
   /** Brought-in session → master, and which masters have their crew folded. */
   const [broughtIn, setBroughtIn] = useState<Record<string, string>>({});
-  const [foldedCrews, setFoldedCrews] = useState<Set<string>>(new Set());
+  const [foldedCrews, setFoldedCrews] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem("aiterm.foldedCrews") ?? "[]")); }
+    catch { return new Set(); }
+  });
+  const toggleCrew = (id: string) => {
+    setFoldedCrews((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      try { localStorage.setItem("aiterm.foldedCrews", JSON.stringify([...next])); } catch { /* private mode */ }
+      return next;
+    });
+  };
   useEffect(() => {
     const load = () => {
       sessionTitles().then(setTitleOverrides).catch(() => {});
@@ -995,14 +1006,7 @@ export default function SessionsPanel({
                 <button
                   className={"crew-badge" + (folded ? " folded" : "")}
                   title={folded ? `${crew} brought-in agent(s) — click to show` : `${crew} brought-in agent(s) — click to fold`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setFoldedCrews((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(s.id)) next.delete(s.id); else next.add(s.id);
-                      return next;
-                    });
-                  }}
+                  onClick={(e) => { e.stopPropagation(); toggleCrew(s.id); }}
                 ><Icon of={Users} size="sm" />+{crew}</button>
               );
             })()}
