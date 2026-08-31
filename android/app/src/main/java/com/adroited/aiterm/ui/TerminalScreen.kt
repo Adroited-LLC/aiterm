@@ -53,6 +53,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -91,6 +92,7 @@ import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemoteSession
+import com.adroited.aiterm.remote.TerminalSize
 import com.adroited.aiterm.terminal.CellAttributes
 import com.adroited.aiterm.terminal.CursorShape
 import com.adroited.aiterm.terminal.ScreenCell
@@ -238,10 +240,16 @@ fun TerminalScreenContent(
                     val renderHeight = (maxHeight - composerInset).coerceAtLeast(terminalMetrics.lineHeight)
                     val measuredCols = (maxWidth / terminalMetrics.cellWidth).toInt().coerceIn(1, 512)
                     val measuredRows = (renderHeight / terminalMetrics.lineHeight).toInt().coerceIn(1, 512)
-                    LaunchedEffect(measuredCols, measuredRows, screen?.tabId) {
+                    LaunchedEffect(measuredCols, measuredRows) {
                         cols = measuredCols
                         rows = measuredRows
-                        if (screen != null) onResize(measuredCols, measuredRows)
+                    }
+                    LaunchedEffect(screen?.tabId) {
+                        if (screen != null) {
+                            snapshotFlow { TerminalSize(cols, rows) }
+                                .settledTerminalSizes()
+                                .collect { size -> onResize(size.cols, size.rows) }
+                        }
                     }
                     TerminalGrid(
                         screen = screen,

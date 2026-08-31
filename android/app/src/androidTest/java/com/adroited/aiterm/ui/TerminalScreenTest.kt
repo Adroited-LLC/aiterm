@@ -331,6 +331,40 @@ class TerminalScreenTest {
     }
 
     @Test
+    fun resizeStormPublishesOnlyTheFinalStableViewport() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        val height = mutableStateOf(480.dp)
+        compose.mainClock.autoAdvance = false
+        compose.setContent {
+            Box(Modifier.size(400.dp, height.value)) {
+                TerminalScreenContent(
+                    state = RemoteClientState(connection = ConnectionState.Connected),
+                    screen = ScreenSnapshot(
+                        tabId = "tab-resize-storm",
+                        revision = 1,
+                        cols = 1,
+                        rows = 1,
+                        visible = listOf(ScreenRow(listOf(ScreenCell("M")))),
+                        cursor = CursorState(0, 0, true),
+                    ),
+                    onResize = { cols, rows -> sizes += cols to rows },
+                )
+            }
+        }
+        compose.mainClock.advanceTimeByFrame()
+        compose.runOnIdle { sizes.clear() }
+
+        repeat(10) { index ->
+            compose.runOnIdle { height.value = (480 + (index + 1) * 24).dp }
+            compose.mainClock.advanceTimeBy(10)
+        }
+
+        compose.runOnIdle { assertTrue(sizes.isEmpty()) }
+        compose.mainClock.advanceTimeBy(TERMINAL_RESIZE_SETTLE_MILLIS)
+        compose.runOnIdle { assertEquals(1, sizes.size) }
+    }
+
+    @Test
     fun measuredGridKeepsWideCombiningAndCursorOnTheSameFontScaledGeometry() {
         compose.setContent {
             val density = LocalDensity.current
@@ -418,11 +452,13 @@ class TerminalScreenTest {
         }
 
         compose.waitUntil(5_000) { sizes.isNotEmpty() }
+        val callbacksBeforeResizeStorm = sizes.size
         for (width in 380..410) {
             compose.runOnIdle { dimensions.value = width.dp to 800.dp }
             compose.waitForIdle()
-            assertLatestViewportMatchesGrid()
         }
+        compose.waitUntil(8_000) { sizes.size > callbacksBeforeResizeStorm }
+        assertLatestViewportMatchesGrid()
         val portrait = sizes.last()
         compose.runOnIdle { dimensions.value = 800.dp to 400.dp }
         compose.waitUntil(8_000) { sizes.lastOrNull() != portrait }
