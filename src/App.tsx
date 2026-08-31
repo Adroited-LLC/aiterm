@@ -2252,8 +2252,8 @@ export default function App() {
   // ---- Remote access: a phone asks, the desktop opens. The tab appears here
   // too, so both screens agree about what is running. Refs, not deps: the
   // handlers below are recreated every render and the listener must not be.
-  const remoteRef = useRef({ resumeSession, newSession });
-  remoteRef.current = { resumeSession, newSession };
+  const remoteRef = useRef({ resumeSession, newSession, tabs, relayStart: relayCtl.start });
+  remoteRef.current = { resumeSession, newSession, tabs, relayStart: relayCtl.start };
   useEffect(() => {
     const unOpen = listen<{ sessionId: string }>("remote://open-session", async (e) => {
       const id = e.payload.sessionId;
@@ -2270,9 +2270,21 @@ export default function App() {
         title ? { title } : {},
       );
     });
+    const unBring = listen<{ session_id: string; agent_id: string; model: string | null; effort: string | null; focus: string; rounds: number }>("remote://bring-in", (e) => {
+      const p = e.payload;
+      const tab = remoteRef.current.tabs.find((t) => t.sessionId === p.session_id);
+      if (!tab) { setNotice("The phone asked to bring in a second agent, but that session has no tab here"); return; }
+      void remoteRef.current.relayStart({
+        aKey: tab.key,
+        choice: { kind: "agent", agentId: p.agent_id, model: p.model ?? null, effort: p.effort ?? null },
+        focus: p.focus ?? "",
+        rounds: p.rounds ?? 2,
+      });
+    });
     return () => {
       unOpen.then((f) => f());
       unNew.then((f) => f());
+      unBring.then((f) => f());
     };
   }, []);
   return (

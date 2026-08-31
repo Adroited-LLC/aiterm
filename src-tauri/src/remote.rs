@@ -658,6 +658,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/sessions/{id}/input", post(input))
         .route("/v1/sessions/{id}/rename", post(rename))
         .route("/v1/sessions/{id}/star", post(star))
+        .route("/v1/sessions/{id}/bringin", post(bring_in))
         .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop_session))
         .route("/v1/events", get(events))
@@ -1480,6 +1481,37 @@ struct RenameBody {
 #[derive(Deserialize)]
 struct StarBody {
     on: bool,
+}
+
+#[derive(Deserialize)]
+struct BringInBody {
+    agent_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+    focus: Option<String>,
+    rounds: Option<u32>,
+}
+
+/// The phone asks for a second agent; the desktop's renderer runs the
+/// relay (it owns the tabs the two agents talk through). Needs the session
+/// open in a tab — the phone opens it first.
+async fn bring_in(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<BringInBody>) -> Response {
+    let ptys = ctx.app.state::<crate::pty::PtyManager>();
+    if ptys.pty_for_session(&id).is_none() {
+        return err(StatusCode::CONFLICT, "open the session on the desktop first");
+    }
+    let _ = ctx.app.emit(
+        "remote://bring-in",
+        serde_json::json!({
+            "session_id": id,
+            "agent_id": b.agent_id,
+            "model": b.model,
+            "effort": b.effort,
+            "focus": b.focus.unwrap_or_default(),
+            "rounds": b.rounds.unwrap_or(2).clamp(1, 3),
+        }),
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Star or unstar from the phone; both UIs re-read.
