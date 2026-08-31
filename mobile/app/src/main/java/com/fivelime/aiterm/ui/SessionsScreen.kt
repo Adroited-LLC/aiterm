@@ -24,7 +24,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.Groups
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.SubdirectoryArrowRight
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -92,7 +93,7 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
         RenameDialog(current = s.title, onDone = { vm.rename(s, it); renaming = null }, onDismiss = { renaming = null })
     }
     // Opening the drawer is also the moment to freshen what it shows.
-    LaunchedEffect(drawer.isOpen) { if (drawer.isOpen) vm.loadUsage() }
+    LaunchedEffect(drawer.isOpen) { if (drawer.isOpen) { vm.loadUsage(); vm.checkDesktops() } }
     ModalNavigationDrawer(
         drawerState = drawer,
         drawerContent = { AppDrawer(vm, close = { scope.launch { drawer.close() } }) },
@@ -136,7 +137,8 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
                             s, vm.stateOf(s), showFolder = true,
                             starred = s.id in vm.stars,
                             satellite = vm.broughtIn[s.id] != null && visible.any { it.id == vm.broughtIn[s.id] },
-                            crew = vm.broughtIn.count { it.value == s.id },
+                            crewAgents = vm.broughtIn.filterValues { it == s.id }.keys
+                                .mapNotNull { id -> vm.sessions.find { it.id == id }?.agent },
                             folded = s.id in vm.foldedCrews,
                             onCrewTap = { vm.toggleCrew(s.id) },
                             crewNeedsYou = vm.broughtIn.any { it.value == s.id && vm.activity[it.key] == "attention" },
@@ -232,7 +234,8 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 IconButton(onClick = close) { Icon(Icons.Filled.Close, "Close menu") }
             }
             // Every paired desktop, when there is more than one: tap to
-            // switch. The shown one wears the connection dot.
+            // switch. Every dot is a status — the shown one live, the rest
+            // from the probe the drawer's opening fired.
             if (vm.desktops.size > 1) {
                 HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
                 Text("DESKTOPS", style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp))
@@ -240,7 +243,16 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                     val active = d.fingerprint == vm.desktop?.fingerprint
                     NavigationDrawerItem(
                         label = { Text(d.name, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal) },
-                        icon = { Dot(if (!active) Surface1 else if (vm.connected) Green else Muted) },
+                        icon = {
+                            Dot(
+                                if (active) { if (vm.connected) Green else Muted }
+                                else when (vm.reachable[d.fingerprint]) {
+                                    true -> Green
+                                    false -> Surface1
+                                    null -> Muted // probing, no answer yet
+                                },
+                            )
+                        },
                         selected = active,
                         onClick = { if (!active) { vm.switchTo(d); close() } },
                         modifier = Modifier.padding(horizontal = 12.dp),
@@ -345,7 +357,7 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
 @Composable
 private fun SessionRow(
     s: Session, state: SessionState, showFolder: Boolean, starred: Boolean = false,
-    satellite: Boolean = false, crew: Int = 0, folded: Boolean = false, onCrewTap: () -> Unit = {},
+    satellite: Boolean = false, crewAgents: List<String> = emptyList(), folded: Boolean = false, onCrewTap: () -> Unit = {},
     crewNeedsYou: Boolean = false,
     onLongClick: () -> Unit = {}, onClick: () -> Unit,
 ) {
@@ -369,20 +381,6 @@ private fun SessionRow(
                     Spacer(Modifier.width(5.dp))
                 }
                 Text(s.title.ifBlank { "Untitled" }, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                if (crew > 0) {
-                    Spacer(Modifier.width(6.dp))
-                    Row(
-                        Modifier.clip(RoundedCornerShape(8.dp))
-                            .background(Accent.copy(alpha = if (folded) 0.08f else 0.15f))
-                            .clickable(onClick = onCrewTap)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(Icons.Filled.Groups, null, tint = Accent, modifier = Modifier.size(12.dp))
-                        Spacer(Modifier.width(3.dp))
-                        Text(if (folded) "+$crew ▸" else "+$crew ▾", style = MaterialTheme.typography.labelSmall, color = Accent)
-                    }
-                }
             }
         },
         supportingContent = {
@@ -398,10 +396,36 @@ private fun SessionRow(
         },
         trailingContent = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
+                // The state indicator is always the rightmost thing, so the
+                // dots right-align down the list; the crew fold sits beside
+                // it — who is in the crew, by their marks, and a caret,
+                // padded into a real touch target.
+                if (crewAgents.isNotEmpty()) {
+                    Row(
+                        Modifier.clip(RoundedCornerShape(10.dp))
+                            .background(Accent.copy(alpha = if (folded) 0.08f else 0.15f))
+                            .clickable(onClick = onCrewTap)
+                            .padding(start = 8.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(3.dp),
+                    ) {
+                        crewAgents.take(3).forEach { AgentIcon(it, 16.dp) }
+                        if (crewAgents.size > 3) {
+                            Text("+${crewAgents.size - 3}", style = MaterialTheme.typography.labelMedium, color = Accent)
+                        }
+                        Icon(
+                            if (folded) Icons.Filled.KeyboardArrowRight else Icons.Filled.KeyboardArrowDown,
+                            if (folded) "Show crew" else "Hide crew",
+                            tint = Accent, modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
                 // A brought-in agent of THIS session is parked on a prompt —
                 // its own row may be folded away, so the master's row says so.
                 if (crewNeedsYou) StateChip("crew needs you", stateColor(SessionState.NeedsYou), pulse = true)
-                stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
+                // Open on the desktop is ambient, not news — a quiet dot, no words.
+                if (state == SessionState.OnDesktop) Dot(stateColor(state))
+                else stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
             }
         },
     )
@@ -412,10 +436,12 @@ fun Dot(color: Color) = Box(Modifier.size(8.dp).background(color, CircleShape))
 
 @Composable
 fun StateChip(label: String, color: Color, pulse: Boolean = false) {
+    // Label first, dot last: the dot is the indicator, and it sits at the
+    // right edge so every row's indicator lines up in one column.
     Row(verticalAlignment = Alignment.CenterVertically) {
-        if (pulse) PulsingDot(color) else Dot(color)
-        Spacer(Modifier.width(6.dp))
         Text(label, style = MaterialTheme.typography.labelSmall, color = color)
+        Spacer(Modifier.width(6.dp))
+        if (pulse) PulsingDot(color) else Dot(color)
     }
 }
 
