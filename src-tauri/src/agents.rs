@@ -1624,9 +1624,10 @@ fn scan_backends(list: &[Box<dyn AgentBackend>]) -> Vec<(Session, std::path::Pat
         .iter()
         .flat_map(|b| {
             let id = b.id();
-            b.sessions()
-                .scan_with_paths()
-                .into_iter()
+            let t0 = std::time::Instant::now();
+            let rows = b.sessions().scan_with_paths();
+            crate::diag!("scan", "{id}: {} rows in {}ms", rows.len(), t0.elapsed().as_millis());
+            rows.into_iter()
                 .map(move |(mut s, path)| {
                     s.agent = id.to_string();
                     (s, path)

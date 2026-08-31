@@ -97,6 +97,22 @@ pub trait SessionProvider: Send + Sync {
 
 pub struct ClaudeProvider;
 
+/// Parsed claude rows by transcript path, keyed on (mtime_ms, len) — see the
+/// scan loop. `None` remembers "this file parses to no session", so a
+/// malformed file is not re-read every poll either. An entry for a deleted
+/// file lingers, unused — the push loop only reads entries for paths that
+/// exist this scan — and a few hundred stale rows of a few hundred bytes
+/// are not worth eviction machinery.
+static SCAN_CACHE: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, (u64, u64, Option<Session>)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn mtime_len(p: &std::path::Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(p).ok()?;
+    let m = md.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+    Some((m, md.len()))
+}
+
 impl SessionProvider for ClaudeProvider {
     fn find_session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
         claude_session_file(session_id)
@@ -128,14 +144,36 @@ impl SessionProvider for ClaudeProvider {
                         .is_some_and(|n| n.to_string_lossy().contains(".orphaned-"))
                 })
                 .collect();
-            // Every real session in a project dir records the same cwd; find it
-            // once so /fork stub files (title-only, no cwd) can borrow it.
-            let dir_cwd = paths.iter().find_map(|p| read_first_cwd(p));
+            // Parsing a transcript costs ~8ms of file reads, and 426 of them
+            // cost every /v1/sessions poll 3.3 seconds — the whole of the
+            // phone's "really bad delay" [measured 2026-08-31: claude 426
+            // rows in 3266ms; every other engine single-digit ms]. A row is
+            // pure function of its file, so it is cached by (mtime, len):
+            // a warm scan stats 426 files and re-parses only what moved.
+            let mut cache = SCAN_CACHE.lock().unwrap();
+            let uncached: Vec<&std::path::PathBuf> = paths
+                .iter()
+                .filter(|p| {
+                    let Some((m, l)) = mtime_len(p) else { return false };
+                    !cache.get(*p).is_some_and(|(cm, cl, _)| *cm == m && *cl == l)
+                })
+                .collect();
+            // Every real session in a project dir records the same cwd; found
+            // once so /fork stub files (title-only, no cwd) can borrow it —
+            // and only when something actually needs parsing: it reads file
+            // heads, which is exactly the cost the cache exists to skip.
+            let dir_cwd = if uncached.is_empty() { None } else { paths.iter().find_map(|p| read_first_cwd(p)) };
+            for path in &uncached {
+                let Some((m, l)) = mtime_len(path) else { continue };
+                let row = parse_session(path, dir_cwd.as_deref());
+                cache.insert((*path).clone(), (m, l, row));
+            }
             for path in paths {
-                if let Some(s) = parse_session(&path, dir_cwd.as_deref()) {
-                    sessions.push((s, path));
+                if let Some((_, _, Some(s))) = cache.get(&path) {
+                    sessions.push((s.clone(), path));
                 }
             }
+            drop(cache);
         }
         // Attach fork lineage from Claude Code's job state. This has to come
         // from outside the transcript: a fresh `/fork` stub is two lines

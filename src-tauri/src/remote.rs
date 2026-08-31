@@ -720,6 +720,11 @@ fn router(app: AppHandle) -> Router {
         // unguessable ticket. See `make_preview`.
         .route("/p/{ticket}/", get(preview_root))
         .route("/p/{ticket}/{*rest}", get(preview_rest))
+        // Gzip on everything the phone reads: /v1/sessions alone is 185 KB
+        // raw and 27 KB compressed [measured 2026-08-31], and every byte
+        // rides a ~300ms relay path when the office Wi-Fi isolates clients.
+        // OkHttp asks for gzip by itself and decompresses transparently.
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(ctx)
 }
 
@@ -1062,8 +1067,11 @@ async fn cached_models(ctx: &Ctx, provider_id: &str) -> Vec<String> {
 /// agent reports progress, "attention" when it rang for a person, else
 /// "idle". The desktop's terminal is the source of all three.
 async fn sessions(State(ctx): State<Ctx>) -> Response {
+    let t0 = Instant::now();
     let sessions = crate::sessions::list_sessions().await;
+    let t_list = t0.elapsed();
     let running = crate::sessions::running_session_ids().await;
+    let t_running = t0.elapsed();
     let ptys = ctx.app.state::<crate::pty::PtyManager>();
     let open = ptys.bound_sessions();
     let mut activity: HashMap<String, String> = ptys.activities().into_iter().collect();
@@ -1083,8 +1091,10 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
             *e = st.into();
         }
     }
+    let t_busy = t0.elapsed();
     // Which sessions produced files, for the phone's "has files" filter.
     let with_files: Vec<String> = crate::changes::sessions_with_files(&ctx.app).into_iter().collect();
+    let t_files = t0.elapsed();
     // Dev servers: listening ports owned by each open session's process
     // tree, so the phone can offer a live preview of what's being built.
     let port_roots: Vec<(String, u32)> = open
@@ -1101,6 +1111,16 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
             .collect()
     })
     .await;
+    crate::diag!(
+        "remote",
+        "sessions: list {}ms | running +{}ms | busy +{}ms | files +{}ms | ports +{}ms | total {}ms",
+        t_list.as_millis(),
+        (t_running - t_list).as_millis(),
+        (t_busy - t_running).as_millis(),
+        (t_files - t_busy).as_millis(),
+        (t0.elapsed() - t_files).as_millis(),
+        t0.elapsed().as_millis()
+    );
     Json(serde_json::json!({
         "sessions": sessions,
         "running": running,
