@@ -258,6 +258,16 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                 animationSpec = tween(if (list.isScrollInProgress) 80 else 900),
                 label = "thumb",
             )
+            // The thumb's height is settled outside the scroll: sizing it
+            // from what is visible RIGHT NOW made it breathe as tall and
+            // short messages passed. It re-derives only when content grows.
+            var thumbFrac by remember(s.id) { mutableStateOf(0f) }
+            LaunchedEffect(vm.turns.size, working) {
+                val info = list.layoutInfo
+                if (info.totalItemsCount > 0 && info.visibleItemsInfo.isNotEmpty()) {
+                    thumbFrac = info.visibleItemsInfo.size.toFloat() / info.totalItemsCount
+                }
+            }
             val awayFromEnd by remember {
                 derivedStateOf {
                     val info = list.layoutInfo
@@ -274,7 +284,8 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                         val total = info.totalItemsCount
                         val seen = info.visibleItemsInfo.size
                         if (thumbAlpha > 0f && seen in 1 until total) {
-                            val h = (size.height * seen / total).coerceAtLeast(32.dp.toPx())
+                            val frac = if (thumbFrac > 0f) thumbFrac else seen.toFloat() / total
+                            val h = (size.height * frac).coerceIn(32.dp.toPx(), size.height * 0.9f)
                             val first = info.visibleItemsInfo.first()
                             val exact = first.index + -first.offset.toFloat() / first.size.coerceAtLeast(1)
                             val progress = (exact / (total - seen)).coerceIn(0f, 1f)
