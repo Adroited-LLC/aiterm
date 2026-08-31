@@ -44,6 +44,24 @@ class TerminalScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComposeTestActivity>()
 
     @Test
+    fun terminalKeyBarCollapsesToARestoreStrip() {
+        val expanded = mutableStateOf(true)
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-keys"),
+                keyBarExpanded = expanded.value,
+                onKeyBarExpandedChange = { expanded.value = it },
+            )
+        }
+
+        compose.onNodeWithTag("collapse-extra-keys").performClick()
+        assertTrue(compose.onAllNodesWithText("Esc").fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithTag("expand-extra-keys").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Esc").assertIsDisplayed()
+    }
+
+    @Test
     fun textComposerKeepsTheDraftVisibleUntilSend() {
         val sent = mutableListOf<String>()
         compose.setContent {
@@ -440,4 +458,18 @@ class TerminalScreenTest {
         assertTrue("composed $composedRows rows", composedRows < 100)
         assertEquals(5_000, history.size)
     }
+
+    private fun connectedState() = RemoteClientState(
+        connection = ConnectionState.Connected,
+        focus = FocusOwner.Self,
+    )
+
+    private fun oneCellScreen(tabId: String) = ScreenSnapshot(
+        tabId = tabId,
+        revision = 1,
+        cols = 1,
+        rows = 1,
+        visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
+        cursor = CursorState(0, 0, true),
+    )
 }

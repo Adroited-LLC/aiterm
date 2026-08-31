@@ -68,6 +68,7 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.text
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -100,14 +101,21 @@ import kotlinx.coroutines.launch
 import java.net.URI
 
 @Composable
-fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit) {
+fun RemoteTerminalScreen(
+    viewModel: RemoteTerminalViewModel,
+    onBack: () -> Unit,
+    keyBarPreference: TerminalKeyBarPreference,
+) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     val screen by viewModel.client.screen.collectAsStateWithLifecycle()
     val scrollback by viewModel.client.scrollback.collectAsStateWithLifecycle()
+    val keyBarExpanded by keyBarPreference.expanded.collectAsStateWithLifecycle()
     TerminalScreenContent(
         state = state,
         screen = screen,
         scrollback = scrollback,
+        keyBarExpanded = keyBarExpanded,
+        onKeyBarExpandedChange = keyBarPreference::setExpanded,
         onBack = onBack,
         onReconnect = viewModel::reconnect,
         onSelectTab = viewModel::selectTab,
@@ -132,6 +140,8 @@ fun TerminalScreenContent(
     state: RemoteClientState,
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow> = emptyList(),
+    keyBarExpanded: Boolean = true,
+    onKeyBarExpandedChange: (Boolean) -> Unit = {},
     onBack: () -> Unit = {},
     onReconnect: () -> Unit = {},
     onSelectTab: (String) -> Unit = {},
@@ -293,6 +303,8 @@ fun TerminalScreenContent(
                 ExtraKeys(
                     screen = screen,
                     scrollback = scrollback,
+                    expanded = keyBarExpanded,
+                    onExpandedChange = onKeyBarExpandedChange,
                     onInput = onInput,
                     onOpenComposer = { if (screen != null) composer = composer.open() },
                 )
@@ -629,6 +641,8 @@ private fun rememberTerminalMetrics(): TerminalMetrics {
 private fun ExtraKeys(
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow>,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
     onInput: (String) -> Unit,
     onOpenComposer: () -> Unit,
 ) {
@@ -647,44 +661,69 @@ private fun ExtraKeys(
         control = false
         alt = false
     }
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-            .background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 4.dp, vertical = 3.dp)
-            .testTag("extra-keys"),
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
-    ) {
-        ExtraKey("Type", onOpenComposer)
-        ExtraKey("Esc") { send("\u001b") }
-        ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
-        ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
-        ExtraKey("Tab") { send("\t") }
-        ExtraKey("Enter") { send("\r") }
-        ExtraKey("⌫") { send("\u007f") }
-        ExtraKey("←") { send(if (applicationCursor) "\u001bOD" else "\u001b[D") }
-        ExtraKey("↑") { send(if (applicationCursor) "\u001bOA" else "\u001b[A") }
-        ExtraKey("↓") { send(if (applicationCursor) "\u001bOB" else "\u001b[B") }
-        ExtraKey("→") { send(if (applicationCursor) "\u001bOC" else "\u001b[C") }
-        ExtraKey("PgUp") { send("\u001b[5~") }
-        ExtraKey("PgDn") { send("\u001b[6~") }
-        ExtraKey("|") { send("|") }
-        ExtraKey("/") { send("/") }
-        ExtraKey("~") { send("~") }
-        ExtraKey("Paste") {
-            clipboard.getText()?.text?.let { text ->
-                send(if (screen?.modes?.bracketedPaste == true) "\u001b[200~$text\u001b[201~" else text)
+    if (expanded) {
+        Row(
+            Modifier.fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .padding(horizontal = 4.dp, vertical = 3.dp)
+                .testTag("extra-keys"),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Row(
+                modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                ExtraKey("Type", action = onOpenComposer)
+                ExtraKey("Esc") { send("\u001b") }
+                ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
+                ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
+                ExtraKey("Tab") { send("\t") }
+                ExtraKey("Enter") { send("\r") }
+                ExtraKey("⌫") { send("\u007f") }
+                ExtraKey("←") { send(if (applicationCursor) "\u001bOD" else "\u001b[D") }
+                ExtraKey("↑") { send(if (applicationCursor) "\u001bOA" else "\u001b[A") }
+                ExtraKey("↓") { send(if (applicationCursor) "\u001bOB" else "\u001b[B") }
+                ExtraKey("→") { send(if (applicationCursor) "\u001bOC" else "\u001b[C") }
+                ExtraKey("PgUp") { send("\u001b[5~") }
+                ExtraKey("PgDn") { send("\u001b[6~") }
+                ExtraKey("|") { send("|") }
+                ExtraKey("/") { send("/") }
+                ExtraKey("~") { send("~") }
+                ExtraKey("Paste") {
+                    clipboard.getText()?.text?.let { text ->
+                        send(if (screen?.modes?.bracketedPaste == true) "\u001b[200~$text\u001b[201~" else text)
+                    }
+                }
+                ExtraKey("Copy screen") {
+                    val text = (scrollback.asReversed() + (screen?.visible ?: emptyList()))
+                        .joinToString("\n", transform = ScreenRow::plainText)
+                    clipboard.setText(AnnotatedString(text))
+                }
             }
+            ExtraKey(
+                label = "⌄",
+                action = { onExpandedChange(false) },
+                modifier = Modifier.testTag("collapse-extra-keys"),
+            )
         }
-        ExtraKey("Copy screen") {
-            val text = (scrollback.asReversed() + (screen?.visible ?: emptyList()))
-                .joinToString("\n", transform = ScreenRow::plainText)
-            clipboard.setText(AnnotatedString(text))
+    } else {
+        Box(
+            modifier = Modifier.fillMaxWidth()
+                .height(28.dp)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .clickable { onExpandedChange(true) }
+                .semantics { contentDescription = "Show terminal keys" }
+                .testTag("expand-extra-keys"),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("⌃")
         }
     }
 }
 
 @Composable
-private fun ExtraKey(label: String, action: () -> Unit) {
-    OutlinedButton(onClick = action, modifier = Modifier.height(38.dp)) { Text(label) }
+private fun ExtraKey(label: String, modifier: Modifier = Modifier, action: () -> Unit) {
+    OutlinedButton(onClick = action, modifier = modifier.height(38.dp)) { Text(label) }
 }
 
 private fun CellAttributes.span(foreground: Color, background: Color) = SpanStyle(

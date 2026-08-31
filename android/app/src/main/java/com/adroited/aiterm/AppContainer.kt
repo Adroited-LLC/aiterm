@@ -7,9 +7,11 @@ import com.adroited.aiterm.pairing.SharedPreferencesPairedDesktopStore
 import com.adroited.aiterm.pairing.PairedDesktopStoreException
 import com.adroited.aiterm.security.AndroidDeviceKeyStore
 import com.adroited.aiterm.security.AppLock
+import com.adroited.aiterm.ui.TerminalKeyBarPreference
 
 /** Process-scoped dependencies; no pairing secret is ever retained here. */
 class AppContainer(context: Context) {
+    val terminalKeyBarPreference = TerminalKeyBarPreference(context.applicationContext)
     val pairedDesktopStore = SharedPreferencesPairedDesktopStore(context.applicationContext)
     val deviceKeys = AndroidDeviceKeyStore()
     val pairingRepository = PairingRepository(
