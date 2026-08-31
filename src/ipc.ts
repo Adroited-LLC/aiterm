@@ -134,6 +134,11 @@ export const sessionRename = (sessionId: string, title: string) =>
 /** Every person-chosen title, id → name. */
 export const sessionTitles = () =>
   invoke<Record<string, string>>("session_titles");
+/** Tell the backend (and through it, the phones) where a relay stands. */
+export const relayReport = (
+  sessionId: string, bSessionId: string | null, bName: string,
+  phase: string, round: number, rounds: number, note: string,
+) => invoke<void>("relay_report", { sessionId, bSessionId, bName, phase, round, rounds, note });
 /** Starred sessions — the ones that stay on top everywhere. */
 export const sessionStars = () => invoke<string[]>("session_stars");
 export const sessionStar = (sessionId: string, on: boolean) =>

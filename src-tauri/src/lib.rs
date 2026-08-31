@@ -72,6 +72,7 @@ pub fn run() {
             remote::remote_set_name,
             remote::remote_set_port,
             remote::remote_pair_payload,
+            remote::relay_report,
             changes::session_changes,
             changes::read_file_base64,
             pty::pty_write,

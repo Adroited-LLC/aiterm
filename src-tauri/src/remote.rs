@@ -128,6 +128,17 @@ pub enum Event {
     Activity { session_id: String, activity: String },
     /// A file in a session's workspace was created, modified or deleted.
     FileChanged { session_id: String, path: String, kind: String },
+    /// A second-agent relay changed state; `session_id` is the first
+    /// agent's session — where the phone is looking.
+    Relay {
+        session_id: String,
+        b_session_id: Option<String>,
+        b_name: String,
+        phase: String,
+        round: u32,
+        rounds: u32,
+        note: String,
+    },
     Ping,
 }
 
@@ -1545,6 +1556,22 @@ struct BringInBody {
     effort: Option<String>,
     focus: Option<String>,
     rounds: Option<u32>,
+    auto: Option<bool>,
+}
+
+/// The renderer runs the relay; this is how its state reaches the phones.
+#[tauri::command]
+pub fn relay_report(
+    app: tauri::AppHandle,
+    session_id: String,
+    b_session_id: Option<String>,
+    b_name: String,
+    phase: String,
+    round: u32,
+    rounds: u32,
+    note: String,
+) {
+    notify(&app, Event::Relay { session_id, b_session_id, b_name, phase, round, rounds, note });
 }
 
 /// The phone asks for a second agent; the desktop's renderer runs the
@@ -1575,6 +1602,7 @@ async fn bring_in(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<
             "effort": b.effort,
             "focus": b.focus.unwrap_or_default(),
             "rounds": b.rounds.unwrap_or(2).clamp(1, 3),
+            "auto": b.auto.unwrap_or(false),
         }),
     );
     StatusCode::NO_CONTENT.into_response()

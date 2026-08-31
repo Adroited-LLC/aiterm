@@ -94,7 +94,7 @@ export function useRelay(io: {
     try { return (await getSessionDetail(tab.sessionId))?.assistant_messages ?? 0; } catch { return 0; }
   };
 
-  const start = useCallback(async (opts: { aKey: number; choice: StartChoice; focus: string; rounds: number }) => {
+  const start = useCallback(async (opts: { aKey: number; choice: StartChoice; focus: string; rounds: number; auto?: boolean }) => {
     const a = ioRef.current.tabs().find((t) => t.key === opts.aKey);
     if (!a?.sessionId || !a.cwd) return;
     gen.current++;
@@ -160,7 +160,22 @@ export function useRelay(io: {
               ? `You two have converged. Do nothing further; the user will take it from here.`
               : `That is the last round. Do nothing further; the user has both views and will decide.`,
           ].join("\n"));
-          setRelay((r) => r && { ...r, phase: "done", note: agreed ? "they agreed" : "both views are in" });
+          if (opts.auto) {
+            // The user pre-approved acting on the outcome: the first agent
+            // proceeds instead of parking for a decision.
+            ioRef.current.handle(opts.aKey)?.sendComposed([
+              `The user pre-approved acting on this exchange. Proceed now:`,
+              agreed
+                ? `implement the AGREED direction.`
+                : `weigh both views and implement the direction you judge best, noting where you differed from ${bName}.`,
+              `You may edit files. Work as usual and report when done.`,
+            ].join("\n"));
+          }
+          setRelay((r) => r && {
+            ...r,
+            phase: "done",
+            note: (agreed ? "they agreed" : "both views are in") + (opts.auto ? " — acting on it" : ""),
+          });
           return;
         }
         bBase = await countOf(bKey);

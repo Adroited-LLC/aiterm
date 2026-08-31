@@ -29,7 +29,7 @@ import { useLibrarian } from "./librarian";
 import { useRelay } from "./relay";
 import BringIn from "./components/BringIn";
 import { RotateCcw, Users } from "lucide-react";
-import { LIBRARIAN_DIR_SUFFIX, isImagePath, isVideoPath, readFileBase64 } from "./ipc";
+import { LIBRARIAN_DIR_SUFFIX, isImagePath, isVideoPath, readFileBase64, relayReport } from "./ipc";
 import {
   FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
 } from "lucide-react";
@@ -2249,6 +2249,17 @@ export default function App() {
     setFormat: (f: AppSettings["timeFormat"]) => setSettings((s) => ({ ...s, timeFormat: f })),
   }), [settings.timeFormat]);
 
+  // The relay's state, pushed to the phones as it moves — a person watching
+  // from the couch sees "Grok is writing…" instead of nothing.
+  useEffect(() => {
+    const r = relayCtl.relay;
+    if (!r) return;
+    const aTab = tabs.find((t) => t.key === r.aKey);
+    if (!aTab?.sessionId) return;
+    const bTab = tabs.find((t) => t.key === r.bKey);
+    relayReport(aTab.sessionId, bTab?.sessionId ?? null, r.bName, r.phase, r.round, r.rounds, r.note).catch(() => {});
+  }, [relayCtl.relay, tabs]);
+
   // ---- Remote access: a phone asks, the desktop opens. The tab appears here
   // too, so both screens agree about what is running. Refs, not deps: the
   // handlers below are recreated every render and the listener must not be.
@@ -2277,7 +2288,7 @@ export default function App() {
       const choice: StartChoice = p.kind === "api" && p.provider_id && p.model
         ? { kind: "api", providerId: p.provider_id, modelId: p.model }
         : { kind: "agent", agentId: p.agent_id, model: p.model ?? null, effort: p.effort ?? null };
-      void remoteRef.current.relayStart({ aKey: tab.key, choice, focus: p.focus ?? "", rounds: p.rounds ?? 2 });
+      void remoteRef.current.relayStart({ aKey: tab.key, choice, focus: p.focus ?? "", rounds: p.rounds ?? 2, auto: (p as { auto?: boolean }).auto ?? false });
     });
     return () => {
       unOpen.then((f) => f());
