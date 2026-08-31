@@ -950,7 +950,27 @@ async fn status(State(ctx): State<Ctx>) -> Response {
 }
 
 async fn agents() -> Response {
-    let list = crate::agents::agent_choices();
+    let mut list = serde_json::to_value(crate::agents::agent_choices()).unwrap_or_default();
+    // API providers with a startup shortlist join as choices of their own —
+    // "OpenRouter" beside the CLIs, its models as the model list. The id
+    // wears an api: prefix so bring-in and new-session know the kind.
+    if let Some(arr) = list.as_array_mut() {
+        for p in crate::providers::load_providers() {
+            if p.startup_models.is_empty() {
+                continue;
+            }
+            arr.push(serde_json::json!({
+                "id": format!("api:{}", p.id),
+                "display_name": p.name,
+                "models": p.startup_models.iter().map(|m| serde_json::json!({
+                    "id": m,
+                    "display_name": m.split('/').next_back().unwrap_or(m),
+                    "efforts": [],
+                })).collect::<Vec<_>>(),
+                "mints_session_id": false,
+            }));
+        }
+    }
     Json(list).into_response()
 }
 
@@ -1500,11 +1520,22 @@ async fn bring_in(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<
     if ptys.pty_for_session(&id).is_none() {
         return err(StatusCode::CONFLICT, "open the session on the desktop first");
     }
+    // An api:<provider> id is a model off a provider's startup list, not a
+    // CLI — the renderer builds the matching StartChoice.
+    let (kind, agent_id, provider_id) = match b.agent_id.strip_prefix("api:") {
+        Some(pid) => ("api", String::new(), Some(pid.to_string())),
+        None => ("agent", b.agent_id.clone(), None),
+    };
+    if kind == "api" && b.model.is_none() {
+        return err(StatusCode::BAD_REQUEST, "an API choice needs a model");
+    }
     let _ = ctx.app.emit(
         "remote://bring-in",
         serde_json::json!({
             "session_id": id,
-            "agent_id": b.agent_id,
+            "kind": kind,
+            "agent_id": agent_id,
+            "provider_id": provider_id,
             "model": b.model,
             "effort": b.effort,
             "focus": b.focus.unwrap_or_default(),

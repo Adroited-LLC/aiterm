@@ -2270,16 +2270,14 @@ export default function App() {
         title ? { title } : {},
       );
     });
-    const unBring = listen<{ session_id: string; agent_id: string; model: string | null; effort: string | null; focus: string; rounds: number }>("remote://bring-in", (e) => {
+    const unBring = listen<{ session_id: string; kind?: string; agent_id: string; provider_id?: string | null; model: string | null; effort: string | null; focus: string; rounds: number }>("remote://bring-in", (e) => {
       const p = e.payload;
       const tab = remoteRef.current.tabs.find((t) => t.sessionId === p.session_id);
       if (!tab) { setNotice("The phone asked to bring in a second agent, but that session has no tab here"); return; }
-      void remoteRef.current.relayStart({
-        aKey: tab.key,
-        choice: { kind: "agent", agentId: p.agent_id, model: p.model ?? null, effort: p.effort ?? null },
-        focus: p.focus ?? "",
-        rounds: p.rounds ?? 2,
-      });
+      const choice: StartChoice = p.kind === "api" && p.provider_id && p.model
+        ? { kind: "api", providerId: p.provider_id, modelId: p.model }
+        : { kind: "agent", agentId: p.agent_id, model: p.model ?? null, effort: p.effort ?? null };
+      void remoteRef.current.relayStart({ aKey: tab.key, choice, focus: p.focus ?? "", rounds: p.rounds ?? 2 });
     });
     return () => {
       unOpen.then((f) => f());
