@@ -4000,3 +4000,11 @@ input[type="range"]::-webkit-slider-thumb {
 /* Starred sessions: the mark before the title, and the lit toggle. */
 .star-mark { color: #e5c07b; display: inline-flex; margin-right: 4px; }
 .act-btn.starred { color: #e5c07b; }
+
+/* Bring-in: the auto-continue line, quiet but findable. */
+.bringin-auto {
+  display: flex; align-items: center; gap: 7px;
+  margin: 6px 0 2px; font-size: 12px; color: var(--text-dim);
+  cursor: pointer; user-select: none;
+}
+.bringin-auto input { accent-color: var(--accent); }

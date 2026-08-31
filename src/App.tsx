@@ -2503,9 +2503,9 @@ export default function App() {
             <BringIn
               onClose={() => setShowBringIn(false)}
               onOpenModelAccess={openModelAccess}
-              onGo={(choice, focus, rounds) => {
+              onGo={(choice, focus, rounds, auto) => {
                 setShowBringIn(false);
-                if (rootKey !== null) void relayCtl.start({ aKey: rootKey, choice, focus, rounds });
+                if (rootKey !== null) void relayCtl.start({ aKey: rootKey, choice, focus, rounds, auto });
               }}
             />
           )}

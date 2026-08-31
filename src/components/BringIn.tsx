@@ -8,13 +8,14 @@ import Icon from "./Icon";
 import { Users, X } from "lucide-react";
 
 export default function BringIn({ onGo, onClose, onOpenModelAccess }: {
-  onGo: (choice: StartChoice, focus: string, rounds: number) => void;
+  onGo: (choice: StartChoice, focus: string, rounds: number, auto: boolean) => void;
   onClose: () => void;
   onOpenModelAccess?: (providerId?: string) => void;
 }) {
   const ctl = useStartChoice();
   const [focus, setFocus] = useState("");
   const [rounds, setRounds] = useState(2);
+  const [auto, setAuto] = useState(false);
   return (
     <div className="bringin">
       <div className="bringin-head">
@@ -31,6 +32,10 @@ export default function BringIn({ onGo, onClose, onOpenModelAccess }: {
           placeholder="What should they look at? — e.g. is this secure, is there a simpler way. Blank asks for a general second view."
           spellCheck={false}
         />
+        <label className="bringin-auto" title="When the exchange ends, the first agent acts on the outcome — the agreed direction, or its judgment between the views — instead of waiting for you">
+          <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+          Auto-continue — act on the outcome without waiting
+        </label>
         <div className="bringin-foot">
           <label className="bringin-rounds">
             Rounds
@@ -40,7 +45,7 @@ export default function BringIn({ onGo, onClose, onOpenModelAccess }: {
               <option value={3}>3</option>
             </select>
           </label>
-          <button className="tui-pick" disabled={!ctl.ready} onClick={() => onGo(ctl.choice(), focus, rounds)}>
+          <button className="tui-pick" disabled={!ctl.ready} onClick={() => onGo(ctl.choice(), focus, rounds, auto)}>
             Bring them in
           </button>
         </div>
