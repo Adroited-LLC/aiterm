@@ -249,6 +249,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         connect()
     }
 
+    /** fingerprint → whether that desktop answered its last status probe.
+     *  The shown desktop's truth is `connected`; this covers the rest of the
+     *  drawer list, so its dots mean "up right now", not "the one shown". */
+    var reachable by mutableStateOf<Map<String, Boolean>>(emptyMap()); private set
+    private var reachJob: Job? = null
+
+    /** Probe every desktop not being shown, the drawer's moment. The last
+     *  answer stands while a re-probe runs, so a dot never blinks gray on
+     *  every open; first address to answer wins, bridge included. */
+    fun checkDesktops() {
+        if (reachJob?.isActive == true) return
+        reachJob = viewModelScope.launch {
+            desktops.filter { it.fingerprint != desktop?.fingerprint }.forEach { d ->
+                launch {
+                    val bridge = if (d.iroh.isNotEmpty())
+                        runCatching { IrohBridge.urlFor(getApplication(), d.iroh) }.getOrNull() else null
+                    val urls = (listOf(d.baseUrl) + d.candidates + listOfNotNull(bridge)).distinct()
+                    val answers = kotlinx.coroutines.channels.Channel<Boolean>(urls.size)
+                    urls.forEach { url ->
+                        viewModelScope.launch {
+                            answers.send(runCatching { Api(url, d.token, d.fingerprint).status() }.isSuccess)
+                        }
+                    }
+                    repeat(urls.size) {
+                        if (answers.receive()) { reachable = reachable + (d.fingerprint to true); return@launch }
+                    }
+                    reachable = reachable + (d.fingerprint to false)
+                }
+            }
+        }
+    }
+
     /** Unpair one desktop. Forgetting the shown one falls back to the next;
      *  forgetting the last returns the app to the pair screen. */
     fun forget(d: Desktop? = null) {
@@ -357,8 +389,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val fresh = status.hosts.map { "https://$it:$port" }
             val candidates = (fresh.ifEmpty { d.candidates } + reachable).distinct()
             val iroh = status.iroh ?: d.iroh
-            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh) {
-                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh)
+            val name = status.name.ifBlank { d.name }
+            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh || name != d.name) {
+                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh, name = name)
                 desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
                 store.saveAll(desktops)
                 desktop = nd
@@ -429,6 +462,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             val a = obj["activity"]?.jsonPrimitive?.content ?: return@launch
                             activity = activity + (id to a)
                             if (a != "idle") turnsWhenSent = -1
+                        }
+                        "renamed" -> {
+                            // The desktop's name was edited over there; wear
+                            // it everywhere at once.
+                            val n = obj["name"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: return@launch
+                            val cur = desktop ?: return@launch
+                            if (cur.name != n) {
+                                val nd = cur.copy(name = n)
+                                desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
+                                store.saveAll(desktops)
+                                desktop = nd
+                            }
                         }
                         "attention" -> {
                             val t = obj["title"]?.jsonPrimitive?.content

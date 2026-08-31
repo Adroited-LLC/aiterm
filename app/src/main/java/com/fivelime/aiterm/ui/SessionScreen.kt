@@ -69,7 +69,16 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -106,10 +115,22 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     val list = rememberLazyListState()
 
     // New content lands at the bottom, where the eye is. The working row is
-    // one extra item past the last turn.
+    // one extra item past the last turn. The FIRST fill jumps straight to
+    // the end — animating from the top replays the whole transcript and
+    // looks glitchy on a long session. After that, follow new turns with a
+    // short animation, but only when already reading the end: someone
+    // scrolled up into history stays where they are.
+    var positioned by remember(s.id) { mutableStateOf(false) }
     LaunchedEffect(vm.turns.size, working) {
         val n = vm.turns.size + (if (working) 1 else 0)
-        if (n > 0) list.animateScrollToItem(n - 1)
+        if (n == 0) return@LaunchedEffect
+        if (!positioned) {
+            list.scrollToItem(n - 1)
+            positioned = true
+        } else {
+            val lastVisible = list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            if (lastVisible >= n - 3) list.animateScrollToItem(n - 1)
+        }
     }
 
     Scaffold(
@@ -225,19 +246,92 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                 if (vm.loadingTurns) CircularProgressIndicator() else Text("Nothing here yet — say something.", color = Muted)
             }
         } else {
-            LazyColumn(
-                state = list,
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                itemsIndexed(vm.turns) { _, t -> TurnView(t, onOpenPath = vm::openMentioned) }
-                // What the session made, right where the conversation ends —
-                // the transcript often never prints a path (tool output is
-                // dropped at phone size), but the desktop's ledger knows.
-                val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
-                if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
-                if (working) item(key = "working") { WorkingRow(s.agent) }
+            // A LazyColumn draws no scrollbar, so a long transcript gives no
+            // sense of place. Two quiet cues: a thin thumb along the right
+            // edge while scrolling — its height says how much there is, its
+            // position says where you are — and a pill at the foot whenever
+            // the newest message is out of sight, one tap from the end.
+            val scope = rememberCoroutineScope()
+            val thumbColor = Muted
+            val thumbAlpha by animateFloatAsState(
+                targetValue = if (list.isScrollInProgress) 0.5f else 0f,
+                animationSpec = tween(if (list.isScrollInProgress) 80 else 900),
+                label = "thumb",
+            )
+            // Pixel truth for the thumb: remember the real height of every
+            // message the list has laid out, estimate the unseen with the
+            // running average, and place the thumb by pixels — not by item
+            // counts, which jump with every tall or short message and made
+            // the thumb breathe and jitter. Plain map, not state: it feeds
+            // the next draw, it never drives recomposition.
+            val heights = remember(s.id) { HashMap<Int, Int>() }
+            val spacingPx = with(androidx.compose.ui.platform.LocalDensity.current) { 8.dp.toPx() }
+            val awayFromEnd by remember {
+                derivedStateOf {
+                    val info = list.layoutInfo
+                    val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+                    info.totalItemsCount > 0 && last < info.totalItemsCount - 1
+                }
+            }
+            Box(Modifier.fillMaxSize().padding(padding)) {
+                LazyColumn(
+                    state = list,
+                    modifier = Modifier.fillMaxSize().drawWithContent {
+                        drawContent()
+                        val info = list.layoutInfo
+                        val total = info.totalItemsCount
+                        for (it in info.visibleItemsInfo) heights[it.index] = it.size
+                        val first = info.visibleItemsInfo.firstOrNull()
+                        if (thumbAlpha > 0f && first != null && total > info.visibleItemsInfo.size) {
+                            var knownSum = 0L; var knownN = 0
+                            for ((i, hgt) in heights) if (i < total) { knownSum += hgt; knownN++ }
+                            val avg = if (knownN > 0) knownSum.toFloat() / knownN else 0f
+                            val contentPx = knownSum + avg * (total - knownN) + spacingPx * (total - 1)
+                            val viewport = (info.viewportEndOffset - info.viewportStartOffset).toFloat()
+                            if (contentPx > viewport) {
+                                var before = -first.offset.toFloat()
+                                for (i in 0 until first.index) before += (heights[i]?.toFloat() ?: avg) + spacingPx
+                                val h = (size.height * viewport / contentPx).coerceIn(32.dp.toPx(), size.height * 0.9f)
+                                val progress = (before / (contentPx - viewport)).coerceIn(0f, 1f)
+                                drawRoundRect(
+                                    color = thumbColor,
+                                    topLeft = Offset(size.width - 7.dp.toPx(), progress * (size.height - h)),
+                                    size = Size(3.dp.toPx(), h),
+                                    cornerRadius = CornerRadius(2.dp.toPx()),
+                                    alpha = thumbAlpha,
+                                )
+                            }
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    itemsIndexed(vm.turns) { _, t -> TurnView(t, onOpenPath = vm::openMentioned) }
+                    // What the session made, right where the conversation ends —
+                    // the transcript often never prints a path (tool output is
+                    // dropped at phone size), but the desktop's ledger knows.
+                    val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
+                    if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
+                    if (working) item(key = "working") { WorkingRow(s.agent) }
+                }
+                if (awayFromEnd) {
+                    Row(
+                        Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(Surface2)
+                            .clickable {
+                                scope.launch {
+                                    val end = list.layoutInfo.totalItemsCount - 1
+                                    if (end >= 0) list.animateScrollToItem(end)
+                                }
+                            }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Newest", style = MaterialTheme.typography.labelMedium, color = Muted)
+                        Icon(Icons.Filled.KeyboardArrowDown, "Jump to newest", tint = Muted, modifier = Modifier.size(18.dp))
+                    }
+                }
             }
         }
     }
