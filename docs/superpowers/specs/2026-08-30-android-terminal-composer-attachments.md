@@ -83,9 +83,12 @@ submitted, or expired.
 Image bytes use additive version-1 request kinds on the authenticated `/v1/ws`
 connection:
 
-- `terminal.upload.begin` identifies the active `tab_id`, `attachment_id`,
-  normalized byte length, JPEG media type, and SHA-256 digest. A successful
-  response returns an opaque upload id and the required next chunk index.
+- `terminal.upload.begin` identifies the active `tab_id`, `attachment_id`, a
+  random submission id shared by this draft's images, declared submission
+  image count and total bytes, normalized image byte length, JPEG media type,
+  and SHA-256 digest. A successful response returns an opaque upload id and the
+  required next chunk index. Submission metadata lets the server independently
+  enforce the four-image/48 MiB boundary rather than trusting the UI.
 - `terminal.upload.chunk` carries the opaque upload id, monotonically
   increasing chunk index, and at most 256 KiB of bytes.
 - `terminal.upload.finish` verifies length, digest, image format, and dimensions,
