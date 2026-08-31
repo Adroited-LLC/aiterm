@@ -19,8 +19,8 @@ import type { TermHandle, TermTab } from "./components/TerminalView";
 import type { StartChoice } from "./components/StartControls";
 
 export interface RelayState {
-  aKey: number;
-  bKey: number;
+  aKey: string;
+  bKey: string;
   aName: string;
   bName: string;
   round: number;
@@ -61,13 +61,13 @@ function engineName(agentId: string | undefined, model?: string | null): string 
 
 export function useRelay(io: {
   tabs: () => TermTab[];
-  handle: (key: number) => TermHandle | undefined;
+  handle: (key: string) => TermHandle | undefined;
   /** ms since this tab last produced output. */
-  quietFor: (key: number) => number;
+  quietFor: (key: string) => number;
   /** Whether the tab is reporting progress (a turn in flight). */
-  busy: (key: number) => boolean;
+  busy: (key: string) => boolean;
   /** Start a session; resolves with the tab opened. */
-  open: (cwd: string, choice: StartChoice, prompt: string, extra: { parentKey: number; title: string; permissionFlags?: string }) => Promise<{ key: number; sessionId?: string } | null>;
+  open: (cwd: string, choice: StartChoice, prompt: string, extra: { parentKey: string; title: string; permissionFlags?: string }) => Promise<{ key: string; sessionId?: string } | null>;
 }) {
   const [relay, setRelay] = useState<RelayState | null>(null);
   const timer = useRef<number | null>(null);
@@ -83,7 +83,7 @@ export function useRelay(io: {
 
   /** Wait for one more assistant message in a tab's session, then a quiet
    *  moment; resolve with its text. Rejects when the tab is gone. */
-  const awaitReply = useCallback((key: number, baseline: number, myGen: number): Promise<string> =>
+  const awaitReply = useCallback((key: string, baseline: number, myGen: number): Promise<string> =>
     new Promise((resolve, reject) => {
       const tick = async () => {
         if (myGen !== gen.current) return; // stopped or superseded
@@ -105,20 +105,20 @@ export function useRelay(io: {
       timer.current = window.setTimeout(tick, POLL_MS);
     }), []);
 
-  const countOf = async (key: number): Promise<number> => {
+  const countOf = async (key: string): Promise<number> => {
     const tab = ioRef.current.tabs().find((t) => t.key === key);
     if (!tab?.sessionId) return 0;
     try { return (await getSessionDetail(tab.sessionId))?.assistant_messages ?? 0; } catch { return 0; }
   };
 
-  const start = useCallback(async (opts: { aKey: number; choice: StartChoice; focus: string; rounds: number; auto?: boolean }) => {
+  const start = useCallback(async (opts: { aKey: string; choice: StartChoice; focus: string; rounds: number; auto?: boolean }) => {
     const a = ioRef.current.tabs().find((t) => t.key === opts.aKey);
     if (!a?.sessionId || !a.cwd) return;
     gen.current++;
     const myGen = gen.current;
     const aName = engineName(a.agentId);
     const bName = opts.choice.kind === "agent" ? engineName(opts.choice.agentId, opts.choice.model) : opts.choice.modelId;
-    setRelay({ aKey: a.key, bKey: -1, aName, bName, round: 1, rounds: opts.rounds, phase: "opening", note: "" });
+    setRelay({ aKey: a.key, bKey: "", aName, bName, round: 1, rounds: opts.rounds, phase: "opening", note: "" });
 
     let turns: [string, string][] = [];
     try { turns = await sessionConversation(a.sessionId, CONTEXT_CHARS); } catch { /* an empty context still works */ }

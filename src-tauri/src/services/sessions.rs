@@ -185,10 +185,12 @@ impl SessionService {
 
 impl SessionCatalog for DesktopCatalog {
     fn list(&self) -> Result<Vec<Session>, SessionServiceError> {
-        Ok(crate::agents::scan_all_with_paths()
+        let mut sessions: Vec<_> = crate::agents::scan_all_with_paths()
             .into_iter()
             .map(|(session, _)| session)
-            .collect())
+            .collect();
+        crate::sessions::apply_session_names(&mut sessions);
+        Ok(sessions)
     }
 
     fn preview(&self, session_id: &str) -> Result<Vec<PreviewMsg>, SessionServiceError> {

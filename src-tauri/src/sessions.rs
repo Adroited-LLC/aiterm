@@ -16,6 +16,131 @@ use std::time::UNIX_EPOCH;
 pub(crate) const MAX_DISCOVERED_SESSION_FILES: usize = 4096;
 pub(crate) const MAX_SESSION_DISCOVERY_DEPTH: usize = 16;
 
+// --- Person-owned session metadata -------------------------------------
+//
+// These sidecars enrich the shared session model without becoming another
+// session registry. Rust-owned tabs and provider transcripts remain the
+// source of identity and lifecycle truth.
+
+fn metadata_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+fn metadata_path(name: &str) -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|directory| directory.join("aiterm").join(name))
+}
+
+fn load_metadata<T: serde::de::DeserializeOwned + Default>(name: &str) -> T {
+    metadata_path(name)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_metadata<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
+    let path = metadata_path(name).ok_or("no data directory")?;
+    let parent = path.parent().ok_or("invalid metadata path")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let text = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary, text).map_err(|error| error.to_string())?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+pub fn rename_session(session_id: &str, title: &str) -> Result<(), String> {
+    let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
+    let mut titles: std::collections::HashMap<String, String> = load_metadata("titles.json");
+    let title = title.trim();
+    if title.is_empty() {
+        titles.remove(session_id);
+    } else {
+        titles.insert(session_id.to_owned(), title.chars().take(160).collect());
+    }
+    save_metadata("titles.json", &titles)
+}
+
+#[tauri::command]
+pub fn session_titles() -> std::collections::HashMap<String, String> {
+    load_metadata("titles.json")
+}
+
+pub fn load_stars() -> Vec<String> {
+    load_metadata("stars.json")
+}
+
+pub fn set_star(session_id: &str, on: bool) -> Result<(), String> {
+    let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
+    let mut stars: Vec<String> = load_metadata("stars.json");
+    stars.retain(|candidate| candidate != session_id);
+    if on {
+        stars.insert(0, session_id.to_owned());
+    }
+    save_metadata("stars.json", &stars)
+}
+
+#[tauri::command]
+pub fn session_stars() -> Vec<String> {
+    load_stars()
+}
+
+pub fn load_brought_in() -> std::collections::HashMap<String, String> {
+    load_metadata("brought_in.json")
+}
+
+pub(crate) fn apply_session_names(sessions: &mut [Session]) {
+    let titles: std::collections::HashMap<String, String> = load_metadata("titles.json");
+    let librarian = crate::librarian::load_store();
+    for session in sessions {
+        if let Some(title) = titles.get(&session.id).filter(|title| !title.trim().is_empty()) {
+            session.title = title.clone();
+        } else if let Some(entry) = librarian
+            .sessions
+            .get(&session.id)
+            .filter(|entry| !entry.name.trim().is_empty())
+        {
+            session.title = entry.name.clone();
+        }
+    }
+}
+
+#[tauri::command]
+pub fn session_brought_in() -> std::collections::HashMap<String, String> {
+    load_brought_in()
+}
+
+pub fn record_brought_in(second_session: &str, master_session: &str) -> Result<(), String> {
+    let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
+    let mut lineage: std::collections::HashMap<String, String> =
+        load_metadata("brought_in.json");
+    lineage.insert(second_session.to_owned(), master_session.to_owned());
+    save_metadata("brought_in.json", &lineage)
+}
+
+#[tauri::command]
+pub fn session_star(app: tauri::AppHandle, session_id: String, on: bool) -> Result<(), String> {
+    set_star(&session_id, on)?;
+    use tauri::Emitter;
+    let _ = app.emit("sessions://changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn session_rename(
+    app: tauri::AppHandle,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
+    rename_session(&session_id, &title)?;
+    use tauri::Emitter;
+    let _ = app.emit("sessions://changed", ());
+    Ok(())
+}
+
 /// A provider directory opened component-by-component without following a
 /// symlink. Discovery reads children relative to this descriptor, so replacing
 /// the provider root (or any directory below it) cannot redirect a scan into
@@ -9382,7 +9507,12 @@ mod tests {
 #[tauri::command]
 pub async fn list_sessions() -> Vec<Session> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
-    crate::run_blocking(move || sessions.list().unwrap_or_default()).await
+    crate::run_blocking(move || {
+        let mut rows = sessions.list().unwrap_or_default();
+        apply_session_names(&mut rows);
+        rows
+    })
+    .await
 }
 
 #[cfg(test)]

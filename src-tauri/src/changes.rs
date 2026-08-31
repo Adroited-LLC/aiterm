@@ -366,9 +366,6 @@ fn record(app: &AppHandle, path: PathBuf, kind: &str) {
             }
         }
         let _ = app.emit("changes://file", &c);
-        if let Some(sid) = session_id {
-            crate::remote::notify(app, crate::remote::Event::FileChanged { session_id: sid, path: c.path.clone(), kind: kind.into() });
-        }
     }
 }
 
@@ -376,7 +373,7 @@ fn record(app: &AppHandle, path: PathBuf, kind: &str) {
 /// its session in the path. Otherwise: sessions whose workspace holds the
 /// file and whose terminal showed work in the last while; several at once
 /// share the credit, none at all means nobody's agent did it.
-fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
+fn attribute(inner: &Inner, path: &Path, _app: &AppHandle) -> Vec<String> {
     let s = path.to_string_lossy();
     if let Some(sid) = harness_session_of(&s) {
         return vec![sid];
@@ -384,13 +381,9 @@ fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
     // Only a session that is working, or was a moment ago, gets the credit.
     // An idle tab in the folder does not — the person editing in another
     // window, or another tool entirely, is not the agent's doing.
-    let active: HashSet<String> = app
-        .state::<crate::pty::PtyManager>()
-        .activities()
-        .into_iter()
-        .filter(|(_, a)| a != "idle")
-        .map(|(id, _)| id)
-        .collect();
+    // Rust-owned tabs will feed activity into `recent`; the legacy PR #20
+    // PtyManager activity table is intentionally not revived alongside it.
+    let active: HashSet<String> = HashSet::new();
     inner
         .session_roots
         .iter()
@@ -405,15 +398,6 @@ fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
         .filter(|id| {
             active.contains(*id)
                 || inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT)
-                // Cadence is a liar mid tool call: a grok turn that went
-                // quiet rendering screenshots was stored "idle", and 31s of
-                // silence later its index.html landed unattributed — no
-                // FileChanged ever reached the phone [observed: ledger,
-                // 2026-08-31]. The transcript outranks cadence here exactly
-                // as it does for busy state: an open turn owns its
-                // workspace writes. Consulted last — a tail read per
-                // candidate, only for sessions the cheap checks failed.
-                || matches!(crate::remote::transcript_state(id), Some("working") | Some("attention"))
         })
         .cloned()
         .collect()
