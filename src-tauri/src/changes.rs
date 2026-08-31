@@ -402,7 +402,19 @@ fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
         // that inner repo can claim it.
         .filter(|(_, root)| !inside_nested_repo(path, root))
         .map(|(id, _)| id)
-        .filter(|id| active.contains(*id) || inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT))
+        .filter(|id| {
+            active.contains(*id)
+                || inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT)
+                // Cadence is a liar mid tool call: a grok turn that went
+                // quiet rendering screenshots was stored "idle", and 31s of
+                // silence later its index.html landed unattributed — no
+                // FileChanged ever reached the phone [observed: ledger,
+                // 2026-08-31]. The transcript outranks cadence here exactly
+                // as it does for busy state: an open turn owns its
+                // workspace writes. Consulted last — a tail read per
+                // candidate, only for sessions the cheap checks failed.
+                || matches!(crate::remote::transcript_state(id), Some("working") | Some("attention"))
+        })
         .cloned()
         .collect()
 }
