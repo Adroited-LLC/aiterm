@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import Row from "./SettingsRow";
 import {
@@ -18,8 +18,11 @@ export default function RemotePane() {
   const [portError, setPortError] = useState<string | null>(null);
   const [confirmForget, setConfirmForget] = useState(false);
   const [now, setNow] = useState(Date.now());
+  // The 5s poll must not type over the person: while a field has focus,
+  // its value belongs to them, not to the status refresh.
+  const editing = useRef(false);
 
-  const load = () => remoteStatus().then((s) => { setStatus(s); setName(s.name); setPort(String(s.port)); });
+  const load = () => remoteStatus().then((s) => { setStatus(s); if (!editing.current) { setName(s.name); setPort(String(s.port)); } });
   useEffect(() => { load(); }, []);
   // Connections come and go on their own schedule; the router answers late.
   useEffect(() => {
@@ -103,7 +106,8 @@ export default function RemotePane() {
         <input
           type="number" min={1024} max={65535} value={port}
           onChange={(e) => setPort(e.target.value)}
-          onBlur={commitPort} onKeyDown={blurOnEnter}
+          onFocus={() => { editing.current = true; }}
+          onBlur={() => { editing.current = false; commitPort(); }} onKeyDown={blurOnEnter}
           style={{ width: 90 }}
         />
       </Row>
@@ -111,7 +115,8 @@ export default function RemotePane() {
         <input
           type="text" value={name}
           onChange={(e) => setName(e.target.value)}
-          onBlur={commitName} onKeyDown={blurOnEnter}
+          onFocus={() => { editing.current = true; }}
+          onBlur={() => { editing.current = false; commitName(); }} onKeyDown={blurOnEnter}
           style={{ width: 180 }}
         />
       </Row>

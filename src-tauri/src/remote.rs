@@ -144,6 +144,8 @@ pub enum Event {
         rounds: u32,
         note: String,
     },
+    /// The machine's name was edited; phones show the new one at once.
+    Renamed { name: String },
     Ping,
 }
 
@@ -613,7 +615,9 @@ pub fn remote_set_name(app: AppHandle, name: String) -> RemoteStatus {
     let name = name.trim();
     cfg.name = if name.is_empty() { hostname() } else { name.to_string() };
     save_config(&cfg);
+    let renamed = cfg.name.clone();
     drop(cfg);
+    notify(&app, Event::Renamed { name: renamed });
     status_of(&app)
 }
 
