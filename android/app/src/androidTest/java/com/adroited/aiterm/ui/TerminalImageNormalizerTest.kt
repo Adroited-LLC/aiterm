@@ -1,6 +1,7 @@
 package com.adroited.aiterm.ui
 
 import android.content.Context
+import android.os.Bundle
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -17,7 +18,9 @@ import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.CRC32
 import java.util.zip.DeflaterOutputStream
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -42,6 +45,7 @@ class TerminalImageNormalizerTest {
     fun removeOnlyThisTestsFixtures() {
         capturesRoot.deleteRecursively()
         normalizedOutputs.forEach(File::delete)
+        context.contentResolver.call(mutableUri, "reset", null, null)
     }
 
     @Test
@@ -67,6 +71,7 @@ class TerminalImageNormalizerTest {
         assertEquals(0xd8.toByte(), bytes[1])
         assertEquals(0xff.toByte(), bytes[bytes.lastIndex - 1])
         assertEquals(0xd9.toByte(), bytes.last())
+        assertTrue(hasBaselineSof0(bytes))
         assertTrue(image.length in 1..TerminalImageNormalizer.MAX_OUTPUT_BYTES)
 
         val outputExif = ExifInterface(image.file.absolutePath)
@@ -141,6 +146,65 @@ class TerminalImageNormalizerTest {
     }
 
     @Test
+    fun mutableProvider_isOpenedOnceAndCannotSwapInAnOversizedImageAfterSnapshot() = runBlocking {
+        val initial = jpegBytes(80, 40)
+        val later = pngBytes(TerminalImageNormalizer.MAX_SOURCE_EDGE + 1, 1)
+        configureMutable(first = initial, later = later)
+
+        val image = normalizer().normalize(mutableUri).getOrThrow().also { normalizedOutputs += it.file }
+
+        assertEquals(80, image.width)
+        assertEquals(40, image.height)
+        assertEquals(1, mutableStats().getInt("opens"))
+        assertNoSnapshots()
+    }
+
+    @Test
+    fun inputBeyondFortyEightMiB_isRejectedAndLeavesNoSnapshot() = runBlocking {
+        context.contentResolver.call(
+            mutableUri,
+            "configure-generated",
+            null,
+            Bundle().apply { putInt("length", TerminalImageNormalizer.MAX_INPUT_BYTES.toInt() + 1) },
+        )
+
+        val failure = normalizer().normalize(mutableUri).exceptionOrNull() as? TerminalImageNormalizationError
+
+        assertEquals(TerminalImageNormalizationError.Code.INPUT_TOO_LARGE, failure?.code)
+        assertEquals(1, mutableStats().getInt("opens"))
+        assertNoSnapshots()
+    }
+
+    @Test
+    fun cancellationDuringSnapshotCopy_propagatesCancellationAndDeletesTemporaryFile() = runBlocking {
+        context.contentResolver.call(
+            mutableUri,
+            "configure-slow",
+            null,
+            Bundle().apply {
+                putInt("length", 512 * 1_024)
+                putInt("chunk", 32 * 1_024)
+                putLong("delay", 10)
+                putLong("start-delay", 250)
+            },
+        )
+
+        val completed = withTimeoutOrNull(100) {
+            async { normalizer().normalize(mutableUri) }.await()
+        }
+
+        assertNull(completed)
+        assertNoSnapshots()
+    }
+
+    @Test
+    fun legacySampling_neverAllocatesPastTheFinalImageEdgeBudget() {
+        assertEquals(1, legacyTerminalImageSampleSize(4_096, 4_096))
+        assertEquals(2, legacyTerminalImageSampleSize(4_097, 4_097))
+        assertEquals(4, legacyTerminalImageSampleSize(8_193, 8_193))
+    }
+
+    @Test
     fun jpegWhoseNormalizedOutputExceedsTwelveMiB_isRemovedAndReported() = runBlocking {
         val source = writeNoisyBitmap("output-too-large.jpg", 4_096, 4_096)
         val drafts = File(context.cacheDir, "terminal-image-drafts")
@@ -166,6 +230,10 @@ class TerminalImageNormalizerTest {
             writeBytes(byteArrayOf(2))
             setLastModified(now)
         }
+        val exactExpiry = File(drafts, "${UUID.randomUUID()}.jpg").apply {
+            writeBytes(byteArrayOf(4))
+            setLastModified(now - TerminalImageNormalizer.DRAFT_TTL_MILLIS)
+        }
         val unrelated = File(drafts, "user-photo.jpg").apply {
             writeBytes(byteArrayOf(3))
             setLastModified(now - TerminalImageNormalizer.DRAFT_TTL_MILLIS - 1)
@@ -174,6 +242,7 @@ class TerminalImageNormalizerTest {
         TerminalImageNormalizer(context, clockMillis = { now }).cleanupExpiredDrafts()
 
         assertFalse(oldGenerated.exists())
+        assertFalse(exactExpiry.exists())
         assertTrue(freshGenerated.exists())
         assertTrue(unrelated.exists())
         freshGenerated.delete()
@@ -182,6 +251,26 @@ class TerminalImageNormalizerTest {
     }
 
     private fun normalizer() = TerminalImageNormalizer(context)
+
+    private fun configureMutable(first: ByteArray, later: ByteArray) {
+        context.contentResolver.call(
+            mutableUri,
+            "configure",
+            null,
+            Bundle().apply {
+                putByteArray("first", first)
+                putByteArray("later", later)
+            },
+        )
+    }
+
+    private fun mutableStats(): Bundle = requireNotNull(
+        context.contentResolver.call(mutableUri, "stats", null, null),
+    )
+
+    private fun assertNoSnapshots() {
+        assertTrue(File(context.cacheDir, "terminal-image-snapshots").listFiles().orEmpty().isEmpty())
+    }
 
     private fun writeBitmap(
         name: String,
@@ -223,6 +312,19 @@ class TerminalImageNormalizerTest {
         }
     }
 
+    private fun jpegBytes(width: Int, height: Int): ByteArray {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        return try {
+            Canvas(bitmap).drawColor(Color.CYAN)
+            ByteArrayOutputStream().use { output ->
+                assertTrue(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output))
+                output.toByteArray()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
     private fun uriFor(file: File): Uri = FileProvider.getUriForFile(
         context,
         "${context.packageName}.terminal-images",
@@ -232,12 +334,17 @@ class TerminalImageNormalizerTest {
     private fun sha256(file: File): ByteArray = MessageDigest.getInstance("SHA-256").digest(file.readBytes())
 
     private fun writePngHeader(file: File, width: Int, height: Int) {
+        file.writeBytes(pngBytes(width, height))
+    }
+
+    private fun pngBytes(width: Int, height: Int): ByteArray {
         val rawPixels = ByteArray(1 + width * 4)
         val compressed = ByteArrayOutputStream().use { bytes ->
             DeflaterOutputStream(bytes).use { it.write(rawPixels) }
             bytes.toByteArray()
         }
-        DataOutputStream(file.outputStream()).use { output ->
+        return ByteArrayOutputStream().use { bytes ->
+            DataOutputStream(bytes).use { output ->
             output.write(byteArrayOf(137.toByte(), 80, 78, 71, 13, 10, 26, 10))
             ByteArrayOutputStream().use { header ->
                 DataOutputStream(header).use {
@@ -253,6 +360,8 @@ class TerminalImageNormalizerTest {
             }
             writePngChunk(output, "IDAT", compressed)
             writePngChunk(output, "IEND", ByteArray(0))
+            }
+            bytes.toByteArray()
         }
     }
 
@@ -266,5 +375,13 @@ class TerminalImageNormalizerTest {
         output.write(typeBytes)
         output.write(data)
         output.writeInt(crc.value.toInt())
+    }
+
+    private fun hasBaselineSof0(bytes: ByteArray): Boolean = bytes.indices.any { index ->
+        index + 1 < bytes.size && bytes[index] == 0xff.toByte() && bytes[index + 1] == 0xc0.toByte()
+    }
+
+    private companion object {
+        val mutableUri: Uri = Uri.parse("content://com.adroited.aiterm.test.mutable-image/image")
     }
 }
