@@ -1,11 +1,41 @@
 /** App-wide appearance settings: theme, fonts, per-panel sizing. */
 import type { TimeFormat } from "./timefmt";
+import { setDisplayZone } from "./timefmt";
 
 export interface PanelScales {
   sessions: number;
   explorer: number;
   git: number;
   agent: number;
+}
+
+/** The librarian: a small model that names, tags and threads sessions. Off
+ *  until a provider and model are chosen — it spends money, a little. */
+export interface LibrarianSettings {
+  /** The master switch. Off: no runs, no Threads tab, no names in the
+   *  list, and the rest of the pane is not shown. What was catalogued
+   *  stays on disk for when it is turned back on. */
+  enabled: boolean;
+  /** How the model is reached: an installed CLI in its print mode — which
+   *  runs on the plan already paid for — or an API provider. */
+  engine: "claude" | "codex" | "grok" | "api";
+  /** Provider id from Model access; only for `engine: "api"`. */
+  providerId: string;
+  /** Model id in the engine's spelling; "" means the CLI's default. */
+  model: string;
+  /** Catalogue new sessions on its own, a little after they go quiet. */
+  auto: boolean;
+  /** After a run, take one look at everything and merge threads that are
+   *  the same work. Sessions are read eight at a time, so without this the
+   *  same project ends up in several threads. */
+  tidyAfterRun: boolean;
+  /** Show the librarian's names in the session list, in place of the raw
+   *  first prompt. The original stays in the tooltip. */
+  renameRows: boolean;
+  /** The system prompt for reading sessions; "" means the one shipped. */
+  promptCatalogue: string;
+  /** The system prompt for the tidy pass; "" means the one shipped. */
+  promptTidy: string;
 }
 
 export interface AppSettings {
@@ -44,6 +74,9 @@ export interface AppSettings {
   /** How "last active" and the like are written: "3h ago", or the clock
    *  time. See `timefmt.ts`. */
   timeFormat: TimeFormat;
+  /** IANA zone id stamps are written in; "" = this machine's own. */
+  timeZone: string;
+  librarian: LibrarianSettings;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -61,6 +94,18 @@ export const DEFAULT_SETTINGS: AppSettings = {
   panelScale: { sessions: 1, explorer: 1, git: 1, agent: 1 },
   iconSize: 16,
   timeFormat: "relative",
+  timeZone: "",
+  librarian: {
+    enabled: false,
+    engine: "claude",
+    providerId: "",
+    model: "haiku",
+    auto: true,
+    tidyAfterRun: true,
+    renameRows: true,
+    promptCatalogue: "",
+    promptTidy: "",
+  },
 };
 
 /** Weights offered for terminal text, and what to call them.
@@ -93,6 +138,7 @@ export function loadSettings(): AppSettings {
       ...DEFAULT_SETTINGS,
       ...parsed,
       panelScale: { ...DEFAULT_SETTINGS.panelScale, ...(parsed.panelScale ?? {}) },
+      librarian: { ...DEFAULT_SETTINGS.librarian, ...(parsed.librarian ?? {}) },
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -249,6 +295,7 @@ const MONO_FALLBACK = `"JetBrainsMono Nerd Font", "JetBrains Mono", "Fira Code",
 
 /** Push the current theme + fonts into CSS custom properties on :root. */
 export function applySettings(s: AppSettings) {
+  setDisplayZone(s.timeZone);
   const t = themeById(s.themeId);
   const r = document.documentElement.style;
   r.setProperty("--bg", t.vars.bg);

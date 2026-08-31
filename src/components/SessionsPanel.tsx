@@ -1,23 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
+  sessionBroughtIn, sessionRename, sessionStar, sessionStars, sessionTitles,
 } from "../ipc";
 import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import {
-  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Play, RefreshCw, Search,
+  ChevronsDownUp, ChevronsUpDown, CornerDownRight, Folder, GitBranch, GitFork, Pencil, Play, RefreshCw, Search, Star, Users,
   Settings as SettingsIcon, Trash2, X,
 } from "lucide-react";
 import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
 import { followRekey } from "../selection";
+import ThreadsView from "./ThreadsView";
+import { LibrarianCtl } from "../librarian";
 
 import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 
-type ViewMode = "recent" | "project" | "date";
+type ViewMode = "recent" | "project" | "date" | "threads";
 
 function dateBucket(ms: number): string {
   const now = new Date();
@@ -180,7 +184,17 @@ interface Props {
    *  project or group header. The panel has already excluded anything a per-row
    *  🗑 would refuse. */
   onTrashSessions: (sessions: Session[]) => void;
+  /** The librarian's store and controls — the Threads tab, and the names it
+   *  has written where `renameRows` says to use them. */
+  librarian: LibrarianCtl;
+  renameRows: boolean;
+  showThreads: boolean;
+  onOpenLibrarian: () => void;
 }
+
+/** How many recent rows render before "Show all" — a screen and a half of
+ *  history; everything stays reachable through search. */
+const RECENT_WINDOW = 80;
 
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
@@ -189,10 +203,86 @@ export default function SessionsPanel({
   onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
+  librarian, renameRows, showThreads, onOpenLibrarian,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
+  /** The recent list renders a window, not the archive: 500+ rows of DOM
+   *  reconciled on every transcript-append reload is what made typing lag
+   *  [measured 2026-08-31]. Search always looks at everything; "Show all"
+   *  opens the rest for a browse. */
+  const [showAllRecent, setShowAllRecent] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  /** Row whose title is being edited in place, and the text so far. */
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  /** Person-chosen titles, id → name. A name the person typed outranks
+   *  every other naming layer — the librarian's labels included — and the
+   *  row can only rank what it can see, so the map rides along. */
+  const [titleOverrides, setTitleOverrides] = useState<Record<string, string>>({});
+  /** Starred sessions float to the top of every list. */
+  const [stars, setStars] = useState<Set<string>>(new Set());
+  /** Brought-in session → master, and which masters have their crew folded. */
+  const [broughtIn, setBroughtIn] = useState<Record<string, string>>({});
+  const [foldedCrews, setFoldedCrews] = useState<Set<string>>(() => {
+    try { return new Set(JSON.parse(localStorage.getItem("aiterm.foldedCrews") ?? "[]")); }
+    catch { return new Set(); }
+  });
+  const toggleCrew = (id: string) => {
+    setFoldedCrews((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      try { localStorage.setItem("aiterm.foldedCrews", JSON.stringify([...next])); } catch { /* private mode */ }
+      return next;
+    });
+  };
+  useEffect(() => {
+    const load = () => {
+      sessionTitles().then(setTitleOverrides).catch(() => {});
+      sessionStars().then((s) => setStars(new Set(s))).catch(() => {});
+      sessionBroughtIn().then(setBroughtIn).catch(() => {});
+    };
+    load();
+    const un = listen("sessions://changed", load);
+    return () => { un.then((f) => f()); };
+  }, []);
+  /** Glue each master's brought-in agents directly beneath it (hidden when
+   *  folded); a satellite whose master is elsewhere stays where it is. */
+  const glueCrew = (list: Session[]): Session[] => {
+    const out: Session[] = [];
+    const placed = new Set<string>();
+    for (const s of list) {
+      if (placed.has(s.id)) continue;
+      const master = broughtIn[s.id];
+      if (master && list.some((x) => x.id === master)) continue;
+      out.push(s); placed.add(s.id);
+      for (const k of list) {
+        if (broughtIn[k.id] === s.id && !placed.has(k.id)) {
+          placed.add(k.id);
+          if (!foldedCrews.has(s.id)) out.push(k);
+        }
+      }
+    }
+    return out;
+  };
+  const toggleStar = (s: Session) => {
+    const on = !stars.has(s.id);
+    setStars((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(s.id); else next.delete(s.id);
+      return next;
+    });
+    sessionStar(s.id, on).catch(() => {});
+  };
+  const floatStars = (list: Session[]) =>
+    [...list.filter((s) => stars.has(s.id)), ...list.filter((s) => !stars.has(s.id))];
+  const commitTitle = (s: Session, draft: string) => {
+    const t = draft.trim();
+    setRenamingId(null);
+    if (!t || t === (titleOverrides[s.id] ?? s.title)) return;
+    setTitleOverrides((prev) => ({ ...prev, [s.id]: t }));
+    sessionRename(s.id, t).catch(() => {});
+  };
   // Resuming a session that's still running stops it first, which throws away
   // whatever it was mid-way through — worth one click of confirmation.
   const [confirmStop, setConfirmStop] = useState<string | null>(null);
@@ -279,6 +369,8 @@ export default function SessionsPanel({
   const [ftResults, setFtResults] = useState<Session[] | null>(null);
 
   useEffect(() => localStorage.setItem("aiterm.viewMode", viewMode), [viewMode]);
+  // The Threads tab switched off while it was the one showing: fall back.
+  useEffect(() => { if (!showThreads && viewMode === "threads") setViewMode("recent"); }, [showThreads, viewMode]);
 
   // Debounced full-text search (tantivy index over titles + message text).
   useEffect(() => {
@@ -339,6 +431,15 @@ export default function SessionsPanel({
   };
   const flyHold = () => {
     if (flyClose.current) { window.clearTimeout(flyClose.current); flyClose.current = null; }
+  };
+  /** Begin editing a row's title. The preview card would sit right on top
+   *  of the input, so it goes away — immediately, not on the leave timer. */
+  const startRename = (s: Session) => {
+    if (flyTimer.current) { window.clearTimeout(flyTimer.current); flyTimer.current = null; }
+    if (flyClose.current) { window.clearTimeout(flyClose.current); flyClose.current = null; }
+    setFly(null);
+    setRenamingId(s.id);
+    setRenameDraft(titleOverrides[s.id] ?? s.title);
   };
   useEffect(() => {
     // Anything that moves the row from under the pointer closes the card —
@@ -420,8 +521,9 @@ export default function SessionsPanel({
   // beside the session it branched from. Rows still spawn in `project_path`.
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
   const ungrouped = useMemo(
-    () => applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"]),
-    [filtered, grouped, orders],
+    () => glueCrew(floatStars(applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"]))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filtered, grouped, orders, stars, broughtIn, foldedCrews],
   );
   const groupMembers = useMemo(() => {
     const m = new Map<string, Session[]>();
@@ -797,7 +899,7 @@ export default function SessionsPanel({
         key={s.id}
         data-item={container ? s.id : undefined}
         data-container={container}
-        onMouseEnter={(e) => { if (!isDragging) flyEnter(s, e.currentTarget, isRunning); }}
+        onMouseEnter={(e) => { if (!isDragging && renamingId === null) flyEnter(s, e.currentTarget, isRunning); }}
         onMouseLeave={flyLeave}
         onPointerDown={(e) => {
           if (e.button !== 0 || !container || searchList) return;
@@ -811,7 +913,7 @@ export default function SessionsPanel({
           };
         }}
         className={
-          "session-item" +
+          "session-item" + (broughtIn[s.id] ? " satellite" : "") +
           // Only the single focused session tints — not every session that
           // happens to share the active project. Multi-highlight is opt-in
           // via ctrl/shift-click (builds the `selected` set below).
@@ -858,6 +960,16 @@ export default function SessionsPanel({
         </div>
         <div className="session-text">
           <div className="session-title-row">
+            {broughtIn[s.id] && (
+              <span className="sat-mark" title="Brought into the session above">
+                <Icon of={CornerDownRight} size="sm" />
+              </span>
+            )}
+            {stars.has(s.id) && (
+              <span className="star-mark" title="Starred — stays on top">
+                <Icon of={Star} size="sm" />
+              </span>
+            )}
             {s.forked && (
               <span
                 className="fork-mark"
@@ -870,7 +982,43 @@ export default function SessionsPanel({
                 <Icon of={GitFork} size="sm" />
               </span>
             )}
-            <span className="session-title">{s.title}</span>
+            {renamingId === s.id ? (
+              <input
+                className="session-rename-input"
+                value={renameDraft}
+                autoFocus
+                onChange={(e) => setRenameDraft(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter") commitTitle(s, renameDraft);
+                  // Escape resets the draft first so a stray blur commits nothing.
+                  if (e.key === "Escape") { setRenameDraft(titleOverrides[s.id] ?? s.title); setRenamingId(null); }
+                }}
+                onBlur={() => commitTitle(s, renameDraft)}
+              />
+            ) : (
+              <span
+                className="session-title"
+                title={renameRows && librarian.store.sessions[s.id] ? s.title : undefined}
+                onDoubleClick={(e) => { e.stopPropagation(); startRename(s); }}
+              >
+                {titleOverrides[s.id] ?? ((renameRows && librarian.store.sessions[s.id]?.name) || s.title)}
+              </span>
+            )}
+            {(() => {
+              const crew = Object.values(broughtIn).filter((m) => m === s.id).length;
+              if (!crew) return null;
+              const folded = foldedCrews.has(s.id);
+              return (
+                <button
+                  className={"crew-badge" + (folded ? " folded" : "")}
+                  title={folded ? `${crew} brought-in agent(s) — click to show` : `${crew} brought-in agent(s) — click to fold`}
+                  onClick={(e) => { e.stopPropagation(); toggleCrew(s.id); }}
+                ><Icon of={Users} size="sm" />+{crew}</button>
+              );
+            })()}
             {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
           {(opts.showPath || (opts.showBranch && s.branch)) && (
@@ -982,6 +1130,16 @@ export default function SessionsPanel({
                   onClick={() => onFork(s)}
                 ><Icon of={GitFork} size="sm" /></button>
               )}
+              <button
+                className={"act-btn" + (stars.has(s.id) ? " starred" : "")}
+                title={stars.has(s.id) ? "Unstar" : "Star — keeps this session on top"}
+                onClick={() => toggleStar(s)}
+              ><Icon of={Star} size="sm" /></button>
+              <button
+                className="act-btn"
+                title="Rename this session (or double-click its title)"
+                onClick={() => startRename(s)}
+              ><Icon of={Pencil} size="sm" /></button>
               {/* aiterm's own clear — same end shape as typing /clear, built
                   like ⑂: no claude machinery, just a fresh process on a
                   minted id. Needs this session's own live terminal to act on,
@@ -1203,16 +1361,29 @@ export default function SessionsPanel({
         />
       )}
       <div className="view-tabs">
-        {(["recent", "project", "date"] as ViewMode[]).map((m) => (
+        {(["recent", "project", "date", ...(showThreads ? ["threads" as const] : [])] as ViewMode[]).map((m) => (
           <button
             key={m}
             className={"view-tab" + (viewMode === m ? " on" : "")}
             onClick={() => setViewMode(m)}
           >
-            {m === "recent" ? "Recent" : m === "project" ? "Project" : "Date"}
+            {m === "recent" ? "Recent" : m === "project" ? "Project" : m === "date" ? "Date" : "Threads"}
           </button>
         ))}
       </div>
+      {viewMode === "threads" && !searchList ? (
+        <div className="sessions-list">
+          <ThreadsView
+            lib={librarian}
+            sessions={sessions}
+            liveIds={liveSlots}
+            onSelect={onSelect}
+            onResume={onResume}
+            onOpenSettings={onOpenLibrarian}
+            canResume={(s) => capsOf(s.agent).resume}
+          />
+        </div>
+      ) : (
       <div className="sessions-list">
         {/* Above every view and outside the search filter: a session you just
             started is the one row you are certainly looking for, and it has no
@@ -1382,7 +1553,19 @@ export default function SessionsPanel({
             className={"ungrouped" + (dragOver === "ungrouped" ? " over" : "")}
             data-drop="ungrouped"
           >
-            {sectionOpen("recent:all") && ungrouped.map((s) => renderItem(s, "recent"))}
+            {sectionOpen("recent:all") &&
+              (query.trim() || showAllRecent ? ungrouped : ungrouped.slice(0, RECENT_WINDOW))
+                .map((s) => renderItem(s, "recent"))}
+            {sectionOpen("recent:all") && !query.trim() && ungrouped.length > RECENT_WINDOW && (
+              <button
+                className="tui-plain session-show-all"
+                onClick={() => setShowAllRecent((v) => !v)}
+              >
+                {showAllRecent
+                  ? `Show the first ${RECENT_WINDOW} — the full list is what makes the app slow`
+                  : `Show all ${ungrouped.length} — search reaches them regardless`}
+              </button>
+            )}
             {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
           </div>
         </div>
@@ -1445,6 +1628,7 @@ export default function SessionsPanel({
           </div>
         )}
       </div>
+      )}
       {menu && (
         // The backdrop is what closes it on a click anywhere else, including a
         // right-click somewhere new.
