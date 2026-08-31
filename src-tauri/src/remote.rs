@@ -172,6 +172,9 @@ pub struct RemoteState {
     last_error: Mutex<Option<String>>,
     /// Bad tokens per address: (failures, first failure). See `auth`.
     strikes: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// Provider model catalogs, cached — the phone asks on every connect
+    /// and OpenRouter's /models is not a thing to curl that often.
+    models_cache: Mutex<HashMap<String, (Instant, Vec<String>)>>,
     /// Live preview tickets: unguessable path → what it serves. Minted by
     /// the authed API, honored without a bearer — a WebView can't attach
     /// headers to subresource requests, but it can keep a secret path.
@@ -203,6 +206,7 @@ impl Default for RemoteState {
             usage_cache: Mutex::new(HashMap::new()),
             last_error: Mutex::new(None),
             strikes: Mutex::new(HashMap::new()),
+            models_cache: Mutex::new(HashMap::new()),
             previews: Mutex::new(HashMap::new()),
             events: broadcast::channel(64).0,
         }
@@ -949,20 +953,31 @@ async fn status(State(ctx): State<Ctx>) -> Response {
     .into_response()
 }
 
-async fn agents() -> Response {
+async fn agents(State(ctx): State<Ctx>) -> Response {
     let mut list = serde_json::to_value(crate::agents::agent_choices()).unwrap_or_default();
-    // API providers with a startup shortlist join as choices of their own —
-    // "OpenRouter" beside the CLIs, its models as the model list. The id
-    // wears an api: prefix so bring-in and new-session know the kind.
+    // Every keyed provider joins as a choice of its own — "OpenRouter"
+    // beside the CLIs — carrying its FULL catalog: starred models first,
+    // then everything the provider publishes. The id wears an api: prefix
+    // so bring-in and new-session know the kind.
     if let Some(arr) = list.as_array_mut() {
         for p in crate::providers::load_providers() {
-            if p.startup_models.is_empty() {
+            if p.api_key.is_empty() {
+                continue;
+            }
+            let catalog = cached_models(&ctx, &p.id).await;
+            let mut models = p.startup_models.clone();
+            for m in catalog {
+                if !models.contains(&m) {
+                    models.push(m);
+                }
+            }
+            if models.is_empty() {
                 continue;
             }
             arr.push(serde_json::json!({
                 "id": format!("api:{}", p.id),
                 "display_name": p.name,
-                "models": p.startup_models.iter().map(|m| serde_json::json!({
+                "models": models.iter().map(|m| serde_json::json!({
                     "id": m,
                     "display_name": m.split('/').next_back().unwrap_or(m),
                     "efforts": [],
@@ -972,6 +987,24 @@ async fn agents() -> Response {
         }
     }
     Json(list).into_response()
+}
+
+/// A provider's /models ids, at most one real fetch per ten minutes.
+async fn cached_models(ctx: &Ctx, provider_id: &str) -> Vec<String> {
+    {
+        let state = ctx.app.state::<RemoteState>();
+        let cache = state.models_cache.lock().unwrap();
+        if let Some((at, v)) = cache.get(provider_id) {
+            if at.elapsed() < Duration::from_secs(600) {
+                return v.clone();
+            }
+        }
+    }
+    let id = provider_id.to_string();
+    let fetched = crate::run_blocking(move || crate::providers::provider_models(id).unwrap_or_default()).await;
+    let state = ctx.app.state::<RemoteState>();
+    state.models_cache.lock().unwrap().insert(provider_id.to_string(), (Instant::now(), fetched.clone()));
+    fetched
 }
 
 /// The sidebar's list, plus what the phone renders as state: `running` (a
