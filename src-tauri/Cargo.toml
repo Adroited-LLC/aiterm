@@ -68,6 +68,7 @@ zune-jpeg = "=0.5.15"
 tower-http = { version = "0.6", features = ["fs", "compression-gzip"] }
 tower = "0.5"
 iroh = "1"
+igd-next = "0.17"
 rand = "0.8"
 
 [dev-dependencies]

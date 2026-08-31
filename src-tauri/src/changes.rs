@@ -376,6 +376,16 @@ fn record(app: &AppHandle, path: PathBuf, kind: &str) {
             }
         }
         let _ = app.emit("changes://file", &c);
+        if let Some(sid) = session_id {
+            crate::remote_api::notify(
+                app,
+                crate::remote_api::Event::FileChanged {
+                    session_id: sid,
+                    path: c.path.clone(),
+                    kind: kind.into(),
+                },
+            );
+        }
     }
 }
 

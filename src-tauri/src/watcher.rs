@@ -134,6 +134,7 @@ pub fn watch_claude_projects(app: AppHandle) -> Result<(), String> {
                 .is_ok()
             {}
             let _ = app.emit("sessions://changed", ());
+            crate::remote_api::notify(&app, crate::remote_api::Event::SessionsChanged);
         }
     });
     Ok(())

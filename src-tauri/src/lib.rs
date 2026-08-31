@@ -20,6 +20,8 @@ pub mod permissions;
 pub mod providers;
 pub mod pty;
 pub mod remote;
+pub mod remote_api;
+pub mod iroh_tunnel;
 pub mod changes;
 pub mod rendercost;
 pub mod services;
@@ -61,6 +63,7 @@ pub fn run() {
         // then: a desktop that never pairs a phone never grows a
         // trusted-device file.
         .manage(remote::RemoteState::default())
+        .manage(remote_api::RemoteState::default())
         // Wrapped so a debug build logs every IPC call before it dispatches.
         // In release `log_invokes` is the identity function and the generated
         // handler is passed straight through — see `trace.rs`.
@@ -189,6 +192,13 @@ pub fn run() {
             remote::remote_deny_device,
             remote::remote_devices,
             remote::remote_revoke_device,
+            remote_api::remote_api_status,
+            remote_api::remote_set_enabled,
+            remote_api::remote_rotate_token,
+            remote_api::remote_set_name,
+            remote_api::remote_set_port,
+            remote_api::remote_pair_payload,
+            remote_api::relay_report,
         ]))
         .setup(move |app| {
             if let Err(e) =
@@ -226,6 +236,12 @@ pub fn run() {
             // Track files produced by active sessions. The structured mobile
             // API reads this ledger; it does not replace tab/session ownership.
             changes::start(app.handle());
+
+            // The phone-protocol listener (with its iroh tunnel), separate
+            // from the remote gateway above and off unless enabled in
+            // Settings. A phone paired earlier expects the desktop to answer
+            // again.
+            remote_api::autostart(app.handle());
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.

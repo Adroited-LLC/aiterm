@@ -144,6 +144,8 @@ pub enum Event {
         rounds: u32,
         note: String,
     },
+    /// The machine's name was edited; phones show the new one at once.
+    Renamed { name: String },
     Ping,
 }
 
@@ -572,7 +574,7 @@ fn addresses() -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn remote_status(app: AppHandle) -> RemoteStatus {
+pub fn remote_api_status(app: AppHandle) -> RemoteStatus {
     status_of(&app)
 }
 
@@ -613,7 +615,9 @@ pub fn remote_set_name(app: AppHandle, name: String) -> RemoteStatus {
     let name = name.trim();
     cfg.name = if name.is_empty() { hostname() } else { name.to_string() };
     save_config(&cfg);
+    let renamed = cfg.name.clone();
     drop(cfg);
+    notify(&app, Event::Renamed { name: renamed });
     status_of(&app)
 }
 
@@ -1008,7 +1012,10 @@ async fn status(State(ctx): State<Ctx>) -> Response {
 }
 
 async fn agents(State(ctx): State<Ctx>) -> Response {
-    let mut list = serde_json::to_value(crate::agents::agent_choices()).unwrap_or_default();
+    let mut list = serde_json::to_value(crate::agents::agent_choices_from(
+        ctx.app.state::<crate::services::ApplicationServices>().inner(),
+    ))
+    .unwrap_or_default();
     // Every keyed provider joins as a choice of its own — "OpenRouter"
     // beside the CLIs — carrying its FULL catalog: starred models first,
     // then everything the provider publishes. The id wears an api: prefix
@@ -1072,9 +1079,9 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     let t_list = t0.elapsed();
     let running = crate::sessions::running_session_ids().await;
     let t_running = t0.elapsed();
-    let ptys = ctx.app.state::<crate::pty::PtyManager>();
-    let open = ptys.bound_sessions();
-    let mut activity: HashMap<String, String> = ptys.activities().into_iter().collect();
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
+    let open = tabs.bound_sessions();
+    let mut activity: HashMap<String, String> = tabs.session_activities().into_iter().collect();
     // A terminal that reports nothing (Codex has no progress sequence) is
     // not idle — ask its transcript. Only for sessions with a live process.
     let candidates: Vec<String> = open.iter().chain(running.iter()).cloned().collect();
@@ -1099,7 +1106,7 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     // tree, so the phone can offer a live preview of what's being built.
     let port_roots: Vec<(String, u32)> = open
         .iter()
-        .filter_map(|id| ptys.child_pid_for_session(id).map(|pid| (id.clone(), pid)))
+        .filter_map(|id| tabs.child_pid_for_session(id).map(|pid| (id.clone(), pid)))
         .collect();
     let ports: HashMap<String, Vec<u16>> = crate::run_blocking(move || {
         port_roots
@@ -1712,18 +1719,18 @@ struct InputBody {
 }
 
 async fn input(State(ctx): State<Ctx>, Path(id): Path<String>, Json(body): Json<InputBody>) -> Response {
-    let ptys = ctx.app.state::<crate::pty::PtyManager>();
-    let Some(pty) = ptys.pty_for_session(&id) else {
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
+    if !tabs.has_session(&id) {
         return err(StatusCode::CONFLICT, "session is not open in a tab — open it first");
-    };
-    if let Err(e) = ptys.write_str(pty, &body.text) {
+    }
+    if let Err(e) = tabs.write_session_str(&id, &body.text) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     if body.enter.unwrap_or(true) {
         // A TUI that just took a paste needs a beat before the Enter, or it
         // reads the two as one and the line sits unsent.
         tokio::time::sleep(Duration::from_millis(60)).await;
-        if let Err(e) = ptys.write_str(pty, "\r") {
+        if let Err(e) = tabs.write_session_str(&id, "\r") {
             return err(StatusCode::INTERNAL_SERVER_ERROR, e);
         }
     }
@@ -1766,7 +1773,9 @@ pub fn relay_report(
 ) {
     crate::diag!("relay", "{phase} r{round}/{rounds} a={} b={:?} ({b_name}) {note}", &session_id[..8.min(session_id.len())], b_session_id.as_deref().map(|b| &b[..8.min(b.len())]));
     if let Some(b) = b_session_id.as_deref() {
-        crate::sessions::record_brought_in(b, &session_id);
+        if let Err(e) = crate::sessions::record_brought_in(b, &session_id) {
+            crate::diag!("relay", "brought-in lineage not recorded: {e}");
+        }
     }
     notify(&app, Event::Relay { session_id, b_session_id, b_name, phase, round, rounds, note });
 }
@@ -1775,8 +1784,8 @@ pub fn relay_report(
 /// relay (it owns the tabs the two agents talk through). Needs the session
 /// open in a tab — the phone opens it first.
 async fn bring_in(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<BringInBody>) -> Response {
-    let ptys = ctx.app.state::<crate::pty::PtyManager>();
-    if ptys.pty_for_session(&id).is_none() {
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
+    if !tabs.has_session(&id) {
         return err(StatusCode::CONFLICT, "open the session on the desktop first");
     }
     // An api:<provider> id is a model off a provider's startup list, not a
@@ -1831,11 +1840,11 @@ async fn rename(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<Re
 }
 
 async fn interrupt(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
-    let ptys = ctx.app.state::<crate::pty::PtyManager>();
-    let Some(pty) = ptys.pty_for_session(&id) else {
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
+    if !tabs.has_session(&id) {
         return err(StatusCode::CONFLICT, "session is not open in a tab");
-    };
-    match ptys.write_str(pty, "\x1b") {
+    }
+    match tabs.write_session_str(&id, "\x1b") {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
@@ -1845,10 +1854,13 @@ async fn stop_session(State(ctx): State<Ctx>, Path(id): Path<String>) -> Respons
     // A session open in a terminal tab is stopped by ending that tab's
     // process — the roster only knows Claude's daemon sessions, so going
     // through it for a tab (any engine) stopped nothing at all.
-    let pty = ctx.app.state::<crate::pty::PtyManager>().pty_for_session(&id);
-    if let Some(pty_id) = pty {
+    if ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>().has_session(&id) {
         let app = ctx.app.clone();
-        crate::run_blocking(move || app.state::<crate::pty::PtyManager>().kill_now(pty_id)).await;
+        let sid = id.clone();
+        crate::run_blocking(move || {
+            app.state::<std::sync::Arc<crate::tabs::TabRegistry>>().kill_session_tab(&sid)
+        })
+        .await;
         return StatusCode::NO_CONTENT.into_response();
     }
     // An OpenCode id can never be in Claude's roster, so falling through

@@ -514,6 +514,10 @@ pub trait PtyBackend: Send + Sync + 'static {
     fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<(), String>;
     fn kill(&self, id: u32);
     fn pty_for_descendant(&self, pid: u32) -> Option<u32>;
+    /// Root pid of the PTY's child, when the backend knows it.
+    fn child_pid(&self, _id: u32) -> Option<u32> {
+        None
+    }
 }
 
 impl PtyBackend for PtyManager {
@@ -535,6 +539,10 @@ impl PtyBackend for PtyManager {
 
     fn pty_for_descendant(&self, pid: u32) -> Option<u32> {
         PtyManager::pty_for_descendant(self, pid)
+    }
+
+    fn child_pid(&self, id: u32) -> Option<u32> {
+        PtyManager::child_pid(self, id)
     }
 }
 
@@ -1817,6 +1825,108 @@ impl TabRegistry {
         let pty_id = self.inner.backend.pty_for_descendant(pid)?;
         self.inner.maps.lock().ok()?.by_pty.get(&pty_id).cloned()
     }
+
+    // Session-keyed views for the phone listener (`remote_api`). That
+    // protocol authorizes the phone at the listener (token + pinned TLS),
+    // then addresses tabs by the session they run — not by tab id, and not
+    // through an input-owner attachment. These helpers answer by session id
+    // and write through the backend directly, leaving desktop input
+    // ownership untouched.
+
+    fn cells(&self) -> Vec<Arc<TabCell>> {
+        let maps = self.inner.maps.lock().unwrap();
+        maps.order
+            .iter()
+            .filter_map(|id| maps.by_id.get(id).cloned())
+            .collect()
+    }
+
+    fn cell_for_session(&self, session_id: &str) -> Option<Arc<TabCell>> {
+        self.cells().into_iter().find(|tab| {
+            let live = tab.live.lock().unwrap();
+            live.descriptor.state == TabState::Running
+                && live.descriptor.session_id.as_deref() == Some(session_id)
+        })
+    }
+
+    /// Session ids of tabs whose process is still running.
+    pub fn bound_sessions(&self) -> Vec<String> {
+        self.cells()
+            .iter()
+            .filter_map(|tab| {
+                let live = tab.live.lock().unwrap();
+                if live.descriptor.state == TabState::Running {
+                    live.descriptor.session_id.clone()
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Whether some running tab is bound to this session.
+    pub fn has_session(&self, session_id: &str) -> bool {
+        self.cell_for_session(session_id).is_some()
+    }
+
+    /// What each bound session's terminal is doing, as cadence evidence:
+    /// "output" while bytes flowed recently, "idle" otherwise. Weak on its
+    /// own — the transcript outranks it, and `remote_api` upgrades verdicts
+    /// with `transcript_state` before a phone sees them.
+    pub fn session_activities(&self) -> Vec<(String, String)> {
+        self.cells()
+            .iter()
+            .filter_map(|tab| {
+                let live = tab.live.lock().unwrap();
+                if live.descriptor.state != TabState::Running {
+                    return None;
+                }
+                let session_id = live.descriptor.session_id.clone()?;
+                drop(live);
+                let recent =
+                    tab.last_activity.lock().unwrap().elapsed() < Duration::from_secs(10);
+                Some((session_id, if recent { "output" } else { "idle" }.to_string()))
+            })
+            .collect()
+    }
+
+    /// Write into the session's tab as the phone: straight to the PTY,
+    /// ordered against desktop output but not gated on input ownership.
+    pub fn write_session_str(&self, session_id: &str, data: &str) -> Result<(), String> {
+        let tab = self
+            .cell_for_session(session_id)
+            .ok_or_else(|| "session is not open in a tab".to_string())?;
+        let _send_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open().map_err(|e| e.to_string())?;
+        let pty_id = tab
+            .live
+            .lock()
+            .unwrap()
+            .live_pty()
+            .map_err(|e| e.to_string())?;
+        self.inner.backend.write(pty_id, data.as_bytes())
+    }
+
+    /// End the process of the session's tab. The tab stays, showing its
+    /// exit — a phone-side stop reads as "something killed it", not as the
+    /// person closing the tab.
+    pub fn kill_session_tab(&self, session_id: &str) -> bool {
+        let Some(tab) = self.cell_for_session(session_id) else {
+            return false;
+        };
+        let Ok(pty_id) = tab.live.lock().unwrap().live_pty() else {
+            return false;
+        };
+        self.inner.backend.kill(pty_id);
+        true
+    }
+
+    /// Root pid of the session's tab process, for port scanning.
+    pub fn child_pid_for_session(&self, session_id: &str) -> Option<u32> {
+        let tab = self.cell_for_session(session_id)?;
+        let pty_id = tab.live.lock().unwrap().live_pty().ok()?;
+        self.inner.backend.child_pid(pty_id)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1897,6 +2007,44 @@ fn emit_desktop_exit(app: &AppHandle, tab_id: &TabId, exit: &TabExit) {
     );
 }
 
+/// Project one registry event into the phone listener's session-keyed
+/// stream (`remote_api`): a tab binding or losing a session moves the
+/// phone's list, and a Running→Exited transition is that session's exit.
+/// `known` remembers each tab's last-seen (session, state) so both are
+/// announced exactly once.
+fn note_tab_for_phone(
+    app: &AppHandle,
+    known: &mut HashMap<TabId, (Option<String>, TabState)>,
+    tab: &TabDescriptor,
+    list_moved: &mut bool,
+) {
+    let session = tab.session_id().map(str::to_owned);
+    let state = tab.state().clone();
+    match known.get(tab.id()) {
+        Some((prev_session, prev_state)) => {
+            if *prev_session != session {
+                *list_moved = true;
+            }
+            if *prev_state == TabState::Running && state == TabState::Exited {
+                crate::remote_api::notify(
+                    app,
+                    crate::remote_api::Event::SessionExit {
+                        session_id: session.clone(),
+                        code: tab.exit().and_then(|exit| exit.code()),
+                    },
+                );
+                *list_moved = true;
+            }
+        }
+        None => {
+            if session.is_some() {
+                *list_moved = true;
+            }
+        }
+    }
+    known.insert(tab.id().clone(), (session, state));
+}
+
 fn unexpected_desktop_exits(change: &TabRegistryEvent) -> Vec<(TabId, TabExit)> {
     fn unexpected(tab: &TabDescriptor) -> Option<(TabId, TabExit)> {
         tab.exit()
@@ -1926,9 +2074,33 @@ pub fn start_desktop_registry_bridge(
     std::thread::Builder::new()
         .name("desktop-tab-registry".to_string())
         .spawn(move || {
+            let mut known: HashMap<TabId, (Option<String>, TabState)> = HashMap::new();
             loop {
                 match changes.recv_timeout(Duration::from_millis(250)) {
                     Ok(change) => {
+                        let mut list_moved = false;
+                        match &change {
+                            TabRegistryEvent::Snapshot { tabs, .. } => {
+                                for tab in tabs {
+                                    note_tab_for_phone(&app, &mut known, tab, &mut list_moved);
+                                }
+                            }
+                            TabRegistryEvent::Opened { tab, .. }
+                            | TabRegistryEvent::Changed { tab, .. } => {
+                                note_tab_for_phone(&app, &mut known, tab, &mut list_moved);
+                            }
+                            TabRegistryEvent::Removed { tab_id, .. } => {
+                                if known.remove(tab_id).is_some() {
+                                    list_moved = true;
+                                }
+                            }
+                        }
+                        if list_moved {
+                            crate::remote_api::notify(
+                                &app,
+                                crate::remote_api::Event::SessionsChanged,
+                            );
+                        }
                         let sessions: Vec<String> = match &change {
                             TabRegistryEvent::Snapshot { tabs, .. } => tabs
                                 .iter()
@@ -1954,6 +2126,16 @@ pub fn start_desktop_registry_bridge(
                 }
                 while let Ok(session_id) = activity.try_recv() {
                     crate::changes::touch(&app, &session_id);
+                    // A phone shows "working" off terminal cadence the moment
+                    // bytes flow; the transcript upgrades or overrides this on
+                    // the next sessions poll.
+                    crate::remote_api::notify(
+                        &app,
+                        crate::remote_api::Event::Activity {
+                            session_id,
+                            activity: "output".into(),
+                        },
+                    );
                 }
             }
         })

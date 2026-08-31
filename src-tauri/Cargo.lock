@@ -65,6 +65,7 @@ dependencies = [
  "futures-util",
  "git2",
  "if-addrs",
+ "igd-next",
  "image",
  "iroh",
  "libc",

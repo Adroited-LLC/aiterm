@@ -117,6 +117,7 @@ pub fn record_brought_in(second_session: &str, master_session: &str) -> Result<(
 #[tauri::command]
 pub fn session_star(app: tauri::AppHandle, session_id: String, on: bool) -> Result<(), String> {
     set_star(&session_id, on)?;
+    crate::remote_api::notify(&app, crate::remote_api::Event::SessionsChanged);
     use tauri::Emitter;
     let _ = app.emit("sessions://changed", ());
     Ok(())
@@ -129,6 +130,9 @@ pub fn session_rename(
     title: String,
 ) -> Result<(), String> {
     rename_session(&session_id, &title)?;
+    // Both UIs list the same sessions; tell them the list moved. (The
+    // transcript watcher can't see titles.json, so say it ourselves.)
+    crate::remote_api::notify(&app, crate::remote_api::Event::SessionsChanged);
     use tauri::Emitter;
     let _ = app.emit("sessions://changed", ());
     Ok(())
@@ -5974,6 +5978,50 @@ fn has_conversation(path: &Path) -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+/// Is some live process running this OpenCode session? `time.completed`
+/// staying NULL means "working" only while something is actually running the
+/// session. Two ways a process names one [observed: opencode 1.18.25]:
+///
+/// - a resume carries the id in argv (`opencode --session ses_…`, or the
+///   `$SHELL -ic` wrapper holding that same text), so any argv mentioning the
+///   id counts;
+/// - a fresh launch (`opencode --model … --prompt …`) names no session at
+///   all — the row is minted at the first prompt — so an `opencode` process
+///   whose cwd is the session's directory stands in for it.
+pub(crate) fn opencode_process_alive(session_id: &str, dir: Option<&str>) -> bool {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in procs.flatten() {
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if args.iter().any(|a| a.contains(session_id)) {
+            return true;
+        }
+        let is_opencode = args
+            .first()
+            .and_then(|a| Path::new(a).file_name().map(|n| n == "opencode"))
+            .unwrap_or(false);
+        if is_opencode {
+            if let (Some(dir), Ok(cwd)) = (dir, std::fs::read_link(entry.path().join("cwd"))) {
+                if cwd == Path::new(dir) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Session ids that currently have a live Claude Code process, read from

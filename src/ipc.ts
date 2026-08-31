@@ -1183,3 +1183,51 @@ export const remoteDevices = () => invoke<TrustedDevice[]>("remote_devices");
 /** Forgets the device's key and drops its live connections. */
 export const remoteRevokeDevice = (deviceId: string) =>
   invoke<boolean>("remote_revoke_device", { deviceId });
+
+// ------------------------------------------------- phone listener (remote_api)
+// The phone-protocol listener with its iroh tunnel — separate from the
+// remote gateway above, and off unless enabled in Settings → Phone remote.
+// Wire names keep their remote_* spelling except `remote_api_status`, which
+// the gateway's own `remote_status` forced to move.
+
+export interface PhoneRemoteStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  name: string;
+  /** Addresses a phone might reach this machine on, best first. */
+  addresses: string[];
+  /** What the router said: "off" | "searching" | "mapped" | "no_router" | "refused". */
+  upnp: string;
+  /** The address the internet sees, when the router told us. */
+  public_address: string | null;
+  /** SHA-256 of the listener certificate — what a paired phone pins. */
+  fingerprint: string | null;
+  /** Phones holding the event socket open right now. */
+  clients: PhoneRemoteClient[];
+  error: string | null;
+}
+export interface PhoneRemoteClient {
+  id: number;
+  device: string;
+  os: string;
+  app: string;
+  address: string;
+  /** Unix seconds. */
+  since: number;
+}
+export interface PhonePairPayload {
+  uri: string;
+  /** The QR, as SVG markup from the backend — the token never becomes a string here. */
+  svg: string;
+}
+export const phoneRemoteStatus = () => invoke<PhoneRemoteStatus>("remote_api_status");
+export const phoneRemoteSetEnabled = (on: boolean) =>
+  invoke<PhoneRemoteStatus>("remote_set_enabled", { on });
+/** Forget every paired phone: a new token, so each must scan again. */
+export const phoneRemoteRotateToken = () => invoke<PhoneRemoteStatus>("remote_rotate_token");
+export const phoneRemoteSetName = (name: string) =>
+  invoke<PhoneRemoteStatus>("remote_set_name", { name });
+export const phoneRemoteSetPort = (port: number) =>
+  invoke<PhoneRemoteStatus>("remote_set_port", { port });
+export const phoneRemotePairPayload = () => invoke<PhonePairPayload>("remote_pair_payload");

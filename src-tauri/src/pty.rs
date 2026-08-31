@@ -396,6 +396,16 @@ fn parent_of(pid: u32) -> Option<u32> {
 }
 
 impl PtyManager {
+    /// Root pid of the PTY's child process, when it was known at spawn.
+    pub fn child_pid(&self, id: u32) -> Option<u32> {
+        self.ptys
+            .entries
+            .lock()
+            .ok()?
+            .get(&id)
+            .and_then(|entry| entry.child_pid)
+    }
+
     /// Write input to one live PTY.
     pub fn write(&self, id: u32, data: &[u8]) -> Result<(), String> {
         self.ptys
