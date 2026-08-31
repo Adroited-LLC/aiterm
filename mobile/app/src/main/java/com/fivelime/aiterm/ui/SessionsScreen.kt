@@ -137,7 +137,8 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
                             s, vm.stateOf(s), showFolder = true,
                             starred = s.id in vm.stars,
                             satellite = vm.broughtIn[s.id] != null && visible.any { it.id == vm.broughtIn[s.id] },
-                            crew = vm.broughtIn.count { it.value == s.id },
+                            crewAgents = vm.broughtIn.filterValues { it == s.id }.keys
+                                .mapNotNull { id -> vm.sessions.find { it.id == id }?.agent },
                             folded = s.id in vm.foldedCrews,
                             onCrewTap = { vm.toggleCrew(s.id) },
                             crewNeedsYou = vm.broughtIn.any { it.value == s.id && vm.activity[it.key] == "attention" },
@@ -356,7 +357,7 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
 @Composable
 private fun SessionRow(
     s: Session, state: SessionState, showFolder: Boolean, starred: Boolean = false,
-    satellite: Boolean = false, crew: Int = 0, folded: Boolean = false, onCrewTap: () -> Unit = {},
+    satellite: Boolean = false, crewAgents: List<String> = emptyList(), folded: Boolean = false, onCrewTap: () -> Unit = {},
     crewNeedsYou: Boolean = false,
     onLongClick: () -> Unit = {}, onClick: () -> Unit,
 ) {
@@ -397,16 +398,21 @@ private fun SessionRow(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
                 // The state indicator is always the rightmost thing, so the
                 // dots right-align down the list; the crew fold sits beside
-                // it — a count and a caret, padded into a real touch target.
-                if (crew > 0) {
+                // it — who is in the crew, by their marks, and a caret,
+                // padded into a real touch target.
+                if (crewAgents.isNotEmpty()) {
                     Row(
                         Modifier.clip(RoundedCornerShape(10.dp))
                             .background(Accent.copy(alpha = if (folded) 0.08f else 0.15f))
                             .clickable(onClick = onCrewTap)
-                            .padding(start = 10.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                            .padding(start = 8.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
                         verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(3.dp),
                     ) {
-                        Text("+$crew", style = MaterialTheme.typography.labelMedium, color = Accent)
+                        crewAgents.take(3).forEach { AgentIcon(it, 16.dp) }
+                        if (crewAgents.size > 3) {
+                            Text("+${crewAgents.size - 3}", style = MaterialTheme.typography.labelMedium, color = Accent)
+                        }
                         Icon(
                             if (folded) Icons.Filled.KeyboardArrowRight else Icons.Filled.KeyboardArrowDown,
                             if (folded) "Show crew" else "Hide crew",
