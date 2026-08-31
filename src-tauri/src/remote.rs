@@ -694,7 +694,10 @@ async fn make_preview(State(ctx): State<Ctx>, Json(b): Json<PreviewBody>) -> Res
         let Ok(real) = std::path::PathBuf::from(&d).canonicalize() else {
             return err(StatusCode::NOT_FOUND, "no such folder");
         };
-        if !real.is_dir() || !under_home(&real) {
+        // Home, plus claude's scratchpads — where throwaway demo pages
+        // land by convention (/tmp/claude-<uid>/<project>/scratchpad).
+        let scratch = real.to_string_lossy().starts_with("/tmp/claude-");
+        if !real.is_dir() || !(under_home(&real) || scratch) {
             return err(StatusCode::FORBIDDEN, "only folders under home");
         }
         PreviewTarget::Dir(real)
@@ -1388,6 +1391,10 @@ async fn file_is_allowed(real: &std::path::Path) -> bool {
     if let Some(home) = dirs::home_dir() {
         always.push(home.join(".codex").join("generated_images"));
         always.push(home.join(".grok").join("sessions"));
+    }
+    // Claude's scratchpads: session-owned throwaway output, phone-viewable.
+    if real.to_string_lossy().starts_with("/tmp/claude-") {
+        return true;
     }
     for dir in always {
         if let Ok(dir) = dir.canonicalize() {
