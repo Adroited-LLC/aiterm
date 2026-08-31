@@ -340,7 +340,7 @@ class RemoteWireCodecTest {
         RemoteCommands.uploadBegin(
             tabId = "tab",
             attachmentId = "attachment",
-            submissionId = "s".repeat(128),
+            submissionId = "é".repeat(64),
             submissionCount = 1,
             submissionBytes = 1,
             length = 1,
@@ -350,7 +350,7 @@ class RemoteWireCodecTest {
             RemoteCommands.uploadBegin(
                 tabId = "tab",
                 attachmentId = "attachment",
-                submissionId = "s".repeat(129),
+                submissionId = "é".repeat(65),
                 submissionCount = 1,
                 submissionBytes = 1,
                 length = 1,

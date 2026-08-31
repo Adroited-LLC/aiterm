@@ -10,6 +10,7 @@ import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -142,12 +143,32 @@ class AuthenticatedRemoteTransport(
         return deferred
     }
 
+    override fun abandonRequest(request: Deferred<RemoteResponse>) {
+        val abandoned = synchronized(stateLock) {
+            val accepted = acceptedRequests.firstOrNull { it === request }
+                ?: return@synchronized null
+            acceptedRequests.remove(accepted)
+            pending.entries.firstOrNull { it.value.deferred === accepted }?.let { (requestId, pendingRequest) ->
+                pending.remove(requestId)
+                heldAttachments.remove(requestId)
+                pendingRequest.timeout?.cancel()
+                rememberCompletedLocked(requestId)
+            }
+            accepted
+        }
+        abandoned?.cancel()
+    }
+
     private suspend fun writeLoop() {
         for (outgoing in outbound) {
             val prepared = synchronized(stateLock) {
                 queuedRequests = (queuedRequests - 1).coerceAtLeast(0)
                 val active = socket
-                if (closed || active == null) null
+                if (!acceptedRequests.contains(outgoing.deferred)) null
+                else if (closed || active == null) {
+                    acceptedRequests.remove(outgoing.deferred)
+                    null
+                }
                 else {
                     val requestId = nextRequestId++
                     pending[requestId] = PendingRequest(outgoing.kind, outgoing.deferred)
@@ -156,6 +177,7 @@ class AuthenticatedRemoteTransport(
                 }
             }
             if (prepared == null) {
+                outgoing.payload.fill(0)
                 outgoing.deferred.completeExceptionally(RemoteProtocolException("remote transport is disconnected"))
                 continue
             }
@@ -164,6 +186,13 @@ class AuthenticatedRemoteTransport(
                 outgoing.onAssigned(requestId)
             } catch (_: Exception) {
                 failPendingSend(requestId, "remote request assignment callback failed")
+                outgoing.payload.fill(0)
+                continue
+            }
+            val stillPending = synchronized(stateLock) {
+                pending[requestId]?.deferred === outgoing.deferred && acceptedRequests.contains(outgoing.deferred)
+            }
+            if (!stillPending) {
                 outgoing.payload.fill(0)
                 continue
             }
@@ -348,6 +377,10 @@ class AuthenticatedRemoteTransport(
     }
 
     private fun rememberCompleted(requestId: Long) = synchronized(stateLock) {
+        rememberCompletedLocked(requestId)
+    }
+
+    private fun rememberCompletedLocked(requestId: Long) {
         completed += requestId
         while (completed.size > MAX_COMPLETED_CORRELATIONS) {
             completed.remove(completed.first())

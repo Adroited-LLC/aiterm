@@ -868,6 +868,7 @@ class RemoteClientTest {
             val failure = operation.await()
             assertTrue(failure.isFailure)
             assertEquals("terminal.upload_failed", (failure.exceptionOrNull() as RemoteUploadException).code)
+            assertEquals(listOf(pendingCancel), transport.abandonedRequests)
         } finally {
             pendingCancel.complete(RemoteResponse.Success(99, "terminal.upload.cancel", uploadSuccessReply()))
             operation.cancelAndJoin()
@@ -908,6 +909,7 @@ class RemoteClientTest {
 
             assertTrue(operation.isCompleted)
             assertTrue(operation.isCancelled)
+            assertEquals(listOf(pendingCancel), transport.abandonedRequests)
         } finally {
             pendingCancel.complete(RemoteResponse.Success(99, "terminal.upload.cancel", uploadSuccessReply()))
             operation.cancelAndJoin()
@@ -951,6 +953,7 @@ class RemoteClientTest {
             listOf("terminal.upload.begin", "terminal.upload.cancel"),
             transport.requests.map(RemoteRequest::kind),
         )
+        assertTrue(transport.abandonedRequests.isEmpty())
         cleanupUploadSources(source)
         client.lock()
     }
@@ -1145,6 +1148,7 @@ private fun scrollbackChunk(
 private class FakeRemoteTransport(private val onClose: () -> Unit = {}) : RemoteTransport {
     override val events = MutableSharedFlow<RemoteServerEvent>(extraBufferCapacity = 8)
     val requests = mutableListOf<RemoteRequest>()
+    val abandonedRequests = mutableListOf<Deferred<RemoteResponse>>()
     var responseFor: ((RemoteRequest) -> Deferred<RemoteResponse>)? = null
     var closed = false
 
@@ -1171,6 +1175,10 @@ private class FakeRemoteTransport(private val onClose: () -> Unit = {}) : Remote
         }
         return responseFor?.invoke(request)
             ?: CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+    }
+
+    override fun abandonRequest(request: Deferred<RemoteResponse>) {
+        abandonedRequests += request
     }
 
     override fun close() {

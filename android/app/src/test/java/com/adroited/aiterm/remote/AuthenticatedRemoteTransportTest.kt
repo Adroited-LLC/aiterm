@@ -194,6 +194,47 @@ class AuthenticatedRemoteTransportTest {
     }
 
     @Test
+    fun abandoningAQueuedRequestDropsItBeforeTheWriterConsumesIt() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+
+        val abandoned = transport.request("tab.list", byteArrayOf(1))
+        transport.abandonRequest(abandoned)
+        val successor = transport.request("tab.list", byteArrayOf(2))
+        runCurrent()
+
+        assertTrue(abandoned.isCancelled)
+        assertEquals(2, socket.sent.size)
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "tab.list", byteArrayOf()))
+        assertEquals(1L, (successor.await() as RemoteResponse.Success).requestId)
+        transport.close()
+    }
+
+    @Test
+    fun abandoningAnAssignedRequestReleasesItsSlotAndDiscardsALateResponse() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+
+        val accepted = (1..64).map { transport.request("tab.list", byteArrayOf()) }
+        runCurrent()
+        transport.abandonRequest(accepted.first())
+        val successor = transport.request("tab.list", byteArrayOf())
+        runCurrent()
+
+        assertTrue(accepted.first().isCancelled)
+        assertFalse(successor.isCompleted)
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "tab.list", byteArrayOf()))
+        transport.acceptEnvelopeForTest(
+            RemoteEventEnvelope(1, "error", cborFixture(linkedMapOf("code" to "cancelled", "message" to "late"))),
+        )
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(65, "tab.list", byteArrayOf()))
+        assertEquals(65L, (successor.await() as RemoteResponse.Success).requestId)
+        transport.close()
+    }
+
+    @Test
     fun outboundRequestsCannotOvertakeAnEarlierBlockedSend() = runTest {
         val socket = ReorderingBinarySocket().apply {
             incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))

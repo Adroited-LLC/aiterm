@@ -143,6 +143,8 @@ interface RemoteTransport {
         payload: ByteArray,
         onAssigned: (Long) -> Unit = {},
     ): Deferred<RemoteResponse>
+    /** Stops tracking an unanswered request when its caller no longer owns the result. */
+    fun abandonRequest(request: Deferred<RemoteResponse>) = Unit
     suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) = Unit
     fun close()
 }
@@ -1053,11 +1055,13 @@ class RemoteClient(
                     isCurrent(context.lifecycleGeneration, context.transport)
                 }
                 if (!sameConnection) return@withTimeoutOrNull
+                val cancel = context.transport.request(
+                    "terminal.upload.cancel",
+                    RemoteCommands.uploadCancel(uploadId),
+                )
+                var completed = false
                 try {
-                    when (val response = context.transport.request(
-                        "terminal.upload.cancel",
-                        RemoteCommands.uploadCancel(uploadId),
-                    ).await()) {
+                    when (val response = cancel.await()) {
                         is RemoteResponse.Success -> {
                             if (response.kind == "terminal.upload.cancel") {
                                 RemoteCommands.uploadAcknowledged(response.payload)
@@ -1065,10 +1069,13 @@ class RemoteClient(
                         }
                         is RemoteResponse.Error -> Unit
                     }
+                    completed = true
                 } catch (error: kotlinx.coroutines.CancellationException) {
                     throw error
                 } catch (_: Exception) {
                     // The disconnected transport owns server-side cleanup when a cancel frame cannot be delivered.
+                } finally {
+                    if (!completed) context.transport.abandonRequest(cancel)
                 }
             }
         }
