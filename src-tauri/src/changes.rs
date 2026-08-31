@@ -407,16 +407,27 @@ fn attribute(inner: &Inner, path: &Path, app: &AppHandle) -> Vec<String> {
         .collect()
 }
 
-/// Is there a `.git` strictly between `path` and `root`? Then the file
-/// belongs to a nested repository, not to `root`'s project.
+/// Is there an *established* repository strictly between `path` and
+/// `root`? Then the file belongs to that nested project, not to `root`'s.
+/// A `.git` younger than an hour is the opposite signal — the session is
+/// spinning up a new project right now (git init is step two of every
+/// spinup) and deserves the credit for what lands inside it.
 fn inside_nested_repo(path: &Path, root: &Path) -> bool {
     let mut dir = path.parent();
     while let Some(d) = dir {
         if d == root {
             return false;
         }
-        if d.join(".git").exists() {
-            return true;
+        let git = d.join(".git");
+        if git.exists() {
+            // `description` is written at init and never touched again —
+            // the closest thing a repo has to a birth certificate.
+            let marker = git.join("description");
+            let age = std::fs::metadata(if marker.exists() { marker } else { git })
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok());
+            return age.is_none_or(|a| a > Duration::from_secs(3600));
         }
         dir = d.parent();
     }

@@ -964,13 +964,16 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     // not idle — ask its transcript. Only for sessions with a live process.
     let candidates: Vec<String> = open.iter().chain(running.iter()).cloned().collect();
     let busy = crate::run_blocking(move || {
-        candidates.into_iter().filter(|id| transcript_busy(id)).collect::<Vec<String>>()
+        candidates
+            .into_iter()
+            .filter_map(|id| transcript_state(&id).map(|s| (id, s)))
+            .collect::<Vec<(String, &'static str)>>()
     })
     .await;
-    for id in busy {
+    for (id, st) in busy {
         let e = activity.entry(id).or_insert_with(|| "idle".into());
         if e == "idle" {
-            *e = "working".into();
+            *e = st.into();
         }
     }
     // Which sessions produced files, for the phone's "has files" filter.
@@ -1006,20 +1009,34 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
 /// `task_started` and `task_complete` events; Claude's last message is the
 /// person's until the assistant answers. Reads only the tail of the file.
 fn transcript_busy(session_id: &str) -> bool {
+    transcript_state(session_id).is_some()
+}
+
+/// `Some("working")`, `Some("attention")` — codex mid-approval — or `None`.
+/// Codex writes nothing while its approval prompt is up, so "waiting on a
+/// person" is read as: a turn in progress whose last act is a tool call
+/// with no output, and a transcript that has gone quiet.
+fn transcript_state(session_id: &str) -> Option<&'static str> {
     let list = crate::agents::backends();
-    let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return false };
-    let Ok(mut f) = std::fs::File::open(&path) else { return false };
+    let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return None };
+    let stale = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|e| e > Duration::from_secs(45));
+    let Ok(mut f) = std::fs::File::open(&path) else { return None };
     use std::io::{Read, Seek, SeekFrom};
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let start = len.saturating_sub(128 * 1024);
     if f.seek(SeekFrom::Start(start)).is_err() {
-        return false;
+        return None;
     }
     let mut buf = String::new();
     if f.read_to_string(&mut buf).is_err() {
-        return false;
+        return None;
     }
     let mut state: Option<bool> = None;
+    let mut pending_call = false;
     for line in buf.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
@@ -1027,8 +1044,13 @@ fn transcript_busy(session_id: &str) -> bool {
         }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("event_msg") => match v.pointer("/payload/type").and_then(|t| t.as_str()) {
-                Some("task_started") => state = Some(true),
-                Some("task_complete") | Some("turn_aborted") => state = Some(false),
+                Some("task_started") => { state = Some(true); pending_call = false }
+                Some("task_complete") | Some("turn_aborted") => { state = Some(false); pending_call = false }
+                _ => {}
+            },
+            Some("response_item") => match v.pointer("/payload/type").and_then(|t| t.as_str()) {
+                Some("custom_tool_call") | Some("function_call") => pending_call = true,
+                Some("custom_tool_call_output") | Some("function_call_output") => pending_call = false,
                 _ => {}
             },
             Some("user") => {
@@ -1063,7 +1085,11 @@ fn transcript_busy(session_id: &str) -> bool {
             _ => {}
         }
     }
-    state.unwrap_or(false)
+    match state {
+        Some(true) if pending_call && stale => Some("attention"),
+        Some(true) => Some("working"),
+        _ => None,
+    }
 }
 
 /// The same numbers the desktop's usage strip shows: plan limits per engine
