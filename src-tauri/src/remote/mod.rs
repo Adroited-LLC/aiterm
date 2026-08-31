@@ -2,6 +2,7 @@ pub mod auth;
 pub mod model;
 pub mod server;
 pub mod terminal;
+pub mod uploads;
 
 use auth::{DeviceStore, PendingPairing, TrustedDevice};
 use qrcode::{EcLevel, QrCode};
