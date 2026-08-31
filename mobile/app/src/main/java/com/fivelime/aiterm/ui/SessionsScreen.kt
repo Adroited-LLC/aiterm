@@ -24,7 +24,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.Groups
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.SubdirectoryArrowRight
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
@@ -379,20 +380,6 @@ private fun SessionRow(
                     Spacer(Modifier.width(5.dp))
                 }
                 Text(s.title.ifBlank { "Untitled" }, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                if (crew > 0) {
-                    Spacer(Modifier.width(6.dp))
-                    Row(
-                        Modifier.clip(RoundedCornerShape(8.dp))
-                            .background(Accent.copy(alpha = if (folded) 0.08f else 0.15f))
-                            .clickable(onClick = onCrewTap)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(Icons.Filled.Groups, null, tint = Accent, modifier = Modifier.size(12.dp))
-                        Spacer(Modifier.width(3.dp))
-                        Text(if (folded) "+$crew ▸" else "+$crew ▾", style = MaterialTheme.typography.labelSmall, color = Accent)
-                    }
-                }
             }
         },
         supportingContent = {
@@ -411,7 +398,27 @@ private fun SessionRow(
                 // A brought-in agent of THIS session is parked on a prompt —
                 // its own row may be folded away, so the master's row says so.
                 if (crewNeedsYou) StateChip("crew needs you", stateColor(SessionState.NeedsYou), pulse = true)
-                stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
+                // Open on the desktop is ambient, not news — a quiet dot, no words.
+                if (state == SessionState.OnDesktop) Dot(stateColor(state))
+                else stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
+                // The crew fold lives at the row's far edge: a count and a
+                // caret, padded into a real touch target.
+                if (crew > 0) {
+                    Row(
+                        Modifier.clip(RoundedCornerShape(10.dp))
+                            .background(Accent.copy(alpha = if (folded) 0.08f else 0.15f))
+                            .clickable(onClick = onCrewTap)
+                            .padding(start = 10.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("+$crew", style = MaterialTheme.typography.labelMedium, color = Accent)
+                        Icon(
+                            if (folded) Icons.Filled.KeyboardArrowRight else Icons.Filled.KeyboardArrowDown,
+                            if (folded) "Show crew" else "Hide crew",
+                            tint = Accent, modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
             }
         },
     )
