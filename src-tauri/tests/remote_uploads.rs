@@ -5,8 +5,8 @@ use aiterm_lib::remote::uploads::{
 use aiterm_lib::tabs::{AttachmentId, TabId};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 struct UploadFixture {
@@ -122,6 +122,15 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
 fn publish(fixture: &mut UploadFixture, jpeg: &[u8]) -> PathBuf {
     let request = fixture.begin(jpeg.len(), digest(jpeg));
     let began = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
@@ -235,6 +244,35 @@ fn digest_mismatch_aborts_publication() {
 }
 
 #[test]
+fn finish_hashes_the_actual_staged_inode_not_only_the_received_chunks() {
+    let mut fixture = UploadFixture::new("staged-inode-digest");
+    let jpeg = fixture.jpeg(64, 48);
+    let request = fixture.begin(jpeg.len(), digest(&jpeg));
+    let began = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
+    fixture.uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
+
+    let mut replacement = jpeg.clone();
+    // Alter JFIF density metadata without changing the stream length or image validity.
+    assert_eq!(&replacement[..4], &[0xff, 0xd8, 0xff, 0xe0]);
+    replacement[13] ^= 1;
+    image::load_from_memory_with_format(&replacement, ImageFormat::Jpeg).unwrap();
+    let part = fixture.part_files().pop().unwrap();
+    let mut staged = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(part)
+        .unwrap();
+    staged.write_all(&replacement).unwrap();
+    staged.sync_all().unwrap();
+
+    let error = fixture.uploads.finish(&began.upload_id).unwrap_err();
+
+    assert_eq!(error.kind(), UploadErrorKind::DigestMismatch);
+    assert!(fixture.part_files().is_empty());
+    assert!(files_with_extension(&fixture.cwd.join(".aiterm/attachments"), "jpg").is_empty());
+}
+
+#[test]
 fn non_jpeg_stream_is_rejected_and_removed() {
     let mut fixture = UploadFixture::new("not-jpeg");
     let bytes = b"this is not a jpeg";
@@ -267,6 +305,45 @@ fn jpeg_with_parseable_dimensions_but_truncated_scan_data_is_rejected() {
             .chunk(&began.upload_id, index as u32, chunk)
             .unwrap();
     }
+
+    let error = fixture.uploads.finish(&began.upload_id).unwrap_err();
+
+    assert_eq!(error.kind(), UploadErrorKind::InvalidImage);
+    assert!(fixture.part_files().is_empty());
+}
+
+#[test]
+fn truncated_jpeg_with_an_appended_eoi_marker_is_rejected() {
+    let mut fixture = UploadFixture::new("truncated-appended-eoi");
+    let complete = fixture.multi_chunk_jpeg();
+    let mut truncated = complete[..complete.len() / 2].to_vec();
+    truncated.extend_from_slice(&[0xff, 0xd9]);
+    let request = fixture.begin(truncated.len(), digest(&truncated));
+    let began = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
+    for (index, chunk) in truncated.chunks(MAX_UPLOAD_CHUNK_BYTES).enumerate() {
+        fixture
+            .uploads
+            .chunk(&began.upload_id, index as u32, chunk)
+            .unwrap();
+    }
+
+    let error = fixture.uploads.finish(&began.upload_id).unwrap_err();
+
+    assert_eq!(error.kind(), UploadErrorKind::InvalidImage);
+    assert!(fixture.part_files().is_empty());
+}
+
+#[test]
+fn concatenated_jpeg_streams_are_rejected() {
+    let mut fixture = UploadFixture::new("concatenated-jpeg");
+    let jpeg = fixture.jpeg(64, 48);
+    let concatenated = [jpeg.as_slice(), jpeg.as_slice()].concat();
+    let request = fixture.begin(concatenated.len(), digest(&concatenated));
+    let began = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
+    fixture
+        .uploads
+        .chunk(&began.upload_id, 0, &concatenated)
+        .unwrap();
 
     let error = fixture.uploads.finish(&began.upload_id).unwrap_err();
 
@@ -849,6 +926,54 @@ fn nested_git_exclusion_escapes_pattern_metacharacters_in_path_components() {
         .all(|entry| entry.status() == git2::Status::IGNORED));
 }
 
+#[test]
+fn concurrent_git_exclude_updates_preserve_every_writer() {
+    const WRITERS: usize = 12;
+
+    let fixture = UploadFixture::new("concurrent-git-exclude");
+    let repository = git2::Repository::init(&fixture.cwd).unwrap();
+    let exclude = repository.commondir().join("info/exclude");
+    fs::write(&exclude, b"existing\n").unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+    let jpeg = fixture.jpeg(64, 48);
+
+    std::thread::scope(|scope| {
+        for index in 0..WRITERS {
+            let cwd = fixture.cwd.join(format!("writer-{index}"));
+            let cache = fixture.root.join(format!("cache-{index}"));
+            let barrier = barrier.clone();
+            let jpeg = jpeg.clone();
+            fs::create_dir_all(&cwd).unwrap();
+            scope.spawn(move || {
+                let store = AttachmentStore::new(cache).unwrap();
+                let mut uploads = store.upload_set();
+                let request = UploadBegin {
+                    tab_id: TabId::new(),
+                    attachment_id: AttachmentId::new(),
+                    submission_id: uuid::Uuid::new_v4().to_string(),
+                    submission_count: 1,
+                    submission_bytes: jpeg.len() as u64,
+                    length: jpeg.len() as u64,
+                    sha256: digest(&jpeg),
+                };
+                barrier.wait();
+                let began = uploads.begin(Some(&cwd), request).unwrap();
+                uploads.cancel(&began.upload_id).unwrap();
+            });
+        }
+    });
+
+    let contents = fs::read_to_string(exclude).unwrap();
+    assert!(contents.contains("existing\n"));
+    for index in 0..WRITERS {
+        let expected = format!("/writer-{index}/.aiterm/attachments/");
+        assert!(
+            contents.lines().any(|line| line == expected),
+            "missing {expected} in {contents:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn failed_atomic_git_exclude_update_preserves_existing_bytes() {
@@ -873,6 +998,26 @@ fn failed_atomic_git_exclude_update_preserves_existing_bytes() {
 
 #[cfg(unix)]
 #[test]
+fn fifo_git_exclude_is_rejected_without_blocking() {
+    let mut fixture = UploadFixture::new("git-exclude-fifo");
+    let repository = git2::Repository::init(&fixture.cwd).unwrap();
+    let exclude = repository.commondir().join("info/exclude");
+    fs::remove_file(&exclude).unwrap();
+    make_fifo(&exclude);
+    let jpeg = fixture.jpeg(64, 48);
+    let request = fixture.begin(jpeg.len(), digest(&jpeg));
+
+    let error = fixture
+        .uploads
+        .begin(Some(&fixture.cwd), request)
+        .unwrap_err();
+
+    assert_eq!(error.kind(), UploadErrorKind::UnsafePath);
+    assert!(fixture.part_files().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn replacing_the_staged_entry_with_a_symlink_cannot_publish_the_target() {
     use std::os::unix::fs::symlink;
 
@@ -891,6 +1036,24 @@ fn replacing_the_staged_entry_with_a_symlink_cannot_publish_the_target() {
 
     assert_eq!(error.kind(), UploadErrorKind::UnsafePath);
     assert_eq!(fs::read(&outside).unwrap(), jpeg);
+    assert!(files_with_extension(&fixture.cwd.join(".aiterm/attachments"), "jpg").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_staged_entry_is_rejected_without_blocking() {
+    let mut fixture = UploadFixture::new("part-fifo");
+    let jpeg = fixture.jpeg(64, 48);
+    let request = fixture.begin(jpeg.len(), digest(&jpeg));
+    let began = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
+    fixture.uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
+    let part = fixture.part_files().pop().unwrap();
+    fs::remove_file(&part).unwrap();
+    make_fifo(&part);
+
+    let error = fixture.uploads.finish(&began.upload_id).unwrap_err();
+
+    assert_eq!(error.kind(), UploadErrorKind::UnsafePath);
     assert!(files_with_extension(&fixture.cwd.join(".aiterm/attachments"), "jpg").is_empty());
 }
 

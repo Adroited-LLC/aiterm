@@ -59,6 +59,8 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "x509-parser",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
