@@ -35,10 +35,15 @@ internal data class TerminalComposerState(
         )
     }
 
-    fun sendText(): TerminalComposerUpdate {
+    fun sendText(bracketedPaste: Boolean = false): TerminalComposerUpdate {
         if (direct) return TerminalComposerUpdate(this)
         val outbound = buildList {
-            if (textValue.text.isNotEmpty()) add(textValue.text)
+            if (textValue.text.isNotEmpty()) {
+                add(
+                    if (bracketedPaste) "\u001b[200~${textValue.text}\u001b[201~"
+                    else textValue.text,
+                )
+            }
             add("\r")
         }
         return TerminalComposerUpdate(

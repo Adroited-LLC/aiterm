@@ -34,6 +34,7 @@ import com.adroited.aiterm.terminal.CursorState
 import com.adroited.aiterm.terminal.ScreenCell
 import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.ScreenSnapshot
+import com.adroited.aiterm.terminal.TerminalModes
 import com.adroited.aiterm.testing.ComposeTestActivity
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
@@ -81,6 +82,39 @@ class TerminalScreenTest {
         compose.runOnIdle { assertEquals(listOf("hello phone", "\r"), sent) }
         assertTrue(compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
         compose.onNodeWithText("Type").assertIsDisplayed()
+    }
+
+    @Test
+    fun imeSubmitUsesBracketedPasteBeforeTheToolbarEnterAction() {
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    focus = FocusOwner.Self,
+                    activeTabId = "tab-ime-submit",
+                ),
+                screen = ScreenSnapshot(
+                    tabId = "tab-ime-submit",
+                    revision = 1,
+                    cols = 1,
+                    rows = 1,
+                    visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
+                    cursor = CursorState(0, 0, true),
+                    modes = TerminalModes(bracketedPaste = true),
+                ),
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+        composer.performTextInput("hello phone")
+        composer.performImeAction()
+
+        compose.runOnIdle {
+            assertEquals(listOf("\u001b[200~hello phone\u001b[201~", "\r"), sent)
+        }
     }
 
     @Test

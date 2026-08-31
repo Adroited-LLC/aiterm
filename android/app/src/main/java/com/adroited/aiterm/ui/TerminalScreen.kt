@@ -275,7 +275,7 @@ fun TerminalScreenContent(
                                     update.outbound.forEach(onInput)
                                 },
                                 onSend = {
-                                    val update = composer.sendText()
+                                    val update = composer.sendText(screen.modes.bracketedPaste)
                                     composer = update.state
                                     update.outbound.forEach(onInput)
                                     if (!update.state.expanded) keyboard?.hide()
