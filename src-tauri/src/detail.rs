@@ -686,6 +686,11 @@ fn conversation_rich_sync(session_id: &str, max_chars: usize) -> Vec<(String, St
                 .filter(|l| l.contains("\"type\""))
                 .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
                 .filter(|v| v.get("isSidechain").and_then(|b| b.as_bool()) != Some(true))
+                // Harness-to-model text (a loaded skill's body) rides in
+                // isMeta:true user records; line_message filters it, but this
+                // path parses with line_events — same rule applies.
+                // [observed: Claude Code 2.1.251, 2026-08-31]
+                .filter(|v| v.get("isMeta").and_then(|b| b.as_bool()) != Some(true))
                 .flat_map(|v| line_events(&v))
                 .collect()
         }
