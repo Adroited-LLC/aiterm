@@ -11,15 +11,19 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -52,6 +56,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -170,7 +175,22 @@ fun TerminalScreenContent(
     val keyboard = LocalSoftwareKeyboardController.current
     val density = LocalDensity.current
     var composer by remember(screen?.tabId) { mutableStateOf(TerminalComposerState()) }
-    var composerHeight by remember(screen?.tabId, density) { mutableStateOf(72.dp) }
+    var chromeInteractiveHeightPx by remember(screen?.tabId) { mutableIntStateOf(0) }
+    val bottomInsets = WindowInsets.ime.union(WindowInsets.navigationBars)
+    val bottomInsetPx = bottomInsets.getBottom(density)
+    val onViewportSizeChanged = remember {
+        { size: TerminalSize ->
+            cols = size.cols
+            rows = size.rows
+        }
+    }
+    val onRequestKeyboard = remember(state.focus, screen?.tabId) {
+        {
+            if (state.focus == FocusOwner.Self && screen != null) {
+                composer = composer.open()
+            }
+        }
+    }
 
     BackHandler(enabled = composer.expanded) {
         composer = composer.close()
@@ -208,6 +228,7 @@ fun TerminalScreenContent(
         },
     ) {
         Scaffold(
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
                 TopAppBar(
                     navigationIcon = {
@@ -229,93 +250,79 @@ fun TerminalScreenContent(
                 )
             },
         ) { padding ->
-            Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
-                ConnectionRail(state, onReconnect)
-                BoxWithConstraints(
-                    Modifier.weight(1f).fillMaxWidth()
-                        .background(Color(0xFF07111B))
-                        .padding(horizontal = 4.dp, vertical = 3.dp),
-                ) {
-                    val composerInset = if (composer.expanded) composerHeight else 0.dp
-                    val renderHeight = (maxHeight - composerInset).coerceAtLeast(terminalMetrics.lineHeight)
-                    val measuredCols = (maxWidth / terminalMetrics.cellWidth).toInt().coerceIn(1, 512)
-                    val measuredRows = (renderHeight / terminalMetrics.lineHeight).toInt().coerceIn(1, 512)
-                    LaunchedEffect(measuredCols, measuredRows) {
-                        cols = measuredCols
-                        rows = measuredRows
-                    }
-                    LaunchedEffect(screen?.tabId) {
-                        if (screen != null) {
-                            snapshotFlow { TerminalSize(cols, rows) }
-                                .settledTerminalSizes()
-                                .collect { size -> onResize(size.cols, size.rows) }
-                        }
-                    }
-                    TerminalGrid(
+            Box(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
+                Column(Modifier.fillMaxSize().testTag("terminal-surface")) {
+                    ConnectionRail(state, onReconnect)
+                    TerminalViewport(
                         screen = screen,
                         scrollback = scrollback,
-                        modifier = Modifier.fillMaxSize().padding(bottom = composerInset),
-                        onRequestKeyboard = {
-                            if (state.focus == FocusOwner.Self) {
-                                composer = composer.open()
-                            }
-                        },
                         metrics = terminalMetrics,
+                        bottomObstructionPx = bottomInsetPx + chromeInteractiveHeightPx,
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        emptyMessage = if (state.tabs.isEmpty()) {
+                            "No remote tabs are open."
+                        } else {
+                            "Choose a tab from Sessions."
+                        },
+                        onViewportSizeChanged = onViewportSizeChanged,
+                        onResize = onResize,
+                        onRequestKeyboard = onRequestKeyboard,
                     )
-                    if (screen == null) {
-                        Text(
-                            if (state.tabs.isEmpty()) "No remote tabs are open." else "Choose a tab from Sessions.",
-                            modifier = Modifier.align(Alignment.Center),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                }
+                Column(
+                    Modifier.align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .testTag("terminal-bottom-chrome")
+                        .windowInsetsPadding(bottomInsets),
+                ) {
+                    Column(Modifier.onSizeChanged { chromeInteractiveHeightPx = it.height }) {
+                        if (screen != null && composer.expanded) {
+                            Box(
+                                Modifier.fillMaxWidth()
+                                    .testTag("terminal-composer-overlay")
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                            ) {
+                                TerminalInputBar(
+                                    value = composer.value,
+                                    onValueChange = { next ->
+                                        val update = composer.updateValue(next)
+                                        composer = update.state
+                                        update.outbound.forEach(onInput)
+                                    },
+                                    onSend = {
+                                        val update = composer.sendText(screen.modes.bracketedPaste)
+                                        composer = update.state
+                                        update.outbound.forEach(onInput)
+                                        if (!update.state.expanded) keyboard?.hide()
+                                    },
+                                    focusRequester = inputFocus,
+                                    enabled = state.focus == FocusOwner.Self,
+                                )
+                            }
+                        }
+                        if (state.showTakeFocus && screen != null) {
+                            Button(
+                                onClick = { onTakeFocus(cols, rows) },
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                            ) { Text("Take Focus") }
+                        }
+                        if (screen != null) {
+                            TextButton(
+                                onClick = onLoadScrollback,
+                                modifier = Modifier.fillMaxWidth().height(36.dp).testTag("load-scrollback"),
+                            ) { Text("Load older history · ${scrollback.size} rows") }
+                        }
+                        ExtraKeys(
+                            screen = screen,
+                            scrollback = scrollback,
+                            expanded = keyBarExpanded,
+                            onExpandedChange = onKeyBarExpandedChange,
+                            onInput = onInput,
+                            onOpenComposer = { if (screen != null) composer = composer.open() },
                         )
                     }
-                    if (screen != null && composer.expanded) {
-                        Box(
-                            Modifier.align(Alignment.BottomCenter)
-                                .fillMaxWidth()
-                                .onSizeChanged { composerHeight = with(density) { it.height.toDp() } }
-                                .testTag("terminal-composer-overlay")
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
-                        ) {
-                            TerminalInputBar(
-                                value = composer.value,
-                                onValueChange = { next ->
-                                    val update = composer.updateValue(next)
-                                    composer = update.state
-                                    update.outbound.forEach(onInput)
-                                },
-                                onSend = {
-                                    val update = composer.sendText(screen.modes.bracketedPaste)
-                                    composer = update.state
-                                    update.outbound.forEach(onInput)
-                                    if (!update.state.expanded) keyboard?.hide()
-                                },
-                                focusRequester = inputFocus,
-                                enabled = state.focus == FocusOwner.Self,
-                            )
-                        }
-                    }
                 }
-                if (state.showTakeFocus && screen != null) {
-                    Button(
-                        onClick = { onTakeFocus(cols, rows) },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                    ) { Text("Take Focus") }
-                }
-                if (screen != null) {
-                    TextButton(
-                        onClick = onLoadScrollback,
-                        modifier = Modifier.fillMaxWidth().height(36.dp).testTag("load-scrollback"),
-                    ) { Text("Load older history · ${scrollback.size} rows") }
-                }
-                ExtraKeys(
-                    screen = screen,
-                    scrollback = scrollback,
-                    expanded = keyBarExpanded,
-                    onExpandedChange = onKeyBarExpandedChange,
-                    onInput = onInput,
-                    onOpenComposer = { if (screen != null) composer = composer.open() },
-                )
             }
         }
     }
@@ -333,6 +340,58 @@ fun TerminalScreenContent(
             },
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } },
         )
+    }
+}
+
+@Composable
+private fun TerminalViewport(
+    screen: ScreenSnapshot?,
+    scrollback: List<ScreenRow>,
+    metrics: TerminalMetrics,
+    bottomObstructionPx: Int,
+    modifier: Modifier,
+    emptyMessage: String,
+    onViewportSizeChanged: (TerminalSize) -> Unit,
+    onResize: (Int, Int) -> Unit,
+    onRequestKeyboard: () -> Unit,
+) {
+    val density = LocalDensity.current
+    BoxWithConstraints(
+        modifier.background(Color(0xFF07111B))
+            .padding(horizontal = 4.dp, vertical = 3.dp),
+    ) {
+        val bottomObstruction = with(density) { bottomObstructionPx.toDp() }
+        val availableHeight = (maxHeight - bottomObstruction).coerceAtLeast(metrics.lineHeight)
+        val measuredSize = TerminalSize(
+            cols = (maxWidth / metrics.cellWidth).toInt().coerceIn(1, 512),
+            rows = (availableHeight / metrics.lineHeight).toInt().coerceIn(1, 512),
+        )
+        val currentMeasuredSize by rememberUpdatedState(measuredSize)
+        val currentOnResize by rememberUpdatedState(onResize)
+        LaunchedEffect(measuredSize) {
+            onViewportSizeChanged(measuredSize)
+        }
+        LaunchedEffect(screen?.tabId) {
+            if (screen != null) {
+                snapshotFlow { currentMeasuredSize }
+                    .settledTerminalSizes()
+                    .collect { size -> currentOnResize(size.cols, size.rows) }
+            }
+        }
+        TerminalGrid(
+            screen = screen,
+            scrollback = scrollback,
+            modifier = Modifier.fillMaxSize(),
+            onRequestKeyboard = onRequestKeyboard,
+            metrics = metrics,
+        )
+        if (screen == null) {
+            Text(
+                emptyMessage,
+                modifier = Modifier.align(Alignment.Center),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 

@@ -20,6 +20,8 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performTextInput
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
@@ -133,7 +135,8 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun composerFloatsOverTheTerminalWithoutCoveringItsRenderArea() {
+    fun composerOverlaysTheTerminalWhileAdvertisedRowsExcludeBottomChrome() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
         compose.setContent {
             TerminalScreenContent(
                 state = RemoteClientState(
@@ -149,13 +152,22 @@ class TerminalScreenTest {
                     visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
                     cursor = CursorState(0, 0, true),
                 ),
+                onResize = { cols, rows -> sizes += cols to rows },
             )
         }
 
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
+        compose.runOnIdle { sizes.clear() }
         compose.onNodeWithText("Type").performClick()
-        compose.waitForIdle()
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) == true
+        }
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
 
         val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
         val overlay = compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
@@ -169,7 +181,17 @@ class TerminalScreenTest {
             "composer input must remain a compact single row",
             field.height <= maxSingleRowHeight,
         )
-        assertTrue("terminal content must end above the composer", render.bottom <= overlay.top + 1f)
+        assertTrue("composer must overlay the stable terminal render", render.bottom > overlay.top)
+        val rowHeight = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot.height
+        val expectedRows = ((chrome.top - render.top) / rowHeight).toInt().coerceIn(1, 512)
+        compose.runOnIdle {
+            assertEquals(
+                "advertised rows must exclude the terminal area hidden by bottom chrome",
+                expectedRows,
+                sizes.last().second,
+            )
+        }
         assertTrue(
             "placeholder must be vertically centered in the input",
             kotlin.math.abs(field.center.y - placeholder.center.y) < 2f,
@@ -180,6 +202,55 @@ class TerminalScreenTest {
                 .fetchSemanticsNodes().isEmpty(),
         )
         assertTrue(kotlin.math.abs(field.center.y - placeholder.center.y) < 2f)
+    }
+
+    @Test
+    fun terminalSurfaceStaysFixedWhileBottomChromeConsumesNativeImeInsets() {
+        compose.runOnIdle {
+            WindowCompat.getInsetsController(
+                compose.activity.window,
+                compose.activity.window.decorView,
+            ).hide(WindowInsetsCompat.Type.ime())
+        }
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) != true
+        }
+        compose.setContent {
+            TerminalScreenContent(
+                state = RemoteClientState(
+                    connection = ConnectionState.Connected,
+                    focus = FocusOwner.Self,
+                    activeTabId = "tab-native-insets",
+                ),
+                screen = oneCellScreen("tab-native-insets"),
+            )
+        }
+
+        val surfaceBefore = compose.onNodeWithTag("terminal-surface", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        compose.onNodeWithText("Type").performClick()
+        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+        composer.performClick().performTextInput("native")
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) == true
+        }
+
+        val surfaceDuring = compose.onNodeWithTag("terminal-surface", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        assertEquals(surfaceBefore.top, surfaceDuring.top, 1f)
+        assertEquals(surfaceBefore.bottom, surfaceDuring.bottom, 1f)
+
+        val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val decorHeight = compose.activity.window.decorView.height.toFloat()
+        assertTrue(
+            "surface ${surfaceBefore.top}..${surfaceBefore.bottom} -> " +
+                "${surfaceDuring.top}..${surfaceDuring.bottom}; bottom chrome " +
+                "${chrome.top}..${chrome.bottom} must own decor bottom $decorHeight",
+            chrome.bottom >= decorHeight,
+        )
     }
 
     @Test
@@ -367,8 +438,10 @@ class TerminalScreenTest {
                 .fetchSemanticsNode().boundsInRoot
             val row = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
                 .fetchSemanticsNode().boundsInRoot
+            val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
             val finalViewport = (render.width / cell.width).toInt().coerceIn(1, 512) to
-                (render.height / row.height).toInt().coerceIn(1, 512)
+                ((chrome.top - render.top) / row.height).toInt().coerceIn(1, 512)
             compose.runOnIdle { assertTrue(sizes.isEmpty()) }
             compose.mainClock.advanceTimeBy(TERMINAL_RESIZE_SETTLE_MILLIS)
             compose.runOnIdle { assertEquals(listOf(finalViewport), sizes) }
@@ -450,18 +523,20 @@ class TerminalScreenTest {
                 .fetchSemanticsNode().boundsInRoot
             val row = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
                 .fetchSemanticsNode().boundsInRoot
+            val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
             assertEquals(
                 "advertised columns must come from the padded grid width",
                 (grid.width / cell.width).toInt().coerceIn(1, 512),
                 advertised.first,
             )
             assertEquals(
-                "advertised rows must come from the padded grid height",
-                (grid.height / row.height).toInt().coerceIn(1, 512),
+                "advertised rows must come from the unobscured padded grid height",
+                ((chrome.top - grid.top) / row.height).toInt().coerceIn(1, 512),
                 advertised.second,
             )
             assertTrue(advertised.first * cell.width <= grid.width + 1f)
-            assertTrue(advertised.second * row.height <= grid.height + 1f)
+            assertTrue(advertised.second * row.height <= chrome.top - grid.top + 1f)
         }
 
         compose.waitUntil(5_000) { sizes.isNotEmpty() }
