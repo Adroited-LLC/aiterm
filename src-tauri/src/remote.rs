@@ -56,6 +56,10 @@ pub struct Config {
     pub token: String,
     /// What the phone shows for this machine. The hostname, unless edited.
     pub name: String,
+    /// iroh identity, 32 bytes hex. The public half is the address a phone
+    /// dials from anywhere; minted on the first start after this existed.
+    #[serde(default)]
+    pub iroh_secret: String,
 }
 
 impl Default for Config {
@@ -65,6 +69,7 @@ impl Default for Config {
             port: DEFAULT_PORT,
             token: new_token(),
             name: hostname(),
+            iroh_secret: crate::iroh_tunnel::new_secret_hex(),
         }
     }
 }
@@ -173,6 +178,8 @@ pub struct ClientInfo {
 pub struct RemoteState {
     config: Mutex<Config>,
     running: Mutex<Option<Running>>,
+    /// The iroh endpoint while listening — the reach-from-anywhere path.
+    tunnel: Mutex<Option<crate::iroh_tunnel::Tunnel>>,
     reach: Mutex<Reach>,
     clients: Mutex<HashMap<u64, ClientInfo>>,
     next_client: std::sync::atomic::AtomicU64,
@@ -211,6 +218,7 @@ impl Default for RemoteState {
         RemoteState {
             config: Mutex::new(load_config()),
             running: Mutex::new(None),
+            tunnel: Mutex::new(None),
             reach: Mutex::new(Reach { upnp: "off".into(), public_ip: None }),
             clients: Mutex::new(HashMap::new()),
             next_client: std::sync::atomic::AtomicU64::new(1),
@@ -413,6 +421,25 @@ fn start(app: &AppHandle) -> Result<(), String> {
         let alive = alive.clone();
         std::thread::spawn(move || keep_port_mapped(app, port, alive));
     }
+    // The iroh endpoint rides alongside: a config without a key yet (created
+    // before this existed) gets one now, so its node id is stable from here on.
+    let secret = {
+        let mut cfg = state.config.lock().unwrap();
+        if crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret).is_none() {
+            cfg.iroh_secret = crate::iroh_tunnel::new_secret_hex();
+            save_config(&cfg);
+        }
+        crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret)
+    };
+    if let Some(secret) = secret {
+        let app2 = app.clone();
+        tauri::async_runtime::spawn(async move {
+            match crate::iroh_tunnel::start(secret, port).await {
+                Ok(t) => *app2.state::<RemoteState>().tunnel.lock().unwrap() = Some(t),
+                Err(e) => crate::diag!("remote", "{e}"),
+            }
+        });
+    }
     *state.running.lock().unwrap() = Some(Running { port, handle, upnp_alive: alive });
     *state.last_error.lock().unwrap() = None;
     crate::diag!("remote", "listening (TLS) on port {port}");
@@ -428,6 +455,10 @@ fn stop(app: &AppHandle) {
         state.clients.lock().unwrap().clear();
         let _ = app.emit("remote://clients", ());
         crate::diag!("remote", "stopped listening on port {}", running.port);
+    }
+    let tunnel = state.tunnel.lock().unwrap().take();
+    if let Some(tunnel) = tunnel {
+        tauri::async_runtime::spawn(crate::iroh_tunnel::stop(tunnel));
     }
 }
 
@@ -624,6 +655,12 @@ pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
     for h in &addrs {
         uri.push_str("&h=");
         uri.push_str(h);
+    }
+    // The reach-from-anywhere address: the iroh node id. A phone that knows
+    // it can dial this desktop with no address at all.
+    if let Some(id) = crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) {
+        uri.push_str("&z=");
+        uri.push_str(&id);
     }
     let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| e.to_string())?;
     let svg = code
@@ -960,6 +997,7 @@ async fn status(State(ctx): State<Ctx>) -> Response {
         "name": cfg.name,
         "version": env!("CARGO_PKG_VERSION"),
         "hosts": hosts,
+        "iroh": crate::iroh_tunnel::node_id_of(&cfg.iroh_secret),
     }))
     .into_response()
 }

@@ -19,6 +19,7 @@ pub mod permissions;
 pub mod providers;
 pub mod rendercost;
 pub mod pty;
+pub mod iroh_tunnel;
 pub mod remote;
 pub mod changes;
 pub mod detail;

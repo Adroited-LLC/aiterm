@@ -55,3 +55,5 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tower = "0.5"
+iroh = "1"
+rand = "0.8"
