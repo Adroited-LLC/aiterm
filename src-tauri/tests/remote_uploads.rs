@@ -1,6 +1,7 @@
 use aiterm_lib::remote::uploads::{
-    AttachmentStore, UploadBegin, UploadErrorKind, UploadSet, MAX_CLOSED_SUBMISSIONS,
-    MAX_SUBMISSION_BYTES, MAX_UPLOAD_BYTES, MAX_UPLOAD_CHUNK_BYTES,
+    AttachmentStore, UploadBegin, UploadErrorKind, UploadSet, ATTACHMENT_BUDGET_BYTES,
+    ATTACHMENT_TTL, MAX_CLOSED_SUBMISSIONS, MAX_SUBMISSION_BYTES, MAX_UPLOAD_BYTES,
+    MAX_UPLOAD_CHUNK_BYTES, PARTIAL_ATTACHMENT_TTL,
 };
 use aiterm_lib::tabs::{AttachmentId, TabId};
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
@@ -8,11 +9,13 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 struct UploadFixture {
     root: PathBuf,
     cwd: PathBuf,
     cache: PathBuf,
+    store: AttachmentStore,
     uploads: UploadSet,
     tab_id: TabId,
     attachment_id: AttachmentId,
@@ -33,6 +36,7 @@ impl UploadFixture {
             root,
             cwd,
             cache,
+            store,
             uploads,
             tab_id: TabId::new(),
             attachment_id: AttachmentId::new(),
@@ -141,6 +145,332 @@ fn publish(fixture: &mut UploadFixture, jpeg: &[u8]) -> PathBuf {
             .unwrap();
     }
     fixture.uploads.finish(&began.upload_id).unwrap().path
+}
+
+fn publish_at(fixture: &mut UploadFixture, jpeg: &[u8], now: SystemTime) -> PathBuf {
+    let request = fixture.begin(jpeg.len(), digest(jpeg));
+    let began = fixture
+        .uploads
+        .begin_at(Some(&fixture.cwd), request, now)
+        .unwrap();
+    for (index, chunk) in jpeg.chunks(MAX_UPLOAD_CHUNK_BYTES).enumerate() {
+        fixture
+            .uploads
+            .chunk(&began.upload_id, index as u32, chunk)
+            .unwrap();
+    }
+    fixture
+        .uploads
+        .finish_at(&began.upload_id, now)
+        .unwrap()
+        .path
+}
+
+#[test]
+fn maintenance_removes_only_manifested_expired_generated_files() {
+    let mut fixture = UploadFixture::new("ttl");
+    let jpeg = fixture.jpeg(64, 48);
+    let published = publish_at(&mut fixture, &jpeg, SystemTime::UNIX_EPOCH);
+    let unrelated = fixture.cwd.join(".aiterm/attachments/keep-me.jpg");
+    fs::write(&unrelated, b"user file").unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + ATTACHMENT_TTL + Duration::from_secs(1))
+        .unwrap();
+
+    assert!(!published.exists());
+    assert!(unrelated.exists());
+}
+
+#[test]
+fn maintenance_removes_an_abandoned_partial_after_fifteen_minutes() {
+    let mut fixture = UploadFixture::new("partial-ttl");
+    let jpeg = fixture.jpeg(64, 48);
+    let request = fixture.begin(jpeg.len(), digest(&jpeg));
+    fixture
+        .uploads
+        .begin_at(Some(&fixture.cwd), request, SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let partial = fixture.part_files().pop().unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + PARTIAL_ATTACHMENT_TTL + Duration::from_secs(1))
+        .unwrap();
+
+    assert!(!partial.exists());
+}
+
+#[test]
+fn budget_cleanup_evicts_the_oldest_completed_attachment_first() {
+    let mut fixture = UploadFixture::new("budget-oldest");
+    let jpeg = fixture.jpeg(16, 16);
+    let mut published = Vec::new();
+    for age in 0..22_u64 {
+        published.push(publish_at(
+            &mut fixture,
+            &jpeg,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(age),
+        ));
+    }
+    let manifest_path = fixture.cache.join("remote-attachments/attachments.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    for (record, path) in manifest["records"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(&published)
+    {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(MAX_UPLOAD_BYTES)
+            .unwrap();
+        record["length"] = serde_json::json!(MAX_UPLOAD_BYTES);
+    }
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + Duration::from_secs(60))
+        .unwrap();
+
+    assert!(!published[0].exists());
+    assert!(published[1..].iter().all(|path| path.exists()));
+    let remaining_bytes: u64 = fs::read(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value["records"].as_array().cloned())
+        .unwrap()
+        .iter()
+        .map(|record| record["length"].as_u64().unwrap())
+        .sum();
+    assert!(remaining_bytes <= ATTACHMENT_BUDGET_BYTES);
+}
+
+#[test]
+fn corrupt_manifest_is_quarantined_without_deleting_an_unrelated_path() {
+    let fixture = UploadFixture::new("corrupt-manifest");
+    let outside = fixture.root.join("must-survive.jpg");
+    fs::write(&outside, b"must survive").unwrap();
+    let manifest_dir = fixture.cache.join("remote-attachments");
+    let manifest_path = manifest_dir.join("attachments.json");
+    fs::write(
+        &manifest_path,
+        format!("not json, but mentions {}", outside.display()),
+    )
+    .unwrap();
+
+    fixture.store.maintain(SystemTime::now()).unwrap();
+
+    assert_eq!(fs::read(outside).unwrap(), b"must survive");
+    let rebuilt: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert_eq!(rebuilt["version"], 1);
+    assert_eq!(rebuilt["records"].as_array().unwrap().len(), 0);
+    assert!(fs::read_dir(manifest_dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("attachments.corrupt")
+    }));
+}
+
+#[test]
+fn structurally_unsafe_manifest_path_is_quarantined_without_deletion() {
+    let mut fixture = UploadFixture::new("unsafe-manifest-path");
+    let jpeg = fixture.jpeg(64, 48);
+    let published = publish_at(&mut fixture, &jpeg, SystemTime::UNIX_EPOCH);
+    let outside = fixture.root.join("outside.jpg");
+    fs::write(&outside, b"outside survives").unwrap();
+    let manifest_path = fixture.cache.join("remote-attachments/attachments.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        manifest["records"][0]["path"] = serde_json::json!(outside.as_os_str().as_bytes().to_vec());
+    }
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + ATTACHMENT_TTL + Duration::from_secs(1))
+        .unwrap();
+
+    assert_eq!(fs::read(outside).unwrap(), b"outside survives");
+    assert!(published.exists());
+    let rebuilt: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert!(rebuilt["records"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn oversized_manifest_is_quarantined_with_bounded_read_allocation() {
+    let fixture = UploadFixture::new("oversized-manifest");
+    let manifest_dir = fixture.cache.join("remote-attachments");
+    let manifest_path = manifest_dir.join("attachments.json");
+    fs::write(&manifest_path, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
+
+    fixture.store.maintain(SystemTime::now()).unwrap();
+
+    let rebuilt: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert!(rebuilt["records"].as_array().unwrap().is_empty());
+    assert!(fs::read_dir(manifest_dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("attachments.corrupt")
+    }));
+}
+
+#[test]
+fn repeated_corruption_keeps_one_bounded_quarantine_file() {
+    let fixture = UploadFixture::new("bounded-quarantine");
+    let manifest_dir = fixture.cache.join("remote-attachments");
+    let manifest_path = manifest_dir.join("attachments.json");
+
+    for _ in 0..8 {
+        fs::write(&manifest_path, b"invalid manifest").unwrap();
+        fixture.store.maintain(SystemTime::now()).unwrap();
+    }
+
+    let quarantines = fs::read_dir(manifest_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("attachments.corrupt")
+        })
+        .count();
+    assert_eq!(quarantines, 1);
+}
+
+#[test]
+fn regular_file_replacement_is_not_deleted_by_cleanup() {
+    let mut fixture = UploadFixture::new("cleanup-regular-replacement");
+    let jpeg = fixture.jpeg(64, 48);
+    let published = publish_at(&mut fixture, &jpeg, SystemTime::UNIX_EPOCH);
+    fs::remove_file(&published).unwrap();
+    fs::write(&published, vec![b'x'; jpeg.len()]).unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + ATTACHMENT_TTL + Duration::from_secs(1))
+        .unwrap();
+
+    assert_eq!(fs::read(published).unwrap(), vec![b'x'; jpeg.len()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_replacement_is_quarantined_without_following_or_unlinking_it() {
+    use std::os::unix::fs::symlink;
+
+    let mut fixture = UploadFixture::new("cleanup-symlink");
+    let jpeg = fixture.jpeg(64, 48);
+    let published = publish_at(&mut fixture, &jpeg, SystemTime::UNIX_EPOCH);
+    let outside = fixture.root.join("outside.jpg");
+    fs::write(&outside, b"outside survives").unwrap();
+    fs::remove_file(&published).unwrap();
+    symlink(&outside, &published).unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + ATTACHMENT_TTL + Duration::from_secs(1))
+        .unwrap();
+
+    assert_eq!(fs::read(outside).unwrap(), b"outside survives");
+    assert!(published
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn constructing_a_store_runs_startup_maintenance() {
+    let mut fixture = UploadFixture::new("startup-maintenance");
+    let jpeg = fixture.jpeg(64, 48);
+    let published = publish_at(&mut fixture, &jpeg, SystemTime::UNIX_EPOCH);
+
+    let _reopened = AttachmentStore::new_at(
+        fixture.cache.clone(),
+        SystemTime::UNIX_EPOCH + ATTACHMENT_TTL + Duration::from_secs(1),
+    )
+    .unwrap();
+
+    assert!(!published.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn manifest_and_atomic_lock_are_owner_only_regular_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = UploadFixture::new("manifest-permissions");
+    let manifest_dir = fixture.cache.join("remote-attachments");
+    for name in ["attachments.json", ".attachments.lock"] {
+        let metadata = fs::symlink_metadata(manifest_dir.join(name)).unwrap();
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    assert!(fs::read_dir(manifest_dir).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+}
+
+#[test]
+fn concurrent_upload_sets_preserve_every_manifest_record() {
+    const WRITERS: usize = 12;
+
+    let fixture = UploadFixture::new("manifest-concurrency");
+    let jpeg = fixture.jpeg(16, 16);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+    std::thread::scope(|scope| {
+        for index in 0..WRITERS {
+            let cwd = fixture.root.join(format!("concurrent-project-{index}"));
+            let cache = fixture.cache.clone();
+            let barrier = barrier.clone();
+            let jpeg = jpeg.clone();
+            fs::create_dir_all(&cwd).unwrap();
+            scope.spawn(move || {
+                barrier.wait();
+                let mut uploads = AttachmentStore::new(cache).unwrap().upload_set();
+                let request = UploadBegin {
+                    tab_id: TabId::new(),
+                    attachment_id: AttachmentId::new(),
+                    submission_id: uuid::Uuid::new_v4().to_string(),
+                    submission_count: 1,
+                    submission_bytes: jpeg.len() as u64,
+                    length: jpeg.len() as u64,
+                    sha256: digest(&jpeg),
+                };
+                let began = uploads.begin(Some(&cwd), request).unwrap();
+                uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
+                uploads.finish(&began.upload_id).unwrap();
+            });
+        }
+    });
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.cache.join("remote-attachments/attachments.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["records"].as_array().unwrap().len(), WRITERS);
 }
 
 #[test]

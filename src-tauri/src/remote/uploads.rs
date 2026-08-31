@@ -1,4 +1,5 @@
 use crate::tabs::{AttachmentId, TabId};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 #[cfg(unix)]
@@ -10,12 +11,12 @@ use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
@@ -26,9 +27,15 @@ pub const MAX_IMAGE_EDGE: u32 = 4096;
 pub const MAX_UPLOADS_PER_SUBMISSION: usize = 4;
 pub const MAX_SUBMISSION_BYTES: u64 = 48 * 1024 * 1024;
 pub const ATTACHMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const PARTIAL_ATTACHMENT_TTL: Duration = Duration::from_secs(15 * 60);
 pub const ATTACHMENT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CLOSED_SUBMISSIONS: usize = 64;
 const MAX_GIT_EXCLUDE_BYTES: u64 = 1024 * 1024;
+const MANIFEST_VERSION: u8 = 1;
+const MANIFEST_NAME: &str = "attachments.json";
+const MANIFEST_LOCK_NAME: &str = ".attachments.lock";
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_MANIFEST_RECORDS: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct UploadBegin {
@@ -109,27 +116,40 @@ impl std::error::Error for UploadError {}
 #[derive(Clone, Debug)]
 pub struct AttachmentStore {
     fallback_cache: Arc<StableDirectory>,
+    manifest: Arc<ManifestStorage>,
 }
 
 impl AttachmentStore {
     /// Create a store whose fallback path is used for tabs without a known cwd.
     ///
-    /// The caller supplies AITerm's cache path, which is canonicalized once and
-    /// kept owner-only. Project paths are always supplied separately at begin
-    /// time from the authoritative tab registry.
-    pub fn new(fallback_cache: PathBuf) -> Result<Self, UploadError> {
-        let fallback_cache = StableDirectory::open_or_create_tree(&fallback_cache)?;
+    /// The caller supplies AITerm's cache root. The private remote-attachments
+    /// child holds both the fallback files and the persistent ownership manifest.
+    pub fn new(cache_root: PathBuf) -> Result<Self, UploadError> {
+        Self::new_at(cache_root, SystemTime::now())
+    }
+
+    pub fn new_at(cache_root: PathBuf, now: SystemTime) -> Result<Self, UploadError> {
+        let fallback_cache =
+            StableDirectory::open_or_create_tree(&cache_root.join("remote-attachments"))?;
         fallback_cache.set_owner_only()?;
-        Ok(Self {
+        let manifest = Arc::new(ManifestStorage::new(fallback_cache.duplicate()?)?);
+        let store = Self {
             fallback_cache: Arc::new(fallback_cache),
-        })
+            manifest,
+        };
+        store.maintain(now)?;
+        Ok(store)
     }
 
     pub fn system() -> Result<Self, UploadError> {
         let cache = dirs::cache_dir()
             .ok_or_else(|| UploadError::new(UploadErrorKind::Storage, "no cache directory"))?
-            .join("aiterm/attachments");
+            .join("aiterm");
         Self::new(cache)
+    }
+
+    pub fn maintain(&self, now: SystemTime) -> Result<(), UploadError> {
+        self.manifest.maintain(now)
     }
 
     pub fn upload_set(&self) -> UploadSet {
@@ -141,7 +161,12 @@ impl AttachmentStore {
         }
     }
 
-    fn stage(&self, tab_cwd: Option<&Path>) -> Result<StagedFile, UploadError> {
+    fn stage(
+        &self,
+        tab_cwd: Option<&Path>,
+        length: u64,
+        now: SystemTime,
+    ) -> Result<StagedFile, UploadError> {
         let directory = match tab_cwd {
             Some(cwd) => {
                 let canonical = canonical_project_cwd(cwd)?;
@@ -159,14 +184,27 @@ impl AttachmentStore {
             let staged_directory = directory.duplicate()?;
             match directory.create_new_file(&part_name) {
                 Ok(file) => {
-                    let staged = StagedFile {
+                    let identity = FileIdentity::of(&file)?;
+                    let mut staged = StagedFile {
                         directory: staged_directory,
+                        manifest: self.manifest.clone(),
+                        record_id: basename,
                         part_name,
                         published_name,
                         file,
                         published: false,
+                        manifested: false,
                     };
                     staged.verify_bound_entry()?;
+                    self.manifest.record_partial(
+                        &staged.record_id,
+                        &staged.directory.path,
+                        &staged.part_name,
+                        length,
+                        now,
+                        identity,
+                    )?;
+                    staged.manifested = true;
                     return Ok(staged);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -197,6 +235,16 @@ impl UploadSet {
         tab_cwd: Option<&Path>,
         request: UploadBegin,
     ) -> Result<UploadBegan, UploadError> {
+        self.begin_at(tab_cwd, request, SystemTime::now())
+    }
+
+    pub fn begin_at(
+        &mut self,
+        tab_cwd: Option<&Path>,
+        request: UploadBegin,
+        now: SystemTime,
+    ) -> Result<UploadBegan, UploadError> {
+        self.store.maintain(now)?;
         if self.closed_submissions.len() >= MAX_CLOSED_SUBMISSIONS {
             return Err(UploadError::new(
                 UploadErrorKind::Capacity,
@@ -272,7 +320,7 @@ impl UploadSet {
             }
         };
 
-        let staged = match self.store.stage(tab_cwd) {
+        let staged = match self.store.stage(tab_cwd, request.length, now) {
             Ok(staged) => staged,
             Err(error) => {
                 if self.submission.is_some() {
@@ -374,6 +422,14 @@ impl UploadSet {
     }
 
     pub fn finish(&mut self, upload_id: &str) -> Result<PublishedUpload, UploadError> {
+        self.finish_at(upload_id, SystemTime::now())
+    }
+
+    pub fn finish_at(
+        &mut self,
+        upload_id: &str,
+        now: SystemTime,
+    ) -> Result<PublishedUpload, UploadError> {
         let mut upload = self
             .uploads
             .remove(upload_id)
@@ -383,7 +439,21 @@ impl UploadSet {
         }
         let submission_id = upload.submission_id.clone();
 
-        let result = finish_upload(&mut upload);
+        let result = finish_upload(&mut upload).and_then(|published| {
+            if let Err(error) = upload.staged.mark_complete(now) {
+                let _ = upload.staged.remove_published();
+                return Err(error);
+            }
+            if let Err(error) = self.store.maintain(now) {
+                let _ = upload.staged.remove_published();
+                let _ = upload
+                    .staged
+                    .manifest
+                    .remove_record(&upload.staged.record_id);
+                return Err(error);
+            }
+            Ok(published)
+        });
         match result {
             Ok(published) => {
                 let complete = if let Some(group) = self.submission.as_mut() {
@@ -475,10 +545,13 @@ struct ActiveUpload {
 
 struct StagedFile {
     directory: StableDirectory,
+    manifest: Arc<ManifestStorage>,
+    record_id: String,
     part_name: OsString,
     published_name: OsString,
     file: File,
     published: bool,
+    manifested: bool,
 }
 
 impl StagedFile {
@@ -525,6 +598,9 @@ impl StagedFile {
         before_link: impl FnOnce(),
     ) -> Result<PathBuf, UploadError> {
         self.verify_bound_entry()?;
+        let held_publication = validated
+            .try_clone()
+            .map_err(|error| UploadError::storage("hold published attachment", error))?;
         before_link();
         self.directory.verify_current_path()?;
         self.directory
@@ -547,8 +623,35 @@ impl StagedFile {
             let _ = self.directory.sync();
             return Err(error);
         }
+        self.file = held_publication;
         self.published = true;
         Ok(self.directory.path.join(&self.published_name))
+    }
+
+    fn mark_complete(&mut self, now: SystemTime) -> Result<(), UploadError> {
+        self.directory.verify_current_path()?;
+        self.directory
+            .verify_entry_identity(&self.published_name, &self.file)?;
+        self.manifest.record_complete(
+            &self.record_id,
+            &self.directory.path,
+            &self.published_name,
+            now,
+            FileIdentity::of(&self.file)?,
+        )
+    }
+
+    fn remove_published(&mut self) -> Result<(), UploadError> {
+        if !self.published {
+            return Ok(());
+        }
+        self.directory.verify_current_path()?;
+        self.directory
+            .verify_entry_identity(&self.published_name, &self.file)?;
+        self.directory.unlink(&self.published_name)?;
+        self.directory.sync()?;
+        self.published = false;
+        Ok(())
     }
 }
 
@@ -599,6 +702,15 @@ impl Drop for StagedFile {
                         path = %self.directory.path.join(&self.part_name).display(),
                         error = %error,
                         "failed to remove staged attachment"
+                    );
+                }
+            }
+            if self.manifested {
+                if let Err(error) = self.manifest.remove_record(&self.record_id) {
+                    tracing::warn!(
+                        attachment_id = %self.record_id,
+                        error = %error,
+                        "failed to remove staged attachment manifest record"
                     );
                 }
             }
@@ -1218,6 +1330,520 @@ fn project_attachment_directory(canonical_cwd: &Path) -> Result<StableDirectory,
     aiterm.open_or_create_child(OsStr::new("attachments"), true)
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ManifestState {
+    Partial,
+    Complete,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestRecord {
+    id: String,
+    root: Vec<u8>,
+    path: Vec<u8>,
+    length: u64,
+    created_unix_millis: u64,
+    state: ManifestState,
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AttachmentManifest {
+    version: u8,
+    records: Vec<ManifestRecord>,
+}
+
+impl Default for AttachmentManifest {
+    fn default() -> Self {
+        Self {
+            version: MANIFEST_VERSION,
+            records: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ManifestStorage {
+    directory: StableDirectory,
+    process_lock: Arc<Mutex<()>>,
+}
+
+impl ManifestStorage {
+    fn new(directory: StableDirectory) -> Result<Self, UploadError> {
+        let process_lock = manifest_lock_for(&directory.path);
+        Ok(Self {
+            directory,
+            process_lock,
+        })
+    }
+
+    fn maintain(&self, now: SystemTime) -> Result<(), UploadError> {
+        self.with_manifest(|manifest| {
+            let now = system_time_millis(now)?;
+            let mut remove = Vec::new();
+            for record in &manifest.records {
+                let ttl = match record.state {
+                    ManifestState::Partial => PARTIAL_ATTACHMENT_TTL,
+                    ManifestState::Complete => ATTACHMENT_TTL,
+                };
+                let expired =
+                    now.saturating_sub(record.created_unix_millis) > duration_millis(ttl)?;
+                let exists = manifest_record_exists(record)?;
+                if !exists {
+                    // Publication replaces the manifest's `.part` inode with a
+                    // held, validated `.jpg` inode before updating this record.
+                    // Keep that short-lived missing partial binding until its
+                    // finish transaction or normal expiry resolves it.
+                    if expired {
+                        remove.push(record.id.clone());
+                    }
+                    continue;
+                }
+                if expired {
+                    delete_manifest_file(record)?;
+                    remove.push(record.id.clone());
+                }
+            }
+            manifest
+                .records
+                .retain(|record| !remove.iter().any(|id| id == &record.id));
+
+            let mut total = manifest_total(manifest)?;
+            if total > ATTACHMENT_BUDGET_BYTES {
+                let mut candidates: Vec<_> = manifest
+                    .records
+                    .iter()
+                    .filter(|record| record.state == ManifestState::Complete)
+                    .map(|record| (record.created_unix_millis, record.id.clone()))
+                    .collect();
+                candidates.sort();
+                for (_, id) in candidates {
+                    if total <= ATTACHMENT_BUDGET_BYTES {
+                        break;
+                    }
+                    if let Some(index) = manifest.records.iter().position(|record| record.id == id)
+                    {
+                        let record = &manifest.records[index];
+                        delete_manifest_file(record)?;
+                        total = total.saturating_sub(record.length);
+                        manifest.records.remove(index);
+                    }
+                }
+            }
+            if total > ATTACHMENT_BUDGET_BYTES {
+                let mut partials: Vec<_> = manifest
+                    .records
+                    .iter()
+                    .filter(|record| record.state == ManifestState::Partial)
+                    .map(|record| (record.created_unix_millis, record.id.clone()))
+                    .collect();
+                partials.sort();
+                for (_, id) in partials {
+                    if total <= ATTACHMENT_BUDGET_BYTES {
+                        break;
+                    }
+                    if let Some(index) = manifest.records.iter().position(|record| record.id == id)
+                    {
+                        let record = &manifest.records[index];
+                        delete_manifest_file(record)?;
+                        total = total.saturating_sub(record.length);
+                        manifest.records.remove(index);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_partial(
+        &self,
+        id: &str,
+        root: &Path,
+        name: &OsStr,
+        length: u64,
+        now: SystemTime,
+        identity: FileIdentity,
+    ) -> Result<(), UploadError> {
+        self.with_manifest(|manifest| {
+            if manifest.records.len() >= MAX_MANIFEST_RECORDS {
+                return Err(UploadError::new(
+                    UploadErrorKind::Capacity,
+                    "attachment manifest record limit reached",
+                ));
+            }
+            if manifest.records.iter().any(|record| record.id == id) {
+                return Err(UploadError::new(
+                    UploadErrorKind::Storage,
+                    "attachment id already exists in the manifest",
+                ));
+            }
+            let partial_total = manifest
+                .records
+                .iter()
+                .filter(|record| record.state == ManifestState::Partial)
+                .try_fold(length, |total, record| total.checked_add(record.length))
+                .ok_or_else(|| {
+                    UploadError::new(UploadErrorKind::Capacity, "attachment budget overflowed")
+                })?;
+            if partial_total > ATTACHMENT_BUDGET_BYTES {
+                return Err(UploadError::new(
+                    UploadErrorKind::Capacity,
+                    "active attachments exhaust the global storage budget",
+                ));
+            }
+
+            let mut total = manifest_total(manifest)?
+                .checked_add(length)
+                .ok_or_else(|| {
+                    UploadError::new(UploadErrorKind::Capacity, "attachment budget overflowed")
+                })?;
+            if total > ATTACHMENT_BUDGET_BYTES {
+                let mut completed: Vec<_> = manifest
+                    .records
+                    .iter()
+                    .filter(|record| record.state == ManifestState::Complete)
+                    .map(|record| (record.created_unix_millis, record.id.clone()))
+                    .collect();
+                completed.sort();
+                for (_, completed_id) in completed {
+                    if total <= ATTACHMENT_BUDGET_BYTES {
+                        break;
+                    }
+                    if let Some(index) = manifest
+                        .records
+                        .iter()
+                        .position(|record| record.id == completed_id)
+                    {
+                        let record = &manifest.records[index];
+                        delete_manifest_file(record)?;
+                        total = total.saturating_sub(record.length);
+                        manifest.records.remove(index);
+                    }
+                }
+            }
+
+            let path = root.join(name);
+            manifest.records.push(ManifestRecord {
+                id: id.to_string(),
+                root: path_bytes(root),
+                path: path_bytes(&path),
+                length,
+                created_unix_millis: system_time_millis(now)?,
+                state: ManifestState::Partial,
+                device: identity.device,
+                inode: identity.inode,
+            });
+            Ok(())
+        })
+    }
+
+    fn record_complete(
+        &self,
+        id: &str,
+        root: &Path,
+        name: &OsStr,
+        now: SystemTime,
+        identity: FileIdentity,
+    ) -> Result<(), UploadError> {
+        self.with_manifest(|manifest| {
+            let record = manifest
+                .records
+                .iter_mut()
+                .find(|record| record.id == id)
+                .ok_or_else(|| {
+                    UploadError::new(
+                        UploadErrorKind::Storage,
+                        "staged attachment is missing from the manifest",
+                    )
+                })?;
+            if record.state != ManifestState::Partial || path_from_bytes(&record.root) != root {
+                return Err(UploadError::new(
+                    UploadErrorKind::UnsafePath,
+                    "staged attachment manifest binding changed",
+                ));
+            }
+            record.path = path_bytes(&root.join(name));
+            record.created_unix_millis = system_time_millis(now)?;
+            record.state = ManifestState::Complete;
+            record.device = identity.device;
+            record.inode = identity.inode;
+            Ok(())
+        })
+    }
+
+    fn remove_record(&self, id: &str) -> Result<(), UploadError> {
+        self.with_manifest(|manifest| {
+            manifest.records.retain(|record| record.id != id);
+            Ok(())
+        })
+    }
+
+    fn with_manifest<T>(
+        &self,
+        operation: impl FnOnce(&mut AttachmentManifest) -> Result<T, UploadError>,
+    ) -> Result<T, UploadError> {
+        let _process_guard = self
+            .process_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file_guard = self.directory.lock_manifest()?;
+        self.directory.verify_current_path()?;
+        let (mut manifest, expected) = self.load_or_rebuild()?;
+        let result = operation(&mut manifest)?;
+        validate_manifest(&manifest, &self.directory.path)?;
+        let mut bytes = serde_json::to_vec(&manifest)
+            .map_err(|error| UploadError::storage("serialize attachment manifest", error))?;
+        bytes.push(b'\n');
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(UploadError::new(
+                UploadErrorKind::Capacity,
+                "attachment manifest exceeds its safety limit",
+            ));
+        }
+        self.directory
+            .write_atomic_replacing(OsStr::new(MANIFEST_NAME), &bytes, expected)?;
+        Ok(result)
+    }
+
+    fn load_or_rebuild(&self) -> Result<(AttachmentManifest, Option<FileIdentity>), UploadError> {
+        let loaded = self
+            .directory
+            .read_optional_file(OsStr::new(MANIFEST_NAME), MAX_MANIFEST_BYTES);
+        match loaded {
+            Ok((_, None)) => Ok((AttachmentManifest::default(), None)),
+            Ok((bytes, Some(identity))) => {
+                let parsed = serde_json::from_slice::<AttachmentManifest>(&bytes)
+                    .map_err(|error| UploadError::storage("parse attachment manifest", error))
+                    .and_then(|manifest| {
+                        validate_manifest(&manifest, &self.directory.path)?;
+                        Ok(manifest)
+                    });
+                match parsed {
+                    Ok(manifest) => Ok((manifest, Some(identity))),
+                    Err(error) => {
+                        self.quarantine_manifest()?;
+                        tracing::warn!(error = %error, "quarantined invalid attachment manifest");
+                        Ok((AttachmentManifest::default(), None))
+                    }
+                }
+            }
+            Err(error) => {
+                if matches!(
+                    error.kind(),
+                    UploadErrorKind::UnsafePath | UploadErrorKind::Capacity
+                ) {
+                    self.quarantine_manifest()?;
+                    tracing::warn!(error = %error, "quarantined unsafe attachment manifest");
+                    Ok((AttachmentManifest::default(), None))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn quarantine_manifest(&self) -> Result<(), UploadError> {
+        self.directory.verify_current_path()?;
+        self.directory.rename_replacing(
+            OsStr::new(MANIFEST_NAME),
+            OsStr::new("attachments.corrupt.json"),
+        )?;
+        self.directory.sync()
+    }
+}
+
+fn manifest_total(manifest: &AttachmentManifest) -> Result<u64, UploadError> {
+    manifest.records.iter().try_fold(0_u64, |total, record| {
+        total.checked_add(record.length).ok_or_else(|| {
+            UploadError::new(UploadErrorKind::Capacity, "attachment budget overflowed")
+        })
+    })
+}
+
+fn validate_manifest(
+    manifest: &AttachmentManifest,
+    fallback_root: &Path,
+) -> Result<(), UploadError> {
+    if manifest.version != MANIFEST_VERSION || manifest.records.len() > MAX_MANIFEST_RECORDS {
+        return Err(UploadError::new(
+            UploadErrorKind::UnsafePath,
+            "attachment manifest version or record count is invalid",
+        ));
+    }
+    let mut ids = HashSet::new();
+    let mut paths = HashSet::new();
+    for record in &manifest.records {
+        let parsed_id = Uuid::parse_str(&record.id).map_err(|_| {
+            UploadError::new(UploadErrorKind::UnsafePath, "manifest id is not a UUID")
+        })?;
+        if parsed_id.hyphenated().to_string() != record.id
+            || !ids.insert(record.id.clone())
+            || record.length == 0
+            || record.length > MAX_UPLOAD_BYTES
+            || record.device == 0
+            || record.inode == 0
+        {
+            return Err(UploadError::new(
+                UploadErrorKind::UnsafePath,
+                "attachment manifest record is invalid",
+            ));
+        }
+        let root = path_from_bytes(&record.root);
+        let path = path_from_bytes(&record.path);
+        if !root.is_absolute() || !paths.insert(path.clone()) {
+            return Err(UploadError::new(
+                UploadErrorKind::UnsafePath,
+                "attachment manifest path is invalid",
+            ));
+        }
+        let allowed_project_root = root.file_name() == Some(OsStr::new("attachments"))
+            && root.parent().and_then(Path::file_name) == Some(OsStr::new(".aiterm"));
+        if root != fallback_root && !allowed_project_root {
+            return Err(UploadError::new(
+                UploadErrorKind::UnsafePath,
+                "attachment manifest confinement root is invalid",
+            ));
+        }
+        let expected_name = match record.state {
+            ManifestState::Partial => format!("{}.jpg.part", record.id),
+            ManifestState::Complete => format!("{}.jpg", record.id),
+        };
+        if path != root.join(expected_name) {
+            return Err(UploadError::new(
+                UploadErrorKind::UnsafePath,
+                "attachment manifest path escapes its confinement root",
+            ));
+        }
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(UploadError::new(
+                        UploadErrorKind::UnsafePath,
+                        "attachment manifest root is not a real directory",
+                    ));
+                }
+                let canonical = fs::canonicalize(&root)
+                    .map_err(|error| UploadError::storage("canonicalize manifest root", error))?;
+                if canonical != root {
+                    return Err(UploadError::new(
+                        UploadErrorKind::UnsafePath,
+                        "attachment manifest root is not canonical",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(UploadError::storage("inspect manifest root", error)),
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(UploadError::new(
+                        UploadErrorKind::UnsafePath,
+                        "manifest attachment was replaced with an unsafe entry",
+                    ));
+                }
+                let directory = StableDirectory::open_existing_absolute(&root)?;
+                let file = match directory.open_file(
+                    path.file_name()
+                        .expect("validated attachment path has a name"),
+                ) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(path_operation_error("open manifested attachment", error))
+                    }
+                };
+                let identity = FileIdentity::of(&file)?;
+                if identity.device != record.device
+                    || identity.inode != record.inode
+                    || !identity.is_regular()
+                    || (record.state == ManifestState::Complete && metadata.len() != record.length)
+                    || (record.state == ManifestState::Partial && metadata.len() > record.length)
+                {
+                    return Err(UploadError::new(
+                        UploadErrorKind::UnsafePath,
+                        "manifest attachment identity or length changed",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(UploadError::storage("inspect manifested attachment", error)),
+        }
+    }
+    Ok(())
+}
+
+fn manifest_record_exists(record: &ManifestRecord) -> Result<bool, UploadError> {
+    match fs::symlink_metadata(path_from_bytes(&record.path)) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(UploadError::new(
+                UploadErrorKind::UnsafePath,
+                "manifested attachment is unsafe",
+            ))
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(UploadError::storage("inspect manifested attachment", error)),
+    }
+}
+
+fn delete_manifest_file(record: &ManifestRecord) -> Result<(), UploadError> {
+    let root = path_from_bytes(&record.root);
+    let path = path_from_bytes(&record.path);
+    let directory = StableDirectory::open_existing_absolute(&root)?;
+    directory.verify_current_path()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| UploadError::new(UploadErrorKind::UnsafePath, "attachment has no name"))?;
+    let file = directory
+        .open_file(name)
+        .map_err(|error| path_operation_error("open attachment for cleanup", error))?;
+    let identity = FileIdentity::of(&file)?;
+    if !identity.is_regular() || identity.device != record.device || identity.inode != record.inode
+    {
+        return Err(UploadError::new(
+            UploadErrorKind::UnsafePath,
+            "attachment changed before cleanup",
+        ));
+    }
+    directory.verify_entry_identity(name, &file)?;
+    directory.unlink(name)?;
+    directory.sync()
+}
+
+fn duration_millis(duration: Duration) -> Result<u64, UploadError> {
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        UploadError::new(
+            UploadErrorKind::Storage,
+            "attachment duration is out of range",
+        )
+    })
+}
+
+fn system_time_millis(time: SystemTime) -> Result<u64, UploadError> {
+    duration_millis(time.duration_since(UNIX_EPOCH).map_err(|_| {
+        UploadError::new(
+            UploadErrorKind::Storage,
+            "attachment timestamp predates the Unix epoch",
+        )
+    })?)
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
 #[derive(Debug)]
 struct StableDirectory {
     #[cfg(unix)]
@@ -1441,6 +2067,54 @@ impl StableDirectory {
         }
     }
 
+    #[cfg(unix)]
+    fn lock_manifest(&self) -> Result<File, UploadError> {
+        let name = cstring(OsStr::new(MANIFEST_LOCK_NAME), "manifest lock name")?;
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
+                0o600,
+            )
+        };
+        if descriptor < 0 {
+            return Err(path_operation_error(
+                "open attachment manifest lock",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if !FileIdentity::of(&file)?.is_regular() {
+            return Err(UploadError::new(
+                UploadErrorKind::UnsafePath,
+                "attachment manifest lock is not a regular file",
+            ));
+        }
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+            return Err(UploadError::storage(
+                "set attachment manifest lock permissions",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(UploadError::storage(
+                "lock attachment manifest",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn lock_manifest(&self) -> Result<File, UploadError> {
+        Err(unsupported_stable_filesystem())
+    }
+
     #[cfg(not(unix))]
     fn create_new_file(&self, _name: &OsStr) -> std::io::Result<File> {
         Err(std::io::Error::new(
@@ -1550,7 +2224,7 @@ impl StableDirectory {
         if metadata_length > max_bytes {
             return Err(UploadError::new(
                 UploadErrorKind::Capacity,
-                "Git info/exclude exceeds the 1 MiB safety limit",
+                "stable optional file exceeds its safety limit",
             ));
         }
         let mut bytes = Vec::new();
@@ -1560,7 +2234,7 @@ impl StableDirectory {
         if bytes.len() as u64 > max_bytes {
             return Err(UploadError::new(
                 UploadErrorKind::Capacity,
-                "Git info/exclude exceeds the 1 MiB safety limit",
+                "stable optional file exceeds its safety limit",
             ));
         }
         Ok((bytes, Some(identity)))
@@ -1794,6 +2468,22 @@ fn unsupported_stable_filesystem() -> UploadError {
 
 type ExcludeLockRegistry = Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>;
 static EXCLUDE_UPDATE_LOCKS: OnceLock<ExcludeLockRegistry> = OnceLock::new();
+type ManifestLockRegistry = Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>;
+static MANIFEST_UPDATE_LOCKS: OnceLock<ManifestLockRegistry> = OnceLock::new();
+
+fn manifest_lock_for(path: &Path) -> Arc<Mutex<()>> {
+    let registry = MANIFEST_UPDATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
 
 fn exclude_update_lock(path: &Path) -> Result<Arc<Mutex<()>>, UploadError> {
     let registry = EXCLUDE_UPDATE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -2111,12 +2801,16 @@ mod tests {
         let mut publication = directory.create_anonymous_file().unwrap();
         publication.write_all(original).unwrap();
         publication.sync_all().unwrap();
+        let manifest = Arc::new(ManifestStorage::new(directory.duplicate().unwrap()).unwrap());
         let mut staged = StagedFile {
             directory,
+            manifest,
+            record_id: Uuid::new_v4().hyphenated().to_string(),
             part_name,
             published_name,
             file,
             published: false,
+            manifested: false,
         };
 
         let published = staged
