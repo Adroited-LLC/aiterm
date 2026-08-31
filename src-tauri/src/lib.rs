@@ -115,6 +115,8 @@ pub fn run() {
             sessions::list_sessions,
             sessions::session_rename,
             sessions::session_titles,
+            sessions::session_stars,
+            sessions::session_star,
             sessions::session_status,
             sessions::session_preview,
             detail::session_detail,

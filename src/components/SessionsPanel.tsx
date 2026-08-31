@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
-  sessionRename, sessionTitles,
+  sessionRename, sessionStar, sessionStars, sessionTitles,
 } from "../ipc";
 import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import {
-  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Pencil, Play, RefreshCw, Search,
+  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Pencil, Play, RefreshCw, Search, Star,
   Settings as SettingsIcon, Trash2, X,
 } from "lucide-react";
 import { agentTint } from "../brand";
@@ -211,12 +211,28 @@ export default function SessionsPanel({
    *  every other naming layer — the librarian's labels included — and the
    *  row can only rank what it can see, so the map rides along. */
   const [titleOverrides, setTitleOverrides] = useState<Record<string, string>>({});
+  /** Starred sessions float to the top of every list. */
+  const [stars, setStars] = useState<Set<string>>(new Set());
   useEffect(() => {
-    const load = () => sessionTitles().then(setTitleOverrides).catch(() => {});
+    const load = () => {
+      sessionTitles().then(setTitleOverrides).catch(() => {});
+      sessionStars().then((s) => setStars(new Set(s))).catch(() => {});
+    };
     load();
     const un = listen("sessions://changed", load);
     return () => { un.then((f) => f()); };
   }, []);
+  const toggleStar = (s: Session) => {
+    const on = !stars.has(s.id);
+    setStars((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(s.id); else next.delete(s.id);
+      return next;
+    });
+    sessionStar(s.id, on).catch(() => {});
+  };
+  const floatStars = (list: Session[]) =>
+    [...list.filter((s) => stars.has(s.id)), ...list.filter((s) => !stars.has(s.id))];
   const commitTitle = (s: Session, draft: string) => {
     const t = draft.trim();
     setRenamingId(null);
@@ -462,8 +478,8 @@ export default function SessionsPanel({
   // beside the session it branched from. Rows still spawn in `project_path`.
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
   const ungrouped = useMemo(
-    () => applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"]),
-    [filtered, grouped, orders],
+    () => floatStars(applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"])),
+    [filtered, grouped, orders, stars],
   );
   const groupMembers = useMemo(() => {
     const m = new Map<string, Session[]>();
@@ -900,6 +916,11 @@ export default function SessionsPanel({
         </div>
         <div className="session-text">
           <div className="session-title-row">
+            {stars.has(s.id) && (
+              <span className="star-mark" title="Starred — stays on top">
+                <Icon of={Star} size="sm" />
+              </span>
+            )}
             {s.forked && (
               <span
                 className="fork-mark"
@@ -1048,6 +1069,11 @@ export default function SessionsPanel({
                   onClick={() => onFork(s)}
                 ><Icon of={GitFork} size="sm" /></button>
               )}
+              <button
+                className={"act-btn" + (stars.has(s.id) ? " starred" : "")}
+                title={stars.has(s.id) ? "Unstar" : "Star — keeps this session on top"}
+                onClick={() => toggleStar(s)}
+              ><Icon of={Star} size="sm" /></button>
               <button
                 className="act-btn"
                 title="Rename this session (or double-click its title)"

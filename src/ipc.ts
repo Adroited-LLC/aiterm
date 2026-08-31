@@ -134,6 +134,10 @@ export const sessionRename = (sessionId: string, title: string) =>
 /** Every person-chosen title, id → name. */
 export const sessionTitles = () =>
   invoke<Record<string, string>>("session_titles");
+/** Starred sessions — the ones that stay on top everywhere. */
+export const sessionStars = () => invoke<string[]>("session_stars");
+export const sessionStar = (sessionId: string, on: boolean) =>
+  invoke<void>("session_star", { sessionId, on });
 export const sessionDelete = (sessionId: string) =>
   invoke<void>("session_delete", { sessionId });
 

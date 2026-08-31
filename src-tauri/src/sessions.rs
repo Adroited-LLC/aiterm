@@ -3978,6 +3978,46 @@ pub fn session_titles() -> std::collections::HashMap<String, String> {
     load_titles()
 }
 
+/// Starred sessions, id list, kept beside the config — the ones that stay
+/// on top of every list, on every device.
+fn stars_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("aiterm").join("stars.json"))
+}
+
+pub fn load_stars() -> Vec<String> {
+    stars_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn set_star(session_id: &str, on: bool) -> Result<(), String> {
+    let Some(p) = stars_path() else { return Err("no data dir".into()) };
+    let mut stars = load_stars();
+    stars.retain(|s| s != session_id);
+    if on {
+        stars.insert(0, session_id.to_string());
+    }
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&p, serde_json::to_string_pretty(&stars).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn session_stars() -> Vec<String> {
+    load_stars()
+}
+
+#[tauri::command]
+pub fn session_star(app: tauri::AppHandle, session_id: String, on: bool) -> Result<(), String> {
+    set_star(&session_id, on)?;
+    crate::remote::notify(&app, crate::remote::Event::SessionsChanged);
+    use tauri::Emitter;
+    let _ = app.emit("sessions://changed", ());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn session_rename(app: tauri::AppHandle, session_id: String, title: String) -> Result<(), String> {
     rename_session(&session_id, &title)?;

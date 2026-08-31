@@ -3996,3 +3996,7 @@ input[type="range"]::-webkit-slider-thumb {
   border: 1px solid var(--border); border-radius: 6px;
   padding: 4px 8px; font-size: 13px;
 }
+
+/* Starred sessions: the mark before the title, and the lit toggle. */
+.star-mark { color: #e5c07b; display: inline-flex; margin-right: 4px; }
+.act-btn.starred { color: #e5c07b; }
