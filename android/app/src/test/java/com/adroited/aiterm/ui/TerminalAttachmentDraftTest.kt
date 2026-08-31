@@ -39,6 +39,21 @@ class TerminalAttachmentDraftTest {
     }
 
     @Test
+    fun duplicateNormalizedImageContentIsRejectedWithoutChangingSelectionOrder() {
+        val initial = TerminalAttachmentDraft().add(
+            image("first-id", 12, digest = ByteArray(32) { 3 }),
+        ).draft
+
+        val duplicate = initial.add(
+            image("different-id", 12, digest = ByteArray(32) { 3 }),
+        )
+
+        assertFalse(duplicate.accepted)
+        assertEquals("This image is already attached.", duplicate.draft.message)
+        assertEquals(listOf("first-id"), duplicate.draft.items.map { it.image.id })
+    }
+
+    @Test
     fun fifthImageIsRejectedWithAnExplicitMessage() {
         val four = (1..4).fold(TerminalAttachmentDraft()) { draft, index ->
             draft.add(image("image-$index", 1)).draft
@@ -49,6 +64,29 @@ class TerminalAttachmentDraftTest {
         assertFalse(fifth.accepted)
         assertEquals("You can attach up to 4 images.", fifth.draft.message)
         assertEquals(4, fifth.draft.items.size)
+    }
+
+    @Test
+    fun imagePreparationBlocksSubmissionAndRemovalUntilItFinishes() {
+        val draft = TerminalAttachmentDraft()
+            .add(image("first", 12)).draft
+            .beginPreparation().draft
+
+        val submit = draft.beginSubmission()
+        val remove = draft.remove("first")
+        val finished = draft.finishPreparation().draft
+
+        assertFalse(submit.accepted)
+        assertFalse(remove.accepted)
+        assertTrue(finished.beginSubmission().accepted)
+    }
+
+    @Test
+    fun preparationWithoutTextOrCompletedImagesStillCountsAsADraft() {
+        val store = TerminalDraftStore()
+        store.transitionAttachments("tab-preparing") { it.beginPreparation() }
+
+        assertTrue(store.hasDrafts())
     }
 
     @Test
@@ -152,6 +190,22 @@ class TerminalAttachmentDraftTest {
     }
 
     @Test
+    fun discardAllReturnsEveryOwnedImageAndClearsAllTabDrafts() {
+        val store = TerminalDraftStore()
+        store.updateComposer("tab-a") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("for A")).state
+        }
+        store.updateAttachments("tab-a") { it.add(image("a", 12)).draft }
+        store.updateAttachments("tab-b") { it.add(image("b", 34)).draft }
+
+        val removed = store.discardAll()
+
+        assertEquals(setOf("a", "b"), removed.map { it.image.id }.toSet())
+        assertFalse(store.hasDrafts())
+        assertTrue(store.drafts.value.isEmpty())
+    }
+
+    @Test
     fun composerUpdateAndAttachmentTransitionRetryFromTheSameSnapshotWithoutLoss() {
         val store = TerminalDraftStore()
         val barrier = CyclicBarrier(2)
@@ -225,7 +279,11 @@ class TerminalAttachmentDraftTest {
         }
     }
 
-    private fun image(id: String, length: Long, digest: ByteArray = ByteArray(32) { 7 }) =
+    private fun image(
+        id: String,
+        length: Long,
+        digest: ByteArray = ByteArray(32) { index -> (id.hashCode() + index).toByte() },
+    ) =
         NormalizedTerminalImage(
             id = id,
             file = File("/private/$id.jpg"),

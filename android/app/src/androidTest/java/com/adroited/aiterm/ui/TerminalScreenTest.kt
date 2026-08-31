@@ -1,5 +1,6 @@
 package com.adroited.aiterm.ui
 
+import android.net.Uri
 import android.view.WindowInsets
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
@@ -10,6 +11,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -30,6 +33,8 @@ import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemoteAgentChoice
 import com.adroited.aiterm.remote.RemoteModelOption
 import com.adroited.aiterm.remote.RemoteSession
+import com.adroited.aiterm.remote.RemoteUploadException
+import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.terminal.CursorState
 import com.adroited.aiterm.terminal.ScreenCell
 import com.adroited.aiterm.terminal.ScreenRow
@@ -37,8 +42,11 @@ import com.adroited.aiterm.terminal.ScreenSnapshot
 import com.adroited.aiterm.terminal.TerminalModes
 import com.adroited.aiterm.testing.ComposeTestActivity
 import kotlin.math.roundToInt
+import java.io.File
+import kotlinx.coroutines.CompletableDeferred
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -63,6 +71,361 @@ class TerminalScreenTest {
         assertTrue(compose.onAllNodesWithText("Esc").fetchSemanticsNodes().isEmpty())
         compose.onNodeWithTag("expand-extra-keys").assertIsDisplayed().performClick()
         compose.onNodeWithText("Esc").assertIsDisplayed()
+    }
+
+    @Test
+    fun imageChooserAddsAtMostFourGalleryImagesInSelectionOrderAndExplainsTheLimit() {
+        val store = TerminalDraftStore()
+        val picker = FakeTerminalImagePickerLauncher().apply {
+            galleryResult = TerminalImagePickerResult.Selected(
+                (1..5).map { Uri.parse("content://gallery/image-$it") },
+            )
+        }
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-gallery"),
+                draftStore = store,
+                imagePickerLauncher = picker,
+                imageNormalizer = fakeNormalizer(),
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-add-image").performClick()
+        compose.onNodeWithTag("terminal-image-source-camera").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-image-source-gallery").performClick()
+
+        (1..4).forEach { index ->
+            compose.onNodeWithTag("terminal-image-image-$index").assertIsDisplayed()
+        }
+        assertTrue(compose.onAllNodesWithTag("terminal-image-image-5").fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithText("You can attach up to 4 images.").assertIsDisplayed()
+        compose.runOnIdle {
+            assertEquals(
+                listOf("image-1", "image-2", "image-3", "image-4"),
+                store.draftFor("tab-gallery").attachments.items.map { it.image.id },
+            )
+        }
+    }
+
+    @Test
+    fun cameraCaptureIsDeletedAfterNormalizationAndRemovingDeletesOnlyTheNormalizedDraft() {
+        val store = TerminalDraftStore()
+        val capture = File(compose.activity.cacheDir, "terminal-image-captures/test-capture.jpg")
+            .apply { parentFile?.mkdirs(); writeBytes(byteArrayOf(1, 2, 3)) }
+        val normalized = normalizedImage("camera-owned")
+        val picker = FakeTerminalImagePickerLauncher().apply {
+            cameraResult = TerminalImagePickerResult.Selected(
+                uris = listOf(Uri.fromFile(capture)),
+                ownedCaptureFiles = setOf(capture),
+            )
+        }
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-camera"),
+                draftStore = store,
+                imagePickerLauncher = picker,
+                imageNormalizer = TerminalImageNormalization { Result.success(normalized) },
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-add-image").performClick()
+        compose.onNodeWithTag("terminal-image-source-camera").performClick()
+        compose.onNodeWithTag("terminal-image-camera-owned").assertIsDisplayed()
+        compose.runOnIdle { assertTrue(!capture.exists() && normalized.file.exists()) }
+
+        compose.onNodeWithTag("terminal-image-remove-camera-owned").performClick()
+
+        compose.runOnIdle {
+            assertTrue(store.draftFor("tab-camera").attachments.items.isEmpty())
+            assertTrue(!normalized.file.exists())
+        }
+    }
+
+    @Test
+    fun delayedNormalizationPreventsASecondPickerOrPrematureTextSubmission() {
+        val store = TerminalDraftStore()
+        store.updateComposer("tab-preparing") { it.open() }
+        val normalized = normalizedImage("prepared")
+        val release = CompletableDeferred<Result<NormalizedTerminalImage>>()
+        val sent = mutableListOf<String>()
+        val picker = FakeTerminalImagePickerLauncher().apply {
+            galleryResult = TerminalImagePickerResult.Selected(
+                listOf(Uri.parse("content://gallery/prepared")),
+            )
+        }
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-preparing"),
+                draftStore = store,
+                imagePickerLauncher = picker,
+                imageNormalizer = TerminalImageNormalization { release.await() },
+                onInput = sent::add,
+            )
+        }
+
+        compose.onNodeWithTag("terminal-add-image").performClick()
+        compose.onNodeWithTag("terminal-image-source-gallery").performClick()
+        compose.waitUntil(5_000) { store.draftFor("tab-preparing").attachments.preparing }
+        compose.onNodeWithTag("terminal-add-image").assertIsNotEnabled()
+        compose.onNodeWithTag("terminal-enter").performScrollTo().assertIsNotEnabled()
+        compose.runOnIdle { assertTrue(sent.isEmpty()) }
+
+        release.complete(Result.success(normalized))
+        compose.waitUntil(5_000) { !store.draftFor("tab-preparing").attachments.preparing }
+        compose.onNodeWithTag("terminal-image-prepared").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-enter").assertIsEnabled()
+    }
+
+    @Test
+    fun multiSelectKeepsAnActionableFailureAfterALaterImageSucceeds() {
+        val store = TerminalDraftStore()
+        val picker = FakeTerminalImagePickerLauncher().apply {
+            galleryResult = TerminalImagePickerResult.Selected(
+                listOf(Uri.parse("content://gallery/broken"), Uri.parse("content://gallery/good")),
+            )
+        }
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-partial-selection"),
+                draftStore = store,
+                imagePickerLauncher = picker,
+                imageNormalizer = TerminalImageNormalization { uri ->
+                    if (uri.lastPathSegment == "broken") {
+                        Result.failure(
+                            TerminalImageNormalizationError(
+                                TerminalImageNormalizationError.Code.DECODE_FAILED,
+                                "bad image",
+                            ),
+                        )
+                    } else {
+                        Result.success(normalizedImage("good"))
+                    }
+                },
+            )
+        }
+
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-add-image").performClick()
+        compose.onNodeWithTag("terminal-image-source-gallery").performClick()
+
+        compose.onNodeWithTag("terminal-image-good").assertIsDisplayed()
+        compose.onNodeWithText("The image could not be prepared. Choose a different image.")
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun uploadProgressDisablesRepeatSubmissionAndFailurePreservesTheEntireDraft() {
+        val store = TerminalDraftStore()
+        val normalized = normalizedImage("slow")
+        store.updateComposer("tab-upload") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("inspect this")).state
+        }
+        store.updateAttachments("tab-upload") { it.add(normalized).draft }
+        val release = CompletableDeferred<Result<List<String>>>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-upload"),
+                draftStore = store,
+                onUploadImages = { images, progress ->
+                    progress(RemoteUploadProgress(images.single().id, 2, images.single().length))
+                    release.await()
+                },
+            )
+        }
+
+        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.onNodeWithTag("terminal-image-progress-slow").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-enter").assertIsNotEnabled()
+        release.complete(Result.failure(IllegalStateException("Desktop disconnected.")))
+        compose.waitForIdle()
+
+        compose.onNodeWithTag("terminal-enter").assertIsEnabled()
+        compose.onNodeWithTag("terminal-image-slow").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("inspect this")
+        compose.onNodeWithText("Desktop disconnected.").assertIsDisplayed()
+        compose.runOnIdle { assertTrue(normalized.file.exists()) }
+    }
+
+    @Test
+    fun disposingTheScreenDuringUploadReturnsTheExactTabDraftToRetryableState() {
+        val store = TerminalDraftStore()
+        val image = normalizedImage("cancelled")
+        store.updateComposer("tab-cancel") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("keep this")).state
+        }
+        store.updateAttachments("tab-cancel") { it.add(image).draft }
+        val visible = mutableStateOf(true)
+        compose.setContent {
+            if (visible.value) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = oneCellScreen("tab-cancel"),
+                    draftStore = store,
+                    onUploadImages = { _, _ ->
+                        kotlinx.coroutines.suspendCancellableCoroutine { }
+                    },
+                )
+            }
+        }
+
+        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.waitUntil(5_000) { store.draftFor("tab-cancel").attachments.submitting }
+        compose.runOnIdle { visible.value = false }
+        compose.waitUntil(5_000) { !store.draftFor("tab-cancel").attachments.submitting }
+
+        compose.runOnIdle {
+            assertEquals("keep this", store.draftFor("tab-cancel").composer.value.text)
+            assertEquals(listOf("cancelled"), store.draftFor("tab-cancel").attachments.items.map { it.image.id })
+            assertTrue(image.file.exists())
+        }
+    }
+
+    @Test
+    fun successfulImageSubmissionSendsTextAndOrderedPathsThenClearsOwnedDraftFiles() {
+        val store = TerminalDraftStore()
+        val first = normalizedImage("first")
+        val second = normalizedImage("second")
+        store.updateComposer("tab-submit") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("compare them")).state
+        }
+        store.updateAttachments("tab-submit") { it.add(first).draft.add(second).draft }
+        val accepted = mutableListOf<List<String>>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-submit").copy(modes = TerminalModes(bracketedPaste = true)),
+                draftStore = store,
+                onUploadImages = { _, _ -> Result.success(listOf("/project/one.jpg", "/project/two.jpg")) },
+                onInputBatch = { _, inputs -> accepted += inputs; true },
+            )
+        }
+
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertEquals(
+                listOf(
+                    listOf(
+                        "\u001b[200~compare them\n\nAttached images:\n- /project/one.jpg\n- /project/two.jpg\u001b[201~",
+                        "\r",
+                    ),
+                ),
+                accepted,
+            )
+            assertTrue(store.draftFor("tab-submit").composer.value.text.isEmpty())
+            assertTrue(store.draftFor("tab-submit").attachments.items.isEmpty())
+            assertTrue(!first.file.exists() && !second.file.exists())
+        }
+    }
+
+    @Test
+    fun attachmentOnlySubmissionUsesSharedEnterPathAndLocalRejectionKeepsTheDraft() {
+        val store = TerminalDraftStore()
+        val image = normalizedImage("only")
+        store.updateComposer("tab-only") { it.open() }
+        store.updateAttachments("tab-only") { it.add(image).draft }
+        val attempted = mutableListOf<List<String>>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-only"),
+                draftStore = store,
+                onUploadImages = { _, _ -> Result.success(listOf("/project/only.jpg")) },
+                onInputBatch = { _, inputs -> attempted += inputs; false },
+            )
+        }
+
+        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertEquals(
+                listOf("Please inspect the attached image(s):\n\nAttached images:\n- /project/only.jpg", "\r"),
+                attempted.single(),
+            )
+            assertEquals(listOf("only"), store.draftFor("tab-only").attachments.items.map { it.image.id })
+            assertTrue(image.file.exists())
+        }
+        compose.onNodeWithText("Terminal input was not accepted. Take focus and try again.").assertIsDisplayed()
+    }
+
+    @Test
+    fun unsupportedDesktopAndPickerCancellationKeepIndependentTabDrafts() {
+        val store = TerminalDraftStore()
+        val selectedTab = mutableStateOf("tab-a")
+        val first = normalizedImage("tab-a-image")
+        store.updateComposer("tab-a") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("A text")).state
+        }
+        store.updateAttachments("tab-a") { it.add(first).draft }
+        store.updateComposer("tab-b") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("B text")).state
+        }
+        val picker = FakeTerminalImagePickerLauncher().apply {
+            galleryResult = TerminalImagePickerResult.Cancelled
+        }
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen(selectedTab.value),
+                draftStore = store,
+                imagePickerLauncher = picker,
+                imageNormalizer = fakeNormalizer(),
+                onUploadImages = { _, _ ->
+                    Result.failure(RemoteUploadException("remote.unsupported", "unknown request"))
+                },
+            )
+        }
+
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("A text")
+        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("Update AITerm on the desktop to attach images.").assertIsDisplayed()
+        compose.runOnIdle { selectedTab.value = "tab-b" }
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("B text")
+        compose.onNodeWithTag("terminal-add-image").performClick()
+        compose.onNodeWithTag("terminal-image-source-gallery").performClick()
+        compose.runOnIdle { assertTrue(store.draftFor("tab-b").attachments.items.isEmpty()) }
+        compose.runOnIdle { selectedTab.value = "tab-a" }
+        compose.onNodeWithTag("terminal-image-tab-a-image").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("A text")
+    }
+
+    @Test
+    fun backKeepsOrDiscardsAllDraftsOnlyAfterExplicitChoice() {
+        val store = TerminalDraftStore()
+        val image = normalizedImage("discard")
+        store.updateAttachments("tab-back") { it.add(image).draft }
+        var left = 0
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-back"),
+                draftStore = store,
+                onBack = { left += 1 },
+            )
+        }
+
+        compose.onNodeWithText("Back").performClick()
+        compose.onNodeWithTag("terminal-draft-discard-dialog").assertIsDisplayed()
+        compose.onNodeWithText("Keep editing").performClick()
+        compose.runOnIdle { assertEquals(0, left); assertTrue(image.file.exists()) }
+
+        compose.onNodeWithText("Back").performClick()
+        compose.onNodeWithText("Discard drafts and leave").performClick()
+        compose.runOnIdle {
+            assertEquals(1, left)
+            assertTrue(!image.file.exists())
+            assertFalse(store.hasDrafts())
+        }
     }
 
     @Test
@@ -818,4 +1181,35 @@ class TerminalScreenTest {
         visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
         cursor = CursorState(0, 0, true),
     )
+
+    private fun normalizedImage(id: String): NormalizedTerminalImage {
+        val file = File(compose.activity.cacheDir, "terminal-image-drafts/test-$id.jpg")
+            .apply { parentFile?.mkdirs(); writeBytes(byteArrayOf(0xff.toByte(), id.length.toByte(), 0xd9.toByte())) }
+        return NormalizedTerminalImage(
+            id = id,
+            file = file,
+            width = 80,
+            height = 40,
+            length = file.length(),
+            sha256 = ByteArray(32) { index -> (id.hashCode() + index).toByte() },
+        )
+    }
+
+    private fun fakeNormalizer() = TerminalImageNormalization { uri ->
+        Result.success(normalizedImage(uri.lastPathSegment ?: "selected"))
+    }
+
+    private class FakeTerminalImagePickerLauncher : TerminalImagePickerLauncher {
+        var galleryResult: TerminalImagePickerResult = TerminalImagePickerResult.Cancelled
+        var cameraResult: TerminalImagePickerResult = TerminalImagePickerResult.Cancelled
+
+        override fun launch(
+            source: TerminalImageSource,
+            remainingSlots: Int,
+            destinationTabId: String,
+            onResult: (TerminalImagePickerResult) -> Unit,
+        ) {
+            onResult(if (source == TerminalImageSource.Camera) cameraResult else galleryResult)
+        }
+    }
 }

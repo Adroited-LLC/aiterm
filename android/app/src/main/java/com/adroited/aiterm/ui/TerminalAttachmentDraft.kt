@@ -83,6 +83,7 @@ data class TerminalAttachmentDraftUpdate(
 
 data class TerminalAttachmentDraft(
     val items: List<TerminalAttachmentItem> = emptyList(),
+    val preparing: Boolean = false,
     val submitting: Boolean = false,
     val message: String? = null,
 ) {
@@ -96,7 +97,9 @@ data class TerminalAttachmentDraft(
             return rejected("The selected image is invalid.")
         }
         if (image.length !in 1..MAX_IMAGE_BYTES) return rejected("Each image must be 12 MiB or smaller.")
-        if (items.any { it.image.id == image.id }) return rejected("This image is already attached.")
+        if (items.any { it.image.id == image.id || it.image.sha256.contentEquals(image.sha256) }) {
+            return rejected("This image is already attached.")
+        }
         if (items.size >= MAX_IMAGES) return rejected("You can attach up to 4 images.")
         if (image.length > MAX_TOTAL_BYTES - totalBytes) {
             return rejected("Selected images exceed the 48 MiB limit.")
@@ -105,6 +108,7 @@ data class TerminalAttachmentDraft(
     }
 
     fun remove(imageId: String): TerminalAttachmentDraftUpdate {
+        if (preparing) return rejected("Wait for the selected image to finish preparing.")
         if (submitting) return rejected("Images are uploading.")
         val item = items.firstOrNull { it.image.id == imageId } ?: return TerminalAttachmentDraftUpdate(this)
         return TerminalAttachmentDraftUpdate(
@@ -114,6 +118,7 @@ data class TerminalAttachmentDraft(
     }
 
     fun beginSubmission(): TerminalAttachmentDraftUpdate {
+        if (preparing) return rejected("Wait for the selected image to finish preparing.")
         if (submitting) return rejected("Images are already uploading.")
         if (items.isEmpty()) return rejected("Choose an image before uploading.")
         return TerminalAttachmentDraftUpdate(
@@ -176,6 +181,17 @@ data class TerminalAttachmentDraft(
         ),
     )
 
+    fun beginPreparation(): TerminalAttachmentDraftUpdate {
+        if (preparing) return rejected("An image is already being prepared.")
+        if (submitting) return rejected("Images are uploading.")
+        if (items.size >= MAX_IMAGES) return rejected("You can attach up to 4 images.")
+        return TerminalAttachmentDraftUpdate(copy(preparing = true, message = null))
+    }
+
+    fun finishPreparation(): TerminalAttachmentDraftUpdate = TerminalAttachmentDraftUpdate(
+        copy(preparing = false),
+    )
+
     /** Clears state only after caller has locally accepted the complete terminal submission. */
     fun completeSubmission(): TerminalAttachmentDraftUpdate {
         if (!submitting) return rejected("No image upload is in progress.")
@@ -184,6 +200,7 @@ data class TerminalAttachmentDraft(
 
     /** Lets the UI discard a non-uploading draft and delete the returned private files. */
     fun discard(): TerminalAttachmentDraftUpdate {
+        if (preparing) return rejected("Wait for the selected image to finish preparing.")
         if (submitting) return rejected("Images are uploading.")
         return TerminalAttachmentDraftUpdate(draft = TerminalAttachmentDraft(), removed = items)
     }
@@ -242,6 +259,22 @@ internal class TerminalDraftStore {
         }
     }
 
+    /** Clears composer and attachments in one CAS only after local terminal-input acceptance. */
+    fun completeSubmission(tabId: String): TerminalAttachmentDraftUpdate {
+        val id = requireTabId(tabId)
+        while (true) {
+            val current = mutableDrafts.value
+            val previous = current[id] ?: return TerminalAttachmentDraftUpdate(
+                TerminalAttachmentDraft(message = "No terminal draft is available."),
+                accepted = false,
+            )
+            val transition = previous.attachments.completeSubmission()
+            if (!transition.accepted) return transition
+            val next = current + (id to TerminalTabDraft())
+            if (mutableDrafts.compareAndSet(current, next)) return transition
+        }
+    }
+
     fun clear(tabId: String): TerminalTabDraft? {
         val id = requireTabId(tabId)
         while (true) {
@@ -252,7 +285,19 @@ internal class TerminalDraftStore {
     }
 
     fun hasDrafts(): Boolean = mutableDrafts.value.values.any { draft ->
-        draft.composer.value.text.isNotEmpty() || draft.attachments.items.isNotEmpty()
+        draft.composer.value.text.isNotEmpty() || draft.attachments.items.isNotEmpty() ||
+            draft.attachments.preparing || draft.attachments.submitting
+    }
+
+    /** Atomically clears every non-uploading draft and returns its app-private image ownership. */
+    fun discardAll(): List<TerminalAttachmentItem> {
+        while (true) {
+            val current = mutableDrafts.value
+            if (current.values.any { it.attachments.submitting || it.attachments.preparing }) return emptyList()
+            if (mutableDrafts.compareAndSet(current, emptyMap())) {
+                return current.values.flatMap { it.attachments.items }
+            }
+        }
     }
 
     private fun update(tabId: String, transform: (TerminalTabDraft) -> TerminalTabDraft): TerminalTabDraft {

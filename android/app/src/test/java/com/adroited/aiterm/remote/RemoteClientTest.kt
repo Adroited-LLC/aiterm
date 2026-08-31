@@ -42,6 +42,92 @@ import kotlin.concurrent.thread
 class RemoteClientTest {
 
     @Test
+    fun orderedInputBatchIsAcceptedOnceAndQueuedInOrderForTheSameTerminalAttachment() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("tab-1", listOf("prompt with image paths", "\r"))
+        advanceUntilIdle()
+
+        assertTrue(accepted)
+        assertEquals(listOf("terminal.input", "terminal.input"), transport.requests.map { it.kind })
+        val expected = listOf(
+            RemoteCommands.input("tab-1", "attachment-1", "prompt with image paths".encodeToByteArray()),
+            RemoteCommands.input("tab-1", "attachment-1", "\r".encodeToByteArray()),
+        )
+        assertTrue(expected.zip(transport.requests.map { it.payload }).all { (a, b) -> a.contentEquals(b) })
+        client.lock()
+    }
+
+    @Test
+    fun orderedInputBatchRejectsEverythingWhenAnyInputCannotBeAccepted() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("tab-1", listOf("valid", "x".repeat(1_048_577)))
+        advanceUntilIdle()
+
+        assertFalse(accepted)
+        assertTrue(transport.requests.isEmpty())
+        client.lock()
+    }
+
+    @Test
+    fun orderedInputBatchRejectsAnOldTabAfterSelectionChanges() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("old-tab", listOf("old image paths", "\r"))
+        advanceUntilIdle()
+
+        assertFalse(accepted)
+        assertTrue(transport.requests.isEmpty())
+        client.lock()
+    }
+
+    @Test
+    fun orderedInputBatchRejectsEverythingAfterFocusIsLost() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged(
+                "tab-1",
+                "attachment-1",
+                FocusOwner.Other,
+                TerminalSize(80, 24),
+            ),
+        )
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("tab-1", listOf("old image paths", "\r"))
+        advanceUntilIdle()
+
+        assertFalse(accepted)
+        assertTrue(transport.requests.isEmpty())
+        assertTrue(client.state.value.showTakeFocus)
+        client.lock()
+    }
+
+    @Test
     fun inputNotOwnedKeepsTerminalReadOnlyAndOffersTakeFocus() = runTest {
         val transport = FakeRemoteTransport()
         val client = RemoteClient(
@@ -119,6 +205,7 @@ class RemoteClientTest {
             override suspend fun connect() = throw RemoteAccessRevokedException()
             override fun request(kind: String, payload: ByteArray, onAssigned: (Long) -> Unit) =
                 CompletableDeferred<RemoteResponse>().also { it.completeExceptionally(IllegalStateException("not connected")) }
+            override fun requestBatch(requests: List<RemoteRequestInput>) = null
             override fun close() = Unit
         }
         val client = RemoteClient(
@@ -1177,6 +1264,9 @@ private class FakeRemoteTransport(private val onClose: () -> Unit = {}) : Remote
             ?: CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
     }
 
+    override fun requestBatch(requests: List<RemoteRequestInput>): List<Deferred<RemoteResponse>>? =
+        requests.map { input -> request(input.kind, input.payload, input.onAssigned) }
+
     override fun abandonRequest(request: Deferred<RemoteResponse>) {
         abandonedRequests += request
     }
@@ -1215,6 +1305,9 @@ private class DeferredRemoteTransport(connectImmediately: Boolean = true) : Remo
         return response
     }
 
+    override fun requestBatch(requests: List<RemoteRequestInput>): List<Deferred<RemoteResponse>>? =
+        requests.map { input -> request(input.kind, input.payload, input.onAssigned) }
+
     fun pendingAttachCount(): Int = attaches.size
 
     fun completeNextAttach(tabId: String, attachmentId: String) {
@@ -1244,6 +1337,8 @@ private class GatedEventsRemoteTransport(
         payload: ByteArray,
         onAssigned: (Long) -> Unit,
     ) = delegate.request(kind, payload, onAssigned)
+
+    override fun requestBatch(requests: List<RemoteRequestInput>) = delegate.requestBatch(requests)
 
     override suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) =
         delegate.completeAttachment(requestId, publishEvents)

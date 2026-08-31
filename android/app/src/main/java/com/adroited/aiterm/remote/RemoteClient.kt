@@ -55,6 +55,12 @@ data class RemoteClientState(
 
 data class RemoteRequest(val requestId: Long, val kind: String, val payload: ByteArray)
 
+data class RemoteRequestInput(
+    val kind: String,
+    val payload: ByteArray,
+    val onAssigned: (Long) -> Unit = {},
+)
+
 data class RemoteUploadSource(
     val id: String,
     val file: File,
@@ -143,6 +149,8 @@ interface RemoteTransport {
         payload: ByteArray,
         onAssigned: (Long) -> Unit = {},
     ): Deferred<RemoteResponse>
+    /** Atomically reserves queue capacity and enqueues every request in caller order, or none. */
+    fun requestBatch(requests: List<RemoteRequestInput>): List<Deferred<RemoteResponse>>?
     /** Stops tracking an unanswered request when its caller no longer owns the result. */
     fun abandonRequest(request: Deferred<RemoteResponse>) = Unit
     suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) = Unit
@@ -272,6 +280,43 @@ class RemoteClient(
         val data = text.encodeToByteArray()
         if (data.size > MAX_INPUT_BYTES) return false
         launchRequest("terminal.input", RemoteCommands.input(target.first, target.second, data))
+        return true
+    }
+
+    /**
+     * Reserves one bounded transport batch for an ordered terminal submission. Success means all
+     * sibling inputs were accepted locally for the same authorized terminal attachment.
+     */
+    fun sendInputs(tabId: String, texts: List<String>): Boolean {
+        if (tabId.isBlank()) return false
+        if (texts.isEmpty()) return false
+        val encoded = texts.map { text ->
+            if (text.isEmpty()) return false
+            text.encodeToByteArray().also { if (it.size > MAX_INPUT_BYTES) return false }
+        }
+        val batch = synchronized(lifecycleLock) {
+            if (mutableState.value.focus != FocusOwner.Self) {
+                mutableState.value = mutableState.value.copy(readOnly = true, showTakeFocus = true)
+                return false
+            }
+            if (mutableState.value.activeTabId != tabId) return false
+            val attachmentId = activeAttachmentId ?: return false
+            if (activeAttachmentTabId != tabId) return false
+            val active = transport ?: return false
+            val generation = lifecycleGeneration
+            val responses = active.requestBatch(
+                encoded.map { data ->
+                    RemoteRequestInput(
+                        kind = "terminal.input",
+                        payload = RemoteCommands.input(tabId, attachmentId, data),
+                    )
+                },
+            ) ?: return false
+            RequestBatchContext(generation, active, responses)
+        }
+        batch.responses.forEach { response ->
+            observeAcceptedResponse(batch.lifecycleGeneration, batch.transport, response)
+        }
         return true
     }
 
@@ -736,16 +781,30 @@ class RemoteClient(
             RequestContext(lifecycleGeneration, active)
         }
         val response = requestContext.transport.request(kind, payload)
-        launchOwned(requestContext.lifecycleGeneration) {
+        observeAcceptedResponse(
+            generation = requestContext.lifecycleGeneration,
+            active = requestContext.transport,
+            response = response,
+            onSuccess = onSuccess,
+        )
+    }
+
+    private fun observeAcceptedResponse(
+        generation: Long,
+        active: RemoteTransport,
+        response: Deferred<RemoteResponse>,
+        onSuccess: (ByteArray) -> Unit = {},
+    ) {
+        launchOwned(generation) {
             try {
                 when (val result = response.await()) {
                     is RemoteResponse.Error -> accept(
-                        requestContext.lifecycleGeneration,
+                        generation,
                         RemoteServerEvent.Failure(result.code, result.message),
-                        requestContext.transport,
+                        active,
                     )
                     is RemoteResponse.Success -> synchronized(lifecycleLock) {
-                        if (isCurrent(requestContext.lifecycleGeneration, requestContext.transport)) {
+                        if (isCurrent(generation, active)) {
                             onSuccess(result.payload)
                         }
                     }
@@ -754,8 +813,8 @@ class RemoteClient(
                 throw kotlinx.coroutines.CancellationException("remote request canceled")
             } catch (error: Exception) {
                 acceptRequestFailure(
-                    requestContext.lifecycleGeneration,
-                    requestContext.transport,
+                    generation,
+                    active,
                     error,
                 )
             }
@@ -1098,6 +1157,11 @@ class RemoteClient(
     }
 
     private data class RequestContext(val lifecycleGeneration: Long, val transport: RemoteTransport)
+    private data class RequestBatchContext(
+        val lifecycleGeneration: Long,
+        val transport: RemoteTransport,
+        val responses: List<Deferred<RemoteResponse>>,
+    )
     private data class UploadContext(
         val lifecycleGeneration: Long,
         val transport: RemoteTransport,

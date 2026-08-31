@@ -69,6 +69,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
@@ -98,6 +99,8 @@ import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemoteSession
+import com.adroited.aiterm.remote.RemoteUploadException
+import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.remote.TerminalSize
 import com.adroited.aiterm.terminal.CellAttributes
 import com.adroited.aiterm.terminal.CursorShape
@@ -106,6 +109,9 @@ import com.adroited.aiterm.terminal.ScreenSnapshot
 import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.TerminalColor
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import java.io.File
 import java.net.URI
 
 @Composable
@@ -136,6 +142,9 @@ fun RemoteTerminalScreen(
         onDeleteSession = viewModel::deleteSession,
         onOpenShell = { cols, rows -> viewModel.openShell(null, cols, rows) },
         onInput = viewModel::sendInput,
+        onInputBatch = viewModel::sendInputs,
+        draftStore = viewModel.terminalDrafts,
+        onUploadImages = viewModel::uploadDraftImages,
         onTakeFocus = viewModel::takeFocus,
         onResize = viewModel::resize,
         onLoadScrollback = viewModel::loadOlderScrollback,
@@ -144,7 +153,7 @@ fun RemoteTerminalScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TerminalScreenContent(
+internal fun TerminalScreenContent(
     state: RemoteClientState,
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow> = emptyList(),
@@ -162,6 +171,16 @@ fun TerminalScreenContent(
     onDeleteSession: (String) -> Unit = {},
     onOpenShell: (Int, Int) -> Unit = { _, _ -> },
     onInput: (String) -> Unit = {},
+    onInputBatch: ((String, List<String>) -> Boolean)? = null,
+    draftStore: TerminalDraftStore? = null,
+    imagePickerLauncher: TerminalImagePickerLauncher? = null,
+    imageNormalizer: TerminalImageNormalization? = null,
+    onUploadImages: suspend (
+        List<TerminalAttachmentImage>,
+        (RemoteUploadProgress) -> Unit,
+    ) -> Result<List<String>> = { _, _ ->
+        Result.failure(IllegalStateException("Image upload is unavailable."))
+    },
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
     onResize: (Int, Int) -> Unit = { _, _ -> },
     onLoadScrollback: () -> Unit = {},
@@ -176,9 +195,22 @@ fun TerminalScreenContent(
     val terminalMetrics = rememberTerminalMetrics()
     val inputFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
+    val context = LocalContext.current
     val density = LocalDensity.current
     val layoutDirection = LocalLayoutDirection.current
-    var composer by remember(screen?.tabId) { mutableStateOf(TerminalComposerState()) }
+    val localDraftStore = remember { TerminalDraftStore() }
+    val activeDraftStore = draftStore ?: localDraftStore
+    val allDrafts by activeDraftStore.drafts.collectAsStateWithLifecycle()
+    val activeTabId = screen?.tabId
+    val tabDraft = activeTabId?.let { allDrafts[it] } ?: TerminalTabDraft()
+    val composer = tabDraft.composer
+    val attachments = tabDraft.attachments
+    val defaultNormalizer = remember(context) { TerminalImageNormalizer(context) }
+    val normalizer = imageNormalizer ?: remember(defaultNormalizer) {
+        TerminalImageNormalization(defaultNormalizer::normalize)
+    }
+    var showImageSources by remember { mutableStateOf(false) }
+    var showDiscardDrafts by remember { mutableStateOf(false) }
     var chromeInteractiveHeightPx by remember(screen?.tabId) { mutableIntStateOf(0) }
     val bottomInsets = imeInsets.union(navigationInsets)
     val bottomInsetPx = bottomInsets.getBottom(density)
@@ -190,24 +222,144 @@ fun TerminalScreenContent(
             rows = size.rows
         }
     }
-    val onRequestKeyboard = remember(state.focus, screen?.tabId) {
+    val onRequestKeyboard = remember(state.focus, activeTabId, activeDraftStore) {
         {
-            if (state.focus == FocusOwner.Self && screen != null) {
-                composer = composer.open()
+            if (state.focus == FocusOwner.Self && activeTabId != null) {
+                activeDraftStore.updateComposer(activeTabId) { it.open() }
             }
         }
     }
-    fun submitComposer() {
-        val activeScreen = screen ?: return
-        val update = composer.sendText(activeScreen.modes.bracketedPaste)
-        composer = update.state
-        update.outbound.forEach(onInput)
-        if (!update.state.expanded) keyboard?.hide()
+
+    fun setAttachmentMessage(tabId: String, message: String) {
+        activeDraftStore.updateAttachments(tabId) { it.copy(message = message) }
     }
 
-    BackHandler(enabled = composer.expanded) {
-        composer = composer.close()
-        keyboard?.hide()
+    fun handlePickerResult(tabId: String, result: TerminalImagePickerResult) {
+        when (result) {
+            TerminalImagePickerResult.Cancelled -> Unit
+            is TerminalImagePickerResult.Failed -> setAttachmentMessage(tabId, result.message)
+            is TerminalImagePickerResult.Selected -> coroutineScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                val preparation = activeDraftStore.transitionAttachments(tabId) { it.beginPreparation() }
+                if (!preparation.accepted) {
+                    result.ownedCaptureFiles.forEach(File::delete)
+                    return@launch
+                }
+                try {
+                    val currentCount = activeDraftStore.draftFor(tabId).attachments.items.size
+                    val remaining = (TerminalAttachmentDraft.MAX_IMAGES - currentCount).coerceAtLeast(0)
+                    val distinctUris = result.uris.distinct()
+                    var selectionMessage: String? = null
+                    for (uri in distinctUris.take(remaining)) {
+                        val normalizedImage = normalizer.normalize(uri).getOrElse { error ->
+                            selectionMessage = terminalImageErrorMessage(error)
+                            continue
+                        }
+                        val transition = activeDraftStore.transitionAttachments(tabId) {
+                            it.add(normalizedImage)
+                        }
+                        if (!transition.accepted) {
+                            selectionMessage = transition.draft.message
+                            normalizedImage.file.delete()
+                        }
+                    }
+                    val finalMessage = when {
+                        result.uris.size != distinctUris.size ->
+                            "This image is already attached."
+                        distinctUris.size > remaining ->
+                            "You can attach up to 4 images."
+                        else -> selectionMessage
+                    }
+                    finalMessage?.let { setAttachmentMessage(tabId, it) }
+                } finally {
+                    result.ownedCaptureFiles.forEach(File::delete)
+                    activeDraftStore.transitionAttachments(tabId) { it.finishPreparation() }
+                }
+            }
+        }
+    }
+    val nativePicker = rememberTerminalImagePicker(::handlePickerResult)
+    val picker = imagePickerLauncher ?: nativePicker
+
+    fun submitComposer() {
+        val activeScreen = screen ?: return
+        val tabId = activeScreen.tabId
+        val current = activeDraftStore.draftFor(tabId)
+        if (current.attachments.preparing || current.attachments.submitting ||
+            (current.composer.value.text.isEmpty() && current.attachments.items.isEmpty())
+        ) return
+        coroutineScope.launch {
+            var uploadBegan = false
+            try {
+                val initial = activeDraftStore.draftFor(tabId)
+                val images = initial.attachments.items.map { it.image }
+                val paths = if (images.isEmpty()) {
+                    emptyList()
+                } else {
+                    val began = activeDraftStore.transitionAttachments(tabId) { it.beginSubmission() }
+                    if (!began.accepted) return@launch
+                    uploadBegan = true
+                    onUploadImages(images) { progress ->
+                        activeDraftStore.transitionAttachments(tabId) {
+                            it.recordProgress(progress.sourceId, progress.sent, progress.total)
+                        }
+                    }.getOrElse { error ->
+                        activeDraftStore.transitionAttachments(tabId) {
+                            it.failSubmission(terminalUploadErrorMessage(error))
+                        }
+                        uploadBegan = false
+                        return@launch
+                    }
+                }
+                val latest = activeDraftStore.draftFor(tabId)
+                val outbound = formatTerminalSubmission(
+                    text = latest.composer.value.text,
+                    paths = paths,
+                    bracketedPaste = activeScreen.modes.bracketedPaste,
+                )
+                val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
+                    outbound.forEach(onInput)
+                    true
+                }
+                if (!accepted) {
+                    val message = "Terminal input was not accepted. Take focus and try again."
+                    if (images.isNotEmpty()) {
+                        activeDraftStore.transitionAttachments(tabId) { it.failSubmission(message) }
+                        uploadBegan = false
+                    } else {
+                        setAttachmentMessage(tabId, message)
+                    }
+                    return@launch
+                }
+                if (images.isEmpty()) {
+                    activeDraftStore.updateComposer(tabId) { TerminalComposerState() }
+                } else {
+                    val completed = activeDraftStore.completeSubmission(tabId)
+                    completed.removed.forEach { it.image.file.delete() }
+                    uploadBegan = false
+                }
+                keyboard?.hide()
+            } catch (cancelled: CancellationException) {
+                if (uploadBegan) {
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.failSubmission("Image upload paused. Try again.")
+                    }
+                }
+                throw cancelled
+            }
+        }
+    }
+
+    fun requestLeave() {
+        if (activeDraftStore.hasDrafts()) showDiscardDrafts = true else onBack()
+    }
+
+    BackHandler {
+        if (composer.expanded && activeTabId != null) {
+            activeDraftStore.updateComposer(activeTabId) { it.close() }
+            keyboard?.hide()
+        } else {
+            requestLeave()
+        }
     }
     LaunchedEffect(composer.expanded, state.focus, screen?.tabId) {
         if (composer.expanded && state.focus == FocusOwner.Self && screen != null) {
@@ -259,7 +411,7 @@ fun TerminalScreenContent(
                             )
                         }
                     },
-                    actions = { TextButton(onClick = onBack) { Text("Back") } },
+                    actions = { TextButton(onClick = ::requestLeave) { Text("Back") } },
                 )
             },
         ) { padding ->
@@ -293,21 +445,33 @@ fun TerminalScreenContent(
                 ) {
                     Column(Modifier.onSizeChanged { chromeInteractiveHeightPx = it.height }) {
                         if (screen != null && composer.expanded) {
-                            Box(
+                            Column(
                                 Modifier.fillMaxWidth()
                                     .testTag("terminal-composer-overlay")
                                     .padding(horizontal = 8.dp, vertical = 6.dp),
                             ) {
+                                TerminalAttachmentStrip(
+                                    draft = attachments,
+                                    onRemove = { imageId ->
+                                        val removed = activeDraftStore.transitionAttachments(screen.tabId) {
+                                            it.remove(imageId)
+                                        }
+                                        removed.removed.forEach { it.image.file.delete() }
+                                    },
+                                )
                                 TerminalInputBar(
                                     value = composer.value,
                                     onValueChange = { next ->
-                                        val update = composer.updateValue(next)
-                                        composer = update.state
-                                        update.outbound.forEach(onInput)
+                                        activeDraftStore.updateComposer(screen.tabId) {
+                                            it.updateValue(next).state
+                                        }
                                     },
                                     onSend = ::submitComposer,
+                                    onAddImage = { showImageSources = true },
+                                    addImageEnabled = state.focus == FocusOwner.Self &&
+                                        !attachments.preparing && !attachments.submitting,
                                     focusRequester = inputFocus,
-                                    enabled = state.focus == FocusOwner.Self,
+                                    enabled = state.focus == FocusOwner.Self && !attachments.submitting,
                                 )
                             }
                         }
@@ -329,14 +493,98 @@ fun TerminalScreenContent(
                             expanded = keyBarExpanded,
                             onExpandedChange = onKeyBarExpandedChange,
                             onInput = onInput,
-                            onOpenComposer = { if (screen != null) composer = composer.open() },
-                            submitComposerDraft = composer.expanded && composer.value.text.isNotEmpty(),
+                            onOpenComposer = {
+                                screen?.tabId?.let { tabId ->
+                                    activeDraftStore.updateComposer(tabId) { it.open() }
+                                }
+                            },
+                            submitComposerDraft = composer.expanded &&
+                                (composer.value.text.isNotEmpty() || attachments.items.isNotEmpty() ||
+                                    attachments.preparing),
+                            submissionEnabled = !attachments.preparing && !attachments.submitting,
                             onSubmitComposer = ::submitComposer,
                         )
                     }
                 }
             }
         }
+    }
+
+    if (showImageSources) {
+        AlertDialog(
+            onDismissRequest = { showImageSources = false },
+            title = { Text("Attach image") },
+            text = { Text("Choose a source") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showImageSources = false
+                        val tabId = screen?.tabId ?: return@TextButton
+                        val remaining = TerminalAttachmentDraft.MAX_IMAGES -
+                            activeDraftStore.draftFor(tabId).attachments.items.size
+                        if (remaining <= 0) {
+                            setAttachmentMessage(tabId, "You can attach up to 4 images.")
+                        } else {
+                            picker.launch(TerminalImageSource.Gallery, remaining, tabId) {
+                                handlePickerResult(tabId, it)
+                            }
+                        }
+                    },
+                    modifier = Modifier.testTag("terminal-image-source-gallery"),
+                ) { Text("Gallery") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showImageSources = false
+                        val tabId = screen?.tabId ?: return@TextButton
+                        val remaining = TerminalAttachmentDraft.MAX_IMAGES -
+                            activeDraftStore.draftFor(tabId).attachments.items.size
+                        if (remaining <= 0) {
+                            setAttachmentMessage(tabId, "You can attach up to 4 images.")
+                        } else {
+                            picker.launch(TerminalImageSource.Camera, remaining, tabId) {
+                                handlePickerResult(tabId, it)
+                            }
+                        }
+                    },
+                    modifier = Modifier.testTag("terminal-image-source-camera"),
+                ) { Text("Camera") }
+            },
+        )
+    }
+
+    if (showDiscardDrafts) {
+        val draftWorkInProgress = allDrafts.values.any {
+            it.attachments.preparing || it.attachments.submitting
+        }
+        AlertDialog(
+            onDismissRequest = { showDiscardDrafts = false },
+            modifier = Modifier.testTag("terminal-draft-discard-dialog"),
+            title = { Text("Leave remote terminal?") },
+            text = {
+                Text(
+                    if (draftWorkInProgress) {
+                        "Wait for image preparation or upload to finish before leaving."
+                    } else {
+                        "Draft text and attached images are still on this phone."
+                    },
+                )
+            },
+            confirmButton = {
+                Button(enabled = !draftWorkInProgress, onClick = {
+                    val removed = activeDraftStore.discardAll()
+                    if (!activeDraftStore.hasDrafts()) {
+                        removed.forEach { it.image.file.delete() }
+                        showDiscardDrafts = false
+                        onBack()
+                    }
+                }) { Text("Discard drafts and leave") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDiscardDrafts = false }) { Text("Keep editing") }
+            },
+        )
     }
 
     deleteTarget?.let { session ->
@@ -574,6 +822,8 @@ private fun TerminalInputBar(
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     onSend: () -> Unit,
+    onAddImage: () -> Unit,
+    addImageEnabled: Boolean,
     focusRequester: FocusRequester,
     enabled: Boolean,
 ) {
@@ -589,6 +839,16 @@ private fun TerminalInputBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            TextButton(
+                onClick = onAddImage,
+                enabled = addImageEnabled,
+                modifier = Modifier.size(48.dp)
+                    .semantics { contentDescription = "Attach image" }
+                    .testTag("terminal-add-image"),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+            ) {
+                Text("＋", color = Color(0xFF63D3E1), fontSize = 22.sp)
+            }
             BasicTextField(
                 value = value,
                 onValueChange = onValueChange,
@@ -746,6 +1006,7 @@ private fun ExtraKeys(
     onInput: (String) -> Unit,
     onOpenComposer: () -> Unit,
     submitComposerDraft: Boolean,
+    submissionEnabled: Boolean,
     onSubmitComposer: () -> Unit,
 ) {
     var control by remember { mutableStateOf(false) }
@@ -780,7 +1041,11 @@ private fun ExtraKeys(
                 ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
                 ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
                 ExtraKey("Tab") { send("\t") }
-                ExtraKey("Enter") {
+                ExtraKey(
+                    "Enter",
+                    modifier = Modifier.testTag("terminal-enter"),
+                    enabled = !submitComposerDraft || submissionEnabled,
+                ) {
                     if (submitComposerDraft) {
                         onSubmitComposer()
                         control = false
@@ -832,8 +1097,13 @@ private fun ExtraKeys(
 }
 
 @Composable
-private fun ExtraKey(label: String, modifier: Modifier = Modifier, action: () -> Unit) {
-    OutlinedButton(onClick = action, modifier = modifier.height(38.dp)) { Text(label) }
+private fun ExtraKey(
+    label: String,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    action: () -> Unit,
+) {
+    OutlinedButton(onClick = action, enabled = enabled, modifier = modifier.height(38.dp)) { Text(label) }
 }
 
 private fun CellAttributes.span(foreground: Color, background: Color) = SpanStyle(
@@ -868,6 +1138,25 @@ internal fun terminalIndexedColor(index: Int): Color {
 }
 
 private fun Color.ifTransparent(fallback: Color): Color = if (alpha == 0f) fallback else this
+
+private fun terminalImageErrorMessage(error: Throwable): String = when (error) {
+    is TerminalImageNormalizationError -> when (error.code) {
+        TerminalImageNormalizationError.Code.INPUT_TOO_LARGE,
+        TerminalImageNormalizationError.Code.OUTPUT_TOO_LARGE ->
+            "This image is too large. Choose a smaller image."
+        TerminalImageNormalizationError.Code.CONTENT_UNAVAILABLE ->
+            "The image could not be opened. Choose it again."
+        else -> "The image could not be prepared. Choose a different image."
+    }
+    else -> "The image could not be prepared. Choose a different image."
+}
+
+private fun terminalUploadErrorMessage(error: Throwable): String = when {
+    error is RemoteUploadException && error.code == "remote.unsupported" ->
+        "Update AITerm on the desktop to attach images."
+    !error.message.isNullOrBlank() -> error.message!!
+    else -> "The image upload failed. Check the connection and try again."
+}
 
 private fun ConnectionState.label(): String = when (this) {
     ConnectionState.Disconnected -> "DISCONNECTED"
