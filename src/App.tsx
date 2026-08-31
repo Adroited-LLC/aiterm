@@ -2277,6 +2277,18 @@ export default function App() {
     });
     const unNew = listen<{ agentId: string; cwd: string; prompt: string | null; model: string | null; effort: string | null; title: string | null }>("remote://new-session", (e) => {
       const { agentId, cwd, prompt, model, effort, title } = e.payload;
+      // An api:<provider> id is a model off a provider's list, not a CLI —
+      // the same routing bring-in does. Left unrouted it reached the
+      // resolver as an agent and died as "api:… isn't installed", which is
+      // what a phone asking for a local model used to get back.
+      if (agentId.startsWith("api:")) {
+        if (!model) { setNotice("The phone asked for a provider model but named no model"); return; }
+        remoteRef.current.newSession(
+          cwd, { kind: "api", providerId: agentId.slice(4), modelId: model }, prompt ?? undefined,
+          title ? { title } : {},
+        );
+        return;
+      }
       remoteRef.current.newSession(
         cwd, { kind: "agent", agentId, model: model ?? null, effort: effort ?? null }, prompt ?? undefined,
         title ? { title } : {},
