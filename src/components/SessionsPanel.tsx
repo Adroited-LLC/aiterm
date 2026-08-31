@@ -1556,12 +1556,14 @@ export default function SessionsPanel({
             {sectionOpen("recent:all") &&
               (query.trim() || showAllRecent ? ungrouped : ungrouped.slice(0, RECENT_WINDOW))
                 .map((s) => renderItem(s, "recent"))}
-            {sectionOpen("recent:all") && !query.trim() && !showAllRecent && ungrouped.length > RECENT_WINDOW && (
+            {sectionOpen("recent:all") && !query.trim() && ungrouped.length > RECENT_WINDOW && (
               <button
                 className="tui-plain session-show-all"
-                onClick={() => setShowAllRecent(true)}
+                onClick={() => setShowAllRecent((v) => !v)}
               >
-                Show all {ungrouped.length} — search reaches them regardless
+                {showAllRecent
+                  ? `Show the first ${RECENT_WINDOW} — the full list is what makes the app slow`
+                  : `Show all ${ungrouped.length} — search reaches them regardless`}
               </button>
             )}
             {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
