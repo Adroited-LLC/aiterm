@@ -3925,12 +3925,22 @@ pub async fn list_sessions() -> Vec<Session> {
 
 fn list_sessions_sync() -> Vec<Session> {
     // Adding an agent means adding a backend in `agents.rs` and nothing here.
+    //
+    // A session has up to three names, resolved HERE and nowhere else so
+    // every surface — sidebar, tab, phone, rename box — says the same
+    // thing: the person's rename beats the librarian's label beats the
+    // engine's own title.
     let titles = load_titles();
+    let lib = crate::librarian::load_store();
     crate::agents::scan_all_with_paths()
         .into_iter()
         .map(|(mut s, _)| {
             if let Some(t) = titles.get(&s.id) {
                 s.title = t.clone();
+            } else if let Some(e) = lib.sessions.get(&s.id) {
+                if !e.name.trim().is_empty() {
+                    s.title = e.name.clone();
+                }
             }
             s
         })
