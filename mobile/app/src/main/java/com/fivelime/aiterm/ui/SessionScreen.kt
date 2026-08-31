@@ -258,16 +258,14 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                 animationSpec = tween(if (list.isScrollInProgress) 80 else 900),
                 label = "thumb",
             )
-            // The thumb's height is settled outside the scroll: sizing it
-            // from what is visible RIGHT NOW made it breathe as tall and
-            // short messages passed. It re-derives only when content grows.
-            var thumbFrac by remember(s.id) { mutableStateOf(0f) }
-            LaunchedEffect(vm.turns.size, working) {
-                val info = list.layoutInfo
-                if (info.totalItemsCount > 0 && info.visibleItemsInfo.isNotEmpty()) {
-                    thumbFrac = info.visibleItemsInfo.size.toFloat() / info.totalItemsCount
-                }
-            }
+            // Pixel truth for the thumb: remember the real height of every
+            // message the list has laid out, estimate the unseen with the
+            // running average, and place the thumb by pixels — not by item
+            // counts, which jump with every tall or short message and made
+            // the thumb breathe and jitter. Plain map, not state: it feeds
+            // the next draw, it never drives recomposition.
+            val heights = remember(s.id) { HashMap<Int, Int>() }
+            val spacingPx = with(androidx.compose.ui.platform.LocalDensity.current) { 8.dp.toPx() }
             val awayFromEnd by remember {
                 derivedStateOf {
                     val info = list.layoutInfo
@@ -282,20 +280,27 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                         drawContent()
                         val info = list.layoutInfo
                         val total = info.totalItemsCount
-                        val seen = info.visibleItemsInfo.size
-                        if (thumbAlpha > 0f && seen in 1 until total) {
-                            val frac = if (thumbFrac > 0f) thumbFrac else seen.toFloat() / total
-                            val h = (size.height * frac).coerceIn(32.dp.toPx(), size.height * 0.9f)
-                            val first = info.visibleItemsInfo.first()
-                            val exact = first.index + -first.offset.toFloat() / first.size.coerceAtLeast(1)
-                            val progress = (exact / (total - seen)).coerceIn(0f, 1f)
-                            drawRoundRect(
-                                color = thumbColor,
-                                topLeft = Offset(size.width - 7.dp.toPx(), progress * (size.height - h)),
-                                size = Size(3.dp.toPx(), h),
-                                cornerRadius = CornerRadius(2.dp.toPx()),
-                                alpha = thumbAlpha,
-                            )
+                        for (it in info.visibleItemsInfo) heights[it.index] = it.size
+                        val first = info.visibleItemsInfo.firstOrNull()
+                        if (thumbAlpha > 0f && first != null && total > info.visibleItemsInfo.size) {
+                            var knownSum = 0L; var knownN = 0
+                            for ((i, hgt) in heights) if (i < total) { knownSum += hgt; knownN++ }
+                            val avg = if (knownN > 0) knownSum.toFloat() / knownN else 0f
+                            val contentPx = knownSum + avg * (total - knownN) + spacingPx * (total - 1)
+                            val viewport = (info.viewportEndOffset - info.viewportStartOffset).toFloat()
+                            if (contentPx > viewport) {
+                                var before = -first.offset.toFloat()
+                                for (i in 0 until first.index) before += (heights[i]?.toFloat() ?: avg) + spacingPx
+                                val h = (size.height * viewport / contentPx).coerceIn(32.dp.toPx(), size.height * 0.9f)
+                                val progress = (before / (contentPx - viewport)).coerceIn(0f, 1f)
+                                drawRoundRect(
+                                    color = thumbColor,
+                                    topLeft = Offset(size.width - 7.dp.toPx(), progress * (size.height - h)),
+                                    size = Size(3.dp.toPx(), h),
+                                    cornerRadius = CornerRadius(2.dp.toPx()),
+                                    alpha = thumbAlpha,
+                                )
+                            }
                         }
                     },
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
