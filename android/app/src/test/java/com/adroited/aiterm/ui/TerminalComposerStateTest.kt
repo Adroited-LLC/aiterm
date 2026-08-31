@@ -11,22 +11,21 @@ class TerminalComposerStateTest {
     fun textDraftSurvivesClosingTheOverlayUntilItIsSent() {
         val initial = TerminalComposerState()
         assertFalse(initial.expanded)
-        assertFalse(initial.direct)
 
         val opened = initial.open()
         val drafted = opened.updateValue(TextFieldValue("hello phone"))
 
         assertEquals(emptyList<String>(), drafted.outbound)
-        assertEquals("hello phone", drafted.state.visibleValue.text)
+        assertEquals("hello phone", drafted.state.value.text)
 
         val closed = drafted.state.close()
         assertFalse(closed.expanded)
-        assertEquals("hello phone", closed.visibleValue.text)
+        assertEquals("hello phone", closed.value.text)
 
         val sent = closed.open().sendText()
         assertEquals(listOf("hello phone", "\r"), sent.outbound)
         assertFalse(sent.state.expanded)
-        assertEquals("", sent.state.visibleValue.text)
+        assertEquals("", sent.state.value.text)
     }
 
     @Test
@@ -38,14 +37,12 @@ class TerminalComposerStateTest {
     }
 
     @Test
-    fun directModeSendsCommittedTextImmediately() {
-        val direct = TerminalComposerState().open().toggleDirect()
+    fun composerHasOneAutocorrectableTextDraft() {
+        val typed = TerminalComposerState().open()
+            .updateValue(TextFieldValue("correct this"))
 
-        assertTrue(direct.direct)
-        val typed = direct.updateValue(TextFieldValue("x\n"))
-
-        assertEquals(listOf("x\r"), typed.outbound)
-        assertEquals("", typed.state.visibleValue.text)
+        assertEquals("correct this", typed.state.value.text)
+        assertEquals(emptyList<String>(), typed.outbound)
         assertTrue(typed.state.expanded)
     }
 }

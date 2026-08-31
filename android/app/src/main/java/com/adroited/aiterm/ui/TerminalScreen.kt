@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -33,7 +32,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -63,10 +61,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -266,9 +260,7 @@ fun TerminalScreenContent(
                                 .padding(horizontal = 8.dp, vertical = 6.dp),
                         ) {
                             TerminalInputBar(
-                                direct = composer.direct,
-                                onToggleDirect = { composer = composer.toggleDirect() },
-                                value = composer.visibleValue,
+                                value = composer.value,
                                 onValueChange = { next ->
                                     val update = composer.updateValue(next)
                                     composer = update.state
@@ -280,10 +272,8 @@ fun TerminalScreenContent(
                                     update.outbound.forEach(onInput)
                                     if (!update.state.expanded) keyboard?.hide()
                                 },
-                                onDirectKey = onInput,
                                 focusRequester = inputFocus,
                                 enabled = state.focus == FocusOwner.Self,
-                                applicationCursor = screen.modes.applicationCursor,
                             )
                         }
                     }
@@ -473,15 +463,11 @@ private fun TerminalGrid(
 
 @Composable
 private fun TerminalInputBar(
-    direct: Boolean,
-    onToggleDirect: () -> Unit,
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     onSend: () -> Unit,
-    onDirectKey: (String) -> Unit,
     focusRequester: FocusRequester,
     enabled: Boolean,
-    applicationCursor: Boolean,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -500,16 +486,6 @@ private fun TerminalInputBar(
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f).height(44.dp)
                     .focusRequester(focusRequester)
-                    .onPreviewKeyEvent { event ->
-                        if (!direct || event.type != KeyEventType.KeyDown) {
-                            return@onPreviewKeyEvent false
-                        }
-                        terminalKeySequence(event.key, applicationCursor)?.let { sequence ->
-                            onDirectKey(sequence)
-                            onValueChange(TextFieldValue())
-                            true
-                        } ?: false
-                    }
                     .testTag("terminal-composer"),
                 enabled = enabled,
                 singleLine = true,
@@ -519,10 +495,10 @@ private fun TerminalInputBar(
                 ),
                 cursorBrush = SolidColor(Color(0xFF63D3E1)),
                 keyboardOptions = KeyboardOptions(
-                    capitalization = if (direct) KeyboardCapitalization.None else KeyboardCapitalization.Sentences,
-                    autoCorrectEnabled = !direct,
-                    keyboardType = if (direct) KeyboardType.Ascii else KeyboardType.Text,
-                    imeAction = if (direct) ImeAction.None else ImeAction.Go,
+                    capitalization = KeyboardCapitalization.Sentences,
+                    autoCorrectEnabled = true,
+                    keyboardType = KeyboardType.Text,
+                    imeAction = ImeAction.Go,
                 ),
                 keyboardActions = KeyboardActions(onGo = { onSend() }),
                 decorationBox = { inner ->
@@ -535,11 +511,7 @@ private fun TerminalInputBar(
                     ) {
                         if (value.text.isEmpty()) {
                             Text(
-                                when {
-                                    !enabled -> "Take focus to type"
-                                    direct -> "Direct keys send immediately"
-                                    else -> "Type a command or prompt…"
-                                },
+                                if (!enabled) "Take focus to type" else "Type a command or prompt…",
                                 color = Color(0xFF6F8798),
                                 style = MaterialTheme.typography.bodyMedium,
                             )
@@ -548,36 +520,7 @@ private fun TerminalInputBar(
                     }
                 },
             )
-            InputModeButton(
-                label = "Direct",
-                selected = direct,
-                enabled = enabled,
-                tag = "input-mode-direct",
-                onClick = onToggleDirect,
-            )
         }
-    }
-}
-
-@Composable
-private fun InputModeButton(
-    label: String,
-    selected: Boolean,
-    enabled: Boolean,
-    tag: String,
-    onClick: () -> Unit,
-) {
-    TextButton(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = Modifier.widthIn(min = 44.dp).height(36.dp).testTag(tag),
-        colors = ButtonDefaults.textButtonColors(
-            containerColor = if (selected) Color(0xFF17465B) else Color.Transparent,
-            contentColor = if (selected) Color(0xFF8DE7F2) else Color(0xFF8CA1B0),
-        ),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 7.dp),
-    ) {
-        Text(label, style = MaterialTheme.typography.labelMedium)
     }
 }
 

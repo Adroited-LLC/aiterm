@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -20,9 +19,7 @@ import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
-import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.performTextInput
-import androidx.compose.ui.test.pressKey
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
@@ -160,17 +157,11 @@ class TerminalScreenTest {
             kotlin.math.abs(field.center.y - placeholder.center.y) < 2f,
         )
 
-        compose.onNodeWithTag("input-mode-direct").performClick()
-        compose.waitForIdle()
-        val directField = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
-            .fetchSemanticsNode().boundsInRoot
-        val directPlaceholder = compose.onNodeWithText("Direct keys send immediately", useUnmergedTree = true)
-            .fetchSemanticsNode().boundsInRoot
-        assertTrue("input height must stay stable between modes", kotlin.math.abs(field.height - directField.height) < 1f)
         assertTrue(
-            "direct placeholder must be vertically centered in the input",
-            kotlin.math.abs(directField.center.y - directPlaceholder.center.y) < 2f,
+            compose.onAllNodesWithTag("input-mode-direct", useUnmergedTree = true)
+                .fetchSemanticsNodes().isEmpty(),
         )
+        assertTrue(kotlin.math.abs(field.center.y - placeholder.center.y) < 2f)
     }
 
     @Test
@@ -209,68 +200,6 @@ class TerminalScreenTest {
             "composer bottom $composerBottom must be above keyboard top $keyboardTop",
             composerBottom <= keyboardTop + 1f,
         )
-    }
-
-    @Test
-    fun directModeSendsCommittedTextImmediately() {
-        val sent = mutableListOf<String>()
-        compose.setContent {
-            TerminalScreenContent(
-                state = RemoteClientState(
-                    connection = ConnectionState.Connected,
-                    focus = FocusOwner.Self,
-                    activeTabId = "tab-raw",
-                ),
-                screen = ScreenSnapshot(
-                    tabId = "tab-raw",
-                    revision = 1,
-                    cols = 1,
-                    rows = 1,
-                    visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
-                    cursor = CursorState(0, 0, true),
-                ),
-                onInput = sent::add,
-            )
-        }
-
-        compose.onNodeWithText("Type").performClick()
-        compose.onNodeWithTag("input-mode-direct").performClick()
-        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
-        composer.performTextInput("x")
-
-        compose.runOnIdle { assertEquals(listOf("x"), sent) }
-        composer.assertTextEquals("")
-    }
-
-    @Test
-    fun directModeForwardsHardwareTerminalKeys() {
-        val sent = mutableListOf<String>()
-        compose.setContent {
-            TerminalScreenContent(
-                state = RemoteClientState(
-                    connection = ConnectionState.Connected,
-                    focus = FocusOwner.Self,
-                    activeTabId = "tab-raw-key",
-                ),
-                screen = ScreenSnapshot(
-                    tabId = "tab-raw-key",
-                    revision = 1,
-                    cols = 1,
-                    rows = 1,
-                    visible = listOf(ScreenRow(listOf(ScreenCell("$")))),
-                    cursor = CursorState(0, 0, true),
-                ),
-                onInput = sent::add,
-            )
-        }
-
-        compose.onNodeWithText("Type").performClick()
-        compose.onNodeWithTag("input-mode-direct").performClick()
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
-            .performClick()
-            .performKeyInput { pressKey(Key.DirectionUp) }
-
-        compose.runOnIdle { assertEquals(listOf("\u001b[A"), sent) }
     }
 
     @Test

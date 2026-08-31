@@ -9,45 +9,26 @@ internal data class TerminalComposerUpdate(
 
 internal data class TerminalComposerState(
     val expanded: Boolean = false,
-    val direct: Boolean = false,
-    private val textValue: TextFieldValue = TextFieldValue(),
-    private val directValue: TextFieldValue = TextFieldValue(),
+    val value: TextFieldValue = TextFieldValue(),
 ) {
-    val visibleValue: TextFieldValue
-        get() = if (direct) directValue else textValue
-
     fun open(): TerminalComposerState = copy(expanded = true)
 
     fun close(): TerminalComposerState = copy(expanded = false)
 
-    fun toggleDirect(): TerminalComposerState = copy(direct = !direct)
-
-    fun updateValue(next: TextFieldValue): TerminalComposerUpdate {
-        if (!direct) {
-            return TerminalComposerUpdate(copy(textValue = next))
-        }
-        if (next.composition != null || next.text.isEmpty()) {
-            return TerminalComposerUpdate(copy(directValue = next))
-        }
-        return TerminalComposerUpdate(
-            state = copy(directValue = TextFieldValue()),
-            outbound = listOf(next.text.replace("\n", "\r")),
-        )
-    }
+    fun updateValue(next: TextFieldValue) = TerminalComposerUpdate(copy(value = next))
 
     fun sendText(bracketedPaste: Boolean = false): TerminalComposerUpdate {
-        if (direct) return TerminalComposerUpdate(this)
         val outbound = buildList {
-            if (textValue.text.isNotEmpty()) {
+            if (value.text.isNotEmpty()) {
                 add(
-                    if (bracketedPaste) "\u001b[200~${textValue.text}\u001b[201~"
-                    else textValue.text,
+                    if (bracketedPaste) "\u001b[200~${value.text}\u001b[201~"
+                    else value.text,
                 )
             }
             add("\r")
         }
         return TerminalComposerUpdate(
-            state = copy(expanded = false, textValue = TextFieldValue()),
+            state = copy(expanded = false, value = TextFieldValue()),
             outbound = outbound,
         )
     }
