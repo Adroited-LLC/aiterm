@@ -4019,6 +4019,35 @@ pub fn session_stars() -> Vec<String> {
     load_stars()
 }
 
+/// Relay lineage: brought-in session → the master it was brought into.
+/// Written when a relay reports; read so every surface can group a
+/// workspace's agents under the one that owns the conversation.
+fn brought_in_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|d| d.join("aiterm").join("brought_in.json"))
+}
+
+pub fn load_brought_in() -> std::collections::HashMap<String, String> {
+    brought_in_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn record_brought_in(b_session: &str, master: &str) {
+    let Some(p) = brought_in_path() else { return };
+    let mut m = load_brought_in();
+    if m.get(b_session).map(String::as_str) == Some(master) {
+        return;
+    }
+    m.insert(b_session.to_string(), master.to_string());
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&m) {
+        let _ = std::fs::write(&p, text);
+    }
+}
+
 #[tauri::command]
 pub fn session_star(app: tauri::AppHandle, session_id: String, on: bool) -> Result<(), String> {
     set_star(&session_id, on)?;

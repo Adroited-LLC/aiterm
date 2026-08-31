@@ -1071,6 +1071,7 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
         "with_files": with_files,
         "ports": ports,
         "stars": crate::sessions::load_stars(),
+        "brought_in": crate::sessions::load_brought_in(),
     }))
     .into_response()
 }
@@ -1571,6 +1572,9 @@ pub fn relay_report(
     rounds: u32,
     note: String,
 ) {
+    if let Some(b) = b_session_id.as_deref() {
+        crate::sessions::record_brought_in(b, &session_id);
+    }
     notify(&app, Event::Relay { session_id, b_session_id, b_name, phase, round, rounds, note });
 }
 
