@@ -1252,6 +1252,14 @@ pub(crate) fn line_may_hold_message(line: &str) -> bool {
 /// preamble, which is not something you said and not something worth matching
 /// a search against — the same reason claude's meta-prompts are filtered.
 pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
+    // A meta message is the harness talking to the model — a loaded skill's
+    // body, the local-command caveat — never something the person said. One
+    // rendered as a phone user-bubble when a skill loaded mid-session.
+    // [observed: Claude Code 2.1.251 — isMeta:true + sourceToolUseID on the
+    // artifact-design skill body, 2026-08-31]
+    if v.get("isMeta").and_then(|b| b.as_bool()) == Some(true) {
+        return None;
+    }
     let (role, content) = match v.get("type").and_then(|t| t.as_str()) {
         Some(r @ ("user" | "assistant")) => (r.to_string(), v.pointer("/message/content")?),
         Some("response_item") => {
