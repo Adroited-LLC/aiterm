@@ -532,6 +532,12 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
 }
 
 impl PtyManager {
+    /// The child pid of the tab bound to `session_id`, when there is one.
+    pub fn child_pid_for_session(&self, session_id: &str) -> Option<u32> {
+        let pty = self.pty_for_session(session_id)?;
+        self.ptys.lock().ok()?.get(&pty)?.child_pid
+    }
+
     /// End a tab's process tree and forget the pty. Shared by the desktop's
     /// close-tab command and the phone's stop — blocking, up to ~1.6s.
     pub fn kill_now(&self, id: u32) {

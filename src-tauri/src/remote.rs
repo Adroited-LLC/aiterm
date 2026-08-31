@@ -172,7 +172,24 @@ pub struct RemoteState {
     last_error: Mutex<Option<String>>,
     /// Bad tokens per address: (failures, first failure). See `auth`.
     strikes: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    /// Live preview tickets: unguessable path → what it serves. Minted by
+    /// the authed API, honored without a bearer — a WebView can't attach
+    /// headers to subresource requests, but it can keep a secret path.
+    previews: Mutex<HashMap<String, Preview>>,
     events: broadcast::Sender<Event>,
+}
+
+#[derive(Clone)]
+enum PreviewTarget {
+    /// Reverse-proxy to a server on the desktop's loopback.
+    Port(u16),
+    /// Serve files out of a folder (an agent-built static page).
+    Dir(PathBuf),
+}
+
+struct Preview {
+    target: PreviewTarget,
+    expires: Instant,
 }
 
 impl Default for RemoteState {
@@ -186,6 +203,7 @@ impl Default for RemoteState {
             usage_cache: Mutex::new(HashMap::new()),
             last_error: Mutex::new(None),
             strikes: Mutex::new(HashMap::new()),
+            previews: Mutex::new(HashMap::new()),
             events: broadcast::channel(64).0,
         }
     }
@@ -642,8 +660,205 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop_session))
         .route("/v1/events", get(events))
+        .route("/v1/previews", post(make_preview))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
+        // Below the auth layer on purpose: preview paths carry their own
+        // unguessable ticket. See `make_preview`.
+        .route("/p/{ticket}/", get(preview_root))
+        .route("/p/{ticket}/{*rest}", get(preview_rest))
         .with_state(ctx)
+}
+
+// ------------------------------------------------------------- previews
+//
+// "The agent built a web page — show me." Two shapes: a folder of static
+// files (the usual index.html landing page), or a dev server the agent
+// started on the desktop's loopback. Either way the phone can't reach it
+// directly, and a WebView can't send Authorization headers for the page's
+// images and stylesheets — so the authed API mints a ticket, and the
+// ticket IS the credential: an unguessable path prefix, expiring, serving
+// exactly one target.
+
+const PREVIEW_TTL: Duration = Duration::from_secs(3600);
+
+#[derive(Deserialize)]
+struct PreviewBody {
+    port: Option<u16>,
+    dir: Option<String>,
+}
+
+async fn make_preview(State(ctx): State<Ctx>, Json(b): Json<PreviewBody>) -> Response {
+    let target = if let Some(p) = b.port {
+        PreviewTarget::Port(p)
+    } else if let Some(d) = b.dir {
+        let Ok(real) = std::path::PathBuf::from(&d).canonicalize() else {
+            return err(StatusCode::NOT_FOUND, "no such folder");
+        };
+        if !real.is_dir() || !under_home(&real) {
+            return err(StatusCode::FORBIDDEN, "only folders under home");
+        }
+        PreviewTarget::Dir(real)
+    } else {
+        return err(StatusCode::BAD_REQUEST, "port or dir required");
+    };
+    let ticket = new_token();
+    let state = ctx.app.state::<RemoteState>();
+    let mut p = state.previews.lock().unwrap();
+    p.retain(|_, v| v.expires > Instant::now());
+    p.insert(ticket.clone(), Preview { target, expires: Instant::now() + PREVIEW_TTL });
+    Json(serde_json::json!({ "path": format!("/p/{ticket}/") })).into_response()
+}
+
+async fn preview_root(
+    State(ctx): State<Ctx>,
+    Path(ticket): Path<String>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Response {
+    serve_preview(ctx, ticket, String::new(), q).await
+}
+
+async fn preview_rest(
+    State(ctx): State<Ctx>,
+    Path((ticket, rest)): Path<(String, String)>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Response {
+    serve_preview(ctx, ticket, rest, q).await
+}
+
+async fn serve_preview(ctx: Ctx, ticket: String, rest: String, query: Option<String>) -> Response {
+    let target = {
+        let state = ctx.app.state::<RemoteState>();
+        let p = state.previews.lock().unwrap();
+        match p.get(&ticket) {
+            Some(v) if v.expires > Instant::now() => v.target.clone(),
+            _ => return err(StatusCode::NOT_FOUND, "preview expired — reopen it from the app"),
+        }
+    };
+    match target {
+        PreviewTarget::Dir(dir) => {
+            if rest.contains("..") {
+                return err(StatusCode::FORBIDDEN, "no");
+            }
+            let mut path = dir.join(rest.trim_start_matches('/'));
+            if rest.is_empty() || path.is_dir() {
+                path = path.join("index.html");
+            }
+            match std::fs::read(&path) {
+                Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, mime_of(&path))], bytes).into_response(),
+                Err(_) => err(StatusCode::NOT_FOUND, "not found"),
+            }
+        }
+        PreviewTarget::Port(port) => proxy_local(port, &rest, query.as_deref()).await,
+    }
+}
+
+/// One GET against a loopback server, HTTP/1.0 so the body is
+/// close-delimited — no client crate, no chunked parsing. Dev servers
+/// (python http.server, vite, uvicorn) all answer 1.0 happily.
+async fn proxy_local(port: u16, rest: &str, query: Option<&str>) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = format!(
+        "/{}{}",
+        rest.trim_start_matches('/'),
+        query.map(|q| format!("?{q}")).unwrap_or_default()
+    );
+    let work = async {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.ok()?;
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.ok()?;
+        Some(buf)
+    };
+    let Ok(Some(raw)) = tokio::time::timeout(Duration::from_secs(20), work).await else {
+        return err(StatusCode::BAD_GATEWAY, format!("nothing answered on port {port}"));
+    };
+    // Split head from body, pull status and content-type, pass the rest on.
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let body = raw[(split + 4).min(raw.len())..].to_vec();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::OK);
+    let ctype = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+        .map(|l| l[13..].trim().to_string())
+        .unwrap_or_else(|| "application/octet-stream".into());
+    (status, [(axum::http::header::CONTENT_TYPE, ctype)], body).into_response()
+}
+
+fn mime_of(p: &std::path::Path) -> &'static str {
+    match p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css",
+        "js" | "mjs" => "text/javascript",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "mp4" => "video/mp4",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Listening TCP ports owned by a process tree — how a session's dev
+/// server is noticed. `ss` names the pid per listener; /proc names each
+/// pid's parent; the intersection is "this session is serving something".
+fn ports_of_tree(root: u32) -> Vec<u16> {
+    let mut kids: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(rd) = std::fs::read_dir("/proc") {
+        for e in rd.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+            let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else { continue };
+            // ppid is the 2nd field after the parenthesised comm.
+            let Some(after) = stat.rsplit(')').next() else { continue };
+            let mut it = after.split_whitespace();
+            let _state = it.next();
+            if let Some(ppid) = it.next().and_then(|p| p.parse::<u32>().ok()) {
+                kids.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    let mut tree = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(p) = stack.pop() {
+        if tree.insert(p) {
+            if let Some(c) = kids.get(&p) {
+                stack.extend(c);
+            }
+        }
+    }
+    let Ok(out) = std::process::Command::new("ss").args(["-ltnpH"]).output() else { return vec![] };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut ports = Vec::new();
+    for line in text.lines() {
+        let Some(pid) = line.split("pid=").nth(1).and_then(|r| r.split(&[',', ')'][..]).next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if !tree.contains(&pid) {
+            continue;
+        }
+        // Local address is the 4th column; the port follows the last ':'.
+        if let Some(addr) = line.split_whitespace().nth(3) {
+            if let Some(port) = addr.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
+                if !ports.contains(&port) {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports
 }
 
 #[derive(Deserialize)]
@@ -760,12 +975,29 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     }
     // Which sessions produced files, for the phone's "has files" filter.
     let with_files: Vec<String> = crate::changes::sessions_with_files(&ctx.app).into_iter().collect();
+    // Dev servers: listening ports owned by each open session's process
+    // tree, so the phone can offer a live preview of what's being built.
+    let port_roots: Vec<(String, u32)> = open
+        .iter()
+        .filter_map(|id| ptys.child_pid_for_session(id).map(|pid| (id.clone(), pid)))
+        .collect();
+    let ports: HashMap<String, Vec<u16>> = crate::run_blocking(move || {
+        port_roots
+            .into_iter()
+            .filter_map(|(id, pid)| {
+                let p = ports_of_tree(pid);
+                if p.is_empty() { None } else { Some((id, p)) }
+            })
+            .collect()
+    })
+    .await;
     Json(serde_json::json!({
         "sessions": sessions,
         "running": running,
         "open": open,
         "activity": activity,
         "with_files": with_files,
+        "ports": ports,
     }))
     .into_response()
 }
@@ -812,13 +1044,22 @@ fn transcript_busy(session_id: &str) -> bool {
                 }
             }
             Some("assistant") => {
-                // Text without a tool call ends the turn; a tool call means more to come.
-                let calls_tool = v
+                // Text without a tool call ends the turn; a tool call means
+                // more to come. Claude nests tool_use in /message/content;
+                // grok puts tool_calls at the top of the line.
+                let claude_tool = v
                     .pointer("/message/content")
                     .and_then(|c| c.as_array())
                     .is_some_and(|a| a.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use")));
-                state = Some(calls_tool);
+                let grok_tool = v
+                    .get("tool_calls")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|a| !a.is_empty());
+                state = Some(claude_tool || grok_tool);
             }
+            // Grok writes tool results as their own lines: the model has a
+            // result to act on, so the turn is still going.
+            Some("tool_result") => state = Some(true),
             _ => {}
         }
     }
