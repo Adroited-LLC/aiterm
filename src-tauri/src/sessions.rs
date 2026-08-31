@@ -2206,15 +2206,33 @@ fn running_session_ids_sync() -> Vec<String> {
             .filter(|s| !s.is_empty())
             .map(|s| String::from_utf8_lossy(s).into_owned())
             .collect();
-        for (i, a) in args.iter().enumerate() {
-            if a == "--session-id" || a == "--resume" {
-                if let Some(id) = args.get(i + 1).and_then(|v| extract_session_id(v)) {
-                    ids.insert(id);
-                }
+        ids.extend(argv_session_ids(&args));
+    }
+    ids.into_iter().collect()
+}
+
+/// The session ids one process's argv names. Two spellings exist today:
+/// claude/grok's `--session-id`/`--resume` followed by a UUID (or a path
+/// ending in one), and OpenCode's `-s`/`--session` followed by a `ses_…` id —
+/// the UUID arm can never match one, and before the second arm existed a live
+/// `opencode --session ses_…` contributed nothing to `running`, so a working
+/// opencode session rendered idle on the phone.
+/// [observed: opencode 1.18.25]
+fn argv_session_ids(args: &[String]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--session-id" || a == "--resume" {
+            if let Some(id) = args.get(i + 1).and_then(|v| extract_session_id(v)) {
+                ids.push(id);
+            }
+        }
+        if a == "--session" || a == "-s" {
+            if let Some(v) = args.get(i + 1).filter(|v| crate::opencode::valid_id(v)) {
+                ids.push(v.clone());
             }
         }
     }
-    ids.into_iter().collect()
+    ids
 }
 
 /// Pull a session UUID out of a `--session-id`/`--resume` value, which is
@@ -2227,6 +2245,53 @@ fn extract_session_id(val: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Does a live process hold this OpenCode session?
+///
+/// The guard on the store's turn-in-flight signal: a killed run leaves its
+/// newest assistant row's `time.completed` NULL forever, so the NULL only
+/// means "working" while something is actually running the session. Two ways
+/// a process names one [observed: opencode 1.18.25]:
+///
+/// - a resume carries the id in argv (`opencode --session ses_…`, or the
+///   `$SHELL -ic` wrapper holding that same text), so any argv mentioning the
+///   id counts;
+/// - a fresh launch (`opencode --model … --prompt …`) names no session at
+///   all — the row is minted at the first prompt — so an `opencode` process
+///   whose cwd is the session's directory stands in for it.
+pub(crate) fn opencode_process_alive(session_id: &str, dir: Option<&str>) -> bool {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in procs.flatten() {
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if args.iter().any(|a| a.contains(session_id)) {
+            return true;
+        }
+        let is_opencode = args
+            .first()
+            .and_then(|a| Path::new(a).file_name().map(|n| n == "opencode"))
+            .unwrap_or(false);
+        if is_opencode {
+            if let (Some(dir), Ok(cwd)) = (dir, std::fs::read_link(entry.path().join("cwd"))) {
+                if cwd == Path::new(dir) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Every session the Claude Code daemon currently holds — background agents
@@ -3314,6 +3379,38 @@ fn materialize_fork_sync(session_id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `running` is built from: every spelling a live process names its
+    /// session by. Claude/grok say `--session-id`/`--resume` with a UUID (or
+    /// a transcript path); OpenCode says `-s`/`--session` with a `ses_…` id —
+    /// which the UUID arm can never match, and which must not admit arbitrary
+    /// strings either. [observed: opencode 1.18.25]
+    #[test]
+    fn a_processes_argv_names_its_session_in_every_spelling() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            argv_session_ids(&args(&["claude", "--session-id", "0f5e8f9a-1234-4abc-8def-000000000001"])),
+            vec!["0f5e8f9a-1234-4abc-8def-000000000001"],
+        );
+        assert_eq!(
+            argv_session_ids(&args(&["claude", "--resume", "/home/x/.claude/projects/p/0f5e8f9a-1234-4abc-8def-000000000001.jsonl"])),
+            vec!["0f5e8f9a-1234-4abc-8def-000000000001"],
+        );
+        assert_eq!(
+            argv_session_ids(&args(&["opencode", "--session", "ses_fa77f5ffbffeXb1zyomOEZQQFP", "--model", "local/qwen3.8-27b"])),
+            vec!["ses_fa77f5ffbffeXb1zyomOEZQQFP"],
+        );
+        assert_eq!(
+            argv_session_ids(&args(&["opencode", "-s", "ses_fa77f5ffbffeXb1zyomOEZQQFP"])),
+            vec!["ses_fa77f5ffbffeXb1zyomOEZQQFP"],
+        );
+        // Not an opencode id after --session: contributes nothing.
+        assert!(argv_session_ids(&args(&["tool", "--session", "cookie-1234"])).is_empty());
+        // A fresh opencode launch names no session at all.
+        assert!(argv_session_ids(&args(&["opencode", "--model", "local/qwen3.5-0.8b", "--prompt", "hi"])).is_empty());
+        // Flag at the end of argv: nothing to read, nothing to panic over.
+        assert!(argv_session_ids(&args(&["opencode", "--session"])).is_empty());
+    }
 
     fn msg(line: &str) -> Option<(String, String)> {
         assert!(

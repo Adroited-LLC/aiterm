@@ -4,8 +4,10 @@
 //! Every other engine aiterm reads keeps one file per conversation, and the
 //! rest of the app is shaped around that: a session *is* a path, previews and
 //! the search indexer open it and read lines. OpenCode keeps everything in
-//! `~/.local/share/opencode/opencode.db` — three tables, `session`, `message`
-//! and `part` — so there is no per-session file to hand anyone. That is why
+//! `~/.local/share/opencode/opencode.db` — `session`, `message` and `part`
+//! carry the conversations, with more session-keyed tables around them
+//! (`event`, `todo`, … — see [`SIDE_TABLES`]) [observed: opencode 1.18.25] —
+//! so there is no per-session file to hand anyone. That is why
 //! [`crate::sessions::SessionProvider::messages`] exists: this backend answers
 //! with the conversation itself instead of a path to it.
 //!
@@ -96,6 +98,12 @@ struct SessionRow {
     time_updated: Option<u64>,
     parent_id: Option<String>,
     time_archived: Option<i64>,
+    /// The session's declared model, as OpenCode's JSON blob
+    /// (`{"id":…,"providerID":…}`) — the title of last resort.
+    model: Option<String>,
+    /// The first thing the person said, for sessions still wearing the
+    /// default title (see [`is_boilerplate_title`]).
+    first_user_text: Option<String>,
 }
 
 /// The sessions a person means when they say "my OpenCode sessions".
@@ -103,9 +111,52 @@ struct SessionRow {
 /// The `WHERE` clause is repeated in [`parse_sessions`] rather than trusted
 /// once: the filter is the whole point of this query and a parser that only
 /// works because of its caller's SQL is a parser that cannot be tested.
-const SESSIONS_SQL: &str = "select id, title, directory, time_updated, parent_id, time_archived \
+///
+/// The correlated subquery fetches each session's first user text part in the
+/// same round trip — it only matters for boilerplate-titled rows, but one
+/// query beats a query per row, and text parts are small.
+const SESSIONS_SQL: &str = "select id, title, directory, time_updated, parent_id, time_archived, model, \
+     (select json_extract(p.data, '$.text') from part p \
+        join message m on m.id = p.message_id \
+        where p.session_id = session.id \
+          and json_extract(p.data, '$.type') = 'text' \
+          and json_extract(m.data, '$.role') = 'user' \
+        order by m.time_created, p.time_created limit 1) as first_user_text \
      from session where parent_id is null and time_archived is null \
      order by time_updated desc";
+
+/// OpenCode's default session title, which is harness boilerplate and must
+/// never be shown as a title (HARNESS-CONTRACT.md §2). The default is
+/// literally `New session - <ISO(time_created)>`, and it normally gets
+/// rewritten by OpenCode's title agent — a model call after the first prompt —
+/// which a config can disable, making the default permanent.
+/// [observed: opencode 1.18.25]
+pub(crate) fn is_boilerplate_title(title: &str) -> bool {
+    title.trim().strip_prefix("New session - ").is_some_and(|rest| {
+        let b = rest.as_bytes();
+        b.len() >= 10 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-'
+    })
+}
+
+/// A sidebar-sized title from a prompt or message: the first non-empty line,
+/// capped at 80 chars — the same cap claude sidebar rows get from their first
+/// prompt. `None` when there is nothing to say.
+pub(crate) fn short_title(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.chars().take(80).collect())
+}
+
+/// The model id off the session row's `model` blob
+/// (`{"id":"qwen3.8-27b","providerID":"local",…}`) — the last-resort title
+/// for a session with no user text at all, e.g. a launch that failed before
+/// its first prompt landed. [observed: opencode 1.18.25]
+fn model_title(model: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(model?).ok()?;
+    v.get("id")
+        .and_then(|m| m.as_str())
+        .filter(|m| !m.is_empty())
+        .map(String::from)
+}
 
 /// Sidebar rows for every top-level OpenCode session, newest first.
 pub fn sessions() -> Vec<Session> {
@@ -118,6 +169,12 @@ pub fn sessions() -> Vec<Session> {
 /// they are steps inside a conversation, not conversations, and listing them
 /// would bury the sessions someone actually had. Archived ones are dropped
 /// because that is what archiving means.
+///
+/// A boilerplate `New session - <ISO>` title is replaced — first user text,
+/// then the declared model, then a plain "OpenCode session" — because with
+/// the title agent disabled the default is permanent and a sidebar of
+/// timestamps says nothing. A real title passes through verbatim.
+/// [observed: opencode 1.18.25]
 pub(crate) fn parse_sessions(json: &str) -> Vec<Session> {
     let trimmed = json.trim();
     if trimmed.is_empty() {
@@ -130,10 +187,19 @@ pub(crate) fn parse_sessions(json: &str) -> Vec<Session> {
         .filter(|r| r.parent_id.is_none() && r.time_archived.is_none())
         .map(|r| {
             let cwd = r.directory.unwrap_or_default();
+            let title = match r.title.filter(|t| !t.trim().is_empty() && !is_boilerplate_title(t)) {
+                Some(t) => t,
+                None => r
+                    .first_user_text
+                    .as_deref()
+                    .and_then(short_title)
+                    .or_else(|| model_title(r.model.as_deref()))
+                    .unwrap_or_else(|| "OpenCode session".into()),
+            };
             Session {
                 id: r.id,
                 agent: "opencode".into(),
-                title: r.title.unwrap_or_default(),
+                title,
                 project_path: cwd.clone(),
                 // No worktree concept to regroup around, so a row groups under
                 // the directory it ran in — the same thing `scan_chats` does.
@@ -206,9 +272,9 @@ struct DetailSession {
 /// parts for the counts and the files. Shapes are OpenCode's own message
 /// and part records (`role`, `modelID`, `providerID`, `time.created`,
 /// `tokens.{input,output,cache.{read,write}}`; `type:"tool"`, `tool`,
-/// `state.input.filePath`). There is no OpenCode session on this machine
-/// to read one off, so the reader takes every field as optional and says
-/// nothing where a field is missing.
+/// `state.input.filePath`). The shapes were confirmed against live rows
+/// [observed: opencode 1.18.25]; the reader still takes every field as
+/// optional and says nothing where a field is missing.
 pub(crate) fn parse_detail(id: &str, session_json: &str, rows_json: &str) -> crate::detail::SessionDetail {
     use crate::detail::{iso_from_ms, note_message, push_unique, top_tools, touch_file, SessionDetail};
     let mut d = SessionDetail { id: id.to_string(), ..Default::default() };
@@ -409,6 +475,50 @@ pub(crate) fn parse_session_model(json: &str) -> Option<(String, String)> {
     }
 }
 
+/// Is a turn in flight for this session, and where does the session run?
+///
+/// OpenCode's store carries its own busy signal: an assistant message row is
+/// written at turn start with `time.completed` NULL, and the NULL flips to
+/// epoch-ms when the turn completes (`finish` set to "stop"/"tool-calls").
+/// So the newest assistant row still NULL means a turn is open. The database
+/// is written at step boundaries mid-turn, so polling this sees the turn, not
+/// each token. [observed: opencode 1.18.25, read off the db at 1s polling
+/// through a 40s turn]
+///
+/// The answer is `(turn_open, directory)` rather than a verdict, because the
+/// NULL alone must not be believed: a killed run leaves `time.completed` NULL
+/// forever, so the caller pairs it with process liveness — and the directory
+/// is what a fresh launch (whose argv names no session id yet) can be matched
+/// by.
+pub(crate) fn open_turn(session_id: &str) -> Option<(bool, Option<String>)> {
+    if !valid_id(session_id) {
+        return None;
+    }
+    let sql = format!(
+        "select (json_extract(m.data, '$.time.completed') is null) as open, \
+                s.directory as directory \
+         from message m join session s on s.id = m.session_id \
+         where m.session_id = '{session_id}' \
+           and json_extract(m.data, '$.role') = 'assistant' \
+         order by m.time_created desc limit 1"
+    );
+    query(&sql).and_then(|json| parse_open_turn(&json))
+}
+
+/// sqlite3's JSON for the query above → `(turn_open, directory)`. No assistant
+/// row yet — a session before its first reply — is no answer, not "idle": the
+/// caller falls through to whatever other signals it has.
+pub(crate) fn parse_open_turn(json: &str) -> Option<(bool, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        open: Option<i64>,
+        directory: Option<String>,
+    }
+    let rows: Vec<Row> = serde_json::from_str(json.trim()).ok()?;
+    let r = rows.into_iter().next()?;
+    Some((r.open == Some(1), r.directory))
+}
+
 /// Does OpenCode know this id?
 ///
 /// Every session, not only the listed ones: this answers "is this row ours",
@@ -494,6 +604,26 @@ fn tree_sql(session_id: &str) -> String {
     )
 }
 
+/// The session-keyed tables beyond the original `session`/`message`/`part`
+/// three, with the column that keys each: the 1.18.25 schema also keys
+/// `event` (thousands of rows per session) and `event_sequence` by
+/// `aggregate_id` = session id, and `todo`, `session_input`,
+/// `session_message` and `session_share` by `session_id`. OpenCode's own
+/// `session delete` cleans `event` too, and with `foreign_keys` off nothing
+/// cascades — so a delete that skips these orphans rows OpenCode still
+/// counts. Each is checked against `sqlite_master` first, so a store from an
+/// older OpenCode without a table costs nothing rather than failing the
+/// delete. `event` before `event_sequence`: event rows reference the
+/// sequence row. [observed: opencode 1.18.25]
+const SIDE_TABLES: &[(&str, &str)] = &[
+    ("event", "aggregate_id"),
+    ("event_sequence", "aggregate_id"),
+    ("todo", "session_id"),
+    ("session_input", "session_id"),
+    ("session_message", "session_id"),
+    ("session_share", "session_id"),
+];
+
 /// Delete one session — dump first, rows after.
 ///
 /// The dump is what lets this share the trash's promise: everything deleted is
@@ -528,6 +658,20 @@ pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), 
     }
     let messages = rows(&format!("select * from message where session_id in ({tree})"))?;
     let parts = rows(&format!("select * from part where session_id in ({tree})"))?;
+    // The rest of the schema's session-keyed tables (see [`SIDE_TABLES`]),
+    // dumped and deleted with the same id list. Only the tables this store
+    // actually has: an older schema without one is not an error.
+    let present: std::collections::HashSet<String> =
+        rows("select name from sqlite_master where type = 'table'")?
+            .iter()
+            .filter_map(|r| r.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+    let mut side: Vec<(&str, &str, Vec<serde_json::Value>)> = Vec::new();
+    for (table, key) in SIDE_TABLES {
+        if present.contains(*table) {
+            side.push((table, key, rows(&format!("select * from {table} where {key} in ({tree})"))?));
+        }
+    }
 
     let root = sessions
         .iter()
@@ -559,6 +703,11 @@ pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), 
                 writeln!(out, "{}", serde_json::json!({ "table": table, "row": row }))?;
             }
         }
+        for (table, _, rows) in &side {
+            for row in rows {
+                writeln!(out, "{}", serde_json::json!({ "table": table, "row": row }))?;
+            }
+        }
         out.into_inner()?.sync_all()
     };
     if let Err(e) = write() {
@@ -568,9 +717,14 @@ pub fn delete_to_trash(session_id: &str, trash: &std::path::Path) -> Result<(), 
 
     let id_list =
         ids.iter().map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+    let side_deletes: String = side
+        .iter()
+        .map(|(table, key, _)| format!("delete from {table} where {key} in ({id_list}); "))
+        .collect();
     let sql = format!(
         "pragma busy_timeout = 3000; \
          begin immediate; \
+         {side_deletes}\
          delete from part where session_id in ({id_list}); \
          delete from message where session_id in ({id_list}); \
          delete from session where id in ({id_list}); \
@@ -759,6 +913,83 @@ mod tests {
         let ids: Vec<&str> = rows.iter().map(|s| s.id.as_str()).collect();
         assert!(!ids.contains(&"ses_child00000000000000000000"));
         assert!(!ids.contains(&"ses_archived0000000000000000"));
+    }
+
+    /// OpenCode's default title is `New session - <ISO(time_created)>`, and
+    /// with the title agent disabled it is permanent — harness boilerplate,
+    /// which the contract says must never be shown as a title. A real title,
+    /// even one that merely mentions a new session, passes.
+    #[test]
+    fn the_default_title_is_recognized_as_boilerplate() {
+        assert!(is_boilerplate_title("New session - 2026-08-24T12:01:43.374Z"));
+        assert!(is_boilerplate_title("  New session - 2026-08-24T12:01:43.374Z  "));
+        assert!(!is_boilerplate_title("Greeting"));
+        assert!(!is_boilerplate_title("New session - notes for Matt"));
+        assert!(!is_boilerplate_title("New session"));
+        assert!(!is_boilerplate_title(""));
+    }
+
+    /// A boilerplate-titled row is retitled from what the person actually
+    /// said — first line, capped — while a real title is never touched.
+    /// [observed: opencode 1.18.25]
+    #[test]
+    fn a_boilerplate_title_becomes_the_first_user_text() {
+        let long = "a".repeat(200);
+        let json = serde_json::json!([
+            {"id":"ses_a","title":"New session - 2026-08-31T15:46:59.000Z","directory":"/w",
+             "time_updated":3,"parent_id":null,"time_archived":null,
+             "model":r#"{"id":"qwen3.8-27b","providerID":"local"}"#,
+             "first_user_text":"say hi back"},
+            {"id":"ses_b","title":"Greeting","directory":"/w",
+             "time_updated":2,"parent_id":null,"time_archived":null,
+             "model":null,"first_user_text":"this must not replace a real title"},
+            {"id":"ses_c","title":"New session - 2026-08-31T15:47:00.000Z","directory":"/w",
+             "time_updated":1,"parent_id":null,"time_archived":null,
+             "model":null,"first_user_text":format!("\n  {long}\nsecond line")},
+        ])
+        .to_string();
+        let rows = parse_sessions(&json);
+        assert_eq!(rows[0].title, "say hi back");
+        assert_eq!(rows[1].title, "Greeting");
+        assert_eq!(rows[2].title, "a".repeat(80), "first non-empty line, capped at 80 chars");
+    }
+
+    /// No user text at all — a launch that failed before its first prompt —
+    /// falls back to the declared model, and past that to a plain name.
+    /// Never the boilerplate.
+    #[test]
+    fn a_boilerplate_title_without_user_text_falls_back_to_the_model() {
+        let json = serde_json::json!([
+            {"id":"ses_a","title":"New session - 2026-08-24T12:01:43.374Z","directory":"/w",
+             "time_updated":2,"parent_id":null,"time_archived":null,
+             "model":r#"{"id":"qwen3.8-27b","providerID":"local","variant":"default"}"#,
+             "first_user_text":null},
+            {"id":"ses_b","title":"New session - 2026-08-24T12:02:00.000Z","directory":"/w",
+             "time_updated":1,"parent_id":null,"time_archived":null,
+             "model":null,"first_user_text":"   "},
+        ])
+        .to_string();
+        let rows = parse_sessions(&json);
+        assert_eq!(rows[0].title, "qwen3.8-27b");
+        assert_eq!(rows[1].title, "OpenCode session");
+    }
+
+    /* ---- busy signal ------------------------------------------------------ */
+
+    /// The store's turn bracket: the newest assistant row's `time.completed`
+    /// is NULL while a turn is in flight and epoch-ms once it completes.
+    /// sqlite3 -json spells the `is null` as 1/0. [observed: opencode 1.18.25]
+    #[test]
+    fn an_open_assistant_row_reads_as_a_turn_in_flight() {
+        assert_eq!(
+            parse_open_turn(r#"[{"open":1,"directory":"/home/john/nanoclaw"}]"#),
+            Some((true, Some("/home/john/nanoclaw".into()))),
+        );
+        assert_eq!(parse_open_turn(r#"[{"open":0,"directory":"/w"}]"#), Some((false, Some("/w".into()))));
+        // No assistant row yet is no verdict at all — not "idle".
+        assert_eq!(parse_open_turn(""), None);
+        assert_eq!(parse_open_turn("[]"), None);
+        assert_eq!(parse_open_turn("not json"), None);
     }
 
     /// Nothing to read is an empty list, not a panic: sqlite3 prints nothing at
@@ -1010,6 +1241,19 @@ mod tests {
         let keep = all.first().unwrap().clone();
         let trash = fake.join("trash");
         std::fs::create_dir_all(&trash).unwrap();
+        // The dump is a dump of rows, so its header carries the STORED title —
+        // which may be the boilerplate the sidebar replaces (`parse_sessions`
+        // derives its own from the first user text).
+        let raw_title = query(&format!("select title from session where id = '{}'", victim.id))
+            .and_then(|j| {
+                serde_json::from_str::<Vec<serde_json::Value>>(j.trim())
+                    .ok()?
+                    .first()?
+                    .get("title")?
+                    .as_str()
+                    .map(String::from)
+            })
+            .expect("the victim row has a title");
 
         delete_to_trash(&victim.id, &trash).expect("delete should succeed");
 
@@ -1017,8 +1261,8 @@ mod tests {
         assert!(dump.is_file(), "the dump is the trash entry");
         assert_eq!(
             dump_meta(&dump).map(|(t, _)| t),
-            Some(victim.title.clone()),
-            "the dump header names the session",
+            Some(raw_title),
+            "the dump header names the session by its stored title",
         );
         assert!(!has_session(&victim.id), "the session's rows must be gone");
         assert!(has_session(&keep.id), "every other session must survive");
@@ -1028,6 +1272,17 @@ mod tests {
         ))
         .unwrap_or_default();
         assert!(orphans.trim().is_empty(), "no message rows may be left behind");
+        // The 1.18.25 side tables must come out too — OpenCode's own delete
+        // cleans `event`, and leaving thousands of rows keyed to a gone
+        // session was the delete-completeness bug.
+        for (table, key) in SIDE_TABLES {
+            let left = query(&format!(
+                "select {key} from {table} where {key} = '{}'",
+                victim.id
+            ))
+            .unwrap_or_default();
+            assert!(left.trim().is_empty(), "{table} rows left behind");
+        }
     }
 
     /// A claude transcript's first line is JSON too — recognition rides on the

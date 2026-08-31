@@ -261,8 +261,27 @@ fn reopen(
     // first stored provider this engine accepts. Same gate as the fresh
     // launch: only an engine that authenticates through us gets either value.
     let (env_provider, env_model) = match backend.api_resume_context(session_id) {
-        Some((_, model)) if backend.needs_provider_key_env() => {
-            let p = providers.iter().find(|p| backend.accepts_api(p));
+        Some((recorded, model)) if backend.needs_provider_key_env() => {
+            // The record names the ENGINE-side provider id — "openrouter",
+            // or an opencode.json id like "local". Resolve it to the aiterm
+            // provider serving the same endpoint instead of taking the first
+            // accepted one: with more than one accepted provider, "first"
+            // handed a resumed local session the OpenRouter key and every
+            // turn after resume answered "Invalid API Key" [observed:
+            // opencode 1.18.25, 2026-08-31]. Only OpenCode answers
+            // needs_provider_key_env today, so the opencode.json bridge is
+            // the right dictionary for the non-openrouter spelling.
+            let p = providers
+                .iter()
+                .find(|p| {
+                    if recorded == "openrouter" {
+                        p.is_openrouter()
+                    } else {
+                        crate::agents::opencode_provider_matching(p)
+                            .is_some_and(|(id, _)| id == recorded)
+                    }
+                })
+                .or_else(|| providers.iter().find(|p| backend.accepts_api(p)));
             (p.map(|p| p.id.clone()), p.map(|_| model))
         }
         _ => (None, None),

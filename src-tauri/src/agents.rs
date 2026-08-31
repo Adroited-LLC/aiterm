@@ -1320,6 +1320,14 @@ impl AgentBackend for OpenCodeBackend {
         cmd
     }
 
+    /// The first prompt, and nothing else. Stamping a title at launch does
+    /// not work here: `--title` belongs to `opencode run` only, and the
+    /// top-level TUI command — what this backend launches — rejects it with
+    /// a usage dump and exit 1 (measured against a scratch store; a control
+    /// launch without the flag started fine). Boilerplate-titled rows are
+    /// retitled at read time instead — `opencode::parse_sessions` replaces
+    /// the default `New session - <ISO>` with the session's first user text.
+    /// [observed: opencode 1.18.25]
     fn prompt_arg(&self, prompt: &str) -> String {
         format!("--prompt {}", q(prompt))
     }

@@ -1212,6 +1212,28 @@ fn transcript_outranks(terminal: &str, transcript: &str) -> bool {
 /// explicit events instead ([`grok_events_state`]), which short-circuit that
 /// inference for grok sessions only.
 pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
+    // OpenCode sessions live in a SQLite store, not a transcript file —
+    // `owner_in` resolves one to `opencode.db` itself, and the tail read
+    // below then fails UTF-8 on binary SQLite into a silent `None`, every
+    // call. Answer from the store instead: the newest assistant message row
+    // with `time.completed` still NULL is a turn in flight; completed means
+    // no busy claim. A killed run leaves the NULL forever, so "working" also
+    // requires a live process holding the session (argv naming the id, or an
+    // `opencode` in the session's directory for a fresh launch whose argv
+    // names no session yet). No needs-you verdict exists to give: OpenCode's
+    // permission config auto-answers, and its TUI emits no OSC 9;4 and no
+    // bell — output cadence and this bracket are the only signals.
+    // [observed: opencode 1.18.25]
+    if crate::opencode::valid_id(session_id) {
+        return match crate::opencode::open_turn(session_id) {
+            Some((true, dir))
+                if crate::sessions::opencode_process_alive(session_id, dir.as_deref()) =>
+            {
+                Some("working")
+            }
+            _ => None,
+        };
+    }
     let list = crate::agents::backends();
     let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return None };
     // Grok ≥1.0.13: the transcript sits in a session DIRECTORY named by the
@@ -1794,6 +1816,13 @@ async fn stop_session(State(ctx): State<Ctx>, Path(id): Path<String>) -> Respons
         let app = ctx.app.clone();
         crate::run_blocking(move || app.state::<crate::pty::PtyManager>().kill_now(pty_id)).await;
         return StatusCode::NO_CONTENT.into_response();
+    }
+    // An OpenCode id can never be in Claude's roster, so falling through
+    // would find no entry and return Ok — a stop that stopped nothing,
+    // reported as success, while any live `opencode` process kept running.
+    // Refuse instead, the same answer input gives. [observed: opencode 1.18.25]
+    if crate::opencode::valid_id(&id) {
+        return err(StatusCode::CONFLICT, "session is not open in a tab — open it first");
     }
     match crate::sessions::stop_session(id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

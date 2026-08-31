@@ -1688,6 +1688,18 @@ export default function App() {
   };
   const resumeSession = async (s: Session) => {
     setActiveProject(s.project_path);
+    // A tab already bound to this session IS the conversation, live — focus
+    // it. Launching a resume beside it attaches a second process to the same
+    // transcript (observed 2026-08-31: two `opencode --session <id>` PIDs on
+    // one db row, minted by a phone play tap). An ended tab is a dead pane,
+    // not a live process, so it falls through to the machinery below and the
+    // resume actually runs.
+    const bound = tabsRef.current.find((t) => t.sessionId === s.id && !ended.has(t.key));
+    if (bound) {
+      setPreviewSession(null);
+      setActiveTab(bound.key);
+      return;
+    }
     // Ask the pinned id first, because the plan is also how we learn which
     // engine this row belongs to — and everything below is claude's.
     let plan;
@@ -2035,6 +2047,23 @@ export default function App() {
             envModel: plan.env_model ?? undefined,
             agentId: plan.agent_id,
             parentKey: extra.parentKey,
+            // Same rule as the agent branch: an engine that could not be told
+            // its id (OpenCode — `mints_session_id` false) names itself at the
+            // first prompt, and only adoption binds the tab to that name. The
+            // chat console mints its own id, so `plan.session_id` gates it out
+            // here exactly as it does below. Without this the tab held
+            // `sessionId: undefined` for life, and everything keyed on the
+            // binding — phone open/activity/input/stop, play reuse — was dead
+            // for OpenCode.
+            adopt: plan.session_id
+              ? undefined
+              : {
+                  agentId: plan.agent_id,
+                  since: Date.now(),
+                  known: sessionsRef.current
+                    .filter((s) => s.project_path === cwd)
+                    .map((s) => s.id),
+                },
           });
           return { key, sessionId: plan.session_id ?? undefined };
         } catch (e) {
