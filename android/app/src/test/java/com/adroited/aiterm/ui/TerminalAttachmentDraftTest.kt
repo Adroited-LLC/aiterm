@@ -1,6 +1,10 @@
 package com.adroited.aiterm.ui
 
 import java.io.File
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotSame
@@ -145,6 +149,80 @@ class TerminalAttachmentDraftTest {
         assertEquals("for B", store.draftFor("tab-b").composer.value.text)
         assertEquals(listOf("b"), store.draftFor("tab-b").attachments.items.map { it.image.id })
         assertTrue(store.hasDrafts())
+    }
+
+    @Test
+    fun composerUpdateAndAttachmentTransitionRetryFromTheSameSnapshotWithoutLoss() {
+        val store = TerminalDraftStore()
+        val barrier = CyclicBarrier(2)
+        val composerFirstInvocation = AtomicBoolean(true)
+        val attachmentFirstInvocation = AtomicBoolean(true)
+
+        runTwoUpdates(
+            first = {
+                store.updateComposer("tab-a") { composer ->
+                    awaitFirstInvocation(barrier, composerFirstInvocation)
+                    composer.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("keep me")).state
+                }
+            },
+            second = {
+                store.transitionAttachments("tab-a") { attachments ->
+                    awaitFirstInvocation(barrier, attachmentFirstInvocation)
+                    attachments.add(image("photo", 12))
+                }
+            },
+        )
+
+        val draft = store.draftFor("tab-a")
+        assertEquals("keep me", draft.composer.value.text)
+        assertEquals(listOf("photo"), draft.attachments.items.map { it.image.id })
+    }
+
+    @Test
+    fun sameTabAttachmentTransitionsRetryFromTheSameSnapshotWithoutLoss() {
+        val store = TerminalDraftStore()
+        val barrier = CyclicBarrier(2)
+        val firstInvocation = AtomicBoolean(true)
+        val secondInvocation = AtomicBoolean(true)
+
+        runTwoUpdates(
+            first = {
+                store.transitionAttachments("tab-a") { attachments ->
+                    awaitFirstInvocation(barrier, firstInvocation)
+                    attachments.add(image("first", 12))
+                }
+            },
+            second = {
+                store.transitionAttachments("tab-a") { attachments ->
+                    awaitFirstInvocation(barrier, secondInvocation)
+                    attachments.add(image("second", 34))
+                }
+            },
+        )
+
+        assertEquals(
+            setOf("first", "second"),
+            store.draftFor("tab-a").attachments.items.map { it.image.id }.toSet(),
+        )
+    }
+
+    private fun runTwoUpdates(first: () -> Unit, second: () -> Unit) {
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val firstFuture = executor.submit<Unit> { first() }
+            val secondFuture = executor.submit<Unit> { second() }
+            firstFuture.get(3, TimeUnit.SECONDS)
+            secondFuture.get(3, TimeUnit.SECONDS)
+        } finally {
+            executor.shutdownNow()
+            assertTrue(executor.awaitTermination(3, TimeUnit.SECONDS))
+        }
+    }
+
+    private fun awaitFirstInvocation(barrier: CyclicBarrier, firstInvocation: AtomicBoolean) {
+        if (firstInvocation.compareAndSet(true, false)) {
+            barrier.await(2, TimeUnit.SECONDS)
+        }
     }
 
     private fun image(id: String, length: Long, digest: ByteArray = ByteArray(32) { 7 }) =
