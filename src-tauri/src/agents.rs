@@ -288,10 +288,12 @@ pub trait AgentBackend: Send + Sync {
     }
 
     /// How this engine spells a provider's model id on its command line.
-    /// OpenCode wants its own catalog prefix; a raw id is right for everyone
+    /// OpenCode wants its own catalog prefix — which one depends on WHICH
+    /// provider, so the provider rides along; a raw id is right for everyone
     /// else. The engine's spelling is the engine's business — the resolver
     /// must not learn it.
-    fn api_model_slug(&self, model_id: &str) -> String {
+    fn api_model_slug(&self, provider: &crate::providers::Provider, model_id: &str) -> String {
+        let _ = provider;
         model_id.to_string()
     }
 
@@ -402,6 +404,68 @@ pub const OPENCODE_PERMISSION_MODES: &[PermissionMode] = &[
         flags: &["--auto"],
     },
 ];
+
+/// OpenCode's own provider declarations, parsed from config text: id, its
+/// `options.baseURL`, and the env var its `options.apiKey` reads when spelled
+/// `{env:NAME}`. The shape is opencode.json's:
+/// `provider.<id>.options.{baseURL, apiKey}`. [observed: opencode.json on
+/// this machine, 2026-08-31 — provider "local", baseURL
+/// "http://127.0.0.1:8099/v1", apiKey "{env:LOCAL_LLM_API_KEY}"]
+pub(crate) fn parse_opencode_providers(text: &str) -> Vec<(String, String, Option<String>)> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
+    let Some(map) = v.get("provider").and_then(|p| p.as_object()) else { return Vec::new() };
+    map.iter()
+        .filter_map(|(id, cfg)| {
+            let base = cfg.pointer("/options/baseURL")?.as_str()?.to_string();
+            let env = cfg
+                .pointer("/options/apiKey")
+                .and_then(|k| k.as_str())
+                .and_then(|k| k.strip_prefix("{env:"))
+                .and_then(|k| k.strip_suffix('}'))
+                .map(str::to_string);
+            Some((id.clone(), base, env))
+        })
+        .collect()
+}
+
+/// `parse_opencode_providers` over `~/.config/opencode/opencode.json` —
+/// read on every ask, which is launch-time only, so a config edit between
+/// launches is always seen. Missing or unparseable file: no declarations.
+fn opencode_declared_providers() -> Vec<(String, String, Option<String>)> {
+    let Some(home) = dirs::home_dir() else { return Vec::new() };
+    match std::fs::read_to_string(home.join(".config/opencode/opencode.json")) {
+        Ok(text) => parse_opencode_providers(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Two spellings of the same endpoint. Deliberately narrow: lowercase,
+/// trailing slashes trimmed, and loopback's two names folded together —
+/// this machine's opencode.json says 127.0.0.1 where the provider store
+/// says localhost, and that one mismatch is the difference between OpenCode
+/// running a local model and the chat console taking it.
+fn same_base_url(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+            .replace("//127.0.0.1", "//localhost")
+    };
+    norm(a) == norm(b)
+}
+
+/// The opencode.json provider serving the same endpoint as an aiterm
+/// provider: its id (OpenCode's catalog prefix for the launch) and the env
+/// var its key rides in. The bridge that lets OpenCode run a provider it
+/// already knows — the local llama router — rather than only OpenRouter.
+pub(crate) fn opencode_provider_matching(
+    p: &crate::providers::Provider,
+) -> Option<(String, Option<String>)> {
+    opencode_declared_providers()
+        .into_iter()
+        .find(|(_, base, _)| same_base_url(base, &p.base_url))
+        .map(|(id, _, env)| (id, env))
+}
 
 pub struct ClaudeBackend;
 
@@ -1248,16 +1312,28 @@ impl AgentBackend for OpenCodeBackend {
         false
     }
 
-    /// OpenRouter only. OpenCode keys its catalog by *its* provider ids, so an
-    /// arbitrary OpenAI-compatible endpoint would launch a session that fails
-    /// to resolve — the same reason `opencode_models` filters the shortlist.
+    /// OpenRouter, plus any provider OpenCode's own config already declares.
+    /// OpenCode keys its catalog by *its* provider ids, so an arbitrary
+    /// OpenAI-compatible endpoint would launch a session that fails to
+    /// resolve — but an endpoint that opencode.json itself lists (matched by
+    /// base URL) resolves by that config's id. On this machine that is the
+    /// local llama router: aiterm provider base http://localhost:8099/v1,
+    /// opencode.json provider "local" at http://127.0.0.1:8099/v1.
+    /// [observed: opencode.json, 2026-08-31]
     fn accepts_api(&self, provider: &crate::providers::Provider) -> bool {
-        provider.is_openrouter()
+        provider.is_openrouter() || opencode_provider_matching(provider).is_some()
     }
 
-    /// Its catalog prefix, matching the shortlist `opencode_models` builds.
-    fn api_model_slug(&self, model_id: &str) -> String {
-        format!("openrouter/{model_id}")
+    /// Its catalog prefix, matching the shortlist `opencode_models` builds —
+    /// or the opencode.json provider id for an endpoint that config declares.
+    fn api_model_slug(&self, provider: &crate::providers::Provider, model_id: &str) -> String {
+        if provider.is_openrouter() {
+            return format!("openrouter/{model_id}");
+        }
+        match opencode_provider_matching(provider) {
+            Some((ocid, _)) => format!("{ocid}/{model_id}"),
+            None => model_id.to_string(),
+        }
     }
 
     /// It authenticates from `OPENROUTER_API_KEY` in its environment; there is
@@ -2816,9 +2892,51 @@ mod tests {
     /// harness passes the provider's own model id straight through.
     #[test]
     fn only_opencode_prefixes_an_api_model_id() {
-        assert_eq!(OpenCodeBackend.api_model_slug("a/b"), "openrouter/a/b");
-        assert_eq!(ChatBackend.api_model_slug("a/b"), "a/b");
-        assert_eq!(ClaudeBackend.api_model_slug("a/b"), "a/b");
+        let or = crate::providers::Provider {
+            id: "openrouter".into(),
+            name: "OpenRouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "k".into(),
+            management_key: String::new(),
+            startup_models: vec![],
+            policy: Default::default(),
+            routes: Default::default(),
+        };
+        assert_eq!(OpenCodeBackend.api_model_slug(&or, "a/b"), "openrouter/a/b");
+        assert_eq!(ChatBackend.api_model_slug(&or, "a/b"), "a/b");
+        assert_eq!(ClaudeBackend.api_model_slug(&or, "a/b"), "a/b");
+    }
+
+    /// The opencode.json bridge: a provider whose endpoint OpenCode's own
+    /// config declares is accepted and spelled by that config's id — with
+    /// localhost and 127.0.0.1 folded together, the exact mismatch between
+    /// this machine's provider store and its opencode.json.
+    /// [observed: opencode.json, 2026-08-31]
+    #[test]
+    fn opencode_json_providers_parse_and_match() {
+        let cfg = r#"{
+            "provider": {
+                "local": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": {
+                        "baseURL": "http://127.0.0.1:8099/v1",
+                        "apiKey": "{env:LOCAL_LLM_API_KEY}"
+                    },
+                    "models": {"qwen3.8-27b": {}}
+                }
+            }
+        }"#;
+        let parsed = parse_opencode_providers(cfg);
+        assert_eq!(parsed.len(), 1);
+        let (id, base, env) = &parsed[0];
+        assert_eq!(id, "local");
+        assert!(same_base_url(base, "http://localhost:8099/v1"));
+        assert!(same_base_url(base, "http://127.0.0.1:8099/v1/"));
+        assert!(!same_base_url(base, "http://localhost:8098/v1"));
+        assert_eq!(env.as_deref(), Some("LOCAL_LLM_API_KEY"));
+        // A literal key is not an env spelling and names no variable.
+        let literal = r#"{"provider":{"x":{"options":{"baseURL":"http://h/v1","apiKey":"sk-abc"}}}}"#;
+        assert_eq!(parse_opencode_providers(literal)[0].2, None);
     }
 
     /// The key goes only where it is the only way in. The harness reads the
