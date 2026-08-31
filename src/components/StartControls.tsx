@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AgentChoice, ProviderView, agentChoices, providerModels, providersList } from "../ipc";
+import { AgentChoice, ProviderView, agentChoices, providersList } from "../ipc";
 import AgentIcon from "./AgentIcon";
 import BrandIcon from "./BrandIcon";
 import { brandForModel } from "../brand";
@@ -62,10 +62,7 @@ export function useStartChoice(reloadKey?: unknown) {
    *  and a non-empty startup list; the rest are what its setup is about — a
    *  provider half-configured is the state most worth naming. */
   const [allProviders, setAllProviders] = useState<ProviderView[]>([]);
-  const providers = allProviders.filter((p) => p.has_key);
-  /** Full /models catalog per provider, fetched once each. The dropdown
-   *  offers everything the provider publishes — starred models lead. */
-  const [catalogs, setCatalogs] = useState<Record<string, string[]>>({});
+  const providers = allProviders.filter((p) => p.has_key && p.startup_models.length > 0);
   /** `JSON.stringify([providerId, modelId])`, or "" for none. JSON because a
    *  model id can contain any separator this could have picked. */
   const [apiModel, setApiModel] = useState("");
@@ -80,22 +77,6 @@ export function useStartChoice(reloadKey?: unknown) {
     providersList().then(setAllProviders).catch(() => {});
   }, [reloadKey]);
 
-  useEffect(() => {
-    for (const p of allProviders) {
-      if (!p.has_key || catalogs[p.id]) continue;
-      providerModels(p.id)
-        .then((ms) => setCatalogs((prev) => ({ ...prev, [p.id]: ms })))
-        .catch(() => {});
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allProviders]);
-
-  /** Starred first, then the rest of the provider's catalog. */
-  const modelsFor = (p: ProviderView): string[] => {
-    const rest = (catalogs[p.id] ?? []).filter((m) => !p.startup_models.includes(m));
-    return [...p.startup_models, ...rest];
-  };
-
   const agent = agents.find((a) => a.id === agentId) ?? null;
   const isApi = agentId === API_SOURCE;
   /** The API source has something to start: at least one provider is fully
@@ -108,8 +89,7 @@ export function useStartChoice(reloadKey?: unknown) {
    *  nothing chosen would start nothing. */
   const firstApiModel = () => {
     const p = providers[0];
-    const first = p ? modelsFor(p)[0] : undefined;
-    return p && first ? JSON.stringify([p.id, first]) : "";
+    return p ? JSON.stringify([p.id, p.startup_models[0]]) : "";
   };
 
   // Switching source invalidates both: a Claude alias is not a Codex slug.
@@ -125,13 +105,6 @@ export function useStartChoice(reloadKey?: unknown) {
     setEffort((cur) => (next.includes(cur) ? cur : ""));
   };
 
-  // The catalog can land after the API tab was opened; give the empty
-  // pick its default as soon as there is one.
-  useEffect(() => {
-    if (isApi && !apiModel) setApiModel(firstApiModel());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catalogs, isApi]);
-
   const choice = (): StartChoice => {
     if (isApi && apiModel) {
       const [providerId, modelId] = JSON.parse(apiModel) as [string, string];
@@ -142,7 +115,7 @@ export function useStartChoice(reloadKey?: unknown) {
 
   return {
     agents, agentId, model, effort, models, efforts, providers, allProviders, apiModel,
-    isApi, apiReady, modelsFor,
+    isApi, apiReady,
     pickAgent, pickModel, setEffort, setApiModel, choice,
     ready: isApi ? apiReady && apiModel !== "" : agents.length > 0,
   };
@@ -162,8 +135,13 @@ type Ctl = ReturnType<typeof useStartChoice>;
  * - no provider at all.
  */
 function apiSetup(all: ProviderView[]): { text: string; provider?: string } {
-  // A keyed provider offers its full catalog; only key/provider absence
-  // is a setup state now.
+  const unstarred = all.find((p) => p.has_key && p.startup_models.length === 0);
+  if (unstarred) {
+    return {
+      text: `${unstarred.name} is connected but has no startup models yet — click to pick some`,
+      provider: unstarred.id,
+    };
+  }
   const keyless = all.find((p) => !p.has_key);
   if (keyless) {
     return { text: `${keyless.name} has no API key yet — click to add one`, provider: keyless.id };
@@ -232,7 +210,7 @@ export default function StartControls({ ctl, onOpenModelAccess }: Props) {
           >
             {providers.map((p) => (
               <optgroup key={p.id} label={p.name}>
-                {ctl.modelsFor(p).map((m) => (
+                {p.startup_models.map((m) => (
                   <option key={m} value={JSON.stringify([p.id, m])}>{m}</option>
                 ))}
               </optgroup>
