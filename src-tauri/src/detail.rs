@@ -134,7 +134,7 @@ fn is_bookkeeping(line: &str) -> bool {
     [
         "\"permission-mode\"", "\"ai-title\"", "\"pr-link\"", "\"compact_boundary\"",
         "\"session_meta\"", "\"turn_context\"", "\"token_count\"", "\"task_started\"",
-        "\"function_call\"", "\"custom_tool_call\"", "\"aiterm-chat",
+        "\"function_call\"", "\"custom_tool_call\"", "\"compacted\"", "\"aiterm-chat",
     ]
     .iter()
     .any(|k| line.contains(k))
@@ -265,6 +265,10 @@ pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>,
         }
         "aiterm-chat-clear" => d.compactions += 1,
         // ---- codex bookkeeping ----
+        // Codex compacts too: `{"type":"compacted","payload":{…}}` written
+        // when context is compacted (manual or automatic).
+        // [observed: codex-cli 0.150.1]
+        "compacted" => d.compactions += 1,
         "session_meta" => {
             if let Some(c) = str_at(v, "/payload/cwd") {
                 d.cwd = Some(c.to_string());
@@ -368,12 +372,35 @@ pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>,
         return;
     }
     if let Some((role, text)) = line_message(v) {
+        if role == "user" && is_codex_agents_preamble(&text) {
+            return;
+        }
         let text = strip_system_tags(&text);
         if text.trim().is_empty() {
             return;
         }
         note_message(d, &role, &text);
     }
+}
+
+/// Codex sends the repo's AGENTS.md as its own first "user" message: an
+/// untagged `# AGENTS.md instructions for <cwd>` header ahead of an
+/// `<INSTRUCTIONS>…</INSTRUCTIONS>` block. The whole-block system filter
+/// keeps it — stripping the tags leaves the header line — so it has to be
+/// named here: harness preamble, never a phone bubble, a `first_prompt` or
+/// a title. Both the header AND the block are required, so a genuine message
+/// that merely mentions AGENTS.md is not swallowed. Checked against the RAW
+/// text, before tags are stripped. Older rollouts (0.147.0–0.149.1) put a
+/// `<recommended_plugins>` block ahead of the header — skip it before the
+/// prefix check. [observed: codex-cli 0.150.1]
+fn is_codex_agents_preamble(text: &str) -> bool {
+    let mut t = text.trim_start();
+    if t.starts_with("<recommended_plugins>") {
+        if let Some(end) = t.find("</recommended_plugins>") {
+            t = t[end + "</recommended_plugins>".len()..].trim_start();
+        }
+    }
+    t.starts_with("# AGENTS.md instructions for ") && t.contains("<INSTRUCTIONS>")
 }
 
 pub(crate) fn note_message(d: &mut SessionDetail, role: &str, text: &str) {
@@ -401,6 +428,9 @@ pub(crate) fn note_message(d: &mut SessionDetail, role: &str, text: &str) {
 fn from_messages(id: String, msgs: Vec<(String, String)>) -> SessionDetail {
     let mut d = SessionDetail { id, ..Default::default() };
     for (role, text) in msgs {
+        if role == "user" && is_codex_agents_preamble(&text) {
+            continue;
+        }
         let text = strip_system_tags(&text);
         if text.trim().is_empty() {
             continue;
@@ -470,10 +500,14 @@ mod tests {
             json!({"timestamp":"2026-08-28T23:18:39Z","type":"session_meta","payload":{"cwd":"/c","cli_version":"0.150.1"}}),
             json!({"timestamp":"2026-08-28T23:18:39Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}),
             json!({"timestamp":"2026-08-28T23:18:39Z","type":"turn_context","payload":{"model":"gpt-5-codex","approval_policy":"on-request"}}),
+            // Codex's first "user" message is the repo's AGENTS.md — harness
+            // preamble, not the person. [observed: codex-cli 0.150.1]
+            json!({"timestamp":"2026-08-28T23:18:39Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /c\n\n<INSTRUCTIONS>\n# Agent start\nrules live here\n</INSTRUCTIONS>"}]}}),
             json!({"timestamp":"2026-08-28T23:18:40Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}),
             json!({"timestamp":"2026-08-28T23:18:41Z","type":"response_item","payload":{"type":"function_call","name":"shell"}}),
             json!({"timestamp":"2026-08-28T23:18:42Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hey John!"}]}}),
             json!({"timestamp":"2026-08-28T23:18:42Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":14},"last_token_usage":{"input_tokens":15612}}}}),
+            json!({"timestamp":"2026-08-28T23:18:43Z","type":"compacted","payload":{"message":"","replacement_history":[]}}),
         ]);
         assert_eq!(d.cwd.as_deref(), Some("/c"));
         assert_eq!(d.cli_version.as_deref(), Some("0.150.1"));
@@ -484,8 +518,42 @@ mod tests {
         assert_eq!(d.output_tokens, 14);
         assert_eq!(d.tool_calls, 1);
         assert_eq!(d.tools, vec![ToolCount { name: "shell".into(), count: 1 }]);
-        assert_eq!(d.first_prompt.as_deref(), Some("hi"));
+        assert_eq!(d.user_messages, 1, "the AGENTS.md preamble is not the conversation");
+        assert_eq!(d.first_prompt.as_deref(), Some("hi"), "the preamble is never the first prompt");
         assert_eq!(d.last_assistant.as_deref(), Some("Hey John!"));
+        assert_eq!(d.compactions, 1, "codex's `compacted` record counts too");
+    }
+
+    #[test]
+    fn a_message_that_merely_mentions_agents_md_is_kept() {
+        let d = feed(&[
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for this repo need a rewrite — draft one"}]}}),
+        ]);
+        assert_eq!(d.user_messages, 1, "no <INSTRUCTIONS> block: the person's own words");
+        assert_eq!(
+            d.first_prompt.as_deref(),
+            Some("# AGENTS.md instructions for this repo need a rewrite — draft one")
+        );
+    }
+
+    /// Both 0.150.1 exec spellings summarize to the shell command inside:
+    /// flagship `custom_tool_call` name `exec` with bare-`cmd:` JavaScript,
+    /// mini `function_call` name `exec_command` with JSON `arguments`.
+    /// [observed: codex-cli 0.150.1]
+    #[test]
+    fn codex_exec_one_liners_read_the_command() {
+        // Flagship: bare `cmd:` key, other keys quoted, plan call in the same input.
+        let js = line_events(&json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec",
+            "input":"const p = await tools.update_plan({plan:[\n  {step:\"Read hello.txt\",status:\"in_progress\"}\n]});\nconst r = await tools.exec_command({cmd:\"sed -n '1,200p' hello.txt\",\"workdir\":\"/w\"})"}}));
+        assert_eq!(js, vec![("exec".to_string(), "sed -n '1,200p' hello.txt".to_string())]);
+        // Older rollouts quote the key.
+        let quoted = line_events(&json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec",
+            "input":"const r = await tools.exec_command({\"cmd\":\"ls -la\"})"}}));
+        assert_eq!(quoted, vec![("exec".to_string(), "ls -la".to_string())]);
+        // Mini: JSON arguments on a declared `exec_command` tool.
+        let json_args = line_events(&json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command",
+            "arguments":"{\"cmd\":\"wc -c hello.txt\",\"workdir\":\"/w\",\"yield_time_ms\":10000,\"max_output_tokens\":4000}"}}));
+        assert_eq!(json_args, vec![("exec".to_string(), "wc -c hello.txt".to_string())]);
     }
 
     #[test]
@@ -561,7 +629,9 @@ fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)
                 .collect()
         }
     };
-    turns.retain(|(_, t)| !crate::sessions::is_only_system_block(t) && !t.trim().is_empty());
+    turns.retain(|(_, t)| {
+        !crate::sessions::is_only_system_block(t) && !is_codex_agents_preamble(t) && !t.trim().is_empty()
+    });
     // Adjacent same-role turns (an assistant that spoke, used a tool, spoke
     // again) read as one.
     let mut merged: Vec<(String, String)> = Vec::new();
@@ -620,7 +690,9 @@ fn conversation_rich_sync(session_id: &str, max_chars: usize) -> Vec<(String, St
                 .collect()
         }
     };
-    turns.retain(|(_, t)| !crate::sessions::is_only_system_block(t) && !t.trim().is_empty());
+    turns.retain(|(_, t)| {
+        !crate::sessions::is_only_system_block(t) && !is_codex_agents_preamble(t) && !t.trim().is_empty()
+    });
     let mut merged: Vec<(String, String)> = Vec::new();
     for (role, text) in turns {
         match merged.last_mut() {
@@ -723,7 +795,11 @@ fn line_events(v: &serde_json::Value) -> Vec<(String, String)> {
                             other => other.to_string(),
                         })
                         .unwrap_or_default();
-                    let (name, text) = if name == "exec" { codex_exec_summary(&input) } else { (name.to_string(), input) };
+                    let (name, text) = if name == "exec" || name == "exec_command" {
+                        codex_exec_summary(name, &input)
+                    } else {
+                        (name.to_string(), input)
+                    };
                     out.push((name, cap(&text)));
                 }
                 Some("reasoning") => {
@@ -750,20 +826,26 @@ fn line_events(v: &serde_json::Value) -> Vec<(String, String)> {
     out
 }
 
-/// Codex's `exec` input is a JavaScript snippet; a person cares what it did,
-/// not how it was invoked. `tools.exec_command({"cmd":…})` is a shell
-/// command — show the command. `tools.image_gen__imagegen({prompt:…})` is an
-/// image being generated — show it as one, with its prompt. Anything else
-/// stays raw.
-fn codex_exec_summary(input: &str) -> (String, String) {
+/// Codex's exec input, either spelling, down to what a person cares about —
+/// the shell command inside, not how it was invoked. Flagship models write
+/// `custom_tool_call` name `exec` whose input is a JavaScript snippet,
+/// `tools.exec_command({cmd:"…"})` — the `cmd` key BARE on current rollouts,
+/// quoted on older ones, so both are probed. Mini models write
+/// `function_call` name `exec_command` with JSON `arguments` carrying the
+/// same `"cmd"`. `tools.image_gen__imagegen({prompt:…})` is an image being
+/// generated — show it as one, with its prompt. Anything else stays raw.
+/// [observed: codex-cli 0.150.1; bare `cmd:` back to 0.147.0, quoted before]
+fn codex_exec_summary(name: &str, input: &str) -> (String, String) {
     if input.contains("tools.image_gen__imagegen(") {
         let text = js_string_after(input, "prompt:\"")
             .or_else(|| js_string_after(input, "prompt: \""))
             .unwrap_or_else(|| "Generating an image".into());
         return ("image".into(), text);
     }
-    if input.contains("tools.exec_command(") {
-        if let Some(cmd) = js_string_after(input, "\"cmd\":\"") {
+    if input.contains("tools.exec_command(") || name == "exec_command" {
+        if let Some(cmd) =
+            js_string_after(input, "\"cmd\":\"").or_else(|| js_string_after(input, "cmd:\""))
+        {
             return ("exec".into(), cmd);
         }
     }

@@ -659,6 +659,52 @@ fn codex_session_files_in(root: &std::path::Path, session_id: &str) -> Vec<std::
     mine.into_iter().map(|(_, p)| p).collect()
 }
 
+/// The model the session last ran a turn on, from the newest rollout's last
+/// `turn_context` record. Codex stamps one per turn:
+/// `{"type":"turn_context","payload":{…,"model":"gpt-5.4-mini","effort":"low",…}}`
+/// — so the last one is the model the session is actually on, resumes
+/// included (a resume appends its turns, and their `turn_context`, to the
+/// root rollout). `None` when no rollout carries one — a session old enough
+/// to predate the record, or one killed before its first turn.
+/// [observed: codex-cli 0.150.1]
+pub fn codex_session_model(session_id: &str) -> Option<String> {
+    codex_root().and_then(|r| codex_session_model_in(&r, session_id))
+}
+
+/// The body of [`codex_session_model`], over an explicit root so it can be
+/// tested against a directory built for the purpose.
+fn codex_session_model_in(root: &std::path::Path, session_id: &str) -> Option<String> {
+    use std::io::BufRead;
+    // Newest rollout first: the freshest file's turn_context is the current
+    // model; older rollouts only matter if the newest has none.
+    for path in codex_session_files_in(root, session_id).into_iter().rev() {
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        let mut last: Option<String> = None;
+        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+            if !line.contains("turn_context") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) != Some("turn_context") {
+                continue;
+            }
+            if let Some(m) = v
+                .pointer("/payload/model")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+            {
+                last = Some(m.to_string());
+            }
+        }
+        if last.is_some() {
+            return last;
+        }
+    }
+    None
+}
+
 /// One rollout file → its session row, or `None` if it is not a readable
 /// rollout. The unit both [`scan_codex_dir`] and [`CodexSessions::find_session_file`]
 /// build on, so the row a click selects and the file a delete moves are read
@@ -823,20 +869,37 @@ fn string_value(obj: &str, key: &str) -> Option<String> {
 /// `tools.update_plan({…})` — what current codex CLIs actually write to the
 /// rollout: the plan tool is reached through the exec JS runtime, so the
 /// arguments are source text, not JSON. Returns `(step, status)` pairs.
+///
+/// One exec input can carry SEVERAL `update_plan` calls, and the tool's
+/// semantics are replace-the-list — observed live: a closing exec called it
+/// twice, first marking a step in_progress, then marking everything
+/// completed. The LAST parseable call is the plan's final state; taking the
+/// first showed a finished session as in_progress. [observed: codex-cli 0.150.1]
 pub fn extract_js_plan(input: &str) -> Option<Vec<(String, String)>> {
-    let at = input.find("update_plan")?;
-    let rest = &input[at + "update_plan".len()..];
-    let arr = balanced(&rest[after_key(rest, "plan")?..], '[', ']')?;
-    let steps: Vec<(String, String)> = top_objects(arr)
-        .into_iter()
-        .filter_map(|obj| {
-            Some((
-                string_value(obj, "step")?,
-                string_value(obj, "status").unwrap_or_else(|| "pending".into()),
-            ))
-        })
-        .collect();
-    (!steps.is_empty()).then_some(steps)
+    let mut last: Option<Vec<(String, String)>> = None;
+    let mut from = 0;
+    while let Some(i) = input[from..].find("update_plan") {
+        from += i + "update_plan".len();
+        let rest = &input[from..];
+        let steps: Option<Vec<(String, String)>> = after_key(rest, "plan")
+            .and_then(|at| balanced(&rest[at..], '[', ']'))
+            .map(|arr| {
+                top_objects(arr)
+                    .into_iter()
+                    .filter_map(|obj| {
+                        Some((
+                            string_value(obj, "step")?,
+                            string_value(obj, "status").unwrap_or_else(|| "pending".into()),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|s| !s.is_empty());
+        if steps.is_some() {
+            last = steps;
+        }
+    }
+    last
 }
 
 /// File paths named by an `apply_patch` envelope embedded in an exec input.
@@ -1059,11 +1122,21 @@ impl AgentBackend for CodexBackend {
     }
 
     /// `codex resume <SESSION_ID>` — reopen a session by its UUID, confirmed on
-    /// codex-cli (`Session id (UUID) or session name`). No model/effort override:
-    /// resume reopens the session with the settings it already carries, unlike
-    /// [`Self::launch`], which is spelling out a fresh start.
+    /// codex-cli (`Session id (UUID) or session name`). The session's model is
+    /// re-passed explicitly, because resume does NOT keep it on its own: a
+    /// session started `-m gpt-5.4-mini` resumed its turn on the config-default
+    /// flagship (the resumed turn's `turn_context` read the default model, not
+    /// the session's), and `codex resume` takes `-m/--model` overrides of its
+    /// own — a faithful reopen must repeat the flag. The model is read from the
+    /// rollout's last `turn_context` ([`codex_session_model`]); a rollout
+    /// without one falls back to the bare command, which is the old behavior.
+    /// [observed: codex-cli 0.150.1]
     fn resume(&self, session_id: &str) -> Option<String> {
-        Some(format!("codex resume {}", q(session_id)))
+        let mut cmd = format!("codex resume {}", q(session_id));
+        if let Some(m) = codex_session_model(session_id) {
+            cmd.push_str(&format!(" --model {}", q(&m)));
+        }
+        Some(cmd)
     }
 
     /// Codex has no `--session-id`. `codex --help` offers `resume` and `fork`
@@ -2807,5 +2880,86 @@ mod codex_panel_tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], ("/tmp/a.md".to_string(), "Write"));
         assert_eq!(paths[1], ("/tmp/b.rs".to_string(), "Edit"));
+    }
+
+    /// One exec input, two `update_plan` calls — the observed 0.150.1 shape:
+    /// the closing exec marked step 2 in_progress, then everything completed.
+    /// The plan's final state is the LAST call; taking the first showed a
+    /// finished session as in_progress.
+    #[test]
+    fn the_last_update_plan_call_in_an_input_wins() {
+        let input = concat!(
+            "const a = await tools.update_plan({plan:[\n",
+            "  {step:\"Read hello.txt\",status:\"completed\"},\n",
+            "  {step:\"Summarize it\",status:\"in_progress\"}\n",
+            "]});\n",
+            "const b = await tools.update_plan({plan:[\n",
+            "  {step:\"Read hello.txt\",status:\"completed\"},\n",
+            "  {step:\"Summarize it\",status:\"completed\"}\n",
+            "]});\n",
+            "text(JSON.stringify({first:a, second:b}));\n"
+        );
+        let plan = extract_js_plan(input).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[1], ("Summarize it".to_string(), "completed".to_string()));
+    }
+
+    /// A trailing mention of the tool with no plan of its own must not erase
+    /// a real plan earlier in the same input.
+    #[test]
+    fn an_unparseable_trailing_mention_keeps_the_earlier_plan() {
+        let input = concat!(
+            "const p = await tools.update_plan({plan:[{step:\"Do it\",status:\"completed\"}]});\n",
+            "text(\"update_plan done\");\n"
+        );
+        let plan = extract_js_plan(input).unwrap();
+        assert_eq!(plan, vec![("Do it".to_string(), "completed".to_string())]);
+    }
+
+    /// The resumed session's model comes from the newest rollout's LAST
+    /// `turn_context` — codex stamps one per turn, and a resume appends new
+    /// turns (with a fresh turn_context) to the same file. A session with no
+    /// turn_context anywhere yields `None`, the old bare-resume behavior.
+    #[test]
+    fn the_session_model_is_the_newest_rollouts_last_turn_context() {
+        use std::io::Write;
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join("aiterm-codex-model-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, sid: &str, secs: u64, body: &str| {
+            let p = dir.join(name);
+            let mut f = std::fs::File::create(&p).unwrap();
+            writeln!(f, "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/p\"}}}}").unwrap();
+            write!(f, "{body}").unwrap();
+            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+        };
+        // Older rollout on the flagship; the newest carries two turn_contexts
+        // — the session was started on mini and its last turn stayed there.
+        write(
+            "rollout-a-1.jsonl",
+            "sess-m",
+            100,
+            "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\",\"effort\":\"high\"}}\n",
+        );
+        write(
+            "rollout-b-2.jsonl",
+            "sess-m",
+            200,
+            concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6-sol\",\"effort\":\"high\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.4-mini\",\"effort\":\"low\"}}\n",
+            ),
+        );
+        write("rollout-c-3.jsonl", "sess-bare", 300, "");
+
+        assert_eq!(
+            codex_session_model_in(&dir, "sess-m"),
+            Some("gpt-5.4-mini".to_string())
+        );
+        assert_eq!(codex_session_model_in(&dir, "sess-bare"), None);
+        assert_eq!(codex_session_model_in(&dir, "sess-nothing"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

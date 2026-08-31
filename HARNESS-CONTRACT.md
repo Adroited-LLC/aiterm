@@ -28,16 +28,22 @@ read off. Training-data memory of a CLI's formats is usually stale.
 ## 3. Conversation parsing  (`detail.rs`)
 - Turn encoding: roles, text blocks, tool calls, tool results, reasoning.
 - What the phone hides: tool outputs, harness preambles (codex sends
-  AGENTS.md as its own first "user" message), env blocks.
+  AGENTS.md as its own first "user" message, untagged, BEFORE its
+  <INSTRUCTIONS> block; grok ≥1.0.13 splits the first prompt into four
+  "user" lines — user_info/rules, two system_reminder lines, then the
+  real user_query), env blocks.
 - Tool-input summaries: the person-readable one-liner per tool call
   (codex `exec` JS → the shell command inside; image_gen → the prompt).
 
 ## 4. Busy / needs-you  (`remote.rs` transcript_state, `pty.rs` activity)
-- Turn-in-flight signal: explicit events (codex task_started/complete),
-  last-role (claude), open tool_calls (grok).
-- Waiting-on-a-person signal: bell/OSC 9 (claude), or inference — an
-  unanswered tool call plus a transcript quiet for ~45s (codex approval
-  prompts write NOTHING while up).
+- Turn-in-flight signal: explicit events (codex task_started/complete;
+  grok ≥1.0.13 turn_started/turn_ended in the session's events.jsonl),
+  last-role (claude), open tool_calls (grok pre-events fallback).
+- Waiting-on-a-person signal: an explicit event where the engine writes
+  one (grok ≥1.0.13 permission_requested/permission_resolved), bell/OSC 9
+  (claude), or inference — an unanswered tool call plus a transcript
+  quiet for ~45s (codex approval prompts write NOTHING while up; no
+  approval record exists in any rollout 0.144→0.150.1).
 - Terminal: OSC 9;4 progress? bell? If neither, output cadence is the
   only working signal.
 
@@ -68,7 +74,12 @@ read off. Training-data memory of a CLI's formats is usually stale.
 - Stop: daemon roster (claude) vs pty-tree kill (everyone else).
 - Delete/trash: safe for files; a session that is a DIRECTORY (grok)
   needs directory trash or no button — half-working is worse.
-- Fork / clear / compaction: claude-only unless proven otherwise.
+- Fork / clear / compaction: NOT claude-only — proven otherwise 2026-08-31.
+  Codex writes `compacted` records (0.150.1); grok has /compact, auto-compact
+  at 80%, and on-disk compaction dirs (1.0.13). Fork lineage diverges: grok
+  stamps parent_session_id in the child's summary.json; claude --fork-session
+  (2.1.251) is a full replay with re-minted uuids and NO parent trace — the
+  launcher must record lineage itself if it wants any.
 
 ## 10. Version stamp
 Every answer above rots. Stamp the adapter's doc comments with the CLI

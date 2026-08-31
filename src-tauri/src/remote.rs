@@ -1121,15 +1121,99 @@ fn transcript_busy(session_id: &str) -> bool {
     transcript_state(session_id).is_some()
 }
 
-/// `Some("working")`, `Some("attention")` — codex mid-approval — or `None`.
+/// The tail of `path`, at most `keep` bytes. `None` for a missing file or a
+/// tail that is not valid UTF-8 from the seek point — the same shrug the
+/// transcript read below gives.
+fn tail_of(path: &std::path::Path, keep: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(keep))).ok()?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// The verdict from grok's explicit state events, read off the tail of the
+/// session dir's `events.jsonl`. [observed: grok 1.0.13]
+///
+/// Grok now writes codex-style turn brackets plus something neither other
+/// engine records — an explicit waiting-on-a-person event:
+///
+/// ```text
+/// {"ts":"…","type":"turn_started","session_id":"…","turn_number":0,"model_id":"grok-4.6",…}
+/// {"ts":"…","type":"permission_requested","tool_name":"write"}
+/// {"ts":"…","type":"permission_resolved","tool_name":"write","decision":"allow","wait_ms":0}
+/// {"ts":"…","type":"turn_ended","outcome":"completed"}
+/// ```
+///
+/// These are transcript facts and outrank the open-tool_call + cadence
+/// inference (HARNESS-CONTRACT.md, "The state machine"): an open bracket is
+/// working, an unresolved `permission_requested` is attention with no
+/// 45-second wait, and a closed bracket is idle even when `chat_history.jsonl`
+/// ends on a bare user/tool_result line from a killed run — the case the
+/// inference reads as stuck-working forever. A cancelled turn is still
+/// `turn_ended` (`outcome:"cancelled"`), so the bracket closes either way.
+///
+/// Nested option: `Some(state)` is a verdict (`Some(None)` = idle); the
+/// outer `None` means the tail carries no bracket at all — an events file
+/// from before the first turn, or a tail cut inside one turn's phase spam —
+/// and the caller falls back to the chat_history inference, which is also
+/// all that older grok sessions (no events.jsonl) have.
+fn grok_events_state(text: &str) -> Option<Option<&'static str>> {
+    let (mut open_turn, mut open_permission, mut saw_bracket) = (false, false, false);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("turn_started") => {
+                saw_bracket = true;
+                open_turn = true;
+                open_permission = false;
+            }
+            Some("turn_ended") => {
+                saw_bracket = true;
+                open_turn = false;
+                open_permission = false;
+            }
+            Some("permission_requested") => open_permission = true,
+            Some("permission_resolved") => open_permission = false,
+            _ => {}
+        }
+    }
+    if open_permission {
+        // A fact on its own: the prompt is up whether or not the tail still
+        // holds the turn_started that preceded it.
+        return Some(Some("attention"));
+    }
+    saw_bracket.then(|| open_turn.then_some("working"))
+}
+
+/// `Some("working")`, `Some("attention")` — codex mid-approval, or a grok
+/// permission prompt — or `None`.
 /// Public within the crate: the pty layer consults it before believing a
 /// quiet terminal means an idle session.
 /// Codex writes nothing while its approval prompt is up, so "waiting on a
 /// person" is read as: a turn in progress whose last act is a tool call
-/// with no output, and a transcript that has gone quiet.
+/// with no output, and a transcript that has gone quiet. Grok ≥1.0.13 writes
+/// explicit events instead ([`grok_events_state`]), which short-circuit that
+/// inference for grok sessions only.
 pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
     let list = crate::agents::backends();
     let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return None };
+    // Grok ≥1.0.13: the transcript sits in a session DIRECTORY named by the
+    // session id, and `events.jsonl` beside it carries explicit state events
+    // that replace the inference below. Grok only by construction: claude and
+    // codex transcripts never sit in a directory named after their session,
+    // so they cannot take this branch. Older grok sessions have no
+    // events.jsonl and fall through to the open-tool_call inference.
+    // [observed: grok 1.0.13]
+    if let Some(dir) = path.parent().filter(|d| d.file_name().is_some_and(|n| n == session_id)) {
+        if let Some(text) = tail_of(&dir.join("events.jsonl"), 256 * 1024) {
+            if let Some(verdict) = grok_events_state(&text) {
+                return verdict;
+            }
+        }
+    }
     let stale = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -1825,5 +1909,70 @@ mod tests {
     fn the_name_survives_a_uri() {
         assert_eq!(percent_encode("john-laptop"), "john-laptop");
         assert_eq!(percent_encode("John's PC"), "John%27s%20PC");
+    }
+
+    // grok_events_state — event lines below are verbatim from real grok
+    // 1.0.13 sessions (harness-audit/grok.md §4).
+
+    #[test]
+    fn an_open_grok_turn_bracket_is_working() {
+        let text = concat!(
+            r#"{"ts":"2026-08-31T13:51:54.907Z","type":"turn_started","session_id":"01a05817-4052-7641-aa1f-18c5c845f914","turn_number":0,"model_id":"grok-4.6","yolo_mode":true,"conversation_message_count":3,"session_relationship":"primary","schema_version":"1.0"}"#, "\n",
+            r#"{"ts":"2026-08-31T13:51:57.388Z","type":"phase_changed","phase":"streaming_reasoning"}"#, "\n",
+        );
+        assert_eq!(grok_events_state(text), Some(Some("working")));
+    }
+
+    #[test]
+    fn a_closed_grok_turn_bracket_is_an_idle_verdict_not_a_fallback() {
+        // The case the chat_history inference gets wrong: a transcript ending
+        // on a bare tool_result reads as working forever; the closed bracket
+        // says idle, and says it as a verdict.
+        let text = concat!(
+            r#"{"ts":"2026-08-31T13:51:54.907Z","type":"turn_started","session_id":"01a05817-4052-7641-aa1f-18c5c845f914","turn_number":0,"model_id":"grok-4.6","yolo_mode":true,"conversation_message_count":3,"session_relationship":"primary","schema_version":"1.0"}"#, "\n",
+            r#"{"ts":"2026-08-31T13:51:58.009Z","type":"turn_ended","outcome":"completed"}"#, "\n",
+        );
+        assert_eq!(grok_events_state(text), Some(None));
+        // A cancelled turn closes the bracket the same way.
+        let cancelled = concat!(
+            r#"{"ts":"2026-08-17T11:42:20.000Z","type":"turn_started","session_id":"x","turn_number":4,"model_id":"grok-4.6","schema_version":"1.0"}"#, "\n",
+            r#"{"ts":"2026-08-17T11:42:35.043Z","type":"turn_ended","outcome":"cancelled","cancellation_category":"mid_turn_abort","cancellation_context":{"trigger":"ctrl_c"}}"#, "\n",
+        );
+        assert_eq!(grok_events_state(cancelled), Some(None));
+    }
+
+    #[test]
+    fn an_unresolved_grok_permission_is_attention() {
+        let text = concat!(
+            r#"{"ts":"2026-08-31T13:47:00.000Z","type":"turn_started","session_id":"e761294d-0000-0000-0000-000000000000","turn_number":1,"model_id":"grok-4.6","schema_version":"1.0"}"#, "\n",
+            r#"{"ts":"2026-08-31T13:47:04.034Z","type":"permission_requested","tool_name":"write"}"#, "\n",
+        );
+        assert_eq!(grok_events_state(text), Some(Some("attention")));
+        // Even when the tail was cut inside the turn and the bracket is gone,
+        // the unresolved prompt alone is a fact.
+        let cut = concat!(r#"{"ts":"2026-08-31T13:47:04.034Z","type":"permission_requested","tool_name":"write"}"#, "\n");
+        assert_eq!(grok_events_state(cut), Some(Some("attention")));
+    }
+
+    #[test]
+    fn a_resolved_grok_permission_goes_back_to_working() {
+        let text = concat!(
+            r#"{"ts":"2026-08-31T13:47:00.000Z","type":"turn_started","session_id":"e761294d-0000-0000-0000-000000000000","turn_number":1,"model_id":"grok-4.6","schema_version":"1.0"}"#, "\n",
+            r#"{"ts":"2026-08-31T13:47:04.034Z","type":"permission_requested","tool_name":"write"}"#, "\n",
+            r#"{"ts":"2026-08-31T13:47:04.034Z","type":"permission_resolved","tool_name":"write","decision":"allow","wait_ms":0}"#, "\n",
+        );
+        assert_eq!(grok_events_state(text), Some(Some("working")));
+    }
+
+    #[test]
+    fn grok_events_without_a_bracket_are_no_verdict() {
+        // Pre-first-turn bookkeeping only — the caller must fall back to the
+        // chat_history inference rather than call the session idle.
+        let text = concat!(
+            r#"{"ts":"2026-08-31T13:51:54.002Z","type":"mcp_config_resolved","servers":[{"name":"headroom","transport":"stdio","source":"local"}],"disabled":[]}"#, "\n",
+            r#"{"ts":"2026-08-31T13:51:54.485Z","type":"mcp_init_completed","total_servers":2,"succeeded":2,"failed":0,"auth_required":0,"total_tools":4,"duration_ms":471,"is_reinit":false}"#, "\n",
+        );
+        assert_eq!(grok_events_state(text), None);
+        assert_eq!(grok_events_state(""), None);
     }
 }

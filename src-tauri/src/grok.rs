@@ -211,6 +211,13 @@ pub fn parse_messages(text: &str) -> Vec<(String, String)> {
             if role != "user" && role != "assistant" {
                 return None;
             }
+            // The engine talking to itself in the user's seat — the skills
+            // and MCP lists open every session as two
+            // `synthetic_reason:"system_reminder"` user lines.
+            // [observed: grok 1.0.13]
+            if role == "user" && v.get("synthetic_reason").is_some() {
+                return None;
+            }
             let body = match v.get("content")? {
                 serde_json::Value::String(s) => s.clone(),
                 serde_json::Value::Array(parts) => parts
@@ -221,6 +228,12 @@ pub fn parse_messages(text: &str) -> Vec<(String, String)> {
                 _ => return None,
             };
             let body = if role == "user" { user_query(&body) } else { body };
+            // The opening `<user_info>`/`<rules>` line has no query in it;
+            // stripped of its tags it is nothing, and nothing is what it
+            // should count as. [observed: grok 1.0.13]
+            if role == "user" && crate::sessions::is_only_system_block(&body) {
+                return None;
+            }
             let body = body.trim();
             (!body.is_empty()).then(|| (role.to_string(), body.to_string()))
         })
@@ -229,9 +242,14 @@ pub fn parse_messages(text: &str) -> Vec<(String, String)> {
 
 /// What the person typed, out of a user turn.
 ///
-/// Grok wraps the first prompt in the environment it injects — `<user_info>`,
-/// `<git_status>`, the agents files — and puts the words themselves inside
-/// `<user_query>`. A turn with no such tag is the words already.
+/// Grok puts the words themselves inside `<user_query>`; a turn with no such
+/// tag is the words already. Up to 1.0.5 the first prompt arrived as ONE user
+/// message wrapping the environment (`<user_info>`, `<git_status>`, the
+/// agents files) around the query; 1.0.13 splits it into FOUR user lines —
+/// the `<user_info>`/`<rules>` block alone (no `<user_query>` in it), two
+/// `synthetic_reason:"system_reminder"` lines (skills list, MCP list), then
+/// the real query — so callers also need the synthetic-line and
+/// strips-to-nothing guards. [observed: grok 1.0.13]
 fn user_query(body: &str) -> String {
     match (body.find("<user_query>"), body.rfind("</user_query>")) {
         (Some(a), Some(b)) if a + "<user_query>".len() <= b => {
@@ -690,6 +708,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The 1.0.5 combined shape: one first user message wrapping the
+    /// environment around `<user_query>`. Still parsed — old transcripts
+    /// stay readable.
     #[test]
     fn the_preview_is_the_conversation_and_not_the_machinery() {
         let log = concat!(
@@ -709,6 +730,32 @@ mod tests {
                 ("assistant".to_string(), "Fixed it.".to_string()),
                 ("user".to_string(), "thanks".to_string()),
             ]
+        );
+    }
+
+    /// grok 1.0.13 opens a session with FOUR user lines — the
+    /// `<user_info>`/`<rules>` block alone, two
+    /// `synthetic_reason:"system_reminder"` lines (skills, MCP), then the
+    /// real `<user_query>` — and only the last is the person.
+    /// [observed: grok 1.0.13, session 01a05817-4052-…]
+    #[test]
+    fn the_preview_drops_the_four_line_preamble() {
+        let log = concat!(
+            r#"{"type":"system","content":"You are Grok 4.6 released by xAI."}"#, "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: linux\nWorkspace Path: /tmp/grok-specimen\n</user_info>\n\n<rules>\n<user_rule>be brief</user_rule>\n</rules>"}]}"#, "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>\nThe following skills are available for use:\n\n- ai-seo: …\n</system-reminder>"}],"synthetic_reason":"system_reminder"}"#, "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>\nMCP servers connected:\n- memory-index (1 tool)\n</system-reminder>"}],"synthetic_reason":"system_reminder"}"#, "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nSay hi briefly then wait\n</user_query>"}],"prompt_index":0}"#, "\n",
+            r#"{"type":"assistant","content":"Hi."}"#, "\n",
+        );
+        let msgs = parse_messages(log);
+        assert_eq!(
+            msgs,
+            vec![
+                ("user".to_string(), "Say hi briefly then wait".to_string()),
+                ("assistant".to_string(), "Hi.".to_string()),
+            ],
+            "no boilerplate bubbles ahead of the real prompt"
         );
     }
 

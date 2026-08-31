@@ -363,7 +363,31 @@ pub(crate) fn strip_system_tags(text: &str) -> String {
 /// with real text is indexed whole, because guessing which half to keep is how
 /// you lose the half somebody wanted to find.
 pub(crate) fn is_only_system_block(text: &str) -> bool {
+    if is_codex_agents_preamble(text) {
+        return true;
+    }
     !text.trim().is_empty() && strip_system_tags(text).trim().is_empty()
+}
+
+/// Codex sends the repo's AGENTS.md as its own first "user" message: an
+/// untagged `# AGENTS.md instructions for <cwd>` header ahead of an
+/// `<INSTRUCTIONS>…</INSTRUCTIONS>` block. The whole-block system filter
+/// keeps it — stripping the tags leaves the header line — so it has to be
+/// named here: harness preamble, never a preview row or an index entry.
+/// Both the header AND the block are required, so a genuine message that
+/// merely mentions AGENTS.md is not swallowed. Checked against the RAW
+/// text, before tags are stripped. Older rollouts (0.147.0–0.149.1) put a
+/// `<recommended_plugins>` block ahead of the header — skip it before the
+/// prefix check. Mirrors `detail.rs`'s predicate of the same name — keep
+/// the two in step. [observed: codex-cli 0.150.1]
+fn is_codex_agents_preamble(text: &str) -> bool {
+    let mut t = text.trim_start();
+    if t.starts_with("<recommended_plugins>") {
+        if let Some(end) = t.find("</recommended_plugins>") {
+            t = t[end + "</recommended_plugins>".len()..].trim_start();
+        }
+    }
+    t.starts_with("# AGENTS.md instructions for ") && t.contains("<INSTRUCTIONS>")
 }
 
 /// System-injected meta prompts (memory summarizers, compression runs) that
@@ -737,6 +761,22 @@ fn session_delete_sync(session_id: String) -> Result<(), String> {
     if backend.id() == "codex" {
         stash_codex_rollouts(&session_id, &trash);
     }
+    // Claude Code 2.1.251 keeps a per-session DIRECTORY beside the transcript —
+    // `<project>/<sid>/`, holding `subagents/` transcripts and `tool-results/` —
+    // so the jsonl alone is no longer the whole session. Left behind it is
+    // orphaned litter no scan will ever list again. It rides the same trash
+    // mechanism as everything else (rename, never a remove), so restore puts it
+    // back and the keep-window purge is what finally lets go of it.
+    // [observed: Claude Code 2.1.251]
+    if backend.id() == "claude" {
+        let sess_dir = path.with_extension("");
+        if sess_dir.is_dir() {
+            let dir_dest = trash.join(format!("{session_id}.sessiondir"));
+            if std::fs::rename(&sess_dir, &dir_dest).is_ok() {
+                touch(&dir_dest);
+            }
+        }
+    }
     let tasks = home.join(".claude/tasks").join(&session_id);
     if tasks.is_dir() {
         let tasks_dest = trash.join(format!("{session_id}.tasks"));
@@ -916,7 +956,7 @@ fn trash_restore_sync(session_id: String) -> Result<(), String> {
         std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&origin);
         restore_codex_rollouts(&trash, &session_id);
-        return restore_claude_sidecars(&trash, &session_id);
+        return restore_claude_sidecars(&trash, &session_id, &dest);
     }
 
     // No sidecar: trashed before this was recorded, so fall back to deducing a
@@ -946,10 +986,10 @@ fn trash_restore_sync(session_id: String) -> Result<(), String> {
         .and_then(|(_, p)| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| home.join(".claude/projects").join(flatten_project_dir(&cwd)));
     std::fs::create_dir_all(&proj_dir).map_err(|e| e.to_string())?;
-    std::fs::rename(&src, proj_dir.join(format!("{session_id}.jsonl")))
-        .map_err(|e| e.to_string())?;
+    let dest = proj_dir.join(format!("{session_id}.jsonl"));
+    std::fs::rename(&src, &dest).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(trash.join(format!("{session_id}.origin")));
-    restore_claude_sidecars(&trash, &session_id)
+    restore_claude_sidecars(&trash, &session_id, &dest)
 }
 
 /// The path a `.origin` sidecar names, if it names a usable one.
@@ -1050,7 +1090,11 @@ fn restore_codex_rollouts(trash: &Path, session_id: &str) {
     let _ = std::fs::remove_dir(&dir);
 }
 
-fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String> {
+fn restore_claude_sidecars(
+    trash: &Path,
+    session_id: &str,
+    transcript_dest: &Path,
+) -> Result<(), String> {
     let home = dirs::home_dir().ok_or("no home dir")?;
     let tasks_src = trash.join(format!("{session_id}.tasks"));
     if tasks_src.is_dir() {
@@ -1061,6 +1105,17 @@ fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String>
         let jobs = home.join(".claude/jobs");
         let _ = std::fs::create_dir_all(&jobs);
         let _ = std::fs::rename(&job_src, jobs.join(job_dir_name(&job_src, session_id)));
+    }
+    // The per-session directory (`<project>/<sid>/` — subagents, tool-results;
+    // see session_delete) goes back beside wherever the transcript landed. One
+    // already sitting there came back by another route and is left alone, per
+    // the rollout-restore stance. [observed: Claude Code 2.1.251]
+    let dir_src = trash.join(format!("{session_id}.sessiondir"));
+    if dir_src.is_dir() {
+        let dir_dest = transcript_dest.with_extension("");
+        if !dir_dest.exists() {
+            let _ = std::fs::rename(&dir_src, &dir_dest);
+        }
     }
     Ok(())
 }
@@ -1082,6 +1137,10 @@ fn trash_delete_sync(session_id: String) -> Result<(), String> {
     let job = trash.join(format!("{session_id}.job"));
     if job.is_dir() {
         let _ = std::fs::remove_dir_all(job);
+    }
+    let sess_dir = trash.join(format!("{session_id}.sessiondir"));
+    if sess_dir.is_dir() {
+        let _ = std::fs::remove_dir_all(sess_dir);
     }
     // The rest of a Codex conversation goes with it — the entry that named
     // them is gone, so leaving them would be leaking a set nothing can restore.
@@ -1233,6 +1292,11 @@ fn session_preview_sync(session_id: String) -> Vec<PreviewMsg> {
         let Some((role, text)) = line_message(&v) else {
             continue;
         };
+        // On the RAW text: stripped, the codex preamble is a bare header
+        // line the empty-check below would keep.
+        if role == "user" && is_codex_agents_preamble(&text) {
+            continue;
+        }
         let text = strip_system_tags(&text);
         if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
             continue;
@@ -1262,6 +1326,9 @@ fn preview_from_messages(msgs: Vec<(String, String)>) -> Vec<PreviewMsg> {
     let mut out: Vec<PreviewMsg> = msgs
         .into_iter()
         .filter_map(|(role, text)| {
+            if role == "user" && is_codex_agents_preamble(&text) {
+                return None;
+            }
             let text = strip_system_tags(&text);
             if text.trim().is_empty() || (role == "user" && is_system_meta_prompt(&text)) {
                 return None;
@@ -2229,9 +2296,10 @@ static ROSTER: crate::cache::TtlCache<Vec<RosterEntry>> =
     crate::cache::TtlCache::new(ROSTER_TTL);
 
 /// The roster, minus finished sessions. `claude agents --json` keeps reporting
-/// a session with `state: "done"`, so "appears in the roster" is not the same
-/// question as "is running" — counting those made dead sessions look alive and
-/// suppressed Resume on rows that were perfectly resumable.
+/// a session with `state: "done"` — and pid-less `state: "blocked"` corpses
+/// weeks after their processes died — so "appears in the roster" is not the
+/// same question as "is running": counting those made dead sessions look alive
+/// and suppressed Resume on rows that were perfectly resumable.
 ///
 /// May be up to `ROSTER_TTL` old. Use `read_roster_fresh` where the answer is
 /// being used to decide whether something you just did worked.
@@ -2342,6 +2410,18 @@ fn roster_from_cli() -> Vec<RosterEntry> {
     };
     list.iter()
         .filter(|a| a.get("state").and_then(|s| s.as_str()) != Some("done"))
+        // `state:"blocked"` with no `pid` field is a dead entry the daemon
+        // never reaped: a roster read on 2026-08-31 listed a dozen of them
+        // with weeks-old `startedAt` and no matching process anywhere.
+        // Counted as live they wear green dots forever and land on the
+        // unstoppable list, warning Resume off perfectly resumable rows. A
+        // *live* blocked session reports a pid (observed beside them: a
+        // blocked bg entry whose `bg-spare` pid was alive) and is kept —
+        // blocked-with-a-dead-pid falls to the pid check below.
+        // [observed: Claude Code 2.1.251]
+        .filter(|a| {
+            a.get("state").and_then(|s| s.as_str()) != Some("blocked") || a.get("pid").is_some()
+        })
         .filter_map(|a| {
             let session_id = a.get("sessionId")?.as_str()?.to_owned();
             let pid = a.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
@@ -2485,12 +2565,49 @@ fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
     let Some(path) = resolve_live_session_file(&session_id) else {
         return vec![];
     };
-    let Ok(file) = File::open(&path) else {
-        return vec![];
-    };
-    const TOOLS: [&str; 4] = ["Write", "Edit", "NotebookEdit", "MultiEdit"];
     let mut latest: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
+    scan_artifact_writes(&path, &mut latest);
+    // Subagent writes belong to this session too. Claude Code 2.1.251 keeps
+    // sidechain transcripts as separate files — `<project>/<sid>/subagents/
+    // agent-<agentId>.jsonl`, records stamped with the *parent's* sessionId —
+    // no longer inline in the main jsonl, so a file a subagent wrote never
+    // appeared here. Same record shapes as the main transcript, same scan.
+    // Older transcripts with inline `isSidechain:true` records keep working:
+    // the main-file scan never filtered on it. [observed: Claude Code 2.1.251]
+    let subagents = path.with_extension("").join("subagents");
+    if let Ok(rd) = std::fs::read_dir(&subagents) {
+        let mut files: Vec<std::path::PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .collect();
+        // Deterministic merge order; ties on a path still resolve by timestamp.
+        files.sort();
+        for f in files {
+            scan_artifact_writes(&f, &mut latest);
+        }
+    }
+    let mut artifacts: Vec<Artifact> = latest
+        .into_iter()
+        .map(|(path, (tool, at))| Artifact { path, tool, at })
+        .collect();
+    artifacts.sort_by(|a, b| b.at.cmp(&a.at));
+    artifacts
+}
+
+/// One transcript's Write/Edit/NotebookEdit/MultiEdit `tool_use` calls, merged
+/// into `latest` keyed by file path — the newest call per path wins, compared
+/// by the record's ISO timestamp so merging the main transcript with subagent
+/// transcripts cannot let an older write shadow a newer one.
+fn scan_artifact_writes(
+    path: &Path,
+    latest: &mut std::collections::HashMap<String, (String, String)>,
+) {
+    let Ok(file) = File::open(path) else {
+        return;
+    };
+    const TOOLS: [&str; 4] = ["Write", "Edit", "NotebookEdit", "MultiEdit"];
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if !line.contains("file_path") || !line.contains("tool_use") {
             continue;
@@ -2517,16 +2634,15 @@ fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
                 continue;
             }
             if let Some(fp) = block.pointer("/input/file_path").and_then(|f| f.as_str()) {
-                latest.insert(fp.to_string(), (tool.to_string(), ts.clone()));
+                // ISO timestamps order lexicographically; `>=` keeps the old
+                // last-line-wins behaviour within a single file.
+                let newer = latest.get(fp).is_none_or(|(_, at)| ts.as_str() >= at.as_str());
+                if newer {
+                    latest.insert(fp.to_string(), (tool.to_string(), ts.clone()));
+                }
             }
         }
     }
-    let mut artifacts: Vec<Artifact> = latest
-        .into_iter()
-        .map(|(path, (tool, at))| Artifact { path, tool, at })
-        .collect();
-    artifacts.sort_by(|a, b| b.at.cmp(&a.at));
-    artifacts
 }
 
 #[derive(Serialize, Default)]
@@ -3395,6 +3511,32 @@ mod tests {
         assert!(!is_only_system_block(""));
     }
 
+    /// Codex's AGENTS.md preamble — an untagged `# AGENTS.md instructions
+    /// for <cwd>` header ahead of an `<INSTRUCTIONS>` block, opening the
+    /// first user message of every rollout in that repo — is boilerplate,
+    /// not something anyone typed. Both halves are required: a genuine
+    /// message that merely mentions AGENTS.md stays indexed and previewed.
+    /// Shape as observed in real rollouts on this machine.
+    /// [observed: codex-cli 0.150.1]
+    #[test]
+    fn the_codex_agents_preamble_is_boilerplate_not_a_message() {
+        let preamble = "# AGENTS.md instructions for /home/john/nanoclaw\n\n\
+            <INSTRUCTIONS>\n# Agent start — /home/john/nanoclaw\n\n\
+            **This file is the rulebook.**\n</INSTRUCTIONS>";
+        assert!(is_codex_agents_preamble(preamble));
+        assert!(is_only_system_block(preamble), "the indexer consumes it through this predicate");
+        // Header without the block, and the block without the header: kept.
+        assert!(!is_codex_agents_preamble(
+            "# AGENTS.md instructions for /x say, why does codex send this?"
+        ));
+        assert!(!is_codex_agents_preamble(
+            "please add an <INSTRUCTIONS> block to AGENTS.md"
+        ));
+        // A stripped preamble is the bare header line — the reason the
+        // check runs on RAW text, before tags come out.
+        assert!(!is_codex_agents_preamble(&strip_system_tags(preamble)));
+    }
+
     #[test]
     fn a_recorded_origin_sends_a_rollout_back_where_it_came_from() {
         // The case this whole sidecar exists for: deducing a destination from
@@ -3916,6 +4058,96 @@ mod tests {
         assert_eq!(s.project_path, "/home/x/proj/.claude/worktrees/wip/src-tauri");
         assert_eq!(s.group_path, "/home/x/proj");
     }
+
+    /* ---- grok session_kind / fork lineage ------------------------------- */
+
+    /// Field locations as grok 1.0.13 writes them, recorded off real
+    /// summary.json bodies on 2026-08-31: `session_kind` and
+    /// `parent_session_id` sit at the TOP level, beside `info` — not inside
+    /// it. A subagent child hides; a headless run stays; a fork child (the
+    /// live `--fork-session` specimen was headless AND forked) carries its
+    /// parent. [observed: grok 1.0.13]
+    #[test]
+    fn grok_summary_kind_and_lineage_read_where_1_0_13_writes_them() {
+        // Verbatim (trimmed) from a real subagent child under
+        // ~/.grok/sessions/%2Fhome%2Fjohn%2Fnanoclaw/.
+        let subagent = r#"{"info":{"id":"01a01a76-6574-7d03-b980-dbf13a21f3b4","cwd":"/home/john/nanoclaw"},"session_summary":"Version-control live aan-native theme (#130)","session_kind":"subagent","current_model_id":"grok-4.6","agent_name":"general-purpose"}"#;
+        let m = grok_row_meta_from_summary(subagent);
+        assert!(m.subagent, "session_kind:\"subagent\" must hide the row");
+        assert_eq!(m.fork_parent, None);
+
+        // Verbatim (trimmed) from the audit's live fork specimen — a headless
+        // fork child. Headless must NOT hide; the parent must be read.
+        let fork_child = r#"{"info":{"id":"3dfec75c-813a-4ef0-a55e-cf0e5d0a50d4","cwd":"/home/john/.claude/jobs/8f258164/tmp/grok-specimen"},"session_summary":"Create a file named hello.txt in the current directory containing","session_kind":"headless","parent_session_id":"e761294d-49af-4c36-8a22-481d77a05f39","current_model_id":"grok-4.6","agent_name":"grok-build-plan"}"#;
+        let m = grok_row_meta_from_summary(fork_child);
+        assert!(!m.subagent, "headless -p runs are the person's own sessions");
+        assert_eq!(
+            m.fork_parent.as_deref(),
+            Some("e761294d-49af-4c36-8a22-481d77a05f39"),
+        );
+
+        // Interactive sessions carry neither field.
+        let interactive = r#"{"info":{"id":"01a043d8-3c53-7900-a612-ef62d4c72245","cwd":"/home/john/nanoclaw"},"session_summary":"Some chat","current_model_id":"grok-4.6"}"#;
+        let m = grok_row_meta_from_summary(interactive);
+        assert!(!m.subagent);
+        assert_eq!(m.fork_parent, None);
+    }
+
+    /// `grok_row_meta` reads summary.json beside the row's transcript path —
+    /// the path grok's scan hands over points inside the session directory.
+    #[test]
+    fn grok_row_meta_reads_beside_the_transcript() {
+        let dir = std::env::temp_dir().join("aiterm-test-grok-row-meta");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("summary.json"),
+            r#"{"info":{"id":"x","cwd":"/tmp"},"session_summary":"t","session_kind":"subagent"}"#,
+        )
+        .unwrap();
+        let chat = dir.join("chat_history.jsonl");
+        std::fs::write(&chat, "").unwrap();
+        assert!(grok_row_meta(&chat).subagent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /* ---- claude subagent artifact writes -------------------------------- */
+
+    /// Subagent transcripts (`<project>/<sid>/subagents/agent-<id>.jsonl`,
+    /// Claude Code 2.1.251) carry the same Write/Edit tool_use shapes as the
+    /// main jsonl and merge into the same artifact set — with the newest write
+    /// per path winning by timestamp, whichever file it came from.
+    #[test]
+    fn subagent_writes_merge_into_the_session_artifacts() {
+        let dir = std::env::temp_dir().join("aiterm-test-subagent-artifacts");
+        let _ = std::fs::remove_dir_all(&dir);
+        let sid = "99999999-9999-4999-8999-999999999999";
+        let sub = dir.join(sid).join("subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let main = dir.join(format!("{sid}.jsonl"));
+        // The main transcript wrote a.txt late; a subagent wrote a.txt early
+        // and b.css (record shape as observed: isSidechain:true, the PARENT's
+        // sessionId, ISO timestamps).
+        std::fs::write(&main,
+            format!(r#"{{"type":"assistant","sessionId":"{sid}","timestamp":"2026-08-27T16:00:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Edit","input":{{"file_path":"/w/a.txt"}}}}]}}}}"#)).unwrap();
+        std::fs::write(sub.join("agent-a4f351af645be8f44.jsonl"),
+            format!(r#"{{"type":"assistant","isSidechain":true,"agentId":"a4f351af645be8f44","sessionId":"{sid}","timestamp":"2026-08-27T15:27:46.767Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_2","name":"Write","input":{{"file_path":"/w/a.txt"}}}}]}}}}
+{{"type":"assistant","isSidechain":true,"agentId":"a4f351af645be8f44","sessionId":"{sid}","timestamp":"2026-08-27T15:30:00.000Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_3","name":"Write","input":{{"file_path":"/w/b.css"}}}}]}}}}"#)).unwrap();
+
+        let mut latest = std::collections::HashMap::new();
+        scan_artifact_writes(&main, &mut latest);
+        scan_artifact_writes(&sub.join("agent-a4f351af645be8f44.jsonl"), &mut latest);
+        assert_eq!(
+            latest.get("/w/a.txt"),
+            Some(&("Edit".to_string(), "2026-08-27T16:00:00.000Z".to_string())),
+            "the main transcript's later Edit must not be shadowed by the subagent's earlier Write",
+        );
+        assert_eq!(
+            latest.get("/w/b.css"),
+            Some(&("Write".to_string(), "2026-08-27T15:30:00.000Z".to_string())),
+            "a file only a subagent wrote must reach the session's artifacts",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[tauri::command]
@@ -3934,7 +4166,20 @@ fn list_sessions_sync() -> Vec<Session> {
     let lib = crate::librarian::load_store();
     crate::agents::scan_all_with_paths()
         .into_iter()
-        .map(|(mut s, _)| {
+        .filter_map(|(mut s, path)| {
+            // Grok's row scan predates two summary.json fields its rows now
+            // need (see grok_row_meta); patched here, at the one place every
+            // surface's list is composed, so sidebar and phone agree.
+            if s.agent == "grok" {
+                let meta = grok_row_meta(&path);
+                if meta.subagent {
+                    return None;
+                }
+                if let Some(parent) = meta.fork_parent {
+                    s.forked = true;
+                    s.fork_parent = Some(parent);
+                }
+            }
             if let Some(t) = titles.get(&s.id) {
                 s.title = t.clone();
             } else if let Some(e) = lib.sessions.get(&s.id) {
@@ -3942,9 +4187,52 @@ fn list_sessions_sync() -> Vec<Session> {
                     s.title = e.name.clone();
                 }
             }
-            s
+            Some(s)
         })
         .collect()
+}
+
+/// What a grok row's `summary.json` says beyond what the row itself carries.
+struct GrokRowMeta {
+    /// `"session_kind": "subagent"` — a subagent's child session. grok 1.0.13
+    /// gives subagent children full session directories in the normal sessions
+    /// tree (the parent's `subagents/<id>/meta.json` points at them), so
+    /// unfiltered they list as top-level sidebar rows. Only this kind hides a
+    /// row: `"headless"` (`-p` runs) and absent (interactive) are sessions the
+    /// person started and stay listed. [observed: grok 1.0.13]
+    subagent: bool,
+    /// `"parent_session_id"` — the source session of a fork or restore,
+    /// stamped by grok 1.0.13 in the child's summary.json (verified off a live
+    /// `--resume <id> --fork-session` child). [observed: grok 1.0.13]
+    fork_parent: Option<String>,
+}
+
+/// Read [`GrokRowMeta`] for the row whose transcript is at `transcript` —
+/// grok's row paths point inside the session directory, beside `summary.json`.
+/// Both fields are top level, NOT under `info`. [observed: grok 1.0.13]
+fn grok_row_meta(transcript: &Path) -> GrokRowMeta {
+    transcript
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("summary.json")).ok())
+        .map(|raw| grok_row_meta_from_summary(&raw))
+        .unwrap_or(GrokRowMeta { subagent: false, fork_parent: None })
+}
+
+/// The parse behind [`grok_row_meta`], separated so the field locations can be
+/// tested against recorded summary.json bodies without a session on disk.
+fn grok_row_meta_from_summary(raw: &str) -> GrokRowMeta {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return GrokRowMeta { subagent: false, fork_parent: None },
+    };
+    GrokRowMeta {
+        subagent: v.get("session_kind").and_then(|k| k.as_str()) == Some("subagent"),
+        fork_parent: v
+            .get("parent_session_id")
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .map(String::from),
+    }
 }
 
 /// Person-chosen session titles, id → title, kept beside the config. Every
