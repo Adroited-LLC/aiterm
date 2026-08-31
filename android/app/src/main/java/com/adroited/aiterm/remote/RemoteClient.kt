@@ -749,7 +749,10 @@ class RemoteClient(
                     accept(null, RemoteServerEvent.FocusChanged(focus.tabId, focus.attachmentId, focus.focus, focus.size))
                 }
             }
-            "session.changed" -> refreshSessions()
+            "session.changed" -> {
+                refreshSessions()
+                mutableState.value.previewSessionId?.let(::previewSession)
+            }
             "agent.changed" -> refreshAgents()
             "tab.changed" -> refreshTabs()
             "terminal.title" -> {

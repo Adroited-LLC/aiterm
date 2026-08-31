@@ -16,7 +16,12 @@ import com.adroited.aiterm.security.AppLock
 import com.adroited.aiterm.security.DeviceKeys
 import com.adroited.aiterm.terminal.DefaultTerminalScreenStore
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 class RemoteTerminalViewModel(
     desktop: PairedDesktop,
@@ -93,6 +98,60 @@ class RemoteTerminalViewModel(
     fun openSession(id: String, cols: Int, rows: Int) =
         client.openSession(id, TerminalSize(cols, rows))
     fun previewSession(id: String) = client.previewSession(id)
+
+    /**
+     * Sends from the conversation view without introducing a second protocol. Opening the
+     * session, attaching, and taking focus use the same authenticated terminal path as the grid.
+     */
+    suspend fun sendConversationPrompt(sessionId: String, text: String): Result<Unit> {
+        val prompt = text.trim()
+        if (prompt.isEmpty()) return Result.failure(IllegalArgumentException("Write a message first."))
+        return try {
+            val existing = client.state.value.tabs.firstOrNull { it.sessionId == sessionId }
+            if (existing != null) client.selectTab(existing.id)
+            else client.openSession(sessionId, TerminalSize(80, 24))
+
+            val activeScreen = withTimeoutOrNull(10_000) {
+                client.screen.filterNotNull().first { screen ->
+                    client.state.value.tabs.any { it.id == screen.tabId && it.sessionId == sessionId }
+                }
+            } ?: return Result.failure(IllegalStateException("The session did not open on the desktop."))
+
+            if (client.state.value.focus != com.adroited.aiterm.remote.FocusOwner.Self) {
+                if (!client.takeFocus(TerminalSize(activeScreen.cols, activeScreen.rows))) {
+                    return Result.failure(IllegalStateException("The terminal is not ready for input."))
+                }
+                val focused = withTimeoutOrNull(5_000) {
+                    client.state.first {
+                        it.activeTabId == activeScreen.tabId &&
+                            it.focus == com.adroited.aiterm.remote.FocusOwner.Self
+                    }
+                }
+                if (focused == null) {
+                    return Result.failure(IllegalStateException("AITerm could not take terminal focus."))
+                }
+            }
+
+            val latestScreen = client.screen.value
+                ?.takeIf { it.tabId == activeScreen.tabId }
+                ?: return Result.failure(IllegalStateException("The terminal changed before sending."))
+            val outbound = formatTerminalSubmission(
+                text = prompt,
+                paths = emptyList(),
+                bracketedPaste = latestScreen.modes.bracketedPaste,
+            )
+            if (!client.sendInputs(activeScreen.tabId, outbound)) {
+                return Result.failure(IllegalStateException("The terminal did not accept the message."))
+            }
+            delay(350)
+            client.previewSession(sessionId)
+            Result.success(Unit)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
+    }
     fun closeSession(id: String) = client.closeSession(id)
     fun stopSession(id: String) = client.stopSession(id)
     fun forkSession(id: String) = client.forkSession(id)
