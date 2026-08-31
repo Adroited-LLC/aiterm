@@ -224,9 +224,9 @@ Text-only terminal use continues normally.
 
 | Data | Location | Retention |
 | --- | --- | --- |
-| Android normalized draft | App-private cache | 24 hours, or until removed/submitted |
-| Android source snapshot | App-private cache | During normalization; stale snapshots expire after 15 minutes |
-| Android camera capture | App-private FileProvider path | Until normalization completes or 24-hour cleanup |
+| Android normalized draft | App-private cache | Removed/submitted immediately, or deleted on the next cleanup opportunity after 24 hours |
+| Android source snapshot | App-private cache | During normalization; stale snapshots are deleted on the next cleanup opportunity after 15 minutes |
+| Android camera capture | App-private FileProvider path | Until normalization completes, or deleted on the next cleanup opportunity after 24 hours |
 | Desktop partial upload | Owner-only `.part` staging file | 15 minutes, or immediate cancellation/disconnect cleanup |
 | Desktop completed image | `<tab cwd>/.aiterm/attachments/` when safe, otherwise AITerm's owner-only cache | 24 hours, subject to the 256 MiB global attachment budget |
 
