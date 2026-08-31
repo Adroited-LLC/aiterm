@@ -738,15 +738,37 @@ export default function App() {
 
   // Event-driven refresh: Claude's transcripts changed (backend debounces).
   // A refusal lands in the transcript too, so the same event checks for one.
+  // The reload is throttled: the watcher fires on every transcript-append
+  // burst, so with any session writing (one usually is) this event arrives
+  // every ~2s — and each unthrottled reload shipped 500+ rows over IPC and
+  // reconciled them all, which is what made every click and keystroke queue
+  // behind render work [measured 2026-08-31]. Trailing-edge, so the last
+  // burst of a quiet-down still lands, at most LIST_RELOAD_MS late.
+  const lastListReload = useRef(0);
+  const listReloadTimer = useRef<number | null>(null);
+  const throttledSessionReload = useCallback(() => {
+    const LIST_RELOAD_MS = 4000;
+    const since = Date.now() - lastListReload.current;
+    if (since >= LIST_RELOAD_MS) {
+      lastListReload.current = Date.now();
+      refreshSessionList();
+    } else if (listReloadTimer.current === null) {
+      listReloadTimer.current = window.setTimeout(() => {
+        listReloadTimer.current = null;
+        lastListReload.current = Date.now();
+        refreshSessionList();
+      }, LIST_RELOAD_MS - since);
+    }
+  }, [refreshSessionList]);
   useEffect(() => {
     const un = listen("sessions://changed", () => {
-      refreshSessionList();
+      throttledSessionReload();
       checkRefusal();
     });
     return () => {
       un.then((f) => f());
     };
-  }, [refreshSessionList, checkRefusal]);
+  }, [throttledSessionReload, checkRefusal]);
 
   // NOTE: there used to be a large effect here that watched for newly-appeared
   // sessions and decided some of them "superseded" older rows — hiding those

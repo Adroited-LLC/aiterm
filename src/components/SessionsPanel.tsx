@@ -192,6 +192,10 @@ interface Props {
   onOpenLibrarian: () => void;
 }
 
+/** How many recent rows render before "Show all" — a screen and a half of
+ *  history; everything stays reachable through search. */
+const RECENT_WINDOW = 80;
+
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
   attentionText, progressSlots, activeSlot, rekey, opts,
@@ -203,6 +207,11 @@ export default function SessionsPanel({
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
+  /** The recent list renders a window, not the archive: 500+ rows of DOM
+   *  reconciled on every transcript-append reload is what made typing lag
+   *  [measured 2026-08-31]. Search always looks at everything; "Show all"
+   *  opens the rest for a browse. */
+  const [showAllRecent, setShowAllRecent] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   /** Row whose title is being edited in place, and the text so far. */
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -1544,7 +1553,17 @@ export default function SessionsPanel({
             className={"ungrouped" + (dragOver === "ungrouped" ? " over" : "")}
             data-drop="ungrouped"
           >
-            {sectionOpen("recent:all") && ungrouped.map((s) => renderItem(s, "recent"))}
+            {sectionOpen("recent:all") &&
+              (query.trim() || showAllRecent ? ungrouped : ungrouped.slice(0, RECENT_WINDOW))
+                .map((s) => renderItem(s, "recent"))}
+            {sectionOpen("recent:all") && !query.trim() && !showAllRecent && ungrouped.length > RECENT_WINDOW && (
+              <button
+                className="tui-plain session-show-all"
+                onClick={() => setShowAllRecent(true)}
+              >
+                Show all {ungrouped.length} — search reaches them regardless
+              </button>
+            )}
             {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
           </div>
         </div>
