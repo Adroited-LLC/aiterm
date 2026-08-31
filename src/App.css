@@ -3593,6 +3593,14 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* The rendered file. Measured for reading — a column, real margins, the
    theme's colours — not a web page dropped into a terminal app. */
+/* An html file previewing as the page it is. White ground, not the app
+   theme: the page carries its own styling and most assume paper. */
+.page-preview {
+  flex: 1; min-height: 0; width: 100%;
+  border: 0;
+  background: #fff;
+}
+
 .md-preview {
   flex: 1; min-height: 0; overflow-y: auto;
   padding: 18px 28px 40px;
