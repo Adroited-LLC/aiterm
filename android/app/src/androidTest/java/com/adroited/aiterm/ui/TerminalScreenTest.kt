@@ -334,34 +334,47 @@ class TerminalScreenTest {
     fun resizeStormPublishesOnlyTheFinalStableViewport() {
         val sizes = mutableListOf<Pair<Int, Int>>()
         val height = mutableStateOf(480.dp)
+        val originalAutoAdvance = compose.mainClock.autoAdvance
         compose.mainClock.autoAdvance = false
-        compose.setContent {
-            Box(Modifier.size(400.dp, height.value)) {
-                TerminalScreenContent(
-                    state = RemoteClientState(connection = ConnectionState.Connected),
-                    screen = ScreenSnapshot(
-                        tabId = "tab-resize-storm",
-                        revision = 1,
-                        cols = 1,
-                        rows = 1,
-                        visible = listOf(ScreenRow(listOf(ScreenCell("M")))),
-                        cursor = CursorState(0, 0, true),
-                    ),
-                    onResize = { cols, rows -> sizes += cols to rows },
-                )
+        try {
+            compose.setContent {
+                Box(Modifier.size(400.dp, height.value)) {
+                    TerminalScreenContent(
+                        state = RemoteClientState(connection = ConnectionState.Connected),
+                        screen = ScreenSnapshot(
+                            tabId = "tab-resize-storm",
+                            revision = 1,
+                            cols = 1,
+                            rows = 1,
+                            visible = listOf(ScreenRow(listOf(ScreenCell("M")))),
+                            cursor = CursorState(0, 0, true),
+                        ),
+                        onResize = { cols, rows -> sizes += cols to rows },
+                    )
+                }
             }
-        }
-        compose.mainClock.advanceTimeByFrame()
-        compose.runOnIdle { sizes.clear() }
+            compose.mainClock.advanceTimeByFrame()
+            compose.runOnIdle { sizes.clear() }
 
-        repeat(10) { index ->
-            compose.runOnIdle { height.value = (480 + (index + 1) * 24).dp }
-            compose.mainClock.advanceTimeBy(10)
-        }
+            repeat(10) { index ->
+                compose.runOnIdle { height.value = (480 + (index + 1) * 24).dp }
+                compose.mainClock.advanceTimeBy(10)
+            }
 
-        compose.runOnIdle { assertTrue(sizes.isEmpty()) }
-        compose.mainClock.advanceTimeBy(TERMINAL_RESIZE_SETTLE_MILLIS)
-        compose.runOnIdle { assertEquals(1, sizes.size) }
+            val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val cell = compose.onNodeWithTag("terminal-cell-0-0", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val row = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val finalViewport = (render.width / cell.width).toInt().coerceIn(1, 512) to
+                (render.height / row.height).toInt().coerceIn(1, 512)
+            compose.runOnIdle { assertTrue(sizes.isEmpty()) }
+            compose.mainClock.advanceTimeBy(TERMINAL_RESIZE_SETTLE_MILLIS)
+            compose.runOnIdle { assertEquals(listOf(finalViewport), sizes) }
+        } finally {
+            compose.mainClock.autoAdvance = originalAutoAdvance
+        }
     }
 
     @Test
