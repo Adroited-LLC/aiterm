@@ -80,6 +80,7 @@ object RemoteCommands {
     const val MAX_UPLOAD_CHUNK_BYTES = 256 * 1_024
     const val MAX_UPLOADS_PER_SUBMISSION = 4
     const val MAX_SUBMISSION_BYTES = 48 * 1_024 * 1_024L
+    const val MAX_SUBMISSION_ID_BYTES = 128
     const val MAX_IDENTIFIER_BYTES = 4 * 1_024
     const val MAX_PATH_BYTES = 4 * 1_024
 
@@ -130,7 +131,7 @@ object RemoteCommands {
     ): ByteArray {
         requireIdentifier(tabId)
         requireIdentifier(attachmentId)
-        requireIdentifier(submissionId)
+        requireSubmissionId(submissionId)
         if (submissionCount !in 1..MAX_UPLOADS_PER_SUBMISSION ||
             submissionBytes !in 1..MAX_SUBMISSION_BYTES ||
             length !in 1..MAX_UPLOAD_BYTES ||
@@ -251,6 +252,10 @@ object RemoteCommands {
 
     private fun requireIdentifier(value: String) {
         if (value.isBlank() || value.encodeToByteArray().size > MAX_IDENTIFIER_BYTES) malformed()
+    }
+
+    private fun requireSubmissionId(value: String) {
+        if (value.isBlank() || value.encodeToByteArray().size > MAX_SUBMISSION_ID_BYTES) malformed()
     }
 
     @Serializable private data class TabIdPayload(@SerialName("tab_id") val tabId: String)

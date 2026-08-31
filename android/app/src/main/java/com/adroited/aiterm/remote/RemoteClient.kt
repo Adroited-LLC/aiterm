@@ -20,6 +20,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import java.io.File
 import java.io.FileInputStream
@@ -62,6 +63,29 @@ data class RemoteUploadSource(
 )
 
 data class RemoteUploadProgress(val sourceId: String, val sent: Long, val total: Long)
+
+internal data class RemoteUploadSubmission(val count: Int, val bytes: Long)
+
+internal fun validateRemoteUploadSources(sources: List<RemoteUploadSource>): RemoteUploadSubmission {
+    if (sources.isEmpty() || sources.size > RemoteCommands.MAX_UPLOADS_PER_SUBMISSION) {
+        throw RemoteUploadException(null, "choose between one and four images")
+    }
+    val ids = hashSetOf<String>()
+    var total = 0L
+    for (source in sources) {
+        if (source.id.isBlank() || source.id.encodeToByteArray().size > RemoteCommands.MAX_IDENTIFIER_BYTES ||
+            !ids.add(source.id) || !source.file.isFile || source.file.length() != source.length ||
+            source.length !in 1..RemoteCommands.MAX_UPLOAD_BYTES || source.sha256.size != 32
+        ) {
+            throw RemoteUploadException(null, "the selected image is invalid or changed")
+        }
+        total += source.length
+        if (total > RemoteCommands.MAX_SUBMISSION_BYTES) {
+            throw RemoteUploadException(null, "selected images exceed the 48 MiB upload limit")
+        }
+    }
+    return RemoteUploadSubmission(sources.size, total)
+}
 
 class RemoteUploadException(val code: String?, message: String, cause: Throwable? = null) :
     Exception(message, cause)
@@ -261,10 +285,8 @@ class RemoteClient(
             ?: return@withContext Result.failure(RemoteUploadException(null, "terminal focus is required to upload images"))
         val activeUploadIds = linkedSetOf<String>()
         try {
-            validateUploadSources(sources)
+            val submission = validateRemoteUploadSources(sources)
             val submissionId = UUID.randomUUID().toString()
-            val submissionCount = sources.size
-            val submissionBytes = sources.sumOf(RemoteUploadSource::length)
             val paths = ArrayList<String>(sources.size)
 
             for (source in sources) {
@@ -276,8 +298,8 @@ class RemoteClient(
                         tabId = context.tabId,
                         attachmentId = context.attachmentId,
                         submissionId = submissionId,
-                        submissionCount = submissionCount,
-                        submissionBytes = submissionBytes,
+                        submissionCount = submission.count,
+                        submissionBytes = submission.bytes,
                         length = source.length,
                         sha256 = source.sha256,
                     ),
@@ -331,7 +353,7 @@ class RemoteClient(
             withContext(NonCancellable) { cancelBegunUploads(context, activeUploadIds) }
             throw error
         } catch (error: Exception) {
-            cancelBegunUploads(context, activeUploadIds)
+            withContext(NonCancellable) { cancelBegunUploads(context, activeUploadIds) }
             Result.failure(error)
         }
     }
@@ -1001,26 +1023,6 @@ class RemoteClient(
         return UploadContext(lifecycleGeneration, active, tabId, attachmentId)
     }
 
-    private fun validateUploadSources(sources: List<RemoteUploadSource>) {
-        if (sources.isEmpty() || sources.size > RemoteCommands.MAX_UPLOADS_PER_SUBMISSION) {
-            throw RemoteUploadException(null, "choose between one and four images")
-        }
-        val ids = hashSetOf<String>()
-        var total = 0L
-        for (source in sources) {
-            if (source.id.isBlank() || source.id.encodeToByteArray().size > RemoteCommands.MAX_IDENTIFIER_BYTES ||
-                !ids.add(source.id) || !source.file.isFile || source.file.length() != source.length ||
-                source.length !in 1..RemoteCommands.MAX_UPLOAD_BYTES || source.sha256.size != 32
-            ) {
-                throw RemoteUploadException(null, "the selected image is invalid or changed")
-            }
-            total += source.length
-            if (total > RemoteCommands.MAX_SUBMISSION_BYTES) {
-                throw RemoteUploadException(null, "selected images exceed the 48 MiB upload limit")
-            }
-        }
-    }
-
     private fun requireCurrentUploadContext(context: UploadContext) {
         val current = synchronized(lifecycleLock) {
             isCurrent(context.lifecycleGeneration, context.transport) &&
@@ -1045,27 +1047,29 @@ class RemoteClient(
     }
 
     private suspend fun cancelBegunUploads(context: UploadContext, uploadIds: Set<String>) {
-        for (uploadId in uploadIds.toList()) {
-            val sameConnection = synchronized(lifecycleLock) {
-                isCurrent(context.lifecycleGeneration, context.transport)
-            }
-            if (!sameConnection) return
-            try {
-                when (val response = context.transport.request(
-                    "terminal.upload.cancel",
-                    RemoteCommands.uploadCancel(uploadId),
-                ).await()) {
-                    is RemoteResponse.Success -> {
-                        if (response.kind == "terminal.upload.cancel") {
-                            RemoteCommands.uploadAcknowledged(response.payload)
-                        }
-                    }
-                    is RemoteResponse.Error -> Unit
+        withTimeoutOrNull(UPLOAD_CLEANUP_TIMEOUT_MILLIS) {
+            for (uploadId in uploadIds.toList()) {
+                val sameConnection = synchronized(lifecycleLock) {
+                    isCurrent(context.lifecycleGeneration, context.transport)
                 }
-            } catch (_: kotlinx.coroutines.CancellationException) {
-                // Best-effort cancellation must not replace the original cancellation or failure.
-            } catch (_: Exception) {
-                // The disconnected transport owns server-side cleanup when a cancel frame cannot be delivered.
+                if (!sameConnection) return@withTimeoutOrNull
+                try {
+                    when (val response = context.transport.request(
+                        "terminal.upload.cancel",
+                        RemoteCommands.uploadCancel(uploadId),
+                    ).await()) {
+                        is RemoteResponse.Success -> {
+                            if (response.kind == "terminal.upload.cancel") {
+                                RemoteCommands.uploadAcknowledged(response.payload)
+                            }
+                        }
+                        is RemoteResponse.Error -> Unit
+                    }
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
+                } catch (_: Exception) {
+                    // The disconnected transport owns server-side cleanup when a cancel frame cannot be delivered.
+                }
             }
         }
     }
@@ -1115,6 +1119,7 @@ class RemoteClient(
         const val MAX_INPUT_BYTES = 64 * 1_024
         const val MAX_SCROLLBACK_ROWS = 5_000
         const val MAX_OWNED_JOBS = 64
+        const val UPLOAD_CLEANUP_TIMEOUT_MILLIS = 2_000L
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }

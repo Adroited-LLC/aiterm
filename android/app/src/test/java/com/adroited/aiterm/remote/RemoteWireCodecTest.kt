@@ -333,6 +333,32 @@ class RemoteWireCodecTest {
         }
     }
 
+    @Test
+    fun terminalImageUploadSubmissionIdAccepts128Utf8BytesAndRejects129() {
+        val digest = ByteArray(32)
+
+        RemoteCommands.uploadBegin(
+            tabId = "tab",
+            attachmentId = "attachment",
+            submissionId = "s".repeat(128),
+            submissionCount = 1,
+            submissionBytes = 1,
+            length = 1,
+            sha256 = digest,
+        )
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadBegin(
+                tabId = "tab",
+                attachmentId = "attachment",
+                submissionId = "s".repeat(129),
+                submissionCount = 1,
+                submissionBytes = 1,
+                length = 1,
+                sha256 = digest,
+            )
+        }
+    }
+
     private fun fixture(value: Any?): ByteArray {
         val output = ByteArrayOutputStream()
         fun writeHeader(major: Int, size: Int) {

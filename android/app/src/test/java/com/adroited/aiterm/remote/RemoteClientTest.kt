@@ -33,6 +33,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
@@ -820,6 +821,102 @@ class RemoteClientTest {
     }
 
     @Test
+    fun imageUploadAcceptsTheExactFourImage48MiBAggregateBoundary() {
+        val source = sparseUploadSource("boundary", 12L * 1_024 * 1_024)
+        try {
+            val submission = validateRemoteUploadSources(
+                listOf("one", "two", "three", "four").map { source.copy(id = it) },
+            )
+
+            assertEquals(4, submission.count)
+            assertEquals(48L * 1_024 * 1_024, submission.bytes)
+        } finally {
+            cleanupUploadSources(source)
+        }
+    }
+
+    @Test
+    fun failedUploadReturnsAfterOneCleanupBudgetWhenCancelNeverReplies() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        val pendingCancel = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                )
+                "terminal.upload.chunk" -> CompletableDeferred(
+                    RemoteResponse.Error(request.requestId, "terminal.upload_failed", "staging failed"),
+                )
+                "terminal.upload.cancel" -> pendingCancel
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        val operation = async { client.uploadImages(listOf(source)) }
+        try {
+            runCurrent()
+            advanceTimeBy(2_001)
+            runCurrent()
+
+            assertTrue(operation.isCompleted)
+            val failure = operation.await()
+            assertTrue(failure.isFailure)
+            assertEquals("terminal.upload_failed", (failure.exceptionOrNull() as RemoteUploadException).code)
+        } finally {
+            pendingCancel.complete(RemoteResponse.Success(99, "terminal.upload.cancel", uploadSuccessReply()))
+            operation.cancelAndJoin()
+            cleanupUploadSources(source)
+            client.lock()
+        }
+    }
+
+    @Test
+    fun cancelledUploadRethrowsCancellationAfterOneCleanupBudgetWhenCancelNeverReplies() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        val pendingChunk = CompletableDeferred<RemoteResponse>()
+        val pendingCancel = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                )
+                "terminal.upload.chunk" -> pendingChunk
+                "terminal.upload.cancel" -> pendingCancel
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        val operation = async { client.uploadImages(listOf(source)) }
+        try {
+            runCurrent()
+            operation.cancel()
+            runCurrent()
+            advanceTimeBy(2_001)
+            runCurrent()
+
+            assertTrue(operation.isCompleted)
+            assertTrue(operation.isCancelled)
+        } finally {
+            pendingCancel.complete(RemoteResponse.Success(99, "terminal.upload.cancel", uploadSuccessReply()))
+            operation.cancelAndJoin()
+            cleanupUploadSources(source)
+            client.lock()
+        }
+    }
+
+    @Test
     fun losingFocusBetweenUploadOperationsCancelsTheBoundUpload() = runTest {
         val transport = FakeRemoteTransport()
         val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
@@ -920,6 +1017,12 @@ private fun uploadSource(id: String, bytes: ByteArray): RemoteUploadSource {
     val file = Files.createTempFile("aiterm-upload-$id-", ".jpg").toFile()
     file.writeBytes(bytes)
     return RemoteUploadSource(id, file, bytes.size.toLong(), ByteArray(32) { id.first().code.toByte() })
+}
+
+private fun sparseUploadSource(id: String, length: Long): RemoteUploadSource {
+    val file = Files.createTempFile("aiterm-upload-$id-", ".jpg").toFile()
+    RandomAccessFile(file, "rw").use { it.setLength(length) }
+    return RemoteUploadSource(id, file, length, ByteArray(32) { id.first().code.toByte() })
 }
 
 private fun cleanupUploadSources(vararg sources: RemoteUploadSource) {
