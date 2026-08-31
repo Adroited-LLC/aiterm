@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Android 16+ local network protection: without this, the OS silently
+         drops every packet to a RFC1918 address (the desktop's LAN IP) while
+         letting internet traffic through — "works remote, dead at home". -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <!-- The desktop speaks plain HTTP: the LAN or the VPN is the transport
+         security, by design. See the desktop's remote.rs. -->
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.AITerm"
+        android:usesCleartextTraffic="true"
+        android:allowBackup="false">
+
+        <!-- Lets "Open with…" hand a downloaded file to another app. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="com.fivelime.aiterm.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
+        </provider>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- The pairing QR is an aiterm://pair link, so the camera app
+                 can open it here too — no in-app scan needed. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="aiterm" android:host="pair" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
