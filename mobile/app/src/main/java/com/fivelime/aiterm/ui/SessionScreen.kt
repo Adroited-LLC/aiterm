@@ -69,7 +69,16 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -237,19 +246,76 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                 if (vm.loadingTurns) CircularProgressIndicator() else Text("Nothing here yet — say something.", color = Muted)
             }
         } else {
-            LazyColumn(
-                state = list,
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                itemsIndexed(vm.turns) { _, t -> TurnView(t, onOpenPath = vm::openMentioned) }
-                // What the session made, right where the conversation ends —
-                // the transcript often never prints a path (tool output is
-                // dropped at phone size), but the desktop's ledger knows.
-                val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
-                if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
-                if (working) item(key = "working") { WorkingRow(s.agent) }
+            // A LazyColumn draws no scrollbar, so a long transcript gives no
+            // sense of place. Two quiet cues: a thin thumb along the right
+            // edge while scrolling — its height says how much there is, its
+            // position says where you are — and a pill at the foot whenever
+            // the newest message is out of sight, one tap from the end.
+            val scope = rememberCoroutineScope()
+            val thumbColor = Muted
+            val thumbAlpha by animateFloatAsState(
+                targetValue = if (list.isScrollInProgress) 0.5f else 0f,
+                animationSpec = tween(if (list.isScrollInProgress) 80 else 900),
+                label = "thumb",
+            )
+            val awayFromEnd by remember {
+                derivedStateOf {
+                    val info = list.layoutInfo
+                    val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+                    info.totalItemsCount > 0 && last < info.totalItemsCount - 1
+                }
+            }
+            Box(Modifier.fillMaxSize().padding(padding)) {
+                LazyColumn(
+                    state = list,
+                    modifier = Modifier.fillMaxSize().drawWithContent {
+                        drawContent()
+                        val info = list.layoutInfo
+                        val total = info.totalItemsCount
+                        val seen = info.visibleItemsInfo.size
+                        if (thumbAlpha > 0f && seen in 1 until total) {
+                            val h = (size.height * seen / total).coerceAtLeast(32.dp.toPx())
+                            val first = info.visibleItemsInfo.first()
+                            val exact = first.index + -first.offset.toFloat() / first.size.coerceAtLeast(1)
+                            val progress = (exact / (total - seen)).coerceIn(0f, 1f)
+                            drawRoundRect(
+                                color = thumbColor,
+                                topLeft = Offset(size.width - 7.dp.toPx(), progress * (size.height - h)),
+                                size = Size(3.dp.toPx(), h),
+                                cornerRadius = CornerRadius(2.dp.toPx()),
+                                alpha = thumbAlpha,
+                            )
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    itemsIndexed(vm.turns) { _, t -> TurnView(t, onOpenPath = vm::openMentioned) }
+                    // What the session made, right where the conversation ends —
+                    // the transcript often never prints a path (tool output is
+                    // dropped at phone size), but the desktop's ledger knows.
+                    val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
+                    if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
+                    if (working) item(key = "working") { WorkingRow(s.agent) }
+                }
+                if (awayFromEnd) {
+                    Row(
+                        Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(Surface2)
+                            .clickable {
+                                scope.launch {
+                                    val end = list.layoutInfo.totalItemsCount - 1
+                                    if (end >= 0) list.animateScrollToItem(end)
+                                }
+                            }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Newest", style = MaterialTheme.typography.labelMedium, color = Muted)
+                        Icon(Icons.Filled.KeyboardArrowDown, "Jump to newest", tint = Muted, modifier = Modifier.size(18.dp))
+                    }
+                }
             }
         }
     }

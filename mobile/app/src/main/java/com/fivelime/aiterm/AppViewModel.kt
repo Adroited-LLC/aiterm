@@ -389,8 +389,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             val fresh = status.hosts.map { "https://$it:$port" }
             val candidates = (fresh.ifEmpty { d.candidates } + reachable).distinct()
             val iroh = status.iroh ?: d.iroh
-            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh) {
-                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh)
+            val name = status.name.ifBlank { d.name }
+            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh || name != d.name) {
+                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh, name = name)
                 desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
                 store.saveAll(desktops)
                 desktop = nd
@@ -461,6 +462,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             val a = obj["activity"]?.jsonPrimitive?.content ?: return@launch
                             activity = activity + (id to a)
                             if (a != "idle") turnsWhenSent = -1
+                        }
+                        "renamed" -> {
+                            // The desktop's name was edited over there; wear
+                            // it everywhere at once.
+                            val n = obj["name"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: return@launch
+                            val cur = desktop ?: return@launch
+                            if (cur.name != n) {
+                                val nd = cur.copy(name = n)
+                                desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
+                                store.saveAll(desktops)
+                                desktop = nd
+                            }
                         }
                         "attention" -> {
                             val t = obj["title"]?.jsonPrimitive?.content
