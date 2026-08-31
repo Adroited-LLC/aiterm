@@ -44,10 +44,12 @@ fun PairScreen(vm: AppViewModel, padding: PaddingValues) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("AITerm", style = MaterialTheme.typography.displaySmall)
+        val adding = vm.desktop != null
+        Text(if (adding) "Add a desktop" else "AITerm", style = MaterialTheme.typography.displaySmall)
         Spacer(Modifier.height(8.dp))
         Text(
-            "Your desktop sessions, from your phone.\nOn the desktop: Settings → Remote → Show QR.",
+            if (adding) "Pairing another desktop keeps the ones you have.\nOn that desktop: Settings → Remote → Show QR."
+            else "Your desktop sessions, from your phone.\nOn the desktop: Settings → Remote → Show QR.",
             style = MaterialTheme.typography.bodyLarge, color = Muted, textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(32.dp))
@@ -76,6 +78,10 @@ fun PairScreen(vm: AppViewModel, padding: PaddingValues) {
                 TextButton(onClick = { vm.pair(pasted) }, enabled = pasted.isNotBlank()) { Text("Pair") }
             } else {
                 TextButton(onClick = { showPaste = true }) { Text("Paste a pairing link instead") }
+            }
+            if (adding) {
+                Spacer(Modifier.height(8.dp))
+                TextButton(onClick = { vm.showPair = false }) { Text("Cancel") }
             }
         }
     }

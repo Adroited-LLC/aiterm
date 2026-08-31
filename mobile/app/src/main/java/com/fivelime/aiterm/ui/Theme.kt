@@ -131,7 +131,10 @@ fun brandAsset(id: String): String? = when (id.lowercase()) {
     "upstage" -> "upstage-color.svg"
     "stepfun" -> "stepfun-color.svg"
     "inception" -> "inception.svg"
-    "openrouter", "chat", "api" -> "openrouter-color.svg"
+    // OpenRouter's mark is OpenRouter's only. The chat console ("chat"/"api")
+    // used to borrow it, which dressed a LOCAL model's session in another
+    // company's logo; a brandless id falls through to the letter avatar.
+    "openrouter" -> "openrouter-color.svg"
     else -> null
 }
 

@@ -5,7 +5,11 @@ import android.net.Uri
 /** The QR: `aiterm://pair?v=1&p=<port>&t=<token>&n=<name>&h=<addr>&h=<addr>…`.
  *  Hosts repeat, best first. Anything we don't understand is a refusal, not
  *  a guess — the payload decides what we trust. */
-data class PairLink(val hosts: List<String>, val port: Int, val token: String, val name: String, val fingerprint: String) {
+data class PairLink(
+    val hosts: List<String>, val port: Int, val token: String, val name: String, val fingerprint: String,
+    /** iroh node id — the reach-from-anywhere address; "" when the desktop predates it. */
+    val iroh: String = "",
+) {
     val candidates: List<String> get() = hosts.map { "https://$it:$port" }
 
     companion object {
@@ -19,7 +23,8 @@ data class PairLink(val hosts: List<String>, val port: Int, val token: String, v
             val name = uri.getQueryParameter("n")?.takeIf { it.isNotBlank() } ?: "Desktop"
             val fp = uri.getQueryParameter("f")?.takeIf { it.length == 64 } ?: return null
             if (hosts.isEmpty()) return null
-            return PairLink(hosts, port, token, name, fp)
+            val iroh = uri.getQueryParameter("z")?.takeIf { it.length == 64 } ?: ""
+            return PairLink(hosts, port, token, name, fp, iroh)
         }
     }
 }

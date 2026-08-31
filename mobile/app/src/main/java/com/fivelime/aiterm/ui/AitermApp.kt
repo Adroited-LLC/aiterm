@@ -22,6 +22,7 @@ fun AitermApp(vm: AppViewModel) {
         vm.notice = null
         snackbar.showSnackbar(n)
     }
+    BackHandler(enabled = vm.showPair && vm.desktop != null) { vm.showPair = false }
     BackHandler(enabled = vm.previewUrl != null) { vm.previewUrl = null }
     BackHandler(enabled = vm.showSettings) { vm.showSettings = false }
     BackHandler(enabled = vm.viewing != null) { vm.viewing = null }
@@ -40,10 +41,11 @@ fun AitermApp(vm: AppViewModel) {
     ) { padding ->
         when {
             vm.locked -> LockScreen(vm, padding)
-            vm.desktop == null -> PairScreen(vm, padding)
+            vm.desktop == null || vm.showPair -> PairScreen(vm, padding)
             vm.previewUrl != null -> PreviewScreen(vm, vm.previewUrl!!, padding)
             vm.showSettings -> SettingsScreen(vm, padding)
             vm.composingNew -> NewSessionScreen(vm, padding)
+            vm.starting != null -> StartingScreen(vm, vm.starting!!, padding)
             vm.viewing != null -> FileViewer(vm, vm.viewing!!.first, vm.viewing!!.second, padding)
             vm.selected == null -> SessionsScreen(vm, padding)
             else -> SessionScreen(vm, vm.selected!!, padding)

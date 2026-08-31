@@ -93,18 +93,20 @@ data class Status(
     /** Every address the desktop answers on right now, LAN first, public
      *  last. Fresher than what the QR carried at pairing time. */
     val hosts: List<String> = emptyList(),
+    /** iroh node id, when this desktop can be dialed by key. */
+    val iroh: String? = null,
 )
 
 class ApiError(val code: Int, message: String) : Exception(message)
 
 /** The desktop's remote API. Plain HTTP with a bearer token; see the
  *  desktop's remote.rs for what each call does there. */
-class Api(val baseUrl: String, private val token: String, fingerprint: String) {
+class Api(val baseUrl: String, private val token: String, fingerprint: String, connectSeconds: Long = 4) {
     private val json = Json { ignoreUnknownKeys = true }
     private val http = pinnedClient(
         fingerprint,
         OkHttpClient.Builder()
-            .connectTimeout(4, TimeUnit.SECONDS)
+            .connectTimeout(connectSeconds, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .pingInterval(25, TimeUnit.SECONDS),
     )
@@ -183,6 +185,13 @@ class Api(val baseUrl: String, private val token: String, fingerprint: String) {
     suspend fun stop(id: String) { call(req("/v1/sessions/$id/stop").post(empty)) }
     suspend fun input(id: String, text: String) {
         val body = json.encodeToString(InputBody.serializer(), InputBody(text))
+        call(req("/v1/sessions/$id/input").post(jsonBody(body)))
+    }
+    /** Raw keystrokes into the session's terminal, no Enter appended — what
+     *  answers a TUI dialog (an approval prompt) the conversation view
+     *  cannot render. Enter, when wanted, is itself the key ("\r"). */
+    suspend fun inputKeys(id: String, keys: String) {
+        val body = json.encodeToString(InputBody.serializer(), InputBody(keys, enter = false))
         call(req("/v1/sessions/$id/input").post(jsonBody(body)))
     }
     suspend fun newSession(agentId: String, cwd: String, prompt: String?, model: String?, effort: String?, title: String?) {

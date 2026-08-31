@@ -139,6 +139,7 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
                             crew = vm.broughtIn.count { it.value == s.id },
                             folded = s.id in vm.foldedCrews,
                             onCrewTap = { vm.toggleCrew(s.id) },
+                            crewNeedsYou = vm.broughtIn.any { it.value == s.id && vm.activity[it.key] == "attention" },
                             onLongClick = { renaming = s },
                         ) { vm.select(s) }
                     }
@@ -230,6 +231,22 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 // an X does.
                 IconButton(onClick = close) { Icon(Icons.Filled.Close, "Close menu") }
             }
+            // Every paired desktop, when there is more than one: tap to
+            // switch. The shown one wears the connection dot.
+            if (vm.desktops.size > 1) {
+                HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
+                Text("DESKTOPS", style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp))
+                vm.desktops.forEach { d ->
+                    val active = d.fingerprint == vm.desktop?.fingerprint
+                    NavigationDrawerItem(
+                        label = { Text(d.name, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal) },
+                        icon = { Dot(if (!active) Surface1 else if (vm.connected) Green else Muted) },
+                        selected = active,
+                        onClick = { if (!active) { vm.switchTo(d); close() } },
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                    )
+                }
+            }
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
             Text("USAGE", style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp))
             if (vm.usage.isEmpty()) {
@@ -307,6 +324,13 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 modifier = Modifier.padding(horizontal = 12.dp),
             )
             NavigationDrawerItem(
+                label = { Text("Add a desktop") },
+                icon = { Icon(Icons.Filled.Add, null) },
+                selected = false,
+                onClick = { close(); vm.showPair = true },
+                modifier = Modifier.padding(horizontal = 12.dp),
+            )
+            NavigationDrawerItem(
                 label = { Text("Forget this desktop") },
                 icon = { Icon(Icons.Filled.LinkOff, null) },
                 selected = false,
@@ -322,6 +346,7 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
 private fun SessionRow(
     s: Session, state: SessionState, showFolder: Boolean, starred: Boolean = false,
     satellite: Boolean = false, crew: Int = 0, folded: Boolean = false, onCrewTap: () -> Unit = {},
+    crewNeedsYou: Boolean = false,
     onLongClick: () -> Unit = {}, onClick: () -> Unit,
 ) {
     ListItem(
@@ -371,7 +396,14 @@ private fun SessionRow(
                 color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
         },
-        trailingContent = { stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) } },
+        trailingContent = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
+                // A brought-in agent of THIS session is parked on a prompt —
+                // its own row may be folded away, so the master's row says so.
+                if (crewNeedsYou) StateChip("crew needs you", stateColor(SessionState.NeedsYou), pulse = true)
+                stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
+            }
+        },
     )
 }
 
