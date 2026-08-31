@@ -7,6 +7,7 @@ kotlin = "2.4.10"
 androidxActivity = "1.13.0"
 androidxBiometric = "1.1.0"
 androidxCore = "1.19.0"
+androidxExifInterface = "1.4.2"
 androidxLifecycle = "2.11.0"
 androidxNavigation = "2.10.0"
 androidxTestEspresso = "3.7.0"
@@ -24,6 +25,7 @@ serialization = "1.11.0"
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidxActivity" }
 androidx-biometric = { module = "androidx.biometric:biometric", version.ref = "androidxBiometric" }
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "androidxCore" }
+androidx-exifinterface = { module = "androidx.exifinterface:exifinterface", version.ref = "androidxExifInterface" }
 androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "androidxLifecycle" }
 androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "androidxLifecycle" }
 androidx-lifecycle-process = { module = "androidx.lifecycle:lifecycle-process", version.ref = "androidxLifecycle" }
