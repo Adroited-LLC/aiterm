@@ -2799,6 +2799,80 @@ async fn peer_close_cancels_a_blocked_dispatch_and_detaches_other_attachments() 
 }
 
 #[tokio::test]
+async fn revocation_after_a_blocked_dispatch_delivers_auth_revoked_before_close() {
+    let root = private_test_dir("revoke-blocked-dispatch");
+    let (store, key, device_id) = paired_store(&root);
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    let attached_tab = registry
+        .open(TabLaunch::new(
+            "Attached",
+            "revoke-attached",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    let blocked_tab = registry
+        .open(TabLaunch::new(
+            "Blocked",
+            "revoke-blocked",
+            TerminalSize::try_new(20, 2).unwrap(),
+        ))
+        .unwrap();
+    pty.block_kill(2);
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store.clone(),
+        identity,
+        RemoteServices::new(registry.clone()),
+    )
+    .await
+    .unwrap();
+    let mut socket = connect(&gateway).await;
+    authenticate(&mut socket, &key, &device_id).await;
+    socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest {
+                tab_id: &attached_tab,
+            }),
+        ))
+        .await
+        .unwrap();
+    let _attached = response(&mut socket).await;
+    let _snapshot = response(&mut socket).await;
+    socket
+        .send(request(
+            2,
+            "tab.close",
+            &encode(&TabRequest {
+                tab_id: &blocked_tab,
+            }),
+        ))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !pty.kill_entered.load(Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+
+    assert!(store.revoke(&device_id).unwrap());
+    pty.release_kill();
+    let revoked = tokio::time::timeout(Duration::from_secs(1), response(&mut socket))
+        .await
+        .expect("revocation must be delivered after the blocked dispatch releases");
+    assert_eq!(revoked.request_id, 0);
+    assert_eq!(revoked.kind, "auth.revoked");
+    assert_closed(&mut socket).await;
+
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn peer_close_cancels_dense_recovery_planning_and_detaches_promptly() {
     let root = private_test_dir("cancel-recovery-planning");
     let (store, key, device_id) = paired_store(&root);

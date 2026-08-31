@@ -3325,6 +3325,20 @@ async fn cancel_connection_uploads(upload_set: Arc<Mutex<UploadSet>>) {
     .await;
 }
 
+async fn notify_revoked_if_needed(
+    devices: &DeviceStore,
+    device_id: &str,
+    outbound: &EgressHandle,
+) -> bool {
+    if devices.is_trusted(device_id) {
+        return false;
+    }
+    if let Ok(event) = response(0, "auth.revoked", &()) {
+        let _ = enqueue_event(outbound, event).await;
+    }
+    true
+}
+
 async fn run_authenticated_socket(
     socket: WebSocket,
     services: RemoteServices,
@@ -3406,10 +3420,9 @@ async fn run_authenticated_socket(
             tokio::select! {
                 biased;
                 changed = revocations.changed() => {
-                    if changed.is_err() || !devices.is_trusted(&device_id) {
-                        if let Ok(event) = response(0, "auth.revoked", &()) {
-                            let _ = enqueue_event(&outbound, event).await;
-                        }
+                    if changed.is_err()
+                        || notify_revoked_if_needed(&devices, &device_id, &outbound).await
+                    {
                         break;
                     }
                     continue;
@@ -3540,6 +3553,9 @@ async fn run_authenticated_socket(
                 {
                     Ok(outcome) => outcome,
                     Err(_) => {
+                        if notify_revoked_if_needed(&devices, &device_id, &outbound).await {
+                            break;
+                        }
                         let _ = cancelled.send(true);
                         let _ = outbound.controls.try_send(EgressControl::Close);
                         break;
