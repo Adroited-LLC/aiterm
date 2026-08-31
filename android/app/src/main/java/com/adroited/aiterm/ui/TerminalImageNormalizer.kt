@@ -129,6 +129,7 @@ class TerminalImageNormalizer(
     private fun normalizeBlocking(uri: Uri, checkpoint: () -> Unit): NormalizedTerminalImage {
         checkpoint()
         cleanupExpiredDraftsBlocking(clockMillis(), checkpoint)
+        cleanupExpiredSnapshotsBlocking(clockMillis(), checkpoint)
 
         var snapshot: File? = null
         var decoded: Bitmap? = null
@@ -445,8 +446,31 @@ class TerminalImageNormalizer(
             }
     }
 
+    /** Best-effort cleanup after a process death interrupted a source snapshot copy. */
+    private fun cleanupExpiredSnapshotsBlocking(nowMillis: Long, checkpoint: () -> Unit) {
+        if (
+            !snapshotsDirectory.isDirectory ||
+            isSymlink(snapshotsDirectory) ||
+            !isPrivateCacheChild(snapshotsDirectory)
+        ) return
+        snapshotsDirectory.listFiles()
+            .orEmpty()
+            .asSequence()
+            .filter(::isGeneratedSnapshot)
+            .filter { nowMillis - it.lastModified() >= SNAPSHOT_TTL_MILLIS }
+            .sortedBy(File::lastModified)
+            .take(MAX_CLEANUP_FILES_PER_PASS)
+            .forEach {
+                checkpoint()
+                it.delete()
+            }
+    }
+
     private fun isGeneratedDraft(file: File): Boolean =
         file.name.matches(GENERATED_DRAFT_NAME) && file.isFile && !isSymlink(file)
+
+    private fun isGeneratedSnapshot(file: File): Boolean =
+        file.name.matches(GENERATED_SNAPSHOT_NAME) && file.isFile && !isSymlink(file)
 
     private fun isSymlink(file: File): Boolean =
         try {
@@ -562,6 +586,7 @@ class TerminalImageNormalizer(
         const val MAX_INPUT_BYTES = 48L * 1_024 * 1_024
         const val MAX_OUTPUT_BYTES = 12L * 1_024 * 1_024
         const val DRAFT_TTL_MILLIS = 24L * 60 * 60 * 1_000
+        const val SNAPSHOT_TTL_MILLIS = 15L * 60 * 1_000
         private const val MAX_CLEANUP_FILES_PER_PASS = 64
         private const val JPEG_QUALITY = 90
         private const val DEFAULT_BUFFER_BYTES = 32 * 1_024
@@ -576,6 +601,9 @@ class TerminalImageNormalizer(
         private const val MARKER_RESTART_LAST = 0xd7
         private val GENERATED_DRAFT_NAME = Regex(
             "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.jpg",
+        )
+        private val GENERATED_SNAPSHOT_NAME = Regex(
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.source",
         )
         private val TERMINAL_BACKGROUND = Color.rgb(0x07, 0x11, 0x1B)
         private val SCALE_PAINT = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)

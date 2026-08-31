@@ -14,6 +14,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.DataOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.zip.CRC32
@@ -29,6 +30,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
+import org.junit.Assume.assumeNoException
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -40,11 +42,13 @@ class TerminalImageNormalizerTest {
         "terminal-image-captures/normalizer-test-${UUID.randomUUID()}",
     ).apply { mkdirs() }
     private val normalizedOutputs = mutableListOf<File>()
+    private val snapshotFixtures = mutableListOf<File>()
 
     @After
     fun removeOnlyThisTestsFixtures() {
         capturesRoot.deleteRecursively()
         normalizedOutputs.forEach(File::delete)
+        snapshotFixtures.reversed().forEach(File::delete)
         context.contentResolver.call(mutableUri, "reset", null, null)
     }
 
@@ -250,7 +254,105 @@ class TerminalImageNormalizerTest {
         Unit
     }
 
-    private fun normalizer() = TerminalImageNormalizer(context)
+    @Test
+    fun normalizeStart_expiresOnlyStaleGeneratedSnapshotsAtTheExactFifteenMinuteBoundary() = runBlocking {
+        val now = 1_700_000_000_000L
+        val stale = snapshotFixture("${UUID.randomUUID()}.source", now - SNAPSHOT_EXPIRY_MILLIS - 1)
+        val exactExpiry = snapshotFixture("${UUID.randomUUID()}.source", now - SNAPSHOT_EXPIRY_MILLIS)
+        val fresh = snapshotFixture("${UUID.randomUUID()}.source", now)
+        val unrelated = snapshotFixture("not-a-normalizer-snapshot.source", now - SNAPSHOT_EXPIRY_MILLIS - 1)
+
+        triggerSnapshotMaintenance(now)
+
+        assertFalse(stale.exists())
+        assertFalse(exactExpiry.exists())
+        assertTrue(fresh.exists())
+        assertTrue(unrelated.exists())
+    }
+
+    @Test
+    fun normalizeStart_limitsStaleSnapshotCleanupToSixtyFourFilesPerPass() = runBlocking {
+        val now = 1_700_000_000_000L
+        repeat(65) { index ->
+            snapshotFixture(
+                "${UUID.randomUUID()}.source",
+                now - SNAPSHOT_EXPIRY_MILLIS - index - 1,
+            )
+        }
+
+        triggerSnapshotMaintenance(now)
+
+        assertEquals(1, snapshotRoot.listFiles().orEmpty().count { it.name.endsWith(".source") })
+    }
+
+    @Test
+    fun normalizeStart_preservesAStaleGeneratedSnapshotSymlink() = runBlocking {
+        val now = 1_700_000_000_000L
+        val target = snapshotFixture("symlink-target", now - SNAPSHOT_EXPIRY_MILLIS - 1)
+        val link = File(snapshotRoot, "${UUID.randomUUID()}.source").also(snapshotFixtures::add)
+        try {
+            Files.createSymbolicLink(link.toPath(), target.toPath())
+        } catch (error: Exception) {
+            assumeNoException("symbolic links unavailable on this device", error)
+        }
+
+        triggerSnapshotMaintenance(now)
+
+        assertTrue(Files.isSymbolicLink(link.toPath()))
+        assertTrue(target.exists())
+    }
+
+    @Test
+    fun normalizeStart_refusesASnapshotSymlinkRootWithoutDeletingItsTarget() = runBlocking {
+        val now = 1_700_000_000_000L
+        assertTrue(snapshotRoot.listFiles().orEmpty().isEmpty())
+        assertTrue(snapshotRoot.delete())
+        val targetRoot = File(context.cacheDir, "normalizer-snapshot-symlink-target-${UUID.randomUUID()}")
+            .apply { mkdirs() }
+        val target = File(targetRoot, "${UUID.randomUUID()}.source").apply {
+            writeBytes(byteArrayOf(1))
+            setLastModified(now - SNAPSHOT_EXPIRY_MILLIS - 1)
+        }
+        try {
+            try {
+                Files.createSymbolicLink(snapshotRoot.toPath(), targetRoot.toPath())
+            } catch (error: Exception) {
+                assumeNoException("symbolic links unavailable on this device", error)
+            }
+            val source = File(capturesRoot, "symlink-root-trigger.jpg").apply { writeBytes(ByteArray(0)) }
+
+            val failure = normalizer { now }.normalize(uriFor(source))
+                .exceptionOrNull() as? TerminalImageNormalizationError
+
+            assertEquals(TerminalImageNormalizationError.Code.OUTPUT_FAILED, failure?.code)
+            assertTrue(Files.isSymbolicLink(snapshotRoot.toPath()))
+            assertTrue(target.exists())
+        } finally {
+            Files.deleteIfExists(snapshotRoot.toPath())
+            targetRoot.deleteRecursively()
+            snapshotRoot.mkdirs()
+        }
+    }
+
+    private fun normalizer(clockMillis: () -> Long = System::currentTimeMillis) =
+        TerminalImageNormalizer(context, clockMillis = clockMillis)
+
+    private val snapshotRoot: File
+        get() = File(context.cacheDir, "terminal-image-snapshots").apply { mkdirs() }
+
+    private fun snapshotFixture(name: String, lastModified: Long): File =
+        File(snapshotRoot, name).apply {
+            writeBytes(byteArrayOf(1))
+            setLastModified(lastModified)
+            snapshotFixtures += this
+        }
+
+    private suspend fun triggerSnapshotMaintenance(now: Long) {
+        val source = File(capturesRoot, "snapshot-maintenance-trigger-${UUID.randomUUID()}.jpg")
+            .apply { writeBytes(ByteArray(0)) }
+        val failure = normalizer { now }.normalize(uriFor(source)).exceptionOrNull() as? TerminalImageNormalizationError
+        assertEquals(TerminalImageNormalizationError.Code.EMPTY_CONTENT, failure?.code)
+    }
 
     private fun configureMutable(first: ByteArray, later: ByteArray) {
         context.contentResolver.call(
@@ -382,6 +484,7 @@ class TerminalImageNormalizerTest {
     }
 
     private companion object {
+        const val SNAPSHOT_EXPIRY_MILLIS = 15L * 60 * 1_000
         val mutableUri: Uri = Uri.parse("content://com.adroited.aiterm.test.mutable-image/image")
     }
 }
