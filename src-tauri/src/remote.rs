@@ -1288,22 +1288,26 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
     }
     let mut state: Option<bool> = None;
     let mut pending_call = false;
+    // Codex-shaped records seen: gates the no-pending-call attention
+    // fallback below to codex rollouts only.
+    let mut saw_codex = false;
     for line in buf.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
             continue;
         }
         match v.get("type").and_then(|t| t.as_str()) {
-            Some("event_msg") => match v.pointer("/payload/type").and_then(|t| t.as_str()) {
+            Some("event_msg") => { saw_codex = true; match v.pointer("/payload/type").and_then(|t| t.as_str()) {
                 Some("task_started") => { state = Some(true); pending_call = false }
                 Some("task_complete") | Some("turn_aborted") => { state = Some(false); pending_call = false }
                 _ => {}
-            },
-            Some("response_item") => match v.pointer("/payload/type").and_then(|t| t.as_str()) {
+            } },
+            Some("turn_context") | Some("session_meta") => saw_codex = true,
+            Some("response_item") => { saw_codex = true; match v.pointer("/payload/type").and_then(|t| t.as_str()) {
                 Some("custom_tool_call") | Some("function_call") => pending_call = true,
                 Some("custom_tool_call_output") | Some("function_call_output") => pending_call = false,
                 _ => {}
-            },
+            } },
             Some("user") => {
                 // A tool result is Claude talking to itself, not a new ask.
                 let is_result = v
@@ -1338,6 +1342,16 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
     }
     match state {
         Some(true) if pending_call && stale => Some("attention"),
+        // Codex asks for command approval BEFORE writing the exec record, so
+        // a dialog can be up with NO unanswered call on disk — a live stuck
+        // approval showed exactly that: open turn, all steps completed, phone
+        // said "working" [observed: codex-cli 0.150.1, 2026-08-31; the audit
+        // found no approval record type in any rollout 0.144→0.150.1]. For
+        // codex files only: an open turn that has written nothing for 45s is
+        // a person being waited on — or a wedge, which wants the same glance.
+        // Claude keeps the pending-call requirement: its long silent Bash
+        // calls are routine, and its prompts ring the terminal bell instead.
+        Some(true) if saw_codex && stale => Some("attention"),
         Some(true) => Some("working"),
         _ => None,
     }

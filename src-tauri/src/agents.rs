@@ -391,8 +391,8 @@ pub const CODEX_PERMISSION_MODES: &[PermissionMode] = &[
     },
     PermissionMode {
         id: "bypass",
-        label: "Skip approvals and sandbox",
-        note: "--dangerously-bypass-approvals-and-sandbox: nothing asks and nothing is confined.",
+        label: "Skip approvals and sandbox (yolo)",
+        note: "--dangerously-bypass-approvals-and-sandbox — what `--yolo` used to spell (the alias is gone from 0.150.1's binary): nothing asks and nothing is confined.",
         flags: &["--dangerously-bypass-approvals-and-sandbox"],
     },
 ];
