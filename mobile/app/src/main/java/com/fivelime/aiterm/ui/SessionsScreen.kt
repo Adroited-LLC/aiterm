@@ -395,14 +395,9 @@ private fun SessionRow(
         },
         trailingContent = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
-                // A brought-in agent of THIS session is parked on a prompt —
-                // its own row may be folded away, so the master's row says so.
-                if (crewNeedsYou) StateChip("crew needs you", stateColor(SessionState.NeedsYou), pulse = true)
-                // Open on the desktop is ambient, not news — a quiet dot, no words.
-                if (state == SessionState.OnDesktop) Dot(stateColor(state))
-                else stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
-                // The crew fold lives at the row's far edge: a count and a
-                // caret, padded into a real touch target.
+                // The state indicator is always the rightmost thing, so the
+                // dots right-align down the list; the crew fold sits beside
+                // it — a count and a caret, padded into a real touch target.
                 if (crew > 0) {
                     Row(
                         Modifier.clip(RoundedCornerShape(10.dp))
@@ -419,6 +414,12 @@ private fun SessionRow(
                         )
                     }
                 }
+                // A brought-in agent of THIS session is parked on a prompt —
+                // its own row may be folded away, so the master's row says so.
+                if (crewNeedsYou) StateChip("crew needs you", stateColor(SessionState.NeedsYou), pulse = true)
+                // Open on the desktop is ambient, not news — a quiet dot, no words.
+                if (state == SessionState.OnDesktop) Dot(stateColor(state))
+                else stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
             }
         },
     )
@@ -429,10 +430,12 @@ fun Dot(color: Color) = Box(Modifier.size(8.dp).background(color, CircleShape))
 
 @Composable
 fun StateChip(label: String, color: Color, pulse: Boolean = false) {
+    // Label first, dot last: the dot is the indicator, and it sits at the
+    // right edge so every row's indicator lines up in one column.
     Row(verticalAlignment = Alignment.CenterVertically) {
-        if (pulse) PulsingDot(color) else Dot(color)
-        Spacer(Modifier.width(6.dp))
         Text(label, style = MaterialTheme.typography.labelSmall, color = color)
+        Spacer(Modifier.width(6.dp))
+        if (pulse) PulsingDot(color) else Dot(color)
     }
 }
 
