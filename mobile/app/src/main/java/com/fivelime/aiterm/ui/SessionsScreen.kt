@@ -92,7 +92,7 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
         RenameDialog(current = s.title, onDone = { vm.rename(s, it); renaming = null }, onDismiss = { renaming = null })
     }
     // Opening the drawer is also the moment to freshen what it shows.
-    LaunchedEffect(drawer.isOpen) { if (drawer.isOpen) vm.loadUsage() }
+    LaunchedEffect(drawer.isOpen) { if (drawer.isOpen) { vm.loadUsage(); vm.checkDesktops() } }
     ModalNavigationDrawer(
         drawerState = drawer,
         drawerContent = { AppDrawer(vm, close = { scope.launch { drawer.close() } }) },
@@ -232,7 +232,8 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 IconButton(onClick = close) { Icon(Icons.Filled.Close, "Close menu") }
             }
             // Every paired desktop, when there is more than one: tap to
-            // switch. The shown one wears the connection dot.
+            // switch. Every dot is a status — the shown one live, the rest
+            // from the probe the drawer's opening fired.
             if (vm.desktops.size > 1) {
                 HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
                 Text("DESKTOPS", style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp))
@@ -240,7 +241,16 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                     val active = d.fingerprint == vm.desktop?.fingerprint
                     NavigationDrawerItem(
                         label = { Text(d.name, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal) },
-                        icon = { Dot(if (!active) Surface1 else if (vm.connected) Green else Muted) },
+                        icon = {
+                            Dot(
+                                if (active) { if (vm.connected) Green else Muted }
+                                else when (vm.reachable[d.fingerprint]) {
+                                    true -> Green
+                                    false -> Surface1
+                                    null -> Muted // probing, no answer yet
+                                },
+                            )
+                        },
                         selected = active,
                         onClick = { if (!active) { vm.switchTo(d); close() } },
                         modifier = Modifier.padding(horizontal = 12.dp),
