@@ -356,12 +356,16 @@ private fun TerminalViewport(
     onRequestKeyboard: () -> Unit,
 ) {
     val density = LocalDensity.current
+    val viewportVerticalPadding = 3.dp
     BoxWithConstraints(
         modifier.background(Color(0xFF07111B))
-            .padding(horizontal = 4.dp, vertical = 3.dp),
+            .padding(horizontal = 4.dp, vertical = viewportVerticalPadding),
     ) {
         val bottomObstruction = with(density) { bottomObstructionPx.toDp() }
-        val availableHeight = (maxHeight - bottomObstruction).coerceAtLeast(metrics.lineHeight)
+        val obstructionWithinRender = (bottomObstruction - viewportVerticalPadding)
+            .coerceAtLeast(0.dp)
+        val availableHeight = (maxHeight - obstructionWithinRender)
+            .coerceAtLeast(metrics.lineHeight)
         val measuredSize = TerminalSize(
             cols = (maxWidth / metrics.cellWidth).toInt().coerceIn(1, 512),
             rows = (availableHeight / metrics.lineHeight).toInt().coerceIn(1, 512),

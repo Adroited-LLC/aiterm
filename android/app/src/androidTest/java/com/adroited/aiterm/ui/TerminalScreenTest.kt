@@ -451,6 +451,71 @@ class TerminalScreenTest {
     }
 
     @Test
+    fun advertisedRowsIncludeTheViewportBottomPaddingAtALineThreshold() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        val height = mutableStateOf(480.dp)
+        compose.setContent {
+            Box(Modifier.size(400.dp, height.value)) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = oneCellScreen("tab-bottom-padding-threshold"),
+                    onResize = { cols, rows -> sizes += cols to rows },
+                )
+            }
+        }
+
+        val density = compose.activity.resources.displayMetrics.density
+        val viewportBottomPaddingPx = 3f * density
+        var thresholdHeight = 0.dp
+        var rowStep = 0.dp
+        for (candidateHeight in 480..504) {
+            compose.runOnIdle { height.value = candidateHeight.dp }
+            compose.waitForIdle()
+            val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val rowHeight = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot.height
+            val visibleHeight = chrome.top - render.top
+            val visibleRows = (visibleHeight / rowHeight).toInt().coerceIn(1, 512)
+            val undercountedRows = ((visibleHeight - viewportBottomPaddingPx) / rowHeight)
+                .toInt().coerceIn(1, 512)
+            if (visibleRows > undercountedRows) {
+                thresholdHeight = candidateHeight.dp
+                rowStep = (rowHeight / density).dp
+                break
+            }
+        }
+        assertTrue("test geometry must cross a row boundary within the bottom 3 dp", rowStep > 0.dp)
+
+        compose.runOnIdle {
+            sizes.clear()
+            height.value = thresholdHeight + rowStep
+        }
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
+
+        val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val rowHeight = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot.height
+        val visibleHeight = chrome.top - render.top
+        val expectedRows = (visibleHeight / rowHeight).toInt().coerceIn(1, 512)
+        val undercountedRows = ((visibleHeight - viewportBottomPaddingPx) / rowHeight)
+            .toInt().coerceIn(1, 512)
+        assertTrue("threshold must distinguish the old undercount", expectedRows > undercountedRows)
+        compose.runOnIdle {
+            assertEquals(
+                "advertised rows must include the render's bottom padding above chrome",
+                expectedRows,
+                sizes.last().second,
+            )
+        }
+    }
+
+    @Test
     fun measuredGridKeepsWideCombiningAndCursorOnTheSameFontScaledGeometry() {
         compose.setContent {
             val density = LocalDensity.current
