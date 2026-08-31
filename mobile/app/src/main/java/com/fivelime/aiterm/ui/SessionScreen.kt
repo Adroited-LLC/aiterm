@@ -106,10 +106,22 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     val list = rememberLazyListState()
 
     // New content lands at the bottom, where the eye is. The working row is
-    // one extra item past the last turn.
+    // one extra item past the last turn. The FIRST fill jumps straight to
+    // the end — animating from the top replays the whole transcript and
+    // looks glitchy on a long session. After that, follow new turns with a
+    // short animation, but only when already reading the end: someone
+    // scrolled up into history stays where they are.
+    var positioned by remember(s.id) { mutableStateOf(false) }
     LaunchedEffect(vm.turns.size, working) {
         val n = vm.turns.size + (if (working) 1 else 0)
-        if (n > 0) list.animateScrollToItem(n - 1)
+        if (n == 0) return@LaunchedEffect
+        if (!positioned) {
+            list.scrollToItem(n - 1)
+            positioned = true
+        } else {
+            val lastVisible = list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            if (lastVisible >= n - 3) list.animateScrollToItem(n - 1)
+        }
     }
 
     Scaffold(
