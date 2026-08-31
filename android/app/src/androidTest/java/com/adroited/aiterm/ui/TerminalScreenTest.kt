@@ -8,6 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
@@ -233,7 +234,7 @@ class TerminalScreenTest {
                 state = connectedState(),
                 screen = oneCellScreen("tab-upload"),
                 draftStore = store,
-                onUploadImages = { images, progress ->
+                onUploadImages = { _, images, progress ->
                     progress(RemoteUploadProgress(images.single().id, 2, images.single().length))
                     release.await()
                 },
@@ -268,7 +269,7 @@ class TerminalScreenTest {
                     state = connectedState(),
                     screen = oneCellScreen("tab-cancel"),
                     draftStore = store,
-                    onUploadImages = { _, _ ->
+                    onUploadImages = { _, _, _ ->
                         kotlinx.coroutines.suspendCancellableCoroutine { }
                     },
                 )
@@ -302,7 +303,7 @@ class TerminalScreenTest {
                 state = connectedState(),
                 screen = oneCellScreen("tab-submit").copy(modes = TerminalModes(bracketedPaste = true)),
                 draftStore = store,
-                onUploadImages = { _, _ -> Result.success(listOf("/project/one.jpg", "/project/two.jpg")) },
+                onUploadImages = { _, _, _ -> Result.success(listOf("/project/one.jpg", "/project/two.jpg")) },
                 onInputBatch = { _, inputs -> accepted += inputs; true },
             )
         }
@@ -338,7 +339,7 @@ class TerminalScreenTest {
                 state = connectedState(),
                 screen = oneCellScreen("tab-only"),
                 draftStore = store,
-                onUploadImages = { _, _ -> Result.success(listOf("/project/only.jpg")) },
+                onUploadImages = { _, _, _ -> Result.success(listOf("/project/only.jpg")) },
                 onInputBatch = { _, inputs -> attempted += inputs; false },
             )
         }
@@ -379,8 +380,8 @@ class TerminalScreenTest {
                 draftStore = store,
                 imagePickerLauncher = picker,
                 imageNormalizer = fakeNormalizer(),
-                onUploadImages = { _, _ ->
-                    Result.failure(RemoteUploadException("remote.unsupported", "unknown request"))
+                onUploadImages = { _, _, _ ->
+                    Result.failure(RemoteUploadException("protocol.unknown_request", "unknown request kind"))
                 },
             )
         }
@@ -397,6 +398,63 @@ class TerminalScreenTest {
         compose.runOnIdle { selectedTab.value = "tab-a" }
         compose.onNodeWithTag("terminal-image-tab-a-image").assertIsDisplayed()
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("A text")
+    }
+
+    @Test
+    fun acceptedTextOnlySubmissionClearsAnObsoleteAttachmentErrorWithTheWholeTabDraft() {
+        val store = TerminalDraftStore()
+        store.updateComposer("tab-text-clean") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("status")).state
+        }
+        store.updateAttachments("tab-text-clean") {
+            it.copy(message = "The previous image could not be prepared.")
+        }
+        val accepted = mutableListOf<List<String>>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-text-clean"),
+                draftStore = store,
+                onInputBatch = { _, inputs -> accepted += inputs; true },
+            )
+        }
+
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
+
+        compose.runOnIdle {
+            assertEquals(listOf(listOf("status", "\r")), accepted)
+            assertFalse(store.hasDrafts())
+            assertEquals(null, store.draftFor("tab-text-clean").attachments.message)
+        }
+    }
+
+    @Test
+    fun rapidTextOnlyImeRepeatsAcceptOnlyOnePromptBatch() {
+        val store = TerminalDraftStore()
+        store.updateComposer("tab-text-repeat") {
+            it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("run once")).state
+        }
+        val accepted = mutableListOf<List<String>>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-text-repeat"),
+                draftStore = store,
+                onInputBatch = { _, inputs -> accepted += inputs; true },
+            )
+        }
+        val imeAction = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .fetchSemanticsNode().config[SemanticsActions.OnImeAction].action
+
+        compose.runOnUiThread {
+            imeAction?.invoke()
+            imeAction?.invoke()
+        }
+
+        compose.runOnIdle {
+            assertEquals(listOf(listOf("run once", "\r")), accepted)
+            assertFalse(store.hasDrafts())
+        }
     }
 
     @Test

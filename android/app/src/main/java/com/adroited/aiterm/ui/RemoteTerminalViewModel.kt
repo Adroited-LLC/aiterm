@@ -72,15 +72,21 @@ class RemoteTerminalViewModel(
      * path so failed uploads can never inject a partial prompt.
      */
     suspend fun uploadImages(
+        expectedTabId: String,
         images: List<NormalizedTerminalImage>,
         onProgress: (RemoteUploadProgress) -> Unit = {},
-    ): Result<List<String>> = client.uploadImages(images.map(::remoteUploadSource), onProgress)
+    ): Result<List<String>> = client.uploadImages(expectedTabId, images.map(::remoteUploadSource), onProgress)
 
     /** Upload counterpart for the immutable images retained by [terminalDrafts]. */
     internal suspend fun uploadDraftImages(
+        expectedTabId: String,
         images: List<TerminalAttachmentImage>,
         onProgress: (RemoteUploadProgress) -> Unit = {},
-    ): Result<List<String>> = client.uploadImages(images.map { it.asRemoteUploadSource() }, onProgress)
+    ): Result<List<String>> = client.uploadImages(
+        expectedTabId,
+        images.map { it.asRemoteUploadSource() },
+        onProgress,
+    )
     fun takeFocus(cols: Int, rows: Int) = client.takeFocus(TerminalSize(cols, rows))
     fun resize(cols: Int, rows: Int) = client.resize(TerminalSize(cols, rows))
     fun loadOlderScrollback() = client.requestNextScrollbackPage()

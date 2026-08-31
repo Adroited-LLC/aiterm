@@ -15,6 +15,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.FileProvider
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.util.UUID
 
 enum class TerminalImageSource { Camera, Gallery }
@@ -60,13 +62,7 @@ internal fun rememberTerminalImagePicker(
 
     LaunchedEffect(context.cacheDir, pendingCapturePath) {
         val directory = File(context.cacheDir, CAPTURE_DIRECTORY)
-        val protectedPath = pendingCapturePath
-        val expiredBefore = System.currentTimeMillis() - CAPTURE_MAX_AGE_MILLIS
-        directory.listFiles()?.take(MAX_CAPTURE_CLEANUP_FILES)?.forEach { file ->
-            if (file.path != protectedPath && file.isFile && file.lastModified() < expiredBefore) {
-                file.delete()
-            }
-        }
+        cleanupExpiredTerminalCaptures(directory, pendingCapturePath, System.currentTimeMillis())
     }
 
     val singleGalleryLauncher = rememberLauncherForActivityResult(
@@ -152,5 +148,64 @@ internal fun rememberTerminalImagePicker(
 }
 
 private const val CAPTURE_DIRECTORY = "terminal-image-captures"
-private const val CAPTURE_MAX_AGE_MILLIS = 24L * 60L * 60L * 1_000L
+internal const val TERMINAL_CAPTURE_TTL_MILLIS = 24L * 60L * 60L * 1_000L
 private const val MAX_CAPTURE_CLEANUP_FILES = 64
+private val GENERATED_CAPTURE_NAME = Regex(
+    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.jpg$",
+)
+
+/** Deletes only the oldest expired files from this picker's exact private capture namespace. */
+internal fun cleanupExpiredTerminalCaptures(
+    root: File,
+    protectedPath: String?,
+    nowMillis: Long,
+): Int {
+    val rootPath = root.toPath()
+    if (Files.isSymbolicLink(rootPath) ||
+        !Files.isDirectory(rootPath, LinkOption.NOFOLLOW_LINKS) ||
+        nowMillis < TERMINAL_CAPTURE_TTL_MILLIS
+    ) return 0
+    val protected = protectedPath?.let { File(it).toPath().toAbsolutePath().normalize() }
+    val expiredBeforeOrAt = nowMillis - TERMINAL_CAPTURE_TTL_MILLIS
+    val candidates = try {
+        root.listFiles()?.asSequence().orEmpty()
+            .filter { file ->
+                val path = file.toPath()
+                GENERATED_CAPTURE_NAME.matches(file.name) &&
+                    path.toAbsolutePath().normalize() != protected &&
+                    !Files.isSymbolicLink(path) &&
+                    Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+            }
+            .mapNotNull { file ->
+                runCatching {
+                    file to Files.getLastModifiedTime(
+                        file.toPath(),
+                        LinkOption.NOFOLLOW_LINKS,
+                    ).toMillis()
+                }.getOrNull()
+            }
+            .filter { (_, modified) -> modified <= expiredBeforeOrAt }
+            .sortedWith(compareBy<Pair<File, Long>> { it.second }.thenBy { it.first.name })
+            .take(MAX_CAPTURE_CLEANUP_FILES)
+            .map { it.first }
+            .toList()
+    } catch (_: Exception) {
+        return 0
+    }
+    var deleted = 0
+    for (file in candidates) {
+        val path = file.toPath()
+        val stillOwned = runCatching {
+            !Files.isSymbolicLink(rootPath) &&
+                Files.isDirectory(rootPath, LinkOption.NOFOLLOW_LINKS) &&
+                GENERATED_CAPTURE_NAME.matches(file.name) &&
+                path.toAbsolutePath().normalize() != protected &&
+                !Files.isSymbolicLink(path) &&
+                Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) &&
+                Files.getLastModifiedTime(path, LinkOption.NOFOLLOW_LINKS).toMillis() <=
+                expiredBeforeOrAt
+        }.getOrDefault(false)
+        if (stillOwned && runCatching { Files.deleteIfExists(path) }.getOrDefault(false)) deleted += 1
+    }
+    return deleted
+}

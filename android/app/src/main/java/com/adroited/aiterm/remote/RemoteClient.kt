@@ -325,11 +325,17 @@ class RemoteClient(
      * The caller owns prompt submission and local draft-file deletion after this succeeds.
      */
     suspend fun uploadImages(
+        expectedTabId: String,
         sources: List<RemoteUploadSource>,
         onProgress: (RemoteUploadProgress) -> Unit = {},
     ): Result<List<String>> = withContext(dispatcher) {
         val context = synchronized(lifecycleLock) { activeUploadContext() }
             ?: return@withContext Result.failure(RemoteUploadException(null, "terminal focus is required to upload images"))
+        if (expectedTabId.isBlank() || context.tabId != expectedTabId) {
+            return@withContext Result.failure(
+                RemoteUploadException(null, "terminal tab changed before images could upload"),
+            )
+        }
         val activeUploadIds = linkedSetOf<String>()
         try {
             val submission = validateRemoteUploadSources(sources)

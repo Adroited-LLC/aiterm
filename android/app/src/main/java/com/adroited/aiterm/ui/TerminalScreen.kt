@@ -176,9 +176,10 @@ internal fun TerminalScreenContent(
     imagePickerLauncher: TerminalImagePickerLauncher? = null,
     imageNormalizer: TerminalImageNormalization? = null,
     onUploadImages: suspend (
+        String,
         List<TerminalAttachmentImage>,
         (RemoteUploadProgress) -> Unit,
-    ) -> Result<List<String>> = { _, _ ->
+    ) -> Result<List<String>> = { _, _, _ ->
         Result.failure(IllegalStateException("Image upload is unavailable."))
     },
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
@@ -287,28 +288,46 @@ internal fun TerminalScreenContent(
         if (current.attachments.preparing || current.attachments.submitting ||
             (current.composer.value.text.isEmpty() && current.attachments.items.isEmpty())
         ) return
+        if (current.attachments.items.isEmpty()) {
+            val outbound = formatTerminalSubmission(
+                text = current.composer.value.text,
+                paths = emptyList(),
+                bracketedPaste = activeScreen.modes.bracketedPaste,
+            )
+            val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
+                outbound.forEach(onInput)
+                true
+            }
+            if (accepted) {
+                activeDraftStore.clear(tabId)
+                keyboard?.hide()
+            } else {
+                setAttachmentMessage(
+                    tabId,
+                    "Terminal input was not accepted. Take focus and try again.",
+                )
+            }
+            return
+        }
         coroutineScope.launch {
             var uploadBegan = false
             try {
                 val initial = activeDraftStore.draftFor(tabId)
                 val images = initial.attachments.items.map { it.image }
-                val paths = if (images.isEmpty()) {
-                    emptyList()
-                } else {
-                    val began = activeDraftStore.transitionAttachments(tabId) { it.beginSubmission() }
-                    if (!began.accepted) return@launch
-                    uploadBegan = true
-                    onUploadImages(images) { progress ->
-                        activeDraftStore.transitionAttachments(tabId) {
-                            it.recordProgress(progress.sourceId, progress.sent, progress.total)
-                        }
-                    }.getOrElse { error ->
-                        activeDraftStore.transitionAttachments(tabId) {
-                            it.failSubmission(terminalUploadErrorMessage(error))
-                        }
-                        uploadBegan = false
-                        return@launch
+                if (images.isEmpty()) return@launch
+                val began = activeDraftStore.transitionAttachments(tabId) { it.beginSubmission() }
+                if (!began.accepted) return@launch
+                uploadBegan = true
+                val paths = onUploadImages(tabId, images) { progress ->
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.recordProgress(progress.sourceId, progress.sent, progress.total)
                     }
+                }.getOrElse { error ->
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.failSubmission(terminalUploadErrorMessage(error))
+                    }
+                    uploadBegan = false
+                    return@launch
                 }
                 val latest = activeDraftStore.draftFor(tabId)
                 val outbound = formatTerminalSubmission(
@@ -322,21 +341,13 @@ internal fun TerminalScreenContent(
                 }
                 if (!accepted) {
                     val message = "Terminal input was not accepted. Take focus and try again."
-                    if (images.isNotEmpty()) {
-                        activeDraftStore.transitionAttachments(tabId) { it.failSubmission(message) }
-                        uploadBegan = false
-                    } else {
-                        setAttachmentMessage(tabId, message)
-                    }
+                    activeDraftStore.transitionAttachments(tabId) { it.failSubmission(message) }
+                    uploadBegan = false
                     return@launch
                 }
-                if (images.isEmpty()) {
-                    activeDraftStore.updateComposer(tabId) { TerminalComposerState() }
-                } else {
-                    val completed = activeDraftStore.completeSubmission(tabId)
-                    completed.removed.forEach { it.image.file.delete() }
-                    uploadBegan = false
-                }
+                val completed = activeDraftStore.completeSubmission(tabId)
+                completed.removed.forEach { it.image.file.delete() }
+                uploadBegan = false
                 keyboard?.hide()
             } catch (cancelled: CancellationException) {
                 if (uploadBegan) {
@@ -1152,7 +1163,10 @@ private fun terminalImageErrorMessage(error: Throwable): String = when (error) {
 }
 
 private fun terminalUploadErrorMessage(error: Throwable): String = when {
-    error is RemoteUploadException && error.code == "remote.unsupported" ->
+    error is RemoteUploadException && error.code in setOf(
+        "remote.unsupported",
+        "protocol.unknown_request",
+    ) ->
         "Update AITerm on the desktop to attach images."
     !error.message.isNullOrBlank() -> error.message!!
     else -> "The image upload failed. Check the connection and try again."

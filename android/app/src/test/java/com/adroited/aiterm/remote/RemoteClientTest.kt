@@ -718,7 +718,7 @@ class RemoteClientTest {
         transport.requests.clear()
         val progress = mutableListOf<RemoteUploadProgress>()
 
-        val operation = async { client.uploadImages(listOf(first, second), progress::add) }
+        val operation = async { client.uploadImages("tab-1", listOf(first, second), progress::add) }
         advanceUntilIdle()
         val result = operation.await()
 
@@ -746,6 +746,51 @@ class RemoteClientTest {
     }
 
     @Test
+    fun queuedImageUploadRejectsAStaleDraftTabBeforeAnyBeginRequest() = runTest {
+        val transport = DeferredRemoteTransport()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val client = uploadClient(transport, this, dispatcher)
+        val source = uploadSource("stale", byteArrayOf(1, 2, 3))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        transport.completeNextAttach("tab-1", "attachment-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val releaseQueuedUpload = CompletableDeferred<Unit>()
+        val operation = async {
+            releaseQueuedUpload.await()
+            client.uploadImages("tab-1", listOf(source))
+        }
+        runCurrent()
+        client.selectTab("tab-2")
+        runCurrent()
+        transport.completeNextAttach("tab-2", "attachment-2")
+        advanceUntilIdle()
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged(
+                "tab-2",
+                "attachment-2",
+                FocusOwner.Self,
+                TerminalSize(80, 24),
+            ),
+        )
+        assertEquals("tab-2", client.state.value.activeTabId)
+        assertEquals(FocusOwner.Self, client.state.value.focus)
+
+        releaseQueuedUpload.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(operation.await().isFailure)
+        assertFalse(transport.requests.any { it.kind == "terminal.upload.begin" })
+        assertTrue(source.file.exists())
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
     fun imageUploadRejectsUnexpectedNonzeroInitialChunkAndCancelsTheUpload() = runTest {
         val transport = FakeRemoteTransport()
         val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
@@ -764,7 +809,7 @@ class RemoteClientTest {
         client.grantUploadFocus()
         transport.requests.clear()
 
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         advanceUntilIdle()
 
         assertTrue(operation.await().isFailure)
@@ -802,7 +847,7 @@ class RemoteClientTest {
         client.grantUploadFocus()
         transport.requests.clear()
 
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         advanceUntilIdle()
 
         val failure = operation.await()
@@ -847,7 +892,7 @@ class RemoteClientTest {
         client.grantUploadFocus()
         transport.requests.clear()
 
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         advanceUntilIdle()
 
         assertTrue(operation.await().isFailure)
@@ -874,7 +919,7 @@ class RemoteClientTest {
             RemoteServerEvent.FocusChanged("tab-1", "attachment-1", FocusOwner.Other, TerminalSize(80, 24)),
         )
 
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         advanceUntilIdle()
 
         assertTrue(operation.await().isFailure)
@@ -896,8 +941,8 @@ class RemoteClientTest {
         val fifth = listOf("a", "b", "c", "d", "e").map { id -> source.copy(id = id) }
         val overBudget = source.copy(length = 48L * 1_024 * 1_024 + 1)
 
-        val tooMany = async { client.uploadImages(fifth) }
-        val tooLarge = async { client.uploadImages(listOf(overBudget)) }
+        val tooMany = async { client.uploadImages("tab-1", fifth) }
+        val tooLarge = async { client.uploadImages("tab-1", listOf(overBudget)) }
         advanceUntilIdle()
 
         assertTrue(tooMany.await().isFailure)
@@ -945,7 +990,7 @@ class RemoteClientTest {
         advanceUntilIdle()
         client.grantUploadFocus()
         transport.requests.clear()
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         try {
             runCurrent()
             advanceTimeBy(2_001)
@@ -986,7 +1031,7 @@ class RemoteClientTest {
         advanceUntilIdle()
         client.grantUploadFocus()
         transport.requests.clear()
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         try {
             runCurrent()
             operation.cancel()
@@ -1032,7 +1077,7 @@ class RemoteClientTest {
         client.grantUploadFocus()
         transport.requests.clear()
 
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         advanceUntilIdle()
 
         assertTrue(operation.await().isFailure)
@@ -1069,7 +1114,7 @@ class RemoteClientTest {
         client.grantUploadFocus()
         transport.requests.clear()
 
-        val operation = async { client.uploadImages(listOf(source)) }
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
         runCurrent()
         operation.cancelAndJoin()
         advanceUntilIdle()
