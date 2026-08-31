@@ -203,6 +203,39 @@ fn maintenance_removes_an_abandoned_partial_after_fifteen_minutes() {
 }
 
 #[test]
+fn partial_attachment_survives_the_exact_fifteen_minute_boundary() {
+    let mut fixture = UploadFixture::new("partial-exact-ttl");
+    let jpeg = fixture.jpeg(64, 48);
+    let request = fixture.begin(jpeg.len(), digest(&jpeg));
+    fixture
+        .uploads
+        .begin_at(Some(&fixture.cwd), request, SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let partial = fixture.part_files().pop().unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + PARTIAL_ATTACHMENT_TTL)
+        .unwrap();
+
+    assert!(partial.exists());
+}
+
+#[test]
+fn completed_attachment_survives_the_exact_twenty_four_hour_boundary() {
+    let mut fixture = UploadFixture::new("complete-exact-ttl");
+    let jpeg = fixture.jpeg(64, 48);
+    let published = publish_at(&mut fixture, &jpeg, SystemTime::UNIX_EPOCH);
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + ATTACHMENT_TTL)
+        .unwrap();
+
+    assert!(published.exists());
+}
+
+#[test]
 fn budget_cleanup_evicts_the_oldest_completed_attachment_first() {
     let mut fixture = UploadFixture::new("budget-oldest");
     let jpeg = fixture.jpeg(16, 16);
@@ -249,6 +282,49 @@ fn budget_cleanup_evicts_the_oldest_completed_attachment_first() {
         .map(|record| record["length"].as_u64().unwrap())
         .sum();
     assert!(remaining_bytes <= ATTACHMENT_BUDGET_BYTES);
+}
+
+#[test]
+fn missing_complete_record_is_removed_before_near_budget_eviction() {
+    let mut fixture = UploadFixture::new("budget-missing-complete");
+    let jpeg = fixture.jpeg(16, 16);
+    let mut published = Vec::new();
+    for age in 0..22_u64 {
+        published.push(publish_at(
+            &mut fixture,
+            &jpeg,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(age),
+        ));
+    }
+    let manifest_path = fixture.cache.join("remote-attachments/attachments.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    for (record, path) in manifest["records"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(&published)
+    {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(MAX_UPLOAD_BYTES)
+            .unwrap();
+        record["length"] = serde_json::json!(MAX_UPLOAD_BYTES);
+    }
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    fs::remove_file(&published[0]).unwrap();
+
+    fixture
+        .store
+        .maintain(SystemTime::UNIX_EPOCH + Duration::from_secs(60))
+        .unwrap();
+
+    assert!(published[1..].iter().all(|path| path.exists()));
+    let rebuilt: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    assert_eq!(rebuilt["records"].as_array().unwrap().len(), 21);
 }
 
 #[test]
@@ -471,6 +547,194 @@ fn concurrent_upload_sets_preserve_every_manifest_record() {
     )
     .unwrap();
     assert_eq!(manifest["records"].as_array().unwrap().len(), WRITERS);
+}
+
+#[cfg(unix)]
+#[test]
+fn subprocess_writers_preserve_every_manifest_record_through_flock() {
+    use std::process::{Command, Stdio};
+
+    const WRITERS: usize = 8;
+    let fixture = UploadFixture::new("manifest-subprocess-concurrency");
+    let start = fixture.root.join("start-writers");
+    let executable = std::env::current_exe().unwrap();
+    let mut children = Vec::new();
+    for index in 0..WRITERS {
+        let cwd = fixture.root.join(format!("subprocess-project-{index}"));
+        fs::create_dir_all(&cwd).unwrap();
+        children.push(
+            Command::new(&executable)
+                .arg("--exact")
+                .arg("manifest_subprocess_writer_helper")
+                .arg("--ignored")
+                .env("AITERM_UPLOAD_TEST_CHILD", "1")
+                .env("AITERM_UPLOAD_TEST_CACHE", &fixture.cache)
+                .env("AITERM_UPLOAD_TEST_CWD", cwd)
+                .env("AITERM_UPLOAD_TEST_START", &start)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    fs::write(&start, b"go").unwrap();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "subprocess writer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.cache.join("remote-attachments/attachments.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["records"].as_array().unwrap().len(), WRITERS);
+}
+
+#[cfg(unix)]
+#[test]
+fn subprocess_writer_blocks_until_the_manifest_flock_is_released() {
+    use std::process::{Command, Stdio};
+
+    let fixture = UploadFixture::new("manifest-subprocess-lock");
+    let executable = std::env::current_exe().unwrap();
+    let cwd = fixture.root.join("subprocess-locked-project");
+    let start = fixture.root.join("start-locked-writer");
+    let attempted = fixture.root.join("writer-attempted");
+    let ready = fixture.root.join("lock-ready");
+    let release = fixture.root.join("release-lock");
+    fs::create_dir_all(&cwd).unwrap();
+    let holder = Command::new(&executable)
+        .arg("--exact")
+        .arg("manifest_subprocess_lock_holder")
+        .arg("--ignored")
+        .env(
+            "AITERM_UPLOAD_TEST_LOCK_PATH",
+            fixture.cache.join("remote-attachments/.attachments.lock"),
+        )
+        .env("AITERM_UPLOAD_TEST_LOCK_READY", &ready)
+        .env("AITERM_UPLOAD_TEST_LOCK_RELEASE", &release)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_test_path(&ready);
+    fs::write(&start, b"go").unwrap();
+    let mut writer = Command::new(&executable)
+        .arg("--exact")
+        .arg("manifest_subprocess_writer_helper")
+        .arg("--ignored")
+        .env("AITERM_UPLOAD_TEST_CHILD", "1")
+        .env("AITERM_UPLOAD_TEST_CACHE", &fixture.cache)
+        .env("AITERM_UPLOAD_TEST_CWD", cwd)
+        .env("AITERM_UPLOAD_TEST_START", &start)
+        .env("AITERM_UPLOAD_TEST_ATTEMPTED", &attempted)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_test_path(&attempted);
+    assert!(
+        writer.try_wait().unwrap().is_none(),
+        "writer bypassed the held cross-process manifest flock"
+    );
+
+    fs::write(&release, b"release").unwrap();
+    let writer_output = writer.wait_with_output().unwrap();
+    let holder_output = holder.wait_with_output().unwrap();
+    assert!(
+        writer_output.status.success(),
+        "subprocess writer failed: {}",
+        String::from_utf8_lossy(&writer_output.stderr)
+    );
+    assert!(
+        holder_output.status.success(),
+        "subprocess lock holder failed: {}",
+        String::from_utf8_lossy(&holder_output.stderr)
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.cache.join("remote-attachments/attachments.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["records"].as_array().unwrap().len(), 1);
+}
+
+#[cfg(unix)]
+fn wait_for_test_path(path: &Path) {
+    for _ in 0..500 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess helper invoked by subprocess_writers_preserve_every_manifest_record_through_flock"]
+fn manifest_subprocess_writer_helper() {
+    if std::env::var_os("AITERM_UPLOAD_TEST_CHILD").is_none() {
+        return;
+    }
+    let cache = PathBuf::from(std::env::var_os("AITERM_UPLOAD_TEST_CACHE").unwrap());
+    let cwd = PathBuf::from(std::env::var_os("AITERM_UPLOAD_TEST_CWD").unwrap());
+    let start = PathBuf::from(std::env::var_os("AITERM_UPLOAD_TEST_START").unwrap());
+    for _ in 0..500 {
+        if start.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(start.exists(), "subprocess writer start barrier timed out");
+    if let Some(attempted) = std::env::var_os("AITERM_UPLOAD_TEST_ATTEMPTED") {
+        fs::write(attempted, b"attempting manifest lock").unwrap();
+    }
+
+    let image = ImageBuffer::from_pixel(16, 16, Rgb([19_u8, 71_u8, 113_u8]));
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut encoded, ImageFormat::Jpeg)
+        .unwrap();
+    let jpeg = encoded.into_inner();
+    let mut uploads = AttachmentStore::new(cache).unwrap().upload_set();
+    let request = UploadBegin {
+        tab_id: TabId::new(),
+        attachment_id: AttachmentId::new(),
+        submission_id: uuid::Uuid::new_v4().to_string(),
+        submission_count: 1,
+        submission_bytes: jpeg.len() as u64,
+        length: jpeg.len() as u64,
+        sha256: digest(&jpeg),
+    };
+    let began = uploads.begin(Some(&cwd), request).unwrap();
+    uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
+    uploads.finish(&began.upload_id).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess helper invoked by subprocess_writer_blocks_until_the_manifest_flock_is_released"]
+fn manifest_subprocess_lock_holder() {
+    use std::os::fd::AsRawFd;
+
+    let Some(lock_path) = std::env::var_os("AITERM_UPLOAD_TEST_LOCK_PATH") else {
+        return;
+    };
+    let ready = PathBuf::from(std::env::var_os("AITERM_UPLOAD_TEST_LOCK_READY").unwrap());
+    let release = PathBuf::from(std::env::var_os("AITERM_UPLOAD_TEST_LOCK_RELEASE").unwrap());
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    fs::write(ready, b"locked").unwrap();
+    wait_for_test_path(&release);
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
 }
 
 #[test]
@@ -941,6 +1205,27 @@ fn cancellation_removes_the_partial_file_and_closes_the_submission() {
             .kind(),
         UploadErrorKind::ClosedSubmission
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cancellation_preserves_a_replacement_partial_entry_and_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let mut fixture = UploadFixture::new("cancel-replaced-partial");
+    let jpeg = fixture.jpeg(64, 48);
+    let request = fixture.begin(jpeg.len(), digest(&jpeg));
+    let began = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
+    let partial = fixture.part_files().pop().unwrap();
+    let outside = fixture.root.join("outside-partial");
+    fs::write(&outside, b"must survive").unwrap();
+    fs::remove_file(&partial).unwrap();
+    symlink(&outside, &partial).unwrap();
+
+    fixture.uploads.cancel(&began.upload_id).unwrap();
+
+    assert!(partial.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(outside).unwrap(), b"must survive");
 }
 
 #[test]
