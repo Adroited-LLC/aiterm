@@ -159,6 +159,7 @@ impl AttachmentStore {
         UploadSet {
             store: self.clone(),
             uploads: HashMap::new(),
+            upload_members: HashMap::new(),
             submission: None,
             closed_submissions: HashSet::new(),
         }
@@ -219,6 +220,7 @@ impl AttachmentStore {
 pub struct UploadSet {
     store: AttachmentStore,
     uploads: HashMap<String, ActiveUpload>,
+    upload_members: HashMap<String, UploadMember>,
     submission: Option<SubmissionState>,
     closed_submissions: HashSet<String>,
 }
@@ -343,6 +345,14 @@ impl UploadSet {
         group.begun_count = prospective.0;
         group.begun_bytes = prospective.1;
         group.active_uploads.insert(upload_id.clone());
+        self.upload_members.insert(
+            upload_id.clone(),
+            UploadMember {
+                submission_id: request.submission_id,
+                tab_id: request.tab_id,
+                attachment_id: request.attachment_id,
+            },
+        );
         self.uploads.insert(upload_id.clone(), active);
 
         Ok(UploadBegan {
@@ -493,17 +503,30 @@ impl UploadSet {
         }
     }
 
-    /// Cancel one upload and the rest of its submission. A partial submission
-    /// cannot be resumed with the same id after any member is cancelled.
+    /// Cancel one upload and the rest of its submission. Finished member ids
+    /// remain valid cancellation handles for the bounded connection lifetime,
+    /// and repeated cancellation is an idempotent success. A partial
+    /// submission cannot be resumed with the same id after any member is
+    /// cancelled.
     pub fn cancel(&mut self, upload_id: &str) -> Result<(), UploadError> {
         let submission_id = self
-            .uploads
+            .upload_members
             .get(upload_id)
             .ok_or_else(upload_not_found)?
             .submission_id
             .clone();
-        self.abort_submission(&submission_id);
-        Ok(())
+        if self
+            .submission
+            .as_ref()
+            .is_some_and(|group| group.submission_id == submission_id)
+        {
+            self.abort_submission(&submission_id);
+            return Ok(());
+        }
+        if self.closed_submissions.contains(&submission_id) {
+            return Ok(());
+        }
+        Err(upload_not_found())
     }
 
     pub fn cancel_all(&mut self) {
@@ -518,6 +541,12 @@ impl UploadSet {
 
     pub fn target(&self, upload_id: &str) -> Option<(&TabId, &AttachmentId)> {
         self.uploads
+            .get(upload_id)
+            .map(|upload| (&upload.tab_id, &upload.attachment_id))
+    }
+
+    pub fn cancel_target(&self, upload_id: &str) -> Option<(&TabId, &AttachmentId)> {
+        self.upload_members
             .get(upload_id)
             .map(|upload| (&upload.tab_id, &upload.attachment_id))
     }
@@ -559,6 +588,12 @@ struct ActiveUpload {
     written: u64,
     hasher: Sha256,
     staged: StagedFile,
+}
+
+struct UploadMember {
+    submission_id: String,
+    tab_id: TabId,
+    attachment_id: AttachmentId,
 }
 
 struct StagedFile {

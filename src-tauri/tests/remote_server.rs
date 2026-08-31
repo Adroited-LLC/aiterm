@@ -590,6 +590,15 @@ async fn response_kind(socket: &mut TestSocket, kind: &str) -> ResponseEnvelope 
     }
 }
 
+async fn response_request(socket: &mut TestSocket, request_id: u64) -> ResponseEnvelope {
+    loop {
+        let event = response(socket).await;
+        if event.request_id == request_id {
+            return event;
+        }
+    }
+}
+
 async fn assert_closed(socket: &mut TestSocket) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -3276,18 +3285,55 @@ async fn terminal_upload_cancel_remains_authorized_after_focus_loss() {
         .send(request(
             3,
             "terminal.upload.begin",
-            &encode(&upload_begin(
-                &tab,
-                &attached.attachment_id,
-                "cancel-focus-loss",
-                &jpeg,
-                digest.as_slice(),
-            )),
+            &encode(&UploadBeginRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                submission_id: "cancel-focus-loss",
+                submission_count: 2,
+                submission_bytes: (jpeg.len() * 2) as u64,
+                length: jpeg.len() as u64,
+                media_type: "image/jpeg",
+                sha256: digest.as_slice(),
+            }),
         ))
         .await
         .unwrap();
     let began: UploadBeginReply = decode(
         &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+
+    socket
+        .send(request(
+            4,
+            "terminal.upload.chunk",
+            &encode(&UploadChunkRequest {
+                upload_id: &began.upload_id,
+                index: 0,
+                data: &jpeg,
+            }),
+        ))
+        .await
+        .unwrap();
+    let chunked: SuccessReply = decode(
+        &response_kind(&mut socket, "terminal.upload.chunk")
+            .await
+            .payload,
+    );
+    assert!(chunked.ok);
+    socket
+        .send(request(
+            5,
+            "terminal.upload.finish",
+            &encode(&UploadIdRequest {
+                upload_id: &began.upload_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let _: UploadFinishReply = decode(
+        &response_kind(&mut socket, "terminal.upload.finish")
             .await
             .payload,
     );
@@ -3298,7 +3344,7 @@ async fn terminal_upload_cancel_remains_authorized_after_focus_loss() {
         .unwrap();
     socket
         .send(request(
-            4,
+            6,
             "terminal.upload.cancel",
             &encode(&UploadIdRequest {
                 upload_id: &began.upload_id,
@@ -3306,12 +3352,20 @@ async fn terminal_upload_cancel_remains_authorized_after_focus_loss() {
         ))
         .await
         .unwrap();
-    let cancelled: SuccessReply = decode(
-        &response_kind(&mut socket, "terminal.upload.cancel")
-            .await
-            .payload,
-    );
+    let cancelled: SuccessReply = decode(&response_request(&mut socket, 6).await.payload);
     assert!(cancelled.ok);
+    socket
+        .send(request(
+            7,
+            "terminal.upload.cancel",
+            &encode(&UploadIdRequest {
+                upload_id: &began.upload_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cancelled_again: SuccessReply = decode(&response_request(&mut socket, 7).await.payload);
+    assert!(cancelled_again.ok);
     assert!(std::fs::read_dir(project.join(".aiterm/attachments"))
         .unwrap()
         .all(|entry| entry
@@ -3320,6 +3374,40 @@ async fn terminal_upload_cancel_remains_authorized_after_focus_loss() {
             .extension()
             .and_then(|value| value.to_str())
             != Some("part")));
+
+    socket
+        .send(request(
+            8,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &attached.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let _ = response_kind(&mut socket, "terminal.focus").await;
+    socket
+        .send(request(
+            9,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &attached.attachment_id,
+                "retry-after-cancel",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let retried: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+    assert_eq!(retried.next_chunk, 0);
 
     registry.close(&tab).ok();
     gateway.stop().await.unwrap();

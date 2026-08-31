@@ -746,6 +746,118 @@ class RemoteClientTest {
     }
 
     @Test
+    fun finishedFirstImageIsCancelledAfterFocusLossAndRetrySucceedsOnTheSameConnection() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val first = uploadSource("first-retry", byteArrayOf(1, 2, 3))
+        val second = uploadSource("second-retry", byteArrayOf(4, 5))
+        var activeSubmission: String? = null
+        var declaredCount = 0
+        var finishedCount = 0
+        var nextUploadId = 0
+        var loseFocusAfterFinish = true
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> {
+                    val begin = decodeUploadBegin(request.payload)
+                    if (activeSubmission != null && activeSubmission != begin.submissionId) {
+                        CompletableDeferred(
+                            RemoteResponse.Error(
+                                request.requestId,
+                                "terminal.upload_invalid_submission",
+                                "this connection already has an active submission",
+                            ),
+                        )
+                    } else {
+                        if (activeSubmission == null) {
+                            activeSubmission = begin.submissionId
+                            declaredCount = begin.submissionCount
+                            finishedCount = 0
+                        }
+                        CompletableDeferred(
+                            RemoteResponse.Success(
+                                request.requestId,
+                                request.kind,
+                                uploadBeginReply("upload-${++nextUploadId}", 0),
+                            ),
+                        )
+                    }
+                }
+                "terminal.upload.chunk" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                )
+                "terminal.upload.finish" -> {
+                    finishedCount += 1
+                    if (finishedCount == declaredCount) activeSubmission = null
+                    if (loseFocusAfterFinish) {
+                        loseFocusAfterFinish = false
+                        client.acceptForTest(
+                            RemoteServerEvent.FocusChanged(
+                                "tab-1",
+                                "attachment-1",
+                                FocusOwner.Other,
+                                TerminalSize(80, 24),
+                            ),
+                        )
+                    }
+                    CompletableDeferred(
+                        RemoteResponse.Success(
+                            request.requestId,
+                            request.kind,
+                            uploadedPathReply("/desktop/finished-$finishedCount.jpg"),
+                        ),
+                    )
+                }
+                "terminal.upload.cancel" -> {
+                    activeSubmission = null
+                    CompletableDeferred(
+                        RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                    )
+                }
+                else -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()),
+                )
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val interrupted = async { client.uploadImages("tab-1", listOf(first, second)) }
+        advanceUntilIdle()
+
+        assertTrue(interrupted.await().isFailure)
+        assertEquals(
+            listOf(
+                "terminal.upload.begin",
+                "terminal.upload.chunk",
+                "terminal.upload.finish",
+                "terminal.upload.cancel",
+            ),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged(
+                "tab-1",
+                "attachment-1",
+                FocusOwner.Self,
+                TerminalSize(80, 24),
+            ),
+        )
+        transport.requests.clear()
+
+        val retried = async { client.uploadImages("tab-1", listOf(first, second)) }
+        advanceUntilIdle()
+
+        assertTrue(retried.await().isSuccess)
+        assertEquals(2, transport.requests.count { it.kind == "terminal.upload.finish" })
+        cleanupUploadSources(first, second)
+        client.lock()
+    }
+
+    @Test
     fun queuedImageUploadRejectsAStaleDraftTabBeforeAnyBeginRequest() = runTest {
         val transport = DeferredRemoteTransport()
         val dispatcher = StandardTestDispatcher(testScheduler)

@@ -336,7 +336,7 @@ class RemoteClient(
                 RemoteUploadException(null, "terminal tab changed before images could upload"),
             )
         }
-        val activeUploadIds = linkedSetOf<String>()
+        val begunUploadIds = linkedSetOf<String>()
         try {
             val submission = validateRemoteUploadSources(sources)
             val submissionId = UUID.randomUUID().toString()
@@ -358,7 +358,7 @@ class RemoteClient(
                     ),
                 )
                 val began = RemoteCommands.uploadBegan(beganPayload)
-                activeUploadIds += began.uploadId
+                begunUploadIds += began.uploadId
                 if (began.nextChunk != 0) {
                     throw RemoteProtocolException("new terminal image upload unexpectedly starts after chunk zero")
                 }
@@ -398,15 +398,14 @@ class RemoteClient(
                     RemoteCommands.uploadFinish(began.uploadId),
                 )
                 paths += RemoteCommands.uploadedPath(finishedPayload)
-                activeUploadIds -= began.uploadId
             }
             Result.success(paths)
         } catch (error: kotlinx.coroutines.CancellationException) {
             // A caller cancellation must leave its local draft intact, but should still stop desktop staging.
-            withContext(NonCancellable) { cancelBegunUploads(context, activeUploadIds) }
+            withContext(NonCancellable) { cancelBegunUploads(context, begunUploadIds) }
             throw error
         } catch (error: Exception) {
-            withContext(NonCancellable) { cancelBegunUploads(context, activeUploadIds) }
+            withContext(NonCancellable) { cancelBegunUploads(context, begunUploadIds) }
             Result.failure(error)
         }
     }

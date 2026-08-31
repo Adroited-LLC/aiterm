@@ -2046,7 +2046,7 @@ impl RemoteServices {
                 let body: UploadIdPayload = decode_payload(request)?;
                 bounded(&body.upload_id, MAX_IDENTIFIER_BYTES)?;
                 let mut upload_set = upload_set.lock().map_err(|_| "remote.operation_failed")?;
-                let (tab_id, attachment_id) = upload_target(&upload_set, &body.upload_id)?;
+                let (tab_id, attachment_id) = upload_cancel_target(&upload_set, &body.upload_id)?;
                 authorize_attachment(attachments, &tab_id, &attachment_id)?;
                 upload_set
                     .cancel(&body.upload_id)
@@ -2147,6 +2147,16 @@ fn upload_target(
 ) -> Result<(TabId, AttachmentId), &'static str> {
     upload_set
         .target(upload_id)
+        .map(|(tab_id, attachment_id)| (tab_id.clone(), attachment_id.clone()))
+        .ok_or("terminal.upload_not_found")
+}
+
+fn upload_cancel_target(
+    upload_set: &UploadSet,
+    upload_id: &str,
+) -> Result<(TabId, AttachmentId), &'static str> {
+    upload_set
+        .cancel_target(upload_id)
         .map(|(tab_id, attachment_id)| (tab_id.clone(), attachment_id.clone()))
         .ok_or("terminal.upload_not_found")
 }
