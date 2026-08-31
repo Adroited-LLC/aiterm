@@ -174,6 +174,162 @@ Requires a desktop and a phone on the same LAN or VPN.
 13. Turn remote access off and on again. A trusted phone must reconnect with
     no QR.
 
+## Terminal image attachments
+
+Attachments are a remote-terminal convenience, not general-purpose phone file
+access. The phone normalizes a selected camera or gallery image into a private,
+metadata-free baseline JPEG before it is sent. The desktop is still the only
+machine that chooses a destination path and writes to the project.
+
+### What can be attached
+
+- A draft may contain at most four images, each at most 12 MiB after
+  normalization, with a 48 MiB combined normalized-data limit.
+- Each JPEG has a longest edge no greater than 4096 pixels. The upload client
+  streams ordered chunks no larger than 256 KiB, so a single image transfer
+  stays well below the WebSocket's 1 MiB frame bound.
+- **Gallery** uses Android's system Photo Picker. It does not request broad
+  storage or media-library permission.
+- **Camera** writes only to an app-private capture URI through the Android
+  camera contract. It is a new picture: do not use it for unattended test
+  automation that could capture private surroundings.
+
+Chosen items appear above the composer in selection order. Remove one with its
+thumbnail control, or remove all of them by discarding the draft. A fifth
+selection is refused with an explanation; it never silently replaces an image.
+
+### Submission and recovery
+
+The Android keyboard's Go/Enter action and the terminal key bar's Enter action
+take the same path. With text and attachments, AITerm uploads every image in
+order and then sends one terminal input containing the text plus an
+`Attached images:` list of desktop absolute paths, followed by Enter. With no
+text, it sends `Please inspect the attached image(s):` plus that list. The
+terminal's bracketed-paste mode is used when the terminal advertises it.
+
+No terminal input is sent until every image has uploaded. A normalization,
+storage, focus, connection, or upload failure preserves the complete draft and
+shows an actionable message, so retry starts a fresh upload and removal can
+target the failed item. Drafts are isolated by terminal tab and survive tab
+switching and reconnecting. Beginning an upload requires the phone to own
+terminal input focus; an upload already bound to that authenticated connection
+may finish after focus changes, but another connection or phone cannot finish
+or cancel it.
+
+An older desktop that does not understand the additive upload protocol keeps
+the draft and reports that image attachments require a desktop update.
+Text-only terminal use continues normally.
+
+### Retention and paths
+
+| Data | Location | Retention |
+| --- | --- | --- |
+| Android normalized draft | App-private cache | Removed/submitted immediately, or deleted on the next cleanup opportunity after 24 hours |
+| Android source snapshot | App-private cache | During normalization; stale snapshots are deleted on the next cleanup opportunity after 15 minutes |
+| Android camera capture | App-private FileProvider path | Until normalization completes, or deleted on the next cleanup opportunity after 24 hours |
+| Desktop partial upload | Owner-only `.part` staging file | 15 minutes, or immediate cancellation/disconnect cleanup |
+| Desktop completed image | `<tab cwd>/.aiterm/attachments/` when safe, otherwise AITerm's owner-only cache | 24 hours, subject to the 256 MiB global attachment budget |
+
+Only generated, owner-controlled paths participate in cleanup. The desktop
+does not follow symlinks during staging or maintenance. In a Git worktree it
+adds the generated attachment directory to that checkout's local Git exclude,
+never to tracked `.gitignore`.
+
+## Pairing-preserving Android install and test procedure
+
+First identify the target. Do not run an unqualified ADB command when more
+than one device is connected, and never target a watch.
+
+```bash
+adb devices -l
+adb -s <PIXEL_SERIAL> shell getprop ro.product.device
+adb -s <PIXEL_SERIAL> shell getprop ro.product.model
+```
+
+For the paired Pixel used during the 2026-08-31 verification, the serial was
+`10.0.0.115:34437`, the product was `mustang`, and the model was
+`Pixel_10_Pro_XL` as reported by `adb devices -l`.
+
+Build, install, and test without disturbing the Android Keystore pairing key:
+
+```bash
+cd android
+./gradlew testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
+adb -s <PIXEL_SERIAL> install -r "$PWD/app/build/outputs/apk/debug/app-debug.apk"
+adb -s <PIXEL_SERIAL> install -r -t "$PWD/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"
+adb -s <PIXEL_SERIAL> shell am instrument -w \
+  com.adroited.aiterm.test/androidx.test.runner.AndroidJUnitRunner
+adb -s <PIXEL_SERIAL> shell pm path com.adroited.aiterm
+```
+
+Never uninstall or clear `com.adroited.aiterm`; both actions can destroy the
+non-exportable Android Keystore key and require a fresh desktop pairing.
+Never use `connectedDebugAndroidTest`, because it can choose the wrong ADB
+device. When the tests are no longer needed, it is safe to remove *only* the
+test package:
+
+```bash
+adb -s <PIXEL_SERIAL> uninstall com.adroited.aiterm.test
+```
+
+## Controlled attachment dogfood checklist
+
+The desktop process serving the phone must already be the newly installed
+AITerm binary. Installing an RPM does not replace or restart an active AITerm
+process; restart it manually before claiming a real upload test against new
+desktop code.
+
+1. Unlock the phone normally with its biometric or PIN gate and open a paired
+   remote terminal. Do not bypass this lock for testing.
+2. Tap **Attach image**, choose **Gallery**, cancel the system picker, and
+   verify the existing text and thumbnails stay unchanged.
+3. Select one deliberately non-personal test image with text. Confirm the
+   normalized thumbnail appears, upload progress only moves forward, terminal
+   diffs remain visible during transfer, and the resulting terminal prompt
+   contains a readable desktop path.
+4. Remove the thumbnail and confirm only that draft image disappears. Add four
+   mixed gallery/camera images and confirm the fifth is refused. Submit an
+   attachment-only draft with the keyboard Go/Enter action.
+5. With the user's physical participation only, exercise Camera once. Verify
+   the capture is private, is normalized, and is gone after removal or cleanup.
+   Do not automate a real camera capture.
+6. Background and restore the app, switch tabs, disconnect/reconnect, and
+   deliberately transfer focus. Drafts must remain tab-local; interrupted
+   uploads must leave no successful terminal input and must be retryable.
+7. Against an older desktop, select a controlled image and confirm the exact
+   desktop-update message, with the draft retained. This is a compatibility
+   check, not an upload success.
+8. Use the injected-clock automated tests for 15-minute snapshot/partial and
+   24-hour draft/completed-file expiry. Do not wait for real time to pass.
+
+If a controlled media file is placed on a phone for this checklist, put it
+under one uniquely named path such as
+`/sdcard/Pictures/AITermTest/aiterm-verification-<date>.png`, record that exact
+path, and remove only that exact file afterward. Do not browse or capture
+personal gallery content in test screenshots or logs.
+
+## 2026-08-31 verification evidence
+
+- `git diff --check`, `npm run test:ui` (78 tests), and `npm run build`
+  completed successfully.
+- Rust compiled every test target with `cargo test --no-run`. Safe targets ran
+  serially: 464 library tests passed (9 ignored), and the remote auth,
+  desktop, operations, protocol, terminal, uploads, registry, and terminal
+  screen integration suites all passed. `tests/backend.rs` was intentionally
+  not executed because its fixture writes and removes data under the real
+  `$HOME/.claude` and `$HOME/.codex` trees. The one known
+  `remote_server` live-PTY fixture was reproduced as a bounded 45-second
+  timeout; the remaining 46 `remote_server` cases passed serially.
+- Android `testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest`
+  completed successfully. On the identified Pixel, both APKs were installed
+  in place and the exact instrumentation package completed `OK (65 tests)` in
+  65.085 seconds. The main package remained installed; it was neither
+  uninstalled nor cleared.
+- The controlled real-picker/upload check remains a manual post-unlock,
+  post-desktop-restart step: the phone was found at its normal biometric/PIN
+  lock screen, and the live desktop process intentionally was not restarted.
+  No personal gallery content was opened and no camera image was captured.
+
 ## Diagnostics
 
 Remote access logs listener lifecycle, a device id prefix, connection state,

@@ -27,6 +27,10 @@ const KNOWN_REQUESTS: &[&str] = &[
     "terminal.detach",
     "terminal.scrollback",
     "terminal.resume",
+    "terminal.upload.begin",
+    "terminal.upload.chunk",
+    "terminal.upload.finish",
+    "terminal.upload.cancel",
     // Taking input ownership is its own request because it is a deliberate act.
     // Attaching gives a second client a read-only view; only this says "I am
     // typing now", and the broker announces it to everyone else on the stream.

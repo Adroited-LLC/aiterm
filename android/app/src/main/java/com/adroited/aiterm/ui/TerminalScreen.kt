@@ -6,21 +6,25 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -33,7 +37,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -54,7 +57,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -62,18 +67,16 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.text
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -96,6 +99,9 @@ import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemoteSession
+import com.adroited.aiterm.remote.RemoteUploadException
+import com.adroited.aiterm.remote.RemoteUploadProgress
+import com.adroited.aiterm.remote.TerminalSize
 import com.adroited.aiterm.terminal.CellAttributes
 import com.adroited.aiterm.terminal.CursorShape
 import com.adroited.aiterm.terminal.ScreenCell
@@ -103,17 +109,27 @@ import com.adroited.aiterm.terminal.ScreenSnapshot
 import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.TerminalColor
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import java.io.File
 import java.net.URI
 
 @Composable
-fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit) {
+fun RemoteTerminalScreen(
+    viewModel: RemoteTerminalViewModel,
+    onBack: () -> Unit,
+    keyBarPreference: TerminalKeyBarPreference,
+) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     val screen by viewModel.client.screen.collectAsStateWithLifecycle()
     val scrollback by viewModel.client.scrollback.collectAsStateWithLifecycle()
+    val keyBarExpanded by keyBarPreference.expanded.collectAsStateWithLifecycle()
     TerminalScreenContent(
         state = state,
         screen = screen,
         scrollback = scrollback,
+        keyBarExpanded = keyBarExpanded,
+        onKeyBarExpandedChange = keyBarPreference::setExpanded,
         onBack = onBack,
         onReconnect = viewModel::reconnect,
         onSelectTab = viewModel::selectTab,
@@ -126,6 +142,9 @@ fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit)
         onDeleteSession = viewModel::deleteSession,
         onOpenShell = { cols, rows -> viewModel.openShell(null, cols, rows) },
         onInput = viewModel::sendInput,
+        onInputBatch = viewModel::sendInputs,
+        draftStore = viewModel.terminalDrafts,
+        onUploadImages = viewModel::uploadDraftImages,
         onTakeFocus = viewModel::takeFocus,
         onResize = viewModel::resize,
         onLoadScrollback = viewModel::loadOlderScrollback,
@@ -134,10 +153,12 @@ fun RemoteTerminalScreen(viewModel: RemoteTerminalViewModel, onBack: () -> Unit)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TerminalScreenContent(
+internal fun TerminalScreenContent(
     state: RemoteClientState,
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow> = emptyList(),
+    keyBarExpanded: Boolean = true,
+    onKeyBarExpandedChange: (Boolean) -> Unit = {},
     onBack: () -> Unit = {},
     onReconnect: () -> Unit = {},
     onSelectTab: (String) -> Unit = {},
@@ -150,9 +171,22 @@ fun TerminalScreenContent(
     onDeleteSession: (String) -> Unit = {},
     onOpenShell: (Int, Int) -> Unit = { _, _ -> },
     onInput: (String) -> Unit = {},
+    onInputBatch: ((String, List<String>) -> Boolean)? = null,
+    draftStore: TerminalDraftStore? = null,
+    imagePickerLauncher: TerminalImagePickerLauncher? = null,
+    imageNormalizer: TerminalImageNormalization? = null,
+    onUploadImages: suspend (
+        String,
+        List<TerminalAttachmentImage>,
+        (RemoteUploadProgress) -> Unit,
+    ) -> Result<List<String>> = { _, _, _ ->
+        Result.failure(IllegalStateException("Image upload is unavailable."))
+    },
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
     onResize: (Int, Int) -> Unit = { _, _ -> },
     onLoadScrollback: () -> Unit = {},
+    imeInsets: WindowInsets = WindowInsets.ime,
+    navigationInsets: WindowInsets = WindowInsets.navigationBars,
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
@@ -162,13 +196,190 @@ fun TerminalScreenContent(
     val terminalMetrics = rememberTerminalMetrics()
     val inputFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
+    val context = LocalContext.current
     val density = LocalDensity.current
-    var composer by remember(screen?.tabId) { mutableStateOf(TerminalComposerState()) }
-    var composerHeight by remember(screen?.tabId, density) { mutableStateOf(72.dp) }
+    val layoutDirection = LocalLayoutDirection.current
+    val localDraftStore = remember { TerminalDraftStore() }
+    val activeDraftStore = draftStore ?: localDraftStore
+    val allDrafts by activeDraftStore.drafts.collectAsStateWithLifecycle()
+    val latestScreen by rememberUpdatedState(screen)
+    val activeTabId = screen?.tabId
+    val tabDraft = activeTabId?.let { allDrafts[it] } ?: TerminalTabDraft()
+    val composer = tabDraft.composer
+    val attachments = tabDraft.attachments
+    val defaultNormalizer = remember(context) { TerminalImageNormalizer(context) }
+    val normalizer = imageNormalizer ?: remember(defaultNormalizer) {
+        TerminalImageNormalization(defaultNormalizer::normalize)
+    }
+    var showImageSources by remember { mutableStateOf(false) }
+    var showDiscardDrafts by remember { mutableStateOf(false) }
+    var chromeInteractiveHeightPx by remember(screen?.tabId) { mutableIntStateOf(0) }
+    val bottomInsets = imeInsets.union(navigationInsets)
+    val bottomInsetPx = bottomInsets.getBottom(density)
+    val navigationLeftInsetPx = navigationInsets.getLeft(density, layoutDirection)
+    val navigationRightInsetPx = navigationInsets.getRight(density, layoutDirection)
+    val onViewportSizeChanged = remember {
+        { size: TerminalSize ->
+            cols = size.cols
+            rows = size.rows
+        }
+    }
+    val onRequestKeyboard = remember(state.focus, activeTabId, activeDraftStore) {
+        {
+            if (state.focus == FocusOwner.Self && activeTabId != null) {
+                activeDraftStore.updateComposer(activeTabId) { it.open() }
+            }
+        }
+    }
 
-    BackHandler(enabled = composer.expanded) {
-        composer = composer.close()
-        keyboard?.hide()
+    fun setAttachmentMessage(tabId: String, message: String) {
+        activeDraftStore.updateAttachments(tabId) { it.copy(message = message) }
+    }
+
+    fun handlePickerResult(tabId: String, result: TerminalImagePickerResult) {
+        when (result) {
+            TerminalImagePickerResult.Cancelled -> Unit
+            is TerminalImagePickerResult.Failed -> setAttachmentMessage(tabId, result.message)
+            is TerminalImagePickerResult.Selected -> coroutineScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                val preparation = activeDraftStore.transitionAttachments(tabId) { it.beginPreparation() }
+                if (!preparation.accepted) {
+                    result.ownedCaptureFiles.forEach(File::delete)
+                    return@launch
+                }
+                try {
+                    val currentCount = activeDraftStore.draftFor(tabId).attachments.items.size
+                    val remaining = (TerminalAttachmentDraft.MAX_IMAGES - currentCount).coerceAtLeast(0)
+                    val distinctUris = result.uris.distinct()
+                    var selectionMessage: String? = null
+                    for (uri in distinctUris.take(remaining)) {
+                        val normalizedImage = normalizer.normalize(uri).getOrElse { error ->
+                            selectionMessage = terminalImageErrorMessage(error)
+                            continue
+                        }
+                        val transition = activeDraftStore.transitionAttachments(tabId) {
+                            it.add(normalizedImage)
+                        }
+                        if (!transition.accepted) {
+                            selectionMessage = transition.draft.message
+                            normalizedImage.file.delete()
+                        }
+                    }
+                    val finalMessage = when {
+                        result.uris.size != distinctUris.size ->
+                            "This image is already attached."
+                        distinctUris.size > remaining ->
+                            "You can attach up to 4 images."
+                        else -> selectionMessage
+                    }
+                    finalMessage?.let { setAttachmentMessage(tabId, it) }
+                } finally {
+                    result.ownedCaptureFiles.forEach(File::delete)
+                    activeDraftStore.transitionAttachments(tabId) { it.finishPreparation() }
+                }
+            }
+        }
+    }
+    val nativePicker = rememberTerminalImagePicker(::handlePickerResult)
+    val picker = imagePickerLauncher ?: nativePicker
+
+    fun submitComposer() {
+        val activeScreen = screen ?: return
+        val tabId = activeScreen.tabId
+        val current = activeDraftStore.draftFor(tabId)
+        if (current.attachments.preparing || current.attachments.submitting ||
+            (current.composer.value.text.isEmpty() && current.attachments.items.isEmpty())
+        ) return
+        if (current.attachments.items.isEmpty()) {
+            val outbound = formatTerminalSubmission(
+                text = current.composer.value.text,
+                paths = emptyList(),
+                bracketedPaste = activeScreen.modes.bracketedPaste,
+            )
+            val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
+                outbound.forEach(onInput)
+                true
+            }
+            if (accepted) {
+                activeDraftStore.clear(tabId)
+                keyboard?.hide()
+            } else {
+                setAttachmentMessage(
+                    tabId,
+                    "Terminal input was not accepted. Take focus and try again.",
+                )
+            }
+            return
+        }
+        coroutineScope.launch {
+            var uploadBegan = false
+            try {
+                val initial = activeDraftStore.draftFor(tabId)
+                val images = initial.attachments.items.map { it.image }
+                if (images.isEmpty()) return@launch
+                val began = activeDraftStore.transitionAttachments(tabId) { it.beginSubmission() }
+                if (!began.accepted) return@launch
+                uploadBegan = true
+                val paths = onUploadImages(tabId, images) { progress ->
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.recordProgress(progress.sourceId, progress.sent, progress.total)
+                    }
+                }.getOrElse { error ->
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.failSubmission(terminalUploadErrorMessage(error))
+                    }
+                    uploadBegan = false
+                    return@launch
+                }
+                val latest = activeDraftStore.draftFor(tabId)
+                val submissionScreen = latestScreen
+                if (submissionScreen?.tabId != tabId) {
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.failSubmission("Terminal tab changed while images were uploading. Try again.")
+                    }
+                    uploadBegan = false
+                    return@launch
+                }
+                val outbound = formatTerminalSubmission(
+                    text = latest.composer.value.text,
+                    paths = paths,
+                    bracketedPaste = submissionScreen.modes.bracketedPaste,
+                )
+                val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
+                    outbound.forEach(onInput)
+                    true
+                }
+                if (!accepted) {
+                    val message = "Terminal input was not accepted. Take focus and try again."
+                    activeDraftStore.transitionAttachments(tabId) { it.failSubmission(message) }
+                    uploadBegan = false
+                    return@launch
+                }
+                val completed = activeDraftStore.completeSubmission(tabId)
+                completed.removed.forEach { it.image.file.delete() }
+                uploadBegan = false
+                keyboard?.hide()
+            } catch (cancelled: CancellationException) {
+                if (uploadBegan) {
+                    activeDraftStore.transitionAttachments(tabId) {
+                        it.failSubmission("Image upload paused. Try again.")
+                    }
+                }
+                throw cancelled
+            }
+        }
+    }
+
+    fun requestLeave() {
+        if (activeDraftStore.hasDrafts()) showDiscardDrafts = true else onBack()
+    }
+
+    BackHandler {
+        if (composer.expanded && activeTabId != null) {
+            activeDraftStore.updateComposer(activeTabId) { it.close() }
+            keyboard?.hide()
+        } else {
+            requestLeave()
+        }
     }
     LaunchedEffect(composer.expanded, state.focus, screen?.tabId) {
         if (composer.expanded && state.focus == FocusOwner.Self && screen != null) {
@@ -202,6 +413,7 @@ fun TerminalScreenContent(
         },
     ) {
         Scaffold(
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
                 TopAppBar(
                     navigationIcon = {
@@ -219,95 +431,180 @@ fun TerminalScreenContent(
                             )
                         }
                     },
-                    actions = { TextButton(onClick = onBack) { Text("Back") } },
+                    actions = { TextButton(onClick = ::requestLeave) { Text("Back") } },
                 )
             },
         ) { padding ->
-            Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
-                ConnectionRail(state, onReconnect)
-                BoxWithConstraints(
-                    Modifier.weight(1f).fillMaxWidth()
-                        .background(Color(0xFF07111B))
-                        .padding(horizontal = 4.dp, vertical = 3.dp),
-                ) {
-                    val composerInset = if (composer.expanded) composerHeight else 0.dp
-                    val renderHeight = (maxHeight - composerInset).coerceAtLeast(terminalMetrics.lineHeight)
-                    val measuredCols = (maxWidth / terminalMetrics.cellWidth).toInt().coerceIn(1, 512)
-                    val measuredRows = (renderHeight / terminalMetrics.lineHeight).toInt().coerceIn(1, 512)
-                    LaunchedEffect(measuredCols, measuredRows, screen?.tabId) {
-                        cols = measuredCols
-                        rows = measuredRows
-                        if (screen != null) onResize(measuredCols, measuredRows)
-                    }
-                    TerminalGrid(
+            Box(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
+                Column(Modifier.fillMaxSize().testTag("terminal-surface")) {
+                    ConnectionRail(state, onReconnect)
+                    TerminalViewport(
                         screen = screen,
                         scrollback = scrollback,
-                        modifier = Modifier.fillMaxSize().padding(bottom = composerInset),
-                        onRequestKeyboard = {
-                            if (state.focus == FocusOwner.Self) {
-                                composer = composer.open()
-                            }
-                        },
                         metrics = terminalMetrics,
+                        bottomObstructionPx = bottomInsetPx + chromeInteractiveHeightPx,
+                        leftObstructionPx = navigationLeftInsetPx,
+                        rightObstructionPx = navigationRightInsetPx,
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        emptyMessage = if (state.tabs.isEmpty()) {
+                            "No remote tabs are open."
+                        } else {
+                            "Choose a tab from Sessions."
+                        },
+                        onViewportSizeChanged = onViewportSizeChanged,
+                        onResize = onResize,
+                        onRequestKeyboard = onRequestKeyboard,
                     )
-                    if (screen == null) {
-                        Text(
-                            if (state.tabs.isEmpty()) "No remote tabs are open." else "Choose a tab from Sessions.",
-                            modifier = Modifier.align(Alignment.Center),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                }
+                Column(
+                    Modifier.align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .testTag("terminal-bottom-chrome")
+                        .windowInsetsPadding(bottomInsets),
+                ) {
+                    Column(Modifier.onSizeChanged { chromeInteractiveHeightPx = it.height }) {
+                        if (screen != null && composer.expanded) {
+                            Column(
+                                Modifier.fillMaxWidth()
+                                    .testTag("terminal-composer-overlay")
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                            ) {
+                                TerminalAttachmentStrip(
+                                    draft = attachments,
+                                    onRemove = { imageId ->
+                                        val removed = activeDraftStore.transitionAttachments(screen.tabId) {
+                                            it.remove(imageId)
+                                        }
+                                        removed.removed.forEach { it.image.file.delete() }
+                                    },
+                                )
+                                TerminalInputBar(
+                                    value = composer.value,
+                                    onValueChange = { next ->
+                                        activeDraftStore.updateComposer(screen.tabId) {
+                                            it.updateValue(next).state
+                                        }
+                                    },
+                                    onSend = ::submitComposer,
+                                    onAddImage = { showImageSources = true },
+                                    addImageEnabled = state.focus == FocusOwner.Self &&
+                                        !attachments.preparing && !attachments.submitting,
+                                    focusRequester = inputFocus,
+                                    enabled = state.focus == FocusOwner.Self && !attachments.submitting,
+                                )
+                            }
+                        }
+                        if (state.showTakeFocus && screen != null) {
+                            Button(
+                                onClick = { onTakeFocus(cols, rows) },
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                            ) { Text("Take Focus") }
+                        }
+                        if (screen != null) {
+                            TextButton(
+                                onClick = onLoadScrollback,
+                                modifier = Modifier.fillMaxWidth().height(36.dp).testTag("load-scrollback"),
+                            ) { Text("Load older history · ${scrollback.size} rows") }
+                        }
+                        ExtraKeys(
+                            screen = screen,
+                            scrollback = scrollback,
+                            expanded = keyBarExpanded,
+                            onExpandedChange = onKeyBarExpandedChange,
+                            onInput = onInput,
+                            onOpenComposer = {
+                                screen?.tabId?.let { tabId ->
+                                    activeDraftStore.updateComposer(tabId) { it.open() }
+                                }
+                            },
+                            submitComposerDraft = composer.expanded &&
+                                (composer.value.text.isNotEmpty() || attachments.items.isNotEmpty() ||
+                                    attachments.preparing),
+                            submissionEnabled = !attachments.preparing && !attachments.submitting,
+                            onSubmitComposer = ::submitComposer,
                         )
                     }
-                    if (screen != null && composer.expanded) {
-                        Box(
-                            Modifier.align(Alignment.BottomCenter)
-                                .fillMaxWidth()
-                                .onSizeChanged { composerHeight = with(density) { it.height.toDp() } }
-                                .testTag("terminal-composer-overlay")
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
-                        ) {
-                            TerminalInputBar(
-                                direct = composer.direct,
-                                onToggleDirect = { composer = composer.toggleDirect() },
-                                value = composer.visibleValue,
-                                onValueChange = { next ->
-                                    val update = composer.updateValue(next)
-                                    composer = update.state
-                                    update.outbound.forEach(onInput)
-                                },
-                                onSend = {
-                                    val update = composer.sendText(screen.modes.bracketedPaste)
-                                    composer = update.state
-                                    update.outbound.forEach(onInput)
-                                    if (!update.state.expanded) keyboard?.hide()
-                                },
-                                onDirectKey = onInput,
-                                focusRequester = inputFocus,
-                                enabled = state.focus == FocusOwner.Self,
-                                applicationCursor = screen.modes.applicationCursor,
-                            )
-                        }
-                    }
                 }
-                if (state.showTakeFocus && screen != null) {
-                    Button(
-                        onClick = { onTakeFocus(cols, rows) },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                    ) { Text("Take Focus") }
-                }
-                if (screen != null) {
-                    TextButton(
-                        onClick = onLoadScrollback,
-                        modifier = Modifier.fillMaxWidth().height(36.dp).testTag("load-scrollback"),
-                    ) { Text("Load older history · ${scrollback.size} rows") }
-                }
-                ExtraKeys(
-                    screen = screen,
-                    scrollback = scrollback,
-                    onInput = onInput,
-                    onOpenComposer = { if (screen != null) composer = composer.open() },
-                )
             }
         }
+    }
+
+    if (showImageSources) {
+        AlertDialog(
+            onDismissRequest = { showImageSources = false },
+            title = { Text("Attach image") },
+            text = { Text("Choose a source") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showImageSources = false
+                        val tabId = screen?.tabId ?: return@TextButton
+                        val remaining = TerminalAttachmentDraft.MAX_IMAGES -
+                            activeDraftStore.draftFor(tabId).attachments.items.size
+                        if (remaining <= 0) {
+                            setAttachmentMessage(tabId, "You can attach up to 4 images.")
+                        } else {
+                            picker.launch(TerminalImageSource.Gallery, remaining, tabId) {
+                                handlePickerResult(tabId, it)
+                            }
+                        }
+                    },
+                    modifier = Modifier.testTag("terminal-image-source-gallery"),
+                ) { Text("Gallery") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showImageSources = false
+                        val tabId = screen?.tabId ?: return@TextButton
+                        val remaining = TerminalAttachmentDraft.MAX_IMAGES -
+                            activeDraftStore.draftFor(tabId).attachments.items.size
+                        if (remaining <= 0) {
+                            setAttachmentMessage(tabId, "You can attach up to 4 images.")
+                        } else {
+                            picker.launch(TerminalImageSource.Camera, remaining, tabId) {
+                                handlePickerResult(tabId, it)
+                            }
+                        }
+                    },
+                    modifier = Modifier.testTag("terminal-image-source-camera"),
+                ) { Text("Camera") }
+            },
+        )
+    }
+
+    if (showDiscardDrafts) {
+        val draftWorkInProgress = allDrafts.values.any {
+            it.attachments.preparing || it.attachments.submitting
+        }
+        AlertDialog(
+            onDismissRequest = { showDiscardDrafts = false },
+            modifier = Modifier.testTag("terminal-draft-discard-dialog"),
+            title = { Text("Leave remote terminal?") },
+            text = {
+                Text(
+                    if (draftWorkInProgress) {
+                        "Wait for image preparation or upload to finish before leaving."
+                    } else {
+                        "Draft text and attached images are still on this phone."
+                    },
+                )
+            },
+            confirmButton = {
+                Button(enabled = !draftWorkInProgress, onClick = {
+                    val removed = activeDraftStore.discardAll()
+                    if (!activeDraftStore.hasDrafts()) {
+                        removed.forEach { it.image.file.delete() }
+                        showDiscardDrafts = false
+                        onBack()
+                    }
+                }) { Text("Discard drafts and leave") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDiscardDrafts = false }) { Text("Keep editing") }
+            },
+        )
     }
 
     deleteTarget?.let { session ->
@@ -323,6 +620,75 @@ fun TerminalScreenContent(
             },
             dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } },
         )
+    }
+}
+
+@Composable
+private fun TerminalViewport(
+    screen: ScreenSnapshot?,
+    scrollback: List<ScreenRow>,
+    metrics: TerminalMetrics,
+    bottomObstructionPx: Int,
+    leftObstructionPx: Int,
+    rightObstructionPx: Int,
+    modifier: Modifier,
+    emptyMessage: String,
+    onViewportSizeChanged: (TerminalSize) -> Unit,
+    onResize: (Int, Int) -> Unit,
+    onRequestKeyboard: () -> Unit,
+) {
+    val density = LocalDensity.current
+    val horizontalPaddingPx = with(density) { 4.dp.roundToPx() }
+    val verticalPaddingPx = with(density) { 3.dp.roundToPx() }
+    BoxWithConstraints(
+        modifier.background(Color(0xFF07111B)),
+    ) {
+        val measuredSize = terminalViewportSizePx(
+            viewportWidthPx = constraints.maxWidth,
+            viewportHeightPx = constraints.maxHeight,
+            leftObstructionPx = leftObstructionPx,
+            rightObstructionPx = rightObstructionPx,
+            bottomObstructionPx = bottomObstructionPx,
+            horizontalPaddingPx = horizontalPaddingPx,
+            verticalPaddingPx = verticalPaddingPx,
+            cellWidthPx = metrics.cellWidthPx,
+            lineHeightPx = metrics.lineHeightPx,
+        )
+        val currentMeasuredSize by rememberUpdatedState(measuredSize)
+        val currentOnResize by rememberUpdatedState(onResize)
+        LaunchedEffect(measuredSize) {
+            onViewportSizeChanged(measuredSize)
+        }
+        LaunchedEffect(screen?.tabId) {
+            if (screen != null) {
+                snapshotFlow { currentMeasuredSize }
+                    .settledTerminalSizes()
+                    .collect { size -> currentOnResize(size.cols, size.rows) }
+            }
+        }
+        Box(
+            Modifier.fillMaxSize().absolutePadding(
+                left = with(density) { (leftObstructionPx + horizontalPaddingPx).toDp() },
+                top = with(density) { verticalPaddingPx.toDp() },
+                right = with(density) { (rightObstructionPx + horizontalPaddingPx).toDp() },
+                bottom = with(density) { verticalPaddingPx.toDp() },
+            ),
+        ) {
+            TerminalGrid(
+                screen = screen,
+                scrollback = scrollback,
+                modifier = Modifier.fillMaxSize(),
+                onRequestKeyboard = onRequestKeyboard,
+                metrics = metrics,
+            )
+            if (screen == null) {
+                Text(
+                    emptyMessage,
+                    modifier = Modifier.align(Alignment.Center),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
@@ -473,15 +839,13 @@ private fun TerminalGrid(
 
 @Composable
 private fun TerminalInputBar(
-    direct: Boolean,
-    onToggleDirect: () -> Unit,
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     onSend: () -> Unit,
-    onDirectKey: (String) -> Unit,
+    onAddImage: () -> Unit,
+    addImageEnabled: Boolean,
     focusRequester: FocusRequester,
     enabled: Boolean,
-    applicationCursor: Boolean,
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -495,21 +859,21 @@ private fun TerminalInputBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            TextButton(
+                onClick = onAddImage,
+                enabled = addImageEnabled,
+                modifier = Modifier.size(48.dp)
+                    .semantics { contentDescription = "Attach image" }
+                    .testTag("terminal-add-image"),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+            ) {
+                Text("＋", color = Color(0xFF63D3E1), fontSize = 22.sp)
+            }
             BasicTextField(
                 value = value,
                 onValueChange = onValueChange,
                 modifier = Modifier.weight(1f).height(44.dp)
                     .focusRequester(focusRequester)
-                    .onPreviewKeyEvent { event ->
-                        if (!direct || event.type != KeyEventType.KeyDown) {
-                            return@onPreviewKeyEvent false
-                        }
-                        terminalKeySequence(event.key, applicationCursor)?.let { sequence ->
-                            onDirectKey(sequence)
-                            onValueChange(TextFieldValue())
-                            true
-                        } ?: false
-                    }
                     .testTag("terminal-composer"),
                 enabled = enabled,
                 singleLine = true,
@@ -519,10 +883,10 @@ private fun TerminalInputBar(
                 ),
                 cursorBrush = SolidColor(Color(0xFF63D3E1)),
                 keyboardOptions = KeyboardOptions(
-                    capitalization = if (direct) KeyboardCapitalization.None else KeyboardCapitalization.Sentences,
-                    autoCorrectEnabled = !direct,
-                    keyboardType = if (direct) KeyboardType.Ascii else KeyboardType.Text,
-                    imeAction = if (direct) ImeAction.None else ImeAction.Go,
+                    capitalization = KeyboardCapitalization.Sentences,
+                    autoCorrectEnabled = true,
+                    keyboardType = KeyboardType.Text,
+                    imeAction = ImeAction.Go,
                 ),
                 keyboardActions = KeyboardActions(onGo = { onSend() }),
                 decorationBox = { inner ->
@@ -535,11 +899,7 @@ private fun TerminalInputBar(
                     ) {
                         if (value.text.isEmpty()) {
                             Text(
-                                when {
-                                    !enabled -> "Take focus to type"
-                                    direct -> "Direct keys send immediately"
-                                    else -> "Type a command or prompt…"
-                                },
+                                if (!enabled) "Take focus to type" else "Type a command or prompt…",
                                 color = Color(0xFF6F8798),
                                 style = MaterialTheme.typography.bodyMedium,
                             )
@@ -548,36 +908,7 @@ private fun TerminalInputBar(
                     }
                 },
             )
-            InputModeButton(
-                label = "Direct",
-                selected = direct,
-                enabled = enabled,
-                tag = "input-mode-direct",
-                onClick = onToggleDirect,
-            )
         }
-    }
-}
-
-@Composable
-private fun InputModeButton(
-    label: String,
-    selected: Boolean,
-    enabled: Boolean,
-    tag: String,
-    onClick: () -> Unit,
-) {
-    TextButton(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = Modifier.widthIn(min = 44.dp).height(36.dp).testTag(tag),
-        colors = ButtonDefaults.textButtonColors(
-            containerColor = if (selected) Color(0xFF17465B) else Color.Transparent,
-            contentColor = if (selected) Color(0xFF8DE7F2) else Color(0xFF8CA1B0),
-        ),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 7.dp),
-    ) {
-        Text(label, style = MaterialTheme.typography.labelMedium)
     }
 }
 
@@ -654,6 +985,8 @@ private fun TerminalCellText(cell: ScreenCell, linked: Boolean, metrics: Termina
 private data class TerminalMetrics(
     val cellWidth: Dp,
     val lineHeight: Dp,
+    val cellWidthPx: Int,
+    val lineHeightPx: Int,
     val textStyle: TextStyle,
 )
 
@@ -678,6 +1011,8 @@ private fun rememberTerminalMetrics(): TerminalMetrics {
     return TerminalMetrics(
         cellWidth = with(density) { measured.size.width.toDp() },
         lineHeight = with(density) { measured.size.height.toDp() },
+        cellWidthPx = measured.size.width,
+        lineHeightPx = measured.size.height,
         textStyle = textStyle,
     )
 }
@@ -686,8 +1021,13 @@ private fun rememberTerminalMetrics(): TerminalMetrics {
 private fun ExtraKeys(
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow>,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
     onInput: (String) -> Unit,
     onOpenComposer: () -> Unit,
+    submitComposerDraft: Boolean,
+    submissionEnabled: Boolean,
+    onSubmitComposer: () -> Unit,
 ) {
     var control by remember { mutableStateOf(false) }
     var alt by remember { mutableStateOf(false) }
@@ -704,44 +1044,86 @@ private fun ExtraKeys(
         control = false
         alt = false
     }
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-            .background(MaterialTheme.colorScheme.surfaceVariant).padding(horizontal = 4.dp, vertical = 3.dp)
-            .testTag("extra-keys"),
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
-    ) {
-        ExtraKey("Type", onOpenComposer)
-        ExtraKey("Esc") { send("\u001b") }
-        ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
-        ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
-        ExtraKey("Tab") { send("\t") }
-        ExtraKey("Enter") { send("\r") }
-        ExtraKey("⌫") { send("\u007f") }
-        ExtraKey("←") { send(if (applicationCursor) "\u001bOD" else "\u001b[D") }
-        ExtraKey("↑") { send(if (applicationCursor) "\u001bOA" else "\u001b[A") }
-        ExtraKey("↓") { send(if (applicationCursor) "\u001bOB" else "\u001b[B") }
-        ExtraKey("→") { send(if (applicationCursor) "\u001bOC" else "\u001b[C") }
-        ExtraKey("PgUp") { send("\u001b[5~") }
-        ExtraKey("PgDn") { send("\u001b[6~") }
-        ExtraKey("|") { send("|") }
-        ExtraKey("/") { send("/") }
-        ExtraKey("~") { send("~") }
-        ExtraKey("Paste") {
-            clipboard.getText()?.text?.let { text ->
-                send(if (screen?.modes?.bracketedPaste == true) "\u001b[200~$text\u001b[201~" else text)
+    if (expanded) {
+        Row(
+            Modifier.fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .padding(horizontal = 4.dp, vertical = 3.dp)
+                .testTag("extra-keys"),
+            horizontalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Row(
+                modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                ExtraKey("Type", action = onOpenComposer)
+                ExtraKey("Esc") { send("\u001b") }
+                ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
+                ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
+                ExtraKey("Tab") { send("\t") }
+                ExtraKey(
+                    "Enter",
+                    modifier = Modifier.testTag("terminal-enter"),
+                    enabled = !submitComposerDraft || submissionEnabled,
+                ) {
+                    if (submitComposerDraft) {
+                        onSubmitComposer()
+                        control = false
+                        alt = false
+                    } else {
+                        send("\r")
+                    }
+                }
+                ExtraKey("⌫") { send("\u007f") }
+                ExtraKey("←") { send(if (applicationCursor) "\u001bOD" else "\u001b[D") }
+                ExtraKey("↑") { send(if (applicationCursor) "\u001bOA" else "\u001b[A") }
+                ExtraKey("↓") { send(if (applicationCursor) "\u001bOB" else "\u001b[B") }
+                ExtraKey("→") { send(if (applicationCursor) "\u001bOC" else "\u001b[C") }
+                ExtraKey("PgUp") { send("\u001b[5~") }
+                ExtraKey("PgDn") { send("\u001b[6~") }
+                ExtraKey("|") { send("|") }
+                ExtraKey("/") { send("/") }
+                ExtraKey("~") { send("~") }
+                ExtraKey("Paste") {
+                    clipboard.getText()?.text?.let { text ->
+                        send(if (screen?.modes?.bracketedPaste == true) "\u001b[200~$text\u001b[201~" else text)
+                    }
+                }
+                ExtraKey("Copy screen") {
+                    val text = (scrollback.asReversed() + (screen?.visible ?: emptyList()))
+                        .joinToString("\n", transform = ScreenRow::plainText)
+                    clipboard.setText(AnnotatedString(text))
+                }
             }
+            ExtraKey(
+                label = "⌄",
+                action = { onExpandedChange(false) },
+                modifier = Modifier.testTag("collapse-extra-keys"),
+            )
         }
-        ExtraKey("Copy screen") {
-            val text = (scrollback.asReversed() + (screen?.visible ?: emptyList()))
-                .joinToString("\n", transform = ScreenRow::plainText)
-            clipboard.setText(AnnotatedString(text))
+    } else {
+        Box(
+            modifier = Modifier.fillMaxWidth()
+                .height(28.dp)
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .clickable { onExpandedChange(true) }
+                .semantics { contentDescription = "Show terminal keys" }
+                .testTag("expand-extra-keys"),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("⌃")
         }
     }
 }
 
 @Composable
-private fun ExtraKey(label: String, action: () -> Unit) {
-    OutlinedButton(onClick = action, modifier = Modifier.height(38.dp)) { Text(label) }
+private fun ExtraKey(
+    label: String,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    action: () -> Unit,
+) {
+    OutlinedButton(onClick = action, enabled = enabled, modifier = modifier.height(38.dp)) { Text(label) }
 }
 
 private fun CellAttributes.span(foreground: Color, background: Color) = SpanStyle(
@@ -775,19 +1157,29 @@ internal fun terminalIndexedColor(index: Int): Color {
     return Color(gray, gray, gray)
 }
 
-internal fun terminalKeySequence(key: Key, applicationCursor: Boolean): String? = when (key) {
-    Key.Backspace -> "\u007f"
-    Key.Enter, Key.NumPadEnter -> "\r"
-    Key.Tab -> "\t"
-    Key.Escape -> "\u001b"
-    Key.DirectionLeft -> if (applicationCursor) "\u001bOD" else "\u001b[D"
-    Key.DirectionUp -> if (applicationCursor) "\u001bOA" else "\u001b[A"
-    Key.DirectionDown -> if (applicationCursor) "\u001bOB" else "\u001b[B"
-    Key.DirectionRight -> if (applicationCursor) "\u001bOC" else "\u001b[C"
-    else -> null
+private fun Color.ifTransparent(fallback: Color): Color = if (alpha == 0f) fallback else this
+
+private fun terminalImageErrorMessage(error: Throwable): String = when (error) {
+    is TerminalImageNormalizationError -> when (error.code) {
+        TerminalImageNormalizationError.Code.INPUT_TOO_LARGE,
+        TerminalImageNormalizationError.Code.OUTPUT_TOO_LARGE ->
+            "This image is too large. Choose a smaller image."
+        TerminalImageNormalizationError.Code.CONTENT_UNAVAILABLE ->
+            "The image could not be opened. Choose it again."
+        else -> "The image could not be prepared. Choose a different image."
+    }
+    else -> "The image could not be prepared. Choose a different image."
 }
 
-private fun Color.ifTransparent(fallback: Color): Color = if (alpha == 0f) fallback else this
+private fun terminalUploadErrorMessage(error: Throwable): String = when {
+    error is RemoteUploadException && error.code in setOf(
+        "remote.unsupported",
+        "protocol.unknown_request",
+    ) ->
+        "Update AITerm on the desktop to attach images."
+    !error.message.isNullOrBlank() -> error.message!!
+    else -> "The image upload failed. Check the connection and try again."
+}
 
 private fun ConnectionState.label(): String = when (this) {
     ConnectionState.Disconnected -> "DISCONNECTED"

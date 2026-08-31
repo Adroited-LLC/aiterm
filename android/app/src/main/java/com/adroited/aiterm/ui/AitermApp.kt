@@ -80,6 +80,7 @@ fun AitermApp(
                         RemoteTerminalScreen(
                             viewModel = remoteViewModel,
                             onBack = { navController.popBackStack() },
+                            keyBarPreference = container.terminalKeyBarPreference,
                         )
                     }
                 }

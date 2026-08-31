@@ -194,6 +194,135 @@ class AuthenticatedRemoteTransportTest {
     }
 
     @Test
+    fun abandoningAQueuedRequestDropsItBeforeTheWriterConsumesIt() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+
+        val abandoned = transport.request("tab.list", byteArrayOf(1))
+        transport.abandonRequest(abandoned)
+        val successor = transport.request("tab.list", byteArrayOf(2))
+        runCurrent()
+
+        assertTrue(abandoned.isCancelled)
+        assertEquals(2, socket.sent.size)
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "tab.list", byteArrayOf()))
+        assertEquals(1L, (successor.await() as RemoteResponse.Success).requestId)
+        transport.close()
+    }
+
+    @Test
+    fun abandoningAnAssignedRequestReleasesItsSlotAndDiscardsALateResponse() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+
+        val accepted = (1..64).map { transport.request("tab.list", byteArrayOf()) }
+        runCurrent()
+        transport.abandonRequest(accepted.first())
+        val successor = transport.request("tab.list", byteArrayOf())
+        runCurrent()
+
+        assertTrue(accepted.first().isCancelled)
+        assertFalse(successor.isCompleted)
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "tab.list", byteArrayOf()))
+        transport.acceptEnvelopeForTest(
+            RemoteEventEnvelope(1, "error", cborFixture(linkedMapOf("code" to "cancelled", "message" to "late"))),
+        )
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(65, "tab.list", byteArrayOf()))
+        assertEquals(65L, (successor.await() as RemoteResponse.Success).requestId)
+        transport.close()
+    }
+
+    @Test
+    fun requestBatchReservesCapacityForEveryRequestOrRejectsTheWholeBatch() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+        val existing = (1..63).map { transport.request("tab.list", byteArrayOf(it.toByte())) }
+
+        val rejected = transport.requestBatch(
+            listOf(
+                RemoteRequestInput("terminal.input", byteArrayOf(1)),
+                RemoteRequestInput("terminal.input", byteArrayOf(2)),
+            ),
+        )
+
+        assertEquals(null, rejected)
+        runCurrent()
+        assertEquals("auth plus only the 63 earlier requests", 64, socket.sent.size)
+        existing.forEach { it.cancel() }
+        transport.close()
+    }
+
+    @Test
+    fun acceptedRequestBatchPublishesEveryRequestInCallerOrder() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+
+        val accepted = transport.requestBatch(
+            listOf(
+                RemoteRequestInput("terminal.input", byteArrayOf(11)),
+                RemoteRequestInput("terminal.input", byteArrayOf(22)),
+            ),
+        )
+        runCurrent()
+
+        assertEquals(2, accepted?.size)
+        assertEquals(3, socket.sent.size)
+        assertTrue(
+            socket.sent[1].contentEquals(
+                RemoteWireCodec.encodeRequest(RemoteRequest(1, "terminal.input", byteArrayOf(11))),
+            ),
+        )
+        assertTrue(
+            socket.sent[2].contentEquals(
+                RemoteWireCodec.encodeRequest(RemoteRequest(2, "terminal.input", byteArrayOf(22))),
+            ),
+        )
+        accepted?.forEach { it.cancel() }
+        transport.close()
+    }
+
+    @Test
+    fun closeRacingBatchReservationRejectsTheWholeBatch() = runTest {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(),
+            deviceKeys = RecordingDeviceKeys(),
+            appLock = unlockedAppLock(),
+            dialer = FakeDialer(authenticatedSocket()),
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+            beforeRequestEnqueue = {
+                entered.countDown()
+                release.await(2, TimeUnit.SECONDS)
+            },
+        )
+        transport.connect()
+        val result = AtomicReference<List<kotlinx.coroutines.Deferred<RemoteResponse>>?>()
+        val requester = thread(start = true) {
+            result.set(
+                transport.requestBatch(
+                    listOf(
+                        RemoteRequestInput("terminal.input", byteArrayOf(1)),
+                        RemoteRequestInput("terminal.input", byteArrayOf(2)),
+                    ),
+                ),
+            )
+        }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+
+        transport.close()
+        release.countDown()
+        requester.join(2_000)
+
+        assertEquals(null, result.get())
+    }
+
+    @Test
     fun outboundRequestsCannotOvertakeAnEarlierBlockedSend() = runTest {
         val socket = ReorderingBinarySocket().apply {
             incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))

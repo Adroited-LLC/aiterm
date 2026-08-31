@@ -10,6 +10,7 @@ import java.util.concurrent.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -124,22 +125,78 @@ class AuthenticatedRemoteTransport(
         payload: ByteArray,
         onAssigned: (Long) -> Unit,
     ): CompletableDeferred<RemoteResponse> {
-        val deferred = CompletableDeferred<RemoteResponse>()
-        val outgoing = OutboundRequest(kind, payload.copyOf(), onAssigned, deferred)
+        return requestBatch(listOf(RemoteRequestInput(kind, payload, onAssigned)))?.single()
+            ?: CompletableDeferred<RemoteResponse>().also {
+                it.completeExceptionally(RemoteProtocolException("invalid or over-bound remote request"))
+            }
+    }
+
+    override fun requestBatch(
+        requests: List<RemoteRequestInput>,
+    ): List<CompletableDeferred<RemoteResponse>>? {
+        if (requests.isEmpty() || requests.size > MAX_PENDING_REQUESTS) return null
+        val outgoing = requests.map { request ->
+            OutboundRequest(
+                kind = request.kind,
+                payload = request.payload.copyOf(),
+                onAssigned = request.onAssigned,
+                deferred = CompletableDeferred(),
+            )
+        }
         beforeRequestEnqueue()
+        val sent = ArrayList<OutboundRequest>(outgoing.size)
         val accepted = synchronized(stateLock) {
-            if (closed || socket == null || acceptedRequests.size >= MAX_PENDING_REQUESTS) false
-            else if (outbound.trySend(outgoing).isSuccess) {
-                queuedRequests += 1
-                acceptedRequests += deferred
-                true
-            } else false
+            if (closed || socket == null ||
+                acceptedRequests.size + outgoing.size > MAX_PENDING_REQUESTS
+            ) {
+                false
+            } else {
+                var complete = true
+                for (request in outgoing) {
+                    if (outbound.trySend(request).isSuccess) {
+                        sent += request
+                    } else {
+                        complete = false
+                        break
+                    }
+                }
+                if (complete) {
+                    queuedRequests += outgoing.size
+                    acceptedRequests.addAll(outgoing.map { it.deferred })
+                    true
+                } else {
+                    // The writer cannot pass its state-lock publication point until this block
+                    // exits. Any sent siblings remain unaccepted, so the writer drops them.
+                    false
+                }
+            }
         }
         if (!accepted) {
-            outgoing.payload.fill(0)
-            deferred.completeExceptionally(RemoteProtocolException("invalid or over-bound remote request"))
+            outgoing.drop(sent.size).forEach { it.payload.fill(0) }
+            outgoing.forEach {
+                it.deferred.completeExceptionally(
+                    RemoteProtocolException("invalid or over-bound remote request"),
+                )
+            }
+            return null
         }
-        return deferred
+        return outgoing.map { it.deferred }
+    }
+
+    override fun abandonRequest(request: Deferred<RemoteResponse>) {
+        val abandoned = synchronized(stateLock) {
+            val accepted = acceptedRequests.firstOrNull { it === request }
+                ?: return@synchronized null
+            acceptedRequests.remove(accepted)
+            pending.entries.firstOrNull { it.value.deferred === accepted }?.let { (requestId, pendingRequest) ->
+                pending.remove(requestId)
+                heldAttachments.remove(requestId)
+                pendingRequest.timeout?.cancel()
+                rememberCompletedLocked(requestId)
+            }
+            accepted
+        }
+        abandoned?.cancel()
     }
 
     private suspend fun writeLoop() {
@@ -147,7 +204,11 @@ class AuthenticatedRemoteTransport(
             val prepared = synchronized(stateLock) {
                 queuedRequests = (queuedRequests - 1).coerceAtLeast(0)
                 val active = socket
-                if (closed || active == null) null
+                if (!acceptedRequests.contains(outgoing.deferred)) null
+                else if (closed || active == null) {
+                    acceptedRequests.remove(outgoing.deferred)
+                    null
+                }
                 else {
                     val requestId = nextRequestId++
                     pending[requestId] = PendingRequest(outgoing.kind, outgoing.deferred)
@@ -156,6 +217,7 @@ class AuthenticatedRemoteTransport(
                 }
             }
             if (prepared == null) {
+                outgoing.payload.fill(0)
                 outgoing.deferred.completeExceptionally(RemoteProtocolException("remote transport is disconnected"))
                 continue
             }
@@ -164,6 +226,13 @@ class AuthenticatedRemoteTransport(
                 outgoing.onAssigned(requestId)
             } catch (_: Exception) {
                 failPendingSend(requestId, "remote request assignment callback failed")
+                outgoing.payload.fill(0)
+                continue
+            }
+            val stillPending = synchronized(stateLock) {
+                pending[requestId]?.deferred === outgoing.deferred && acceptedRequests.contains(outgoing.deferred)
+            }
+            if (!stillPending) {
                 outgoing.payload.fill(0)
                 continue
             }
@@ -348,6 +417,10 @@ class AuthenticatedRemoteTransport(
     }
 
     private fun rememberCompleted(requestId: Long) = synchronized(stateLock) {
+        rememberCompletedLocked(requestId)
+    }
+
+    private fun rememberCompletedLocked(requestId: Long) {
         completed += requestId
         while (completed.size > MAX_COMPLETED_CORRELATIONS) {
             completed.remove(completed.first())

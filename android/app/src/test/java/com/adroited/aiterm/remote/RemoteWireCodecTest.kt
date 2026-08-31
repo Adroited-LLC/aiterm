@@ -230,6 +230,135 @@ class RemoteWireCodecTest {
         assertEquals(WireFocusOwner.Self, chunk.tabs.single().focus)
     }
 
+    @Test
+    fun terminalImageUploadPayloadsMatchTheRustCborContract() {
+        val digest = ByteArray(32) { it.toByte() }
+
+        assertArrayEquals(
+            hex(
+                "a8" +
+                    "667461625f6964" + "63746162" +
+                    "6d6174746163686d656e745f6964" + "6a6174746163686d656e74" +
+                    "6d7375626d697373696f6e5f6964" + "6a7375626d697373696f6e" +
+                    "707375626d697373696f6e5f636f756e74" + "02" +
+                    "707375626d697373696f6e5f6279746573" + "19012c" +
+                    "666c656e677468" + "182a" +
+                    "6a6d656469615f74797065" + "6a696d6167652f6a706567" +
+                    "66736861323536" + "5820" +
+                    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            ),
+            RemoteCommands.uploadBegin(
+                tabId = "tab",
+                attachmentId = "attachment",
+                submissionId = "submission",
+                submissionCount = 2,
+                submissionBytes = 300,
+                length = 42,
+                sha256 = digest,
+            ),
+        )
+        assertArrayEquals(
+            hex("a36975706c6f61645f69646675706c6f616465696e64657807646461746143010203"),
+            RemoteCommands.uploadChunk("upload", 7, byteArrayOf(1, 2, 3)),
+        )
+        assertArrayEquals(
+            hex("a16975706c6f61645f69646675706c6f6164"),
+            RemoteCommands.uploadFinish("upload"),
+        )
+        assertArrayEquals(
+            hex("a16975706c6f61645f69646675706c6f6164"),
+            RemoteCommands.uploadCancel("upload"),
+        )
+    }
+
+    @Test
+    fun terminalImageUploadRepliesAreStrictAndBounded() {
+        val began = RemoteCommands.uploadBegan(
+            fixture(linkedMapOf("upload_id" to "upload-1", "next_chunk" to 0)),
+        )
+        assertEquals("upload-1", began.uploadId)
+        assertEquals(0, began.nextChunk)
+        assertEquals(
+            "/project/.aiterm/attachments/upload.jpg",
+            RemoteCommands.uploadedPath(
+                fixture(linkedMapOf("path" to "/project/.aiterm/attachments/upload.jpg")),
+            ),
+        )
+        RemoteCommands.uploadAcknowledged(fixture(linkedMapOf("ok" to true)))
+
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadBegan(
+                fixture(linkedMapOf("upload_id" to "upload-1", "next_chunk" to 0, "unexpected" to true)),
+            )
+        }
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadedPath(fixture(linkedMapOf("path" to "x".repeat(4_097))))
+        }
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadAcknowledged(fixture(linkedMapOf("ok" to true, "unexpected" to true)))
+        }
+    }
+
+    @Test
+    fun terminalImageUploadCommandsRejectMalformedOrOverBoundValues() {
+        val digest = ByteArray(32)
+
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadBegin(
+                tabId = "x".repeat(4_097),
+                attachmentId = "attachment",
+                submissionId = "submission",
+                submissionCount = 1,
+                submissionBytes = 1,
+                length = 1,
+                sha256 = digest,
+            )
+        }
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadBegin(
+                tabId = "tab",
+                attachmentId = "attachment",
+                submissionId = "submission",
+                submissionCount = 1,
+                submissionBytes = 1,
+                length = 1,
+                sha256 = ByteArray(31),
+            )
+        }
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadChunk("x".repeat(4_097), 0, byteArrayOf(1))
+        }
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadChunk("upload", 0, ByteArray(256 * 1_024 + 1))
+        }
+    }
+
+    @Test
+    fun terminalImageUploadSubmissionIdAccepts128Utf8BytesAndRejects129() {
+        val digest = ByteArray(32)
+
+        RemoteCommands.uploadBegin(
+            tabId = "tab",
+            attachmentId = "attachment",
+            submissionId = "é".repeat(64),
+            submissionCount = 1,
+            submissionBytes = 1,
+            length = 1,
+            sha256 = digest,
+        )
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadBegin(
+                tabId = "tab",
+                attachmentId = "attachment",
+                submissionId = "é".repeat(65),
+                submissionCount = 1,
+                submissionBytes = 1,
+                length = 1,
+                sha256 = digest,
+            )
+        }
+    }
+
     private fun fixture(value: Any?): ByteArray {
         val output = ByteArrayOutputStream()
         fun writeHeader(major: Int, size: Int) {

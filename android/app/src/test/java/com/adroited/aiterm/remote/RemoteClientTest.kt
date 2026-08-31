@@ -12,7 +12,9 @@ import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.ScreenSnapshot
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.emitAll
@@ -22,15 +24,108 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.cbor.ByteString
+import kotlinx.serialization.cbor.Cbor
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.RandomAccessFile
+import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
-@OptIn(ExperimentalCoroutinesApi::class)
+@OptIn(ExperimentalCoroutinesApi::class, ExperimentalSerializationApi::class)
 class RemoteClientTest {
+
+    @Test
+    fun orderedInputBatchIsAcceptedOnceAndQueuedInOrderForTheSameTerminalAttachment() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("tab-1", listOf("prompt with image paths", "\r"))
+        advanceUntilIdle()
+
+        assertTrue(accepted)
+        assertEquals(listOf("terminal.input", "terminal.input"), transport.requests.map { it.kind })
+        val expected = listOf(
+            RemoteCommands.input("tab-1", "attachment-1", "prompt with image paths".encodeToByteArray()),
+            RemoteCommands.input("tab-1", "attachment-1", "\r".encodeToByteArray()),
+        )
+        assertTrue(expected.zip(transport.requests.map { it.payload }).all { (a, b) -> a.contentEquals(b) })
+        client.lock()
+    }
+
+    @Test
+    fun orderedInputBatchRejectsEverythingWhenAnyInputCannotBeAccepted() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("tab-1", listOf("valid", "x".repeat(1_048_577)))
+        advanceUntilIdle()
+
+        assertFalse(accepted)
+        assertTrue(transport.requests.isEmpty())
+        client.lock()
+    }
+
+    @Test
+    fun orderedInputBatchRejectsAnOldTabAfterSelectionChanges() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("old-tab", listOf("old image paths", "\r"))
+        advanceUntilIdle()
+
+        assertFalse(accepted)
+        assertTrue(transport.requests.isEmpty())
+        client.lock()
+    }
+
+    @Test
+    fun orderedInputBatchRejectsEverythingAfterFocusIsLost() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged(
+                "tab-1",
+                "attachment-1",
+                FocusOwner.Other,
+                TerminalSize(80, 24),
+            ),
+        )
+        transport.requests.clear()
+
+        val accepted = client.sendInputs("tab-1", listOf("old image paths", "\r"))
+        advanceUntilIdle()
+
+        assertFalse(accepted)
+        assertTrue(transport.requests.isEmpty())
+        assertTrue(client.state.value.showTakeFocus)
+        client.lock()
+    }
 
     @Test
     fun inputNotOwnedKeepsTerminalReadOnlyAndOffersTakeFocus() = runTest {
@@ -110,6 +205,7 @@ class RemoteClientTest {
             override suspend fun connect() = throw RemoteAccessRevokedException()
             override fun request(kind: String, payload: ByteArray, onAssigned: (Long) -> Unit) =
                 CompletableDeferred<RemoteResponse>().also { it.completeExceptionally(IllegalStateException("not connected")) }
+            override fun requestBatch(requests: List<RemoteRequestInput>) = null
             override fun close() = Unit
         }
         val client = RemoteClient(
@@ -592,7 +688,654 @@ class RemoteClientTest {
         assertEquals(listOf("expected"), client.scrollback.value.map(ScreenRow::plainText))
         client.lock()
     }
+
+    @Test
+    fun imageUploadsAreSequentialAndReturnDesktopPathsInSourceOrder() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        val first = uploadSource("first", byteArrayOf(1, 2, 3))
+        val second = uploadSource("second", byteArrayOf(4, 5))
+        var finished = 0
+        transport.responseFor = { request ->
+            val payload = when (request.kind) {
+                "terminal.upload.begin" -> uploadBeginReply("upload-${request.requestId}", 0)
+                "terminal.upload.chunk", "terminal.upload.cancel" -> uploadSuccessReply()
+                "terminal.upload.finish" -> uploadedPathReply("/desktop/${++finished}.jpg")
+                else -> byteArrayOf()
+            }
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        val progress = mutableListOf<RemoteUploadProgress>()
+
+        val operation = async { client.uploadImages("tab-1", listOf(first, second), progress::add) }
+        advanceUntilIdle()
+        val result = operation.await()
+
+        assertTrue(result.isSuccess)
+        assertEquals(listOf("/desktop/1.jpg", "/desktop/2.jpg"), result.getOrThrow())
+        val begins = transport.requests
+            .filter { it.kind == "terminal.upload.begin" }
+            .map { request -> decodeUploadBegin(request.payload) }
+        assertEquals(2, begins.size)
+        assertEquals(listOf(2, 2), begins.map(UploadBeginWire::submissionCount))
+        assertEquals(listOf(5L, 5L), begins.map(UploadBeginWire::submissionBytes))
+        assertEquals(begins.first().submissionId, begins.last().submissionId)
+        java.util.UUID.fromString(begins.first().submissionId)
+        assertEquals(
+            listOf(
+                "terminal.upload.begin", "terminal.upload.chunk", "terminal.upload.finish",
+                "terminal.upload.begin", "terminal.upload.chunk", "terminal.upload.finish",
+            ),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        assertEquals(listOf(0L, 3L), progress.filter { it.sourceId == "first" }.map { it.sent })
+        assertEquals(listOf(0L, 2L), progress.filter { it.sourceId == "second" }.map { it.sent })
+        cleanupUploadSources(first, second)
+        client.lock()
+    }
+
+    @Test
+    fun finishedFirstImageIsCancelledAfterFocusLossAndRetrySucceedsOnTheSameConnection() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val first = uploadSource("first-retry", byteArrayOf(1, 2, 3))
+        val second = uploadSource("second-retry", byteArrayOf(4, 5))
+        var activeSubmission: String? = null
+        var declaredCount = 0
+        var finishedCount = 0
+        var nextUploadId = 0
+        var loseFocusAfterFinish = true
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> {
+                    val begin = decodeUploadBegin(request.payload)
+                    if (activeSubmission != null && activeSubmission != begin.submissionId) {
+                        CompletableDeferred(
+                            RemoteResponse.Error(
+                                request.requestId,
+                                "terminal.upload_invalid_submission",
+                                "this connection already has an active submission",
+                            ),
+                        )
+                    } else {
+                        if (activeSubmission == null) {
+                            activeSubmission = begin.submissionId
+                            declaredCount = begin.submissionCount
+                            finishedCount = 0
+                        }
+                        CompletableDeferred(
+                            RemoteResponse.Success(
+                                request.requestId,
+                                request.kind,
+                                uploadBeginReply("upload-${++nextUploadId}", 0),
+                            ),
+                        )
+                    }
+                }
+                "terminal.upload.chunk" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                )
+                "terminal.upload.finish" -> {
+                    finishedCount += 1
+                    if (finishedCount == declaredCount) activeSubmission = null
+                    if (loseFocusAfterFinish) {
+                        loseFocusAfterFinish = false
+                        client.acceptForTest(
+                            RemoteServerEvent.FocusChanged(
+                                "tab-1",
+                                "attachment-1",
+                                FocusOwner.Other,
+                                TerminalSize(80, 24),
+                            ),
+                        )
+                    }
+                    CompletableDeferred(
+                        RemoteResponse.Success(
+                            request.requestId,
+                            request.kind,
+                            uploadedPathReply("/desktop/finished-$finishedCount.jpg"),
+                        ),
+                    )
+                }
+                "terminal.upload.cancel" -> {
+                    activeSubmission = null
+                    CompletableDeferred(
+                        RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                    )
+                }
+                else -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()),
+                )
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val interrupted = async { client.uploadImages("tab-1", listOf(first, second)) }
+        advanceUntilIdle()
+
+        assertTrue(interrupted.await().isFailure)
+        assertEquals(
+            listOf(
+                "terminal.upload.begin",
+                "terminal.upload.chunk",
+                "terminal.upload.finish",
+                "terminal.upload.cancel",
+            ),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged(
+                "tab-1",
+                "attachment-1",
+                FocusOwner.Self,
+                TerminalSize(80, 24),
+            ),
+        )
+        transport.requests.clear()
+
+        val retried = async { client.uploadImages("tab-1", listOf(first, second)) }
+        advanceUntilIdle()
+
+        assertTrue(retried.await().isSuccess)
+        assertEquals(2, transport.requests.count { it.kind == "terminal.upload.finish" })
+        cleanupUploadSources(first, second)
+        client.lock()
+    }
+
+    @Test
+    fun queuedImageUploadRejectsAStaleDraftTabBeforeAnyBeginRequest() = runTest {
+        val transport = DeferredRemoteTransport()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val client = uploadClient(transport, this, dispatcher)
+        val source = uploadSource("stale", byteArrayOf(1, 2, 3))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        transport.completeNextAttach("tab-1", "attachment-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val releaseQueuedUpload = CompletableDeferred<Unit>()
+        val operation = async {
+            releaseQueuedUpload.await()
+            client.uploadImages("tab-1", listOf(source))
+        }
+        runCurrent()
+        client.selectTab("tab-2")
+        runCurrent()
+        transport.completeNextAttach("tab-2", "attachment-2")
+        advanceUntilIdle()
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged(
+                "tab-2",
+                "attachment-2",
+                FocusOwner.Self,
+                TerminalSize(80, 24),
+            ),
+        )
+        assertEquals("tab-2", client.state.value.activeTabId)
+        assertEquals(FocusOwner.Self, client.state.value.focus)
+
+        releaseQueuedUpload.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(operation.await().isFailure)
+        assertFalse(transport.requests.any { it.kind == "terminal.upload.begin" })
+        assertTrue(source.file.exists())
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
+    fun imageUploadRejectsUnexpectedNonzeroInitialChunkAndCancelsTheUpload() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        transport.responseFor = { request ->
+            val payload = when (request.kind) {
+                "terminal.upload.begin" -> uploadBeginReply("upload-1", 1)
+                "terminal.upload.cancel" -> uploadSuccessReply()
+                else -> byteArrayOf()
+            }
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        advanceUntilIdle()
+
+        assertTrue(operation.await().isFailure)
+        assertEquals(
+            listOf("terminal.upload.begin", "terminal.upload.cancel"),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        assertTrue(source.file.exists())
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
+    fun uploadServerFailureCancelsBegunWorkAndPreservesTheDraftFile() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1, 2, 3))
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                )
+                "terminal.upload.chunk" -> CompletableDeferred(
+                    RemoteResponse.Error(request.requestId, "terminal.upload_failed", "staging failed"),
+                )
+                "terminal.upload.cancel" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                )
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        advanceUntilIdle()
+
+        val failure = operation.await()
+        assertTrue(failure.isFailure)
+        assertEquals("terminal.upload_failed", (failure.exceptionOrNull() as RemoteUploadException).code)
+        assertEquals(
+            listOf("terminal.upload.begin", "terminal.upload.chunk", "terminal.upload.cancel"),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        assertTrue(source.file.exists())
+        assertFalse(transport.requests.any { it.kind == "terminal.input" })
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
+    fun disconnectedUploadPreservesTheDraftFileAndCleansUpTheServerAttempt() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                )
+                "terminal.upload.chunk" -> CompletableDeferred<RemoteResponse>().also {
+                    it.completeExceptionally(
+                        RemoteTransportTerminatedException(
+                            RemoteTransportTerminalOutcome.Recoverable("connection ended"),
+                        ),
+                    )
+                }
+                "terminal.upload.cancel" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                )
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        advanceUntilIdle()
+
+        assertTrue(operation.await().isFailure)
+        assertEquals(
+            listOf("terminal.upload.begin", "terminal.upload.chunk", "terminal.upload.cancel"),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        assertTrue(source.file.exists())
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
+    fun imageUploadRequiresTheActiveTerminalFocusBeforeItSendsAnyRequest() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged("tab-1", "attachment-1", FocusOwner.Other, TerminalSize(80, 24)),
+        )
+
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        advanceUntilIdle()
+
+        assertTrue(operation.await().isFailure)
+        assertEquals(emptyList<RemoteRequest>(), transport.requests)
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
+    fun imageUploadRejectsClientImageCountAndByteBoundsBeforeAnyRequest() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        val fifth = listOf("a", "b", "c", "d", "e").map { id -> source.copy(id = id) }
+        val overBudget = source.copy(length = 48L * 1_024 * 1_024 + 1)
+
+        val tooMany = async { client.uploadImages("tab-1", fifth) }
+        val tooLarge = async { client.uploadImages("tab-1", listOf(overBudget)) }
+        advanceUntilIdle()
+
+        assertTrue(tooMany.await().isFailure)
+        assertTrue(tooLarge.await().isFailure)
+        assertEquals(emptyList<RemoteRequest>(), transport.requests)
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
+    fun imageUploadAcceptsTheExactFourImage48MiBAggregateBoundary() {
+        val source = sparseUploadSource("boundary", 12L * 1_024 * 1_024)
+        try {
+            val submission = validateRemoteUploadSources(
+                listOf("one", "two", "three", "four").map { source.copy(id = it) },
+            )
+
+            assertEquals(4, submission.count)
+            assertEquals(48L * 1_024 * 1_024, submission.bytes)
+        } finally {
+            cleanupUploadSources(source)
+        }
+    }
+
+    @Test
+    fun failedUploadReturnsAfterOneCleanupBudgetWhenCancelNeverReplies() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        val pendingCancel = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                )
+                "terminal.upload.chunk" -> CompletableDeferred(
+                    RemoteResponse.Error(request.requestId, "terminal.upload_failed", "staging failed"),
+                )
+                "terminal.upload.cancel" -> pendingCancel
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        try {
+            runCurrent()
+            advanceTimeBy(2_001)
+            runCurrent()
+
+            assertTrue(operation.isCompleted)
+            val failure = operation.await()
+            assertTrue(failure.isFailure)
+            assertEquals("terminal.upload_failed", (failure.exceptionOrNull() as RemoteUploadException).code)
+            assertEquals(listOf(pendingCancel), transport.abandonedRequests)
+        } finally {
+            pendingCancel.complete(RemoteResponse.Success(99, "terminal.upload.cancel", uploadSuccessReply()))
+            operation.cancelAndJoin()
+            cleanupUploadSources(source)
+            client.lock()
+        }
+    }
+
+    @Test
+    fun cancelledUploadRethrowsCancellationAfterOneCleanupBudgetWhenCancelNeverReplies() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        val pendingChunk = CompletableDeferred<RemoteResponse>()
+        val pendingCancel = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                )
+                "terminal.upload.chunk" -> pendingChunk
+                "terminal.upload.cancel" -> pendingCancel
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        try {
+            runCurrent()
+            operation.cancel()
+            runCurrent()
+            advanceTimeBy(2_001)
+            runCurrent()
+
+            assertTrue(operation.isCompleted)
+            assertTrue(operation.isCancelled)
+            assertEquals(listOf(pendingCancel), transport.abandonedRequests)
+        } finally {
+            pendingCancel.complete(RemoteResponse.Success(99, "terminal.upload.cancel", uploadSuccessReply()))
+            operation.cancelAndJoin()
+            cleanupUploadSources(source)
+            client.lock()
+        }
+    }
+
+    @Test
+    fun losingFocusBetweenUploadOperationsCancelsTheBoundUpload() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1))
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> {
+                    client.acceptForTest(
+                        RemoteServerEvent.FocusChanged("tab-1", "attachment-1", FocusOwner.Other, TerminalSize(80, 24)),
+                    )
+                    CompletableDeferred(
+                        RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                    )
+                }
+                "terminal.upload.cancel" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                )
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        advanceUntilIdle()
+
+        assertTrue(operation.await().isFailure)
+        assertEquals(
+            listOf("terminal.upload.begin", "terminal.upload.cancel"),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        assertTrue(transport.abandonedRequests.isEmpty())
+        cleanupUploadSources(source)
+        client.lock()
+    }
+
+    @Test
+    fun cancellingAnUploadCancelsBegunServerWorkWithoutDeletingTheDraftFile() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val source = uploadSource("one", byteArrayOf(1, 2, 3))
+        val pendingChunk = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadBeginReply("upload-1", 0)),
+                )
+                "terminal.upload.chunk" -> pendingChunk
+                "terminal.upload.cancel" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                )
+                else -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        runCurrent()
+        operation.cancelAndJoin()
+        advanceUntilIdle()
+
+        assertTrue(operation.isCancelled)
+        assertEquals(
+            listOf("terminal.upload.begin", "terminal.upload.chunk", "terminal.upload.cancel"),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        assertTrue(source.file.exists())
+        cleanupUploadSources(source)
+        client.lock()
+    }
 }
+
+private fun uploadClient(
+    transport: RemoteTransport,
+    scope: kotlinx.coroutines.CoroutineScope,
+    dispatcher: kotlinx.coroutines.CoroutineDispatcher,
+) = RemoteClient(
+    transportFactory = { transport },
+    screenStore = DefaultTerminalScreenStore(),
+    isUnlocked = { true },
+    scope = scope,
+    dispatcher = dispatcher,
+)
+
+private fun RemoteClient.grantUploadFocus() {
+    acceptForTest(
+        RemoteServerEvent.FocusChanged("tab-1", "attachment-1", FocusOwner.Self, TerminalSize(80, 24)),
+    )
+}
+
+private fun uploadSource(id: String, bytes: ByteArray): RemoteUploadSource {
+    val file = Files.createTempFile("aiterm-upload-$id-", ".jpg").toFile()
+    file.writeBytes(bytes)
+    return RemoteUploadSource(id, file, bytes.size.toLong(), ByteArray(32) { id.first().code.toByte() })
+}
+
+private fun sparseUploadSource(id: String, length: Long): RemoteUploadSource {
+    val file = Files.createTempFile("aiterm-upload-$id-", ".jpg").toFile()
+    RandomAccessFile(file, "rw").use { it.setLength(length) }
+    return RemoteUploadSource(id, file, length, ByteArray(32) { id.first().code.toByte() })
+}
+
+private fun cleanupUploadSources(vararg sources: RemoteUploadSource) {
+    sources.map(RemoteUploadSource::file).distinct().forEach { it.delete() }
+}
+
+private fun uploadBeginReply(uploadId: String, nextChunk: Int): ByteArray =
+    cborMap(
+        "upload_id" to uploadId,
+        "next_chunk" to nextChunk,
+    )
+
+private fun uploadedPathReply(path: String): ByteArray = cborMap("path" to path)
+private fun uploadSuccessReply(): ByteArray = byteArrayOf(0xa1.toByte(), 0x62, 0x6f, 0x6b, 0xf5.toByte())
+
+private fun cborMap(vararg values: Pair<String, Any>): ByteArray {
+    val output = java.io.ByteArrayOutputStream()
+    fun header(major: Int, size: Int) {
+        when {
+            size < 24 -> output.write((major shl 5) or size)
+            size <= 0xff -> {
+                output.write((major shl 5) or 24)
+                output.write(size)
+            }
+            else -> error("test fixture only supports short values")
+        }
+    }
+    fun text(value: String) {
+        val bytes = value.encodeToByteArray()
+        header(3, bytes.size)
+        output.write(bytes)
+    }
+    header(5, values.size)
+    values.forEach { (key, value) ->
+        text(key)
+        when (value) {
+            is String -> text(value)
+            is Int -> header(0, value)
+            else -> error("unsupported test fixture value")
+        }
+    }
+    return output.toByteArray()
+}
+
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+private data class UploadBeginWire(
+    @SerialName("tab_id") val tabId: String,
+    @SerialName("attachment_id") val attachmentId: String,
+    @SerialName("submission_id") val submissionId: String,
+    @SerialName("submission_count") val submissionCount: Int,
+    @SerialName("submission_bytes") val submissionBytes: Long,
+    val length: Long,
+    @SerialName("media_type") val mediaType: String,
+    @ByteString val sha256: ByteArray,
+)
+
+@OptIn(ExperimentalSerializationApi::class)
+private val uploadCbor = Cbor {
+    ignoreUnknownKeys = false
+    useDefiniteLengthEncoding = true
+}
+
+@OptIn(ExperimentalSerializationApi::class)
+private fun decodeUploadBegin(payload: ByteArray): UploadBeginWire =
+    uploadCbor.decodeFromByteArray(UploadBeginWire.serializer(), payload)
 
 private fun snapshotChunk(
     transferId: String,
@@ -649,6 +1392,8 @@ private fun scrollbackChunk(
 private class FakeRemoteTransport(private val onClose: () -> Unit = {}) : RemoteTransport {
     override val events = MutableSharedFlow<RemoteServerEvent>(extraBufferCapacity = 8)
     val requests = mutableListOf<RemoteRequest>()
+    val abandonedRequests = mutableListOf<Deferred<RemoteResponse>>()
+    var responseFor: ((RemoteRequest) -> Deferred<RemoteResponse>)? = null
     var closed = false
 
     override suspend fun connect() = Unit
@@ -659,16 +1404,28 @@ private class FakeRemoteTransport(private val onClose: () -> Unit = {}) : Remote
         kind: String,
         payload: ByteArray,
         onAssigned: (Long) -> Unit,
-    ): CompletableDeferred<RemoteResponse> {
+    ): Deferred<RemoteResponse> {
         val request = RemoteRequest(nextRequestId++, kind, payload)
         onAssigned(request.requestId)
         requests += request
-        val responsePayload = if (request.kind == "terminal.attach") {
-            attachedPayload("tab-1", "attachment-1")
-        } else {
-            byteArrayOf()
+        if (request.kind == "terminal.attach") {
+            return CompletableDeferred(
+                RemoteResponse.Success(
+                    request.requestId,
+                    request.kind,
+                    attachedPayload("tab-1", "attachment-1"),
+                ),
+            )
         }
-        return CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, responsePayload))
+        return responseFor?.invoke(request)
+            ?: CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+    }
+
+    override fun requestBatch(requests: List<RemoteRequestInput>): List<Deferred<RemoteResponse>>? =
+        requests.map { input -> request(input.kind, input.payload, input.onAssigned) }
+
+    override fun abandonRequest(request: Deferred<RemoteResponse>) {
+        abandonedRequests += request
     }
 
     override fun close() {
@@ -705,6 +1462,9 @@ private class DeferredRemoteTransport(connectImmediately: Boolean = true) : Remo
         return response
     }
 
+    override fun requestBatch(requests: List<RemoteRequestInput>): List<Deferred<RemoteResponse>>? =
+        requests.map { input -> request(input.kind, input.payload, input.onAssigned) }
+
     fun pendingAttachCount(): Int = attaches.size
 
     fun completeNextAttach(tabId: String, attachmentId: String) {
@@ -734,6 +1494,8 @@ private class GatedEventsRemoteTransport(
         payload: ByteArray,
         onAssigned: (Long) -> Unit,
     ) = delegate.request(kind, payload, onAssigned)
+
+    override fun requestBatch(requests: List<RemoteRequestInput>) = delegate.requestBatch(requests)
 
     override suspend fun completeAttachment(requestId: Long, publishEvents: Boolean) =
         delegate.completeAttachment(requestId, publishEvents)

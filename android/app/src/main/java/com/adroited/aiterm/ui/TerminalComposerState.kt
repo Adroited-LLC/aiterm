@@ -9,46 +9,44 @@ internal data class TerminalComposerUpdate(
 
 internal data class TerminalComposerState(
     val expanded: Boolean = false,
-    val direct: Boolean = false,
-    private val textValue: TextFieldValue = TextFieldValue(),
-    private val directValue: TextFieldValue = TextFieldValue(),
+    val value: TextFieldValue = TextFieldValue(),
 ) {
-    val visibleValue: TextFieldValue
-        get() = if (direct) directValue else textValue
-
     fun open(): TerminalComposerState = copy(expanded = true)
 
     fun close(): TerminalComposerState = copy(expanded = false)
 
-    fun toggleDirect(): TerminalComposerState = copy(direct = !direct)
-
-    fun updateValue(next: TextFieldValue): TerminalComposerUpdate {
-        if (!direct) {
-            return TerminalComposerUpdate(copy(textValue = next))
-        }
-        if (next.composition != null || next.text.isEmpty()) {
-            return TerminalComposerUpdate(copy(directValue = next))
-        }
-        return TerminalComposerUpdate(
-            state = copy(directValue = TextFieldValue()),
-            outbound = listOf(next.text.replace("\n", "\r")),
-        )
-    }
+    fun updateValue(next: TextFieldValue) = TerminalComposerUpdate(copy(value = next))
 
     fun sendText(bracketedPaste: Boolean = false): TerminalComposerUpdate {
-        if (direct) return TerminalComposerUpdate(this)
-        val outbound = buildList {
-            if (textValue.text.isNotEmpty()) {
-                add(
-                    if (bracketedPaste) "\u001b[200~${textValue.text}\u001b[201~"
-                    else textValue.text,
-                )
-            }
-            add("\r")
-        }
+        val outbound = formatTerminalSubmission(value.text, emptyList(), bracketedPaste)
         return TerminalComposerUpdate(
-            state = copy(expanded = false, textValue = TextFieldValue()),
+            state = copy(expanded = false, value = TextFieldValue()),
             outbound = outbound,
         )
+    }
+}
+
+/** Formats terminal input after every attachment has reached the desktop. */
+internal fun formatTerminalSubmission(
+    text: String,
+    paths: List<String>,
+    bracketedPaste: Boolean = false,
+): List<String> {
+    val paste = when {
+        paths.isEmpty() -> text
+        text.isEmpty() -> buildString {
+            append("Please inspect the attached image(s):\n\nAttached images:")
+            paths.forEach { append("\n- ").append(it) }
+        }
+        else -> buildString {
+            append(text).append("\n\nAttached images:")
+            paths.forEach { append("\n- ").append(it) }
+        }
+    }
+    return buildList {
+        if (paste.isNotEmpty()) {
+            add(if (bracketedPaste) "\u001b[200~$paste\u001b[201~" else paste)
+        }
+        add("\r")
     }
 }
