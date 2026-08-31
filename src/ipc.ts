@@ -141,6 +141,8 @@ export const relayReport = (
 ) => invoke<void>("relay_report", { sessionId, bSessionId, bName, phase, round, rounds, note });
 /** Starred sessions — the ones that stay on top everywhere. */
 export const sessionStars = () => invoke<string[]>("session_stars");
+/** Brought-in session → the master it joined (relay lineage). */
+export const sessionBroughtIn = () => invoke<Record<string, string>>("session_brought_in");
 export const sessionStar = (sessionId: string, on: boolean) =>
   invoke<void>("session_star", { sessionId, on });
 export const sessionDelete = (sessionId: string) =>

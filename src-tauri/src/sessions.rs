@@ -4033,6 +4033,11 @@ pub fn load_brought_in() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+#[tauri::command]
+pub fn session_brought_in() -> std::collections::HashMap<String, String> {
+    load_brought_in()
+}
+
 pub fn record_brought_in(b_session: &str, master: &str) {
     let Some(p) = brought_in_path() else { return };
     let mut m = load_brought_in();

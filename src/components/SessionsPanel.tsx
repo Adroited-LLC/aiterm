@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
-  sessionRename, sessionStar, sessionStars, sessionTitles,
+  sessionBroughtIn, sessionRename, sessionStar, sessionStars, sessionTitles,
 } from "../ipc";
 import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import {
-  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Pencil, Play, RefreshCw, Search, Star,
+  ChevronsDownUp, ChevronsUpDown, CornerDownRight, Folder, GitBranch, GitFork, Pencil, Play, RefreshCw, Search, Star, Users,
   Settings as SettingsIcon, Trash2, X,
 } from "lucide-react";
 import { agentTint } from "../brand";
@@ -213,15 +213,38 @@ export default function SessionsPanel({
   const [titleOverrides, setTitleOverrides] = useState<Record<string, string>>({});
   /** Starred sessions float to the top of every list. */
   const [stars, setStars] = useState<Set<string>>(new Set());
+  /** Brought-in session → master, and which masters have their crew folded. */
+  const [broughtIn, setBroughtIn] = useState<Record<string, string>>({});
+  const [foldedCrews, setFoldedCrews] = useState<Set<string>>(new Set());
   useEffect(() => {
     const load = () => {
       sessionTitles().then(setTitleOverrides).catch(() => {});
       sessionStars().then((s) => setStars(new Set(s))).catch(() => {});
+      sessionBroughtIn().then(setBroughtIn).catch(() => {});
     };
     load();
     const un = listen("sessions://changed", load);
     return () => { un.then((f) => f()); };
   }, []);
+  /** Glue each master's brought-in agents directly beneath it (hidden when
+   *  folded); a satellite whose master is elsewhere stays where it is. */
+  const glueCrew = (list: Session[]): Session[] => {
+    const out: Session[] = [];
+    const placed = new Set<string>();
+    for (const s of list) {
+      if (placed.has(s.id)) continue;
+      const master = broughtIn[s.id];
+      if (master && list.some((x) => x.id === master)) continue;
+      out.push(s); placed.add(s.id);
+      for (const k of list) {
+        if (broughtIn[k.id] === s.id && !placed.has(k.id)) {
+          placed.add(k.id);
+          if (!foldedCrews.has(s.id)) out.push(k);
+        }
+      }
+    }
+    return out;
+  };
   const toggleStar = (s: Session) => {
     const on = !stars.has(s.id);
     setStars((prev) => {
@@ -478,8 +501,9 @@ export default function SessionsPanel({
   // beside the session it branched from. Rows still spawn in `project_path`.
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
   const ungrouped = useMemo(
-    () => floatStars(applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"])),
-    [filtered, grouped, orders, stars],
+    () => glueCrew(floatStars(applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"]))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filtered, grouped, orders, stars, broughtIn, foldedCrews],
   );
   const groupMembers = useMemo(() => {
     const m = new Map<string, Session[]>();
@@ -869,7 +893,7 @@ export default function SessionsPanel({
           };
         }}
         className={
-          "session-item" +
+          "session-item" + (broughtIn[s.id] ? " satellite" : "") +
           // Only the single focused session tints — not every session that
           // happens to share the active project. Multi-highlight is opt-in
           // via ctrl/shift-click (builds the `selected` set below).
@@ -916,6 +940,11 @@ export default function SessionsPanel({
         </div>
         <div className="session-text">
           <div className="session-title-row">
+            {broughtIn[s.id] && (
+              <span className="sat-mark" title="Brought into the session above">
+                <Icon of={CornerDownRight} size="sm" />
+              </span>
+            )}
             {stars.has(s.id) && (
               <span className="star-mark" title="Starred — stays on top">
                 <Icon of={Star} size="sm" />
@@ -958,6 +987,25 @@ export default function SessionsPanel({
                 {titleOverrides[s.id] ?? ((renameRows && librarian.store.sessions[s.id]?.name) || s.title)}
               </span>
             )}
+            {(() => {
+              const crew = Object.values(broughtIn).filter((m) => m === s.id).length;
+              if (!crew) return null;
+              const folded = foldedCrews.has(s.id);
+              return (
+                <button
+                  className={"crew-badge" + (folded ? " folded" : "")}
+                  title={folded ? `${crew} brought-in agent(s) — click to show` : `${crew} brought-in agent(s) — click to fold`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setFoldedCrews((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(s.id)) next.delete(s.id); else next.add(s.id);
+                      return next;
+                    });
+                  }}
+                ><Icon of={Users} size="sm" />+{crew}</button>
+              );
+            })()}
             {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
           {(opts.showPath || (opts.showBranch && s.branch)) && (
