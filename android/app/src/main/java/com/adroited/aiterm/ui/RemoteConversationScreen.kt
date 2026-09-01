@@ -1,6 +1,8 @@
 package com.adroited.aiterm.ui
 
+import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -12,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -25,7 +28,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -37,16 +40,21 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -58,7 +66,12 @@ import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemotePreviewMessage
 import com.adroited.aiterm.remote.RemoteSession
+import com.adroited.aiterm.remote.RemoteSessionChange
 import com.adroited.aiterm.remote.RemoteTab
+import com.adroited.aiterm.remote.RemoteUploadProgress
+import java.io.File
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val PAGE_SESSIONS = "sessions"
@@ -106,6 +119,8 @@ fun RemoteDesktopScreen(
                     page = PAGE_TERMINAL
                 },
                 onSend = viewModel::sendConversationPrompt,
+                onLoadFiles = viewModel::sessionChanges,
+                onLoadFile = viewModel::sessionFilePreview,
             )
         }
 
@@ -294,30 +309,129 @@ private fun RemoteConversationContent(
     onBack: () -> Unit,
     onRefresh: () -> Unit,
     onOpenTerminal: () -> Unit,
-    onSend: suspend (String, String) -> Result<Unit>,
+    onSend: suspend (
+        String,
+        String,
+        List<TerminalAttachmentImage>,
+        (RemoteUploadProgress) -> Unit,
+    ) -> Result<Unit>,
+    onLoadFiles: suspend (String) -> Result<List<RemoteSessionChange>>,
+    onLoadFile: suspend (String, String, Int) -> Result<RemoteSessionFilePreview>,
 ) {
-    BackHandler(onBack = onBack)
     var draft by rememberSaveable(session.id) { mutableStateOf("") }
     var sending by remember(session.id) { mutableStateOf(false) }
     var sendError by remember(session.id) { mutableStateOf<String?>(null) }
+    var attachments by remember(session.id) { mutableStateOf(TerminalAttachmentDraft()) }
+    var showImageSources by remember(session.id) { mutableStateOf(false) }
+    var showFiles by remember(session.id) { mutableStateOf(false) }
+    var filesLoading by remember(session.id) { mutableStateOf(false) }
+    var files by remember(session.id) { mutableStateOf<List<RemoteSessionChange>>(emptyList()) }
+    var filesError by remember(session.id) { mutableStateOf<String?>(null) }
+    var filePreviewTarget by remember(session.id) { mutableStateOf<RemoteSessionChange?>(null) }
+    var filePreviewLoading by remember(session.id) { mutableStateOf(false) }
+    var filePreview by remember(session.id) { mutableStateOf<RemoteSessionFilePreview?>(null) }
+    var filePreviewError by remember(session.id) { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val normalizer = remember(context) { TerminalImageNormalizer(context) }
     val messages = if (state.previewSessionId == session.id) state.previewMessages else emptyList()
     val listState = rememberLazyListState()
+    val latestAttachments by rememberUpdatedState(attachments)
+
+    BackHandler(enabled = !sending && !attachments.preparing, onBack = onBack)
+    DisposableEffect(session.id) {
+        onDispose { latestAttachments.items.forEach { it.image.file.delete() } }
+    }
 
     LaunchedEffect(session.id) { onRefresh() }
+    LaunchedEffect(session.id, isConversationSessionLive(session, state.tabs)) {
+        if (isConversationSessionLive(session, state.tabs)) {
+            while (true) {
+                delay(1_500)
+                onRefresh()
+            }
+        }
+    }
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
     }
 
+    fun updateAttachments(
+        transition: (TerminalAttachmentDraft) -> TerminalAttachmentDraftUpdate,
+    ): TerminalAttachmentDraftUpdate = transition(attachments).also { attachments = it.draft }
+
+    fun handlePickerResult(result: TerminalImagePickerResult) {
+        when (result) {
+            TerminalImagePickerResult.Cancelled -> Unit
+            is TerminalImagePickerResult.Failed -> {
+                attachments = attachments.copy(message = result.message)
+            }
+            is TerminalImagePickerResult.Selected -> scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                val preparation = updateAttachments { it.beginPreparation() }
+                if (!preparation.accepted) {
+                    result.ownedCaptureFiles.forEach(File::delete)
+                    return@launch
+                }
+                try {
+                    val distinct = result.uris.distinct()
+                    val remaining = TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size
+                    var message: String? = null
+                    for (uri in distinct.take(remaining.coerceAtLeast(0))) {
+                        val normalized = normalizer.normalize(uri).getOrElse { error ->
+                            message = terminalImageErrorMessage(error)
+                            continue
+                        }
+                        val added = updateAttachments { it.add(normalized) }
+                        if (!added.accepted) {
+                            message = added.draft.message
+                            normalized.file.delete()
+                        }
+                    }
+                    attachments = attachments.copy(
+                        message = when {
+                            result.uris.size != distinct.size -> "This image is already attached."
+                            distinct.size > remaining -> "You can attach up to 4 images."
+                            else -> message
+                        },
+                    )
+                } finally {
+                    result.ownedCaptureFiles.forEach(File::delete)
+                    updateAttachments { it.finishPreparation() }
+                }
+            }
+        }
+    }
+    val picker = rememberTerminalImagePicker { _, result -> handlePickerResult(result) }
+
     fun submit() {
         val text = draft.trim()
-        if (text.isEmpty() || sending) return
+        if ((text.isEmpty() && attachments.items.isEmpty()) || sending || attachments.preparing) return
         sending = true
         sendError = null
+        if (attachments.items.isNotEmpty()) {
+            val began = updateAttachments { it.beginSubmission() }
+            if (!began.accepted) {
+                sending = false
+                return
+            }
+        }
+        val submittedImages = attachments.items.map { it.image }
         scope.launch {
-            onSend(session.id, text).fold(
-                onSuccess = { draft = "" },
-                onFailure = { sendError = it.message ?: "The desktop did not accept the message." },
+            onSend(session.id, text, submittedImages) { progress ->
+                updateAttachments { it.recordProgress(progress.sourceId, progress.sent, progress.total) }
+            }.fold(
+                onSuccess = {
+                    draft = ""
+                    val removed = attachments.items
+                    attachments = TerminalAttachmentDraft()
+                    removed.forEach { it.image.file.delete() }
+                },
+                onFailure = {
+                    sendError = it.message ?: "The desktop did not accept the message."
+                    if (attachments.submitting) {
+                        updateAttachments { draftState -> draftState.failSubmission(sendError!!) }
+                    }
+                },
             )
             sending = false
         }
@@ -327,7 +441,12 @@ private fun RemoteConversationContent(
         modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
-                navigationIcon = { TextButton(onClick = onBack) { Text("Sessions") } },
+                navigationIcon = {
+                    TextButton(
+                        onClick = onBack,
+                        enabled = !sending && !attachments.preparing,
+                    ) { Text("Sessions") }
+                },
                 title = {
                     Column {
                         Text(session.title.ifBlank { "Untitled session" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -339,6 +458,18 @@ private fun RemoteConversationContent(
                     }
                 },
                 actions = {
+                    TextButton(onClick = {
+                        showFiles = true
+                        filesLoading = true
+                        filesError = null
+                        scope.launch {
+                            onLoadFiles(session.id).fold(
+                                onSuccess = { files = it },
+                                onFailure = { filesError = it.message ?: "Could not load files." },
+                            )
+                            filesLoading = false
+                        }
+                    }) { Text("Files") }
                     TextButton(onClick = onRefresh) { Text("Refresh") }
                     TextButton(onClick = onOpenTerminal) { Text("Terminal") }
                 },
@@ -354,7 +485,19 @@ private fun RemoteConversationContent(
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(4.dp))
                 }
+                TerminalAttachmentStrip(
+                    draft = attachments,
+                    onRemove = { imageId ->
+                        val removed = updateAttachments { it.remove(imageId) }
+                        removed.removed.forEach { it.image.file.delete() }
+                    },
+                )
                 Row(verticalAlignment = Alignment.Bottom) {
+                    TextButton(
+                        onClick = { showImageSources = true },
+                        enabled = !sending && !attachments.preparing &&
+                            attachments.items.size < TerminalAttachmentDraft.MAX_IMAGES,
+                    ) { Text("＋") }
                     OutlinedTextField(
                         value = draft,
                         onValueChange = { draft = it },
@@ -365,12 +508,12 @@ private fun RemoteConversationContent(
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                         keyboardActions = KeyboardActions(onSend = { submit() }),
                         enabled = !sending,
+                        trailingIcon = {
+                            if (sending) {
+                                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            }
+                        },
                     )
-                    Spacer(Modifier.width(8.dp))
-                    Button(onClick = { submit() }, enabled = draft.isNotBlank() && !sending) {
-                        if (sending) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                        else Text("Send")
-                    }
                 }
             }
         },
@@ -397,6 +540,168 @@ private fun RemoteConversationContent(
             }
         }
     }
+
+    if (showImageSources) {
+        AlertDialog(
+            onDismissRequest = { showImageSources = false },
+            title = { Text("Attach image") },
+            text = { Text("Choose a source") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showImageSources = false
+                    picker.launch(
+                        TerminalImageSource.Gallery,
+                        TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
+                        session.id,
+                    ) { handlePickerResult(it) }
+                }) { Text("Gallery") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showImageSources = false
+                    picker.launch(
+                        TerminalImageSource.Camera,
+                        TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
+                        session.id,
+                    ) { handlePickerResult(it) }
+                }) { Text("Camera") }
+            },
+        )
+    }
+    if (showFiles) {
+        AlertDialog(
+            onDismissRequest = { showFiles = false },
+            title = { Text("Session files") },
+            text = {
+                when {
+                    filesLoading -> Box(
+                        Modifier.fillMaxWidth().height(120.dp),
+                        contentAlignment = Alignment.Center,
+                    ) { CircularProgressIndicator() }
+                    filesError != null -> Text(filesError!!, color = MaterialTheme.colorScheme.error)
+                    files.isEmpty() -> Text("No files recorded for this session yet.")
+                    else -> LazyColumn(Modifier.fillMaxWidth().heightIn(max = 440.dp)) {
+                        items(files, key = { "${it.path}:${it.at}:${it.kind}" }) { file ->
+                            Column(
+                                Modifier.fillMaxWidth()
+                                    .clickable(enabled = file.kind != "deleted") {
+                                        showFiles = false
+                                        filePreviewTarget = file
+                                        filePreview = null
+                                        filePreviewError = null
+                                        filePreviewLoading = true
+                                        scope.launch {
+                                            onLoadFile(session.id, file.path, 8 * 1024 * 1024).fold(
+                                                onSuccess = { filePreview = it },
+                                                onFailure = {
+                                                    filePreviewError = it.message ?: "Could not read this file."
+                                                },
+                                            )
+                                            filePreviewLoading = false
+                                        }
+                                    }
+                                    .padding(vertical = 7.dp),
+                            ) {
+                                Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(
+                                    "${file.kind} · ${file.bytes} bytes\n${file.path}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showFiles = false }) { Text("Done") } },
+        )
+    }
+    filePreviewTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = {
+                filePreviewTarget = null
+                filePreview = null
+            },
+            title = { Text(target.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            text = {
+                SessionFilePreviewBody(
+                    loading = filePreviewLoading,
+                    preview = filePreview,
+                    error = filePreviewError,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    filePreviewTarget = null
+                    filePreview = null
+                }) { Text("Done") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun SessionFilePreviewBody(
+    loading: Boolean,
+    preview: RemoteSessionFilePreview?,
+    error: String?,
+) {
+    when {
+        loading -> Box(
+            Modifier.fillMaxWidth().height(180.dp),
+            contentAlignment = Alignment.Center,
+        ) { CircularProgressIndicator() }
+        error != null -> Text(error, color = MaterialTheme.colorScheme.error)
+        preview == null -> Text("No preview available.")
+        preview.mime.startsWith("image/") && preview.truncated -> Text(
+            "This image is larger than the 8 MB phone preview limit (${preview.total} bytes).",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        preview.mime.startsWith("image/") -> {
+            val bitmap = remember(preview.data) { decodeBoundedPreviewBitmap(preview.data) }
+            if (bitmap == null) {
+                Text("Android could not decode this image.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = preview.path.substringAfterLast('/'),
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
+                    contentScale = ContentScale.Fit,
+                )
+            }
+        }
+        preview.mime.startsWith("text/") -> LazyColumn(
+            Modifier.fillMaxWidth().heightIn(max = 480.dp),
+        ) {
+            item {
+                Text(
+                    preview.data.decodeToString() + if (preview.truncated) "\n\n…preview truncated…" else "",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+        else -> Text(
+            "No inline preview for ${preview.mime}. The file is ${preview.total} bytes.",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+private fun decodeBoundedPreviewBitmap(data: ByteArray): android.graphics.Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(data, 0, data.size, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    var sample = 1
+    while (bounds.outWidth / sample > 2_048 || bounds.outHeight / sample > 2_048) sample *= 2
+    return BitmapFactory.decodeByteArray(
+        data,
+        0,
+        data.size,
+        BitmapFactory.Options().apply { inSampleSize = sample },
+    )
 }
 
 @Composable

@@ -1159,7 +1159,7 @@ internal fun terminalIndexedColor(index: Int): Color {
 
 private fun Color.ifTransparent(fallback: Color): Color = if (alpha == 0f) fallback else this
 
-private fun terminalImageErrorMessage(error: Throwable): String = when (error) {
+internal fun terminalImageErrorMessage(error: Throwable): String = when (error) {
     is TerminalImageNormalizationError -> when (error.code) {
         TerminalImageNormalizationError.Code.INPUT_TOO_LARGE,
         TerminalImageNormalizationError.Code.OUTPUT_TOO_LARGE ->

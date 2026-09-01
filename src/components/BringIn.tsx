@@ -23,7 +23,7 @@ export default function BringIn({ onGo, onClose, onOpenModelAccess }: {
         <button className="icon-btn" title="Close" onClick={onClose}><Icon of={X} size="sm" /></button>
       </div>
       <div className="bringin-body">
-        <StartControls ctl={ctl} onOpenModelAccess={onOpenModelAccess} />
+        <StartControls ctl={ctl} onOpenModelAccess={onOpenModelAccess} allowApi={false} />
         <textarea
           className="bringin-focus"
           rows={2}
@@ -45,7 +45,7 @@ export default function BringIn({ onGo, onClose, onOpenModelAccess }: {
               <option value={3}>3</option>
             </select>
           </label>
-          <button className="tui-pick" disabled={!ctl.ready} onClick={() => onGo(ctl.choice(), focus, rounds, auto)}>
+          <button className="tui-pick" disabled={!ctl.ready || ctl.isApi} onClick={() => onGo(ctl.choice(), focus, rounds, auto)}>
             Bring them in
           </button>
         </div>

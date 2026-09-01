@@ -29,6 +29,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.cbor.ByteString
 import kotlinx.serialization.cbor.Cbor
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -729,6 +730,7 @@ class RemoteClientTest {
             .map { request -> decodeUploadBegin(request.payload) }
         assertEquals(2, begins.size)
         assertEquals(listOf(2, 2), begins.map(UploadBeginWire::submissionCount))
+        assertEquals(listOf(0, 1), begins.map(UploadBeginWire::memberIndex))
         assertEquals(listOf(5L, 5L), begins.map(UploadBeginWire::submissionBytes))
         assertEquals(begins.first().submissionId, begins.last().submissionId)
         java.util.UUID.fromString(begins.first().submissionId)
@@ -742,6 +744,68 @@ class RemoteClientTest {
         assertEquals(listOf(0L, 3L), progress.filter { it.sourceId == "first" }.map { it.sent })
         assertEquals(listOf(0L, 2L), progress.filter { it.sourceId == "second" }.map { it.sent })
         cleanupUploadSources(first, second)
+        client.lock()
+    }
+
+    @Test
+    fun timedOutChunkResumesFromTheDesktopAcknowledgedOffsetWithoutRepeatingBytes() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        val bytes = ByteArray(RemoteCommands.MAX_UPLOAD_CHUNK_BYTES + 2) { (it % 251).toByte() }
+        val source = uploadSource("resume-timeout", bytes)
+        var begins = 0
+        var chunks = 0
+        transport.responseFor = { request ->
+            when (request.kind) {
+                "terminal.upload.begin" -> CompletableDeferred(
+                    RemoteResponse.Success(
+                        request.requestId,
+                        request.kind,
+                        uploadBeginReply("upload-1", if (begins++ == 0) 0 else 1),
+                    ),
+                )
+                "terminal.upload.chunk" -> if (chunks++ == 0) {
+                    CompletableDeferred<RemoteResponse>().also {
+                        it.completeExceptionally(RemoteProtocolException("remote request timed out"))
+                    }
+                } else {
+                    CompletableDeferred(
+                        RemoteResponse.Success(request.requestId, request.kind, uploadSuccessReply()),
+                    )
+                }
+                "terminal.upload.finish" -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, uploadedPathReply("/desktop/resumed.jpg")),
+                )
+                else -> CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()),
+                )
+            }
+        }
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val operation = async { client.uploadImages("tab-1", listOf(source)) }
+        advanceUntilIdle()
+
+        assertEquals(listOf("/desktop/resumed.jpg"), operation.await().getOrThrow())
+        assertEquals(
+            listOf(
+                "terminal.upload.begin",
+                "terminal.upload.chunk",
+                "terminal.upload.begin",
+                "terminal.upload.chunk",
+                "terminal.upload.finish",
+            ),
+            transport.requests.map(RemoteRequest::kind),
+        )
+        val retriedChunk = transport.requests.filter { it.kind == "terminal.upload.chunk" }.last()
+        val decoded = decodeUploadChunk(retriedChunk.payload)
+        assertEquals(1, decoded.index)
+        assertArrayEquals(bytes.copyOfRange(RemoteCommands.MAX_UPLOAD_CHUNK_BYTES, bytes.size), decoded.data)
+        cleanupUploadSources(source)
         client.lock()
     }
 
@@ -903,13 +967,13 @@ class RemoteClientTest {
     }
 
     @Test
-    fun imageUploadRejectsUnexpectedNonzeroInitialChunkAndCancelsTheUpload() = runTest {
+    fun imageUploadRejectsAResumeOffsetPastTheImageAndCancelsTheUpload() = runTest {
         val transport = FakeRemoteTransport()
         val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
         val source = uploadSource("one", byteArrayOf(1))
         transport.responseFor = { request ->
             val payload = when (request.kind) {
-                "terminal.upload.begin" -> uploadBeginReply("upload-1", 1)
+                "terminal.upload.begin" -> uploadBeginReply("upload-1", 2)
                 "terminal.upload.cancel" -> uploadSuccessReply()
                 else -> byteArrayOf()
             }
@@ -1321,10 +1385,19 @@ private data class UploadBeginWire(
     @SerialName("attachment_id") val attachmentId: String,
     @SerialName("submission_id") val submissionId: String,
     @SerialName("submission_count") val submissionCount: Int,
+    @SerialName("member_index") val memberIndex: Int,
     @SerialName("submission_bytes") val submissionBytes: Long,
     val length: Long,
     @SerialName("media_type") val mediaType: String,
     @ByteString val sha256: ByteArray,
+)
+
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+private data class UploadChunkWire(
+    @SerialName("upload_id") val uploadId: String,
+    val index: Int,
+    @ByteString val data: ByteArray,
 )
 
 @OptIn(ExperimentalSerializationApi::class)
@@ -1336,6 +1409,10 @@ private val uploadCbor = Cbor {
 @OptIn(ExperimentalSerializationApi::class)
 private fun decodeUploadBegin(payload: ByteArray): UploadBeginWire =
     uploadCbor.decodeFromByteArray(UploadBeginWire.serializer(), payload)
+
+@OptIn(ExperimentalSerializationApi::class)
+private fun decodeUploadChunk(payload: ByteArray): UploadChunkWire =
+    uploadCbor.decodeFromByteArray(UploadChunkWire.serializer(), payload)
 
 private fun snapshotChunk(
     transferId: String,

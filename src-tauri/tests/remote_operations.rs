@@ -612,6 +612,7 @@ async fn tauri_agent_adapters_and_remote_gateway_share_one_managed_agent_graph()
             model: Some("fixture-model".into()),
             effort: Some("medium".into()),
             prompt: None,
+            permission_flags: None,
         },
     )
     .unwrap();

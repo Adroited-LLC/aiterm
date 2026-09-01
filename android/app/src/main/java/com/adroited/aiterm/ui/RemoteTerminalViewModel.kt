@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.ByteArrayOutputStream
 
 class RemoteTerminalViewModel(
     desktop: PairedDesktop,
@@ -98,14 +99,60 @@ class RemoteTerminalViewModel(
     fun openSession(id: String, cols: Int, rows: Int) =
         client.openSession(id, TerminalSize(cols, rows))
     fun previewSession(id: String) = client.previewSession(id)
+    suspend fun sessionChanges(id: String): Result<List<com.adroited.aiterm.remote.RemoteSessionChange>> =
+        runCatching { client.sessionChanges(id) }
+
+    internal suspend fun sessionFilePreview(
+        sessionId: String,
+        path: String,
+        maxBytes: Int = 8 * 1024 * 1024,
+    ): Result<RemoteSessionFilePreview> = runCatching {
+        require(maxBytes > 0)
+        val output = ByteArrayOutputStream(maxBytes.coerceAtMost(256 * 1024))
+        var offset = 0L
+        var total = -1L
+        var mime = "application/octet-stream"
+        var eof = false
+        while (!eof && offset < maxBytes) {
+            val count = minOf(256 * 1024, maxBytes - offset.toInt())
+            val chunk = client.readFileChunk(sessionId, path, offset, count)
+            check(chunk.path == path && (total < 0 || chunk.total == total) && chunk.offset == offset) {
+                "The desktop returned a different file while reading."
+            }
+            if (total < 0) {
+                total = chunk.total
+                mime = chunk.mime
+            } else {
+                check(chunk.mime == mime) { "The desktop changed the file type while reading." }
+            }
+            output.write(chunk.data)
+            offset += chunk.data.size
+            eof = chunk.eof
+            check(eof || chunk.data.isNotEmpty()) { "The desktop returned an empty file chunk." }
+        }
+        RemoteSessionFilePreview(
+            path = path,
+            mime = mime,
+            total = total.coerceAtLeast(0),
+            data = output.toByteArray(),
+            truncated = !eof,
+        )
+    }
 
     /**
      * Sends from the conversation view without introducing a second protocol. Opening the
      * session, attaching, and taking focus use the same authenticated terminal path as the grid.
      */
-    suspend fun sendConversationPrompt(sessionId: String, text: String): Result<Unit> {
+    suspend fun sendConversationPrompt(
+        sessionId: String,
+        text: String,
+        images: List<TerminalAttachmentImage> = emptyList(),
+        onProgress: (RemoteUploadProgress) -> Unit = {},
+    ): Result<Unit> {
         val prompt = text.trim()
-        if (prompt.isEmpty()) return Result.failure(IllegalArgumentException("Write a message first."))
+        if (prompt.isEmpty() && images.isEmpty()) {
+            return Result.failure(IllegalArgumentException("Write a message or attach an image first."))
+        }
         return try {
             val existing = client.state.value.tabs.firstOrNull { it.sessionId == sessionId }
             if (existing != null) client.selectTab(existing.id)
@@ -135,9 +182,13 @@ class RemoteTerminalViewModel(
             val latestScreen = client.screen.value
                 ?.takeIf { it.tabId == activeScreen.tabId }
                 ?: return Result.failure(IllegalStateException("The terminal changed before sending."))
+            val paths = if (images.isEmpty()) emptyList() else {
+                client.uploadImages(activeScreen.tabId, images.map { it.asRemoteUploadSource() }, onProgress)
+                    .getOrElse { return Result.failure(it) }
+            }
             val outbound = formatTerminalSubmission(
                 text = prompt,
-                paths = emptyList(),
+                paths = paths,
                 bracketedPaste = latestScreen.modes.bracketedPaste,
             )
             if (!client.sendInputs(activeScreen.tabId, outbound)) {
@@ -182,6 +233,14 @@ class RemoteTerminalViewModel(
         }
     }
 }
+
+internal data class RemoteSessionFilePreview(
+    val path: String,
+    val mime: String,
+    val total: Long,
+    val data: ByteArray,
+    val truncated: Boolean,
+)
 
 internal fun remoteUploadSource(image: NormalizedTerminalImage): RemoteUploadSource = RemoteUploadSource(
     id = image.id,

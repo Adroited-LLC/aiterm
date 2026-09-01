@@ -236,11 +236,12 @@ class RemoteWireCodecTest {
 
         assertArrayEquals(
             hex(
-                "a8" +
+                "a9" +
                     "667461625f6964" + "63746162" +
                     "6d6174746163686d656e745f6964" + "6a6174746163686d656e74" +
                     "6d7375626d697373696f6e5f6964" + "6a7375626d697373696f6e" +
                     "707375626d697373696f6e5f636f756e74" + "02" +
+                    "6c6d656d6265725f696e646578" + "00" +
                     "707375626d697373696f6e5f6279746573" + "19012c" +
                     "666c656e677468" + "182a" +
                     "6a6d656469615f74797065" + "6a696d6167652f6a706567" +
@@ -355,6 +356,74 @@ class RemoteWireCodecTest {
                 submissionBytes = 1,
                 length = 1,
                 sha256 = digest,
+            )
+        }
+    }
+
+    @Test
+    fun sessionChangesAndFileChunksUseStrictBoundedShapes() {
+        val changes = RemoteCommands.sessionChanges(
+            fixture(
+                linkedMapOf(
+                    "changes" to listOf(
+                        linkedMapOf(
+                            "path" to "/project/src/Main.kt",
+                            "name" to "Main.kt",
+                            "kind" to "modified",
+                            "at" to 42L,
+                            "session_id" to "session-1",
+                            "bytes" to 12L,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        assertEquals("/project/src/Main.kt", changes.single().path)
+        assertEquals("modified", changes.single().kind)
+
+        val chunk = RemoteCommands.fileChunk(
+            fixture(
+                linkedMapOf(
+                    "path" to "/project/src/Main.kt",
+                    "mime" to "text/plain",
+                    "offset" to 4L,
+                    "total" to 7L,
+                    "eof" to true,
+                    "data" to byteArrayOf(5, 6, 7),
+                ),
+            ),
+        )
+        assertEquals(4L, chunk.offset)
+        assertArrayEquals(byteArrayOf(5, 6, 7), chunk.data)
+
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.fileChunk(
+                fixture(
+                    linkedMapOf(
+                        "path" to "/project/src/Main.kt",
+                        "mime" to "text/plain",
+                        "offset" to 4L,
+                        "total" to 7L,
+                        "eof" to false,
+                        "data" to byteArrayOf(5, 6, 7),
+                    ),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun uploadMemberIndexMustBelongToTheDeclaredSubmission() {
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.uploadBegin(
+                tabId = "tab",
+                attachmentId = "attachment",
+                submissionId = "submission",
+                submissionCount = 2,
+                memberIndex = 2,
+                submissionBytes = 2,
+                length = 1,
+                sha256 = ByteArray(32),
             )
         }
     }

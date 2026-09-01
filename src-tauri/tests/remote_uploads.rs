@@ -91,11 +91,31 @@ impl UploadFixture {
         length: usize,
         digest: [u8; 32],
     ) -> UploadBegin {
+        self.begin_member_for_submission(
+            submission_id,
+            0,
+            submission_count,
+            submission_bytes,
+            length,
+            digest,
+        )
+    }
+
+    fn begin_member_for_submission(
+        &self,
+        submission_id: &str,
+        member_index: u8,
+        submission_count: u8,
+        submission_bytes: u64,
+        length: usize,
+        digest: [u8; 32],
+    ) -> UploadBegin {
         UploadBegin {
             tab_id: self.tab_id.clone(),
             attachment_id: self.attachment_id.clone(),
             submission_id: submission_id.to_string(),
             submission_count,
+            member_index,
             submission_bytes,
             length: length as u64,
             sha256: digest,
@@ -555,6 +575,7 @@ fn concurrent_upload_sets_preserve_every_manifest_record() {
                     attachment_id: AttachmentId::new(),
                     submission_id: uuid::Uuid::new_v4().to_string(),
                     submission_count: 1,
+                    member_index: 0,
                     submission_bytes: jpeg.len() as u64,
                     length: jpeg.len() as u64,
                     sha256: digest(&jpeg),
@@ -730,6 +751,7 @@ fn manifest_subprocess_writer_helper() {
         attachment_id: AttachmentId::new(),
         submission_id: uuid::Uuid::new_v4().to_string(),
         submission_count: 1,
+        member_index: 0,
         submission_bytes: jpeg.len() as u64,
         length: jpeg.len() as u64,
         sha256: digest(&jpeg),
@@ -1022,9 +1044,10 @@ fn exact_submission_file_count_and_byte_boundaries_are_accepted() {
     let mut fixture = UploadFixture::new("exact-submission-boundaries");
     let submission = uuid::Uuid::new_v4().to_string();
     let mut first_upload = None;
-    for _ in 0..4 {
-        let request = fixture.begin_for_submission(
+    for member_index in 0..4 {
+        let request = fixture.begin_member_for_submission(
             &submission,
+            member_index,
             4,
             MAX_SUBMISSION_BYTES,
             MAX_UPLOAD_BYTES as usize,
@@ -1257,9 +1280,10 @@ fn dropping_an_upload_set_removes_every_partial() {
     let mut fixture = UploadFixture::new("drop-cleanup");
     let jpeg = fixture.jpeg(64, 48);
     let submission = uuid::Uuid::new_v4().to_string();
-    for _ in 0..2 {
-        let request = fixture.begin_for_submission(
+    for member_index in 0..2 {
+        let request = fixture.begin_member_for_submission(
             &submission,
+            member_index,
             2,
             (jpeg.len() * 2) as u64,
             jpeg.len(),
@@ -1291,8 +1315,9 @@ fn submission_metadata_and_aggregate_limits_are_enforced_server_side() {
         digest(&jpeg),
     );
     fixture.uploads.begin(Some(&fixture.cwd), first).unwrap();
-    let inconsistent = fixture.begin_for_submission(
+    let inconsistent = fixture.begin_member_for_submission(
         &submission,
+        1,
         3,
         (jpeg.len() * 3) as u64,
         jpeg.len(),
@@ -1355,8 +1380,9 @@ fn exact_declared_submission_total_is_required_by_the_final_begin() {
         digest(&jpeg),
     );
     fixture.uploads.begin(Some(&fixture.cwd), first).unwrap();
-    let second = fixture.begin_for_submission(
+    let second = fixture.begin_member_for_submission(
         &submission,
+        1,
         2,
         (jpeg.len() * 2 + 1) as u64,
         jpeg.len(),
@@ -1388,8 +1414,9 @@ fn malformed_later_begin_aborts_the_existing_submission_partial() {
     );
     fixture.uploads.begin(Some(&fixture.cwd), first).unwrap();
     assert_eq!(fixture.part_files().len(), 1);
-    let malformed = fixture.begin_for_submission(
+    let malformed = fixture.begin_member_for_submission(
         &submission,
+        1,
         2,
         MAX_SUBMISSION_BYTES,
         (MAX_UPLOAD_BYTES + 1) as usize,
@@ -1408,7 +1435,7 @@ fn malformed_later_begin_aborts_the_existing_submission_partial() {
 }
 
 #[test]
-fn completed_submission_id_cannot_be_reused() {
+fn completed_member_begin_replays_its_published_result() {
     let mut fixture = UploadFixture::new("closed-complete");
     let jpeg = fixture.jpeg(64, 48);
     let submission = uuid::Uuid::new_v4().to_string();
@@ -1420,14 +1447,45 @@ fn completed_submission_id_cannot_be_reused() {
     let reused =
         fixture.begin_for_submission(&submission, 1, jpeg.len() as u64, jpeg.len(), digest(&jpeg));
 
+    let replayed = fixture.uploads.begin(Some(&fixture.cwd), reused).unwrap();
+    assert_eq!(replayed.upload_id, began.upload_id);
+    assert!(replayed.published_path.is_some());
+}
+
+#[test]
+fn an_incomplete_member_resumes_at_the_acknowledged_chunk_on_a_new_attachment() {
+    let mut fixture = UploadFixture::new("resume-member");
+    let jpeg = fixture.jpeg(64, 48);
+    let split = jpeg.len() / 2;
+    let mut request = fixture.begin(jpeg.len(), digest(&jpeg));
+    let began = fixture
+        .uploads
+        .begin(Some(&fixture.cwd), request.clone())
+        .unwrap();
+    fixture
+        .uploads
+        .chunk(&began.upload_id, 0, &jpeg[..split])
+        .unwrap();
+
+    let replacement_attachment = AttachmentId::new();
+    request.attachment_id = replacement_attachment.clone();
+    let resumed = fixture
+        .uploads
+        .begin(Some(&fixture.cwd), request)
+        .unwrap();
+
+    assert_eq!(resumed.upload_id, began.upload_id);
+    assert_eq!(resumed.next_chunk, 1);
     assert_eq!(
-        fixture
-            .uploads
-            .begin(Some(&fixture.cwd), reused)
-            .unwrap_err()
-            .kind(),
-        UploadErrorKind::ClosedSubmission
+        fixture.uploads.target(&resumed.upload_id),
+        Some((&fixture.tab_id, &replacement_attachment)),
     );
+    fixture
+        .uploads
+        .chunk(&resumed.upload_id, 1, &jpeg[split..])
+        .unwrap();
+    let published = fixture.uploads.finish(&resumed.upload_id).unwrap();
+    assert_eq!(fs::read(published.path).unwrap(), jpeg);
 }
 
 #[test]
@@ -1591,6 +1649,7 @@ fn concurrent_git_exclude_updates_preserve_every_writer() {
                     attachment_id: AttachmentId::new(),
                     submission_id: uuid::Uuid::new_v4().to_string(),
                     submission_count: 1,
+                    member_index: 0,
                     submission_bytes: jpeg.len() as u64,
                     length: jpeg.len() as u64,
                     sha256: digest(&jpeg),
@@ -1796,8 +1855,9 @@ fn later_staging_path_failure_aborts_and_closes_the_live_submission() {
     let outside = fixture.root.join("outside-directory");
     fs::create_dir(&outside).unwrap();
     symlink(&outside, &attachments).unwrap();
-    let second = fixture.begin_for_submission(
+    let second = fixture.begin_member_for_submission(
         &submission,
+        1,
         2,
         (jpeg.len() * 2) as u64,
         jpeg.len(),
@@ -1861,8 +1921,9 @@ fn later_git_exclude_failure_aborts_the_live_submission_without_following_symlin
     let outside = fixture.root.join("outside-exclude");
     fs::write(&outside, b"must survive").unwrap();
     symlink(&outside, &exclude).unwrap();
-    let second = fixture.begin_for_submission(
+    let second = fixture.begin_member_for_submission(
         &submission,
+        1,
         2,
         (jpeg.len() * 2) as u64,
         jpeg.len(),

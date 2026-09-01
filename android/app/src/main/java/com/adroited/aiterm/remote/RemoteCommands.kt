@@ -27,7 +27,7 @@ data class AttachedTerminal(
     val title: String,
 )
 
-data class RemoteUploadBegan(val uploadId: String, val nextChunk: Int)
+data class RemoteUploadBegan(val uploadId: String, val nextChunk: Int, val path: String?)
 
 data class RemoteFocusEvent(
     val tabId: String,
@@ -39,6 +39,24 @@ data class RemoteFocusEvent(
 data class RemoteTitleEvent(val tabId: String, val attachmentId: String, val title: String)
 data class RemoteTerminalExitEvent(val tabId: String, val attachmentId: String, val exit: RemoteTabExit)
 @Serializable data class RemotePreviewMessage(val role: String, val text: String, val at: String? = null)
+@Serializable
+data class RemoteSessionChange(
+    val path: String,
+    val name: String,
+    val kind: String,
+    val at: Long,
+    @SerialName("session_id") val sessionId: String? = null,
+    val bytes: Long,
+)
+
+data class RemoteFileChunk(
+    val path: String,
+    val mime: String,
+    val offset: Long,
+    val total: Long,
+    val eof: Boolean,
+    val data: ByteArray,
+)
 
 @Serializable
 data class RemoteModelOption(
@@ -102,6 +120,15 @@ object RemoteCommands {
     fun session(sessionId: String): ByteArray =
         encode(SessionIdPayload.serializer(), SessionIdPayload(sessionId))
     fun previewSession(sessionId: String): ByteArray = session(sessionId)
+    fun conversation(sessionId: String, maxChars: Int = 512 * 1_024): ByteArray =
+        encode(SessionConversationPayload.serializer(), SessionConversationPayload(sessionId, maxChars))
+    fun fileRead(sessionId: String, path: String, offset: Long, count: Int): ByteArray {
+        requireIdentifier(sessionId)
+        if (path.isBlank() || path.encodeToByteArray().size > MAX_PATH_BYTES || offset < 0 ||
+            count !in 1..MAX_UPLOAD_CHUNK_BYTES
+        ) malformed()
+        return encode(FileReadRequest.serializer(), FileReadRequest(sessionId, path, offset, count))
+    }
     fun openSession(sessionId: String, size: TerminalSize): ByteArray =
         encode(SessionOpenPayload.serializer(), SessionOpenPayload(sessionId, size))
     fun closeSession(sessionId: String, tabId: String?): ByteArray =
@@ -125,6 +152,7 @@ object RemoteCommands {
         attachmentId: String,
         submissionId: String,
         submissionCount: Int,
+        memberIndex: Int = 0,
         submissionBytes: Long,
         length: Long,
         sha256: ByteArray,
@@ -133,6 +161,7 @@ object RemoteCommands {
         requireIdentifier(attachmentId)
         requireSubmissionId(submissionId)
         if (submissionCount !in 1..MAX_UPLOADS_PER_SUBMISSION ||
+            memberIndex !in 0 until submissionCount ||
             submissionBytes !in 1..MAX_SUBMISSION_BYTES ||
             length !in 1..MAX_UPLOAD_BYTES ||
             length > submissionBytes ||
@@ -145,6 +174,7 @@ object RemoteCommands {
                 attachmentId = attachmentId,
                 submissionId = submissionId,
                 submissionCount = submissionCount,
+                memberIndex = memberIndex,
                 submissionBytes = submissionBytes,
                 length = length,
                 sha256 = sha256,
@@ -170,7 +200,8 @@ object RemoteCommands {
             if (it.uploadId.isBlank() || it.uploadId.encodeToByteArray().size > MAX_IDENTIFIER_BYTES ||
                 it.nextChunk < 0
             ) malformed()
-            RemoteUploadBegan(it.uploadId, it.nextChunk)
+            if (it.path != null && (it.path.isBlank() || it.path.encodeToByteArray().size > MAX_PATH_BYTES)) malformed()
+            RemoteUploadBegan(it.uploadId, it.nextChunk, it.path)
         }
 
     fun uploadedPath(payload: ByteArray): String = decode(UploadFinishReply.serializer(), payload).path.also {
@@ -200,6 +231,25 @@ object RemoteCommands {
                     it.role.length !in 1..64 || it.text.encodeToByteArray().size > 64 * 1_024
                 } || messages.sumOf { it.text.encodeToByteArray().size } >= RemoteWireCodec.MAX_FRAME_BYTES
             ) malformed()
+        }
+
+    fun sessionChanges(payload: ByteArray): List<RemoteSessionChange> =
+        decode(SessionChangesReply.serializer(), payload).changes.also { changes ->
+            if (changes.size > 5_000 || changes.any {
+                    it.path.isBlank() || it.path.encodeToByteArray().size > MAX_PATH_BYTES ||
+                        it.name.encodeToByteArray().size > MAX_PATH_BYTES
+                }
+            ) malformed()
+        }
+
+    fun fileChunk(payload: ByteArray): RemoteFileChunk =
+        decode(FileReadReply.serializer(), payload).let {
+            if (it.path.isBlank() || it.path.encodeToByteArray().size > MAX_PATH_BYTES ||
+                it.mime.length !in 1..128 || it.offset < 0 || it.total < 0 ||
+                it.offset > it.total || it.data.size > MAX_UPLOAD_CHUNK_BYTES ||
+                it.offset + it.data.size > it.total || it.eof != (it.offset + it.data.size == it.total)
+            ) malformed()
+            RemoteFileChunk(it.path, it.mime, it.offset, it.total, it.eof, it.data.copyOf())
         }
 
     fun attached(payload: ByteArray): AttachedTerminal = decode(AttachedReply.serializer(), payload).let {
@@ -280,6 +330,16 @@ object RemoteCommands {
         val count: Int,
     )
     @Serializable private data class SessionIdPayload(@SerialName("session_id") val sessionId: String)
+    @Serializable private data class SessionConversationPayload(
+        @SerialName("session_id") val sessionId: String,
+        @SerialName("max_chars") val maxChars: Int,
+    )
+    @Serializable private data class FileReadRequest(
+        @SerialName("session_id") val sessionId: String,
+        val path: String,
+        val offset: Long,
+        val count: Int,
+    )
     @Serializable private data class SessionOpenPayload(
         @SerialName("session_id") val sessionId: String,
         val size: TerminalSize,
@@ -308,6 +368,7 @@ object RemoteCommands {
         @SerialName("attachment_id") val attachmentId: String,
         @SerialName("submission_id") val submissionId: String,
         @SerialName("submission_count") val submissionCount: Int,
+        @SerialName("member_index") val memberIndex: Int,
         @SerialName("submission_bytes") val submissionBytes: Long,
         val length: Long,
         @SerialName("media_type") val mediaType: String = "image/jpeg",
@@ -322,11 +383,21 @@ object RemoteCommands {
     @Serializable private data class UploadBeginReply(
         @SerialName("upload_id") val uploadId: String,
         @SerialName("next_chunk") val nextChunk: Int,
+        val path: String? = null,
     )
     @Serializable private data class UploadFinishReply(val path: String)
     @Serializable private data class UploadSuccessReply(val ok: Boolean)
     @Serializable private data class SessionListReply(val sessions: List<RemoteSession>)
     @Serializable private data class SessionPreviewReply(val messages: List<RemotePreviewMessage>)
+    @Serializable private data class SessionChangesReply(val changes: List<RemoteSessionChange>)
+    @Serializable private data class FileReadReply(
+        val path: String,
+        val mime: String,
+        val offset: Long,
+        val total: Long,
+        val eof: Boolean,
+        @ByteString val data: ByteArray,
+    )
     @Serializable private data class TabListReply(val tabs: List<RemoteTab>)
     @Serializable private data class AgentListReply(
         val agents: List<RemoteAgentChoice>,

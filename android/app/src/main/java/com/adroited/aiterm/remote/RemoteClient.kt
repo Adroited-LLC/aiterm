@@ -329,7 +329,7 @@ class RemoteClient(
         sources: List<RemoteUploadSource>,
         onProgress: (RemoteUploadProgress) -> Unit = {},
     ): Result<List<String>> = withContext(dispatcher) {
-        val context = synchronized(lifecycleLock) { activeUploadContext() }
+        var context = synchronized(lifecycleLock) { activeUploadContext() }
             ?: return@withContext Result.failure(RemoteUploadException(null, "terminal focus is required to upload images"))
         if (expectedTabId.isBlank() || context.tabId != expectedTabId) {
             return@withContext Result.failure(
@@ -342,62 +342,84 @@ class RemoteClient(
             val submissionId = UUID.randomUUID().toString()
             val paths = ArrayList<String>(sources.size)
 
-            for (source in sources) {
-                requireCurrentUploadContext(context)
-                val beganPayload = requestUpload(
-                    context,
-                    "terminal.upload.begin",
-                    RemoteCommands.uploadBegin(
-                        tabId = context.tabId,
-                        attachmentId = context.attachmentId,
-                        submissionId = submissionId,
-                        submissionCount = submission.count,
-                        submissionBytes = submission.bytes,
-                        length = source.length,
-                        sha256 = source.sha256,
-                    ),
-                )
-                val began = RemoteCommands.uploadBegan(beganPayload)
-                begunUploadIds += began.uploadId
-                if (began.nextChunk != 0) {
-                    throw RemoteProtocolException("new terminal image upload unexpectedly starts after chunk zero")
-                }
-                onProgress(RemoteUploadProgress(source.id, 0, source.length))
-
-                FileInputStream(source.file).use { input ->
-                    val buffer = ByteArray(RemoteCommands.MAX_UPLOAD_CHUNK_BYTES)
-                    var sent = 0L
-                    var index = began.nextChunk
-                    while (sent < source.length) {
-                        requireCurrentUploadContext(context)
-                        val requested = minOf(buffer.size.toLong(), source.length - sent).toInt()
-                        val count = input.read(buffer, 0, requested)
-                        if (count <= 0) {
-                            throw RemoteUploadException(null, "the selected image changed while it was uploading")
-                        }
-                        val data = buffer.copyOf(count)
-                        val chunkPayload = requestUpload(
+            for ((memberIndex, source) in sources.withIndex()) {
+                image@ while (true) {
+                    val began = try {
+                        val beganPayload = requestUpload(
                             context,
-                            "terminal.upload.chunk",
-                            RemoteCommands.uploadChunk(began.uploadId, index, data),
+                            "terminal.upload.begin",
+                            RemoteCommands.uploadBegin(
+                                tabId = context.tabId,
+                                attachmentId = context.attachmentId,
+                                submissionId = submissionId,
+                                submissionCount = submission.count,
+                                memberIndex = memberIndex,
+                                submissionBytes = submission.bytes,
+                                length = source.length,
+                                sha256 = source.sha256,
+                            ),
                         )
-                        RemoteCommands.uploadAcknowledged(chunkPayload)
-                        sent += count
-                        index += 1
-                        onProgress(RemoteUploadProgress(source.id, sent, source.length))
+                        RemoteCommands.uploadBegan(beganPayload)
+                    } catch (error: Exception) {
+                        context = resumeUploadContext(expectedTabId, context, error) ?: throw error
+                        continue@image
                     }
-                    if (input.read() != -1) {
-                        throw RemoteUploadException(null, "the selected image changed while it was uploading")
+                    begunUploadIds += began.uploadId
+                    began.path?.let {
+                        paths += it
+                        onProgress(RemoteUploadProgress(source.id, source.length, source.length))
+                        break@image
+                    }
+
+                    val maximumChunk = ((source.length + RemoteCommands.MAX_UPLOAD_CHUNK_BYTES - 1) /
+                        RemoteCommands.MAX_UPLOAD_CHUNK_BYTES).toInt()
+                    if (began.nextChunk !in 0..maximumChunk) {
+                        throw RemoteProtocolException("desktop returned an invalid upload resume offset")
+                    }
+                    var sent = minOf(
+                        source.length,
+                        began.nextChunk.toLong() * RemoteCommands.MAX_UPLOAD_CHUNK_BYTES,
+                    )
+                    onProgress(RemoteUploadProgress(source.id, sent, source.length))
+
+                    try {
+                        FileInputStream(source.file).use { input ->
+                            input.channel.position(sent)
+                            val buffer = ByteArray(RemoteCommands.MAX_UPLOAD_CHUNK_BYTES)
+                            var index = began.nextChunk
+                            while (sent < source.length) {
+                                requireCurrentUploadContext(context)
+                                val requested = minOf(buffer.size.toLong(), source.length - sent).toInt()
+                                val count = input.read(buffer, 0, requested)
+                                if (count <= 0) {
+                                    throw RemoteUploadException(null, "the selected image changed while it was uploading")
+                                }
+                                val chunkPayload = requestUpload(
+                                    context,
+                                    "terminal.upload.chunk",
+                                    RemoteCommands.uploadChunk(began.uploadId, index, buffer.copyOf(count)),
+                                )
+                                RemoteCommands.uploadAcknowledged(chunkPayload)
+                                sent += count
+                                index += 1
+                                onProgress(RemoteUploadProgress(source.id, sent, source.length))
+                            }
+                            if (input.read() != -1) {
+                                throw RemoteUploadException(null, "the selected image changed while it was uploading")
+                            }
+                        }
+
+                        val finishedPayload = requestUpload(
+                            context,
+                            "terminal.upload.finish",
+                            RemoteCommands.uploadFinish(began.uploadId),
+                        )
+                        paths += RemoteCommands.uploadedPath(finishedPayload)
+                        break@image
+                    } catch (error: Exception) {
+                        context = resumeUploadContext(expectedTabId, context, error) ?: throw error
                     }
                 }
-
-                requireCurrentUploadContext(context)
-                val finishedPayload = requestUpload(
-                    context,
-                    "terminal.upload.finish",
-                    RemoteCommands.uploadFinish(began.uploadId),
-                )
-                paths += RemoteCommands.uploadedPath(finishedPayload)
             }
             Result.success(paths)
         } catch (error: kotlinx.coroutines.CancellationException) {
@@ -550,13 +572,25 @@ class RemoteClient(
     }
 
     fun previewSession(sessionId: String) {
-        launchRequest("session.preview", RemoteCommands.previewSession(sessionId)) { payload ->
+        launchRequest("session.conversation", RemoteCommands.conversation(sessionId)) { payload ->
             mutableState.value = mutableState.value.copy(
                 previewSessionId = sessionId,
                 previewMessages = RemoteCommands.sessionPreview(payload),
             )
         }
     }
+
+    suspend fun sessionChanges(sessionId: String): List<RemoteSessionChange> =
+        RemoteCommands.sessionChanges(requestResource("session.changes", RemoteCommands.session(sessionId)))
+
+    suspend fun readFileChunk(
+        sessionId: String,
+        path: String,
+        offset: Long,
+        count: Int = RemoteCommands.MAX_UPLOAD_CHUNK_BYTES,
+    ): RemoteFileChunk = RemoteCommands.fileChunk(
+        requestResource("file.read", RemoteCommands.fileRead(sessionId, path, offset, count)),
+    )
 
     fun closeSession(sessionId: String) {
         val tabId = synchronized(lifecycleLock) {
@@ -795,6 +829,21 @@ class RemoteClient(
             response = response,
             onSuccess = onSuccess,
         )
+    }
+
+    private suspend fun requestResource(kind: String, payload: ByteArray): ByteArray {
+        val requestContext = synchronized(lifecycleLock) {
+            val active = transport
+                ?: throw RemoteProtocolException("remote transport is disconnected")
+            RequestContext(lifecycleGeneration, active)
+        }
+        return when (val response = requestContext.transport.request(kind, payload).await()) {
+            is RemoteResponse.Success -> {
+                if (response.kind != kind) throw RemoteProtocolException("unexpected remote resource response")
+                response.payload
+            }
+            is RemoteResponse.Error -> throw RemoteUploadException(response.code, response.message)
+        }
     }
 
     private fun observeAcceptedResponse(
@@ -1115,6 +1164,35 @@ class RemoteClient(
         }
     }
 
+    private suspend fun resumeUploadContext(
+        tabId: String,
+        previous: UploadContext,
+        error: Exception,
+    ): UploadContext? {
+        val requestTimedOut = error is RemoteProtocolException &&
+            error.message.orEmpty().contains("timed out", ignoreCase = true)
+        val transportFailure = synchronized(lifecycleLock) {
+            !isCurrent(previous.lifecycleGeneration, previous.transport) ||
+                mutableState.value.connection != ConnectionState.Connected
+        } || (error is RemoteProtocolException &&
+            error.message.orEmpty().contains("transport", ignoreCase = true)) || requestTimedOut
+        if (!transportFailure) return null
+
+        val deadline = System.nanoTime() + UPLOAD_RESUME_TIMEOUT_MILLIS * 1_000_000
+        while (System.nanoTime() < deadline) {
+            val resumed = synchronized(lifecycleLock) { activeUploadContext() }
+            if (resumed != null && resumed.tabId == tabId &&
+                (requestTimedOut || resumed.lifecycleGeneration != previous.lifecycleGeneration ||
+                    resumed.transport !== previous.transport)
+            ) return resumed
+            if (mutableState.value.connection == ConnectionState.Revoked ||
+                mutableState.value.connection == ConnectionState.Locked
+            ) return null
+            delay(100)
+        }
+        throw RemoteUploadException(null, "image upload could not resume after the desktop connection ended", error)
+    }
+
     private suspend fun cancelBegunUploads(context: UploadContext, uploadIds: Set<String>) {
         withTimeoutOrNull(UPLOAD_CLEANUP_TIMEOUT_MILLIS) {
             for (uploadId in uploadIds.toList()) {
@@ -1199,6 +1277,7 @@ class RemoteClient(
         const val MAX_SCROLLBACK_ROWS = 5_000
         const val MAX_OWNED_JOBS = 64
         const val UPLOAD_CLEANUP_TIMEOUT_MILLIS = 2_000L
+        const val UPLOAD_RESUME_TIMEOUT_MILLIS = 2 * 60_000L
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }

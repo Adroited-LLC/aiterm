@@ -7,7 +7,9 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{
+    self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError,
+};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -1264,6 +1266,7 @@ impl TabRegistry {
                 maps: Mutex::new(RegistryMaps::default()),
                 queue_capacity: queue_capacity.max(1),
                 exit_subscribers: Mutex::new(Vec::new()),
+                activity_subscribers: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -1274,6 +1277,15 @@ impl TabRegistry {
     pub fn subscribe_exits(&self) -> Receiver<(TabId, TabExit)> {
         let (sender, receiver) = mpsc::channel();
         self.inner.exit_subscribers.lock().unwrap().push(sender);
+        receiver
+    }
+
+    /// Subscribe to throttled session activity without turning every PTY read
+    /// into a roster revision. Consumers use this for attribution and other
+    /// presence signals that do not belong in serialized tab state.
+    pub fn subscribe_activity(&self) -> Receiver<String> {
+        let (sender, receiver) = mpsc::sync_channel(256);
+        self.inner.activity_subscribers.lock().unwrap().push(sender);
         receiver
     }
 
@@ -1365,6 +1377,7 @@ impl TabRegistry {
                 exit_notified: false,
             }),
             raw: RawDispatch::new(desktop_open, self.inner.queue_capacity),
+            last_activity: Mutex::new(Instant::now() - Duration::from_secs(1)),
         });
 
         let sink = Arc::new(TabSink {
@@ -1909,14 +1922,38 @@ pub fn start_desktop_registry_bridge(
     registry: Arc<TabRegistry>,
 ) -> Result<(), String> {
     let changes = registry.subscribe_changes();
+    let activity = registry.subscribe_activity();
     std::thread::Builder::new()
         .name("desktop-tab-registry".to_string())
         .spawn(move || {
-            while let Ok(change) = changes.recv() {
-                let unexpected_exits = unexpected_desktop_exits(&change);
-                let _ = app.emit("tab://registry", DesktopTabRegistryEvent::from(change));
-                for (tab_id, exit) in unexpected_exits {
-                    emit_desktop_exit(&app, &tab_id, &exit);
+            loop {
+                match changes.recv_timeout(Duration::from_millis(250)) {
+                    Ok(change) => {
+                        let sessions: Vec<String> = match &change {
+                            TabRegistryEvent::Snapshot { tabs, .. } => tabs
+                                .iter()
+                                .filter_map(|tab| tab.session_id().map(str::to_owned))
+                                .collect(),
+                            TabRegistryEvent::Opened { tab, .. }
+                            | TabRegistryEvent::Changed { tab, .. } => {
+                                tab.session_id().map(str::to_owned).into_iter().collect()
+                            }
+                            TabRegistryEvent::Removed { .. } => Vec::new(),
+                        };
+                        for session_id in sessions {
+                            crate::changes::track(&app, session_id);
+                        }
+                        let unexpected_exits = unexpected_desktop_exits(&change);
+                        let _ = app.emit("tab://registry", DesktopTabRegistryEvent::from(change));
+                        for (tab_id, exit) in unexpected_exits {
+                            emit_desktop_exit(&app, &tab_id, &exit);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+                while let Ok(session_id) = activity.try_recv() {
+                    crate::changes::touch(&app, &session_id);
                 }
             }
         })
@@ -2079,6 +2116,7 @@ struct RegistryInner {
     maps: Mutex<RegistryMaps>,
     queue_capacity: usize,
     exit_subscribers: Mutex<Vec<mpsc::Sender<(TabId, TabExit)>>>,
+    activity_subscribers: Mutex<Vec<SyncSender<String>>>,
 }
 
 impl Drop for RegistryInner {
@@ -2168,6 +2206,7 @@ impl RegistryMaps {
 struct TabCell {
     live: Mutex<LiveTab>,
     raw: RawDispatch,
+    last_activity: Mutex<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2423,6 +2462,16 @@ impl RegistryInner {
             .lock()
             .unwrap()
             .retain(|subscriber| subscriber.send((id.clone(), exit.clone())).is_ok());
+    }
+
+    fn publish_activity(&self, session_id: String) {
+        self.activity_subscribers
+            .lock()
+            .unwrap()
+            .retain(|subscriber| match subscriber.try_send(session_id.clone()) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+                Err(mpsc::TrySendError::Disconnected(_)) => false,
+            });
     }
 
     fn tab(&self, id: &TabId) -> Result<Arc<TabCell>, TabError> {
@@ -2697,6 +2746,18 @@ impl PtySink for TabSink {
         // callbacks ordered while allowing a capacity wait to happen before
         // the Task 4 transaction gate that attach/focus/close need.
         let _producer_order = tab.raw.producer_order.lock().unwrap();
+        let activity = {
+            let mut last = tab.last_activity.lock().unwrap();
+            if last.elapsed() >= Duration::from_millis(250) {
+                *last = Instant::now();
+                tab.live.lock().unwrap().descriptor.session_id.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(session_id) = activity {
+            registry.publish_activity(session_id);
+        }
         for bytes in bytes.chunks(MAX_DESKTOP_RAW_CHUNK) {
             let route = tab.raw.reserve_opening();
             let _send_order = tab.raw.send_order.lock().unwrap();

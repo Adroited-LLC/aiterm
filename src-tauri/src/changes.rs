@@ -258,6 +258,16 @@ fn watch_root(app: &AppHandle, root: PathBuf) {
 
 /// A tab now runs this session: remember its workspace and watch it.
 pub fn track(app: &AppHandle, session_id: String) {
+    if app
+        .state::<ChangeLedger>()
+        .inner
+        .lock()
+        .unwrap()
+        .session_roots
+        .contains_key(&session_id)
+    {
+        return;
+    }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let sessions = crate::sessions::list_sessions().await;
@@ -381,9 +391,6 @@ fn attribute(inner: &Inner, path: &Path, _app: &AppHandle) -> Vec<String> {
     // Only a session that is working, or was a moment ago, gets the credit.
     // An idle tab in the folder does not — the person editing in another
     // window, or another tool entirely, is not the agent's doing.
-    // Rust-owned tabs will feed activity into `recent`; the legacy PR #20
-    // PtyManager activity table is intentionally not revived alongside it.
-    let active: HashSet<String> = HashSet::new();
     inner
         .session_roots
         .iter()
@@ -395,10 +402,7 @@ fn attribute(inner: &Inner, path: &Path, _app: &AppHandle) -> Vec<String> {
         // that inner repo can claim it.
         .filter(|(_, root)| !inside_nested_repo(path, root))
         .map(|(id, _)| id)
-        .filter(|id| {
-            active.contains(*id)
-                || inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT)
-        })
+        .filter(|id| inner.recent.get(*id).is_some_and(|t| t.elapsed() < RECENT))
         .cloned()
         .collect()
 }

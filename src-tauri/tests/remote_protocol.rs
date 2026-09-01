@@ -123,6 +123,15 @@ fn accepts_terminal_upload_requests() {
     }
 }
 
+#[test]
+fn accepts_bounded_conversation_and_file_resource_requests() {
+    for kind in ["session.conversation", "session.changes", "file.read"] {
+        let request = RemoteRequest::decode(&cbor_request(1, kind, b""))
+            .expect("structured phone resources are part of the remote protocol");
+        assert_eq!(request.kind(), kind);
+    }
+}
+
 #[derive(Serialize)]
 struct EnvelopeWithUnknownField<'a> {
     version: u16,

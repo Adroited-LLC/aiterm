@@ -94,16 +94,9 @@ pub fn load_brought_in() -> std::collections::HashMap<String, String> {
 
 pub(crate) fn apply_session_names(sessions: &mut [Session]) {
     let titles: std::collections::HashMap<String, String> = load_metadata("titles.json");
-    let librarian = crate::librarian::load_store();
     for session in sessions {
         if let Some(title) = titles.get(&session.id).filter(|title| !title.trim().is_empty()) {
             session.title = title.clone();
-        } else if let Some(entry) = librarian
-            .sessions
-            .get(&session.id)
-            .filter(|entry| !entry.name.trim().is_empty())
-        {
-            session.title = entry.name.clone();
         }
     }
 }

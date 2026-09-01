@@ -25,8 +25,12 @@ import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
+import ThreadsView from "./components/ThreadsView";
+import { isCurrent, useLibrarian } from "./librarian";
+import BringIn from "./components/BringIn";
+import { useRelay } from "./relay";
 import {
-  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, X,
+  BookOpen, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -463,6 +467,17 @@ export default function App() {
   );
 
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  const librarian = useLibrarian(settings.librarian, sessions);
+  const [showThreads, setShowThreads] = useState(false);
+  const displayedSessions = useMemo(() => {
+    if (!settings.librarian.enabled || !settings.librarian.renameRows) return sessions;
+    return sessions.map((session) => {
+      const entry = librarian.store.sessions[session.id];
+      return entry && isCurrent(librarian.store, session)
+        ? { ...session, title: entry.name || session.title }
+        : session;
+    });
+  }, [sessions, settings.librarian.enabled, settings.librarian.renameRows, librarian.store]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   /** Where the settings window should open, when a caller has somewhere in
    *  mind. Cleared on close so the ⚙ button still opens on the first tab. */
@@ -2053,7 +2068,12 @@ export default function App() {
    *
    * `fresh` covers the gap until that file exists — see `pendingSessions`.
    */
-  const newSession = useCallback(async (cwd: string, choice: StartChoice, prompt?: string): Promise<{ key: TabId; sessionId?: string } | null> => {
+  const newSession = useCallback(async (
+    cwd: string,
+    choice: StartChoice,
+    prompt?: string,
+    extra: { title?: string; permissionFlags?: string } = {},
+  ): Promise<{ key: TabId; sessionId?: string } | null> => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
     // the two are presented differently: a model tab is titled by its model
@@ -2085,7 +2105,7 @@ export default function App() {
           // tab's environment — set only for an engine that has said it
           // authenticates no other way. `env_model` names the model whose
           // routing goes in beside it; the routing is compiled in Rust.
-          const key = await openTab(title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = await openTab(extra.title ?? title, cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             envProvider: plan.env_provider ?? undefined,
             envModel: plan.env_model ?? undefined,
@@ -2108,13 +2128,14 @@ export default function App() {
             model: choice.model,
             effort: choice.effort,
             prompt: prompt || null,
+            permissionFlags: extra.permissionFlags ?? null,
           });
           // No session id on the plan means the engine would not take one —
           // Codex has no `--session-id` — so the slot is a tab handle: the
           // placeholder row keeps the tab reachable, but nothing is keyed to it
           // as a session, because there is no session by that name and never
           // will be.
-          const key = await openTab(basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
+          const key = await openTab(extra.title ?? basename(cwd), cwd, plan.command, plan.session_id ?? crypto.randomUUID(), {
             sessionId: plan.session_id ?? undefined,
             fresh: true,
             agentId: plan.agent_id,
@@ -2140,6 +2161,20 @@ export default function App() {
       }
     }
   }, [openTab]);
+
+  /** A deliberately bounded, read-only conversation between the active
+   *  session and a second agent. Both remain ordinary Rust-owned tabs; the
+   *  relay only composes messages between their terminal handles. */
+  const progressRef = useRef(progress);
+  progressRef.current = progress;
+  const relayCtl = useRelay({
+    tabs: () => tabsRef.current,
+    handle: (key) => handles.current.get(key),
+    quietFor: (key) => Date.now() - (lastOutput.current.get(key) ?? 0),
+    busy: (key) => progressRef.current.has(key),
+    open: (cwd, choice, prompt, extra) => newSession(cwd, choice, prompt, extra),
+  });
+  const [showBringIn, setShowBringIn] = useState(false);
 
   /** The empty pane's own source/model/effort, so its button starts the same
    *  session the ＋ menu would. It used to take the first installed agent on
@@ -2245,6 +2280,13 @@ export default function App() {
             title="Toggle sessions panel"
             onClick={() => setShowSessions(!showSessions)}
           ><Icon of={PanelLeft} /></button>
+          {settings.librarian.enabled && (
+            <button
+              className={"icon-btn" + (showThreads ? " on" : "")}
+              title={showThreads ? "Show sessions" : "Show librarian threads"}
+              onClick={() => setShowThreads((shown) => !shown)}
+            ><Icon of={BookOpen} /></button>
+          )}
           <button
             className={"icon-btn" + (showExplorer ? " on" : "")}
             title="Toggle file explorer"
@@ -2289,8 +2331,21 @@ export default function App() {
         {showSessions && (
           <>
             <div className="panel sessions" style={{ width: sizes.left, ...zoomFor("sessions") }}>
-              <SessionsPanel
-                sessions={sessions}
+              {showThreads && settings.librarian.enabled ? (
+                <ThreadsView
+                  lib={librarian}
+                  sessions={displayedSessions}
+                  liveIds={liveShown}
+                  onSelect={selectSession}
+                  onResume={resumeSession}
+                  onOpenSettings={() => {
+                    setSettingsTarget({ tab: "librarian", provider: null });
+                    setShowSettingsModal(true);
+                  }}
+                  canResume={(session) => capsOf(session.agent).resume}
+                />
+              ) : <SessionsPanel
+                sessions={displayedSessions}
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
@@ -2347,7 +2402,7 @@ export default function App() {
                 onTrashDelete={deleteTrashed}
                 onTrashEmpty={emptyTrash}
                 onTrashSessions={trashSessions}
-              />
+              />}
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
           </>
@@ -2418,7 +2473,69 @@ export default function App() {
                   </button>
                 );
               })}
+              {activeTabObj?.sessionId && !previewSession && (
+                <div className="strip-right">
+                  {relayCtl.relay &&
+                  (relayCtl.relay.aKey === activeTab || relayCtl.relay.bKey === activeTab) ? (
+                    <span
+                      className={"relay-pill " + relayCtl.relay.phase}
+                      title={relayCtl.relay.note || undefined}
+                    >
+                      <Icon of={Users} size="sm" />
+                      {relayCtl.relay.phase === "opening" && `bringing in ${relayCtl.relay.bName}…`}
+                      {relayCtl.relay.phase === "waitB" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.bName}`}
+                      {relayCtl.relay.phase === "waitA" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.aName}`}
+                      {relayCtl.relay.phase === "done" && `done — ${relayCtl.relay.note}`}
+                      {relayCtl.relay.phase === "stopped" && "stopped"}
+                      {relayCtl.relay.phase === "error" && `stopped: ${relayCtl.relay.note}`}
+                      {relayCtl.relay.phase === "opening" ||
+                      relayCtl.relay.phase === "waitA" ||
+                      relayCtl.relay.phase === "waitB" ? (
+                        <button className="relay-x" title="Stop relaying" onClick={() => relayCtl.stop()}>
+                          <Icon of={X} size="sm" />
+                        </button>
+                      ) : (
+                        <button className="relay-x" title="Dismiss" onClick={relayCtl.clear}>
+                          <Icon of={X} size="sm" />
+                        </button>
+                      )}
+                      {relayCtl.relay.bKey && (
+                        <button
+                          className="relay-jump"
+                          onClick={() => setActiveTab(
+                            activeTab === relayCtl.relay!.aKey
+                              ? relayCtl.relay!.bKey
+                              : relayCtl.relay!.aKey,
+                          )}
+                        >
+                          {activeTab === relayCtl.relay.aKey ? "their tab" : "first tab"}
+                        </button>
+                      )}
+                    </span>
+                  ) : (
+                    <button
+                      className="strip-btn"
+                      title="Bring a read-only second agent into this session"
+                      onClick={() => setShowBringIn((shown) => !shown)}
+                    >
+                      <Icon of={Users} size="sm" /> Bring in…
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
+          )}
+          {showBringIn && activeTabObj?.sessionId && !previewSession && (
+            <BringIn
+              onClose={() => setShowBringIn(false)}
+              onOpenModelAccess={openModelAccess}
+              onGo={(choice, focus, rounds, auto) => {
+                setShowBringIn(false);
+                if (activeTab !== null) {
+                  void relayCtl.start({ aKey: activeTab, choice, focus, rounds, auto });
+                }
+              }}
+            />
           )}
           {/* The session's own files, in a row of their own under the strip:
               what this session opened travels with it, and the leftmost tab
@@ -2740,6 +2857,7 @@ export default function App() {
           activeProject={activeProject}
           initialTab={settingsTarget?.tab}
           focusProvider={settingsTarget?.provider}
+          librarian={librarian}
         />
       )}
     </div>
