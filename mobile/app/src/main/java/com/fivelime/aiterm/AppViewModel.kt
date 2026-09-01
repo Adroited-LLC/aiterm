@@ -143,6 +143,58 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     init { runCatching { connectivity.registerDefaultNetworkCallback(netCallback) } }
     override fun onCleared() { runCatching { connectivity.unregisterNetworkCallback(netCallback) } }
 
+    // ---- terminal: a plain shell on the desktop, driven from here
+
+    /** Tab id of the open remote terminal; a screen shows while set. */
+    var terminalTab by mutableStateOf<String?>(null)
+    var terminalTitle by mutableStateOf("Terminal"); private set
+    var terminalLines by mutableStateOf<List<String>>(emptyList()); private set
+    var terminalOpening by mutableStateOf(false); private set
+
+    fun openTerminal() {
+        val a = api ?: return
+        if (terminalOpening) return
+        viewModelScope.launch {
+            terminalOpening = true
+            try {
+                val t = a.terminalOpen(cols = 60, rows = 24)
+                terminalTitle = t.title
+                terminalLines = emptyList()
+                terminalTab = t.tab_id
+            } catch (e: Exception) { notice = describe(e) }
+            finally { terminalOpening = false }
+        }
+    }
+
+    suspend fun pollTerminal(): Boolean {
+        val a = api ?: return false
+        val tab = terminalTab ?: return false
+        return try {
+            terminalLines = a.terminalScreen(tab).lines
+            true
+        } catch (e: ApiError) {
+            // The tab ended on the desktop; the screen has nothing to show.
+            if (e.code == 404) { terminalTab = null; false } else true
+        } catch (_: Exception) { true }
+    }
+
+    fun sendTerminal(text: String, enter: Boolean = true) {
+        val a = api ?: return
+        val tab = terminalTab ?: return
+        viewModelScope.launch {
+            try { a.terminalInput(tab, text, enter) }
+            catch (e: Exception) { notice = describe(e) }
+        }
+    }
+
+    /** Done with it: ends the shell and removes the tab on the desktop too. */
+    fun closeTerminal() {
+        val a = api ?: return
+        val tab = terminalTab ?: return
+        terminalTab = null
+        viewModelScope.launch { runCatching { a.terminalClose(tab) } }
+    }
+
     // ---- settings
 
     var showSettings by mutableStateOf(false)

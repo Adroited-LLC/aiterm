@@ -46,6 +46,15 @@ data class SessionsResponse(
 )
 
 @Serializable
+data class TerminalOpenBody(val cwd: String? = null, val cols: Int? = null, val rows: Int? = null)
+
+@Serializable
+data class TerminalOpened(val tab_id: String, val title: String, val cwd: String)
+
+@Serializable
+data class TerminalScreenData(val lines: List<String>, val cols: Int, val rows: Int)
+
+@Serializable
 data class UsageBar(val kind: String, val label: String, val percent: Double, val severity: String = "", val resets_at: String = "")
 
 @Serializable
@@ -194,6 +203,18 @@ class Api(val baseUrl: String, private val token: String, fingerprint: String, c
         val body = json.encodeToString(InputBody.serializer(), InputBody(keys, enter = false))
         call(req("/v1/sessions/$id/input").post(jsonBody(body)))
     }
+    suspend fun terminalOpen(cols: Int, rows: Int): TerminalOpened {
+        val body = json.encodeToString(TerminalOpenBody.serializer(), TerminalOpenBody(cols = cols, rows = rows))
+        return json.decodeFromString(call(req("/v1/terminal").post(jsonBody(body))))
+    }
+    suspend fun terminalScreen(tab: String): TerminalScreenData =
+        json.decodeFromString(call(req("/v1/terminal/$tab/screen")))
+    suspend fun terminalInput(tab: String, text: String, enter: Boolean = true) {
+        val body = json.encodeToString(InputBody.serializer(), InputBody(text, enter = enter))
+        call(req("/v1/terminal/$tab/input").post(jsonBody(body)))
+    }
+    suspend fun terminalClose(tab: String) { call(req("/v1/terminal/$tab/close").post(empty)) }
+
     suspend fun newSession(agentId: String, cwd: String, prompt: String?, model: String?, effort: String?, title: String?) {
         val body = json.encodeToString(NewSessionBody.serializer(), NewSessionBody(agentId, cwd, prompt, model, effort, title))
         call(req("/v1/sessions").post(jsonBody(body)))

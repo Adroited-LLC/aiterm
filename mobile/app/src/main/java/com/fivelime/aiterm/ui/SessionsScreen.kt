@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.SubdirectoryArrowRight
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.HorizontalDivider
@@ -110,6 +111,13 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
                         Dot(if (vm.connected) Green else Muted)
                         Spacer(Modifier.width(10.dp))
                         Text(vm.desktop?.name ?: "Desktop")
+                    }
+                },
+                actions = {
+                    // A blank shell on the desktop, like the home launcher's —
+                    // driven from here.
+                    IconButton(onClick = { vm.openTerminal() }, enabled = vm.connected && !vm.terminalOpening) {
+                        Icon(Icons.Filled.Terminal, "Open a terminal", tint = if (vm.connected) Accent else Muted)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Bg),

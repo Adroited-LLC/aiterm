@@ -796,6 +796,10 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/sessions/{id}/bringin", post(bring_in))
         .route("/v1/sessions/{id}/interrupt", post(interrupt))
         .route("/v1/sessions/{id}/stop", post(stop_session))
+        .route("/v1/terminal", post(terminal_open))
+        .route("/v1/terminal/{tab}/screen", get(terminal_screen))
+        .route("/v1/terminal/{tab}/input", post(terminal_input))
+        .route("/v1/terminal/{tab}/close", post(terminal_close))
         .route("/v1/events", get(events))
         .route("/v1/previews", post(make_preview))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
@@ -1692,6 +1696,127 @@ fn under_home(p: &std::path::Path) -> bool {
 #[derive(Deserialize)]
 struct DirBody {
     path: String,
+}
+
+// ------------------------------------------------------------- phone terminal
+// A plain shell on the desktop, driven from the phone: the same blank
+// terminal the desktop's home launcher opens, as a tab the desktop shows
+// too. The tab is opened straight in the registry (no renderer round trip),
+// read back as flattened screen text, and written to by tab id — a shell
+// runs no session, so the session-keyed routes cannot address it.
+
+#[derive(Deserialize)]
+struct TerminalOpenBody {
+    cwd: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+async fn terminal_open(State(ctx): State<Ctx>, Json(b): Json<TerminalOpenBody>) -> Response {
+    let cwd = match b.cwd {
+        Some(c) => {
+            let p = std::path::PathBuf::from(&c);
+            if c.contains("..") || !under_home(&p) || !p.is_dir() {
+                return err(StatusCode::FORBIDDEN, "only a folder under home");
+            }
+            c
+        }
+        None => match dirs::home_dir() {
+            Some(h) => h.to_string_lossy().into_owned(),
+            None => return err(StatusCode::INTERNAL_SERVER_ERROR, "no home directory"),
+        },
+    };
+    let title = std::path::Path::new(&cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Terminal".into());
+    let Ok(size) = crate::remote::model::TerminalSize::try_new(
+        b.cols.unwrap_or(80).clamp(20, 500),
+        b.rows.unwrap_or(24).clamp(5, 200),
+    ) else {
+        return err(StatusCode::BAD_REQUEST, "bad terminal size");
+    };
+    // A slot of its own per open: this is a new terminal, not a return to one.
+    let slot = format!("shell:remote:{}", uuid::Uuid::new_v4());
+    let launch = crate::tabs::TabLaunch::new(title.clone(), slot, size).with_cwd(cwd.clone());
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>().inner().clone();
+    let opened = crate::run_blocking(move || tabs.open_desktop(launch)).await;
+    match opened {
+        Ok(id) => Json(serde_json::json!({
+            "tab_id": id.as_str(),
+            "title": title,
+            "cwd": cwd,
+        }))
+        .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// The screen as text: scrollback tail plus the visible rows, one string
+/// per row, wide-cell continuations skipped. Colors and styles stay on the
+/// desktop — the phone gets what the terminal says, not how it looks.
+async fn terminal_screen(State(ctx): State<Ctx>, Path(tab): Path<String>) -> Response {
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
+    let snap = match tabs.snapshot(&crate::tabs::TabId::from_raw(tab)) {
+        Ok(s) => s,
+        Err(e) => return err(StatusCode::NOT_FOUND, e.to_string()),
+    };
+    fn row_text(row: &crate::terminal::model::ScreenRow) -> String {
+        let mut s: String = row
+            .cells()
+            .iter()
+            .filter(|c| !c.is_continuation())
+            .map(|c| c.text())
+            .collect();
+        while s.ends_with(' ') {
+            s.pop();
+        }
+        s
+    }
+    const SCROLLBACK_TAIL: usize = 400;
+    let back = snap.scrollback();
+    let start = back.len().saturating_sub(SCROLLBACK_TAIL);
+    let lines: Vec<String> = back[start..]
+        .iter()
+        .chain(snap.visible().iter())
+        .map(row_text)
+        .collect();
+    Json(serde_json::json!({
+        "lines": lines,
+        "cols": snap.cols(),
+        "rows": snap.rows(),
+    }))
+    .into_response()
+}
+
+async fn terminal_input(
+    State(ctx): State<Ctx>,
+    Path(tab): Path<String>,
+    Json(body): Json<InputBody>,
+) -> Response {
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
+    let id = crate::tabs::TabId::from_raw(tab);
+    if let Err(e) = tabs.write_tab_str(&id, &body.text) {
+        return err(StatusCode::CONFLICT, e);
+    }
+    if body.enter.unwrap_or(true) {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if let Err(e) = tabs.write_tab_str(&id, "\r") {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Close the terminal tab — the deliberate act of being done with it, so
+/// the tab goes on the desktop too rather than lingering as an exit notice.
+async fn terminal_close(State(ctx): State<Ctx>, Path(tab): Path<String>) -> Response {
+    let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>().inner().clone();
+    let id = crate::tabs::TabId::from_raw(tab);
+    match crate::run_blocking(move || tabs.close(&id)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err(StatusCode::NOT_FOUND, e.to_string()),
+    }
 }
 
 /// Make a directory (and its parents) under home — the phone's "new

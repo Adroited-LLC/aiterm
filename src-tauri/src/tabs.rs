@@ -37,6 +37,12 @@ impl TabId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A TabId from a caller-held string — the phone quotes ids back from
+    /// answers it was given, so this mints no identity, only addresses one.
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
 }
 
 impl Default for TabId {
@@ -1896,6 +1902,23 @@ impl TabRegistry {
         let tab = self
             .cell_for_session(session_id)
             .ok_or_else(|| "session is not open in a tab".to_string())?;
+        let _send_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open().map_err(|e| e.to_string())?;
+        let pty_id = tab
+            .live
+            .lock()
+            .unwrap()
+            .live_pty()
+            .map_err(|e| e.to_string())?;
+        self.inner.backend.write(pty_id, data.as_bytes())
+    }
+
+    /// Raw write into a tab as the phone, keyed by tab id — for tabs that
+    /// run no session at all (a plain shell). Same doctrine as
+    /// `write_session_str`: ordered against output, not gated on input
+    /// ownership, authorized at the listener.
+    pub fn write_tab_str(&self, id: &TabId, data: &str) -> Result<(), String> {
+        let tab = self.inner.tab(id).map_err(|e| e.to_string())?;
         let _send_order = tab.raw.send_order.lock().unwrap();
         tab.raw.require_open().map_err(|e| e.to_string())?;
         let pty_id = tab
