@@ -18,6 +18,21 @@ phone connects to the ingress listener with SNI
 ClientHello, opens a multiplexed stream to the matching desktop connector, and
 then copies the complete TLS stream unchanged.
 
+## Multiple clients and growth
+
+A single relay serves every route listed in its configuration concurrently.
+Each desktop/location has a unique route id and connector token, so traffic and
+authentication remain isolated. A route accepts one active desktop connector
+and multiplexes up to 128 simultaneous phone connections; reconnecting the same
+desktop identity replaces its stale connector. The ingress listener bounds the
+whole process to roughly 1,024 concurrent phone tasks so an overloaded edge
+fails closed instead of consuming memory without limit.
+
+This is intentionally enough for a small shared deployment without changing
+the protocol later. When one VM is no longer sufficient, route ids can be
+assigned to multiple relay instances by DNS or a TCP edge while the phone and
+desktop protocol stays unchanged.
+
 ## Build and test
 
 ```sh

@@ -606,6 +606,144 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn independent_routes_serve_clients_concurrently_without_crossover() {
+        let token_a = "connector-token-for-desktop-a-123456789";
+        let token_b = "connector-token-for-desktop-b-987654321";
+        let connector_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connector_addr = connector_listener.local_addr().unwrap();
+        let ingress_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ingress_addr = ingress_listener.local_addr().unwrap();
+        let config = RelayConfig {
+            connector_listen: connector_addr,
+            ingress_listen: ingress_addr,
+            public_domain: "relay.example.com".into(),
+            routes: vec![
+                RouteConfig {
+                    id: "desktop-a".into(),
+                    token_sha256: format!("{:x}", Sha256::digest(token_a.as_bytes())),
+                },
+                RouteConfig {
+                    id: "desktop-b".into(),
+                    token_sha256: format!("{:x}", Sha256::digest(token_b.as_bytes())),
+                },
+            ],
+        };
+        let state = RelayState::from_config(&config).unwrap();
+        let server = tokio::spawn(run_with_listeners(
+            state,
+            connector_listener,
+            ingress_listener,
+        ));
+
+        let (mut connector_a, _) =
+            connect_test_connector(connector_addr, "desktop-a", token_a).await;
+        let (mut connector_b, _) =
+            connect_test_connector(connector_addr, "desktop-b", token_b).await;
+        let (phone_a, phone_b) = tokio::join!(
+            TcpStream::connect(ingress_addr),
+            TcpStream::connect(ingress_addr)
+        );
+        let mut phone_a = phone_a.unwrap();
+        let mut phone_b = phone_b.unwrap();
+        let hello_a = client_hello("desktop-a.relay.example.com");
+        let hello_b = client_hello("desktop-b.relay.example.com");
+        let (write_a, write_b) =
+            tokio::join!(phone_a.write_all(&hello_a), phone_b.write_all(&hello_b));
+        write_a.unwrap();
+        write_b.unwrap();
+
+        let ((stream_a, relayed_a), (stream_b, relayed_b)) = tokio::join!(
+            read_test_stream(&mut connector_a, hello_a.len()),
+            read_test_stream(&mut connector_b, hello_b.len())
+        );
+        assert_ne!(stream_a, stream_b);
+        assert_eq!(relayed_a, hello_a);
+        assert_eq!(relayed_b, hello_b);
+
+        send_test_reply(&mut connector_a, stream_a, b"reply from desktop a").await;
+        send_test_reply(&mut connector_b, stream_b, b"reply from desktop b").await;
+        let mut reply_a = vec![0; b"reply from desktop a".len()];
+        let mut reply_b = vec![0; b"reply from desktop b".len()];
+        let (read_a, read_b) = tokio::join!(
+            phone_a.read_exact(&mut reply_a),
+            phone_b.read_exact(&mut reply_b)
+        );
+        read_a.unwrap();
+        read_b.unwrap();
+        assert_eq!(reply_a, b"reply from desktop a");
+        assert_eq!(reply_b, b"reply from desktop b");
+
+        server.abort();
+    }
+
+    async fn connect_test_connector(
+        connector_addr: SocketAddr,
+        route: &str,
+        token: &str,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ) {
+        let mut request = format!("ws://{connector_addr}/v1/connect/{route}")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        tokio_tungstenite::connect_async(request).await.unwrap()
+    }
+
+    async fn read_test_stream(
+        connector: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<TcpStream>,
+        >,
+        expected_len: usize,
+    ) -> (u64, Vec<u8>) {
+        let open = connector.next().await.unwrap().unwrap().into_data();
+        let stream_id = match Frame::decode(&open).unwrap() {
+            Frame::Open { stream_id } => stream_id,
+            frame => panic!("expected open, got {frame:?}"),
+        };
+        let mut relayed = Vec::new();
+        while relayed.len() < expected_len {
+            let message = connector.next().await.unwrap().unwrap().into_data();
+            match Frame::decode(&message).unwrap() {
+                Frame::Data {
+                    stream_id: actual,
+                    bytes,
+                } => {
+                    assert_eq!(actual, stream_id);
+                    relayed.extend_from_slice(&bytes);
+                }
+                frame => panic!("expected data, got {frame:?}"),
+            }
+        }
+        (stream_id, relayed)
+    }
+
+    async fn send_test_reply(
+        connector: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<TcpStream>,
+        >,
+        stream_id: u64,
+        reply: &[u8],
+    ) {
+        connector
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                Frame::Data {
+                    stream_id,
+                    bytes: reply.to_vec(),
+                }
+                .encode()
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
     fn client_hello(host: &str) -> Vec<u8> {
         let mut names = vec![0];
         names.extend_from_slice(&(host.len() as u16).to_be_bytes());
