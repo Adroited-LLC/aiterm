@@ -45,7 +45,7 @@ import {
   ProjectInfo, Session,
   TrashedSession,
   agentCaps,
-  listProjects, listSessions, materializeFork,
+  listProjects, listSessions, materializeFork, relayReport,
   reindexSessions, sessionFork, uiLog, usageReport,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
   drainSessionEvents,
@@ -2286,6 +2286,66 @@ export default function App() {
     format: settings.timeFormat,
     setFormat: (f: AppSettings["timeFormat"]) => setSettings((s) => ({ ...s, timeFormat: f })),
   }), [settings.timeFormat]);
+
+  // The phone watches the relay too: report each phase change against the
+  // sessions the two tabs run, so a phone looking at either sees the crew.
+  useEffect(() => {
+    const r = relayCtl.relay;
+    if (!r) return;
+    const aTab = tabs.find((t) => t.key === r.aKey);
+    if (!aTab?.sessionId) return;
+    const bTab = tabs.find((t) => t.key === r.bKey);
+    relayReport(aTab.sessionId, bTab?.sessionId ?? null, r.bName, r.phase, r.round, r.rounds, r.note).catch(() => {});
+  }, [relayCtl.relay, tabs]);
+
+  // ---- Remote access: a phone asks, the desktop opens. The tab appears here
+  // too, so both screens agree about what is running. Refs, not deps: the
+  // handlers below are recreated every render and the listener must not be.
+  const remoteRef = useRef({ resumeSession, newSession, tabs, relayStart: relayCtl.start });
+  remoteRef.current = { resumeSession, newSession, tabs, relayStart: relayCtl.start };
+  useEffect(() => {
+    const unOpen = listen<{ sessionId: string }>("remote://open-session", async (e) => {
+      const id = e.payload.sessionId;
+      // The phone's list can be newer than ours — read fresh rather than trust state.
+      const list = sessionsRef.current.find((x) => x.id === id) ? sessionsRef.current : await listSessions();
+      const s = list.find((x) => x.id === id);
+      if (s) remoteRef.current.resumeSession(s);
+      else setNotice(`The phone asked for a session that is not listed: ${id.slice(0, 8)}…`);
+    });
+    const unNew = listen<{ agentId: string; cwd: string; prompt: string | null; model: string | null; effort: string | null; title: string | null }>("remote://new-session", (e) => {
+      const { agentId, cwd, prompt, model, effort, title } = e.payload;
+      // An api:<provider> id is a model off a provider's list, not a CLI —
+      // the same routing bring-in does. Left unrouted it reached the
+      // resolver as an agent and died as "api:… isn't installed", which is
+      // what a phone asking for a local model used to get back.
+      if (agentId.startsWith("api:")) {
+        if (!model) { setNotice("The phone asked for a provider model but named no model"); return; }
+        void remoteRef.current.newSession(
+          cwd, { kind: "api", providerId: agentId.slice(4), modelId: model }, prompt ?? undefined,
+          title ? { title } : {},
+        );
+        return;
+      }
+      void remoteRef.current.newSession(
+        cwd, { kind: "agent", agentId, model: model ?? null, effort: effort ?? null }, prompt ?? undefined,
+        title ? { title } : {},
+      );
+    });
+    const unBring = listen<{ session_id: string; kind?: string; agent_id: string; provider_id?: string | null; model: string | null; effort: string | null; focus: string; rounds: number }>("remote://bring-in", (e) => {
+      const p = e.payload;
+      const tab = remoteRef.current.tabs.find((t) => t.sessionId === p.session_id);
+      if (!tab) { setNotice("The phone asked to bring in a second agent, but that session has no tab here"); return; }
+      const choice: StartChoice = p.kind === "api" && p.provider_id && p.model
+        ? { kind: "api", providerId: p.provider_id, modelId: p.model }
+        : { kind: "agent", agentId: p.agent_id, model: p.model ?? null, effort: p.effort ?? null };
+      void remoteRef.current.relayStart({ aKey: tab.key, choice, focus: p.focus ?? "", rounds: p.rounds ?? 2, auto: (p as { auto?: boolean }).auto ?? false });
+    });
+    return () => {
+      unOpen.then((f) => f());
+      unNew.then((f) => f());
+      unBring.then((f) => f());
+    };
+  }, []);
 
   return (
     <TimeFormatContext.Provider value={timeFormatCtx}>
