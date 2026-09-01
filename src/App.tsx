@@ -1,4 +1,4 @@
-import { TimeFormatContext } from "./timefmt";
+import { TimeFormatContext, fullTime } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -30,7 +30,7 @@ import { isCurrent, useLibrarian } from "./librarian";
 import BringIn from "./components/BringIn";
 import { useRelay } from "./relay";
 import {
-  BookOpen, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, Users, X,
+  BookOpen, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -171,7 +171,20 @@ interface OpenTabOpts {
   agentId?: string;
   /** The session this tab was opened to reopen — see `TermTab.resumedId`. */
   resumedId?: string;
+  /** See `TermTab.parentKey`. */
+  parentKey?: TabId;
 }
+
+/** A second agent brought into a session, remembered by the session's id
+ *  so it can be reopened from that session's row after its tab is closed —
+ *  or after the session itself is resumed another day. */
+interface BroughtIn {
+  sessionId: string;
+  agentId: string;
+  title: string;
+  at: number;
+}
+const BROUGHT_KEY = "aiterm.broughtIn";
 
 function reconcileTermTabs(
   current: TermTab[], authoritative: TabDescriptor[],
@@ -289,6 +302,13 @@ export default function App() {
   // because everything claude-shaped below gates on which engine is in it.
   const activeTabObj = tabs.find((t) => t.key === activeTab) ?? null;
   const activeSessionId = activeTabObj?.sessionId ?? null;
+  /** The session tab in front, seen from the strip: a brought-in agent's
+   *  tab belongs to its master's row, so the master is what the first row
+   *  highlights and what files and bring-in controls key to. */
+  const rootKey: TabId | null = activeTab === null ? null : (activeTabObj?.parentKey ?? activeTab);
+  const rootObj = tabs.find((t) => t.key === rootKey) ?? null;
+  const [broughtIn, setBroughtIn] = useState<Record<string, BroughtIn[]>>(() => loadJSON(BROUGHT_KEY, {}));
+  useEffect(() => localStorage.setItem(BROUGHT_KEY, JSON.stringify(broughtIn)), [broughtIn]);
 
   // What each engine supports, fetched once on mount. `agent_caps` asks the
   // registry and nothing else — no PATH probe, no `--version` — because these
@@ -884,7 +904,7 @@ export default function App() {
       return (async () => {
         let descriptor: TabDescriptor | null = null;
         try {
-          const { adopt, ...registryOpts } = opts;
+          const { adopt, parentKey, ...registryOpts } = opts;
           descriptor = await tabOpen({
             title, cwd, command, slotId, ...registryOpts,
             size: { cols: 80, rows: 24 },
@@ -901,7 +921,7 @@ export default function App() {
             return null;
           }
           setTabs((current) => reconcileTermTabs(current, authoritative).map((tab) =>
-            tab.key === descriptor!.id ? { ...tab, adopt } : tab));
+            tab.key === descriptor!.id ? { ...tab, adopt, parentKey } : tab));
           setActiveTab(descriptor.id);
           if (descriptor.state === "exited") {
             const why = descriptor.exit;
@@ -940,7 +960,7 @@ export default function App() {
    *  is up (it covers the terminal, and the explorer shows *its* project),
    *  else the active terminal, else home. A file opened now belongs to this,
    *  and only files belonging to this are in the row. */
-  const fileScope: FileScope = previewSession ? `preview:${previewSession.id}` : activeTab;
+  const fileScope: FileScope = previewSession ? `preview:${previewSession.id}` : rootKey;
   const fileScopeRef = useRef<FileScope>(fileScope);
   fileScopeRef.current = fileScope;
   /** Which file each scope had on screen, so switching away and back finds
@@ -1621,8 +1641,11 @@ export default function App() {
   // all three things. Removed rather than left running for nobody to read.
 
   const closeTab = useCallback(async (key: TabId) => {
+    // A session's brought-in agents go with it.
+    const gone = new Set([key, ...tabsRef.current.filter((t) => t.parentKey === key).map((t) => t.key)]);
+    const parentOfClosed = tabsRef.current.find((t) => t.key === key)?.parentKey;
     setFileTabs((list) => {
-      const dropped = list.filter((f) => f.termKey === key).map((f) => f.key);
+      const dropped = list.filter((f) => typeof f.termKey === "string" && gone.has(f.termKey)).map((f) => f.key);
       if (dropped.length) {
         setDirtyFiles((prev) => {
           const next = new Set(prev);
@@ -1632,23 +1655,31 @@ export default function App() {
         setActiveFileTab((cur) =>
           cur !== null && dropped.includes(cur) ? null : cur);
       }
-      return list.filter((f) => f.termKey !== key);
+      return list.filter((f) => !(typeof f.termKey === "string" && gone.has(f.termKey)));
     });
     setEnded((m) => {
-      if (!m.has(key)) return m;
+      if (![...gone].some((k) => m.has(k))) return m;
       const next = new Map(m);
-      next.delete(key);
+      gone.forEach((k) => next.delete(k));
       return next;
     });
     setTabs((t) => {
-      const next = t.filter((x) => x.key !== key);
-      setActiveTab((cur) => (cur === key ? (next[next.length - 1]?.key ?? null) : cur));
+      const next = t.filter((x) => !gone.has(x.key));
+      setActiveTab((cur) => {
+        if (cur === null || !gone.has(cur)) return cur;
+        // Closing a child lands back on its master; closing a master lands
+        // on the last first-row tab, never on someone else's child.
+        if (parentOfClosed !== undefined && next.some((x) => x.key === parentOfClosed)) return parentOfClosed;
+        return next.filter((x) => x.parentKey === undefined).slice(-1)[0]?.key ?? null;
+      });
       return next;
     });
-    try {
-      await tabClose(key);
-    } catch (error) {
-      uiLog(`tab close failed for ${key}: ${String(error)}`);
+    for (const k of gone) {
+      try {
+        await tabClose(k);
+      } catch (error) {
+        uiLog(`tab close failed for ${k}: ${String(error)}`);
+      }
     }
     const authoritative = await tabList().catch(() => null);
     if (authoritative) {
@@ -1663,6 +1694,24 @@ export default function App() {
     setActiveFileTab(null);
     setActiveTab(null);
   }, []);
+
+  /** Reopen a second agent under its master's row — or just focus it if a
+   *  tab for that session is already open somewhere. */
+  const reopenBroughtIn = useCallback(async (rootKey: TabId, rec: BroughtIn) => {
+    const parent = tabsRef.current.find((t) => t.key === rootKey);
+    if (!parent?.cwd) return;
+    const open = tabsRef.current.find((t) => t.sessionId === rec.sessionId);
+    if (open) { setActiveTab(open.key); setActiveFileTab(null); return; }
+    try {
+      const plan = await resolveLaunch({ kind: "resume", sessionId: rec.sessionId });
+      void openTab(rec.title, parent.cwd, plan.command, rec.sessionId, {
+        sessionId: rec.sessionId, resumedId: rec.sessionId, agentId: plan.agent_id, parentKey: rootKey,
+      });
+      setActiveFileTab(null);
+    } catch (e) {
+      setNotice(`Couldn't reopen ${rec.title}: ${e}`);
+    }
+  }, [openTab]);
 
   /** Tab strip reordering: drop `from` where `to` sits, shifting the rest. */
   const dragKey = useRef<TabId | null>(null);
@@ -1686,10 +1735,11 @@ export default function App() {
     const h = (e: KeyboardEvent) => {
       if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
       if (e.key !== "PageDown" && e.key !== "PageUp") return;
-      const list = tabsRef.current;
+      const list = tabsRef.current.filter((t) => t.parentKey === undefined);
       if (list.length === 0) return;
       e.preventDefault();
-      const cur = list.findIndex((t) => t.key === activeTabRef.current);
+      const active = tabsRef.current.find((t) => t.key === activeTabRef.current);
+      const cur = list.findIndex((t) => t.key === (active?.parentKey ?? active?.key));
       const step = e.key === "PageDown" ? 1 : -1;
       const next = list[(cur + step + list.length) % list.length];
       setPreviewSession(null);
@@ -2104,7 +2154,7 @@ export default function App() {
     cwd: string,
     choice: StartChoice,
     prompt?: string,
-    extra: { title?: string; permissionFlags?: string } = {},
+    extra: { parentKey?: TabId; title?: string; permissionFlags?: string } = {},
   ): Promise<{ key: TabId; sessionId?: string } | null> => {
     // An API-provider model is a request for a model, not for an engine —
     // which one runs it is the resolver's answer. The branch survives because
@@ -2142,6 +2192,7 @@ export default function App() {
             envProvider: plan.env_provider ?? undefined,
             envModel: plan.env_model ?? undefined,
             agentId: plan.agent_id,
+            parentKey: extra.parentKey,
           });
           if (key === null) return null;
           return { key, sessionId: plan.session_id ?? undefined };
@@ -2171,6 +2222,7 @@ export default function App() {
             sessionId: plan.session_id ?? undefined,
             fresh: true,
             agentId: plan.agent_id,
+            parentKey: extra.parentKey,
             // An agent we could not name has to be identified after the fact.
             // Snapshot what already exists so adoption can tell its session
             // from one that was open before this tab did anything.
@@ -2204,7 +2256,17 @@ export default function App() {
     handle: (key) => handles.current.get(key),
     quietFor: (key) => Date.now() - (lastOutput.current.get(key) ?? 0),
     busy: (key) => progressRef.current.has(key),
-    open: (cwd, choice, prompt, extra) => newSession(cwd, choice, prompt, extra),
+    open: async (cwd, choice, prompt, extra) => {
+      const opened = await newSession(cwd, choice, prompt, extra);
+      // Remember who was brought in, by the master session's id, so the row
+      // can offer them back after their tab — or the day — ends.
+      const parent = tabsRef.current.find((t) => t.key === extra.parentKey);
+      if (opened?.sessionId && parent?.sessionId) {
+        const rec: BroughtIn = { sessionId: opened.sessionId, agentId: choice.kind === "agent" ? choice.agentId : "api", title: extra.title, at: Date.now() };
+        setBroughtIn((m) => ({ ...m, [parent.sessionId!]: [...(m[parent.sessionId!] ?? []).filter((r) => r.sessionId !== rec.sessionId), rec] }));
+      }
+      return opened;
+    },
   });
   const [showBringIn, setShowBringIn] = useState(false);
 
@@ -2528,8 +2590,9 @@ export default function App() {
               {/* Every open session, in the order they sit — drag one to move
                   it, middle-click or × to close (which ends its process; the
                   conversation stays on disk and in the sidebar). */}
-              {tabs.map((t) => {
-                const on = t.key === activeTab && !previewSession;
+              {tabs.filter((t) => t.parentKey === undefined).map((t) => {
+                const on = t.key === rootKey && !previewSession;
+                const wants = attention.has(t.key) || tabs.some((c) => c.parentKey === t.key && attention.has(c.key));
                 const tint = agentTint(t.agentId);
                 return (
                   <button
@@ -2556,7 +2619,7 @@ export default function App() {
                       ? <AgentIcon agent={t.agentId} size={13} />
                       : <span className="center-tab-shell">❯</span>}
                     <span className="center-tab-name">{t.title}</span>
-                    {attention.has(t.key) && !on && <span className="center-tab-dot" title="Waiting for you" />}
+                    {wants && !on && <span className="center-tab-dot" title="Waiting for you" />}
                     <span
                       className="center-tab-close"
                       title="Close (ends the session's process)"
@@ -2565,10 +2628,19 @@ export default function App() {
                   </button>
                 );
               })}
-              {activeTabObj?.sessionId && !previewSession && (
+              {rootObj?.sessionId && rootKey !== null && !previewSession && (
                 <div className="strip-right">
-                  {relayCtl.relay &&
-                  (relayCtl.relay.aKey === activeTab || relayCtl.relay.bKey === activeTab) ? (
+                  {(broughtIn[rootObj.sessionId] ?? [])
+                    .filter((r) => !tabs.some((t) => t.sessionId === r.sessionId))
+                    .map((r) => (
+                      <span key={r.sessionId} className="recall-chip" title={`Reopen ${r.title} — brought in ${fullTime(r.at)}`}>
+                        <button className="recall-open" onClick={() => void reopenBroughtIn(rootKey, r)}>
+                          <Icon of={RotateCcw} size="sm" /> <AgentIcon agent={r.agentId} size={11} /> {r.title}
+                        </button>
+                        <button className="recall-x" title="Forget" onClick={() => setBroughtIn((m) => ({ ...m, [rootObj.sessionId!]: (m[rootObj.sessionId!] ?? []).filter((x) => x.sessionId !== r.sessionId) }))}><Icon of={X} size="sm" /></button>
+                      </span>
+                    ))}
+                  {relayCtl.relay && relayCtl.relay.aKey === rootKey ? (
                     <span
                       className={"relay-pill " + relayCtl.relay.phase}
                       title={relayCtl.relay.note || undefined}
@@ -2617,14 +2689,14 @@ export default function App() {
               )}
             </div>
           )}
-          {showBringIn && activeTabObj?.sessionId && !previewSession && (
+          {showBringIn && rootObj?.sessionId && !previewSession && (
             <BringIn
               onClose={() => setShowBringIn(false)}
               onOpenModelAccess={openModelAccess}
               onGo={(choice, focus, rounds, auto) => {
                 setShowBringIn(false);
-                if (activeTab !== null) {
-                  void relayCtl.start({ aKey: activeTab, choice, focus, rounds, auto });
+                if (rootKey !== null) {
+                  void relayCtl.start({ aKey: rootKey, choice, focus, rounds, auto });
                 }
               }}
             />
@@ -2632,25 +2704,48 @@ export default function App() {
           {/* The session's own files, in a row of their own under the strip:
               what this session opened travels with it, and the leftmost tab
               is the way back to its terminal. */}
-          {fileTabs.some(showsFile) && (
+          {(fileTabs.some(showsFile) || (rootObj?.sessionId && !previewSession)) && (
             <div className="center-tabs file-row">
               <button
-                className={"center-tab sub back" + (activeFileTab === null ? " on" : "")}
-                title={previewSession ? "Back to the preview" : activeTabObj ? "Back to the terminal" : "Back to the start view"}
+                className={"center-tab sub back" + (activeFileTab === null && activeTab === rootKey ? " on" : "")}
+                title={previewSession ? "Back to the preview" : rootObj ? "Back to the terminal" : "Back to the start view"}
                 onClick={() => {
                   setActiveFileTab(null);
-                  if (activeTab !== null) handles.current.get(activeTab)?.focus();
+                  if (rootKey !== null) { setActiveTab(rootKey); handles.current.get(rootKey)?.focus(); }
                 }}
               >
                 {previewSession
                   ? <AgentIcon agent={previewSession.agent} size={12} />
-                  : activeTabObj
-                  ? (activeTabObj.agentId
-                      ? <AgentIcon agent={activeTabObj.agentId} size={12} />
+                  : rootObj
+                  ? (rootObj.agentId
+                      ? <AgentIcon agent={rootObj.agentId} size={12} />
                       : <span className="center-tab-shell">❯</span>)
                   : <Icon of={Home} size="sm" />}
-                <span className="center-tab-name">{previewSession ? "Preview" : activeTabObj ? "Terminal" : "Home"}</span>
+                <span className="center-tab-name">{previewSession ? "Preview" : rootObj ? "Terminal" : "Home"}</span>
               </button>
+              {/* Agents brought into this session: tabs of their own, under it. */}
+              {!previewSession && tabs.filter((c) => c.parentKey === rootKey).map((c) => {
+                const on = activeTab === c.key && activeFileTab === null;
+                return (
+                  <button
+                    key={c.key}
+                    className={"center-tab sub child" + (on ? " on" : "") + agentTint(c.agentId).className}
+                    style={agentTint(c.agentId).style}
+                    title={`${c.title} — brought into this session`}
+                    onClick={() => { setActiveFileTab(null); setActiveTab(c.key); handles.current.get(c.key)?.focus(); }}
+                    onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeTab(c.key); } }}
+                  >
+                    <AgentIcon agent={c.agentId ?? "api"} size={12} />
+                    <span className="center-tab-name">{c.title}</span>
+                    {attention.has(c.key) && !on && <span className="center-tab-dot" title="Waiting for you" />}
+                    <span
+                      className="center-tab-close"
+                      title="Close (ends their process; reopen from this row later)"
+                      onClick={(e) => { e.stopPropagation(); closeTab(c.key); }}
+                    ><Icon of={X} size="sm" /></span>
+                  </button>
+                );
+              })}
               {fileTabs.filter(showsFile).map((f) => (
                 <button
                   key={f.key}
