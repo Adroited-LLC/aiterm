@@ -192,7 +192,17 @@ class RemoteClient(
             reconnectJob?.cancel()
             reconnectJob = null
         }
-        return connectOnce(ConnectionState.Connecting)
+        val connected = connectOnce(ConnectionState.Connecting)
+        if (!connected && synchronized(lifecycleLock) {
+                mutableState.value.connection == ConnectionState.Disconnected && isUnlocked()
+            }
+        ) {
+            synchronized(lifecycleLock) {
+                mutableState.value = mutableState.value.copy(connection = ConnectionState.Reconnecting)
+            }
+            scheduleReconnect()
+        }
+        return connected
     }
 
     private suspend fun connectOnce(connectingState: ConnectionState): Boolean {
@@ -259,7 +269,11 @@ class RemoteClient(
                 if (isCurrent(generation, candidate)) {
                     transport = null
                     mutableState.value = mutableState.value.copy(
-                        connection = ConnectionState.Disconnected,
+                        connection = if (connectingState == ConnectionState.Reconnecting) {
+                            ConnectionState.Reconnecting
+                        } else {
+                            ConnectionState.Disconnected
+                        },
                         lastError = error.message ?: "Connection failed",
                     )
                 }
@@ -947,17 +961,24 @@ class RemoteClient(
     }
 
     private fun scheduleReconnect() {
-        if (reconnectJob?.isActive == true || !isUnlocked()) return
-        reconnectJob = scope.launch(dispatcher) {
-            for (delayMillis in RECONNECT_DELAYS_MILLIS) {
-                delay(delayMillis)
-                if (!isUnlocked() || mutableState.value.connection == ConnectionState.Revoked ||
-                    mutableState.value.connection == ConnectionState.Locked
-                ) return@launch
-                if (connectOnce(ConnectionState.Reconnecting)) return@launch
-            }
-            mutableState.value = mutableState.value.copy(connection = ConnectionState.Disconnected)
+        val job = synchronized(lifecycleLock) {
+            if (reconnectJob?.isActive == true || !isUnlocked()) return
+            scope.launch(dispatcher, start = CoroutineStart.LAZY) {
+                var attempt = 0
+                while (true) {
+                    val delayMillis = RECONNECT_DELAYS_MILLIS[
+                        attempt.coerceAtMost(RECONNECT_DELAYS_MILLIS.lastIndex)
+                    ]
+                    delay(delayMillis)
+                    if (!isUnlocked() || mutableState.value.connection == ConnectionState.Revoked ||
+                        mutableState.value.connection == ConnectionState.Locked
+                    ) return@launch
+                    if (connectOnce(ConnectionState.Reconnecting)) return@launch
+                    attempt += 1
+                }
+            }.also { reconnectJob = it }
         }
+        job.start()
     }
 
     private fun acceptTerminalChunk(chunk: TerminalTransferChunk) {

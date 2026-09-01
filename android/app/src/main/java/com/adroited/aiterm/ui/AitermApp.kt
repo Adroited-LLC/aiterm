@@ -76,6 +76,7 @@ fun AitermApp(
                                 container.deviceKeys,
                                 container.appLock,
                                 container.pairedDesktopStore,
+                                application,
                             ),
                         )
                         RemoteDesktopScreen(

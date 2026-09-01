@@ -29,4 +29,13 @@ class RemoteEndpointOrderingTest {
             OkHttpRemoteSocketDialer().orderedEndpoints(desktop),
         )
     }
+
+    @Test
+    fun fallbackRoutesUseShortStaggerInsteadOfSerialSocketTimeouts() {
+        val dialer = OkHttpRemoteSocketDialer()
+
+        assertEquals(0L, dialer.routeDelayMillis(OkHttpRemoteSocketDialer.Route.LAN))
+        assertEquals(350L, dialer.routeDelayMillis(OkHttpRemoteSocketDialer.Route.VPN))
+        assertEquals(700L, dialer.routeDelayMillis(OkHttpRemoteSocketDialer.Route.RELAY))
+    }
 }
