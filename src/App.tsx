@@ -2640,43 +2640,7 @@ export default function App() {
                         <button className="recall-x" title="Forget" onClick={() => setBroughtIn((m) => ({ ...m, [rootObj.sessionId!]: (m[rootObj.sessionId!] ?? []).filter((x) => x.sessionId !== r.sessionId) }))}><Icon of={X} size="sm" /></button>
                       </span>
                     ))}
-                  {relayCtl.relay && relayCtl.relay.aKey === rootKey ? (
-                    <span
-                      className={"relay-pill " + relayCtl.relay.phase}
-                      title={relayCtl.relay.note || undefined}
-                    >
-                      <Icon of={Users} size="sm" />
-                      {relayCtl.relay.phase === "opening" && `bringing in ${relayCtl.relay.bName}…`}
-                      {relayCtl.relay.phase === "waitB" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.bName}`}
-                      {relayCtl.relay.phase === "waitA" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.aName}`}
-                      {relayCtl.relay.phase === "done" && `done — ${relayCtl.relay.note}`}
-                      {relayCtl.relay.phase === "stopped" && "stopped"}
-                      {relayCtl.relay.phase === "error" && `stopped: ${relayCtl.relay.note}`}
-                      {relayCtl.relay.phase === "opening" ||
-                      relayCtl.relay.phase === "waitA" ||
-                      relayCtl.relay.phase === "waitB" ? (
-                        <button className="relay-x" title="Stop relaying" onClick={() => relayCtl.stop()}>
-                          <Icon of={X} size="sm" />
-                        </button>
-                      ) : (
-                        <button className="relay-x" title="Dismiss" onClick={relayCtl.clear}>
-                          <Icon of={X} size="sm" />
-                        </button>
-                      )}
-                      {relayCtl.relay.bKey && (
-                        <button
-                          className="relay-jump"
-                          onClick={() => setActiveTab(
-                            activeTab === relayCtl.relay!.aKey
-                              ? relayCtl.relay!.bKey
-                              : relayCtl.relay!.aKey,
-                          )}
-                        >
-                          {activeTab === relayCtl.relay.aKey ? "their tab" : "first tab"}
-                        </button>
-                      )}
-                    </span>
-                  ) : (
+                  {relayCtl.relay && relayCtl.relay.aKey === rootKey ? null : (
                     <button
                       className="strip-btn"
                       title="Bring a read-only second agent into this session"
@@ -2746,6 +2710,45 @@ export default function App() {
                   </button>
                 );
               })}
+              {!previewSession && relayCtl.relay && relayCtl.relay.aKey === rootKey && (
+                <div className="strip-right">
+                  <span
+                    className={"relay-pill " + relayCtl.relay.phase}
+                    title={relayCtl.relay.note || undefined}
+                  >
+                    <Icon of={Users} size="sm" />
+                    {relayCtl.relay.phase === "opening" && `bringing in ${relayCtl.relay.bName}…`}
+                    {relayCtl.relay.phase === "waitB" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.bName}`}
+                    {relayCtl.relay.phase === "waitA" && `round ${relayCtl.relay.round}/${relayCtl.relay.rounds} · waiting on ${relayCtl.relay.aName}`}
+                    {relayCtl.relay.phase === "done" && `done — ${relayCtl.relay.note}`}
+                    {relayCtl.relay.phase === "stopped" && "stopped"}
+                    {relayCtl.relay.phase === "error" && `stopped: ${relayCtl.relay.note}`}
+                    {relayCtl.relay.phase === "opening" ||
+                    relayCtl.relay.phase === "waitA" ||
+                    relayCtl.relay.phase === "waitB" ? (
+                      <button className="relay-x" title="Stop relaying" onClick={() => relayCtl.stop()}>
+                        <Icon of={X} size="sm" />
+                      </button>
+                    ) : (
+                      <button className="relay-x" title="Dismiss" onClick={relayCtl.clear}>
+                        <Icon of={X} size="sm" />
+                      </button>
+                    )}
+                    {relayCtl.relay.bKey && (
+                      <button
+                        className="relay-jump"
+                        onClick={() => setActiveTab(
+                          activeTab === relayCtl.relay!.aKey
+                            ? relayCtl.relay!.bKey
+                            : relayCtl.relay!.aKey,
+                        )}
+                      >
+                        {activeTab === relayCtl.relay.aKey ? "their tab" : "first tab"}
+                      </button>
+                    )}
+                  </span>
+                </div>
+              )}
               {fileTabs.filter(showsFile).map((f) => (
                 <button
                   key={f.key}
