@@ -166,6 +166,8 @@ class PairingScreenTest {
             enrollmentSecret: EnrollmentSecret,
             deviceName: String,
             devicePublicKey: ByteArray,
+            relayAuthorityPublicKey: ByteArray?,
+            relaySignatureDer: ByteArray?,
             onPending: () -> Unit,
         ): EnrollmentOutcome {
             attempts++

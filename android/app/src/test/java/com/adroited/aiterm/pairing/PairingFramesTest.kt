@@ -31,6 +31,26 @@ class PairingFramesTest {
     }
 
     @Test
+    fun relayAuthorizationProof_roundTripsAsBoundedByteStrings() {
+        val authority = ByteArray(33) { (it + 1).toByte() }
+        val signature = ByteArray(70) { (it + 2).toByte() }
+        val decoded = PairingFrames.decode(
+            PairingFrames.encode(
+                PairRequestFrame(
+                    enrollmentSecret = ByteArray(32) { 3 },
+                    deviceName = "Pixel",
+                    publicKey = ByteArray(33) { 4 },
+                    relayAuthorityPublicKey = authority,
+                    relaySignatureDer = signature,
+                ),
+            ),
+        ) as PairRequestFrame
+
+        assertArrayEquals(authority, decoded.relayAuthorityPublicKey)
+        assertArrayEquals(signature, decoded.relaySignatureDer)
+    }
+
+    @Test
     fun desktopResponseFixtures_decodeWithoutUsingTheEncoderUnderTest() {
         assertEquals(
             PairPendingFrame("request-1"),

@@ -14,6 +14,8 @@ data class PairRequestFrame(
     val enrollmentSecret: ByteArray,
     val deviceName: String,
     val publicKey: ByteArray,
+    val relayAuthorityPublicKey: ByteArray? = null,
+    val relaySignatureDer: ByteArray? = null,
 ) : PairingFrame
 
 data class PairPendingFrame(val requestId: String) : PairingFrame
@@ -50,6 +52,8 @@ object PairingFrames {
                 enrollmentSecret = frame.enrollmentSecret,
                 deviceName = frame.deviceName,
                 publicKey = frame.publicKey,
+                relayAuthorityPublicKey = frame.relayAuthorityPublicKey,
+                relaySignatureDer = frame.relaySignatureDer,
             )
             is PairPendingFrame -> WireFrame(kind = "pair.pending", requestId = frame.requestId)
             is PairApprovedFrame -> WireFrame(kind = "pair.approved", deviceId = frame.deviceId)
@@ -89,6 +93,10 @@ object PairingFrames {
         val deviceName: String? = null,
         @SerialName("public_key") @ByteString
         val publicKey: ByteArray? = null,
+        @SerialName("relay_authority_public_key") @ByteString
+        val relayAuthorityPublicKey: ByteArray? = null,
+        @SerialName("relay_signature_der") @ByteString
+        val relaySignatureDer: ByteArray? = null,
         @SerialName("request_id")
         val requestId: String? = null,
         @SerialName("device_id")
@@ -104,11 +112,16 @@ object PairingFrames {
                 AuthChallengeFrame(challengeNonce)
             }
             "pair.request" -> {
-                requireFields("enrollment_secret", "device_name", "public_key")
+                val fields = mutableListOf("enrollment_secret", "device_name", "public_key")
+                if (relayAuthorityPublicKey != null) fields += "relay_authority_public_key"
+                if (relaySignatureDer != null) fields += "relay_signature_der"
+                requireFields(*fields.toTypedArray())
                 PairRequestFrame(
                     enrollmentSecret = enrollmentSecret!!,
                     deviceName = deviceName!!,
                     publicKey = publicKey!!,
+                    relayAuthorityPublicKey = relayAuthorityPublicKey,
+                    relaySignatureDer = relaySignatureDer,
                 )
             }
             "pair.pending" -> {
@@ -135,6 +148,8 @@ object PairingFrames {
                 if (enrollmentSecret != null) add("enrollment_secret")
                 if (deviceName != null) add("device_name")
                 if (publicKey != null) add("public_key")
+                if (relayAuthorityPublicKey != null) add("relay_authority_public_key")
+                if (relaySignatureDer != null) add("relay_signature_der")
                 if (requestId != null) add("request_id")
                 if (deviceId != null) add("device_id")
                 if (nonce != null) add("nonce")
@@ -149,7 +164,10 @@ object PairingFrames {
                     deviceName.isNullOrBlank() ||
                     deviceName.length > 128 ||
                     enrollmentSecret?.size != 32 ||
-                    publicKey?.size != 33
+                    publicKey?.size != 33 ||
+                    ((relayAuthorityPublicKey == null) != (relaySignatureDer == null)) ||
+                    (relayAuthorityPublicKey != null && relayAuthorityPublicKey.size != 33) ||
+                    (relaySignatureDer != null && relaySignatureDer.size !in 8..80)
                 ) invalidText()
             }
         }

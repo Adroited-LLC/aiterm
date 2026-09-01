@@ -596,6 +596,30 @@ class RemoteClientTest {
     }
 
     @Test
+    fun initialFailureKeepsRetryingPastTheOldFiveAttemptLimit() = runTest {
+        var factoryCalls = 0
+        val client = RemoteClient(
+            transportFactory = {
+                factoryCalls += 1
+                if (factoryCalls <= 6) FailingRemoteTransport() else FakeRemoteTransport()
+            },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        assertFalse(client.connect())
+        assertEquals(ConnectionState.Reconnecting, client.state.value.connection)
+        advanceTimeBy(47_000)
+        runCurrent()
+
+        assertEquals(7, factoryCalls)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        client.lock()
+    }
+
+    @Test
     fun completeScrollbackPageIsPublishedOnlyForTheVisibleTab() = runTest {
         val store = DefaultTerminalScreenStore()
         store.replace(
@@ -1561,6 +1585,17 @@ private class FakeRemoteTransport(private val onClose: () -> Unit = {}) : Remote
         onClose()
         closed = true
     }
+}
+
+private class FailingRemoteTransport : RemoteTransport {
+    override val events = MutableSharedFlow<RemoteServerEvent>()
+    override suspend fun connect(): Unit = throw RemoteProtocolException("offline")
+    override fun request(kind: String, payload: ByteArray, onAssigned: (Long) -> Unit) =
+        CompletableDeferred<RemoteResponse>().also {
+            it.completeExceptionally(RemoteProtocolException("offline"))
+        }
+    override fun requestBatch(requests: List<RemoteRequestInput>): List<Deferred<RemoteResponse>>? = null
+    override fun close() = Unit
 }
 
 private class DeferredRemoteTransport(connectImmediately: Boolean = true) : RemoteTransport {

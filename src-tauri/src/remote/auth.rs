@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use super::relay::RelayEnrollmentDraft;
 
 const STORE_VERSION: u8 = 1;
 const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(300);
@@ -48,6 +49,7 @@ struct PersistedStore {
 struct PendingEnrollment {
     secret: [u8; 32],
     expires_at: SystemTime,
+    relay: Option<RelayEnrollmentDraft>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -63,6 +65,14 @@ struct PendingDevice {
     public_key: String,
     expires_at: SystemTime,
     last_ip: Option<String>,
+    relay: Option<PendingRelayEnrollment>,
+}
+
+#[derive(Clone)]
+pub struct PendingRelayEnrollment {
+    pub draft: RelayEnrollmentDraft,
+    pub authority_public_key: Vec<u8>,
+    pub signature_der: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,11 +98,16 @@ pub struct DeviceStore {
 #[derive(Clone, Debug)]
 pub struct EnrollmentQr {
     secret: [u8; 32],
+    relay: Option<RelayEnrollmentDraft>,
 }
 
 impl EnrollmentQr {
     pub fn secret(&self) -> &[u8] {
         &self.secret
+    }
+
+    pub fn relay(&self) -> Option<&RelayEnrollmentDraft> {
+        self.relay.as_ref()
     }
 }
 
@@ -116,6 +131,14 @@ impl DeviceStore {
     }
 
     pub fn begin_enrollment_at(&self, now: SystemTime) -> Result<EnrollmentQr, AuthError> {
+        self.begin_enrollment_with_relay_at(now, None)
+    }
+
+    pub fn begin_enrollment_with_relay_at(
+        &self,
+        now: SystemTime,
+        relay: Option<RelayEnrollmentDraft>,
+    ) -> Result<EnrollmentQr, AuthError> {
         let mut secret = [0u8; 32];
         OsRng.fill_bytes(&mut secret);
         let expires_at = now
@@ -125,8 +148,8 @@ impl DeviceStore {
         state.enrollments.retain(|item| item.expires_at >= now);
         state
             .enrollments
-            .push(PendingEnrollment { secret, expires_at });
-        Ok(EnrollmentQr { secret })
+            .push(PendingEnrollment { secret, expires_at, relay: relay.clone() });
+        Ok(EnrollmentQr { secret, relay })
     }
 
     pub fn submit_pairing_at(
@@ -155,6 +178,48 @@ impl DeviceStore {
         secret: &[u8],
         device_name: &str,
         public_key: &[u8],
+        peer_ip: Option<IpAddr>,
+        now: SystemTime,
+    ) -> Result<PendingPairing, AuthError> {
+        self.submit_pairing_with_relay_and_ip_at(
+            secret,
+            device_name,
+            public_key,
+            None,
+            None,
+            peer_ip,
+            now,
+        )
+    }
+
+    pub fn submit_pairing_with_relay_from_at(
+        &self,
+        secret: &[u8],
+        device_name: &str,
+        public_key: &[u8],
+        authority_public_key: Option<&[u8]>,
+        signature_der: Option<&[u8]>,
+        peer_ip: IpAddr,
+        now: SystemTime,
+    ) -> Result<PendingPairing, AuthError> {
+        self.submit_pairing_with_relay_and_ip_at(
+            secret,
+            device_name,
+            public_key,
+            authority_public_key,
+            signature_der,
+            Some(peer_ip),
+            now,
+        )
+    }
+
+    fn submit_pairing_with_relay_and_ip_at(
+        &self,
+        secret: &[u8],
+        device_name: &str,
+        public_key: &[u8],
+        authority_public_key: Option<&[u8]>,
+        signature_der: Option<&[u8]>,
         peer_ip: Option<IpAddr>,
         now: SystemTime,
     ) -> Result<PendingPairing, AuthError> {
@@ -192,6 +257,36 @@ impl DeviceStore {
         })?;
         let canonical_key = verifying_key.to_encoded_point(true);
         let canonical_bytes = canonical_key.as_bytes();
+        let relay = match (pending.relay, authority_public_key, signature_der) {
+            (None, None, None) => None,
+            (Some(draft), Some(authority_public_key), Some(signature_der)) => {
+                let authority = VerifyingKey::from_sec1_bytes(authority_public_key).map_err(|_| {
+                    AuthError::new("pairing.invalid_relay_authority", "invalid relay authority key")
+                })?;
+                let canonical_authority = authority.to_encoded_point(true);
+                if canonical_authority.as_bytes() != authority_public_key {
+                    return Err(AuthError::new(
+                        "pairing.invalid_relay_authority",
+                        "relay authority key is not canonical",
+                    ));
+                }
+                let signature = Signature::from_der(signature_der).map_err(|_| {
+                    AuthError::new("pairing.invalid_relay_signature", "invalid relay authorization signature")
+                })?;
+                authority.verify(draft.authorization_digest(), &signature).map_err(|_| {
+                    AuthError::new("pairing.invalid_relay_signature", "relay authorization signature did not verify")
+                })?;
+                Some(PendingRelayEnrollment {
+                    draft,
+                    authority_public_key: authority_public_key.to_vec(),
+                    signature_der: signature_der.to_vec(),
+                })
+            }
+            _ => return Err(AuthError::new(
+                "pairing.invalid_relay_authorization",
+                "relay authorization is incomplete or unexpected",
+            )),
+        };
         let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical_bytes));
         let view = PendingPairing {
             id: uuid::Uuid::new_v4().to_string(),
@@ -204,6 +299,7 @@ impl DeviceStore {
             public_key: URL_SAFE_NO_PAD.encode(canonical_bytes),
             expires_at: now + PAIRING_RETENTION,
             last_ip: peer_ip.map(|ip| ip.to_string()),
+            relay,
         });
         Ok(view)
     }
@@ -272,6 +368,17 @@ impl DeviceStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn pending_relay_enrollment(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingRelayEnrollment>, AuthError> {
+        let state = self.state.lock().map_err(|_| AuthError::poisoned())?;
+        let pending = state.pending_pairings.iter()
+            .find(|pairing| pairing.view.id == request_id)
+            .ok_or_else(|| AuthError::new("pairing.unknown_request", "pairing request does not exist"))?;
+        Ok(pending.relay.clone())
     }
 
     pub fn take_pairing_outcome(&self, request_id: &str) -> Option<PairingOutcome> {

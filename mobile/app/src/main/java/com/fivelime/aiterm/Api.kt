@@ -93,8 +93,6 @@ data class Status(
     /** Every address the desktop answers on right now, LAN first, public
      *  last. Fresher than what the QR carried at pairing time. */
     val hosts: List<String> = emptyList(),
-    /** iroh node id, when this desktop can be dialed by key. */
-    val iroh: String? = null,
 )
 
 class ApiError(val code: Int, message: String) : Exception(message)

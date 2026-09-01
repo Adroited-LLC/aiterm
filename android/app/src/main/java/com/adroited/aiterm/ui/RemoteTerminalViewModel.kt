@@ -1,12 +1,16 @@
 package com.adroited.aiterm.ui
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.adroited.aiterm.pairing.PairedDesktop
+import com.adroited.aiterm.pairing.PairedDesktopStore
 import com.adroited.aiterm.remote.AuthenticatedRemoteTransport
+import com.adroited.aiterm.remote.AndroidNetworkMonitor
+import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.OkHttpRemoteSocketDialer
 import com.adroited.aiterm.remote.RemoteClient
 import com.adroited.aiterm.remote.RemoteUploadProgress
@@ -18,21 +22,29 @@ import com.adroited.aiterm.terminal.DefaultTerminalScreenStore
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 
 class RemoteTerminalViewModel(
-    desktop: PairedDesktop,
+    initialDesktop: PairedDesktop,
     deviceKeys: DeviceKeys,
     private val appLock: AppLock,
+    private val pairedDesktopStore: PairedDesktopStore,
+    context: Context,
 ) : ViewModel() {
+    private var desktop = initialDesktop
     /** Survives terminal tab changes and configuration changes for this ViewModel's lifetime. */
     internal val terminalDrafts = TerminalDraftStore()
     private val screenStore = DefaultTerminalScreenStore()
     private val dialer = OkHttpRemoteSocketDialer()
+    private val networkMonitor = AndroidNetworkMonitor(context)
+    private var connectJob: Job? = null
     val client = RemoteClient(
         transportFactory = {
             AuthenticatedRemoteTransport(
@@ -51,6 +63,17 @@ class RemoteTerminalViewModel(
     init {
         reconnect()
         viewModelScope.launch {
+            networkMonitor.changes.collectLatest {
+                delay(NETWORK_SETTLE_MILLIS)
+                if (!appLock.isLocked.value) reconnect()
+            }
+        }
+        viewModelScope.launch {
+            client.state.map { it.connection }.distinctUntilChanged().collectLatest { connection ->
+                if (connection == ConnectionState.Connected) refreshConnectedDesktop()
+            }
+        }
+        viewModelScope.launch {
             appLock.isLocked.collectLatest { locked ->
                 if (locked) {
                     client.lock()
@@ -62,12 +85,23 @@ class RemoteTerminalViewModel(
     }
 
     fun reconnect() {
-        viewModelScope.launch {
-            if (client.connect()) {
-                client.refreshSessions()
-                client.refreshAgents()
-            }
+        connectJob?.cancel()
+        connectJob = viewModelScope.launch { client.connect() }
+    }
+
+    private suspend fun refreshConnectedDesktop() {
+        runCatching {
+            val routes = client.gatewayRoutes()
+            desktop = desktop.copy(
+                hosts = routes.hosts,
+                port = routes.port,
+                relayHost = routes.relayHost,
+                relayPort = routes.relayPort,
+            )
+            pairedDesktopStore.save(desktop)
         }
+        client.refreshSessions()
+        client.refreshAgents()
     }
 
     fun selectTab(tabId: String) = client.selectTab(tabId)
@@ -220,6 +254,8 @@ class RemoteTerminalViewModel(
     ) = client.startAgent(agent, modelId, effort, cwd, TerminalSize(cols, rows))
 
     override fun onCleared() {
+        connectJob?.cancel()
+        networkMonitor.close()
         client.lock()
     }
 
@@ -228,9 +264,13 @@ class RemoteTerminalViewModel(
             desktop: PairedDesktop,
             deviceKeys: DeviceKeys,
             appLock: AppLock,
+            pairedDesktopStore: PairedDesktopStore,
+            context: Context,
         ): ViewModelProvider.Factory = viewModelFactory {
-            initializer { RemoteTerminalViewModel(desktop, deviceKeys, appLock) }
+            initializer { RemoteTerminalViewModel(desktop, deviceKeys, appLock, pairedDesktopStore, context) }
         }
+
+        private const val NETWORK_SETTLE_MILLIS = 350L
     }
 }
 

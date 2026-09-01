@@ -20,6 +20,16 @@ export interface RemoteStatus {
   port: number | null;
   /** SHA-256 of the listener's SPKI, base64url. The phone pins this. */
   fingerprint: string | null;
+  relay?: RelayStatus;
+}
+
+export interface RelayStatus {
+  configured: boolean;
+  connector_url: string | null;
+  public_host: string | null;
+  public_port: number | null;
+  route_id: string | null;
+  state: "off" | "connecting" | "connected" | "retrying";
 }
 
 export interface ListenerConfig {
@@ -189,4 +199,40 @@ export function listenerLabel(status: RemoteStatus): string {
   if (!status.enabled) return "off";
   if (!status.address || status.port === null) return "starting";
   return `${status.address}:${status.port}`;
+}
+
+export function relayLabel(status: RemoteStatus): string {
+  const relay = status.relay;
+  if (!relay?.configured) return "not configured";
+  const endpoint = relay.public_host && relay.public_port
+    ? `${relay.public_host}:${relay.public_port}`
+    : "configured";
+  if (!status.enabled) return `${endpoint} — off`;
+  return `${endpoint} — ${relay.state}`;
+}
+
+/** Reduce a stored connector URL to the one relay server origin a person
+ * needs to recognize. Route ids and connector paths remain implementation
+ * details rather than ordinary settings. */
+export function relayServerFromConnectorUrl(connectorUrl: string | null | undefined): string | null {
+  if (!connectorUrl) return null;
+  try {
+    const url = new URL(connectorUrl);
+    if (!matchesConnectorPath(url.pathname) || !matchesWebSocketScheme(url.protocol)) return null;
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = "/";
+    url.search = "";
+    url.hash = "";
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function matchesConnectorPath(path: string): boolean {
+  return path === "/v1/connect" || path === "/v1/connect/";
+}
+
+function matchesWebSocketScheme(protocol: string): boolean {
+  return protocol === "wss:" || protocol === "ws:";
 }

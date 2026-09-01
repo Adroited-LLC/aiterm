@@ -65,7 +65,7 @@ class PairingRepositoryTest {
 
     @Test
     fun unknownPayloadVersion_isRejectedOutright() {
-        val result = PairingPayload.parse(pairingUri(version = "2"), scannedAt)
+        val result = PairingPayload.parse(pairingUri(version = "4"), scannedAt)
 
         assertEquals(
             PairingPayloadResult.Rejected(PairingFailure.UNSUPPORTED_VERSION),
@@ -120,6 +120,61 @@ class PairingRepositoryTest {
 
         assertEquals(listOf("192.168.1.20", "fe80::1", "desktop.local"), payload.hosts)
         assertEquals("Matt's desktop", payload.desktopName)
+    }
+
+    @Test
+    fun relayPayload_requiresVersionTwoAndACompleteEndpoint() {
+        val parsed = parsedPayload(
+            pairingUri(
+                version = "2",
+                relayHost = "desk-1234.relay.example.com",
+                relayPort = 443,
+            ),
+            scannedAt,
+        )
+        assertEquals(PairingEndpoint("desk-1234.relay.example.com", 443), parsed.relayEndpoint)
+
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(version = "1", relayHost = "desk-1234.relay.example.com", relayPort = 443),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(version = "2", relayHost = "desk-1234.relay.example.com"),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
+    }
+
+    @Test
+    fun versionThreeRelayPairing_isAuthorizedByTheDedicatedPhoneKey() = runBlocking {
+        val digest = ByteArray(32) { (it + 11).toByte() }
+        val payload = parsedPayload(
+            pairingUri(
+                version = "3",
+                relayHost = "desktop-1234.relay.example.com",
+                relayPort = 443,
+                relayAuthorizationDigest = digest,
+            ),
+            scannedAt,
+        )
+        val transport = RecordingPairingTransport(
+            outcomes = mapOf("localhost" to EnrollmentOutcome.Approved("device-v3")),
+        )
+        val authority = FakeDeviceKeys()
+        val result = PairingRepository(
+            transport = transport,
+            deviceKeys = deviceKeys,
+            store = store,
+            relayAuthorityKeys = authority,
+        ).pair(payload, deviceName, scannedAt)
+
+        assertTrue(result is PairingResult.Paired)
+        assertEquals(1, authority.publicKeyRequests)
+        assertEquals(33, transport.lastRelayAuthorityPublicKey?.size)
+        assertTrue(transport.lastRelaySignatureDer?.size in 8..80)
     }
 
     @Test
@@ -296,6 +351,31 @@ class PairingRepositoryTest {
     }
 
     @Test
+    fun relayIsTriedAfterEveryDirectAddressAndIsRememberedSeparately() = runBlocking {
+        val relayHost = "desk-1234.relay.example.com"
+        val payload = parsedPayload(
+            pairingUri(
+                version = "2",
+                hosts = listOf("192.168.1.20", "100.90.1.2"),
+                relayHost = relayHost,
+                relayPort = 443,
+            ),
+            scannedAt,
+        )
+        val transport = RecordingPairingTransport(
+            outcomes = mapOf(relayHost to EnrollmentOutcome.Approved("device-7")),
+        )
+
+        val result = repositoryWith(transport).pair(payload, deviceName, scannedAt)
+
+        assertTrue(result is PairingResult.Paired)
+        assertEquals(listOf("192.168.1.20", "100.90.1.2", relayHost), transport.attempted.map { it.host })
+        assertEquals(listOf("192.168.1.20", "100.90.1.2"), store.all().single().hosts)
+        assertEquals(relayHost, store.all().single().relayHost)
+        assertEquals(443, store.all().single().relayPort)
+    }
+
+    @Test
     fun disconnectAfterSecretWasSent_doesNotTryAnotherCandidate() = runBlocking {
         val payload = parsedPayload(
             pairingUri(hosts = listOf("first.local", "second.local")),
@@ -398,6 +478,8 @@ class PairingRepositoryTest {
                     enrollmentSecret = payload.secret,
                     deviceName = deviceName,
                     devicePublicKey = deviceKeys.devicePublicKey(),
+                    relayAuthorityPublicKey = null,
+                    relaySignatureDer = null,
                     onPending = {},
                 )
             }
@@ -613,6 +695,8 @@ class PairingRepositoryTest {
                 enrollmentSecret: EnrollmentSecret,
                 deviceName: String,
                 devicePublicKey: ByteArray,
+                relayAuthorityPublicKey: ByteArray?,
+                relaySignatureDer: ByteArray?,
                 onPending: () -> Unit,
             ): EnrollmentOutcome {
                 if (enrollmentSecret.consume { Unit } is EnrollmentSecret.Consumption.AlreadyConsumed) {
