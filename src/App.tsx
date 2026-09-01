@@ -2628,29 +2628,7 @@ export default function App() {
                   </button>
                 );
               })}
-              {rootObj?.sessionId && rootKey !== null && !previewSession && (
-                <div className="strip-right">
-                  {(broughtIn[rootObj.sessionId] ?? [])
-                    .filter((r) => !tabs.some((t) => t.sessionId === r.sessionId))
-                    .map((r) => (
-                      <span key={r.sessionId} className="recall-chip" title={`Reopen ${r.title} — brought in ${fullTime(r.at)}`}>
-                        <button className="recall-open" onClick={() => void reopenBroughtIn(rootKey, r)}>
-                          <Icon of={RotateCcw} size="sm" /> <AgentIcon agent={r.agentId} size={11} /> {r.title}
-                        </button>
-                        <button className="recall-x" title="Forget" onClick={() => setBroughtIn((m) => ({ ...m, [rootObj.sessionId!]: (m[rootObj.sessionId!] ?? []).filter((x) => x.sessionId !== r.sessionId) }))}><Icon of={X} size="sm" /></button>
-                      </span>
-                    ))}
-                  {relayCtl.relay && relayCtl.relay.aKey === rootKey ? null : (
-                    <button
-                      className="strip-btn"
-                      title="Bring a read-only second agent into this session"
-                      onClick={() => setShowBringIn((shown) => !shown)}
-                    >
-                      <Icon of={Users} size="sm" /> Bring in…
-                    </button>
-                  )}
-                </div>
-              )}
+
             </div>
           )}
           {showBringIn && rootObj?.sessionId && !previewSession && (
@@ -2710,8 +2688,27 @@ export default function App() {
                   </button>
                 );
               })}
-              {!previewSession && relayCtl.relay && relayCtl.relay.aKey === rootKey && (
+              {!previewSession && rootObj?.sessionId && rootKey !== null && (
                 <div className="strip-right">
+                  {(broughtIn[rootObj.sessionId] ?? [])
+                    .filter((r) => !tabs.some((t) => t.sessionId === r.sessionId))
+                    .map((r) => (
+                      <span key={r.sessionId} className="recall-chip" title={`Reopen ${r.title} — brought in ${fullTime(r.at)}`}>
+                        <button className="recall-open" onClick={() => void reopenBroughtIn(rootKey, r)}>
+                          <Icon of={RotateCcw} size="sm" /> <AgentIcon agent={r.agentId} size={11} /> {r.title}
+                        </button>
+                        <button className="recall-x" title="Forget" onClick={() => setBroughtIn((m) => ({ ...m, [rootObj.sessionId!]: (m[rootObj.sessionId!] ?? []).filter((x) => x.sessionId !== r.sessionId) }))}><Icon of={X} size="sm" /></button>
+                      </span>
+                    ))}
+                  {!relayCtl.relay || relayCtl.relay.aKey !== rootKey ? (
+                    <button
+                      className="strip-btn"
+                      title="Bring a read-only second agent into this session"
+                      onClick={() => setShowBringIn((shown) => !shown)}
+                    >
+                      <Icon of={Users} size="sm" /> Bring in…
+                    </button>
+                  ) : (
                   <span
                     className={"relay-pill " + relayCtl.relay.phase}
                     title={relayCtl.relay.note || undefined}
@@ -2747,6 +2744,7 @@ export default function App() {
                       </button>
                     )}
                   </span>
+                  )}
                 </div>
               )}
               {fileTabs.filter(showsFile).map((f) => (
