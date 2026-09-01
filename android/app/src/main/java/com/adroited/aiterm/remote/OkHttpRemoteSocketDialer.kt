@@ -28,9 +28,9 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
         require(desktop.hosts.isNotEmpty())
         val client = pinnedClient(desktop.serverSpkiFingerprint)
         var lastFailure: Exception? = null
-        for (host in desktop.hosts) {
+        for (candidate in orderedEndpoints(desktop)) {
             try {
-                return openEndpoint(client, endpoint(host, desktop.port))
+                return openEndpoint(client, endpoint(candidate.host, candidate.port))
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
@@ -38,6 +38,30 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
             }
         }
         throw RemoteProtocolException("no paired desktop address was reachable", lastFailure)
+    }
+
+    internal data class Endpoint(val host: String, val port: Int, val route: Route)
+    internal enum class Route { LAN, VPN, RELAY }
+
+    internal fun orderedEndpoints(desktop: PairedDesktop): List<Endpoint> {
+        val direct = desktop.hosts.map { host ->
+            Endpoint(host, desktop.port, if (isLanHost(host)) Route.LAN else Route.VPN)
+        }.sortedBy { it.route.ordinal }
+        val relay = desktop.relayHost?.let { host ->
+            desktop.relayPort?.let { port -> Endpoint(host, port, Route.RELAY) }
+        }
+        return direct + listOfNotNull(relay)
+    }
+
+    private fun isLanHost(host: String): Boolean {
+        val normalized = host.lowercase()
+        if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true
+        val octets = host.split('.').mapNotNull(String::toIntOrNull)
+        if (octets.size != 4 || octets.any { it !in 0..255 }) return false
+        return octets[0] == 10 ||
+            (octets[0] == 172 && octets[1] in 16..31) ||
+            (octets[0] == 192 && octets[1] == 168) ||
+            octets[0] == 127
     }
 
     private fun pinnedClient(fingerprint: String): OkHttpClient {

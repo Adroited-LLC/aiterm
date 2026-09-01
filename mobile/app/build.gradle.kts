@@ -48,11 +48,6 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.play.code.scanner)
     implementation(libs.coil.compose)
-    // iroh: reach a paired desktop by node id when no address works.
-    implementation("computer.iroh:iroh-android:1.1.0") {
-        exclude(group = "net.java.dev.jna", module = "jna")
-    }
-    implementation("net.java.dev.jna:jna:5.15.0@aar")
     implementation(libs.coil.svg)
     debugImplementation(libs.compose.ui.tooling)
 }

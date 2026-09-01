@@ -65,7 +65,7 @@ class PairingRepositoryTest {
 
     @Test
     fun unknownPayloadVersion_isRejectedOutright() {
-        val result = PairingPayload.parse(pairingUri(version = "2"), scannedAt)
+        val result = PairingPayload.parse(pairingUri(version = "3"), scannedAt)
 
         assertEquals(
             PairingPayloadResult.Rejected(PairingFailure.UNSUPPORTED_VERSION),
@@ -120,6 +120,32 @@ class PairingRepositoryTest {
 
         assertEquals(listOf("192.168.1.20", "fe80::1", "desktop.local"), payload.hosts)
         assertEquals("Matt's desktop", payload.desktopName)
+    }
+
+    @Test
+    fun relayPayload_requiresVersionTwoAndACompleteEndpoint() {
+        val parsed = parsedPayload(
+            pairingUri(
+                version = "2",
+                relayHost = "desk-1234.relay.example.com",
+                relayPort = 443,
+            ),
+            scannedAt,
+        )
+        assertEquals(PairingEndpoint("desk-1234.relay.example.com", 443), parsed.relayEndpoint)
+
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(version = "1", relayHost = "desk-1234.relay.example.com", relayPort = 443),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(version = "2", relayHost = "desk-1234.relay.example.com"),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
     }
 
     @Test
@@ -293,6 +319,31 @@ class PairingRepositoryTest {
 
         assertEquals(PairingResult.Rejected(PairingFailure.UNREACHABLE), result)
         assertEquals(emptyList<PairedDesktop>(), store.all())
+    }
+
+    @Test
+    fun relayIsTriedAfterEveryDirectAddressAndIsRememberedSeparately() = runBlocking {
+        val relayHost = "desk-1234.relay.example.com"
+        val payload = parsedPayload(
+            pairingUri(
+                version = "2",
+                hosts = listOf("192.168.1.20", "100.90.1.2"),
+                relayHost = relayHost,
+                relayPort = 443,
+            ),
+            scannedAt,
+        )
+        val transport = RecordingPairingTransport(
+            outcomes = mapOf(relayHost to EnrollmentOutcome.Approved("device-7")),
+        )
+
+        val result = repositoryWith(transport).pair(payload, deviceName, scannedAt)
+
+        assertTrue(result is PairingResult.Paired)
+        assertEquals(listOf("192.168.1.20", "100.90.1.2", relayHost), transport.attempted.map { it.host })
+        assertEquals(listOf("192.168.1.20", "100.90.1.2"), store.all().single().hosts)
+        assertEquals(relayHost, store.all().single().relayHost)
+        assertEquals(443, store.all().single().relayPort)
     }
 
     @Test

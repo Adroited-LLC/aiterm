@@ -1164,6 +1164,18 @@ export const remoteStart = (address: string, port: number) =>
  *  turning remote access off is not the same statement as distrusting a phone. */
 export const remoteStop = () => invoke<RemoteStatus>("remote_stop");
 
+export const remoteRelayConfigure = (
+  connectorUrl: string,
+  publicHost: string,
+  publicPort: number,
+  routeId: string,
+  token: string | null,
+) => invoke<RemoteStatus>("remote_relay_configure", {
+  connectorUrl, publicHost, publicPort, routeId, token,
+});
+
+export const remoteRelayClear = () => invoke<RemoteStatus>("remote_relay_clear");
+
 /** A single-use, five-minute enrollment QR, rendered to SVG by the backend so
  *  the secret never exists as a string in this process. */
 export const remoteBeginPairing = () => invoke<PairingInvite>("remote_begin_pairing");

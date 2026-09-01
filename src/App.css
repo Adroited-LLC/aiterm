@@ -2536,6 +2536,12 @@ button.acty-row:hover { background: var(--bg-hover); }
 .remote-listener-control { display: flex; align-items: center; gap: 6px; width: 100%; }
 .remote-listener-control .set-select { flex: 1; min-width: 0; width: auto; }
 .remote-listener-control .set-recheck { flex-shrink: 0; padding-block: 6px; }
+.remote-relay-grid { display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 8px; width: 100%; }
+.remote-relay-grid .set-input { margin: 0; }
+.remote-relay-grid .set-input:first-child,
+.remote-relay-grid .set-input:nth-child(2),
+.remote-relay-grid .set-input:nth-child(5) { grid-column: 1 / -1; }
+.remote-relay-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
 
 input[type="range"] {
   -webkit-appearance: none;

@@ -13,8 +13,6 @@ data class Desktop(
     val candidates: List<String> = listOf(baseUrl),
     /** SHA-256 of the desktop's certificate, hex. The only thing we trust. */
     val fingerprint: String = "",
-    /** iroh node id, for reaching this desktop when no address works. */
-    val iroh: String = "",
 ) {
     /** The address that answered last, then the rest in the QR's order. */
     val ordered: List<String> get() = listOf(baseUrl) + candidates.filter { it != baseUrl }

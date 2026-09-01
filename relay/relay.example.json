@@ -1,0 +1,11 @@
+{
+  "connector_listen": "127.0.0.1:8080",
+  "ingress_listen": "0.0.0.0:443",
+  "public_domain": "relay.example.com",
+  "routes": [
+    {
+      "id": "replace-with-a-random-route-id",
+      "token_sha256": "replace-with-the-lowercase-sha256-of-a-random-connector-token"
+    }
+  ]
+}

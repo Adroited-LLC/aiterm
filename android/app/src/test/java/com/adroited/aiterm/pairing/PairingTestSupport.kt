@@ -24,6 +24,8 @@ internal fun pairingUri(
     fingerprint: String = ByteArray(32) { 7 }.toBase64Url(),
     secret: ByteArray = ByteArray(32) { it.toByte() },
     name: String = "Matt%27s%20desktop",
+    relayHost: String? = null,
+    relayPort: Int? = null,
 ): String = buildString {
     append("aiterm://pair?v=").append(version)
     hosts.forEach { append("&h=").append(it) }
@@ -31,6 +33,8 @@ internal fun pairingUri(
     append("&f=").append(fingerprint)
     append("&s=").append(secret.toBase64Url())
     append("&n=").append(name)
+    relayHost?.let { append("&r=").append(it) }
+    relayPort?.let { append("&q=").append(it) }
 }
 
 internal fun parsedPayload(

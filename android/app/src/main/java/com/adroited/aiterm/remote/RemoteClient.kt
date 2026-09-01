@@ -554,6 +554,9 @@ class RemoteClient(
         }
     }
 
+    suspend fun gatewayRoutes(): RemoteGatewayRoutes =
+        RemoteCommands.gatewayRoutes(requestResource("gateway.routes", byteArrayOf()))
+
     fun refreshTabs() {
         launchRequest("tab.list", byteArrayOf()) { payload ->
             mutableState.value = mutableState.value.copy(tabs = RemoteCommands.tabs(payload))

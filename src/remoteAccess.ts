@@ -20,6 +20,16 @@ export interface RemoteStatus {
   port: number | null;
   /** SHA-256 of the listener's SPKI, base64url. The phone pins this. */
   fingerprint: string | null;
+  relay?: RelayStatus;
+}
+
+export interface RelayStatus {
+  configured: boolean;
+  connector_url: string | null;
+  public_host: string | null;
+  public_port: number | null;
+  route_id: string | null;
+  state: "off" | "connecting" | "connected" | "retrying";
 }
 
 export interface ListenerConfig {
@@ -189,4 +199,14 @@ export function listenerLabel(status: RemoteStatus): string {
   if (!status.enabled) return "off";
   if (!status.address || status.port === null) return "starting";
   return `${status.address}:${status.port}`;
+}
+
+export function relayLabel(status: RemoteStatus): string {
+  const relay = status.relay;
+  if (!relay?.configured) return "not configured";
+  const endpoint = relay.public_host && relay.public_port
+    ? `${relay.public_host}:${relay.public_port}`
+    : "configured";
+  if (!status.enabled) return `${endpoint} — off`;
+  return `${endpoint} — ${relay.state}`;
 }

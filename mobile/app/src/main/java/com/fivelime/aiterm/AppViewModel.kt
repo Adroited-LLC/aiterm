@@ -181,15 +181,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             pairing = true
             try {
-                // The QR's addresses, then — when the desktop has one — its
-                // iroh node id via the local bridge, so pairing succeeds even
-                // on a network where no address is reachable at all.
-                val bridge = if (link.iroh.isNotEmpty()) IrohBridge.urlFor(getApplication(), link.iroh) else null
-                val candidates = link.candidates + listOfNotNull(bridge)
-                for (url in candidates) {
-                    // The bridge deserves more patience than an address: its
-                    // first reach includes discovery and the relay handshake.
-                    val patience = if (url == bridge) 15L else 4L
+                for (url in link.candidates) {
+                    val patience = 4L
                     val t0 = System.currentTimeMillis()
                     val status = try { Api(url, link.token, link.fingerprint, patience).status() } catch (e: IOException) {
                         android.util.Log.i("Aiterm", "pair probe $url → ${e.javaClass.simpleName}: ${e.message} in ${System.currentTimeMillis() - t0}ms")
@@ -199,7 +192,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     android.util.Log.i("Aiterm", "pair probe $url → ok in ${System.currentTimeMillis() - t0}ms")
                     if (status.api != 1) { notice = "This desktop speaks a newer protocol — update the app"; return@launch }
-                    val d = Desktop(url, link.token, status.name, link.candidates, link.fingerprint, link.iroh)
+                    val d = Desktop(url, link.token, status.name, link.candidates, link.fingerprint)
                     adopt(d)
                     return@launch
                 }
@@ -291,8 +284,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun onStop() { foreground = false; pausedAt = System.currentTimeMillis(); disconnect() }
 
-    /** Prefer-order for probing: Tailscale/CGNAT, then LAN, then everything
-     *  else — the public address last. "Last good" is no tiebreak worth
+    /** Prefer-order for probing: LAN/VPN, then everything else. "Last good" is no tiebreak worth
      *  having: after a day out it is the public IP, and from inside the LAN
      *  most routers refuse to hairpin their own port mapping, so the LAN
      *  address must win whenever it answers. */
@@ -313,11 +305,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         ws?.cancel()
         connectJob = viewModelScope.launch {
             // The desktop may be on a different address than last time — home
-            // Wi‑Fi, USB, Tailscale. Probe every known address at once and
-            // commit to the most local one that answers. The iroh bridge is
-            // the always-answering last resort: anything more direct wins.
-            val bridge = if (d.iroh.isNotEmpty())
-                runCatching { IrohBridge.urlFor(getApplication(), d.iroh) }.getOrNull() else null
+            // Wi-Fi, USB, or a VPN. Probe every known address and commit to
+            // the first one that answers.
             // The route that won last time goes FIRST, whatever its rank: on
             // client-isolated office Wi‑Fi the bridge answers in ~0.7s while
             // the doomed LAN probe eats its full 4s timeout — and rank-order
@@ -326,7 +315,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // Locality still wins the day: losing probes keep running below,
             // and a more local answer switches the connection live.
             val myGen = ++connectGen
-            val urls = (listOf(d.baseUrl) + d.ordered.drop(1).sortedBy { rank(it) } + listOfNotNull(bridge)).distinct()
+            val urls = (listOf(d.baseUrl) + d.ordered.drop(1).sortedBy { rank(it) }).distinct()
             // Probes live on the outer scope, not this coroutine: a losing
             // probe blocks in OkHttp until its own timeout, and it must not
             // hold up committing to the address that already answered.
@@ -348,17 +337,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // The desktop reports every address it answers on right now;
             // adopt that list so a DHCP move or new public IP never strands
             // us with only the addresses the QR knew at pairing time.
-            // The bridge answers on a loopback port, not the desktop's own;
-            // fresh addresses keep the desktop's real port instead.
-            val port = if (reachable == bridge)
-                (listOf(d.baseUrl) + d.candidates).firstOrNull { !it.contains("//127.0.0.1:") }?.substringAfterLast(':')
-                    ?: reachable.substringAfterLast(':')
-            else reachable.substringAfterLast(':')
+            val port = reachable.substringAfterLast(':')
             val fresh = status.hosts.map { "https://$it:$port" }
             val candidates = (fresh.ifEmpty { d.candidates } + reachable).distinct()
-            val iroh = status.iroh ?: d.iroh
-            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh) {
-                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh)
+            if (reachable != d.baseUrl || candidates != d.candidates) {
+                val nd = d.copy(baseUrl = reachable, candidates = candidates)
                 desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
                 store.saveAll(desktops)
                 desktop = nd

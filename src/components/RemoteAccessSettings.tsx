@@ -6,6 +6,7 @@ import {
   inviteToShow,
   lastSeenLabel,
   listenerLabel,
+  relayLabel,
   listenerAddressOptions,
   nextRevokeStep,
   preferredListenerConfig,
@@ -24,6 +25,8 @@ import {
   remoteInterfaces,
   remotePendingPairings,
   remoteRevokeDevice,
+  remoteRelayClear,
+  remoteRelayConfigure,
   remoteStart,
   remoteStatus,
   remoteStop,
@@ -70,6 +73,11 @@ export default function RemoteAccessSettings() {
   const [addresses, setAddresses] = useState<string[]>([]);
   const [address, setAddress] = useState<string>("");
   const [port, setPort] = useState(DEFAULT_PORT);
+  const [relayConnectorUrl, setRelayConnectorUrl] = useState("");
+  const [relayPublicHost, setRelayPublicHost] = useState("");
+  const [relayPublicPort, setRelayPublicPort] = useState(443);
+  const [relayRouteId, setRelayRouteId] = useState("");
+  const [relayToken, setRelayToken] = useState("");
   const [invite, setInvite] = useState<PairingInvite | null>(null);
   const [pending, setPending] = useState<PendingPairing[]>([]);
   const [devices, setDevices] = useState<TrustedDevice[]>([]);
@@ -99,12 +107,24 @@ export default function RemoteAccessSettings() {
         );
         setAddress(initial.address);
         setPort(initial.port);
+        setRelayConnectorUrl(currentStatus.relay?.connector_url ?? "");
+        setRelayPublicHost(currentStatus.relay?.public_host ?? "");
+        setRelayPublicPort(currentStatus.relay?.public_port ?? 443);
+        setRelayRouteId(currentStatus.relay?.route_id ?? "");
       })
       .catch(() => {
         setStatus(null);
         setAddresses([]);
       });
   }, [refresh]);
+
+  useEffect(() => {
+    if (!status?.enabled || !status.relay?.configured) return;
+    const timer = setInterval(() => {
+      remoteStatus().then(setStatus).catch(() => {});
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [status?.enabled, status?.relay?.configured]);
 
   // A phone that scans the QR appears here only once the desktop notices it,
   // so poll while a pairing is actually in flight — and only then.
@@ -140,11 +160,11 @@ export default function RemoteAccessSettings() {
   return (
     <>
       <div className="sgroup">
-        <div className="sgroup-title">Listener</div>
+        <div className="sgroup-title">Remote connection</div>
         <div className="sgroup-rows">
           <Row
             label="Remote access"
-            desc="Lets a paired phone use this desktop over your LAN or VPN. Off until you turn it on, and never reachable from the internet."
+            desc="Automatically tries LAN, then VPN, then your AITerm Relay. One switch controls the same encrypted desktop gateway on every route."
           >
             <button
               className="set-recheck"
@@ -161,7 +181,7 @@ export default function RemoteAccessSettings() {
           </Row>
           <Row
             label="Address"
-            desc="Choose a LAN or VPN address. Applying a live change briefly reconnects phones."
+            desc="Preferred local address. AITerm listens on the other shareable LAN/VPN addresses too, so phones can switch routes automatically."
           >
             <div className="remote-listener-control">
               <select
@@ -222,6 +242,82 @@ export default function RemoteAccessSettings() {
           </Row>
           <Row label="Status">
             <span className="diag-val">{listenerLabel(status)}</span>
+          </Row>
+          <Row
+            label="AITerm Relay"
+            desc="The relay only forwards opaque TLS bytes. It cannot read device keys, sessions, terminal data, or files."
+          >
+            <span className="diag-val">{relayLabel(status)}</span>
+          </Row>
+          <Row label="Relay setup" desc="Paste the endpoint and route credentials created on your relay server." wide>
+            <div className="remote-relay-grid">
+              <input
+                className="set-input mono"
+                value={relayConnectorUrl}
+                disabled={status.enabled}
+                placeholder="wss://control.relay.example.com/v1/connect"
+                aria-label="Relay connector URL"
+                onChange={(event) => setRelayConnectorUrl(event.target.value)}
+              />
+              <input
+                className="set-input mono"
+                value={relayPublicHost}
+                disabled={status.enabled}
+                placeholder="route-id.relay.example.com"
+                aria-label="Relay public host"
+                onChange={(event) => setRelayPublicHost(event.target.value)}
+              />
+              <input
+                className="set-input"
+                type="number"
+                min={1}
+                max={65535}
+                value={relayPublicPort}
+                disabled={status.enabled}
+                aria-label="Relay public port"
+                onChange={(event) => setRelayPublicPort(Number(event.target.value) || 443)}
+              />
+              <input
+                className="set-input mono"
+                value={relayRouteId}
+                disabled={status.enabled}
+                placeholder="route id"
+                aria-label="Relay route ID"
+                onChange={(event) => setRelayRouteId(event.target.value)}
+              />
+              <input
+                className="set-input mono"
+                type="password"
+                value={relayToken}
+                disabled={status.enabled}
+                placeholder={status.relay?.configured ? "Stored — leave blank to keep" : "Connector token"}
+                aria-label="Relay connector token"
+                onChange={(event) => setRelayToken(event.target.value)}
+              />
+              <div className="remote-relay-actions">
+                <button
+                  className="set-recheck"
+                  disabled={status.enabled || !relayConnectorUrl || !relayPublicHost || !relayRouteId}
+                  onClick={() => run(
+                    remoteRelayConfigure(
+                      relayConnectorUrl,
+                      relayPublicHost,
+                      relayPublicPort,
+                      relayRouteId,
+                      relayToken || null,
+                    ),
+                    () => setRelayToken(""),
+                  )}
+                >Save relay</button>
+                {status.relay?.configured && (
+                  <button
+                    className="set-recheck"
+                    disabled={status.enabled}
+                    onClick={() => run(remoteRelayClear())}
+                  >Remove relay</button>
+                )}
+              </div>
+            </div>
           </Row>
           <Row
             label="Certificate fingerprint"

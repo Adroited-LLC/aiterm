@@ -183,6 +183,8 @@ pub fn run() {
             remote::remote_interfaces,
             remote::remote_start,
             remote::remote_stop,
+            remote::remote_relay_configure,
+            remote::remote_relay_clear,
             remote::remote_begin_pairing,
             remote::remote_pending_pairings,
             remote::remote_approve_device,

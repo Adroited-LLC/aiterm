@@ -79,7 +79,12 @@ class PairingPayload private constructor(
     val secret: EnrollmentSecret,
     val desktopName: String,
     val scannedAtEpochMillis: Long,
+    val relayHost: String?,
+    val relayPort: Int?,
 ) {
+
+    val relayEndpoint: PairingEndpoint?
+        get() = relayHost?.let { host -> relayPort?.let { port -> PairingEndpoint(host, port) } }
 
     fun isExpired(nowEpochMillis: Long): Boolean {
         val age = nowEpochMillis - scannedAtEpochMillis
@@ -100,8 +105,9 @@ class PairingPayload private constructor(
         private const val MAX_HOSTS = 8
         private const val MAX_DISPLAY_NAME_CHARS = 128
         private val base64Url = Regex("^[A-Za-z0-9_-]+$")
-        private val singletonFields = setOf("v", "p", "f", "s", "n")
-        private val knownFields = singletonFields + "h"
+        private val requiredSingletonFields = setOf("v", "p", "f", "s", "n")
+        private val optionalSingletonFields = setOf("r", "q")
+        private val knownFields = requiredSingletonFields + optionalSingletonFields + "h"
 
         fun parse(raw: String, scannedAtEpochMillis: Long): PairingPayloadResult {
             if (raw.isEmpty() || raw.length > MAX_URI_CHARS || scannedAtEpochMillis < 0) {
@@ -138,9 +144,12 @@ class PairingPayload private constructor(
                 fields.getOrPut(key) { mutableListOf() } += value
             }
 
-            if (singletonFields.any { fields[it]?.size != 1 }) return malformed()
+            if (
+                requiredSingletonFields.any { fields[it]?.size != 1 } ||
+                optionalSingletonFields.any { fields[it]?.size?.let { count -> count > 1 } == true }
+            ) return malformed()
             val version = fields.getValue("v").single()
-            if (version != "1") {
+            if (version !in setOf("1", "2")) {
                 return PairingPayloadResult.Rejected(PairingFailure.UNSUPPORTED_VERSION)
             }
 
@@ -164,6 +173,26 @@ class PairingPayload private constructor(
                 secretBytes.fill(0)
                 return malformed()
             }
+            val relayHost = fields["r"]?.singleOrNull()
+            val relayPortText = fields["q"]?.singleOrNull()
+            if ((relayHost == null) != (relayPortText == null)) {
+                secretBytes.fill(0)
+                return malformed()
+            }
+            if ((version == "2") != (relayHost != null)) {
+                secretBytes.fill(0)
+                return malformed()
+            }
+            val relayPort = relayPortText?.let { text ->
+                if (text.isEmpty() || text.any { !it.isDigit() }) null else text.toIntOrNull()
+            }
+            if (
+                relayHost?.let { !isValidHost(it) } == true ||
+                (relayPortText != null && relayPort !in 1..65_535)
+            ) {
+                secretBytes.fill(0)
+                return malformed()
+            }
 
             return PairingPayloadResult.Parsed(
                 PairingPayload(
@@ -173,6 +202,8 @@ class PairingPayload private constructor(
                     secret = EnrollmentSecret.takeOwnership(secretBytes),
                     desktopName = name,
                     scannedAtEpochMillis = scannedAtEpochMillis,
+                    relayHost = relayHost,
+                    relayPort = relayPort,
                 ),
             )
         }

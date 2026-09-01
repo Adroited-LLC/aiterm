@@ -122,10 +122,11 @@ class PairingRepository(
         devicePublicKey: ByteArray,
         onAwaitingApproval: () -> Unit,
     ): PairingResult {
-        for (host in payload.hosts) {
+        val directEndpoints = payload.hosts.map { PairingEndpoint(it, payload.port) }
+        for (endpoint in directEndpoints + listOfNotNull(payload.relayEndpoint)) {
             val outcome = try {
                 transport.enroll(
-                    endpoint = PairingEndpoint(host, payload.port),
+                    endpoint = endpoint,
                     serverSpkiFingerprint = payload.serverSpkiFingerprint,
                     enrollmentSecret = enrollmentSecret,
                     deviceName = deviceName,
@@ -150,10 +151,16 @@ class PairingRepository(
                     val desktop = PairedDesktop(
                         deviceId = outcome.deviceId,
                         displayName = payload.desktopName,
-                        hosts = listOf(host) + payload.hosts.filterNot { it == host },
+                        hosts = if (endpoint in directEndpoints) {
+                            listOf(endpoint.host) + payload.hosts.filterNot { it == endpoint.host }
+                        } else {
+                            payload.hosts
+                        },
                         port = payload.port,
                         serverSpkiFingerprint = payload.serverSpkiFingerprint,
                         lastSeenEpochMillis = null,
+                        relayHost = payload.relayHost,
+                        relayPort = payload.relayPort,
                     )
                     try {
                         store.save(desktop)

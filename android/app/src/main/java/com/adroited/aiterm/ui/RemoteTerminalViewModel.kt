@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.adroited.aiterm.pairing.PairedDesktop
+import com.adroited.aiterm.pairing.PairedDesktopStore
 import com.adroited.aiterm.remote.AuthenticatedRemoteTransport
 import com.adroited.aiterm.remote.OkHttpRemoteSocketDialer
 import com.adroited.aiterm.remote.RemoteClient
@@ -25,10 +26,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 
 class RemoteTerminalViewModel(
-    desktop: PairedDesktop,
+    initialDesktop: PairedDesktop,
     deviceKeys: DeviceKeys,
     private val appLock: AppLock,
+    private val pairedDesktopStore: PairedDesktopStore,
 ) : ViewModel() {
+    private var desktop = initialDesktop
     /** Survives terminal tab changes and configuration changes for this ViewModel's lifetime. */
     internal val terminalDrafts = TerminalDraftStore()
     private val screenStore = DefaultTerminalScreenStore()
@@ -64,6 +67,16 @@ class RemoteTerminalViewModel(
     fun reconnect() {
         viewModelScope.launch {
             if (client.connect()) {
+                runCatching {
+                    val routes = client.gatewayRoutes()
+                    desktop = desktop.copy(
+                        hosts = routes.hosts,
+                        port = routes.port,
+                        relayHost = routes.relayHost,
+                        relayPort = routes.relayPort,
+                    )
+                    pairedDesktopStore.save(desktop)
+                }
                 client.refreshSessions()
                 client.refreshAgents()
             }
@@ -228,8 +241,9 @@ class RemoteTerminalViewModel(
             desktop: PairedDesktop,
             deviceKeys: DeviceKeys,
             appLock: AppLock,
+            pairedDesktopStore: PairedDesktopStore,
         ): ViewModelProvider.Factory = viewModelFactory {
-            initializer { RemoteTerminalViewModel(desktop, deviceKeys, appLock) }
+            initializer { RemoteTerminalViewModel(desktop, deviceKeys, appLock, pairedDesktopStore) }
         }
     }
 }
