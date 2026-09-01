@@ -415,6 +415,32 @@ pub trait SessionProvider: Send + Sync {
 
 pub struct ClaudeProvider;
 
+/// Parsed claude rows by transcript path, keyed on (mtime_ms, len) — see the
+/// scan loop. Parsing a transcript costs ~8ms of file reads, and 426 of them
+/// cost every /v1/sessions poll ~3 seconds — the whole of the phone's "really
+/// bad delay" [measured 2026-08-31: claude 426 rows in 3266ms; every other
+/// engine single-digit ms]. A row is a pure function of its file, so a warm
+/// scan fstats each already-opened descriptor and re-parses only what moved.
+/// `None` remembers "this file parses to no session", so a malformed file is
+/// not re-read every poll either. An entry for a deleted file lingers, unused
+/// — rows are only read back for paths discovered this scan — and a few
+/// hundred stale rows of a few hundred bytes are not worth eviction machinery.
+static CLAUDE_SCAN_CACHE: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, (u64, u64, Option<Session>)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The cache key, off the open descriptor — never a path re-traversal.
+fn mtime_len_of(file: &std::fs::File) -> Option<(u64, u64)> {
+    let md = file.metadata().ok()?;
+    let m = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((m, md.len()))
+}
+
 fn scan_claude_root_bounded(
     root: &Path,
     budget: &mut DiscoveryBudget,
@@ -463,14 +489,51 @@ fn scan_claude_root_bounded(
             }
             files.push((project.child_path(&name), file));
         }
-        let dir_cwd = files
-            .iter()
-            .find_map(|(_, file)| file.try_clone().ok().and_then(read_first_cwd_from));
+        // Split cache hits from files whose (mtime, len) moved. Only the
+        // moved ones are parsed; the budget already counted them all — it
+        // bounds discovery, not parsing.
+        let mut cache = CLAUDE_SCAN_CACHE.lock().unwrap();
+        let mut ordered: Vec<std::path::PathBuf> = Vec::with_capacity(files.len());
+        let mut fresh: Vec<(std::path::PathBuf, std::fs::File, (u64, u64))> = Vec::new();
+        let mut held: Vec<std::fs::File> = Vec::new();
         for (path, file) in files {
-            if let Some(session) = parse_session_from(file, &path, dir_cwd.as_deref()) {
-                sessions.push((session, path));
+            let Some(key) = mtime_len_of(&file) else {
+                continue;
+            };
+            ordered.push(path.clone());
+            if cache
+                .get(&path)
+                .is_some_and(|(m, l, _)| (*m, *l) == key)
+            {
+                held.push(file);
+            } else {
+                fresh.push((path, file, key));
             }
         }
+        // The shared cwd is only found when something actually needs parsing:
+        // it reads file heads, which is exactly the cost the cache skips. A
+        // cached neighbour's descriptor still serves — a /fork stub being
+        // parsed fresh borrows the cwd its (cached) siblings recorded.
+        let dir_cwd = if fresh.is_empty() {
+            None
+        } else {
+            fresh
+                .iter()
+                .map(|(_, file, _)| file)
+                .chain(held.iter())
+                .find_map(|file| file.try_clone().ok().and_then(read_first_cwd_from))
+        };
+        drop(held);
+        for (path, file, key) in fresh {
+            let row = parse_session_from(file, &path, dir_cwd.as_deref());
+            cache.insert(path.clone(), (key.0, key.1, row));
+        }
+        for path in ordered {
+            if let Some((_, _, Some(session))) = cache.get(&path) {
+                sessions.push((session.clone(), path));
+            }
+        }
+        drop(cache);
         if budget.remaining() == 0 {
             break;
         }
