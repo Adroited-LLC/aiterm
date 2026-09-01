@@ -81,6 +81,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.clickable
 import com.fivelime.aiterm.AppViewModel
 import com.fivelime.aiterm.Session
+import com.fivelime.aiterm.UsageAmount
+import com.fivelime.aiterm.UsageBar
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -224,6 +226,9 @@ private fun filterColors() = FilterChipDefaults.filterChipColors(
  *  page: the list is for sessions. */
 @Composable
 private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
+    /** Usage sources opened up for the full picture; closed rows show only
+     *  the weekly line. */
+    var expandedUsage by remember { mutableStateOf<Set<String>>(emptySet()) }
     ModalDrawerSheet(drawerContainerColor = Bg) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
             Row(
@@ -274,60 +279,64 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
             }
             vm.usage.forEach { u ->
-                Column(Modifier.padding(horizontal = 20.dp, vertical = 5.dp)) {
+                val expanded = u.id in expandedUsage
+                // The row closed is the answer to "am I fine?": connected, and
+                // how much of the week is gone. Everything else waits for a tap.
+                val weekly = u.bars.firstOrNull {
+                    it.kind.startsWith("weekly") || it.kind == "grok_period" || it.label.contains("week", ignoreCase = true)
+                }
+                // A local router that publishes no balance is not failing —
+                // there is nothing to bill. It is simply active.
+                val healthy = u.state == "ok" || u.state == "no_balance"
+                Column(
+                    Modifier.fillMaxWidth()
+                        .clickable {
+                            expandedUsage = if (expanded) expandedUsage - u.id else expandedUsage + u.id
+                        }
+                        .padding(horizontal = 20.dp, vertical = 6.dp),
+                ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         AgentIcon(u.id.removePrefix("provider:"), 16.dp)
                         Spacer(Modifier.width(8.dp))
                         Text(u.name, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
-                        if (u.plan.isNotBlank()) {
+                        Spacer(Modifier.width(8.dp))
+                        Dot(if (healthy) Green else Amber)
+                        if (!healthy) {
                             Spacer(Modifier.width(6.dp))
-                            Text(u.plan, style = MaterialTheme.typography.labelSmall, color = Muted)
+                            Text(u.state.replace('_', ' '), style = MaterialTheme.typography.labelSmall, color = Amber)
+                        }
+                        Spacer(Modifier.weight(1f))
+                        Icon(
+                            if (expanded) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowRight,
+                            if (expanded) "Show less" else "Show all limits",
+                            tint = Muted,
+                        )
+                    }
+                    if (weekly != null) {
+                        UsageBarRow(UsageBar(weekly.kind, "Weekly", weekly.percent, weekly.severity, weekly.resets_at))
+                    } else {
+                        val credit = u.amounts.firstOrNull()
+                        if (credit != null) {
+                            UsageAmountRow(credit)
+                        } else {
+                            Text("Active", style = MaterialTheme.typography.labelSmall, color = Green,
+                                modifier = Modifier.padding(top = 2.dp))
                         }
                     }
-                    if (u.state != "ok") {
-                        Text(u.detail.ifBlank { u.state }, style = MaterialTheme.typography.labelSmall, color = Amber)
-                    }
-                    // One line per limit: what it is, how full, when it lets go.
-                    u.bars.forEach { b ->
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 3.dp)) {
-                            Text(
-                                b.label, style = MaterialTheme.typography.labelSmall, color = Muted,
-                                modifier = Modifier.width(84.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            )
-                            LinearProgressIndicator(
-                                progress = { (b.percent / 100.0).toFloat().coerceIn(0f, 1f) },
-                                modifier = Modifier.weight(1f),
-                                color = when { b.percent < 50 -> Green; b.percent < 80 -> Amber; else -> Red },
-                                trackColor = Surface1,
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "${b.percent.toInt()}%", style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.width(34.dp), textAlign = TextAlign.End,
-                            )
-                            Text(
-                                resetsIn(b.resets_at), style = MaterialTheme.typography.labelSmall, color = Muted,
-                                modifier = Modifier.width(56.dp), textAlign = TextAlign.End, maxLines = 1,
-                            )
+                    if (expanded) {
+                        if (u.plan.isNotBlank()) {
+                            Text(u.plan, style = MaterialTheme.typography.labelSmall, color = Muted,
+                                modifier = Modifier.padding(top = 3.dp))
                         }
-                    }
-                    u.amounts.forEach { am ->
-                        Row(modifier = Modifier.padding(top = 3.dp)) {
-                            Text(am.label, style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.width(84.dp))
-                            Text(
-                                (if (am.currency == "USD") "$" else "") + "%.2f".format(am.amount) + (am.of?.let { " of %.0f".format(it) } ?: ""),
-                                style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold,
-                            )
+                        u.bars.filter { it !== weekly }.forEach { b -> UsageBarRow(b) }
+                        u.amounts.drop(if (weekly == null) 1 else 0).forEach { am -> UsageAmountRow(am) }
+                        if (!healthy && u.detail.isNotBlank()) {
+                            Text(u.detail, style = MaterialTheme.typography.labelSmall, color = Amber,
+                                modifier = Modifier.padding(top = 3.dp))
                         }
                     }
                 }
             }
-            Text(
-                "limit · bar · used · resets in",
-                style = MaterialTheme.typography.labelSmall, color = Muted.copy(alpha = 0.7f),
-                modifier = Modifier.padding(start = 20.dp, top = 2.dp),
-            )
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
             NavigationDrawerItem(
                 label = { Text("Refresh") },
@@ -496,4 +505,42 @@ internal fun RenameDialog(current: String, onDone: (String) -> Unit, onDismiss: 
         confirmButton = { TextButton(onClick = { onDone(draft) }) { Text("Rename") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+/** One limit line: what it is, how full, when it lets go. */
+@Composable
+private fun UsageBarRow(b: UsageBar) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 3.dp)) {
+        Text(
+            b.label, style = MaterialTheme.typography.labelSmall, color = Muted,
+            modifier = Modifier.width(84.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+        LinearProgressIndicator(
+            progress = { (b.percent / 100.0).toFloat().coerceIn(0f, 1f) },
+            modifier = Modifier.weight(1f),
+            color = when { b.percent < 50 -> Green; b.percent < 80 -> Amber; else -> Red },
+            trackColor = Surface1,
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            "${b.percent.toInt()}%", style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.width(34.dp), textAlign = TextAlign.End,
+        )
+        Text(
+            resetsIn(b.resets_at), style = MaterialTheme.typography.labelSmall, color = Muted,
+            modifier = Modifier.width(56.dp), textAlign = TextAlign.End, maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun UsageAmountRow(am: UsageAmount) {
+    Row(modifier = Modifier.padding(top = 3.dp)) {
+        Text(am.label, style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.width(84.dp))
+        Text(
+            (if (am.currency == "USD") "$" else "") + "%.2f".format(am.amount) + (am.of?.let { " of %.0f".format(it) } ?: ""),
+            style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold,
+        )
+    }
 }
