@@ -261,9 +261,16 @@ export default function App() {
   }>({ revision: null, tabs: [] });
   const appAlive = useRef(true);
   const pendingOpens = useRef(new Map<string, { cancelled: boolean }>());
-  useEffect(() => () => {
-    appAlive.current = false;
-    for (const pending of pendingOpens.current.values()) pending.cancelled = true;
+  useEffect(() => {
+    // Re-armed in the body, not only initialized by the ref: a dev hot
+    // reload re-runs cleanup + effect on the same instance, and a ref left
+    // false by that cleanup silently closed every tab opened afterwards —
+    // the 11ms open-then-close that made resume look dead.
+    appAlive.current = true;
+    return () => {
+      appAlive.current = false;
+      for (const pending of pendingOpens.current.values()) pending.cancelled = true;
+    };
   }, []);
   // Codex changes its session id in-place for `/clear` but has no hook that
   // reports that transition. A terminal's submitted command is the missing
@@ -883,11 +890,13 @@ export default function App() {
             size: { cols: 80, rows: 24 },
           });
           if (pending.cancelled || !appAlive.current) {
+            uiLog(`openTab guard1 closing ${descriptor.id}: cancelled=${pending.cancelled} appAlive=${appAlive.current}`);
             await tabClose(descriptor.id).catch(() => {});
             return null;
           }
           const authoritative = await tabList().catch(() => [descriptor!]);
           if (pending.cancelled || !appAlive.current) {
+            uiLog(`openTab guard2 closing ${descriptor.id}: cancelled=${pending.cancelled} appAlive=${appAlive.current}`);
             await tabClose(descriptor.id).catch(() => {});
             return null;
           }
@@ -896,6 +905,7 @@ export default function App() {
           setActiveTab(descriptor.id);
           if (descriptor.state === "exited") {
             const why = descriptor.exit;
+            uiLog(`openTab exited-branch ${descriptor.id}: code=${why?.code} requested=${why?.requested}`);
             if (why?.code === 0 || why?.requested) {
               await tabClose(descriptor.id).catch(() => {});
               setTabs((current) => current.filter((tab) => tab.key !== descriptor!.id));
