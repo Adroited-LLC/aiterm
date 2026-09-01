@@ -280,21 +280,29 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
             }
             vm.usage.forEach { u ->
                 val expanded = u.id in expandedUsage
-                // The row closed is the answer to "am I fine?": connected, and
-                // how much of the week is gone. Everything else waits for a tap.
                 val weekly = u.bars.firstOrNull {
                     it.kind.startsWith("weekly") || it.kind == "grok_period" || it.label.contains("week", ignoreCase = true)
                 }
                 // A local router that publishes no balance is not failing —
                 // there is nothing to bill. It is simply active.
                 val healthy = u.state == "ok" || u.state == "no_balance"
+                val credit = if (weekly == null) u.amounts.firstOrNull() else null
+                // A caret only where a tap would show something. Grok with one
+                // weekly bar and nothing else is already the whole story.
+                val hasMore = u.bars.any { it !== weekly } ||
+                    u.amounts.size > (if (credit != null) 1 else 0) ||
+                    u.plan.isNotBlank() || (!healthy && u.detail.isNotBlank())
                 Column(
                     Modifier.fillMaxWidth()
-                        .clickable {
-                            expandedUsage = if (expanded) expandedUsage - u.id else expandedUsage + u.id
+                        .let { m ->
+                            if (hasMore) m.clickable {
+                                expandedUsage = if (expanded) expandedUsage - u.id else expandedUsage + u.id
+                            } else m
                         }
-                        .padding(horizontal = 20.dp, vertical = 6.dp),
+                        .padding(horizontal = 20.dp, vertical = 7.dp),
                 ) {
+                    // One line is the whole closed state: who, connected, and
+                    // how much of the week is gone.
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         AgentIcon(u.id.removePrefix("provider:"), 16.dp)
                         Spacer(Modifier.width(8.dp))
@@ -306,21 +314,35 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                             Text(u.state.replace('_', ' '), style = MaterialTheme.typography.labelSmall, color = Amber)
                         }
                         Spacer(Modifier.weight(1f))
-                        Icon(
-                            if (expanded) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowRight,
-                            if (expanded) "Show less" else "Show all limits",
-                            tint = Muted,
-                        )
-                    }
-                    if (weekly != null) {
-                        UsageBarRow(UsageBar(weekly.kind, "Weekly", weekly.percent, weekly.severity, weekly.resets_at))
-                    } else {
-                        val credit = u.amounts.firstOrNull()
-                        if (credit != null) {
-                            UsageAmountRow(credit)
-                        } else {
-                            Text("Active", style = MaterialTheme.typography.labelSmall, color = Green,
-                                modifier = Modifier.padding(top = 2.dp))
+                        when {
+                            weekly != null -> {
+                                LinearProgressIndicator(
+                                    progress = { (weekly.percent / 100.0).toFloat().coerceIn(0f, 1f) },
+                                    modifier = Modifier.width(72.dp),
+                                    color = when { weekly.percent < 50 -> Green; weekly.percent < 80 -> Amber; else -> Red },
+                                    trackColor = Surface1,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    "${weekly.percent.toInt()}%", style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.width(34.dp), textAlign = TextAlign.End,
+                                )
+                            }
+                            credit != null -> Text(
+                                (if (credit.currency == "USD") "$" else "") + "%.2f".format(credit.amount),
+                                style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold,
+                            )
+                            else -> Text("Active", style = MaterialTheme.typography.labelSmall, color = Green)
+                        }
+                        if (hasMore) {
+                            Spacer(Modifier.width(4.dp))
+                            Icon(
+                                if (expanded) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowRight,
+                                if (expanded) "Show less" else "Show all limits",
+                                tint = Muted.copy(alpha = 0.6f),
+                                modifier = Modifier.size(16.dp),
+                            )
                         }
                     }
                     if (expanded) {
@@ -328,8 +350,10 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                             Text(u.plan, style = MaterialTheme.typography.labelSmall, color = Muted,
                                 modifier = Modifier.padding(top = 3.dp))
                         }
-                        u.bars.filter { it !== weekly }.forEach { b -> UsageBarRow(b) }
-                        u.amounts.drop(if (weekly == null) 1 else 0).forEach { am -> UsageAmountRow(am) }
+                        // The full picture, weekly included — with its real
+                        // label and reset, which the closed line leaves out.
+                        u.bars.forEach { b -> UsageBarRow(b) }
+                        u.amounts.forEach { am -> UsageAmountRow(am) }
                         if (!healthy && u.detail.isNotBlank()) {
                             Text(u.detail, style = MaterialTheme.typography.labelSmall, color = Amber,
                                 modifier = Modifier.padding(top = 3.dp))
