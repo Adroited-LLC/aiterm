@@ -1,7 +1,10 @@
 use super::auth::{set_private_permissions, write_private_file};
-use aiterm_relay_protocol::Frame;
+use aiterm_relay_protocol::{enrollment_digest, Frame};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -20,6 +23,80 @@ const STREAM_QUEUE: usize = 32;
 const OUTGOING_QUEUE: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PROVISION_RESPONSE_BYTES: u64 = 8 * 1024;
+
+#[derive(Clone)]
+pub struct RelayEnrollmentDraft {
+    control_origin: String,
+    config: RelayConfig,
+    token_sha256: [u8; 32],
+    desktop_spki_sha256: [u8; 32],
+    authorization_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for RelayEnrollmentDraft {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RelayEnrollmentDraft")
+            .field("control_origin", &self.control_origin)
+            .field("public_host", &self.config.public_host)
+            .field("route_id", &self.config.route_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RelayEnrollmentDraft {
+    pub fn authorization_digest(&self) -> &[u8; 32] {
+        &self.authorization_digest
+    }
+
+    pub fn public_endpoint(&self) -> (&str, u16) {
+        (&self.config.public_host, self.config.public_port)
+    }
+
+    pub async fn register(
+        &self,
+        authority_public_key: &[u8],
+        signature_der: &[u8],
+    ) -> Result<RelayConfig, String> {
+        if authority_public_key.len() != 33 || !(8..=80).contains(&signature_der.len()) {
+            return Err("the phone returned an invalid relay authorization".into());
+        }
+        let mut endpoint = validated_server_origin(&self.control_origin)?;
+        endpoint.set_path("/v1/provision");
+        let request = ProvisionRouteRequest {
+            route_id: &self.config.route_id,
+            token_sha256: hex_bytes(&self.token_sha256),
+            desktop_spki_sha256: URL_SAFE_NO_PAD.encode(self.desktop_spki_sha256),
+            authority_public_key: URL_SAFE_NO_PAD.encode(authority_public_key),
+            signature_der: URL_SAFE_NO_PAD.encode(signature_der),
+        };
+        let response = provisioning_client()?
+            .post(endpoint)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|_| "the relay server could not be reached".to_string())?;
+        if !response.status().is_success() {
+            return Err(match response.status().as_u16() {
+                404 => "this relay server does not support automatic setup".into(),
+                409 => "the relay route was already claimed".into(),
+                429 => "this phone or network has reached the relay route limit".into(),
+                _ => format!("relay setup failed with status {}", response.status().as_u16()),
+            });
+        }
+        let provisioned: ProvisionedRelay = bounded_json(response).await?;
+        if provisioned.connector_url != self.config.connector_url
+            || provisioned.public_host != self.config.public_host
+            || provisioned.public_port != self.config.public_port
+            || provisioned.route_id != self.config.route_id
+        {
+            return Err("the relay server returned a different route than the phone authorized".into());
+        }
+        self.config.validate()?;
+        Ok(self.config.clone())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +106,8 @@ pub struct RelayConfig {
     pub public_port: u16,
     pub route_id: String,
     pub token: String,
+    #[serde(default)]
+    pub managed: bool,
 }
 
 impl RelayConfig {
@@ -97,6 +176,159 @@ impl RelayConfig {
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
         write_private_file(&root.join(CONFIG_FILE), &bytes).map_err(|error| error.to_string())
     }
+
+    pub async fn prepare_enrollment(
+        server: &str,
+        desktop_spki_fingerprint: &str,
+    ) -> Result<RelayEnrollmentDraft, String> {
+        let base = validated_server_origin(server)?;
+        let control_origin = base.as_str().trim_end_matches('/').to_string();
+        let mut info_url = base;
+        info_url.set_path("/v1/info");
+        let response = provisioning_client()?
+            .get(info_url)
+            .send()
+            .await
+            .map_err(|_| "the relay server could not be reached".to_string())?;
+        if !response.status().is_success() {
+            return Err("this relay server does not support automatic setup".into());
+        }
+        let info: RelayInfo = bounded_json(response).await?;
+        let returned_origin = validated_server_origin(&info.control_origin)?;
+        if returned_origin.as_str().trim_end_matches('/') != control_origin {
+            return Err("the relay server returned an unexpected control identity".into());
+        }
+        let public_domain = normalize_dns_name(&info.public_domain)
+            .filter(|value| value == &info.public_domain)
+            .ok_or_else(|| "the relay server returned an invalid public domain".to_string())?;
+        let decoded_spki = URL_SAFE_NO_PAD.decode(desktop_spki_fingerprint.as_bytes())
+            .map_err(|_| "the desktop identity fingerprint is invalid".to_string())?;
+        let desktop_spki_sha256: [u8; 32] = decoded_spki.try_into()
+            .map_err(|_| "the desktop identity fingerprint is invalid".to_string())?;
+        let mut route_bytes = [0u8; 12];
+        let mut token_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut route_bytes);
+        OsRng.fill_bytes(&mut token_bytes);
+        let route_id = format!("desktop-{}", hex_bytes(&route_bytes));
+        let token = URL_SAFE_NO_PAD.encode(token_bytes);
+        let token_sha256: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let config = Self {
+            connector_url: info.connector_url,
+            public_host: format!("{route_id}.{public_domain}"),
+            public_port: info.public_port,
+            route_id,
+            token,
+            managed: true,
+        };
+        config.validate()?;
+        let authorization_digest = enrollment_digest(
+            &control_origin,
+            &config.route_id,
+            &token_sha256,
+            &desktop_spki_sha256,
+        );
+        Ok(RelayEnrollmentDraft {
+            control_origin,
+            config,
+            token_sha256,
+            desktop_spki_sha256,
+            authorization_digest,
+        })
+    }
+
+    pub async fn deprovision(&self) -> Result<(), String> {
+        if !self.managed {
+            return Ok(());
+        }
+        let mut url = url::Url::parse(&self.connector_url)
+            .map_err(|_| "stored relay connector URL is invalid".to_string())?;
+        url.set_scheme(if url.scheme() == "wss" { "https" } else { "http" })
+            .map_err(|_| "stored relay connector URL is invalid".to_string())?;
+        url.set_path(&format!("/v1/routes/{}", self.route_id));
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::builder()
+            .timeout(PROVISION_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| "could not initialize relay removal".to_string())?;
+        let response = client.delete(url).bearer_auth(&self.token).send().await
+            .map_err(|_| "the relay server could not be reached".to_string())?;
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(format!("relay removal failed with status {}", response.status().as_u16()))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionedRelay {
+    connector_url: String,
+    public_host: String,
+    public_port: u16,
+    route_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayInfo {
+    control_origin: String,
+    connector_url: String,
+    public_domain: String,
+    public_port: u16,
+}
+
+#[derive(Serialize)]
+struct ProvisionRouteRequest<'a> {
+    route_id: &'a str,
+    token_sha256: String,
+    desktop_spki_sha256: String,
+    authority_public_key: String,
+    signature_der: String,
+}
+
+fn validated_server_origin(server: &str) -> Result<url::Url, String> {
+    let base = url::Url::parse(server).map_err(|_| "relay server URL is invalid".to_string())?;
+    let local_http = base.scheme() == "http"
+        && matches!(base.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    if !(base.scheme() == "https" || local_http)
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+        || !matches!(base.path(), "" | "/")
+    {
+        return Err("relay server must be an https:// origin without credentials or a path".into());
+    }
+    Ok(base)
+}
+
+fn provisioning_client() -> Result<reqwest::Client, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+        .timeout(PROVISION_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "could not initialize relay provisioning".to_string())
+}
+
+async fn bounded_json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
+    if response.content_length().is_some_and(|length| length > MAX_PROVISION_RESPONSE_BYTES) {
+        return Err("the relay server returned an oversized setup response".into());
+    }
+    let bytes = response.bytes().await
+        .map_err(|_| "the relay setup response could not be read".to_string())?;
+    if bytes.len() as u64 > MAX_PROVISION_RESPONSE_BYTES {
+        return Err("the relay server returned an oversized setup response".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "the relay server returned an invalid setup response".to_string())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -344,6 +576,11 @@ fn valid_route_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+    use p256::elliptic_curve::rand_core::OsRng;
     use std::fs;
 
     fn valid_config() -> RelayConfig {
@@ -353,6 +590,7 @@ mod tests {
             public_port: 443,
             route_id: "desk-1234".into(),
             token: "x".repeat(43),
+            managed: false,
         }
     }
 
@@ -384,5 +622,61 @@ mod tests {
         config.save(&root).unwrap();
         assert_eq!(RelayConfig::load(&root).unwrap(), Some(config));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn phone_signed_provisioning_keeps_the_connector_secret_on_the_desktop() {
+        #[derive(Clone)]
+        struct TestServer {
+            origin: String,
+            connector_url: String,
+        }
+        async fn info(State(state): State<TestServer>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "control_origin": state.origin,
+                "connector_url": state.connector_url,
+                "public_domain": "relay.example.com",
+                "public_port": 443,
+            }))
+        }
+        async fn provision(
+            State(state): State<TestServer>,
+            Json(request): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let route = request["route_id"].as_str().unwrap();
+            Json(serde_json::json!({
+                "connector_url": state.connector_url,
+                "public_host": format!("{route}.relay.example.com"),
+                "public_port": 443,
+                "route_id": route,
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let test_state = TestServer {
+            origin: origin.clone(),
+            connector_url: format!("ws://{address}/v1/connect"),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new()
+                .route("/v1/info", get(info))
+                .route("/v1/provision", post(provision))
+                .with_state(test_state))
+                .await
+                .unwrap();
+        });
+
+        let desktop_fingerprint = URL_SAFE_NO_PAD.encode([9u8; 32]);
+        let draft = RelayConfig::prepare_enrollment(&origin, &desktop_fingerprint).await.unwrap();
+        let authority = SigningKey::random(&mut OsRng);
+        let signature: Signature = authority.sign(draft.authorization_digest());
+        let config = draft.register(
+            authority.verifying_key().to_encoded_point(true).as_bytes(),
+            signature.to_der().as_bytes(),
+        ).await.unwrap();
+        assert_eq!(config.token.len(), 43);
+        assert!(config.validate().is_ok());
+        server.abort();
     }
 }

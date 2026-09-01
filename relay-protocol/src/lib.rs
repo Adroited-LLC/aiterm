@@ -6,6 +6,7 @@
 //! requests, device credentials, terminal state, or session data.
 
 use std::fmt;
+use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 4] = b"ATRP";
 const VERSION: u8 = 1;
@@ -13,6 +14,29 @@ const HEADER_BYTES: usize = 14;
 pub const MAX_DATA_BYTES: usize = 64 * 1024;
 pub const MAX_CLOSE_REASON_BYTES: usize = 1024;
 pub const MAX_FRAME_BYTES: usize = HEADER_BYTES + MAX_DATA_BYTES;
+
+/// The exact digest a phone authorizes when it grants a desktop a relay
+/// route. Length-prefixing every variable field makes the statement
+/// unambiguous across Rust and Android implementations.
+pub fn enrollment_digest(
+    control_origin: &str,
+    route_id: &str,
+    token_sha256: &[u8; 32],
+    desktop_spki_sha256: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"aiterm-relay-enrollment-v1\0");
+    update_field(&mut digest, control_origin.as_bytes());
+    update_field(&mut digest, route_id.as_bytes());
+    update_field(&mut digest, token_sha256);
+    update_field(&mut digest, desktop_spki_sha256);
+    digest.finalize().into()
+}
+
+fn update_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u32).to_be_bytes());
+    digest.update(value);
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -156,5 +180,35 @@ mod tests {
         let mut unknown = Frame::Ping.encode().unwrap();
         unknown[5] = 99;
         assert!(Frame::decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn enrollment_digest_is_domain_and_route_bound() {
+        let token = [7; 32];
+        let desktop = [9; 32];
+        let expected = enrollment_digest(
+            "https://control.relay.example.com:8443",
+            "desktop-1234",
+            &token,
+            &desktop,
+        );
+        assert_ne!(
+            expected,
+            enrollment_digest(
+                "https://other.example.com:8443",
+                "desktop-1234",
+                &token,
+                &desktop,
+            )
+        );
+        assert_ne!(
+            expected,
+            enrollment_digest(
+                "https://control.relay.example.com:8443",
+                "desktop-5678",
+                &token,
+                &desktop,
+            )
+        );
     }
 }

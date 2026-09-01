@@ -6,3 +6,6 @@ license = "MIT"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+sha2 = "0.10"

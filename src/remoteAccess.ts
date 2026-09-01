@@ -210,3 +210,29 @@ export function relayLabel(status: RemoteStatus): string {
   if (!status.enabled) return `${endpoint} — off`;
   return `${endpoint} — ${relay.state}`;
 }
+
+/** Reduce a stored connector URL to the one relay server origin a person
+ * needs to recognize. Route ids and connector paths remain implementation
+ * details rather than ordinary settings. */
+export function relayServerFromConnectorUrl(connectorUrl: string | null | undefined): string | null {
+  if (!connectorUrl) return null;
+  try {
+    const url = new URL(connectorUrl);
+    if (!matchesConnectorPath(url.pathname) || !matchesWebSocketScheme(url.protocol)) return null;
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = "/";
+    url.search = "";
+    url.hash = "";
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function matchesConnectorPath(path: string): boolean {
+  return path === "/v1/connect" || path === "/v1/connect/";
+}
+
+function matchesWebSocketScheme(protocol: string): boolean {
+  return protocol === "wss:" || protocol === "ws:";
+}

@@ -179,7 +179,10 @@ impl TlsIdentity {
             .map_err(GatewayError::tls)?;
         let localhost = ServerName::try_from("localhost").map_err(GatewayError::tls)?;
         let dns_names = subject_alt_dns.iter().map(|name| {
-            ServerName::try_from(name.clone()).expect("relay DNS names were validated before use")
+            let probe = name.strip_prefix("*.")
+                .map(|suffix| format!("route-check.{suffix}"))
+                .unwrap_or_else(|| name.clone());
+            ServerName::try_from(probe).expect("relay DNS names were validated before use")
         });
         let names = std::iter::once(localhost)
             .chain(subject_alt_ips.iter().copied().map(ServerName::from))
@@ -232,7 +235,10 @@ fn bounded_subject_alt_dns(subject_alt_dns: &[String]) -> Result<Vec<String>, Ga
     let mut unique = Vec::with_capacity(subject_alt_dns.len().min(4));
     for name in subject_alt_dns {
         let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
-        if normalized != *name || ServerName::try_from(normalized.clone()).is_err() {
+        let validation_name = normalized.strip_prefix("*.")
+            .map(|suffix| format!("route-check.{suffix}"))
+            .unwrap_or_else(|| normalized.clone());
+        if normalized != *name || ServerName::try_from(validation_name).is_err() {
             return Err(GatewayError::new(
                 "gateway.invalid_advertised_dns",
                 "gateway relay host must be a normalized DNS name",
@@ -341,6 +347,16 @@ mod relay_certificate_tests {
         assert!(refreshed.covers(&ips, &dns).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn wildcard_relay_certificate_covers_a_route_created_after_startup() {
+        let root = std::env::temp_dir().join(format!("aiterm-relay-wildcard-{}", uuid::Uuid::new_v4()));
+        let ips = ["192.168.1.20".parse().unwrap()];
+        let dns = vec!["*.relay.example.com".to_string()];
+        let identity = TlsIdentity::load_or_create_with_dns(&root, &ips, &dns).unwrap();
+        assert!(identity.covers(&ips, &dns).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[derive(Clone)]
@@ -426,7 +442,7 @@ pub struct RemoteServices {
     blocking_operations: Arc<tokio::sync::Semaphore>,
     session_open_locks: Arc<Vec<Mutex<()>>>,
     app: Option<tauri::AppHandle>,
-    routes: Option<GatewayRoutesPayload>,
+    routes: Option<Arc<std::sync::RwLock<GatewayRoutesPayload>>>,
 }
 
 impl RemoteServices {
@@ -484,7 +500,12 @@ impl RemoteServices {
         relay_host: Option<String>,
         relay_port: Option<u16>,
     ) -> Self {
-        self.routes = Some(GatewayRoutesPayload { hosts, port, relay_host, relay_port });
+        self.routes = Some(Arc::new(std::sync::RwLock::new(GatewayRoutesPayload {
+            hosts,
+            port,
+            relay_host,
+            relay_port,
+        })));
         self
     }
 
@@ -515,6 +536,7 @@ impl RemoteGateway {
         let certificate_der = identity.certificate_der.clone();
         let spki_fingerprint = identity.spki_fingerprint.clone();
         let tls = identity.rustls_config()?;
+        let routes = services.routes.clone();
         let state = GatewayState {
             devices,
             services,
@@ -545,6 +567,7 @@ impl RemoteGateway {
             task: Some(task),
             maintenance: Some(maintenance),
             maintenance_shutdown,
+            routes,
         })
     }
 }
@@ -557,6 +580,7 @@ pub struct GatewayHandle {
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     maintenance: Option<tokio::task::JoinHandle<()>>,
     maintenance_shutdown: tokio::sync::watch::Sender<bool>,
+    routes: Option<Arc<std::sync::RwLock<GatewayRoutesPayload>>>,
 }
 
 impl GatewayHandle {
@@ -570,6 +594,14 @@ impl GatewayHandle {
 
     pub fn spki_fingerprint(&self) -> &str {
         &self.spki_fingerprint
+    }
+
+    pub fn set_relay_route(&self, host: String, port: u16) {
+        if let Some(routes) = &self.routes {
+            let mut routes = routes.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            routes.relay_host = Some(host);
+            routes.relay_port = Some(port);
+        }
     }
 
     pub async fn stop(mut self) -> Result<(), GatewayError> {
@@ -712,6 +744,10 @@ struct PairRequest {
     device_name: String,
     #[serde(with = "serde_bytes")]
     public_key: Vec<u8>,
+    #[serde(default, with = "serde_bytes")]
+    relay_authority_public_key: Vec<u8>,
+    #[serde(default, with = "serde_bytes")]
+    relay_signature_der: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -1908,7 +1944,8 @@ impl RemoteServices {
             "gateway.routes" => {
                 if !request.payload().is_empty() { return Err("protocol.invalid_payload"); }
                 let routes = self.routes.as_ref().ok_or("remote.unsupported")?;
-                Ok(DispatchOutcome::frames(vec![response(request_id, "gateway.routes", routes)?]))
+                let routes = routes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                Ok(DispatchOutcome::frames(vec![response(request_id, "gateway.routes", &routes)?]))
             }
             "session.list" => {
                 if !request.payload().is_empty() {
@@ -4827,10 +4864,14 @@ async fn handle_pairing(mut socket: WebSocket, state: GatewayState, peer_ip: IpA
             return;
         }
     };
-    let pending = match state.devices.submit_pairing_from_at(
+    let pending = match state.devices.submit_pairing_with_relay_from_at(
         &request.enrollment_secret,
         &request.device_name,
         &request.public_key,
+        (!request.relay_authority_public_key.is_empty())
+            .then_some(request.relay_authority_public_key.as_slice()),
+        (!request.relay_signature_der.is_empty())
+            .then_some(request.relay_signature_der.as_slice()),
         peer_ip,
         SystemTime::now(),
     ) {

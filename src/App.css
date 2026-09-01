@@ -1649,6 +1649,7 @@ body.dragging * { pointer-events: none; }
    carries a 2px accent edge in the gutter — the one loud element; everything
    else is hairlines. */
 .settings-modal {
+  position: relative;
   flex-direction: row;
   width: min(900px, 94vw);
   max-width: 94vw;
@@ -1657,8 +1658,27 @@ body.dragging * { pointer-events: none; }
   min-width: 560px;
   min-height: 400px;
   overflow: hidden;
-  resize: both;
+  resize: none;
 }
+.sm-resize-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 0 0 11px 0;
+  background:
+    linear-gradient(135deg, transparent 0 48%, var(--border) 49% 54%, transparent 55% 64%,
+      var(--text-faint) 65% 70%, transparent 71%);
+  cursor: nwse-resize;
+  touch-action: none;
+  opacity: 0.8;
+}
+.sm-resize-grip:hover,
+.sm-resize-grip:focus-visible { opacity: 1; background-color: var(--bg-hover); }
 .sm-rail {
   width: 172px;
   flex-shrink: 0;
@@ -2536,6 +2556,14 @@ button.acty-row:hover { background: var(--bg-hover); }
 .remote-listener-control { display: flex; align-items: center; gap: 6px; width: 100%; }
 .remote-listener-control .set-select { flex: 1; min-width: 0; width: auto; }
 .remote-listener-control .set-recheck { flex-shrink: 0; padding-block: 6px; }
+.remote-managed-relay { display: flex; flex-direction: column; gap: 8px; }
+.remote-managed-relay .set-input { margin: 0; }
+.remote-relay-advanced summary {
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
 .remote-relay-grid { display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 8px; width: 100%; }
 .remote-relay-grid .set-input { margin: 0; }
 .remote-relay-grid .set-input:first-child,

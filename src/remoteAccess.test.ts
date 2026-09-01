@@ -7,6 +7,7 @@ import {
   inviteToShow,
   listenerAddressOptions,
   relayLabel,
+  relayServerFromConnectorUrl,
   preferredListenerConfig,
   rebindListener,
   lastSeenLabel,
@@ -169,6 +170,15 @@ test("relay status explains route and connector state without implying a second 
   };
   assert.equal(relayLabel(withRelay), "desk-1234.relay.example.com:443 — connected");
   assert.equal(relayLabel({ ...withRelay, enabled: false }), "desk-1234.relay.example.com:443 — off");
+});
+
+test("relay settings show one server origin instead of connector internals", () => {
+  assert.equal(
+    relayServerFromConnectorUrl("wss://control.relay.example.com:8443/v1/connect"),
+    "https://control.relay.example.com:8443",
+  );
+  assert.equal(relayServerFromConnectorUrl("https://control.relay.example.com/v1/connect"), null);
+  assert.equal(relayServerFromConnectorUrl("wss://control.relay.example.com/not-connect"), null);
 });
 
 test("changing a running listener restores the old address when the new bind fails", async () => {

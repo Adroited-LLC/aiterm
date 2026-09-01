@@ -26,6 +26,7 @@ internal fun pairingUri(
     name: String = "Matt%27s%20desktop",
     relayHost: String? = null,
     relayPort: Int? = null,
+    relayAuthorizationDigest: ByteArray? = null,
 ): String = buildString {
     append("aiterm://pair?v=").append(version)
     hosts.forEach { append("&h=").append(it) }
@@ -35,6 +36,7 @@ internal fun pairingUri(
     append("&n=").append(name)
     relayHost?.let { append("&r=").append(it) }
     relayPort?.let { append("&q=").append(it) }
+    relayAuthorizationDigest?.let { append("&a=").append(it.toBase64Url()) }
 }
 
 internal fun parsedPayload(
@@ -98,6 +100,10 @@ internal class RecordingPairingTransport(
 ) : PairingTransport {
 
     val attempted = mutableListOf<PairingEndpoint>()
+    var lastRelayAuthorityPublicKey: ByteArray? = null
+        private set
+    var lastRelaySignatureDer: ByteArray? = null
+        private set
 
     override suspend fun enroll(
         endpoint: PairingEndpoint,
@@ -105,9 +111,13 @@ internal class RecordingPairingTransport(
         enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
+        relayAuthorityPublicKey: ByteArray?,
+        relaySignatureDer: ByteArray?,
         onPending: () -> Unit,
     ): EnrollmentOutcome {
         attempted += endpoint
+        lastRelayAuthorityPublicKey = relayAuthorityPublicKey
+        lastRelaySignatureDer = relaySignatureDer
         delegate?.let {
             return it.enroll(
                 endpoint,
@@ -115,6 +125,8 @@ internal class RecordingPairingTransport(
                 enrollmentSecret,
                 deviceName,
                 devicePublicKey,
+                relayAuthorityPublicKey,
+                relaySignatureDer,
                 onPending,
             )
         }

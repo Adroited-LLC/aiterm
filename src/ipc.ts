@@ -1174,6 +1174,8 @@ export const remoteRelayConfigure = (
   connectorUrl, publicHost, publicPort, routeId, token,
 });
 
+/** Asks a managed relay to mint one private route for this desktop. The
+ * connector secret is returned directly to Rust and never enters JavaScript. */
 export const remoteRelayClear = () => invoke<RemoteStatus>("remote_relay_clear");
 
 /** A single-use, five-minute enrollment QR, rendered to SVG by the backend so

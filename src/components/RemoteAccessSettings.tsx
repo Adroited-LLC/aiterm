@@ -7,6 +7,7 @@ import {
   lastSeenLabel,
   listenerLabel,
   relayLabel,
+  relayServerFromConnectorUrl,
   listenerAddressOptions,
   nextRevokeStep,
   preferredListenerConfig,
@@ -34,6 +35,7 @@ import {
 
 const DEFAULT_PORT = 8443;
 const LISTENER_PREFERENCE_KEY = "aiterm.remote.listener";
+const DEFAULT_RELAY_SERVER = "https://control.34-23-107-73.sslip.io:8443";
 
 function loadListenerPreference(): ListenerConfig | null {
   try {
@@ -163,6 +165,31 @@ export default function RemoteAccessSettings() {
         <div className="sgroup-title">Remote connection</div>
         <div className="sgroup-rows">
           <Row
+            label="Relay server"
+            desc="The first approved phone authorizes this desktop. AITerm creates the private route automatically as part of pairing."
+            wide
+          >
+            <div className="remote-managed-relay">
+              <code className="diag-val">
+                {relayServerFromConnectorUrl(status.relay?.connector_url) ?? DEFAULT_RELAY_SERVER}
+              </code>
+              <div className="remote-relay-actions">
+                {status.relay?.configured && (
+                  <button
+                    className="set-recheck"
+                    disabled={status.enabled}
+                    onClick={() => run(remoteRelayClear())}
+                  >Remove relay</button>
+                )}
+              </div>
+              <div className="sgroup-foot">
+                {status.relay?.configured
+                  ? relayLabel(status)
+                  : "Pair and approve a phone. LAN, VPN, and relay setup complete together."}
+              </div>
+            </div>
+          </Row>
+          <Row
             label="Remote access"
             desc="Automatically tries LAN, then VPN, then your AITerm Relay. One switch controls the same encrypted desktop gateway on every route."
           >
@@ -249,8 +276,11 @@ export default function RemoteAccessSettings() {
           >
             <span className="diag-val">{relayLabel(status)}</span>
           </Row>
-          <Row label="Relay setup" desc="Paste the endpoint and route credentials created on your relay server." wide>
-            <div className="remote-relay-grid">
+          {!status.relay?.configured && (
+          <Row label="Advanced manual route" desc="For self-hosted relays that do not support phone-authorized setup." wide>
+            <details className="remote-relay-advanced">
+              <summary>Enter route details manually</summary>
+              <div className="remote-relay-grid">
               <input
                 className="set-input mono"
                 value={relayConnectorUrl}
@@ -309,16 +339,11 @@ export default function RemoteAccessSettings() {
                     () => setRelayToken(""),
                   )}
                 >Save relay</button>
-                {status.relay?.configured && (
-                  <button
-                    className="set-recheck"
-                    disabled={status.enabled}
-                    onClick={() => run(remoteRelayClear())}
-                  >Remove relay</button>
-                )}
               </div>
-            </div>
+              </div>
+            </details>
           </Row>
+          )}
           <Row
             label="Certificate fingerprint"
             desc="Your phone pins this. If it ever shows a different one, do not continue."

@@ -81,6 +81,7 @@ class PairingPayload private constructor(
     val scannedAtEpochMillis: Long,
     val relayHost: String?,
     val relayPort: Int?,
+    val relayAuthorizationDigest: ByteArray?,
 ) {
 
     val relayEndpoint: PairingEndpoint?
@@ -106,7 +107,7 @@ class PairingPayload private constructor(
         private const val MAX_DISPLAY_NAME_CHARS = 128
         private val base64Url = Regex("^[A-Za-z0-9_-]+$")
         private val requiredSingletonFields = setOf("v", "p", "f", "s", "n")
-        private val optionalSingletonFields = setOf("r", "q")
+        private val optionalSingletonFields = setOf("r", "q", "a")
         private val knownFields = requiredSingletonFields + optionalSingletonFields + "h"
 
         fun parse(raw: String, scannedAtEpochMillis: Long): PairingPayloadResult {
@@ -149,7 +150,7 @@ class PairingPayload private constructor(
                 optionalSingletonFields.any { fields[it]?.size?.let { count -> count > 1 } == true }
             ) return malformed()
             val version = fields.getValue("v").single()
-            if (version !in setOf("1", "2")) {
+            if (version !in setOf("1", "2", "3")) {
                 return PairingPayloadResult.Rejected(PairingFailure.UNSUPPORTED_VERSION)
             }
 
@@ -179,8 +180,14 @@ class PairingPayload private constructor(
                 secretBytes.fill(0)
                 return malformed()
             }
-            if ((version == "2") != (relayHost != null)) {
+            if ((version in setOf("2", "3")) != (relayHost != null)) {
                 secretBytes.fill(0)
+                return malformed()
+            }
+            val relayAuthorizationDigest = fields["a"]?.singleOrNull()?.let(::decodeBase64Url32)
+            if ((version == "3") != (relayAuthorizationDigest != null)) {
+                secretBytes.fill(0)
+                relayAuthorizationDigest?.fill(0)
                 return malformed()
             }
             val relayPort = relayPortText?.let { text ->
@@ -204,6 +211,7 @@ class PairingPayload private constructor(
                     scannedAtEpochMillis = scannedAtEpochMillis,
                     relayHost = relayHost,
                     relayPort = relayPort,
+                    relayAuthorizationDigest = relayAuthorizationDigest,
                 ),
             )
         }

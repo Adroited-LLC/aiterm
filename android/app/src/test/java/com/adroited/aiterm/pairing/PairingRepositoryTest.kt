@@ -65,7 +65,7 @@ class PairingRepositoryTest {
 
     @Test
     fun unknownPayloadVersion_isRejectedOutright() {
-        val result = PairingPayload.parse(pairingUri(version = "3"), scannedAt)
+        val result = PairingPayload.parse(pairingUri(version = "4"), scannedAt)
 
         assertEquals(
             PairingPayloadResult.Rejected(PairingFailure.UNSUPPORTED_VERSION),
@@ -146,6 +146,35 @@ class PairingRepositoryTest {
                 scannedAt,
             ) is PairingPayloadResult.Rejected,
         )
+    }
+
+    @Test
+    fun versionThreeRelayPairing_isAuthorizedByTheDedicatedPhoneKey() = runBlocking {
+        val digest = ByteArray(32) { (it + 11).toByte() }
+        val payload = parsedPayload(
+            pairingUri(
+                version = "3",
+                relayHost = "desktop-1234.relay.example.com",
+                relayPort = 443,
+                relayAuthorizationDigest = digest,
+            ),
+            scannedAt,
+        )
+        val transport = RecordingPairingTransport(
+            outcomes = mapOf("localhost" to EnrollmentOutcome.Approved("device-v3")),
+        )
+        val authority = FakeDeviceKeys()
+        val result = PairingRepository(
+            transport = transport,
+            deviceKeys = deviceKeys,
+            store = store,
+            relayAuthorityKeys = authority,
+        ).pair(payload, deviceName, scannedAt)
+
+        assertTrue(result is PairingResult.Paired)
+        assertEquals(1, authority.publicKeyRequests)
+        assertEquals(33, transport.lastRelayAuthorityPublicKey?.size)
+        assertTrue(transport.lastRelaySignatureDer?.size in 8..80)
     }
 
     @Test
@@ -449,6 +478,8 @@ class PairingRepositoryTest {
                     enrollmentSecret = payload.secret,
                     deviceName = deviceName,
                     devicePublicKey = deviceKeys.devicePublicKey(),
+                    relayAuthorityPublicKey = null,
+                    relaySignatureDer = null,
                     onPending = {},
                 )
             }
@@ -664,6 +695,8 @@ class PairingRepositoryTest {
                 enrollmentSecret: EnrollmentSecret,
                 deviceName: String,
                 devicePublicKey: ByteArray,
+                relayAuthorityPublicKey: ByteArray?,
+                relaySignatureDer: ByteArray?,
                 onPending: () -> Unit,
             ): EnrollmentOutcome {
                 if (enrollmentSecret.consume { Unit } is EnrollmentSecret.Consumption.AlreadyConsumed) {

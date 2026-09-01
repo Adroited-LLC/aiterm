@@ -1,21 +1,26 @@
-use aiterm_relay_protocol::Frame;
+use aiterm_relay_protocol::{enrollment_digest, Frame};
+use axum::extract::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path as FilePath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
@@ -24,6 +29,7 @@ const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTOR_QUEUE: usize = 256;
 const STREAM_QUEUE: usize = 32;
 const MAX_STREAMS_PER_CONNECTOR: usize = 128;
+const MAX_PROVISION_ATTEMPTS_PER_MINUTE: u32 = 30;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RelayConfig {
@@ -31,12 +37,53 @@ pub struct RelayConfig {
     pub ingress_listen: SocketAddr,
     pub public_domain: String,
     pub routes: Vec<RouteConfig>,
+    #[serde(default)]
+    pub provisioning: Option<ProvisioningConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RouteConfig {
     pub id: String,
     pub token_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ProvisioningConfig {
+    pub state_file: PathBuf,
+    pub control_origin: String,
+    pub connector_url: String,
+    pub public_port: u16,
+    pub max_routes: usize,
+    pub max_routes_per_ip: usize,
+    pub max_routes_per_authority: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionedRoute {
+    id: String,
+    token_sha256: String,
+    authority_fingerprint: String,
+    desktop_spki_sha256: String,
+    source_ip: IpAddr,
+    created_at: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisioningStore {
+    routes: Vec<ProvisionedRoute>,
+}
+
+struct ProvisioningState {
+    config: ProvisioningConfig,
+    store: Mutex<ProvisioningStore>,
+    attempts: Mutex<HashMap<IpAddr, ProvisionAttemptWindow>>,
+}
+
+struct ProvisionAttemptWindow {
+    started: Instant,
+    count: u32,
 }
 
 #[derive(Clone)]
@@ -54,7 +101,8 @@ struct Connector {
 #[derive(Clone)]
 struct RelayState {
     public_domain: Arc<str>,
-    routes: Arc<HashMap<String, RouteAuth>>,
+    routes: Arc<RwLock<HashMap<String, RouteAuth>>>,
+    provisioning: Option<Arc<ProvisioningState>>,
     connectors: Arc<Mutex<HashMap<String, Connector>>>,
     next_generation: Arc<AtomicU64>,
     next_stream: Arc<AtomicU64>,
@@ -73,9 +121,43 @@ impl RelayState {
                 .ok_or_else(|| format!("route {} has an invalid token hash", route.id))?;
             routes.insert(route.id.clone(), RouteAuth { token_sha256 });
         }
+        let provisioning = if let Some(provisioning) = &config.provisioning {
+            validate_provisioning(provisioning)?;
+            let stored = load_provisioning_store(&provisioning.state_file)?;
+            for route in &stored.routes {
+                if !valid_route_id(&route.id) || routes.contains_key(&route.id) {
+                    return Err(format!("invalid or duplicate provisioned route {}", route.id));
+                }
+                let token_sha256 = decode_hex_32(&route.token_sha256)
+                    .ok_or_else(|| format!("provisioned route {} has an invalid token hash", route.id))?;
+                for (label, value) in [
+                    ("authority fingerprint", &route.authority_fingerprint),
+                    ("desktop identity", &route.desktop_spki_sha256),
+                ] {
+                    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(value.as_bytes())
+                        .map_err(|_| format!("provisioned route {} has an invalid {label}", route.id))?;
+                    if decoded.len() != 32 {
+                        return Err(format!("provisioned route {} has an invalid {label}", route.id));
+                    }
+                }
+                routes.insert(route.id.clone(), RouteAuth { token_sha256 });
+            }
+            if routes.len() > provisioning.max_routes {
+                return Err("configured routes exceed the provisioning limit".into());
+            }
+            Some(Arc::new(ProvisioningState {
+                config: provisioning.clone(),
+                store: Mutex::new(stored),
+                attempts: Mutex::new(HashMap::new()),
+            }))
+        } else {
+            None
+        };
         Ok(Self {
             public_domain: public_domain.into(),
-            routes: Arc::new(routes),
+            routes: Arc::new(RwLock::new(routes)),
+            provisioning,
             connectors: Arc::new(Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             next_stream: Arc::new(AtomicU64::new(1)),
@@ -101,9 +183,15 @@ async fn run_with_listeners(
 ) -> Result<(), String> {
     let app = Router::new()
         .route("/v1/connect/{route}", get(connector_upgrade))
+        .route("/v1/info", get(relay_info))
+        .route("/v1/provision", post(provision_route))
+        .route("/v1/routes/{route}", delete(deprovision_route))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone());
-    let connector_server = axum::serve(connector_listener, app);
+    let connector_server = axum::serve(
+        connector_listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    );
     let ingress_server = serve_ingress(ingress_listener, state);
     tokio::select! {
         result = connector_server => result.map_err(|error| format!("connector server: {error}")),
@@ -117,7 +205,7 @@ async fn connector_upgrade(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let Some(expected) = state.routes.get(&route) else {
+    let Some(expected) = state.routes.read().await.get(&route).cloned() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(token) = bearer_token(&headers) else {
@@ -131,6 +219,268 @@ async fn connector_upgrade(
         .max_message_size(aiterm_relay_protocol::MAX_FRAME_BYTES)
         .on_upgrade(move |socket| serve_connector(socket, route, state))
         .into_response()
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProvisionedRouteView {
+    connector_url: String,
+    public_host: String,
+    public_port: u16,
+    route_id: String,
+}
+
+#[derive(Serialize)]
+struct RelayInfoView {
+    control_origin: String,
+    connector_url: String,
+    public_domain: String,
+    public_port: u16,
+}
+
+async fn relay_info(State(state): State<RelayState>) -> Response {
+    let Some(provisioning) = &state.provisioning else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(RelayInfoView {
+        control_origin: provisioning.config.control_origin.clone(),
+        connector_url: provisioning.config.connector_url.clone(),
+        public_domain: state.public_domain.to_string(),
+        public_port: provisioning.config.public_port,
+    }).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionRouteRequest {
+    route_id: String,
+    token_sha256: String,
+    desktop_spki_sha256: String,
+    authority_public_key: String,
+    signature_der: String,
+}
+
+async fn provision_route(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<ProvisionRouteRequest>,
+) -> Response {
+    let Some(provisioning) = &state.provisioning else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let source_ip = forwarded_ip(&headers, peer);
+    if !allow_provision_attempt(provisioning, source_ip).await {
+        return (StatusCode::TOO_MANY_REQUESTS, "relay setup request limit reached").into_response();
+    }
+    if !valid_route_id(&request.route_id) {
+        return (StatusCode::BAD_REQUEST, "invalid route id").into_response();
+    }
+    let Some(token_sha256) = decode_hex_32(&request.token_sha256) else {
+        return (StatusCode::BAD_REQUEST, "invalid connector credential hash").into_response();
+    };
+    let Ok(desktop_spki) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(request.desktop_spki_sha256.as_bytes()) else {
+        return (StatusCode::BAD_REQUEST, "invalid desktop identity").into_response();
+    };
+    let Ok(desktop_spki): Result<[u8; 32], _> = desktop_spki.try_into() else {
+        return (StatusCode::BAD_REQUEST, "invalid desktop identity").into_response();
+    };
+    let Ok(authority_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(request.authority_public_key.as_bytes()) else {
+        return (StatusCode::BAD_REQUEST, "invalid phone authority key").into_response();
+    };
+    let Ok(authority) = VerifyingKey::from_sec1_bytes(&authority_bytes) else {
+        return (StatusCode::BAD_REQUEST, "invalid phone authority key").into_response();
+    };
+    let canonical_authority = authority.to_encoded_point(true);
+    if canonical_authority.as_bytes() != authority_bytes.as_slice() {
+        return (StatusCode::BAD_REQUEST, "phone authority key is not canonical").into_response();
+    }
+    let Ok(signature_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(request.signature_der.as_bytes()) else {
+        return (StatusCode::BAD_REQUEST, "invalid phone authority signature").into_response();
+    };
+    let Ok(signature) = Signature::from_der(&signature_bytes) else {
+        return (StatusCode::BAD_REQUEST, "invalid phone authority signature").into_response();
+    };
+    let digest = enrollment_digest(
+        &provisioning.config.control_origin,
+        &request.route_id,
+        &token_sha256,
+        &desktop_spki,
+    );
+    if authority.verify(&digest, &signature).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let authority_fingerprint = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(canonical_authority.as_bytes()));
+    let mut stored = provisioning.store.lock().await;
+    if stored.routes.iter().any(|route| route.id == request.route_id)
+        || state.routes.read().await.contains_key(&request.route_id)
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    if stored.routes.iter().filter(|route| route.source_ip == source_ip).count()
+        >= provisioning.config.max_routes_per_ip
+    {
+        return (StatusCode::TOO_MANY_REQUESTS, "route limit reached for this address").into_response();
+    }
+    if state.routes.read().await.len() >= provisioning.config.max_routes {
+        return (StatusCode::SERVICE_UNAVAILABLE, "relay route capacity reached").into_response();
+    }
+    if stored.routes.iter().filter(|route| route.authority_fingerprint == authority_fingerprint).count()
+        >= provisioning.config.max_routes_per_authority
+    {
+        return (StatusCode::TOO_MANY_REQUESTS, "route limit reached for this phone authority").into_response();
+    }
+    let record = ProvisionedRoute {
+        id: request.route_id.clone(),
+        token_sha256: request.token_sha256.clone(),
+        authority_fingerprint,
+        desktop_spki_sha256: request.desktop_spki_sha256,
+        source_ip,
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let mut next = stored.clone();
+    next.routes.push(record);
+    if persist_provisioning_store(&provisioning.config.state_file, &next).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not persist relay route").into_response();
+    }
+    state.routes.write().await.insert(
+        request.route_id.clone(),
+        RouteAuth { token_sha256 },
+    );
+    *stored = next;
+    Json(ProvisionedRouteView {
+        connector_url: provisioning.config.connector_url.clone(),
+        public_host: format!("{}.{}", request.route_id, state.public_domain),
+        public_port: provisioning.config.public_port,
+        route_id: request.route_id,
+    }).into_response()
+}
+
+async fn allow_provision_attempt(provisioning: &ProvisioningState, source_ip: IpAddr) -> bool {
+    let now = Instant::now();
+    let mut attempts = provisioning.attempts.lock().await;
+    attempts.retain(|_, window| now.duration_since(window.started) < Duration::from_secs(300));
+    let window = attempts.entry(source_ip).or_insert(ProvisionAttemptWindow {
+        started: now,
+        count: 0,
+    });
+    if now.duration_since(window.started) >= Duration::from_secs(60) {
+        window.started = now;
+        window.count = 0;
+    }
+    if window.count >= MAX_PROVISION_ATTEMPTS_PER_MINUTE {
+        return false;
+    }
+    window.count += 1;
+    true
+}
+
+async fn deprovision_route(
+    State(state): State<RelayState>,
+    Path(route): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(provisioning) = &state.provisioning else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    let mut stored = provisioning.store.lock().await;
+    let Some(position) = stored.routes.iter().position(|candidate| {
+        candidate.id == route
+            && decode_hex_32(&candidate.token_sha256)
+                .is_some_and(|expected| bool::from(actual.ct_eq(&expected)))
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mut next = stored.clone();
+    next.routes.remove(position);
+    if persist_provisioning_store(&provisioning.config.state_file, &next).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not persist relay route").into_response();
+    }
+    state.routes.write().await.remove(&route);
+    if let Some(connector) = state.connectors.lock().await.remove(&route) {
+        close_all_streams(&connector.streams).await;
+    }
+    *stored = next;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn forwarded_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    if peer.ip().is_loopback() {
+        if let Some(forwarded) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .and_then(|value| value.trim().parse().ok())
+        {
+            return forwarded;
+        }
+    }
+    peer.ip()
+}
+
+fn validate_provisioning(config: &ProvisioningConfig) -> Result<(), String> {
+    let control = url::Url::parse(&config.control_origin).ok();
+    if !config.state_file.is_absolute()
+        || control.as_ref().is_none_or(|url| {
+            url.scheme() != "https"
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !matches!(url.path(), "" | "/")
+                || url.query().is_some()
+                || url.fragment().is_some()
+        })
+        || !config.connector_url.starts_with("wss://")
+        || !config.connector_url.ends_with("/v1/connect")
+        || config.public_port == 0
+        || config.max_routes == 0
+        || config.max_routes_per_ip == 0
+        || config.max_routes_per_ip > config.max_routes
+        || config.max_routes_per_authority == 0
+        || config.max_routes_per_authority > config.max_routes
+    {
+        return Err("relay provisioning configuration is invalid".into());
+    }
+    Ok(())
+}
+
+fn load_provisioning_store(path: &FilePath) -> Result<ProvisioningStore, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| format!("could not parse {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProvisioningStore::default()),
+        Err(error) => Err(format!("could not read {}: {error}", path.display())),
+    }
+}
+
+fn persist_provisioning_store(path: &FilePath, store: &ProvisioningStore) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "provisioned route path has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("tmp");
+    let bytes = serde_json::to_vec_pretty(store).map_err(|error| error.to_string())?;
+    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(&temporary, path).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -476,6 +826,9 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
+    use p256::ecdsa::{signature::Signer, SigningKey};
+    use p256::elliptic_curve::rand_core::OsRng;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     #[test]
@@ -527,6 +880,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phone_authority_signature_mints_one_route_and_persists_only_hashes() {
+        let root = std::env::temp_dir().join(format!(
+            "aiterm-relay-provision-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        let state_file = root.join("provisioning.json");
+        let control_origin = "https://control.relay.example.com:8443";
+        let config = RelayConfig {
+            connector_listen: "127.0.0.1:1".parse().unwrap(),
+            ingress_listen: "127.0.0.1:2".parse().unwrap(),
+            public_domain: "relay.example.com".into(),
+            routes: Vec::new(),
+            provisioning: Some(ProvisioningConfig {
+                state_file: state_file.clone(),
+                control_origin: control_origin.into(),
+                connector_url: "wss://control.relay.example.com:8443/v1/connect".into(),
+                public_port: 443,
+                max_routes: 8,
+                max_routes_per_ip: 2,
+                max_routes_per_authority: 4,
+            }),
+        };
+        let state = RelayState::from_config(&config).unwrap();
+        let route_id = "desktop-1234567890abcdef";
+        let token = "desktop-generated-connector-token-1234567890";
+        let token_sha256: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let desktop_spki = [9u8; 32];
+        let authority = SigningKey::random(&mut OsRng);
+        let authority_public = authority.verifying_key().to_encoded_point(true);
+        let digest = enrollment_digest(control_origin, route_id, &token_sha256, &desktop_spki);
+        let signature: Signature = authority.sign(&digest);
+        let request = ProvisionRouteRequest {
+            route_id: route_id.into(),
+            token_sha256: hex_bytes(&token_sha256),
+            desktop_spki_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(desktop_spki),
+            authority_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(authority_public.as_bytes()),
+            signature_der: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(signature.to_der().as_bytes()),
+        };
+        let peer = "203.0.113.9:50000".parse().unwrap();
+        let response = provision_route(
+            State(state.clone()),
+            ConnectInfo(peer),
+            HeaderMap::new(),
+            Json(request),
+        ).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let provisioned: ProvisionedRouteView = serde_json::from_slice(&body).unwrap();
+        assert!(provisioned.public_host.starts_with(&format!("{}.", provisioned.route_id)));
+        assert_eq!(
+            state.routes.read().await.get(&provisioned.route_id).unwrap().token_sha256,
+            token_sha256,
+        );
+
+        let persisted = std::fs::read_to_string(&state_file).unwrap();
+        assert!(!persisted.contains(token));
+        assert!(persisted.contains(&provisioned.route_id));
+
+        let replay_signature: Signature = authority.sign(&digest);
+        let replay = provision_route(
+            State(state),
+            ConnectInfo(peer),
+            HeaderMap::new(),
+            Json(ProvisionRouteRequest {
+                route_id: route_id.into(),
+                token_sha256: hex_bytes(&token_sha256),
+                desktop_spki_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(desktop_spki),
+                authority_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(authority_public.as_bytes()),
+                signature_der: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(replay_signature.to_der().as_bytes()),
+            }),
+        ).await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn phone_bytes_round_trip_without_consuming_the_tls_hello() {
         let token = "a-connector-token-that-is-long-enough";
         let token_sha256 = format!("{:x}", Sha256::digest(token.as_bytes()));
@@ -538,6 +972,7 @@ mod tests {
             connector_listen: connector_addr,
             ingress_listen: ingress_addr,
             public_domain: "relay.example.com".into(),
+            provisioning: None,
             routes: vec![RouteConfig {
                 id: "desk-1234".into(),
                 token_sha256,
@@ -618,6 +1053,7 @@ mod tests {
             connector_listen: connector_addr,
             ingress_listen: ingress_addr,
             public_domain: "relay.example.com".into(),
+            provisioning: None,
             routes: vec![
                 RouteConfig {
                     id: "desktop-a".into(),

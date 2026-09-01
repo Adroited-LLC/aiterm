@@ -20,7 +20,7 @@ then copies the complete TLS stream unchanged.
 
 ## Multiple clients and growth
 
-A single relay serves every route listed in its configuration concurrently.
+A single relay serves every static or dynamically enrolled route concurrently.
 Each desktop/location has a unique route id and connector token, so traffic and
 authentication remain isolated. A route accepts one active desktop connector
 and multiplexes up to 128 simultaneous phone connections; reconnecting the same
@@ -50,6 +50,30 @@ The daemon takes one JSON configuration path:
 secrets held only by a desktop; the server stores their lowercase SHA-256
 hashes. A route id is public, random, lowercase DNS-label text of 8–63
 characters.
+
+## Automatic enrollment during pairing
+
+`GET /v1/info` publishes the relay's non-secret connector URL, public domain,
+and ingress port. A desktop uses those values to prepare a route locally when
+it creates a pairing QR. The QR binds the proposed relay identity to the
+pairing exchange. The phone signs that binding with a dedicated hardware-backed
+P-256 authority key, and sends the public key and signature as part of the
+normal pairing request.
+
+After the user approves that same pairing request, the desktop submits the
+phone's proof to `POST /v1/provision`. The relay verifies the signature and
+stores only the route id, connector-token hash, phone-authority fingerprint,
+desktop TLS fingerprint, source address, and creation time. The connector token
+itself never leaves the desktop. There is no separate grant, relay login, or
+second approval prompt.
+
+Dynamic enrollment is bounded by global, per-source-address, and per-authority
+route limits, plus a per-source provisioning attempt rate limit. These controls
+make this suitable for a small private relay. A public multi-tenant service
+would additionally need an account or entitlement layer.
+
+The `routes` array remains available for administratively provisioned static
+routes. Generate a static token and its server-side hash with standard tools:
 
 Generate a token and its server-side hash with standard tools:
 
@@ -82,6 +106,6 @@ wildcard `*.<domain>`.
 because port 443 belongs to the opaque phone ingress; Caddy uses the port 80
 HTTP challenge instead.
 
-The Google Cloud VM, firewall rules, DNS records, ACME proxy, and secrets are
-deliberately not provisioned by this branch. `deploy/aiterm-relay.service` is a
-service template for that later step.
+`deploy/aiterm-relay.service` is a hardened service template. Dynamic route
+state is written beneath systemd's private `StateDirectory` rather than the
+configuration directory.

@@ -56,6 +56,8 @@ interface PairingTransport {
         enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
+        relayAuthorityPublicKey: ByteArray?,
+        relaySignatureDer: ByteArray?,
         onPending: () -> Unit,
     ): EnrollmentOutcome
 }
@@ -69,6 +71,7 @@ class PairingRepository(
     private val transport: PairingTransport,
     private val deviceKeys: DeviceKeys,
     private val store: PairedDesktopStore,
+    private val relayAuthorityKeys: DeviceKeys = deviceKeys,
 ) {
 
     suspend fun pair(
@@ -99,6 +102,14 @@ class PairingRepository(
             payload.discard()
             return PairingResult.Rejected(PairingFailure.KEY_UNAVAILABLE)
         }
+        val relayAuthorization = try {
+            payload.relayAuthorizationDigest?.let { digest ->
+                relayAuthorityKeys.devicePublicKey() to relayAuthorityKeys.signChallenge(digest)
+            }
+        } catch (_: DeviceKeyException) {
+            payload.discard()
+            return PairingResult.Rejected(PairingFailure.KEY_UNAVAILABLE)
+        }
 
         return try {
             pairUnclaimed(
@@ -106,6 +117,8 @@ class PairingRepository(
                 enrollmentSecret = payload.secret,
                 deviceName = deviceName,
                 devicePublicKey = publicKey,
+                relayAuthorityPublicKey = relayAuthorization?.first,
+                relaySignatureDer = relayAuthorization?.second,
                 onAwaitingApproval = onAwaitingApproval,
             )
         } finally {
@@ -120,6 +133,8 @@ class PairingRepository(
         enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
+        relayAuthorityPublicKey: ByteArray?,
+        relaySignatureDer: ByteArray?,
         onAwaitingApproval: () -> Unit,
     ): PairingResult {
         val directEndpoints = payload.hosts.map { PairingEndpoint(it, payload.port) }
@@ -131,6 +146,8 @@ class PairingRepository(
                     enrollmentSecret = enrollmentSecret,
                     deviceName = deviceName,
                     devicePublicKey = devicePublicKey,
+                    relayAuthorityPublicKey = relayAuthorityPublicKey,
+                    relaySignatureDer = relaySignatureDer,
                     onPending = onAwaitingApproval,
                 )
             } catch (cancelled: CancellationException) {
@@ -205,6 +222,8 @@ class OkHttpPairingTransport internal constructor(
         enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
+        relayAuthorityPublicKey: ByteArray?,
+        relaySignatureDer: ByteArray?,
         onPending: () -> Unit,
     ): EnrollmentOutcome {
         pairingDiagnostic("candidate ${endpoint.host}:${endpoint.port}")
@@ -232,6 +251,8 @@ class OkHttpPairingTransport internal constructor(
                     enrollmentSecret = enrollmentSecret,
                     deviceName = deviceName,
                     devicePublicKey = devicePublicKey,
+                    relayAuthorityPublicKey = relayAuthorityPublicKey,
+                    relaySignatureDer = relaySignatureDer,
                     onPending = onPending,
                     onRequestMayHaveBeenSent = { requestMayHaveBeenSent.complete(Unit) },
                 )
@@ -309,6 +330,8 @@ class OkHttpPairingTransport internal constructor(
         enrollmentSecret: EnrollmentSecret,
         deviceName: String,
         devicePublicKey: ByteArray,
+        relayAuthorityPublicKey: ByteArray?,
+        relaySignatureDer: ByteArray?,
         onPending: () -> Unit,
         onRequestMayHaveBeenSent: () -> Unit,
     ): EnrollmentOutcome = suspendCancellableCoroutine { continuation ->
@@ -364,7 +387,9 @@ class OkHttpPairingTransport internal constructor(
                                             PairRequestFrame(
                                                 enrollmentSecret = secret,
                                                 deviceName = deviceName,
-                                                publicKey = devicePublicKey,
+                                            publicKey = devicePublicKey,
+                                            relayAuthorityPublicKey = relayAuthorityPublicKey,
+                                            relaySignatureDer = relaySignatureDer,
                                             ),
                                         )
                                     } catch (_: Exception) {
