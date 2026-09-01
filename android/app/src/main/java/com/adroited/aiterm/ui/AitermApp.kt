@@ -77,8 +77,9 @@ fun AitermApp(
                                 container.appLock,
                             ),
                         )
-                        RemoteTerminalScreen(
+                        RemoteDesktopScreen(
                             viewModel = remoteViewModel,
+                            desktopName = desktop.displayName,
                             onBack = { navController.popBackStack() },
                             keyBarPreference = container.terminalKeyBarPreference,
                         )

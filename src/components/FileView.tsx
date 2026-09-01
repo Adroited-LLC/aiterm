@@ -7,6 +7,7 @@ import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
 import { classHighlighter } from "@lezer/highlight";
 import { languages } from "@codemirror/language-data";
 import { homeAbbrev, openPath, readTextFile, writeTextFile } from "../ipc";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import Icon from "./Icon";
@@ -17,8 +18,18 @@ export function isMarkdown(path: string): boolean {
   return /\.(md|markdown|mdx)$/i.test(path);
 }
 
+/** An HTML file previews as the PAGE, in a sandboxed iframe over the asset
+ *  protocol — which is what makes its relative `civic.jpg` and stylesheet
+ *  load: they resolve against the asset URL and pass through the same
+ *  scoped handler. The iframe reads the DISK, so the preview shows the last
+ *  save, not the buffer — the price of real subresources. */
+export function isHtml(path: string): boolean {
+  return /\.x?html?$/i.test(path);
+}
+
 export type FileMode = "code" | "preview";
 const MODE_KEY = "aiterm.markdownMode";
+const HTML_MODE_KEY = "aiterm.htmlMode";
 
 /** The mode markdown files open in: whatever was chosen last, anywhere.
  *  One setting, not per file — the preference is "I read markdown rendered"
@@ -34,6 +45,19 @@ export function loadMarkdownMode(): FileMode {
 }
 function saveMarkdownMode(m: FileMode) {
   try { localStorage.setItem(MODE_KEY, m); } catch { /* private mode */ }
+}
+
+/** Same one-setting rule as markdown, its own memory: reading rendered
+ *  markdown and reading rendered pages are different habits. */
+export function loadHtmlMode(): FileMode {
+  try {
+    return localStorage.getItem(HTML_MODE_KEY) === "code" ? "code" : "preview";
+  } catch {
+    return "preview";
+  }
+}
+function saveHtmlMode(m: FileMode) {
+  try { localStorage.setItem(HTML_MODE_KEY, m); } catch { /* private mode */ }
 }
 
 /** Markdown → HTML the page can show. GFM (tables, task lists, strike), and
@@ -82,26 +106,32 @@ export default function FileView({
   const [saveErr, setSaveErr] = useState<string | null>(null);
 
   // ---- code / preview ----
-  // Only a markdown file has a preview; every other file is always code.
-  // The mode is read from the buffer, not the disk, so an edit made in code
-  // shows in preview the moment you flip — and the editor stays mounted
-  // underneath, hidden, so flipping back costs nothing and loses nothing.
+  // A markdown file previews as rendered markdown (from the BUFFER — an edit
+  // shows the moment you flip); an html file previews as the page in an
+  // iframe (from the DISK — save to see a change). Every other file is
+  // always code. The editor stays mounted underneath, hidden, so flipping
+  // back costs nothing and loses nothing.
   const md = isMarkdown(path);
-  const [mode, setModeState] = useState<FileMode>(() => (md ? loadMarkdownMode() : "code"));
+  const html = isHtml(path);
+  const [mode, setModeState] = useState<FileMode>(() => (md ? loadMarkdownMode() : html ? loadHtmlMode() : "code"));
   const modeRef = useRef(mode);
   const [previewHtml, setPreviewHtml] = useState("");
+  /** Bumped whenever the disk moved (save, watcher reload), so the page
+   *  iframe re-fetches — its src carries the nonce as a cache-buster. */
+  const [pageNonce, setPageNonce] = useState(0);
   const renderPreview = useCallback(() => {
+    if (isHtml(path)) { setPageNonce((n) => n + 1); return; }
     const view = viewRef.current;
     if (!view) return;
     setPreviewHtml(renderMarkdown(view.state.doc.toString()));
-  }, []);
+  }, [path]);
   const setMode = useCallback((m: FileMode) => {
     modeRef.current = m;
     setModeState(m);
-    saveMarkdownMode(m);
+    if (isHtml(path)) saveHtmlMode(m); else saveMarkdownMode(m);
     if (m === "preview") renderPreview();
     else requestAnimationFrame(() => { viewRef.current?.requestMeasure(); viewRef.current?.focus(); });
-  }, [renderPreview]);
+  }, [renderPreview, path]);
   const toggleMode = useCallback(() => setMode(modeRef.current === "preview" ? "code" : "preview"), [setMode]);
 
   const markDirty = useCallback((d: boolean) => {
@@ -144,6 +174,8 @@ export default function FileView({
       mtimeRef.current = mtime;
       markDirty(false);
       setConflict(false);
+      // The page iframe reads the disk; the disk just changed.
+      if (isHtml(path)) setPageNonce((n) => n + 1);
     } catch (e) {
       if (String(e).includes("changed-on-disk")) setConflict(true);
       else setSaveErr(String(e));
@@ -260,7 +292,7 @@ export default function FileView({
   // preview), and Ctrl+S still saves from the preview, where the editor's own
   // keymap is not listening.
   useEffect(() => {
-    if (!active || !md) return;
+    if (!active || (!md && !html)) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "v") {
         e.preventDefault();
@@ -272,7 +304,7 @@ export default function FileView({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, md, toggleMode]);
+  }, [active, md, html, toggleMode]);
 
   /** Links in the preview go to the system browser; the page must not
    *  navigate away from the app. */
@@ -289,7 +321,7 @@ export default function FileView({
       <div className="file-bar">
         <span className="file-bar-path" title={path}>{homeAbbrev(path)}</span>
         {truncated && <span className="file-bar-note">first 2 MB — read-only</span>}
-        {md && (
+        {(md || html) && (
           <div className="file-mode" role="group" aria-label="View as">
             <button
               className={"file-mode-btn" + (mode === "code" ? " on" : "")}
@@ -339,7 +371,18 @@ export default function FileView({
       ) : (
         <>
           <div className="file-editor" ref={hostRef} hidden={mode === "preview"} />
-          {mode === "preview" && (
+          {mode === "preview" && (html ? (
+            // The page itself, relative assets and all, via the scoped asset
+            // protocol. Sandboxed: its scripts run, but it is not the app's
+            // origin and cannot reach the IPC. Shows the last SAVE — the
+            // nonce re-fetches after every write and watcher reload.
+            <iframe
+              className="page-preview"
+              title={homeAbbrev(path)}
+              sandbox="allow-scripts"
+              src={convertFileSrc(path) + "?v=" + pageNonce}
+            />
+          ) : (
             <div
               className="md-preview"
               onClick={onPreviewClick}
@@ -347,7 +390,7 @@ export default function FileView({
               title="Double-click to edit"
               dangerouslySetInnerHTML={{ __html: previewHtml }}
             />
-          )}
+          ))}
         </>
       )}
     </div>

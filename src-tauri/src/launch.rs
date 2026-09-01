@@ -29,6 +29,12 @@ pub enum LaunchRequest {
         /// the ＋ menu, which opens an empty session.
         #[serde(default)]
         prompt: Option<String>,
+        /// Permission flags for this launch only. The Bring In relay uses a
+        /// read-only, non-interactive mode so its reviewer cannot edit the
+        /// workspace or become stranded behind an unseen approval prompt.
+        /// Absent means the user's stored mode, as for every normal launch.
+        #[serde(default)]
+        permission_flags: Option<String>,
     },
     /// A model from Model access. Which engine runs it is this module's answer,
     /// not the caller's.
@@ -99,12 +105,20 @@ fn resolve_result_with(
     request: LaunchRequest,
     permission_flags: impl Fn(&dyn AgentBackend) -> String,
 ) -> Result<LaunchPlan, String> {
+    let permission_override = match &request {
+        LaunchRequest::Agent {
+            permission_flags: Some(flags),
+            ..
+        } => Some(flags.clone()),
+        _ => None,
+    };
     let plan = resolve_in(list, providers, request.clone()).ok_or_else(|| explain(list, &request))?;
-    let flags = list
-        .iter()
-        .find(|backend| backend.id() == plan.agent_id)
-        .map(|backend| permission_flags(&**backend))
-        .unwrap_or_default();
+    let flags = permission_override.unwrap_or_else(|| {
+        list.iter()
+            .find(|backend| backend.id() == plan.agent_id)
+            .map(|backend| permission_flags(&**backend))
+            .unwrap_or_default()
+    });
     Ok(with_permission(plan, &flags))
 }
 
@@ -131,7 +145,13 @@ pub fn resolve_in(
     request: LaunchRequest,
 ) -> Option<LaunchPlan> {
     match request {
-        LaunchRequest::Agent { agent_id, model, effort, prompt } => {
+        LaunchRequest::Agent {
+            agent_id,
+            model,
+            effort,
+            prompt,
+            ..
+        } => {
             let backend = list.iter().find(|b| b.id() == agent_id)?;
             let spec = LaunchSpec {
                 model,
@@ -366,6 +386,26 @@ mod tests {
         assert_eq!(plan.command, "claude --resume abc --permission-mode plan");
     }
 
+    #[test]
+    fn a_launch_permission_override_replaces_the_stored_mode() {
+        let list = vec![claude_like(vec![])];
+        let plan = resolve_result_with(
+            &list,
+            &[],
+            LaunchRequest::Agent {
+                agent_id: "claude".into(),
+                model: None,
+                effort: None,
+                prompt: None,
+                permission_flags: Some("--permission-mode plan".into()),
+            },
+            |_| "--permission-mode auto".into(),
+        )
+        .unwrap();
+        assert!(plan.command.ends_with("--permission-mode plan"));
+        assert!(!plan.command.contains("--permission-mode auto"));
+    }
+
     /* ---- fakes, in the shape agents.rs already uses ---------------------- */
 
     struct FakeSessions {
@@ -555,6 +595,7 @@ mod tests {
                 model: Some("opus".into()),
                 effort: Some("high".into()),
                 prompt: None,
+                permission_flags: None,
             },
         )
         .expect("no plan");
@@ -570,7 +611,7 @@ mod tests {
         assert!(resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "ghost".into(), model: None, effort: None, prompt: None },
+            LaunchRequest::Agent { agent_id: "ghost".into(), model: None, effort: None, prompt: None, permission_flags: None },
         )
         .is_none());
     }
@@ -724,7 +765,7 @@ mod tests {
         let minting = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None },
+            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None, permission_flags: None },
         )
         .unwrap();
         let id = minting.session_id.expect("claude mints an id");
@@ -751,8 +792,9 @@ mod tests {
             agent_id: "claude".into(),
             model: None,
             effort: None,
-    prompt: None,
-};
+            prompt: None,
+            permission_flags: None,
+        };
         let a = resolve_in(&list, &[], req()).unwrap().session_id;
         let b = resolve_in(&list, &[], req()).unwrap().session_id;
         assert!(a.is_some() && a != b, "the same id twice: {a:?}");
@@ -1028,7 +1070,7 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None },
+            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None, permission_flags: None },
         )
         .unwrap();
         let v: serde_json::Value = serde_json::to_value(&plan).unwrap();

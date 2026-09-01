@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { fmtTime, fullTime, useTimeFormat } from "../timefmt";
 import {
-  AgentRun, Artifact, SessionTask, homeAbbrev, openPath,
-  sessionAgents, sessionArtifacts, sessionTasks,
+  AgentRun, Artifact, Change, SessionTask, homeAbbrev, openPath,
+  isImagePath, isVideoPath, readFileBase64,
+  sessionAgents, sessionArtifacts, sessionChanges, sessionTasks,
 } from "../ipc";
 import Icon from "./Icon";
 import { Ban, Circle, CircleCheck } from "lucide-react";
@@ -11,8 +13,101 @@ interface Props {
   /** Session id of the active terminal tab, when its engine records tasks
    *  and artifacts aiterm can read (`caps.tasks`). */
   sessionId: string | null;
+  /** The active tab's session for the Changes tab — every engine, since the
+   *  filesystem watcher does not care which one wrote the file. */
+  changesSessionId?: string | null;
   /** Open an artifact in a center file tab instead of the system app. */
   onOpenFile?: (path: string) => void;
+}
+
+/** A thumbnail for an image the agent made, read on demand. */
+function Thumb({ path }: { path: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let stop = false;
+    readFileBase64(path).then((f) => !stop && setSrc(`data:${f.mime};base64,${f.data}`)).catch(() => {});
+    return () => { stop = true; };
+  }, [path]);
+  return src ? <img className="change-thumb" src={src} alt="" /> : <span className="change-thumb blank" />;
+}
+
+function ChangesList({ sessionId, extra, onOpenFile }: { sessionId: string; extra?: Artifact[]; onOpenFile?: (path: string) => void }) {
+  const { format: timeFormat } = useTimeFormat();
+  const [changes, setChanges] = useState<Change[]>([]);
+  const [big, setBig] = useState<string | null>(null);
+  useEffect(() => {
+    let stop = false;
+    const load = () => sessionChanges(sessionId).then((c) => !stop && setChanges(c)).catch(() => {});
+    load();
+    const un = listen<Change>("changes://file", (e) => { if (e.payload.session_id === sessionId) load(); });
+    return () => { stop = true; un.then((f) => f()); };
+  }, [sessionId]);
+  // One list for everything the session produced: the filesystem's word
+  // (the ledger, plus harness output read live) and, folded in, files the
+  // transcript says it wrote that the watcher never saw.
+  const rows: Change[] = [
+    ...changes,
+    ...(extra ?? [])
+      .filter((a) => !changes.some((c) => c.path === a.path))
+      .map((a) => ({
+        path: a.path,
+        name: a.path.split("/").pop() ?? a.path,
+        kind: a.tool === "Write" ? "created" : "modified",
+        at: Math.floor(Date.parse(a.at) / 1000) || 0,
+        session_id: sessionId,
+        bytes: 0,
+      })),
+  ].sort((x, y) => y.at - x.at);
+  if (rows.length === 0) {
+    return <div className="empty-note">Nothing produced in this session yet. Files it creates or edits — any engine, any tool — show up here as they land.</div>;
+  }
+  return (
+    <div className="tasks-body">
+      {rows.map((c) => (
+        <div
+          key={c.path}
+          className={"task-row artifact-row change-row " + c.kind}
+          title={`${c.path} — ${c.kind} ${fullTime(c.at * 1000)}`}
+          onClick={() => {
+            if (c.kind === "deleted") return;
+            if (isImagePath(c.path) || isVideoPath(c.path)) setBig(big === c.path ? null : c.path);
+            else if (onOpenFile) onOpenFile(c.path);
+            else openPath(c.path).catch(() => {});
+          }}
+        >
+          {isImagePath(c.path) && c.kind !== "deleted" ? <Thumb path={c.path} /> : (
+            <span className={"artifact-tool " + (c.kind === "created" ? "write" : c.kind === "deleted" ? "gone" : "edit")}>
+              {c.kind === "created" ? "+" : c.kind === "deleted" ? "×" : "~"}
+            </span>
+          )}
+          <span className="task-subject">
+            {c.name}
+            <span className="change-meta"> · {fmtTime(c.at * 1000, timeFormat)} · {homeAbbrev(c.path.slice(0, c.path.lastIndexOf("/")))}</span>
+          </span>
+        </div>
+      ))}
+      {big && (
+        <div className="change-big" onClick={() => setBig(null)}>
+          {isVideoPath(big) ? <BigVideo path={big} /> : <BigImage path={big} />}
+          <div className="change-big-actions">
+            <button className="act-btn" onClick={(e) => { e.stopPropagation(); openPath(big).catch(() => {}); }}>Open in app</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BigImage({ path }: { path: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => { readFileBase64(path).then((f) => setSrc(`data:${f.mime};base64,${f.data}`)).catch(() => {}); }, [path]);
+  return src ? <img src={src} alt="" /> : <span className="empty-note">Loading…</span>;
+}
+
+function BigVideo({ path }: { path: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => { readFileBase64(path).then((f) => setSrc(`data:${f.mime};base64,${f.data}`)).catch(() => {}); }, [path]);
+  return src ? <video src={src} controls autoPlay /> : <span className="empty-note">Loading…</span>;
 }
 
 function statusIcon(t: SessionTask) {
@@ -22,8 +117,7 @@ function statusIcon(t: SessionTask) {
   return <span className="task-icon"><Icon of={Circle} size="sm" /></span>;
 }
 
-export default function AgentPanel({ sessionId, onOpenFile }: Props) {
-  const { format: timeFormat } = useTimeFormat();
+export default function AgentPanel({ sessionId, changesSessionId, onOpenFile }: Props) {
   const [tab, setTab] = useState<"tasks" | "artifacts">("tasks");
   const [tasks, setTasks] = useState<SessionTask[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -51,6 +145,17 @@ export default function AgentPanel({ sessionId, onOpenFile }: Props) {
   }, [sessionId]);
 
   if (!sessionId) {
+    // No task-recording engine, but the filesystem still has a word.
+    if (changesSessionId) {
+      return (
+        <>
+          <div className="git-tabs agent-tabs">
+            <button className="git-tab on">Changes</button>
+          </div>
+          <ChangesList sessionId={changesSessionId} onOpenFile={onOpenFile} />
+        </>
+      );
+    }
     return (
       <div className="empty-note">
         Tasks and artifacts appear here for engines that record them —
@@ -98,9 +203,11 @@ export default function AgentPanel({ sessionId, onOpenFile }: Props) {
         <button
           className={"git-tab" + (tab === "artifacts" ? " on" : "")}
           onClick={() => setTab("artifacts")}
-        >Artifacts{artifacts.length ? ` (${artifacts.length})` : ""}</button>
+        >Artifacts</button>
       </div>
-      {tab === "tasks" ? (
+      {tab !== "tasks" ? (
+        <ChangesList sessionId={changesSessionId ?? sessionId} extra={artifacts} onOpenFile={onOpenFile} />
+      ) : (
         tasks.length === 0 ? (
           <div className="empty-note">No tasks in this session yet</div>
         ) : (
@@ -121,31 +228,6 @@ export default function AgentPanel({ sessionId, onOpenFile }: Props) {
             ))}
           </div>
         )
-      ) : artifacts.length === 0 ? (
-        <div className="empty-note">No files written in this session yet</div>
-      ) : (
-        <div className="tasks-body">
-          {artifacts.map((a) => (
-            <div
-              key={a.path}
-              className="task-row artifact-row"
-              title={`${a.path} (${a.tool})`}
-              onClick={() =>
-                onOpenFile ? onOpenFile(a.path) : openPath(a.path).catch(() => {})}
-            >
-              <span className={"artifact-tool " + a.tool.toLowerCase()}>
-                {a.tool === "Write" ? "W" : "E"}
-              </span>
-              <span className="task-subject">
-                {a.path.split("/").pop()}
-                <span className="artifact-dir"> {homeAbbrev(a.path).replace(/\/[^/]*$/, "")}</span>
-              </span>
-              {a.at && (
-                <span className="artifact-time" title={fullTime(new Date(a.at).getTime())}>{fmtTime(new Date(a.at).getTime(), timeFormat)}</span>
-              )}
-            </div>
-          ))}
-        </div>
       )}
     </div>
   );

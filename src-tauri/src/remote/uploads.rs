@@ -45,6 +45,7 @@ pub struct UploadBegin {
     pub attachment_id: AttachmentId,
     pub submission_id: String,
     pub submission_count: u8,
+    pub member_index: u8,
     pub submission_bytes: u64,
     pub length: u64,
     pub sha256: [u8; 32],
@@ -54,6 +55,7 @@ pub struct UploadBegin {
 pub struct UploadBegan {
     pub upload_id: String,
     pub next_chunk: u32,
+    pub published_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,6 +244,46 @@ impl UploadSet {
         now: SystemTime,
     ) -> Result<UploadBegan, UploadError> {
         self.store.maintain(now)?;
+        if let Some((upload_id, member)) = self.upload_members.iter_mut().find(|(_, member)| {
+            member.submission_id == request.submission_id
+                && member.member_index == request.member_index
+        }) {
+            if member.declared_length != request.length
+                || member.declared_digest != request.sha256
+                || self.submission.as_ref().is_some_and(|group| {
+                    group.declared_count != request.submission_count
+                        || group.declared_bytes != request.submission_bytes
+                })
+            {
+                return Err(UploadError::new(
+                    UploadErrorKind::InvalidSubmission,
+                    "resumed image metadata does not match its original declaration",
+                ));
+            }
+            member.tab_id = request.tab_id.clone();
+            member.attachment_id = request.attachment_id.clone();
+            if let Some(group) = self.submission.as_mut() {
+                group.tab_id = request.tab_id.clone();
+                group.attachment_id = request.attachment_id.clone();
+            }
+            let next_chunk = match self.uploads.get_mut(upload_id) {
+                Some(upload) => {
+                    upload.tab_id = request.tab_id;
+                    upload.attachment_id = request.attachment_id;
+                    upload.next_chunk
+                }
+                None if member.published_path.is_some() => 0,
+                None => return Err(UploadError::new(
+                    UploadErrorKind::ClosedSubmission,
+                    "submission image is no longer resumable",
+                )),
+            };
+            return Ok(UploadBegan {
+                upload_id: upload_id.clone(),
+                next_chunk,
+                published_path: member.published_path.clone(),
+            });
+        }
         if self.closed_submissions.len() >= MAX_CLOSED_SUBMISSIONS {
             return Err(UploadError::new(
                 UploadErrorKind::Capacity,
@@ -342,6 +384,8 @@ impl UploadSet {
         let group = self
             .submission
             .get_or_insert_with(|| SubmissionState::new(&request));
+        group.tab_id = request.tab_id.clone();
+        group.attachment_id = request.attachment_id.clone();
         group.begun_count = prospective.0;
         group.begun_bytes = prospective.1;
         group.active_uploads.insert(upload_id.clone());
@@ -351,6 +395,10 @@ impl UploadSet {
                 submission_id: request.submission_id,
                 tab_id: request.tab_id,
                 attachment_id: request.attachment_id,
+                member_index: request.member_index,
+                declared_length: request.length,
+                declared_digest: request.sha256,
+                published_path: None,
             },
         );
         self.uploads.insert(upload_id.clone(), active);
@@ -358,6 +406,7 @@ impl UploadSet {
         Ok(UploadBegan {
             upload_id,
             next_chunk: 0,
+            published_path: None,
         })
     }
 
@@ -484,6 +533,9 @@ impl UploadSet {
         });
         match result {
             Ok(published) => {
+                if let Some(member) = self.upload_members.get_mut(upload_id) {
+                    member.published_path = Some(published.path.clone());
+                }
                 let complete = if let Some(group) = self.submission.as_mut() {
                     group.finished_count += 1;
                     group.finished_count == group.declared_count as usize
@@ -606,6 +658,10 @@ struct UploadMember {
     submission_id: String,
     tab_id: TabId,
     attachment_id: AttachmentId,
+    member_index: u8,
+    declared_length: u64,
+    declared_digest: [u8; 32],
+    published_path: Option<PathBuf>,
 }
 
 struct StagedFile {
@@ -749,9 +805,7 @@ impl SubmissionState {
     }
 
     fn matches(&self, request: &UploadBegin) -> bool {
-        self.tab_id == request.tab_id
-            && self.attachment_id == request.attachment_id
-            && self.declared_count == request.submission_count
+        self.declared_count == request.submission_count
             && self.declared_bytes == request.submission_bytes
     }
 }
@@ -773,6 +827,12 @@ fn validate_begin(request: &UploadBegin) -> Result<(), UploadError> {
         return Err(UploadError::new(
             UploadErrorKind::TooLarge,
             "submission must contain one to four images",
+        ));
+    }
+    if request.member_index >= request.submission_count {
+        return Err(UploadError::new(
+            UploadErrorKind::InvalidSubmission,
+            "image index is outside the declared submission",
         ));
     }
     if request.submission_bytes > MAX_SUBMISSION_BYTES {
@@ -3485,6 +3545,7 @@ mod tests {
             attachment_id: AttachmentId::new(),
             submission_id: Uuid::new_v4().hyphenated().to_string(),
             submission_count: 1,
+            member_index: 0,
             submission_bytes: jpeg.len() as u64,
             length: jpeg.len() as u64,
             sha256: Sha256::digest(&jpeg).into(),
@@ -3691,6 +3752,7 @@ mod tests {
             attachment_id: AttachmentId::new(),
             submission_id: Uuid::new_v4().hyphenated().to_string(),
             submission_count: 1,
+            member_index: 0,
             submission_bytes: jpeg.len() as u64,
             length: jpeg.len() as u64,
             sha256: Sha256::digest(&jpeg).into(),
@@ -3735,6 +3797,7 @@ mod tests {
             attachment_id: AttachmentId::new(),
             submission_id: Uuid::new_v4().hyphenated().to_string(),
             submission_count: 1,
+            member_index: 0,
             submission_bytes: jpeg.len() as u64,
             length: jpeg.len() as u64,
             sha256: Sha256::digest(&jpeg).into(),

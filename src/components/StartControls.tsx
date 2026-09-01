@@ -151,6 +151,10 @@ function apiSetup(all: ProviderView[]): { text: string; provider?: string } {
 
 interface Props {
   ctl: Ctl;
+  /** Some callers need a real CLI because they rely on its launch-time
+   *  sandbox controls. Keep the general launcher unchanged while allowing
+   *  those constrained flows to omit the API/OpenCode path entirely. */
+  allowApi?: boolean;
   /** Open Settings → Model access, on this provider when one is named. The
    *  API tab calls this instead of selecting while there is nothing to
    *  select. Without it the tab still says what is missing; it just cannot
@@ -158,7 +162,7 @@ interface Props {
   onOpenModelAccess?: (providerId?: string) => void;
 }
 
-export default function StartControls({ ctl, onOpenModelAccess }: Props) {
+export default function StartControls({ ctl, onOpenModelAccess, allowApi = true }: Props) {
   const {
     agents, agentId, model, effort, models, efforts, providers, allProviders, apiModel,
     isApi, apiReady, pickAgent, pickModel, setEffort, setApiModel,
@@ -182,15 +186,17 @@ export default function StartControls({ ctl, onOpenModelAccess }: Props) {
             <span>{a.display_name}</span>
           </button>
         ))}
-        <button
-          className={"ns-agent-tab" + (isApi ? " on" : "") + (apiReady ? "" : " setup")}
-          onClick={onApiTab}
-          title={setup?.text ?? "A model from a configured provider"}
-        >
-          <AgentIcon agent={API_SOURCE} size={14} />
-          <span>API</span>
-          {!apiReady && <span className="ns-tab-setup">set up</span>}
-        </button>
+        {allowApi && (
+          <button
+            className={"ns-agent-tab" + (isApi ? " on" : "") + (apiReady ? "" : " setup")}
+            onClick={onApiTab}
+            title={setup?.text ?? "A model from a configured provider"}
+          >
+            <AgentIcon agent={API_SOURCE} size={14} />
+            <span>API</span>
+            {!apiReady && <span className="ns-tab-setup">set up</span>}
+          </button>
+        )}
       </div>
       <div className="ns-selects">
         {isApi ? (
@@ -262,8 +268,8 @@ export default function StartControls({ ctl, onOpenModelAccess }: Props) {
       )}
       {agents.length === 0 && !isApi && (
         <div className="empty-note">
-          No agent CLI installed — install claude, codex or grok, or use the
-          API tab.
+          No agent CLI installed — install claude, codex or grok
+          {allowApi ? ", or use the API tab" : ""}.
         </div>
       )}
     </div>

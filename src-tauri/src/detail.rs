@@ -101,7 +101,7 @@ pub async fn session_detail(session_id: String) -> Option<SessionDetail> {
     crate::run_blocking(move || session_detail_sync(session_id)).await
 }
 
-fn session_detail_sync(session_id: String) -> Option<SessionDetail> {
+pub(crate) fn session_detail_sync(session_id: String) -> Option<SessionDetail> {
     let list = crate::agents::backends();
     let (backend, path) = crate::agents::owner_in(&list, &session_id)?;
     if let Some(d) = backend.sessions().detail(&session_id) {
@@ -134,7 +134,7 @@ fn is_bookkeeping(line: &str) -> bool {
     [
         "\"permission-mode\"", "\"ai-title\"", "\"pr-link\"", "\"compact_boundary\"",
         "\"session_meta\"", "\"turn_context\"", "\"token_count\"", "\"task_started\"",
-        "\"function_call\"", "\"custom_tool_call\"", "\"aiterm-chat",
+        "\"function_call\"", "\"custom_tool_call\"", "\"compacted\"", "\"aiterm-chat",
     ]
     .iter()
     .any(|k| line.contains(k))
@@ -265,6 +265,10 @@ pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>,
         }
         "aiterm-chat-clear" => d.compactions += 1,
         // ---- codex bookkeeping ----
+        // Codex compacts too: `{"type":"compacted","payload":{…}}` written
+        // when context is compacted (manual or automatic).
+        // [observed: codex-cli 0.150.1]
+        "compacted" => d.compactions += 1,
         "session_meta" => {
             if let Some(c) = str_at(v, "/payload/cwd") {
                 d.cwd = Some(c.to_string());
@@ -368,12 +372,35 @@ pub(crate) fn read_line(d: &mut SessionDetail, tools: &mut HashMap<String, u32>,
         return;
     }
     if let Some((role, text)) = line_message(v) {
+        if role == "user" && is_codex_agents_preamble(&text) {
+            return;
+        }
         let text = strip_system_tags(&text);
         if text.trim().is_empty() {
             return;
         }
         note_message(d, &role, &text);
     }
+}
+
+/// Codex sends the repo's AGENTS.md as its own first "user" message: an
+/// untagged `# AGENTS.md instructions for <cwd>` header ahead of an
+/// `<INSTRUCTIONS>…</INSTRUCTIONS>` block. The whole-block system filter
+/// keeps it — stripping the tags leaves the header line — so it has to be
+/// named here: harness preamble, never a phone bubble, a `first_prompt` or
+/// a title. Both the header AND the block are required, so a genuine message
+/// that merely mentions AGENTS.md is not swallowed. Checked against the RAW
+/// text, before tags are stripped. Older rollouts (0.147.0–0.149.1) put a
+/// `<recommended_plugins>` block ahead of the header — skip it before the
+/// prefix check. [observed: codex-cli 0.150.1]
+fn is_codex_agents_preamble(text: &str) -> bool {
+    let mut t = text.trim_start();
+    if t.starts_with("<recommended_plugins>") {
+        if let Some(end) = t.find("</recommended_plugins>") {
+            t = t[end + "</recommended_plugins>".len()..].trim_start();
+        }
+    }
+    t.starts_with("# AGENTS.md instructions for ") && t.contains("<INSTRUCTIONS>")
 }
 
 pub(crate) fn note_message(d: &mut SessionDetail, role: &str, text: &str) {
@@ -401,6 +428,9 @@ pub(crate) fn note_message(d: &mut SessionDetail, role: &str, text: &str) {
 fn from_messages(id: String, msgs: Vec<(String, String)>) -> SessionDetail {
     let mut d = SessionDetail { id, ..Default::default() };
     for (role, text) in msgs {
+        if role == "user" && is_codex_agents_preamble(&text) {
+            continue;
+        }
         let text = strip_system_tags(&text);
         if text.trim().is_empty() {
             continue;
@@ -470,10 +500,14 @@ mod tests {
             json!({"timestamp":"2026-08-28T23:18:39Z","type":"session_meta","payload":{"cwd":"/c","cli_version":"0.150.1"}}),
             json!({"timestamp":"2026-08-28T23:18:39Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}),
             json!({"timestamp":"2026-08-28T23:18:39Z","type":"turn_context","payload":{"model":"gpt-5-codex","approval_policy":"on-request"}}),
+            // Codex's first "user" message is the repo's AGENTS.md — harness
+            // preamble, not the person. [observed: codex-cli 0.150.1]
+            json!({"timestamp":"2026-08-28T23:18:39Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /c\n\n<INSTRUCTIONS>\n# Agent start\nrules live here\n</INSTRUCTIONS>"}]}}),
             json!({"timestamp":"2026-08-28T23:18:40Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}),
             json!({"timestamp":"2026-08-28T23:18:41Z","type":"response_item","payload":{"type":"function_call","name":"shell"}}),
             json!({"timestamp":"2026-08-28T23:18:42Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hey John!"}]}}),
             json!({"timestamp":"2026-08-28T23:18:42Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":14},"last_token_usage":{"input_tokens":15612}}}}),
+            json!({"timestamp":"2026-08-28T23:18:43Z","type":"compacted","payload":{"message":"","replacement_history":[]}}),
         ]);
         assert_eq!(d.cwd.as_deref(), Some("/c"));
         assert_eq!(d.cli_version.as_deref(), Some("0.150.1"));
@@ -484,8 +518,42 @@ mod tests {
         assert_eq!(d.output_tokens, 14);
         assert_eq!(d.tool_calls, 1);
         assert_eq!(d.tools, vec![ToolCount { name: "shell".into(), count: 1 }]);
-        assert_eq!(d.first_prompt.as_deref(), Some("hi"));
+        assert_eq!(d.user_messages, 1, "the AGENTS.md preamble is not the conversation");
+        assert_eq!(d.first_prompt.as_deref(), Some("hi"), "the preamble is never the first prompt");
         assert_eq!(d.last_assistant.as_deref(), Some("Hey John!"));
+        assert_eq!(d.compactions, 1, "codex's `compacted` record counts too");
+    }
+
+    #[test]
+    fn a_message_that_merely_mentions_agents_md_is_kept() {
+        let d = feed(&[
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for this repo need a rewrite — draft one"}]}}),
+        ]);
+        assert_eq!(d.user_messages, 1, "no <INSTRUCTIONS> block: the person's own words");
+        assert_eq!(
+            d.first_prompt.as_deref(),
+            Some("# AGENTS.md instructions for this repo need a rewrite — draft one")
+        );
+    }
+
+    /// Both 0.150.1 exec spellings summarize to the shell command inside:
+    /// flagship `custom_tool_call` name `exec` with bare-`cmd:` JavaScript,
+    /// mini `function_call` name `exec_command` with JSON `arguments`.
+    /// [observed: codex-cli 0.150.1]
+    #[test]
+    fn codex_exec_one_liners_read_the_command() {
+        // Flagship: bare `cmd:` key, other keys quoted, plan call in the same input.
+        let js = line_events(&json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec",
+            "input":"const p = await tools.update_plan({plan:[\n  {step:\"Read hello.txt\",status:\"in_progress\"}\n]});\nconst r = await tools.exec_command({cmd:\"sed -n '1,200p' hello.txt\",\"workdir\":\"/w\"})"}}));
+        assert_eq!(js, vec![("exec".to_string(), "sed -n '1,200p' hello.txt".to_string())]);
+        // Older rollouts quote the key.
+        let quoted = line_events(&json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec",
+            "input":"const r = await tools.exec_command({\"cmd\":\"ls -la\"})"}}));
+        assert_eq!(quoted, vec![("exec".to_string(), "ls -la".to_string())]);
+        // Mini: JSON arguments on a declared `exec_command` tool.
+        let json_args = line_events(&json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command",
+            "arguments":"{\"cmd\":\"wc -c hello.txt\",\"workdir\":\"/w\",\"yield_time_ms\":10000,\"max_output_tokens\":4000}"}}));
+        assert_eq!(json_args, vec![("exec".to_string(), "wc -c hello.txt".to_string())]);
     }
 
     #[test]
@@ -532,5 +600,324 @@ mod tests {
     fn clip_marks_the_cut() {
         assert_eq!(clip("  short  ", 10), "short");
         assert_eq!(clip("abcdefghij", 5), "abcde…");
+    }
+}
+
+/// The conversation as a list of turns, oldest first — what a second agent
+/// is handed when it is brought into a session. Tool calls and injected
+/// system blocks are left out; only what was said. Trimmed from the front
+/// to `max_chars`, keeping the opening user message so the ask is never
+/// lost, with a marker where the cut was made.
+#[tauri::command]
+pub async fn session_conversation(session_id: String, max_chars: usize) -> Vec<(String, String)> {
+    crate::run_blocking(move || conversation_sync(&session_id, max_chars)).await
+}
+
+fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)> {
+    let list = crate::agents::backends();
+    let Some((backend, path)) = crate::agents::owner_in(&list, session_id) else { return vec![] };
+    let mut turns: Vec<(String, String)> = match backend.sessions().messages(session_id) {
+        Some(m) => m,
+        None => {
+            let Ok(file) = File::open(&path) else { return vec![] };
+            BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|l| crate::sessions::line_may_hold_message(l))
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+                .filter_map(|v| crate::sessions::line_message(&v))
+                .collect()
+        }
+    };
+    turns.retain(|(_, t)| {
+        !crate::sessions::is_only_system_block(t) && !is_codex_agents_preamble(t) && !t.trim().is_empty()
+    });
+    // Adjacent same-role turns (an assistant that spoke, used a tool, spoke
+    // again) read as one.
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (role, text) in turns {
+        match merged.last_mut() {
+            Some((r, t)) if *r == role => {
+                t.push_str("\n\n");
+                t.push_str(&text);
+            }
+            _ => merged.push((role, text)),
+        }
+    }
+    let total: usize = merged.iter().map(|(_, t)| t.len()).sum();
+    if total <= max_chars || merged.len() < 3 {
+        return merged;
+    }
+    // Keep the first turn and as much of the tail as fits.
+    let first = merged.remove(0);
+    let mut budget = max_chars.saturating_sub(first.1.len());
+    let mut tail: Vec<(String, String)> = Vec::new();
+    for turn in merged.into_iter().rev() {
+        if turn.1.len() > budget {
+            break;
+        }
+        budget -= turn.1.len();
+        tail.push(turn);
+    }
+    tail.reverse();
+    let mut out = vec![first, ("system".into(), "[… earlier turns omitted for length …]".into())];
+    out.extend(tail);
+    out
+}
+
+/// The conversation with the work shown: every message, plus each tool
+/// call as a turn named for the tool, and (Codex) reasoning summaries as
+/// "thinking". This is what a phone renders while an agent works — the
+/// desktop's own preview stays on the message-only parser above.
+pub async fn conversation_rich(session_id: String, max_chars: usize) -> Vec<(String, String)> {
+    crate::run_blocking(move || conversation_rich_sync(&session_id, max_chars)).await
+}
+
+/// Synchronous service entry point for transports that already run their
+/// request dispatch on a bounded blocking worker.
+pub(crate) fn conversation_rich_service(
+    session_id: &str,
+    max_chars: usize,
+) -> Vec<(String, String)> {
+    conversation_rich_sync(session_id, max_chars)
+}
+
+fn conversation_rich_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)> {
+    let list = crate::agents::backends();
+    let Some((backend, path)) = crate::agents::owner_in(&list, session_id) else { return vec![] };
+    let mut turns: Vec<(String, String)> = match backend.sessions().messages(session_id) {
+        Some(m) => m,
+        None => {
+            let Ok(file) = File::open(&path) else { return vec![] };
+            BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .filter(|l| l.contains("\"type\""))
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+                .filter(|v| v.get("isSidechain").and_then(|b| b.as_bool()) != Some(true))
+                // Harness-to-model text (a loaded skill's body) rides in
+                // isMeta:true user records; line_message filters it, but this
+                // path parses with line_events — same rule applies.
+                // [observed: Claude Code 2.1.251, 2026-08-31]
+                .filter(|v| v.get("isMeta").and_then(|b| b.as_bool()) != Some(true))
+                .flat_map(|v| line_events(&v))
+                .collect()
+        }
+    };
+    turns.retain(|(_, t)| {
+        !crate::sessions::is_only_system_block(t) && !is_codex_agents_preamble(t) && !t.trim().is_empty()
+    });
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (role, text) in turns {
+        match merged.last_mut() {
+            // Same speaker twice in a row reads as one; tool calls stay separate.
+            Some((r, t)) if *r == role && (role == "user" || role == "assistant" || role == "thinking") => {
+                t.push_str("\n\n");
+                t.push_str(&text);
+            }
+            _ => merged.push((role, text)),
+        }
+    }
+    let total: usize = merged.iter().map(|(_, t)| t.len()).sum();
+    if total <= max_chars || merged.len() < 3 {
+        return merged;
+    }
+    let first = merged.remove(0);
+    let mut budget = max_chars.saturating_sub(first.1.len());
+    let mut tail: Vec<(String, String)> = Vec::new();
+    for turn in merged.into_iter().rev() {
+        if turn.1.len() > budget {
+            break;
+        }
+        budget -= turn.1.len();
+        tail.push(turn);
+    }
+    tail.reverse();
+    let mut out = vec![first, ("system".into(), "[… earlier turns omitted for length …]".into())];
+    out.extend(tail);
+    out
+}
+
+const TOOL_TEXT_CAP: usize = 600;
+
+fn cap(s: &str) -> String {
+    if s.len() <= TOOL_TEXT_CAP {
+        return s.to_string();
+    }
+    let mut end = TOOL_TEXT_CAP;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// One transcript line → zero or more turns. Claude's assistant lines carry
+/// text and tool_use blocks side by side; Codex writes each item on its own
+/// line. Tool results and outputs are left out — the call says what
+/// happened, the output is mostly noise at phone size.
+fn line_events(v: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match v.get("type").and_then(|t| t.as_str()) {
+        Some(r @ ("user" | "assistant")) => {
+            let Some(content) = v.pointer("/message/content") else { return out };
+            match content {
+                serde_json::Value::String(s) => out.push((r.to_string(), s.clone())),
+                serde_json::Value::Array(blocks) => {
+                    let mut text = String::new();
+                    for b in blocks {
+                        match b.get("type").and_then(|t| t.as_str()) {
+                            Some("tool_use") => {
+                                if !text.trim().is_empty() {
+                                    out.push((r.to_string(), std::mem::take(&mut text)));
+                                }
+                                let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                                out.push((name.to_string(), cap(&tool_input_summary(b.get("input")))));
+                            }
+                            Some("tool_result") => {}
+                            _ => {
+                                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty() {
+                                        text.push('\n');
+                                    }
+                                    text.push_str(t);
+                                }
+                            }
+                        }
+                    }
+                    if !text.trim().is_empty() {
+                        out.push((r.to_string(), text));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some("response_item") => {
+            let Some(p) = v.get("payload") else { return out };
+            match p.get("type").and_then(|t| t.as_str()) {
+                Some("message") => {
+                    if let Some(t) = crate::sessions::line_message(v) {
+                        out.push(t);
+                    }
+                }
+                Some("custom_tool_call") | Some("function_call") => {
+                    let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                    let input = p
+                        .get("input")
+                        .or_else(|| p.get("arguments"))
+                        .map(|i| match i {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default();
+                    let (name, text) = if name == "exec" || name == "exec_command" {
+                        codex_exec_summary(name, &input)
+                    } else {
+                        (name.to_string(), input)
+                    };
+                    out.push((name, cap(&text)));
+                }
+                Some("reasoning") => {
+                    let mut text = String::new();
+                    if let Some(items) = p.get("summary").and_then(|s| s.as_array()) {
+                        for it in items {
+                            if let Some(t) = it.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                    if !text.trim().is_empty() {
+                        out.push(("thinking".into(), text));
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Codex's exec input, either spelling, down to what a person cares about —
+/// the shell command inside, not how it was invoked. Flagship models write
+/// `custom_tool_call` name `exec` whose input is a JavaScript snippet,
+/// `tools.exec_command({cmd:"…"})` — the `cmd` key BARE on current rollouts,
+/// quoted on older ones, so both are probed. Mini models write
+/// `function_call` name `exec_command` with JSON `arguments` carrying the
+/// same `"cmd"`. `tools.image_gen__imagegen({prompt:…})` is an image being
+/// generated — show it as one, with its prompt. Anything else stays raw.
+/// [observed: codex-cli 0.150.1; bare `cmd:` back to 0.147.0, quoted before]
+fn codex_exec_summary(name: &str, input: &str) -> (String, String) {
+    if input.contains("tools.image_gen__imagegen(") {
+        let text = js_string_after(input, "prompt:\"")
+            .or_else(|| js_string_after(input, "prompt: \""))
+            .unwrap_or_else(|| "Generating an image".into());
+        return ("image".into(), text);
+    }
+    if input.contains("tools.exec_command(") || name == "exec_command" {
+        if let Some(cmd) =
+            js_string_after(input, "\"cmd\":\"").or_else(|| js_string_after(input, "cmd:\""))
+        {
+            return ("exec".into(), cmd);
+        }
+    }
+    ("exec".into(), input.to_string())
+}
+
+/// The double-quoted string starting right after `key`, JSON-style escapes
+/// resolved. Good enough for the two shapes above; `None` when the string
+/// never closes.
+fn js_string_after(s: &str, key: &str) -> Option<String> {
+    let start = s.find(key)? + key.len();
+    let mut out = String::new();
+    let mut esc = false;
+    for c in s[start..].chars() {
+        if esc {
+            out.push(match c {
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            });
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '"' {
+            return Some(out);
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+/// A tool call's input, as a person would skim it: the command for Bash,
+/// the path for file tools, the pattern for searches, else the JSON.
+fn tool_input_summary(input: Option<&serde_json::Value>) -> String {
+    let Some(i) = input else { return String::new() };
+    for key in ["command", "file_path", "path", "pattern", "query", "description", "prompt", "url"] {
+        if let Some(s) = i.get(key).and_then(|s| s.as_str()) {
+            let extra = i.get("description").and_then(|d| d.as_str()).filter(|_| key != "description");
+            return match extra {
+                Some(d) => format!("{s}\n{d}"),
+                None => s.to_string(),
+            };
+        }
+    }
+    i.to_string()
+}
+
+#[cfg(test)]
+mod conversation_tests {
+    /// Print a real session's conversation as the relay would hand it over.
+    /// `AITERM_SESSION=<id> cargo test --lib conversation_live -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn conversation_live() {
+        let id = std::env::var("AITERM_SESSION").expect("AITERM_SESSION");
+        for (role, text) in super::conversation_sync(&id, 24_000) {
+            println!("[{role}] {}", if text.len() > 300 { format!("{}…", &text[..300]) } else { text });
+        }
     }
 }

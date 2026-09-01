@@ -11,6 +11,7 @@ pub mod grok;
 pub mod hooklink;
 pub mod indexer;
 pub mod launch;
+pub mod librarian;
 pub mod mcp;
 pub mod notify;
 pub mod opencode;
@@ -19,6 +20,7 @@ pub mod permissions;
 pub mod providers;
 pub mod pty;
 pub mod remote;
+pub mod changes;
 pub mod rendercost;
 pub mod services;
 pub mod sessions;
@@ -53,6 +55,7 @@ pub fn run() {
         .manage(pty)
         .manage(tabs.clone())
         .manage(application_services)
+        .manage(changes::ChangeLedger::default())
         .manage(watcher::WatchState::default())
         // Off until the user turns it on, and it opens nothing on disk until
         // then: a desktop that never pairs a phone never grows a
@@ -72,6 +75,17 @@ pub fn run() {
             tabs::tab_resize,
             tabs::tab_take_focus,
             tabs::tab_close,
+            librarian::librarian_state,
+            librarian::librarian_run,
+            librarian::librarian_pending,
+            librarian::librarian_forget,
+            librarian::librarian_rename_thread,
+            librarian::librarian_tidy,
+            librarian::librarian_tag,
+            librarian::librarian_default_prompts,
+            detail::session_conversation,
+            changes::session_changes,
+            changes::read_file_base64,
             agents::detect_agents,
             agents::agent_caps,
             rendercost::renderer_probe,
@@ -108,6 +122,11 @@ pub fn run() {
             providers::provider_activity,
             providers::provider_management_key_set,
             sessions::list_sessions,
+            sessions::session_rename,
+            sessions::session_titles,
+            sessions::session_stars,
+            sessions::session_brought_in,
+            sessions::session_star,
             sessions::session_status,
             sessions::session_preview,
             detail::session_detail,
@@ -203,6 +222,10 @@ pub fn run() {
             if let Err(e) = watcher::watch_claude_projects(app.handle().clone()) {
                 crate::diag!("start", "transcript watcher not running: {e}");
             }
+
+            // Track files produced by active sessions. The structured mobile
+            // API reads this ledger; it does not replace tab/session ownership.
+            changes::start(app.handle());
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.

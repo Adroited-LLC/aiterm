@@ -353,6 +353,7 @@ pub async fn remote_interfaces(
 
 #[tauri::command]
 pub async fn remote_start(
+    app: tauri::AppHandle,
     state: tauri::State<'_, RemoteState>,
     tabs: tauri::State<'_, Arc<crate::tabs::TabRegistry>>,
     services: tauri::State<'_, crate::services::ApplicationServices>,
@@ -403,7 +404,8 @@ pub async fn remote_start(
         SocketAddr::new(ip, port),
         devices,
         identity,
-        RemoteServices::from_application_services(tabs.inner().clone(), services.inner()),
+        RemoteServices::from_application_services(tabs.inner().clone(), services.inner())
+            .with_app_handle(app),
     )
     .await;
     let mut inner = state.inner.lock().await;

@@ -11,6 +11,9 @@ pub const MAX_REQUEST_KIND_BYTES: usize = 64;
 const KNOWN_REQUESTS: &[&str] = &[
     "session.list",
     "session.preview",
+    "session.conversation",
+    "session.changes",
+    "file.read",
     "session.open",
     "session.close",
     "session.delete",

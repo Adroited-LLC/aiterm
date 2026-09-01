@@ -16,7 +16,13 @@ import com.adroited.aiterm.security.AppLock
 import com.adroited.aiterm.security.DeviceKeys
 import com.adroited.aiterm.terminal.DefaultTerminalScreenStore
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.ByteArrayOutputStream
 
 class RemoteTerminalViewModel(
     desktop: PairedDesktop,
@@ -93,6 +99,110 @@ class RemoteTerminalViewModel(
     fun openSession(id: String, cols: Int, rows: Int) =
         client.openSession(id, TerminalSize(cols, rows))
     fun previewSession(id: String) = client.previewSession(id)
+    suspend fun sessionChanges(id: String): Result<List<com.adroited.aiterm.remote.RemoteSessionChange>> =
+        runCatching { client.sessionChanges(id) }
+
+    internal suspend fun sessionFilePreview(
+        sessionId: String,
+        path: String,
+        maxBytes: Int = 8 * 1024 * 1024,
+    ): Result<RemoteSessionFilePreview> = runCatching {
+        require(maxBytes > 0)
+        val output = ByteArrayOutputStream(maxBytes.coerceAtMost(256 * 1024))
+        var offset = 0L
+        var total = -1L
+        var mime = "application/octet-stream"
+        var eof = false
+        while (!eof && offset < maxBytes) {
+            val count = minOf(256 * 1024, maxBytes - offset.toInt())
+            val chunk = client.readFileChunk(sessionId, path, offset, count)
+            check(chunk.path == path && (total < 0 || chunk.total == total) && chunk.offset == offset) {
+                "The desktop returned a different file while reading."
+            }
+            if (total < 0) {
+                total = chunk.total
+                mime = chunk.mime
+            } else {
+                check(chunk.mime == mime) { "The desktop changed the file type while reading." }
+            }
+            output.write(chunk.data)
+            offset += chunk.data.size
+            eof = chunk.eof
+            check(eof || chunk.data.isNotEmpty()) { "The desktop returned an empty file chunk." }
+        }
+        RemoteSessionFilePreview(
+            path = path,
+            mime = mime,
+            total = total.coerceAtLeast(0),
+            data = output.toByteArray(),
+            truncated = !eof,
+        )
+    }
+
+    /**
+     * Sends from the conversation view without introducing a second protocol. Opening the
+     * session, attaching, and taking focus use the same authenticated terminal path as the grid.
+     */
+    suspend fun sendConversationPrompt(
+        sessionId: String,
+        text: String,
+        images: List<TerminalAttachmentImage> = emptyList(),
+        onProgress: (RemoteUploadProgress) -> Unit = {},
+    ): Result<Unit> {
+        val prompt = text.trim()
+        if (prompt.isEmpty() && images.isEmpty()) {
+            return Result.failure(IllegalArgumentException("Write a message or attach an image first."))
+        }
+        return try {
+            val existing = client.state.value.tabs.firstOrNull { it.sessionId == sessionId }
+            if (existing != null) client.selectTab(existing.id)
+            else client.openSession(sessionId, TerminalSize(80, 24))
+
+            val activeScreen = withTimeoutOrNull(10_000) {
+                client.screen.filterNotNull().first { screen ->
+                    client.state.value.tabs.any { it.id == screen.tabId && it.sessionId == sessionId }
+                }
+            } ?: return Result.failure(IllegalStateException("The session did not open on the desktop."))
+
+            if (client.state.value.focus != com.adroited.aiterm.remote.FocusOwner.Self) {
+                if (!client.takeFocus(TerminalSize(activeScreen.cols, activeScreen.rows))) {
+                    return Result.failure(IllegalStateException("The terminal is not ready for input."))
+                }
+                val focused = withTimeoutOrNull(5_000) {
+                    client.state.first {
+                        it.activeTabId == activeScreen.tabId &&
+                            it.focus == com.adroited.aiterm.remote.FocusOwner.Self
+                    }
+                }
+                if (focused == null) {
+                    return Result.failure(IllegalStateException("AITerm could not take terminal focus."))
+                }
+            }
+
+            val latestScreen = client.screen.value
+                ?.takeIf { it.tabId == activeScreen.tabId }
+                ?: return Result.failure(IllegalStateException("The terminal changed before sending."))
+            val paths = if (images.isEmpty()) emptyList() else {
+                client.uploadImages(activeScreen.tabId, images.map { it.asRemoteUploadSource() }, onProgress)
+                    .getOrElse { return Result.failure(it) }
+            }
+            val outbound = formatTerminalSubmission(
+                text = prompt,
+                paths = paths,
+                bracketedPaste = latestScreen.modes.bracketedPaste,
+            )
+            if (!client.sendInputs(activeScreen.tabId, outbound)) {
+                return Result.failure(IllegalStateException("The terminal did not accept the message."))
+            }
+            delay(350)
+            client.previewSession(sessionId)
+            Result.success(Unit)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
+    }
     fun closeSession(id: String) = client.closeSession(id)
     fun stopSession(id: String) = client.stopSession(id)
     fun forkSession(id: String) = client.forkSession(id)
@@ -123,6 +233,14 @@ class RemoteTerminalViewModel(
         }
     }
 }
+
+internal data class RemoteSessionFilePreview(
+    val path: String,
+    val mime: String,
+    val total: Long,
+    val data: ByteArray,
+    val truncated: Boolean,
+)
 
 internal fun remoteUploadSource(image: NormalizedTerminalImage): RemoteUploadSource = RemoteUploadSource(
     id = image.id,

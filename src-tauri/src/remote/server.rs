@@ -7,7 +7,10 @@ use super::terminal::{
     plan_snapshot_for_attachment, RemoteTerminal, RemoteTerminalEvents, TerminalEvent,
     TransferChunk, TransferPlan,
 };
-use super::uploads::{AttachmentStore, UploadBegin, UploadError, UploadErrorKind, UploadSet};
+use super::uploads::{
+    AttachmentStore, UploadBegin, UploadError, UploadErrorKind, UploadSet,
+    PARTIAL_ATTACHMENT_TTL,
+};
 use crate::launch::LaunchRequest;
 use crate::services::agents::AgentService;
 use crate::services::sessions::SessionService;
@@ -30,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -284,8 +288,74 @@ fn build_server_config(
 struct GatewayState {
     devices: Arc<DeviceStore>,
     services: RemoteServices,
-    attachment_store: AttachmentStore,
+    uploads: DeviceUploadRegistry,
     connections: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone)]
+struct DeviceUploadLease {
+    set: Arc<Mutex<UploadSet>>,
+    touched: Arc<Mutex<Instant>>,
+}
+
+impl DeviceUploadLease {
+    fn touch(&self) {
+        *self
+            .touched
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+}
+
+#[derive(Clone)]
+struct DeviceUploadRegistry {
+    store: AttachmentStore,
+    leases: Arc<Mutex<HashMap<String, DeviceUploadLease>>>,
+}
+
+impl DeviceUploadRegistry {
+    fn new(store: AttachmentStore) -> Self {
+        Self {
+            store,
+            leases: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn lease(&self, device_id: &str) -> DeviceUploadLease {
+        let mut leases = self
+            .leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lease = leases
+            .entry(device_id.to_owned())
+            .or_insert_with(|| DeviceUploadLease {
+                set: Arc::new(Mutex::new(self.store.upload_set())),
+                touched: Arc::new(Mutex::new(Instant::now())),
+            })
+            .clone();
+        lease.touch();
+        lease
+    }
+
+    fn maintain(&self) {
+        let now = Instant::now();
+        self.leases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, lease| {
+                // A live socket holds another strong reference to the set.
+                // Keep its registry entry even if that socket has been idle,
+                // or a reconnect could create a second upload set for the
+                // same remembered phone while the first socket still exists.
+                Arc::strong_count(&lease.set) > 1
+                    || now.saturating_duration_since(
+                    *lease
+                        .touched
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                ) <= PARTIAL_ATTACHMENT_TTL
+            });
+    }
 }
 
 #[derive(Clone)]
@@ -296,6 +366,7 @@ pub struct RemoteServices {
     agents: AgentService,
     blocking_operations: Arc<tokio::sync::Semaphore>,
     session_open_locks: Arc<Vec<Mutex<()>>>,
+    app: Option<tauri::AppHandle>,
 }
 
 impl RemoteServices {
@@ -314,6 +385,7 @@ impl RemoteServices {
                     .map(|_| Mutex::new(()))
                     .collect(),
             ),
+            app: None,
         }
     }
 
@@ -339,6 +411,11 @@ impl RemoteServices {
         )
     }
 
+    pub fn with_app_handle(mut self, app: tauri::AppHandle) -> Self {
+        self.app = Some(app);
+        self
+    }
+
     pub fn registry(&self) -> &Arc<TabRegistry> {
         &self.registry
     }
@@ -359,6 +436,7 @@ impl RemoteGateway {
                 format!("unable to initialize terminal attachment storage: {error}"),
             )
         })?;
+        let uploads = DeviceUploadRegistry::new(attachment_store.clone());
         let listener = std::net::TcpListener::bind(bind).map_err(GatewayError::io)?;
         listener.set_nonblocking(true).map_err(GatewayError::io)?;
         let local_addr = listener.local_addr().map_err(GatewayError::io)?;
@@ -368,7 +446,7 @@ impl RemoteGateway {
         let state = GatewayState {
             devices,
             services,
-            attachment_store: attachment_store.clone(),
+            uploads: uploads.clone(),
             connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
         };
         let router = Router::new()
@@ -384,6 +462,7 @@ impl RemoteGateway {
         let (maintenance_shutdown, maintenance_cancellation) = tokio::sync::watch::channel(false);
         let maintenance = tokio::spawn(maintain_attachment_store(
             attachment_store,
+            uploads,
             maintenance_cancellation,
         ));
         Ok(GatewayHandle {
@@ -445,6 +524,7 @@ impl Drop for GatewayHandle {
 
 async fn maintain_attachment_store(
     store: AttachmentStore,
+    uploads: DeviceUploadRegistry,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(ATTACHMENT_MAINTENANCE_INTERVAL);
@@ -463,6 +543,7 @@ async fn maintain_attachment_store(
                 return;
             }
             _ = interval.tick() => {
+                uploads.maintain();
                 let maintenance_store = store.clone();
                 let mut task = tokio::task::spawn_blocking(move || {
                     maintenance_store.maintain(SystemTime::now())
@@ -665,13 +746,14 @@ async fn authenticate_socket(mut socket: WebSocket, state: GatewayState, peer: S
         return;
     }
 
+    let upload_lease = state.uploads.lease(&proof.device_id);
     run_authenticated_socket(
         socket,
         state.services,
         state.devices,
         proof.device_id,
         revocations,
-        state.attachment_store.upload_set(),
+        upload_lease,
     )
     .await;
 }
@@ -1030,6 +1112,7 @@ struct UploadBeginPayload {
     attachment_id: AttachmentId,
     submission_id: String,
     submission_count: u8,
+    member_index: u8,
     submission_bytes: u64,
     length: u64,
     media_type: String,
@@ -1056,6 +1139,68 @@ struct UploadIdPayload {
 #[serde(deny_unknown_fields)]
 struct SessionIdPayload {
     session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionConversationRequest {
+    session_id: String,
+    #[serde(default = "default_conversation_chars")]
+    max_chars: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileReadRequest {
+    session_id: String,
+    path: String,
+    offset: u64,
+    count: u32,
+}
+
+fn default_conversation_chars() -> usize {
+    512 * 1024
+}
+
+const MAX_CONVERSATION_CHARS: usize = 512 * 1024;
+const MAX_CONVERSATION_MESSAGES: usize = 512;
+const MAX_CONVERSATION_MESSAGE_BYTES: usize = 64 * 1024;
+const CONVERSATION_OMISSION: &str = "[… earlier turns omitted for phone view …]";
+const CONVERSATION_TRUNCATION: &str = "\n[… message truncated for phone view …]";
+
+/// Shape only the remote phone conversation response to the limits enforced
+/// by the Android decoder. The shared transcript parser and every desktop
+/// consumer retain their existing behavior.
+fn bound_remote_conversation(
+    mut messages: Vec<crate::sessions::PreviewMsg>,
+) -> Vec<crate::sessions::PreviewMsg> {
+    for message in &mut messages {
+        if message.text.len() <= MAX_CONVERSATION_MESSAGE_BYTES {
+            continue;
+        }
+        let mut end = MAX_CONVERSATION_MESSAGE_BYTES - CONVERSATION_TRUNCATION.len();
+        while !message.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.text.truncate(end);
+        message.text.push_str(CONVERSATION_TRUNCATION);
+    }
+    if messages.len() <= MAX_CONVERSATION_MESSAGES {
+        return messages;
+    }
+
+    let first = messages.remove(0);
+    let tail_at = messages.len() - (MAX_CONVERSATION_MESSAGES - 2);
+    let tail = messages.split_off(tail_at);
+    let mut bounded = Vec::with_capacity(MAX_CONVERSATION_MESSAGES);
+    bounded.push(first);
+    bounded.push(crate::sessions::PreviewMsg {
+        role: "system".into(),
+        text: CONVERSATION_OMISSION.into(),
+        at: None,
+    });
+    bounded.extend(tail);
+    bounded
 }
 
 #[derive(Deserialize)]
@@ -1110,6 +1255,27 @@ struct SessionListPayload {
 #[derive(Serialize)]
 struct SessionPreviewPayload {
     messages: Vec<crate::sessions::PreviewMsg>,
+}
+
+#[derive(Serialize)]
+struct SessionConversationPayload {
+    messages: Vec<crate::sessions::PreviewMsg>,
+}
+
+#[derive(Serialize)]
+struct SessionChangesPayload {
+    changes: Vec<crate::changes::Change>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileReadPayload {
+    path: String,
+    mime: String,
+    offset: u64,
+    total: u64,
+    eof: bool,
+    #[serde(with = "serde_bytes")]
+    data: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -1222,6 +1388,7 @@ struct SuccessPayload {
 struct UploadBeginReplyPayload<'a> {
     upload_id: &'a str,
     next_chunk: u32,
+    path: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1523,6 +1690,79 @@ fn bounded(value: &str, max: usize) -> Result<(), &'static str> {
     }
 }
 
+const MAX_FILE_READ_CHUNK_BYTES: u32 = 256 * 1024;
+
+fn read_authorized_file_chunk(
+    app: &tauri::AppHandle,
+    request: FileReadRequest,
+) -> Result<FileReadPayload, &'static str> {
+    let changes = crate::changes::for_session(app, &request.session_id);
+    read_file_chunk_from_ledger(request, &changes)
+}
+
+fn read_file_chunk_from_ledger(
+    request: FileReadRequest,
+    changes: &[crate::changes::Change],
+) -> Result<FileReadPayload, &'static str> {
+    if request.count == 0 || request.count > MAX_FILE_READ_CHUNK_BYTES {
+        return Err("protocol.invalid_payload");
+    }
+    let authorized = changes
+        .iter()
+        .any(|change| change.kind != "deleted" && change.path == request.path);
+    if !authorized {
+        return Err("file.not_found");
+    }
+
+    let path = PathBuf::from(&request.path);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(&path).map_err(|_| "file.not_found")?;
+    let metadata = file.metadata().map_err(|_| "file.not_found")?;
+    if !metadata.is_file() || request.offset > metadata.len() {
+        return Err("file.not_found");
+    }
+    file.seek(SeekFrom::Start(request.offset))
+        .map_err(|_| "file.read_failed")?;
+    let remaining = metadata.len().saturating_sub(request.offset);
+    let length = remaining.min(u64::from(request.count)) as usize;
+    let mut data = vec![0_u8; length];
+    file.read_exact(&mut data).map_err(|_| "file.read_failed")?;
+    let next = request.offset.saturating_add(data.len() as u64);
+    Ok(FileReadPayload {
+        path: request.path,
+        mime: file_mime(&path).to_string(),
+        offset: request.offset,
+        total: metadata.len(),
+        eof: next == metadata.len(),
+        data,
+    })
+}
+
+fn file_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "txt" | "md" | "rs" | "kt" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml"
+        | "yaml" | "yml" | "css" | "html" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
 fn session_open_lock_index(session_id: &str) -> usize {
     session_id.bytes().fold(0usize, |hash, byte| {
         hash.wrapping_mul(16777619) ^ usize::from(byte)
@@ -1606,6 +1846,63 @@ impl RemoteServices {
                     request_id,
                     "session.preview",
                     &SessionPreviewPayload { messages },
+                )?]))
+            }
+            "session.conversation" => {
+                let payload: SessionConversationRequest = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                // A response is one bounded WebSocket frame. Keeping the text
+                // budget at half the frame ceiling leaves room for CBOR,
+                // roles, and message boundaries without an impossible request
+                // that can only fail during response encoding.
+                if payload.max_chars == 0 || payload.max_chars > MAX_CONVERSATION_CHARS {
+                    return Err("protocol.invalid_payload");
+                }
+                let messages = crate::detail::conversation_rich_service(
+                    &payload.session_id,
+                    payload.max_chars,
+                )
+                .into_iter()
+                .map(|(role, text)| crate::sessions::PreviewMsg {
+                    role,
+                    text,
+                    at: None,
+                })
+                .collect();
+                let messages = bound_remote_conversation(messages);
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.conversation",
+                    &SessionConversationPayload { messages },
+                )?]))
+            }
+            "session.changes" => {
+                let payload: SessionIdPayload = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                let app = self.app.as_ref().ok_or("remote.unsupported")?;
+                let changes = crate::changes::for_session(app, &payload.session_id);
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.changes",
+                    &SessionChangesPayload { changes },
+                )?]))
+            }
+            "file.read" => {
+                let payload: FileReadRequest = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                bounded(&payload.path, MAX_PATH_BYTES)?;
+                let app = self.app.as_ref().ok_or("remote.unsupported")?;
+                let chunk = read_authorized_file_chunk(app, payload)?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "file.read",
+                    &chunk,
                 )?]))
             }
             "session.open" => {
@@ -1787,6 +2084,7 @@ impl RemoteServices {
                                 model,
                                 effort,
                                 prompt: None,
+                                permission_flags: None,
                             })
                             .map_err(|error| error.code())?;
                         let slot_id = plan
@@ -1973,6 +2271,7 @@ impl RemoteServices {
                             attachment_id: body.attachment_id,
                             submission_id: body.submission_id,
                             submission_count: body.submission_count,
+                            member_index: body.member_index,
                             submission_bytes: body.submission_bytes,
                             length: body.length,
                             sha256,
@@ -1997,12 +2296,18 @@ impl RemoteServices {
                     return Err(code);
                 }
                 bounded(&began.upload_id, MAX_IDENTIFIER_BYTES)?;
+                let published_path = began
+                    .published_path
+                    .as_ref()
+                    .map(|path| path.to_str().ok_or("terminal.upload_failed"))
+                    .transpose()?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "terminal.upload.begin",
                     &UploadBeginReplyPayload {
                         upload_id: &began.upload_id,
                         next_chunk: began.next_chunk,
+                        path: published_path,
                     },
                 )?]))
             }
@@ -3325,30 +3630,6 @@ where
     }
 }
 
-async fn cancel_connection_uploads(upload_set: Arc<Mutex<UploadSet>>) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut upload_set = upload_set
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        upload_set.cancel_all();
-    })
-    .await;
-}
-
-async fn cancel_attachment_uploads(
-    upload_set: Arc<Mutex<UploadSet>>,
-    tab_id: TabId,
-    attachment_id: AttachmentId,
-) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let mut upload_set = upload_set
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        upload_set.cancel_attachment(&tab_id, &attachment_id);
-    })
-    .await;
-}
-
 async fn notify_revoked_if_needed(
     devices: &DeviceStore,
     device_id: &str,
@@ -3369,7 +3650,7 @@ async fn run_authenticated_socket(
     devices: Arc<DeviceStore>,
     device_id: String,
     mut revocations: tokio::sync::watch::Receiver<u64>,
-    upload_set: UploadSet,
+    upload_lease: DeviceUploadLease,
 ) {
     let mut guard = RequestGuard::new(Instant::now());
     let (socket_sink, socket_stream) = socket.split();
@@ -3418,7 +3699,7 @@ async fn run_authenticated_socket(
         cancelled.clone(),
     ));
     let mut attachments = HashMap::<AttachmentId, ConnectionAttachment>::new();
-    let upload_set = Arc::new(Mutex::new(upload_set));
+    let upload_set = upload_lease.set.clone();
     let registry_events = services.registry.subscribe_changes();
     let mut closed_attachments = ClosedAttachments::default();
     let (attachment_completed, mut completed_attachments) =
@@ -3494,6 +3775,7 @@ async fn run_authenticated_socket(
         };
         match message {
             InboundMessage::Binary(bytes) => {
+                upload_lease.touch();
                 let request = match RemoteRequest::decode(&bytes) {
                     Ok(request) => request,
                     Err(error) => {
@@ -3689,12 +3971,6 @@ async fn run_authenticated_socket(
                         .await;
                         match outcome {
                             AttachmentCommandOutcome::Completed(Ok(())) => {
-                                cancel_attachment_uploads(
-                                    upload_set.clone(),
-                                    closed_tab.clone(),
-                                    attachment_id.clone(),
-                                )
-                                .await;
                                 if let Some(attachment) = attachments.remove(&attachment_id) {
                                     shutdown_attachment(attachment).await;
                                 }
@@ -3792,7 +4068,6 @@ async fn run_authenticated_socket(
     cancelled.send_replace(true);
     operation_cancelled.send_replace(true);
     let _ = (&mut revocation_watcher).await;
-    cancel_connection_uploads(upload_set.clone()).await;
     for (_, attachment) in attachments {
         shutdown_attachment(attachment).await;
     }
@@ -3871,6 +4146,159 @@ mod request_guard_tests {
     use crate::terminal::model::{CursorState, ScreenSnapshot, TerminalModes};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Barrier, Condvar};
+
+    fn preview_message(role: &str, text: impl Into<String>) -> crate::sessions::PreviewMsg {
+        crate::sessions::PreviewMsg {
+            role: role.into(),
+            text: text.into(),
+            at: None,
+        }
+    }
+
+    #[test]
+    fn remote_conversation_is_bounded_without_changing_the_shared_parser() {
+        let mut messages: Vec<_> = (0..600)
+            .map(|index| preview_message("tool", format!("turn-{index}")))
+            .collect();
+        messages[0] = preview_message("user", "start");
+        messages[1] = preview_message("assistant", "界".repeat(MAX_CONVERSATION_MESSAGE_BYTES));
+
+        let bounded = bound_remote_conversation(messages);
+
+        assert_eq!(bounded.len(), MAX_CONVERSATION_MESSAGES);
+        assert_eq!(bounded[0].text, "start");
+        assert_eq!(bounded[1].role, "system");
+        assert!(bounded[1].text.contains("phone view"));
+        assert!(bounded
+            .iter()
+            .all(|message| message.text.len() <= MAX_CONVERSATION_MESSAGE_BYTES));
+        assert_eq!(bounded.last().unwrap().text, "turn-599");
+    }
+
+    #[test]
+    fn ordinary_remote_conversation_is_not_rewritten() {
+        let messages = vec![
+            preview_message("user", "question"),
+            preview_message("assistant", "answer"),
+        ];
+        let bounded = bound_remote_conversation(messages);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].role, "user");
+        assert_eq!(bounded[0].text, "question");
+        assert_eq!(bounded[1].role, "assistant");
+        assert_eq!(bounded[1].text, "answer");
+    }
+
+    fn recorded_change(path: &Path, kind: &str) -> crate::changes::Change {
+        crate::changes::Change {
+            path: path.to_string_lossy().into_owned(),
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            kind: kind.into(),
+            at: 1,
+            session_id: Some("session-1".into()),
+            bytes: std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+        }
+    }
+
+    #[test]
+    fn upload_registry_keeps_one_set_for_an_idle_live_socket_and_expires_a_disconnected_one() {
+        let root = std::env::temp_dir().join(format!("aiterm-upload-lease-{}", uuid::Uuid::new_v4()));
+        let registry = DeviceUploadRegistry::new(AttachmentStore::new(root.clone()).unwrap());
+        let live = registry.lease("phone-1");
+        *live.touched.lock().unwrap() =
+            Instant::now() - PARTIAL_ATTACHMENT_TTL - Duration::from_secs(1);
+        let live_set = Arc::downgrade(&live.set);
+        registry.maintain();
+        let resumed = registry.lease("phone-1");
+        assert!(live_set
+            .upgrade()
+            .is_some_and(|set| Arc::ptr_eq(&set, &resumed.set)));
+
+        *resumed.touched.lock().unwrap() =
+            Instant::now() - PARTIAL_ATTACHMENT_TTL - Duration::from_secs(1);
+        drop(live);
+        drop(resumed);
+        registry.maintain();
+        assert!(live_set.upgrade().is_none());
+        let replacement = registry.lease("phone-1");
+        drop(replacement);
+        drop(registry);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn file_reads_are_chunked_and_require_an_exact_live_ledger_entry() {
+        let root = std::env::temp_dir().join(format!("aiterm-file-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("answer.txt");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let change = recorded_change(&path, "modified");
+        let request = |path: &Path, offset, count| FileReadRequest {
+            session_id: "session-1".into(),
+            path: path.to_string_lossy().into_owned(),
+            offset,
+            count,
+        };
+
+        let first = read_file_chunk_from_ledger(request(&path, 0, 4), std::slice::from_ref(&change))
+            .unwrap();
+        assert_eq!(first.data, b"abcd");
+        assert_eq!(first.total, 6);
+        assert!(!first.eof);
+        let last = read_file_chunk_from_ledger(request(&path, 4, 4), &[change.clone()]).unwrap();
+        assert_eq!(last.data, b"ef");
+        assert!(last.eof);
+
+        assert_eq!(
+            read_file_chunk_from_ledger(request(&path, 0, 1), &[]).unwrap_err(),
+            "file.not_found",
+        );
+        assert_eq!(
+            read_file_chunk_from_ledger(
+                request(&path, 0, 1),
+                &[recorded_change(&path, "deleted")],
+            )
+            .unwrap_err(),
+            "file.not_found",
+        );
+        assert_eq!(
+            read_file_chunk_from_ledger(
+                request(&path, 0, MAX_FILE_READ_CHUNK_BYTES + 1),
+                &[change],
+            )
+            .unwrap_err(),
+            "protocol.invalid_payload",
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_authorized_symlink_is_still_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("aiterm-file-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.txt");
+        let link = root.join("link.txt");
+        std::fs::write(&target, b"secret").unwrap();
+        symlink(&target, &link).unwrap();
+        let request = FileReadRequest {
+            session_id: "session-1".into(),
+            path: link.to_string_lossy().into_owned(),
+            offset: 0,
+            count: 6,
+        };
+        assert_eq!(
+            read_file_chunk_from_ledger(request, &[recorded_change(&link, "created")]).unwrap_err(),
+            "file.not_found",
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
 
     fn tagged_test_transfer(
         request_id: u64,

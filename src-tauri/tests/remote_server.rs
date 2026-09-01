@@ -246,6 +246,7 @@ struct UploadBeginRequest<'a> {
     attachment_id: &'a str,
     submission_id: &'a str,
     submission_count: u8,
+    member_index: u8,
     submission_bytes: u64,
     length: u64,
     media_type: &'a str,
@@ -259,6 +260,7 @@ struct UploadBeginRequestWithUnknownField<'a> {
     attachment_id: &'a str,
     submission_id: &'a str,
     submission_count: u8,
+    member_index: u8,
     submission_bytes: u64,
     length: u64,
     media_type: &'a str,
@@ -300,6 +302,7 @@ struct UploadIdRequestWithUnknownField<'a> {
 struct UploadBeginReply {
     upload_id: String,
     next_chunk: u32,
+    path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -405,6 +408,7 @@ fn upload_begin<'a>(
         attachment_id,
         submission_id,
         submission_count: 1,
+        member_index: 0,
         submission_bytes: bytes.len() as u64,
         length: bytes.len() as u64,
         media_type: "image/jpeg",
@@ -3060,7 +3064,7 @@ async fn attachment_input_scrollback_command_and_path_limits_are_enforced() {
 }
 
 #[tokio::test]
-async fn terminal_upload_round_trip_survives_focus_loss_and_is_connection_scoped() {
+async fn terminal_upload_round_trip_survives_focus_loss_and_requires_an_explicit_rebind() {
     let root = private_test_dir("upload-round-trip");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -3162,7 +3166,7 @@ async fn terminal_upload_round_trip_survives_focus_loss_and_is_connection_scoped
         .unwrap();
     assert_eq!(
         decode::<ErrorReply>(&response_kind(&mut other, "error").await.payload).code,
-        "terminal.upload_not_found"
+        "terminal.attachment_not_found"
     );
 
     other
@@ -3290,6 +3294,7 @@ async fn terminal_upload_cancel_remains_authorized_after_focus_loss() {
                 attachment_id: &attached.attachment_id,
                 submission_id: "cancel-focus-loss",
                 submission_count: 2,
+                member_index: 0,
                 submission_bytes: (jpeg.len() * 2) as u64,
                 length: jpeg.len() as u64,
                 media_type: "image/jpeg",
@@ -3415,7 +3420,7 @@ async fn terminal_upload_cancel_remains_authorized_after_focus_loss() {
 }
 
 #[tokio::test]
-async fn terminal_upload_detach_releases_incomplete_submission_before_late_cancel() {
+async fn terminal_upload_detach_preserves_submission_until_reattach_and_cancel() {
     let root = private_test_dir("upload-detach-cancel-race");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -3480,6 +3485,7 @@ async fn terminal_upload_detach_releases_incomplete_submission_before_late_cance
                 attachment_id: &attached.attachment_id,
                 submission_id: "detach-interrupted",
                 submission_count: 2,
+                member_index: 0,
                 submission_bytes: (jpeg.len() * 2) as u64,
                 length: jpeg.len() as u64,
                 media_type: "image/jpeg",
@@ -3586,6 +3592,40 @@ async fn terminal_upload_detach_releases_incomplete_submission_before_late_cance
         .send(request(
             10,
             "terminal.upload.begin",
+            &encode(&UploadBeginRequest {
+                tab_id: &tab,
+                attachment_id: &reattached.attachment_id,
+                submission_id: "detach-interrupted",
+                submission_count: 2,
+                member_index: 0,
+                submission_bytes: (jpeg.len() * 2) as u64,
+                length: jpeg.len() as u64,
+                media_type: "image/jpeg",
+                sha256: digest.as_slice(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let resumed = response_request(&mut socket, 10).await;
+    assert_eq!(resumed.kind, "terminal.upload.begin");
+    let resumed: UploadBeginReply = decode(&resumed.payload);
+    assert_eq!(resumed.path.as_deref(), Some(published.to_str().unwrap()));
+    socket
+        .send(request(
+            11,
+            "terminal.upload.cancel",
+            &encode(&UploadIdRequest {
+                upload_id: &resumed.upload_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cancelled: SuccessReply = decode(&response_request(&mut socket, 11).await.payload);
+    assert!(cancelled.ok);
+    socket
+        .send(request(
+            12,
+            "terminal.upload.begin",
             &encode(&upload_begin(
                 &tab,
                 &reattached.attachment_id,
@@ -3596,9 +3636,8 @@ async fn terminal_upload_detach_releases_incomplete_submission_before_late_cance
         ))
         .await
         .unwrap();
-    let retried = response_request(&mut socket, 10).await;
+    let retried = response_request(&mut socket, 12).await;
     assert_eq!(retried.kind, "terminal.upload.begin");
-    assert_eq!(decode::<UploadBeginReply>(&retried.payload).next_chunk, 0);
     assert_eq!(std::fs::read(&published).unwrap(), jpeg);
 
     registry.close(&tab).ok();
@@ -3691,6 +3730,7 @@ async fn terminal_upload_begin_requires_focus_and_payloads_are_strict_and_bounde
                 attachment_id: &attached.attachment_id,
                 submission_id: "unknown-field",
                 submission_count: 1,
+                member_index: 0,
                 submission_bytes: jpeg.len() as u64,
                 length: jpeg.len() as u64,
                 media_type: "image/jpeg",
@@ -3910,10 +3950,13 @@ async fn terminal_upload_begin_requires_focus_and_payloads_are_strict_and_bounde
         ))
         .await
         .unwrap();
-    assert_eq!(
-        decode::<ErrorReply>(&response_kind(&mut socket, "error").await.payload).code,
-        "terminal.upload_invalid_submission"
+    let replayed: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
     );
+    assert_eq!(replayed.upload_id, completed.upload_id);
+    assert!(replayed.path.is_some());
 
     socket
         .send(request(
@@ -4007,7 +4050,7 @@ async fn terminal_upload_begin_requires_focus_and_payloads_are_strict_and_bounde
 }
 
 #[tokio::test]
-async fn terminal_upload_disconnect_removes_unfinished_staging_files() {
+async fn terminal_upload_disconnect_preserves_and_rebinds_unfinished_staging() {
     let root = private_test_dir("upload-disconnect");
     let project = root.join("project");
     std::fs::create_dir_all(&project).unwrap();
@@ -4076,7 +4119,11 @@ async fn terminal_upload_disconnect_removes_unfinished_staging_files() {
         ))
         .await
         .unwrap();
-    let _ = response_kind(&mut socket, "terminal.upload.begin").await;
+    let began: UploadBeginReply = decode(
+        &response_kind(&mut socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
     let directory = project.join(".aiterm/attachments");
     assert!(std::fs::read_dir(&directory).unwrap().any(|entry| entry
         .unwrap()
@@ -4088,21 +4135,93 @@ async fn terminal_upload_disconnect_removes_unfinished_staging_files() {
     drop(socket);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if std::fs::read_dir(&directory).unwrap().all(|entry| {
-                entry
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    != Some("part")
-            }) {
+            if registry.get(&tab).unwrap().input_owner().is_none() {
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("disconnect must cancel every connection-local upload");
+    .expect("disconnect must release terminal focus");
+    assert!(std::fs::read_dir(&directory).unwrap().any(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .and_then(|value| value.to_str())
+        == Some("part")));
+
+    let mut resumed_socket = connect(&gateway).await;
+    authenticate(&mut resumed_socket, &key, &device_id).await;
+    resumed_socket
+        .send(request(
+            1,
+            "terminal.attach",
+            &encode(&TabRequest { tab_id: &tab }),
+        ))
+        .await
+        .unwrap();
+    let resumed_attachment: AttachedReply = decode(
+        &response_kind(&mut resumed_socket, "terminal.attach")
+            .await
+            .payload,
+    );
+    let _ = response_kind(&mut resumed_socket, "terminal.snapshot").await;
+    resumed_socket
+        .send(request(
+            2,
+            "terminal.focus",
+            &encode(&SizedAttachmentRequest {
+                tab_id: &tab,
+                attachment_id: &resumed_attachment.attachment_id,
+                size: TerminalSize::try_new(20, 2).unwrap(),
+            }),
+        ))
+        .await
+        .unwrap();
+    let _ = response_kind(&mut resumed_socket, "terminal.focus").await;
+    resumed_socket
+        .send(request(
+            3,
+            "terminal.upload.begin",
+            &encode(&upload_begin(
+                &tab,
+                &resumed_attachment.attachment_id,
+                "disconnect",
+                &jpeg,
+                digest.as_slice(),
+            )),
+        ))
+        .await
+        .unwrap();
+    let resumed: UploadBeginReply = decode(
+        &response_kind(&mut resumed_socket, "terminal.upload.begin")
+            .await
+            .payload,
+    );
+    assert_eq!(resumed.upload_id, began.upload_id);
+    assert_eq!(resumed.next_chunk, 0);
+    resumed_socket
+        .send(request(
+            4,
+            "terminal.upload.cancel",
+            &encode(&UploadIdRequest {
+                upload_id: &resumed.upload_id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let cancelled: SuccessReply = decode(
+        &response_kind(&mut resumed_socket, "terminal.upload.cancel")
+            .await
+            .payload,
+    );
+    assert!(cancelled.ok);
+    assert!(std::fs::read_dir(&directory).unwrap().all(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .and_then(|value| value.to_str())
+        != Some("part")));
 
     registry.close(&tab).ok();
     gateway.stop().await.unwrap();
