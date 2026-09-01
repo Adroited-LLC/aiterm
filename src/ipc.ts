@@ -1206,6 +1206,10 @@ export interface PhoneRemoteStatus {
   /** Phones holding the event socket open right now. */
   clients: PhoneRemoteClient[];
   error: string | null;
+  /** Whether the iroh tunnel is configured to ride alongside the listener. */
+  iroh_enabled: boolean;
+  /** The reach-from-anywhere address: this desktop's iroh node id. */
+  iroh_node: string | null;
 }
 export interface PhoneRemoteClient {
   id: number;
@@ -1231,3 +1235,9 @@ export const phoneRemoteSetName = (name: string) =>
 export const phoneRemoteSetPort = (port: number) =>
   invoke<PhoneRemoteStatus>("remote_set_port", { port });
 export const phoneRemotePairPayload = () => invoke<PhonePairPayload>("remote_pair_payload");
+/** iroh on/off, live — the LAN route is untouched either way. */
+export const phoneRemoteSetIroh = (on: boolean) =>
+  invoke<PhoneRemoteStatus>("remote_set_iroh", { on });
+/** One QR that pairs either phone app: the gateway invite with the phone
+ *  listener's fields riding behind under their own names. */
+export const remoteBeginPairingCombined = () => invoke<PairingInvite>("remote_begin_pairing_combined");

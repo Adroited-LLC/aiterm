@@ -6,8 +6,7 @@ import { X } from "lucide-react";
 import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
-import RemoteAccessSettings from "./RemoteAccessSettings";
-import RemotePane from "./RemotePane";
+import RemoteSettings from "./RemoteSettings";
 import LibrarianPane from "./LibrarianPane";
 import type { LibrarianCtl } from "../librarian";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
@@ -53,7 +52,6 @@ export type SettingsTab =
   | "models"
   | "librarian"
   | "remote"
-  | "phone"
   | "diagnostics";
 type Tab = SettingsTab;
 
@@ -64,7 +62,6 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "models", label: "Model access" },
   { key: "librarian", label: "Librarian" },
   { key: "remote", label: "Remote access" },
-  { key: "phone", label: "Phone remote (iroh)" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
 
@@ -531,8 +528,7 @@ export default function SettingsModal({
               </Group>
             </>}
 
-            {tab === "remote" && <RemoteAccessSettings />}
-            {tab === "phone" && <RemotePane />}
+            {tab === "remote" && <RemoteSettings />}
             {tab === "librarian" && (
               <LibrarianPane
                 cfg={settings.librarian}

@@ -459,6 +459,38 @@ pub async fn remote_begin_pairing(
     })
 }
 
+/// One QR that pairs either phone app. The gateway's own enrollment payload
+/// (`v`/`h`/`p`/`f`/`s`/`n`) is minted exactly as `remote_begin_pairing` does
+/// it; the phone-listener's fields ride behind under their own names
+/// (`tp`/`tt`/`tf`/`z`) when that listener is running. Each app reads its own
+/// fields and — with the tolerant parsers — skips the other's. Rendered to
+/// SVG here for the same reason as the plain invite: neither secret may exist
+/// as a string in the webview.
+#[tauri::command]
+pub async fn remote_begin_pairing_combined(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, RemoteState>,
+) -> Result<PairingInviteView, String> {
+    let mut inner = state.inner.lock().await;
+    if inner.gateway.is_none() {
+        return Err("turn remote access on before pairing a phone".into());
+    }
+    let devices = inner.devices()?;
+    let now = SystemTime::now();
+    let enrollment = devices
+        .begin_enrollment_at(now)
+        .map_err(|error| error.to_string())?;
+    let mut payload = inner.pairing_payload(enrollment.secret(), &desktop_name())?;
+    if let Some(ext) = crate::remote_api::pair_extension(&app) {
+        payload.push_str(&ext);
+    }
+    let svg = pairing_qr_svg(&payload).ok_or("the pairing payload could not be rendered")?;
+    Ok(PairingInviteView {
+        svg,
+        expires_at: unix_millis(now + ENROLLMENT_LIFETIME),
+    })
+}
+
 #[tauri::command]
 pub async fn remote_pending_pairings(
     state: tauri::State<'_, RemoteState>,

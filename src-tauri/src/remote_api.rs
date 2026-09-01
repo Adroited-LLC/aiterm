@@ -60,6 +60,15 @@ pub struct Config {
     /// dials from anywhere; minted on the first start after this existed.
     #[serde(default)]
     pub iroh_secret: String,
+    /// Whether the iroh tunnel rides alongside the listener. On by default —
+    /// it is what makes the desktop reachable off-LAN with no port forward —
+    /// but a person who wants LAN/VPN only can turn just this off.
+    #[serde(default = "default_true")]
+    pub iroh_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -70,6 +79,7 @@ impl Default for Config {
             token: new_token(),
             name: hostname(),
             iroh_secret: crate::iroh_tunnel::new_secret_hex(),
+            iroh_enabled: true,
         }
     }
 }
@@ -431,7 +441,11 @@ fn start(app: &AppHandle) -> Result<(), String> {
             cfg.iroh_secret = crate::iroh_tunnel::new_secret_hex();
             save_config(&cfg);
         }
-        crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret)
+        if cfg.iroh_enabled {
+            crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret)
+        } else {
+            None
+        }
     };
     if let Some(secret) = secret {
         let app2 = app.clone();
@@ -483,6 +497,10 @@ pub struct RemoteStatus {
     /// Phones holding the event socket open right now.
     pub clients: Vec<ClientInfo>,
     pub error: Option<String>,
+    /// Whether the iroh tunnel is configured to ride alongside the listener.
+    pub iroh_enabled: bool,
+    /// The reach-from-anywhere address: this desktop's iroh node id.
+    pub iroh_node: Option<String>,
 }
 
 fn status_of(app: &AppHandle) -> RemoteStatus {
@@ -504,6 +522,8 @@ fn status_of(app: &AppHandle) -> RemoteStatus {
         fingerprint: identity().ok().map(|i| i.fingerprint),
         clients,
         error,
+        iroh_enabled: cfg.iroh_enabled,
+        iroh_node: crate::iroh_tunnel::node_id_of(&cfg.iroh_secret),
     }
 }
 
@@ -608,6 +628,40 @@ pub fn remote_rotate_token(app: AppHandle) -> RemoteStatus {
     status_of(&app)
 }
 
+/// Turn the iroh tunnel on or off without touching the listener. Live: a
+/// running listener gains or loses its tunnel at once. Phones keep their
+/// LAN route either way; only the reach-from-anywhere path changes.
+#[tauri::command]
+pub fn remote_set_iroh(app: AppHandle, on: bool) -> RemoteStatus {
+    let state = app.state::<RemoteState>();
+    let (changed, port, secret) = {
+        let mut cfg = state.config.lock().unwrap();
+        let changed = cfg.iroh_enabled != on;
+        cfg.iroh_enabled = on;
+        if changed {
+            save_config(&cfg);
+        }
+        (changed, cfg.port, crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret))
+    };
+    let running = state.running.lock().unwrap().is_some();
+    if changed && running {
+        if on {
+            if let Some(secret) = secret {
+                let app2 = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match crate::iroh_tunnel::start(secret, port).await {
+                        Ok(t) => *app2.state::<RemoteState>().tunnel.lock().unwrap() = Some(t),
+                        Err(e) => crate::diag!("remote", "{e}"),
+                    }
+                });
+            }
+        } else if let Some(tunnel) = state.tunnel.lock().unwrap().take() {
+            tauri::async_runtime::spawn(crate::iroh_tunnel::stop(tunnel));
+        }
+    }
+    status_of(&app)
+}
+
 #[tauri::command]
 pub fn remote_set_name(app: AppHandle, name: String) -> RemoteStatus {
     let state = app.state::<RemoteState>();
@@ -662,9 +716,11 @@ pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
     }
     // The reach-from-anywhere address: the iroh node id. A phone that knows
     // it can dial this desktop with no address at all.
-    if let Some(id) = crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) {
-        uri.push_str("&z=");
-        uri.push_str(&id);
+    if cfg.iroh_enabled {
+        if let Some(id) = crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) {
+            uri.push_str("&z=");
+            uri.push_str(&id);
+        }
     }
     let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| e.to_string())?;
     let svg = code
@@ -673,6 +729,29 @@ pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
         .quiet_zone(true)
         .build();
     Ok(PairPayload { uri, svg })
+}
+
+/// The phone-listener's fields for a combined pairing QR, namespaced so they
+/// ride beside the gateway's own (`p`/`f`/`s` belong to the gateway there):
+/// `&tp=<port>&tt=<token>&tf=<cert sha256>[&z=<iroh node id>]`. `None` while
+/// the listener is off — a combined QR then simply carries no phone-listener
+/// route. The token leaves the desktop only inside a rendered QR, same as in
+/// `remote_pair_payload`.
+pub(crate) fn pair_extension(app: &AppHandle) -> Option<String> {
+    let state = app.try_state::<RemoteState>()?;
+    if state.running.lock().unwrap().is_none() {
+        return None;
+    }
+    let cfg = state.config.lock().unwrap().clone();
+    let fingerprint = identity().ok()?.fingerprint;
+    let mut ext = format!("&tp={}&tt={}&tf={}", cfg.port, cfg.token, fingerprint);
+    if cfg.iroh_enabled {
+        if let Some(id) = crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) {
+            ext.push_str("&z=");
+            ext.push_str(&id);
+        }
+    }
+    Some(ext)
 }
 
 fn percent_encode(s: &str) -> String {
@@ -1006,7 +1085,7 @@ async fn status(State(ctx): State<Ctx>) -> Response {
         "name": cfg.name,
         "version": env!("CARGO_PKG_VERSION"),
         "hosts": hosts,
-        "iroh": crate::iroh_tunnel::node_id_of(&cfg.iroh_secret),
+        "iroh": if cfg.iroh_enabled { crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) } else { None },
     }))
     .into_response()
 }
