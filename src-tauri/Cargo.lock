@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "aiterm"
-version = "0.10.61"
+version = "0.10.62"
 dependencies = [
  "alacritty_terminal",
  "axum",
