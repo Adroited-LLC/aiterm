@@ -1163,6 +1163,45 @@ fn default_conversation_chars() -> usize {
 }
 
 const MAX_CONVERSATION_CHARS: usize = 512 * 1024;
+const MAX_CONVERSATION_MESSAGES: usize = 512;
+const MAX_CONVERSATION_MESSAGE_BYTES: usize = 64 * 1024;
+const CONVERSATION_OMISSION: &str = "[… earlier turns omitted for phone view …]";
+const CONVERSATION_TRUNCATION: &str = "\n[… message truncated for phone view …]";
+
+/// Shape only the remote phone conversation response to the limits enforced
+/// by the Android decoder. The shared transcript parser and every desktop
+/// consumer retain their existing behavior.
+fn bound_remote_conversation(
+    mut messages: Vec<crate::sessions::PreviewMsg>,
+) -> Vec<crate::sessions::PreviewMsg> {
+    for message in &mut messages {
+        if message.text.len() <= MAX_CONVERSATION_MESSAGE_BYTES {
+            continue;
+        }
+        let mut end = MAX_CONVERSATION_MESSAGE_BYTES - CONVERSATION_TRUNCATION.len();
+        while !message.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.text.truncate(end);
+        message.text.push_str(CONVERSATION_TRUNCATION);
+    }
+    if messages.len() <= MAX_CONVERSATION_MESSAGES {
+        return messages;
+    }
+
+    let first = messages.remove(0);
+    let tail_at = messages.len() - (MAX_CONVERSATION_MESSAGES - 2);
+    let tail = messages.split_off(tail_at);
+    let mut bounded = Vec::with_capacity(MAX_CONVERSATION_MESSAGES);
+    bounded.push(first);
+    bounded.push(crate::sessions::PreviewMsg {
+        role: "system".into(),
+        text: CONVERSATION_OMISSION.into(),
+        at: None,
+    });
+    bounded.extend(tail);
+    bounded
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1832,6 +1871,7 @@ impl RemoteServices {
                     at: None,
                 })
                 .collect();
+                let messages = bound_remote_conversation(messages);
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "session.conversation",
@@ -4106,6 +4146,48 @@ mod request_guard_tests {
     use crate::terminal::model::{CursorState, ScreenSnapshot, TerminalModes};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Barrier, Condvar};
+
+    fn preview_message(role: &str, text: impl Into<String>) -> crate::sessions::PreviewMsg {
+        crate::sessions::PreviewMsg {
+            role: role.into(),
+            text: text.into(),
+            at: None,
+        }
+    }
+
+    #[test]
+    fn remote_conversation_is_bounded_without_changing_the_shared_parser() {
+        let mut messages: Vec<_> = (0..600)
+            .map(|index| preview_message("tool", format!("turn-{index}")))
+            .collect();
+        messages[0] = preview_message("user", "start");
+        messages[1] = preview_message("assistant", "界".repeat(MAX_CONVERSATION_MESSAGE_BYTES));
+
+        let bounded = bound_remote_conversation(messages);
+
+        assert_eq!(bounded.len(), MAX_CONVERSATION_MESSAGES);
+        assert_eq!(bounded[0].text, "start");
+        assert_eq!(bounded[1].role, "system");
+        assert!(bounded[1].text.contains("phone view"));
+        assert!(bounded
+            .iter()
+            .all(|message| message.text.len() <= MAX_CONVERSATION_MESSAGE_BYTES));
+        assert_eq!(bounded.last().unwrap().text, "turn-599");
+    }
+
+    #[test]
+    fn ordinary_remote_conversation_is_not_rewritten() {
+        let messages = vec![
+            preview_message("user", "question"),
+            preview_message("assistant", "answer"),
+        ];
+        let bounded = bound_remote_conversation(messages);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].role, "user");
+        assert_eq!(bounded[0].text, "question");
+        assert_eq!(bounded[1].role, "assistant");
+        assert_eq!(bounded[1].text, "answer");
+    }
 
     fn recorded_change(path: &Path, kind: &str) -> crate::changes::Change {
         crate::changes::Change {

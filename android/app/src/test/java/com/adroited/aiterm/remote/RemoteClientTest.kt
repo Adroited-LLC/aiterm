@@ -43,6 +43,58 @@ import kotlin.concurrent.thread
 class RemoteClientTest {
 
     @Test
+    fun conversationFailureStopsLoadingAndSuppressesDuplicateRequests() = runTest {
+        val transport = FakeRemoteTransport()
+        val pending = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            if (request.kind == "session.conversation") pending
+            else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+
+        client.previewSession("session-1")
+        client.previewSession("session-1")
+        runCurrent()
+
+        assertEquals("session-1", client.state.value.previewLoadingSessionId)
+        assertEquals(1, transport.requests.count { it.kind == "session.conversation" })
+        val request = transport.requests.single { it.kind == "session.conversation" }
+        pending.complete(RemoteResponse.Error(request.requestId, "conversation.failed", "Could not load it"))
+        advanceUntilIdle()
+
+        assertEquals(null, client.state.value.previewLoadingSessionId)
+        assertEquals("Could not load it", client.state.value.previewError)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        client.lock()
+    }
+
+    @Test
+    fun conversationSuccessPublishesMessagesAndStopsLoading() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request ->
+            CompletableDeferred(
+                RemoteResponse.Success(
+                    request.requestId,
+                    request.kind,
+                    if (request.kind == "session.conversation") conversationReply("hello") else byteArrayOf(),
+                ),
+            )
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+
+        client.previewSession("session-1")
+        advanceUntilIdle()
+
+        assertEquals("session-1", client.state.value.previewSessionId)
+        assertEquals(listOf(RemotePreviewMessage("assistant", "hello")), client.state.value.previewMessages)
+        assertEquals(null, client.state.value.previewLoadingSessionId)
+        assertEquals(null, client.state.value.previewError)
+        client.lock()
+    }
+
+    @Test
     fun orderedInputBatchIsAcceptedOnceAndQueuedInOrderForTheSameTerminalAttachment() = runTest {
         val transport = FakeRemoteTransport()
         val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
@@ -1593,6 +1645,19 @@ private fun attachedPayload(tabId: String, attachmentId: String): ByteArray {
         text("has_focus") + "f4" + text("title") + text(tabId)
     return encoded.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }
+
+@Serializable
+private data class TestConversationReply(val messages: List<RemotePreviewMessage>)
+
+@OptIn(ExperimentalSerializationApi::class)
+private fun conversationReply(text: String): ByteArray = Cbor {
+    encodeDefaults = true
+    ignoreUnknownKeys = false
+    useDefiniteLengthEncoding = true
+}.encodeToByteArray(
+    TestConversationReply.serializer(),
+    TestConversationReply(listOf(RemotePreviewMessage("assistant", text))),
+)
 
 private fun roundThreeScreen() = ScreenSnapshot(
     tabId = "tab-1",

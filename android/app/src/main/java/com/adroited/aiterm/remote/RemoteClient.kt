@@ -46,6 +46,8 @@ data class RemoteClientState(
     val sessions: List<RemoteSession> = emptyList(),
     val previewSessionId: String? = null,
     val previewMessages: List<RemotePreviewMessage> = emptyList(),
+    val previewLoadingSessionId: String? = null,
+    val previewError: String? = null,
     val agents: List<RemoteAgentChoice> = emptyList(),
     val agentCaps: Map<String, RemoteAgentCaps> = emptyMap(),
     val activeTabId: String? = null,
@@ -572,11 +574,40 @@ class RemoteClient(
     }
 
     fun previewSession(sessionId: String) {
-        launchRequest("session.conversation", RemoteCommands.conversation(sessionId)) { payload ->
+        synchronized(lifecycleLock) {
+            if (mutableState.value.previewLoadingSessionId == sessionId) return
             mutableState.value = mutableState.value.copy(
-                previewSessionId = sessionId,
-                previewMessages = RemoteCommands.sessionPreview(payload),
+                previewLoadingSessionId = sessionId,
+                previewError = null,
             )
+        }
+        val started = launchRequest(
+            "session.conversation",
+            RemoteCommands.conversation(sessionId),
+            onError = { _, message ->
+                mutableState.value = mutableState.value.copy(
+                    previewLoadingSessionId = null,
+                    previewError = message,
+                )
+            },
+            onSuccess = { payload ->
+                mutableState.value = mutableState.value.copy(
+                    previewSessionId = sessionId,
+                    previewMessages = RemoteCommands.sessionPreview(payload),
+                    previewLoadingSessionId = null,
+                    previewError = null,
+                )
+            },
+        )
+        if (!started) {
+            synchronized(lifecycleLock) {
+                if (mutableState.value.previewLoadingSessionId == sessionId) {
+                    mutableState.value = mutableState.value.copy(
+                        previewLoadingSessionId = null,
+                        previewError = "The desktop is disconnected.",
+                    )
+                }
+            }
         }
     }
 
@@ -817,9 +848,14 @@ class RemoteClient(
         }
     }
 
-    private fun launchRequest(kind: String, payload: ByteArray, onSuccess: (ByteArray) -> Unit = {}) {
+    private fun launchRequest(
+        kind: String,
+        payload: ByteArray,
+        onError: ((String, String) -> Unit)? = null,
+        onSuccess: (ByteArray) -> Unit = {},
+    ): Boolean {
         val requestContext = synchronized(lifecycleLock) {
-            val active = transport ?: return
+            val active = transport ?: return false
             RequestContext(lifecycleGeneration, active)
         }
         val response = requestContext.transport.request(kind, payload)
@@ -828,7 +864,9 @@ class RemoteClient(
             active = requestContext.transport,
             response = response,
             onSuccess = onSuccess,
+            onError = onError,
         )
+        return true
     }
 
     private suspend fun requestResource(kind: String, payload: ByteArray): ByteArray {
@@ -851,15 +889,21 @@ class RemoteClient(
         active: RemoteTransport,
         response: Deferred<RemoteResponse>,
         onSuccess: (ByteArray) -> Unit = {},
+        onError: ((String, String) -> Unit)? = null,
     ) {
         launchOwned(generation) {
             try {
                 when (val result = response.await()) {
-                    is RemoteResponse.Error -> accept(
-                        generation,
-                        RemoteServerEvent.Failure(result.code, result.message),
-                        active,
-                    )
+                    is RemoteResponse.Error -> {
+                        synchronized(lifecycleLock) {
+                            if (isCurrent(generation, active)) onError?.invoke(result.code, result.message)
+                        }
+                        accept(
+                            generation,
+                            RemoteServerEvent.Failure(result.code, result.message),
+                            active,
+                        )
+                    }
                     is RemoteResponse.Success -> synchronized(lifecycleLock) {
                         if (isCurrent(generation, active)) {
                             onSuccess(result.payload)
@@ -869,6 +913,11 @@ class RemoteClient(
             } catch (_: kotlinx.coroutines.CancellationException) {
                 throw kotlinx.coroutines.CancellationException("remote request canceled")
             } catch (error: Exception) {
+                synchronized(lifecycleLock) {
+                    if (isCurrent(generation, active)) {
+                        onError?.invoke("protocol.invalid_response", error.message ?: "Invalid desktop response")
+                    }
+                }
                 acceptRequestFailure(
                     generation,
                     active,

@@ -520,10 +520,22 @@ private fun RemoteConversationContent(
         containerColor = MaterialTheme.colorScheme.background,
     ) { padding ->
         when {
-            state.previewSessionId != session.id -> Box(
+            state.previewSessionId != session.id && state.previewLoadingSessionId == session.id -> Box(
                 Modifier.fillMaxSize().padding(padding),
                 contentAlignment = Alignment.Center,
             ) { CircularProgressIndicator() }
+            state.previewSessionId != session.id -> Column(
+                Modifier.fillMaxSize().padding(padding).padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                Text(
+                    state.previewError ?: "The conversation could not be loaded.",
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Spacer(Modifier.height(8.dp))
+                TextButton(onClick = onRefresh) { Text("Retry") }
+            }
             messages.isEmpty() -> Box(
                 Modifier.fillMaxSize().padding(padding),
                 contentAlignment = Alignment.Center,
