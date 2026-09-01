@@ -145,7 +145,10 @@ private fun isMono(asset: String) = !asset.contains("-color")
 @Composable
 fun AgentIcon(id: String, size: Dp = 28.dp) {
     val asset = brandAsset(id)
-    if (asset == null) {
+    // A mark that cannot be drawn — no asset for the id, or a load that
+    // failed — is a lettered avatar, never an empty gap in the row.
+    val failed = androidx.compose.runtime.remember(id) { androidx.compose.runtime.mutableStateOf(false) }
+    if (asset == null || failed.value) {
         Box(Modifier.size(size).background(agentColor(id).copy(alpha = 0.18f), CircleShape), contentAlignment = Alignment.Center) {
             Text(id.take(1).uppercase(), color = agentColor(id), fontWeight = FontWeight.Bold)
         }
@@ -157,6 +160,7 @@ fun AgentIcon(id: String, size: Dp = 28.dp) {
         contentDescription = id,
         modifier = Modifier.size(size),
         colorFilter = if (isMono(asset)) ColorFilter.tint(themeState.value.onSurface) else null,
+        onError = { failed.value = true },
     )
 }
 
