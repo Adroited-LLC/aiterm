@@ -66,6 +66,7 @@ The token itself goes into AITerm Settings. Only its hash goes into
 
 The intended single-VM layout uses two public ports:
 
+- TCP 80: ACME HTTP challenge for the connector certificate;
 - TCP 443: raw phone ingress owned by `aiterm-relay`;
 - TCP 8443: ordinary TLS/WebSocket edge, proxied to the connector listener on
   `127.0.0.1:8080`.
@@ -75,6 +76,11 @@ ACME proxy to manage the connector certificate on 8443. The desktop setting is
 then `wss://control.<domain>:8443/v1/connect`; a route's public endpoint is
 `<route-id>.<domain>:443`. DNS needs records for `control.<domain>` and the
 wildcard `*.<domain>`.
+
+`deploy/Caddyfile` is the TLS edge template. Its systemd service must receive
+`AITERM_RELAY_CONTROL_HOST=control.<domain>`. TLS-ALPN validation is disabled
+because port 443 belongs to the opaque phone ingress; Caddy uses the port 80
+HTTP challenge instead.
 
 The Google Cloud VM, firewall rules, DNS records, ACME proxy, and secrets are
 deliberately not provisioned by this branch. `deploy/aiterm-relay.service` is a

@@ -1,0 +1,12 @@
+{
+	auto_https disable_redirects
+}
+
+{$AITERM_RELAY_CONTROL_HOST}:8443 {
+	tls {
+		issuer acme {
+			disable_tlsalpn_challenge
+		}
+	}
+	reverse_proxy 127.0.0.1:8080
+}
