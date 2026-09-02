@@ -651,6 +651,21 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
 pub async fn remote_begin_pairing(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
+    let (payload, now) = begin_pairing_payload(&state).await?;
+    let svg = pairing_qr_svg(&payload).ok_or("the pairing payload could not be rendered")?;
+    Ok(PairingInviteView {
+        svg,
+        expires_at: unix_millis(now + ENROLLMENT_LIFETIME),
+    })
+}
+
+/// Mint the gateway's own pairing payload — enrollment secret, relay draft
+/// when no relay route exists yet — and return it with the instant the
+/// enrollment began. Both pairing commands build on this so a combined QR
+/// carries exactly what a plain one does.
+async fn begin_pairing_payload(
+    state: &tauri::State<'_, RemoteState>,
+) -> Result<(String, SystemTime), String> {
     let (devices, fingerprint, needs_relay) = {
         let mut inner = state.inner.lock().await;
         inner.load_relay_config()?;
@@ -687,11 +702,7 @@ pub async fn remote_begin_pairing(
         &desktop_name(),
         enrollment.relay(),
     )?;
-    let svg = pairing_qr_svg(&payload).ok_or("the pairing payload could not be rendered")?;
-    Ok(PairingInviteView {
-        svg,
-        expires_at: unix_millis(now + ENROLLMENT_LIFETIME),
-    })
+    Ok((payload, now))
 }
 
 /// One QR that pairs either phone app. The gateway's own enrollment payload
@@ -706,16 +717,7 @@ pub async fn remote_begin_pairing_combined(
     app: tauri::AppHandle,
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
-    let mut inner = state.inner.lock().await;
-    if inner.gateway.is_none() {
-        return Err("turn remote access on before pairing a phone".into());
-    }
-    let devices = inner.devices()?;
-    let now = SystemTime::now();
-    let enrollment = devices
-        .begin_enrollment_at(now)
-        .map_err(|error| error.to_string())?;
-    let mut payload = inner.pairing_payload(enrollment.secret(), &desktop_name())?;
+    let (mut payload, now) = begin_pairing_payload(&state).await?;
     if let Some(ext) = crate::remote_api::pair_extension(&app) {
         payload.push_str(&ext);
     }
