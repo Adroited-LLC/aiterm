@@ -991,6 +991,18 @@ mod tests {
 
     /// Reads the real store on this machine and prints what it finds; it
     /// only asserts when a store exists.
+    /// `cargo test --lib antigravity::tests::live_cwd_of_every_row -- --ignored --nocapture`
+    /// prints id → cwd for the real store; empty cwds are the ones to chase.
+    #[test]
+    #[ignore]
+    fn live_cwd_of_every_row() {
+        let Some(root) = store_root() else { println!("agy store absent"); return };
+        for (s, _) in AntigravitySessions.scan_with_paths() {
+            println!("{}  {:40}  {}", &s.id[..8], s.title, if s.project_path.is_empty() { "<none>" } else { &s.project_path });
+        }
+        let _ = root;
+    }
+
     #[test]
     fn live_store_scan() {
         let Some(root) = store_root() else {
