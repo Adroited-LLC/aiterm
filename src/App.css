@@ -4064,3 +4064,53 @@ input[type="range"]::-webkit-slider-thumb {
   font-size: 11px; padding: 1px 6px; margin-left: 6px; cursor: pointer;
 }
 .crew-badge.folded { opacity: 0.65; }
+
+/* remote roads — Settings → Remote access. One card per way a phone can
+   reach this desktop: switch, name, sentence, status dot, and a "Settings"
+   disclosure that opens the road's own rows inline. */
+.road-list { display: flex; flex-direction: column; gap: 8px; margin: 6px 0 4px; }
+.road {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 9px 11px;
+}
+.road.on { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.road-head { display: flex; align-items: flex-start; gap: 10px; }
+.road-head .sw { margin-top: 2px; }
+.road-text { flex: 1; min-width: 0; }
+.road-name { font-size: 13px; color: var(--text); }
+.road-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+.road-status-text { word-break: break-word; }
+.road-sub { margin-top: 2px; padding-left: 13px; color: var(--text-faint); }
+.road-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-faint);
+}
+.road-dot.on { background: var(--green); }
+.road-dot.warn { background: var(--yellow); }
+.road-disclose { flex-shrink: 0; margin-top: 1px; }
+.road-body {
+  margin-top: 8px;
+  padding-top: 2px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+}
+.road-body .srow { padding: 8px 0; }
+.road-body .set-input { margin: 0; }
+.road-note { padding-top: 6px; }
+/* The advanced group folds away; its summary is the group title. */
+.road-listeners > summary { cursor: pointer; list-style: none; }
+.road-listeners > summary::-webkit-details-marker { display: none; }
+.road-listeners > summary::before { content: "▸ "; }
+.road-listeners[open] > summary::before { content: "▾ "; }
