@@ -141,7 +141,6 @@ fun RemoteDesktopScreen(
             state = state,
             desktopName = desktopName,
             onBack = onBack,
-            onReconnect = viewModel::reconnect,
             onRefresh = { viewModel.client.refreshSessions() },
             onLoadUsage = viewModel.client::refreshUsage,
             onStarSession = viewModel.client::starSession,
@@ -165,7 +164,6 @@ private fun RemoteSessionDashboard(
     state: RemoteClientState,
     desktopName: String,
     onBack: () -> Unit,
-    onReconnect: () -> Unit,
     onRefresh: () -> Unit,
     onLoadUsage: () -> Unit,
     onStarSession: (String, Boolean) -> Unit,
@@ -248,18 +246,6 @@ private fun RemoteSessionDashboard(
         containerColor = MaterialTheme.colorScheme.background,
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            state.lastError?.let { error ->
-                Row(
-                    Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.errorContainer)
-                        .padding(horizontal = 14.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(error, color = MaterialTheme.colorScheme.onErrorContainer, modifier = Modifier.weight(1f))
-                    if (state.connection == ConnectionState.Disconnected) {
-                        TextButton(onClick = onReconnect) { Text("Reconnect") }
-                    }
-                }
-            }
             OutlinedTextField(
                 value = query,
                 onValueChange = { query = it },

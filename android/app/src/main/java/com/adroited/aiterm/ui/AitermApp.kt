@@ -24,13 +24,12 @@ object DesktopsRoute
 object PairingRoute
 
 @Serializable
+object WelcomeRoute
+
+@Serializable
 data class TerminalRoute(val deviceId: String)
 
-/**
- * The navigation shell. The start destination is always the paired-desktop
- * list; pairing is reached from it, never the other way round, so a returning
- * user with a paired desktop never sees the camera.
- */
+/** The navigation shell, including the installation-local first-run welcome. */
 @Composable
 fun AitermApp(
     navController: NavHostController = rememberNavController(),
@@ -46,7 +45,25 @@ fun AitermApp(
         if (locked) {
             LockedContent(onUnlock = onRequestUnlock, error = unlockError)
         } else {
-            NavHost(navController = navController, startDestination = DesktopsRoute) {
+            val showWelcome = container.firstRunPreference.shouldShowWelcome()
+            val hasPairedDesktop = runCatching { container.pairedDesktopStore.all().isNotEmpty() }
+                .getOrDefault(false)
+            NavHost(
+                navController = navController,
+                startDestination = if (showWelcome) WelcomeRoute else DesktopsRoute,
+            ) {
+                composable<WelcomeRoute> {
+                    WelcomeScreen(
+                        hasPairedDesktop = hasPairedDesktop,
+                        onContinue = {
+                            container.firstRunPreference.completeWelcome()
+                            navController.navigate(DesktopsRoute) {
+                                popUpTo<WelcomeRoute> { inclusive = true }
+                            }
+                            if (!hasPairedDesktop) navController.navigate(PairingRoute)
+                        },
+                    )
+                }
                 composable<DesktopsRoute> {
                     DesktopListScreen(
                         store = container.pairedDesktopStore,

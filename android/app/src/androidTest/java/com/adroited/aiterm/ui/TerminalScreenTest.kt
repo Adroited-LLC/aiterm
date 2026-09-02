@@ -152,6 +152,7 @@ class TerminalScreenTest {
     fun removingADecodedAttachmentLeavesComposeInChargeOfBitmapLifetime() {
         val store = TerminalDraftStore()
         val image = normalizedImage("preview-lifetime")
+        store.updateComposer("tab-preview-lifetime") { it.open() }
         store.updateAttachments("tab-preview-lifetime") { it.add(image).draft }
         compose.setContent {
             TerminalScreenContent(
