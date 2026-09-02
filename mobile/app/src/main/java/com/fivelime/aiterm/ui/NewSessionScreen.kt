@@ -135,6 +135,7 @@ fun NewSessionScreen(vm: AppViewModel, outer: PaddingValues) {
                             options = vm.agents.map { it.id to it.display_name },
                             onPick = { id -> agent = vm.agents.find { it.id == id } },
                             leading = { agent?.let { AgentIcon(it.id, 16.dp) } },
+                            icon = { id -> AgentIcon(id, 20.dp) },
                         )
                         if (!agent?.models.isNullOrEmpty()) PickerChip(
                             label = model?.display_name ?: "Model",
