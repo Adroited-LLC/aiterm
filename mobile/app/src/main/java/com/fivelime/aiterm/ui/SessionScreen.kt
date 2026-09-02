@@ -691,9 +691,9 @@ private fun BringInDialog(vm: AppViewModel, s: Session, onDismiss: () -> Unit) {
             Spacer(Modifier.height(6.dp))
             Text(
                 when (rounds) {
-                    1 -> "They speak once; the agent answers."
-                    2 -> "One exchange, then a reply back."
-                    else -> "Three full exchanges."
+                    1 -> "They read the session and write once."
+                    2 -> "They write, ${s.agent.replaceFirstChar { it.uppercase() }} replies, they answer."
+                    else -> "Two replies back and forth."
                 },
                 style = MaterialTheme.typography.labelSmall, color = Muted,
                 modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
@@ -705,9 +705,9 @@ private fun BringInDialog(vm: AppViewModel, s: Session, onDismiss: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("Auto-continue", style = MaterialTheme.typography.bodyMedium)
+                    Text("Auto-approve", style = MaterialTheme.typography.bodyMedium)
                     Text(
-                        "When they finish, ${s.agent.replaceFirstChar { it.uppercase() }} acts on the outcome without waiting for you",
+                        "When they finish, ${s.agent.replaceFirstChar { it.uppercase() }} proceeds as approved instead of waiting for you",
                         style = MaterialTheme.typography.labelSmall, color = Muted,
                     )
                 }

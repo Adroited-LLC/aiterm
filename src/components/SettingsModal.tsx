@@ -9,6 +9,7 @@ import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
 import RemoteSettings from "./RemoteSettings";
 import LibrarianPane from "./LibrarianPane";
+import BringInPane from "./BringInPane";
 import type { LibrarianCtl } from "../librarian";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
 import {
@@ -53,6 +54,7 @@ export type SettingsTab =
   | "agents"
   | "models"
   | "librarian"
+  | "bringin"
   | "remote"
   | "diagnostics";
 type Tab = SettingsTab;
@@ -63,6 +65,7 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "agents", label: "Agents" },
   { key: "models", label: "Model access" },
   { key: "librarian", label: "Librarian" },
+  { key: "bringin", label: "Bring in" },
   { key: "remote", label: "Remote access" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
@@ -566,6 +569,9 @@ export default function SettingsModal({
             </>}
 
             {tab === "remote" && <RemoteSettings />}
+            {tab === "bringin" && (
+              <BringInPane prompts={settings.bringIn} onChange={(next) => onChange({ ...settings, bringIn: next })} />
+            )}
             {tab === "librarian" && (
               <LibrarianPane
                 cfg={settings.librarian}

@@ -85,6 +85,7 @@ pub fn run() {
             librarian::librarian_pending,
             librarian::librarian_forget,
             detail::session_conversation,
+            detail::session_transcript_path,
             changes::session_changes,
             changes::read_file_base64,
             agents::detect_agents,

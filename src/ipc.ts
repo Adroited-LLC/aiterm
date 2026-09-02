@@ -1077,6 +1077,9 @@ export const librarianForget = () => invoke<void>("librarian_forget");
 
 export const sessionConversation = (sessionId: string, maxChars: number) =>
   invoke<[string, string][]>("session_conversation", { sessionId, maxChars });
+/** Where the session's transcript is on disk — for an agent to read itself. */
+export const sessionTranscriptPath = (sessionId: string) =>
+  invoke<string>("session_transcript_path", { sessionId });
 
 // --- Files produced by sessions ----------------------------------------
 
