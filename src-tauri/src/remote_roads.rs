@@ -338,6 +338,91 @@ pub fn hex_to_b64url(hex: &str) -> Option<String> {
     Some(b64url(&bytes))
 }
 
+// ---------------------------------------------------------------- draft life
+
+/// How long an enrollment draft is offered before a fresh one is minted in
+/// its place. The relay keeps no state for a draft (it is a route id, a
+/// token hash and a digest, all local), so a stale one costs nothing to
+/// replace and a phone that signed it a second late simply signs the next.
+pub const DRAFT_TTL: Duration = Duration::from_secs(600);
+/// How long after the relay server could not be reached before a status
+/// read asks it again — the panel polls every 5 s and must not turn a dead
+/// relay into a request every 5 s.
+pub const DRAFT_RETRY: Duration = Duration::from_secs(30);
+
+/// What the draft slot holds, as a status read sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftSlot {
+    /// Nothing prepared, nothing failed.
+    Empty,
+    /// A draft is waiting for a phone to sign it.
+    Waiting { age: Duration },
+    /// The last attempt could not reach the relay server.
+    Failed { age: Duration },
+}
+
+/// What to do with the slot on this read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftStep {
+    Keep,
+    /// Ask the relay for a route (spawned; the read itself never waits).
+    Prepare,
+    /// Forget the draft and any error: the road is off or the route is live.
+    Drop,
+}
+
+/// The eager-draft state machine, pure. A draft exists whenever the relay
+/// road is on and no route is enrolled; it is replaced after `DRAFT_TTL`,
+/// a failure is retried after `DRAFT_RETRY`, and a prepare already in
+/// flight is left alone. Whatever the slot holds, an off road or a live
+/// route empties it.
+pub fn draft_step(relay_on: bool, route_live: bool, in_flight: bool, slot: DraftSlot) -> DraftStep {
+    if !relay_on || route_live {
+        return if slot == DraftSlot::Empty { DraftStep::Keep } else { DraftStep::Drop };
+    }
+    if in_flight {
+        return DraftStep::Keep;
+    }
+    match slot {
+        DraftSlot::Empty => DraftStep::Prepare,
+        DraftSlot::Waiting { age } if age >= DRAFT_TTL => DraftStep::Prepare,
+        DraftSlot::Failed { age } if age >= DRAFT_RETRY => DraftStep::Prepare,
+        _ => DraftStep::Keep,
+    }
+}
+
+// ---------------------------------------------------------------- road order
+
+/// The four roads, in the order a fresh desktop tells phones to try them.
+pub const ROADS: [&str; 4] = ["lan", "vpn", "relay", "iroh"];
+
+pub fn default_road_order() -> Vec<String> {
+    ROADS.iter().map(|r| r.to_string()).collect()
+}
+
+/// A stored order made whole: unknown names dropped, repeats dropped, any
+/// road missing appended in default order. The result is always a
+/// permutation of `ROADS`.
+pub fn normalize_road_order(order: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(ROADS.len());
+    for r in order {
+        if ROADS.contains(&r.as_str()) && !out.iter().any(|o| o == r) {
+            out.push(r.clone());
+        }
+    }
+    for r in ROADS {
+        if !out.iter().any(|o| o == r) {
+            out.push(r.to_string());
+        }
+    }
+    out
+}
+
+/// Exactly the four roads, each once — what `remote_set_road_order` accepts.
+pub fn is_road_permutation(order: &[String]) -> bool {
+    order.len() == ROADS.len() && normalize_road_order(order) == order
+}
+
 // ---------------------------------------------------------------- enrollment
 
 /// The phone's answer to `ta`: its authority key and a signature over the
@@ -489,6 +574,72 @@ mod tests {
         assert_eq!(b64url_decode(&b).unwrap(), (0u8..32).collect::<Vec<_>>());
         assert!(hex_to_b64url("abc").is_none());
         assert!(hex_to_b64url(&"zz".repeat(32)).is_none());
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn an_empty_slot_with_the_road_on_and_no_route_prepares_a_draft() {
+        assert_eq!(draft_step(true, false, false, DraftSlot::Empty), DraftStep::Prepare);
+    }
+
+    #[test]
+    fn a_fresh_draft_is_kept_and_a_stale_one_is_replaced() {
+        assert_eq!(draft_step(true, false, false, DraftSlot::Waiting { age: secs(0) }), DraftStep::Keep);
+        assert_eq!(draft_step(true, false, false, DraftSlot::Waiting { age: DRAFT_TTL - secs(1) }), DraftStep::Keep);
+        assert_eq!(draft_step(true, false, false, DraftSlot::Waiting { age: DRAFT_TTL }), DraftStep::Prepare);
+        assert_eq!(draft_step(true, false, false, DraftSlot::Waiting { age: secs(3600) }), DraftStep::Prepare);
+    }
+
+    #[test]
+    fn a_failure_waits_its_backoff_before_asking_again() {
+        assert_eq!(draft_step(true, false, false, DraftSlot::Failed { age: secs(0) }), DraftStep::Keep);
+        assert_eq!(draft_step(true, false, false, DraftSlot::Failed { age: DRAFT_RETRY - secs(1) }), DraftStep::Keep);
+        assert_eq!(draft_step(true, false, false, DraftSlot::Failed { age: DRAFT_RETRY }), DraftStep::Prepare);
+    }
+
+    #[test]
+    fn a_prepare_in_flight_is_never_doubled() {
+        assert_eq!(draft_step(true, false, true, DraftSlot::Empty), DraftStep::Keep);
+        assert_eq!(draft_step(true, false, true, DraftSlot::Waiting { age: secs(9999) }), DraftStep::Keep);
+        assert_eq!(draft_step(true, false, true, DraftSlot::Failed { age: secs(9999) }), DraftStep::Keep);
+    }
+
+    #[test]
+    fn an_off_road_or_a_live_route_empties_the_slot_and_prepares_nothing() {
+        for (on, live) in [(false, false), (false, true), (true, true)] {
+            assert_eq!(draft_step(on, live, false, DraftSlot::Empty), DraftStep::Keep);
+            assert_eq!(draft_step(on, live, false, DraftSlot::Waiting { age: secs(1) }), DraftStep::Drop);
+            assert_eq!(draft_step(on, live, false, DraftSlot::Failed { age: secs(1) }), DraftStep::Drop);
+            // Even mid-flight: the answer will be discarded when it lands.
+            assert_eq!(draft_step(on, live, true, DraftSlot::Waiting { age: secs(1) }), DraftStep::Drop);
+        }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_road_order_is_made_whole_on_load() {
+        assert_eq!(normalize_road_order(&[]), strs(&["lan", "vpn", "relay", "iroh"]));
+        assert_eq!(normalize_road_order(&strs(&["iroh", "relay"])), strs(&["iroh", "relay", "lan", "vpn"]));
+        assert_eq!(normalize_road_order(&strs(&["vpn", "bogus", "vpn", "lan"])), strs(&["vpn", "lan", "relay", "iroh"]));
+        assert_eq!(normalize_road_order(&strs(&["relay", "iroh", "vpn", "lan"])), strs(&["relay", "iroh", "vpn", "lan"]));
+        assert_eq!(default_road_order(), strs(&["lan", "vpn", "relay", "iroh"]));
+    }
+
+    #[test]
+    fn only_a_permutation_of_the_four_roads_is_accepted() {
+        assert!(is_road_permutation(&strs(&["lan", "vpn", "relay", "iroh"])));
+        assert!(is_road_permutation(&strs(&["iroh", "relay", "vpn", "lan"])));
+        assert!(!is_road_permutation(&strs(&["lan", "vpn", "relay"])));
+        assert!(!is_road_permutation(&strs(&["lan", "vpn", "relay", "iroh", "lan"])));
+        assert!(!is_road_permutation(&strs(&["lan", "vpn", "relay", "bogus"])));
+        assert!(!is_road_permutation(&strs(&["lan", "lan", "relay", "iroh"])));
+        assert!(!is_road_permutation(&[]));
     }
 
     #[test]

@@ -44,7 +44,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 
 use crate::remote::relay::{RelayConfig, RelayConnectionState, RelayConnectorHandle, RelayEnrollmentDraft};
-use crate::remote_roads::{self, VpnStatus};
+use crate::remote_roads::{self, DraftSlot, DraftStep, VpnStatus};
 
 const DEFAULT_PORT: u16 = 8877;
 /// Bumped when a phone would misread an older desktop. The phone checks it.
@@ -82,6 +82,11 @@ pub struct Config {
     /// A custom iroh relay URL. None = iroh's default (n0) relays.
     #[serde(default)]
     pub iroh_relay_url: Option<String>,
+    /// The order phones try the roads, most preferred first — published in
+    /// `/v1/status` and adopted by any phone that has not set its own.
+    /// Always a permutation of the four (`load_config` makes it one).
+    #[serde(default = "remote_roads::default_road_order")]
+    pub road_order: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -101,6 +106,7 @@ impl Default for Config {
             vpn_enabled: true,
             relay_enabled: false,
             iroh_relay_url: None,
+            road_order: remote_roads::default_road_order(),
         }
     }
 }
@@ -131,10 +137,14 @@ fn config_path() -> Option<PathBuf> {
 }
 
 fn load_config() -> Config {
-    config_path()
+    let mut cfg: Config = config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // A hand-edited or older file: unknown roads dropped, missing ones
+    // appended, so the order is always whole.
+    cfg.road_order = remote_roads::normalize_road_order(&cfg.road_order);
+    cfg
 }
 
 fn save_config(cfg: &Config) {
@@ -215,13 +225,40 @@ pub struct ClientInfo {
 }
 
 /// The relay road's state: the enrolled route (persisted), its connector
-/// while the listener runs, and the draft a QR is waiting on.
+/// while the listener runs, and the enrollment draft a phone signs.
+///
+/// The draft is eager (`ensure_draft`): whenever the road is on and no
+/// route exists there is one waiting, minted at listener start, when the
+/// road is switched on, after the route is cleared, and lazily on any
+/// status read once it is older than `DRAFT_TTL` or a prepare failed. A
+/// paired phone reads its digest from `/v1/status` and enrolls with no
+/// new pairing; a QR carries the same digest as `ta`.
 #[derive(Default)]
 struct PhoneRelay {
     config: Option<RelayConfig>,
     handle: Option<RelayConnectorHandle>,
-    /// In memory only: replaced by each new QR, dropped when the road is off.
-    draft: Option<RelayEnrollmentDraft>,
+    /// In memory only, with when it was minted. One at a time: a
+    /// re-prepare replaces it. Dropped when the road is off or a route lives.
+    draft: Option<(RelayEnrollmentDraft, Instant)>,
+    /// Why the last prepare failed (the relay server unreachable), and when.
+    /// Cleared by the next successful prepare, by the road going off, and
+    /// by the route going live.
+    failed: Option<(String, Instant)>,
+    /// A prepare is in flight; the next status read does not start another.
+    preparing: bool,
+}
+
+impl PhoneRelay {
+    fn slot(&self) -> DraftSlot {
+        match (&self.draft, &self.failed) {
+            (Some((_, at)), _) => DraftSlot::Waiting { age: at.elapsed() },
+            (None, Some((_, at))) => DraftSlot::Failed { age: at.elapsed() },
+            (None, None) => DraftSlot::Empty,
+        }
+    }
+    fn digest(&self) -> Option<[u8; 32]> {
+        self.draft.as_ref().map(|(d, _)| *d.authorization_digest())
+    }
 }
 
 fn load_phone_relay() -> Option<RelayConfig> {
@@ -508,6 +545,9 @@ fn start(app: &AppHandle) -> Result<(), String> {
     *state.running.lock().unwrap() = Some(Running { port, handle, upnp_alive: alive });
     *state.last_error.lock().unwrap() = None;
     crate::diag!("remote", "listening (TLS) on port {port}");
+    // With the road on and no route, a draft waits from the first moment a
+    // phone could read it.
+    ensure_draft(app);
     Ok(())
 }
 
@@ -593,6 +633,8 @@ pub struct RemoteStatus {
     pub relay: PhoneRelayStatus,
     /// Custom iroh relay URL; None = iroh's default relays.
     pub iroh_relay_url: Option<String>,
+    /// The order phones try the roads; what `/v1/status` publishes.
+    pub road_order: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -617,7 +659,12 @@ pub struct PhoneRelayStatus {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub server: String,
+    /// A draft is waiting for a phone to sign it (no route yet).
     pub pending_enrollment: bool,
+    /// The relay server could not be reached when a draft was wanted.
+    /// `pending_enrollment` is then false; the next status read after
+    /// `DRAFT_RETRY` asks again.
+    pub error: Option<String>,
 }
 
 fn phone_relay_status(state: &RemoteState) -> PhoneRelayStatus {
@@ -636,10 +683,12 @@ fn phone_relay_status(state: &RemoteState) -> PhoneRelayStatus {
         port: relay.config.as_ref().map(|c| c.public_port),
         server: crate::remote::DEFAULT_RELAY_SERVER.into(),
         pending_enrollment: relay.config.is_none() && relay.draft.is_some(),
+        error: relay.failed.as_ref().map(|(e, _)| e.clone()),
     }
 }
 
 fn status_of(app: &AppHandle) -> RemoteStatus {
+    ensure_draft(app);
     let state = app.state::<RemoteState>();
     let cfg = state.config.lock().unwrap().clone();
     let running = state.running.lock().unwrap().is_some();
@@ -663,6 +712,7 @@ fn status_of(app: &AppHandle) -> RemoteStatus {
         vpn: remote_roads::vpn_status(),
         relay: phone_relay_status(&state),
         iroh_relay_url: cfg.iroh_relay_url.clone(),
+        road_order: cfg.road_order.clone(),
         name: cfg.name,
     }
 }
@@ -766,8 +816,8 @@ pub fn remote_set_iroh(app: AppHandle, on: bool) -> RemoteStatus {
 
 /// Turn one road on or off, live. `lan`/`vpn` change what the QR and
 /// `/v1/status` advertise; `relay` starts or stops the connector for an
-/// enrolled route (turning it on with no route prepares nothing by itself —
-/// the next QR offers enrollment); `iroh` is `remote_set_iroh`.
+/// enrolled route, and with no route prepares an enrollment draft that any
+/// paired phone signs from `/v1/status`; `iroh` is `remote_set_iroh`.
 #[tauri::command]
 pub fn remote_set_road(app: AppHandle, road: String, on: bool) -> Result<RemoteStatus, String> {
     set_road(&app, &road, on)?;
@@ -812,9 +862,11 @@ fn set_road(app: &AppHandle, road: &str, on: bool) -> Result<(), String> {
                     start_phone_relay(&state, port);
                 }
             } else {
-                state.phone_relay.lock().unwrap().draft = None;
                 stop_phone_relay(&state);
             }
+            // On with no route: a draft is prepared now. Off: the draft and
+            // any error go.
+            ensure_draft(app);
         }
         _ => {}
     }
@@ -865,14 +917,15 @@ pub fn remote_set_iroh_relay_url(app: AppHandle, url: Option<String>) -> Result<
 
 /// Forget the phone relay route: release it at the relay server when it
 /// was provisioned by pairing, delete `phone-relay.json`, stop the
-/// connector. The road's on/off setting is untouched — the next QR offers
-/// a fresh enrollment.
+/// connector. The road's on/off setting is untouched — a fresh draft is
+/// prepared at once, so the next phone to read status enrolls a new route.
 #[tauri::command]
 pub async fn remote_phone_relay_clear(app: AppHandle) -> Result<RemoteStatus, String> {
     let state = app.state::<RemoteState>();
     let (config, handle) = {
         let mut relay = state.phone_relay.lock().unwrap();
         relay.draft = None;
+        relay.failed = None;
         (relay.config.clone(), relay.handle.take())
     };
     if let Some(handle) = handle {
@@ -902,6 +955,31 @@ pub async fn remote_phone_relay_clear(app: AppHandle) -> Result<RemoteStatus, St
     state.phone_relay.lock().unwrap().config = None;
     notify(&app, Event::StatusChanged);
     let _ = app.emit("remote://clients", ());
+    // The road is still on: the next phone to read status enrolls afresh.
+    ensure_draft(&app);
+    Ok(status_of(&app))
+}
+
+/// The order phones try the roads. Must name all four, each once; phones
+/// that have not set their own order adopt it on their next status read.
+#[tauri::command]
+pub fn remote_set_road_order(app: AppHandle, order: Vec<String>) -> Result<RemoteStatus, String> {
+    if !remote_roads::is_road_permutation(&order) {
+        return Err(format!("The order must name each of {} once", remote_roads::ROADS.join(", ")));
+    }
+    let state = app.state::<RemoteState>();
+    let changed = {
+        let mut cfg = state.config.lock().unwrap();
+        let changed = cfg.road_order != order;
+        if changed {
+            cfg.road_order = order;
+            save_config(&cfg);
+        }
+        changed
+    };
+    if changed {
+        notify(&app, Event::StatusChanged);
+    }
     Ok(status_of(&app))
 }
 
@@ -936,7 +1014,7 @@ pub async fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> 
     if state.running.lock().unwrap().is_none() {
         return Err("Turn remote access on first".into());
     }
-    prepare_phone_relay_draft(&app).await;
+    ensure_draft_now(&app).await;
     let cfg = state.config.lock().unwrap().clone();
     let addrs = hosts_of(&state, &cfg);
     let (relay, digest) = phone_relay_fields(&state, &cfg);
@@ -988,14 +1066,14 @@ pub async fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> 
 /// node id>][&tr=<relay host>&tq=<relay port>][&ta=<digest>]`. `None` while
 /// the listener is off — a combined QR then simply carries no phone-listener
 /// route. The token leaves the desktop only inside a rendered QR, same as in
-/// `remote_pair_payload`. Async because a relay draft is minted here when
-/// the relay road is on and no route exists yet.
+/// `remote_pair_payload`. Async because a relay draft is awaited here when
+/// the relay road is on and none is waiting yet.
 pub(crate) async fn pair_extension(app: &AppHandle) -> Option<String> {
     let state = app.try_state::<RemoteState>()?;
     if state.running.lock().unwrap().is_none() {
         return None;
     }
-    prepare_phone_relay_draft(app).await;
+    ensure_draft_now(app).await;
     let cfg = state.config.lock().unwrap().clone();
     let fingerprint = identity().ok()?.fingerprint;
     let hosts = hosts_of(&state, &cfg);
@@ -1022,33 +1100,111 @@ fn phone_relay_fields(state: &RemoteState, cfg: &Config) -> (Option<(String, u16
     if let Some(c) = &relay.config {
         return (Some((c.public_host.clone(), c.public_port)), None);
     }
-    if let Some(d) = &relay.draft {
+    if let Some((d, _)) = &relay.draft {
         let (host, port) = d.public_endpoint();
         return (Some((host.to_string(), port)), Some(*d.authorization_digest()));
     }
     (None, None)
 }
 
-/// With the relay road on and no route yet, ask the relay server for a
-/// route and keep the draft for the QR being minted. Each QR gets its own;
-/// an earlier draft is replaced. Failure is a log line — the QR then simply
-/// carries no relay fields and the phone pairs over the other roads.
-async fn prepare_phone_relay_draft(app: &AppHandle) {
-    let state = app.state::<RemoteState>();
-    let wanted = {
-        let cfg = state.config.lock().unwrap();
-        let relay = state.phone_relay.lock().unwrap();
-        cfg.relay_enabled && relay.config.is_none()
+/// One step of the draft state machine (`remote_roads::draft_step`) under
+/// the locks: what the slot needs right now. `Prepare` marks the prepare
+/// in flight so a second read does not start another; the caller runs it.
+fn draft_decision(state: &RemoteState) -> DraftStep {
+    let cfg = state.config.lock().unwrap();
+    let mut relay = state.phone_relay.lock().unwrap();
+    let step = remote_roads::draft_step(cfg.relay_enabled, relay.config.is_some(), relay.preparing, relay.slot());
+    match step {
+        DraftStep::Prepare => relay.preparing = true,
+        DraftStep::Drop => {
+            relay.draft = None;
+            relay.failed = None;
+        }
+        DraftStep::Keep => {}
+    }
+    step
+}
+
+/// Keep a draft waiting whenever the road is on and no route exists — from
+/// listener start, a road switch, a cleared route, and every status read.
+/// Never waits: a needed prepare is spawned and its outcome arrives as a
+/// status change. A dropped draft is a status change too.
+fn ensure_draft(app: &AppHandle) {
+    match draft_decision(&app.state::<RemoteState>()) {
+        DraftStep::Prepare => {
+            tauri::async_runtime::spawn(prepare_phone_relay_draft(app.clone()));
+        }
+        DraftStep::Drop => {
+            notify(app, Event::StatusChanged);
+            let _ = app.emit("remote://clients", ());
+        }
+        DraftStep::Keep => {}
+    }
+}
+
+/// The QR's version: a needed prepare is awaited so the code can carry
+/// `ta`. A prepare another read already has in flight is not waited for —
+/// the QR then carries no digest and the phone enrolls from status once
+/// it is paired, which is the ordinary path anyway.
+async fn ensure_draft_now(app: &AppHandle) {
+    match draft_decision(&app.state::<RemoteState>()) {
+        DraftStep::Prepare => prepare_phone_relay_draft(app.clone()).await,
+        DraftStep::Drop => {
+            notify(app, Event::StatusChanged);
+            let _ = app.emit("remote://clients", ());
+        }
+        DraftStep::Keep => {}
+    }
+}
+
+/// Ask the relay server for a route (`GET /v1/info` on Matt's control
+/// origin) and keep the draft. Runs only after `draft_decision` said
+/// `Prepare`, and clears the in-flight mark when done. The answer is
+/// discarded if the road went off or a route went live meanwhile. Success
+/// replaces whatever draft was there and tells phones; failure keeps the
+/// message for the panel and `/v1/status`, with no draft.
+async fn prepare_phone_relay_draft(app: AppHandle) {
+    let outcome = match identity().ok().and_then(|id| remote_roads::hex_to_b64url(&id.fingerprint)) {
+        Some(spki) => RelayConfig::prepare_enrollment(crate::remote::DEFAULT_RELAY_SERVER, &spki).await,
+        None => Err("the listener has no certificate yet".into()),
     };
-    if !wanted {
-        return;
+    let state = app.state::<RemoteState>();
+    let landed = {
+        let cfg = state.config.lock().unwrap();
+        let mut relay = state.phone_relay.lock().unwrap();
+        relay.preparing = false;
+        if !cfg.relay_enabled || relay.config.is_some() {
+            relay.draft = None;
+            relay.failed = None;
+            None
+        } else {
+            match outcome {
+                Ok(draft) => {
+                    relay.draft = Some((draft, Instant::now()));
+                    relay.failed = None;
+                    Some(true)
+                }
+                Err(e) => {
+                    relay.draft = None;
+                    relay.failed = Some((e, Instant::now()));
+                    Some(false)
+                }
+            }
+        }
+    };
+    match landed {
+        Some(true) => {
+            crate::diag!("remote", "phone relay enrollment draft ready; a paired phone signs it from status");
+            notify(&app, Event::StatusChanged);
+        }
+        Some(false) => crate::diag!(
+            "remote",
+            "relay setup was unavailable: {}",
+            state.phone_relay.lock().unwrap().failed.as_ref().map(|(e, _)| e.as_str()).unwrap_or("")
+        ),
+        None => {}
     }
-    let Ok(id) = identity() else { return };
-    let Some(spki) = remote_roads::hex_to_b64url(&id.fingerprint) else { return };
-    match RelayConfig::prepare_enrollment(crate::remote::DEFAULT_RELAY_SERVER, &spki).await {
-        Ok(draft) => state.phone_relay.lock().unwrap().draft = Some(draft),
-        Err(e) => crate::diag!("remote", "relay setup was unavailable while pairing: {e}"),
-    }
+    let _ = app.emit("remote://clients", ());
 }
 
 fn percent_encode(s: &str) -> String {
@@ -1372,6 +1528,10 @@ fn err(status: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 async fn status(State(ctx): State<Ctx>) -> Response {
+    // A phone reading status is the moment a draft is wanted: mint one
+    // (spawned — the phone never waits on the relay server) or replace a
+    // stale one; the phone hears the result as a status change.
+    ensure_draft(&ctx.app);
     let state = ctx.app.state::<RemoteState>();
     let cfg = state.config.lock().unwrap().clone();
     // The addresses the desktop answers on right now, LAN first, public
@@ -1379,25 +1539,46 @@ async fn status(State(ctx): State<Ctx>) -> Response {
     // candidates from this on every connect, so a DHCP move or a new
     // public IP never strands it with only stale addresses.
     let hosts = hosts_of(&state, &cfg);
-    // The relay road as a live route only — never a draft, which is the
-    // QR's business.
-    let relay = {
+    let (relay, enroll, relay_error) = {
         let r = state.phone_relay.lock().unwrap();
-        match (&r.config, cfg.relay_enabled) {
-            (Some(c), true) => serde_json::json!({ "host": c.public_host, "port": c.public_port }),
-            _ => serde_json::Value::Null,
+        if !cfg.relay_enabled {
+            (None, None, None)
+        } else {
+            (
+                r.config.as_ref().map(|c| (c.public_host.clone(), c.public_port)),
+                if r.config.is_none() { r.digest() } else { None },
+                r.failed.as_ref().map(|(e, _)| e.clone()),
+            )
         }
     };
-    Json(serde_json::json!({
+    Json(status_body(&cfg, hosts, relay, enroll, relay_error)).into_response()
+}
+
+/// The `/v1/status` document, pure so its shape is a test. `relay` is the
+/// live route only; `relay_enroll` carries the waiting draft's digest for
+/// a paired phone to sign, and is null once a route lives, when nothing
+/// is waiting, or when the road is off; `relay_error` says why nothing is
+/// waiting when the relay server could not be reached; `road_order` is
+/// the desktop's preference for phones that have not set their own.
+fn status_body(
+    cfg: &Config,
+    hosts: Vec<String>,
+    relay: Option<(String, u16)>,
+    enroll_digest: Option<[u8; 32]>,
+    relay_error: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
         "api": API_VERSION,
         "name": cfg.name,
         "version": env!("CARGO_PKG_VERSION"),
         "hosts": hosts,
         "iroh": if cfg.iroh_enabled { crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) } else { None },
-        "relay": relay,
-        "roads": Roads::of(&cfg),
-    }))
-    .into_response()
+        "relay": relay.map(|(host, port)| serde_json::json!({ "host": host, "port": port })),
+        "relay_enroll": enroll_digest.map(|d| serde_json::json!({ "digest": remote_roads::b64url(&d) })),
+        "relay_error": relay_error,
+        "roads": Roads::of(cfg),
+        "road_order": cfg.road_order,
+    })
 }
 
 #[derive(Deserialize)]
@@ -1408,11 +1589,13 @@ struct EnrollBody {
     signature_der: String,
 }
 
-/// The phone answers the QR's `ta`: it signed the draft digest with its
+/// The phone answers the waiting draft — the QR's `ta`, or the same digest
+/// read from `/v1/status.relay_enroll` after pairing: it signed it with its
 /// authority key, and the desktop — after checking the signature itself —
 /// registers the route with the relay, keeps it, and starts the connector.
-/// 409 when nothing is pending, 400 when the answer does not verify, 502
-/// when the relay server refused.
+/// 409 when nothing is pending, 400 when the answer does not verify (also
+/// what a phone gets for a digest a re-prepare has since replaced — it
+/// re-reads status and signs the new one), 502 when the relay refused.
 async fn relay_enroll(State(ctx): State<Ctx>, Json(b): Json<EnrollBody>) -> Response {
     let state = ctx.app.state::<RemoteState>();
     let draft = {
@@ -1421,7 +1604,7 @@ async fn relay_enroll(State(ctx): State<Ctx>, Json(b): Json<EnrollBody>) -> Resp
         if !cfg.relay_enabled || relay.config.is_some() {
             None
         } else {
-            relay.draft.clone()
+            relay.draft.as_ref().map(|(d, _)| d.clone())
         }
     };
     let Some(draft) = draft else {
@@ -1451,6 +1634,7 @@ async fn relay_enroll(State(ctx): State<Ctx>, Json(b): Json<EnrollBody>) -> Resp
     {
         let mut relay = state.phone_relay.lock().unwrap();
         relay.draft = None;
+        relay.failed = None;
         relay.config = Some(config.clone());
         if let Some(old) = relay.handle.take() {
             tokio::spawn(old.stop());
@@ -2635,6 +2819,54 @@ mod tests {
     fn iso_timestamps_become_unix_seconds() {
         assert_eq!(parse_iso_secs("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso_secs("2026-08-29T14:36:55.009Z"), Some(1788014215));
+    }
+
+    fn cfg() -> Config {
+        Config {
+            name: "office".into(),
+            iroh_enabled: false,
+            relay_enabled: true,
+            road_order: vec!["iroh".into(), "relay".into(), "lan".into(), "vpn".into()],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn status_carries_a_waiting_draft_for_a_paired_phone_to_sign() {
+        let digest = [9u8; 32];
+        let body = status_body(&cfg(), vec!["192.168.2.176".into()], None, Some(digest), None);
+        assert!(body["relay"].is_null());
+        assert_eq!(body["relay_enroll"]["digest"], remote_roads::b64url(&digest));
+        assert!(body["relay_error"].is_null());
+        assert_eq!(body["road_order"], serde_json::json!(["iroh", "relay", "lan", "vpn"]));
+        assert_eq!(body["roads"]["relay"], true);
+        assert_eq!(body["hosts"], serde_json::json!(["192.168.2.176"]));
+    }
+
+    #[test]
+    fn status_with_a_live_route_offers_nothing_to_sign() {
+        let body = status_body(&cfg(), vec![], Some(("desktop-1.relay.example.com".into(), 443)), None, None);
+        assert_eq!(body["relay"], serde_json::json!({ "host": "desktop-1.relay.example.com", "port": 443 }));
+        assert!(body["relay_enroll"].is_null());
+    }
+
+    #[test]
+    fn status_says_why_no_draft_is_waiting() {
+        let body = status_body(&cfg(), vec![], None, None, Some("the relay server could not be reached".into()));
+        assert!(body["relay"].is_null());
+        assert!(body["relay_enroll"].is_null());
+        assert_eq!(body["relay_error"], "the relay server could not be reached");
+    }
+
+    #[test]
+    fn a_config_written_before_road_order_existed_loads_the_default_order() {
+        let json = r#"{"enabled":true,"port":8877,"token":"ab","name":"office"}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.road_order, remote_roads::default_road_order());
+        let json = r#"{"enabled":true,"port":8877,"token":"ab","name":"office","road_order":["iroh","bogus"]}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        // Raw from serde; `load_config` normalizes, as the roads test shows.
+        assert_eq!(remote_roads::normalize_road_order(&cfg.road_order), vec!["iroh", "lan", "vpn", "relay"]);
     }
 
     #[test]
