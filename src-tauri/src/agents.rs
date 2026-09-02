@@ -1570,6 +1570,7 @@ pub fn backends() -> Vec<Box<dyn AgentBackend>> {
         Box::new(CodexBackend),
         Box::new(crate::grok::GrokBackend),
         Box::new(OpenCodeBackend),
+        Box::new(crate::antigravity::AntigravityBackend),
         Box::new(ChatBackend),
     ]
 }
