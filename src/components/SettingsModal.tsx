@@ -609,6 +609,13 @@ export default function SettingsModal({
                               sessions, so aiterm adopts the id once it starts.
                             </div>
                           )}
+                          {a.id === "antigravity" && a.available && (
+                            <div className="agent-path">
+                              Sessions are listed, searchable and resumable; a new one is
+                              adopted from agy's store a moment after launch, and usage
+                              comes from its own /usage.
+                            </div>
+                          )}
                           {/* How much this engine asks before acting, applied
                               to every session aiterm starts or resumes for it.
                               Only shown for an installed engine that has a

@@ -131,8 +131,8 @@ pub struct Candidate {
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Engine {
     Api { provider_id: String, model: String },
-    /// `agent` is a backend id: claude, codex or grok. `model` in that CLI's
-    /// spelling, or none for its default.
+    /// `agent` is a backend id: claude, codex, grok or antigravity. `model`
+    /// in that CLI's spelling, or none for its default.
     Cli { agent: String, model: Option<String> },
 }
 
@@ -307,6 +307,21 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
             }
             prompt_file = Some(f);
         }
+        "antigravity" => {
+            // `-p` is a valued flag, so the prompt rides in its own argv word
+            // (`-p=…`, which agy's own error message recommends) — a prompt
+            // starting with a dash would otherwise be read as a flag. No
+            // slash expansion: a catalogued session's text is not a command.
+            // A print run still leaves a conversation in agy's store, which
+            // is why it runs under the librarian's own directory.
+            // [observed: agy 1.1.24]
+            cmd = std::process::Command::new("agy");
+            cmd.arg(format!("-p={combined}"));
+            cmd.args(["--output-format", "text", "--disable-slash-commands"]);
+            if let Some(m) = model.filter(|m| !m.is_empty()) {
+                cmd.args(["--model", m]);
+            }
+        }
         other => return Err(format!("{other} has no print mode aiterm knows")),
     }
     cmd.current_dir(&dir)
@@ -315,9 +330,10 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
         .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("could not run {agent}: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
-        // claude and codex read the prompt here; grok has its file and gets
-        // an empty stdin so it cannot wait on a terminal.
-        if prompt_file.is_none() {
+        // claude and codex read the prompt here; grok has its file and
+        // antigravity its argv, and both get an empty stdin so they cannot
+        // wait on a terminal.
+        if prompt_file.is_none() && agent != "antigravity" {
             let text = if agent == "claude" { user.to_string() } else { combined.clone() };
             let _ = stdin.write_all(text.as_bytes());
         }

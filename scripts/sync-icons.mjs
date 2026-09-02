@@ -40,7 +40,7 @@ const out = join(root, "src", "assets", "icons");
 /** On screen before anything is clicked: engine tabs, session rows, usage chips. */
 const HOT = [
   "claude", "claudecode", "anthropic", "codex", "openai", "grok", "xai",
-  "opencode", "gemini", "geminicli", "openrouter",
+  "opencode", "gemini", "geminicli", "openrouter", "antigravity",
 ];
 
 if (!existsSync(svgPkg)) {

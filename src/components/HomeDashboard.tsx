@@ -71,7 +71,7 @@ export default function HomeDashboard({
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             onKeyDown={onKey}
-            placeholder={ready ? "What should it do?  Enter starts the session, Shift+Enter for a new line" : "Nothing to start yet — set up the API tab, or install claude, codex or grok"}
+            placeholder={ready ? "What should it do?  Enter starts the session, Shift+Enter for a new line" : "Nothing to start yet — set up the API tab, or install claude, codex, grok or antigravity"}
             rows={3}
             autoFocus
             spellCheck={false}
