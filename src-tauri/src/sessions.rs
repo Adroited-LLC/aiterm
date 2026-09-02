@@ -6522,7 +6522,7 @@ pub async fn session_artifacts(session_id: String) -> Vec<Artifact> {
     crate::run_blocking(move || session_artifacts_sync(session_id)).await
 }
 
-fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
+pub(crate) fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
     let list = crate::agents::backends();
     if let Some((owner, _)) = crate::agents::owner_in(&list, &session_id) {
         if !owner.caps().tasks {

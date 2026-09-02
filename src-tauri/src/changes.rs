@@ -473,6 +473,78 @@ pub fn for_session(app: &AppHandle, session_id: &str) -> Vec<Change> {
     out
 }
 
+/// Everything the remote Files view can safely recover for one session.
+///
+/// The live ledger catches any filesystem writer while the desktop is
+/// running. Structured agent transcripts also remember earlier Write/Edit
+/// operations, including ones from before the watcher existed. Keep the
+/// ledger authoritative when both name the same path, and only admit
+/// transcript paths that resolve to regular files inside this session's
+/// workspace. A transcript is conversation data, not file-read authority.
+pub fn produced_files(app: &AppHandle, session: &crate::sessions::Session) -> Vec<Change> {
+    merge_artifacts(
+        &session.id,
+        &session.project_path,
+        for_session(app, &session.id),
+        crate::sessions::session_artifacts_sync(session.id.clone()),
+    )
+}
+
+fn merge_artifacts(
+    session_id: &str,
+    project_path: &str,
+    mut changes: Vec<Change>,
+    artifacts: Vec<crate::sessions::Artifact>,
+) -> Vec<Change> {
+    let Ok(root) = PathBuf::from(project_path).canonicalize() else {
+        return changes;
+    };
+    let mut seen = HashSet::new();
+    for change in &changes {
+        seen.insert(change.path.clone());
+        if let Ok(canonical) = PathBuf::from(&change.path).canonicalize() {
+            seen.insert(canonical.to_string_lossy().into_owned());
+        }
+    }
+    for artifact in artifacts {
+        let raw = PathBuf::from(&artifact.path);
+        let candidate = if raw.is_absolute() { raw } else { root.join(raw) };
+        let Ok(path) = candidate.canonicalize() else { continue };
+        if !path.starts_with(&root) {
+            continue;
+        }
+        let path_text = path.to_string_lossy().into_owned();
+        if !seen.insert(path_text.clone()) {
+            continue;
+        }
+        let Ok(metadata) = path.metadata() else { continue };
+        if !metadata.is_file() {
+            continue;
+        }
+        let at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        changes.push(Change {
+            path: path_text,
+            name,
+            kind: if artifact.tool == "Write" { "created" } else { "modified" }.into(),
+            at,
+            session_id: Some(session_id.to_string()),
+            bytes: metadata.len(),
+        });
+    }
+    changes.sort_by(|left, right| right.at.cmp(&left.at));
+    changes.truncate(KEEP);
+    changes
+}
+
 /// Session ids with at least one recorded artifact — straight off the
 /// in-memory ledger, cheap enough to ride along on every session list.
 pub fn sessions_with_files(app: &AppHandle) -> HashSet<String> {
@@ -582,5 +654,77 @@ mod tests {
         assert!(is_scratch(Path::new("/x/.a.rs.swp")));
         assert!(is_scratch(Path::new("/x/4913")));
         assert!(!is_scratch(Path::new("/x/a.rs")));
+    }
+
+    #[test]
+    fn transcript_artifacts_fill_history_without_leaving_the_workspace() {
+        let temp = std::env::temp_dir().join(format!(
+            "aiterm-produced-files-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = temp.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("kept.txt"), b"history").unwrap();
+        std::fs::write(temp.join("outside.txt"), b"private").unwrap();
+
+        let artifacts = vec![
+            crate::sessions::Artifact {
+                path: "kept.txt".into(),
+                tool: "Edit".into(),
+                at: String::new(),
+            },
+            crate::sessions::Artifact {
+                path: "../outside.txt".into(),
+                tool: "Write".into(),
+                at: String::new(),
+            },
+        ];
+        let files = merge_artifacts("session-1", root.to_str().unwrap(), vec![], artifacts);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "kept.txt");
+        assert_eq!(files[0].kind, "modified");
+        assert_eq!(files[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(files[0].bytes, 7);
+        assert!(Path::new(&files[0].path).starts_with(root.canonicalize().unwrap()));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn live_ledger_entry_wins_over_the_same_transcript_artifact() {
+        let temp = std::env::temp_dir().join(format!(
+            "aiterm-produced-files-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = temp.join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("same.txt");
+        std::fs::write(&path, b"current").unwrap();
+        let canonical = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        let live = Change {
+            path: canonical.clone(),
+            name: "same.txt".into(),
+            kind: "created".into(),
+            at: 42,
+            session_id: Some("session-1".into()),
+            bytes: 7,
+        };
+        let artifact = crate::sessions::Artifact {
+            path: canonical,
+            tool: "Edit".into(),
+            at: String::new(),
+        };
+
+        let files = merge_artifacts(
+            "session-1",
+            root.to_str().unwrap(),
+            vec![live],
+            vec![artifact],
+        );
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].kind, "created");
+        assert_eq!(files[0].at, 42);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }

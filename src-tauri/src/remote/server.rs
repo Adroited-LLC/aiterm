@@ -1850,9 +1850,10 @@ const MAX_FILE_READ_CHUNK_BYTES: u32 = 256 * 1024;
 
 fn read_authorized_file_chunk(
     app: &tauri::AppHandle,
+    session: &crate::sessions::Session,
     request: FileReadRequest,
 ) -> Result<FileReadPayload, &'static str> {
-    let changes = crate::changes::for_session(app, &request.session_id);
+    let changes = crate::changes::produced_files(app, session);
     read_file_chunk_from_ledger(request, &changes)
 }
 
@@ -2187,11 +2188,11 @@ impl RemoteServices {
             }
             "session.changes" => {
                 let payload: SessionIdPayload = decode_payload(request)?;
-                self.sessions
+                let session = self.sessions
                     .find(&payload.session_id)
                     .map_err(|error| error.code())?;
                 let app = self.app.as_ref().ok_or("remote.unsupported")?;
-                let changes = crate::changes::for_session(app, &payload.session_id);
+                let changes = crate::changes::produced_files(app, &session);
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "session.changes",
@@ -2200,12 +2201,12 @@ impl RemoteServices {
             }
             "file.read" => {
                 let payload: FileReadRequest = decode_payload(request)?;
-                self.sessions
+                let session = self.sessions
                     .find(&payload.session_id)
                     .map_err(|error| error.code())?;
                 bounded(&payload.path, MAX_PATH_BYTES)?;
                 let app = self.app.as_ref().ok_or("remote.unsupported")?;
-                let chunk = read_authorized_file_chunk(app, payload)?;
+                let chunk = read_authorized_file_chunk(app, &session, payload)?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "file.read",
