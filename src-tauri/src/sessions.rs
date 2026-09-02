@@ -110,6 +110,18 @@ pub fn session_brought_in() -> std::collections::HashMap<String, String> {
     load_brought_in()
 }
 
+/// A deleted session leaves the lineage: as a brought-in agent, and as a
+/// master — otherwise the crew badge keeps counting a tab that is gone.
+pub fn forget_brought_in(session_id: &str) {
+    let Ok(_guard) = metadata_lock().lock() else { return };
+    let mut lineage: std::collections::HashMap<String, String> = load_metadata("brought_in.json");
+    let before = lineage.len();
+    lineage.retain(|k, v| k != session_id && v != session_id);
+    if lineage.len() != before {
+        let _ = save_metadata("brought_in.json", &lineage);
+    }
+}
+
 pub fn record_brought_in(second_session: &str, master_session: &str) -> Result<(), String> {
     let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
     let mut lineage: std::collections::HashMap<String, String> =
@@ -1138,13 +1150,17 @@ pub async fn session_delete(session_id: String) -> Result<(), String> {
     crate::run_blocking(move || {
         sessions
             .delete(&session_id)
-            .map_err(|error| error.message().to_owned())
+            .map_err(|error| error.message().to_owned())?;
+        forget_brought_in(&session_id);
+        Ok(())
     })
     .await
 }
 
 pub(crate) fn session_delete_service(session_id: &str) -> Result<(), String> {
-    session_delete_sync(session_id.to_owned())
+    session_delete_sync(session_id.to_owned())?;
+    forget_brought_in(session_id);
+    Ok(())
 }
 
 fn session_delete_sync(session_id: String) -> Result<(), String> {
