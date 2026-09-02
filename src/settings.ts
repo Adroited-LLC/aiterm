@@ -40,6 +40,9 @@ export interface LibrarianSettings {
 
 export interface AppSettings {
   themeId: string;
+  /** Rest the pointer on a session row and a card opens beside it with the
+   *  session's summary, files and tasks. Off, the list is just a list. */
+  sessionHover: boolean;
   /** Accent override; null = theme default. */
   accent: string | null;
   /** UI font family for panels; "" = system default stack. */
@@ -81,6 +84,7 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   themeId: "warp-dark",
+  sessionHover: true,
   accent: null,
   uiFont: "",
   termFont: "",

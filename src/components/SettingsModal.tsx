@@ -345,6 +345,9 @@ export default function SettingsModal({
                     ))}
                   </div>
                 </Row>
+                <Row label="Session summary on hover" desc="Rest the pointer on a session row and a card opens beside it with the summary, files and tasks">
+                  <Switch checked={settings.sessionHover} onChange={(on) => set({ sessionHover: on })} label="Session summary on hover" />
+                </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
                     <button
