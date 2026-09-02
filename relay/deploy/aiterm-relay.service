@@ -1,0 +1,30 @@
+[Unit]
+Description=AITerm blind relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiterm-relay
+Group=aiterm-relay
+ExecStart=/usr/local/bin/aiterm-relay /etc/aiterm-relay/relay.json
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=aiterm-relay
+StateDirectoryMode=0700
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

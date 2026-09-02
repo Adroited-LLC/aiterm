@@ -38,6 +38,12 @@ data class RemoteFocusEvent(
 
 data class RemoteTitleEvent(val tabId: String, val attachmentId: String, val title: String)
 data class RemoteTerminalExitEvent(val tabId: String, val attachmentId: String, val exit: RemoteTabExit)
+data class RemoteGatewayRoutes(
+    val hosts: List<String>,
+    val port: Int,
+    val relayHost: String?,
+    val relayPort: Int?,
+)
 @Serializable data class RemotePreviewMessage(val role: String, val text: String, val at: String? = null)
 @Serializable
 data class RemoteSessionChange(
@@ -109,6 +115,17 @@ object RemoteCommands {
     }
 
     fun tab(tabId: String): ByteArray = encode(TabIdPayload.serializer(), TabIdPayload(tabId))
+    fun gatewayRoutes(payload: ByteArray): RemoteGatewayRoutes =
+        decode(GatewayRoutesReply.serializer(), payload).let {
+            if (
+                it.hosts.isEmpty() || it.hosts.size > 16 ||
+                it.hosts.any { host -> host.isBlank() } ||
+                it.port !in 1024..65_535 ||
+                ((it.relayHost == null) != (it.relayPort == null)) ||
+                it.relayPort?.let { port -> port !in 1..65_535 } == true
+            ) malformed()
+            RemoteGatewayRoutes(it.hosts, it.port, it.relayHost, it.relayPort)
+        }
     fun attachment(tabId: String, attachmentId: String): ByteArray =
         encode(AttachmentPayload.serializer(), AttachmentPayload(tabId, attachmentId))
     fun input(tabId: String, attachmentId: String, data: ByteArray): ByteArray =
@@ -309,6 +326,12 @@ object RemoteCommands {
     }
 
     @Serializable private data class TabIdPayload(@SerialName("tab_id") val tabId: String)
+    @Serializable private data class GatewayRoutesReply(
+        val hosts: List<String>,
+        val port: Int,
+        @SerialName("relay_host") val relayHost: String? = null,
+        @SerialName("relay_port") val relayPort: Int? = null,
+    )
     @Serializable private data class AttachmentPayload(
         @SerialName("tab_id") val tabId: String,
         @SerialName("attachment_id") val attachmentId: String,

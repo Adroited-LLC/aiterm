@@ -1,4 +1,5 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import ModelAccess from "./ModelAccess";
 import Icon from "./Icon";
@@ -14,6 +15,7 @@ import {
   ACCENT_SWATCHES, AppSettings, DEFAULT_SETTINGS, PanelScales, THEMES, themeById,
   TERM_WEIGHTS,
 } from "../settings";
+import { settingsModalSize } from "../settingsModalSize";
 import {
   Caps, FontFamily, FontPackage,
   AgentDetection, detectAgents, homeAbbrev,
@@ -140,6 +142,38 @@ export default function SettingsModal({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+  const beginResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const el = modalRef.current;
+    if (!el) return;
+    event.preventDefault();
+    const pointerId = event.pointerId;
+    const grip = event.currentTarget;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const start = { width: el.offsetWidth, height: el.offsetHeight };
+    grip.setPointerCapture(pointerId);
+    const move = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
+      const size = settingsModalSize(
+        start,
+        next.clientX - startX,
+        next.clientY - startY,
+        { width: window.innerWidth, height: window.innerHeight },
+      );
+      el.style.width = `${size.width}px`;
+      el.style.height = `${size.height}px`;
+    };
+    const finish = (next: PointerEvent) => {
+      if (next.pointerId !== pointerId) return;
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", finish);
+      grip.removeEventListener("pointercancel", finish);
+      if (grip.hasPointerCapture(pointerId)) grip.releasePointerCapture(pointerId);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", finish);
+    grip.addEventListener("pointercancel", finish);
+  };
   /** Engine whose configuration panel is open, drilled into from Agents. */
   const [configFor, setConfigFor] = useState<AgentDetection | null>(null);
   // Each section starts at its top — the pane is one shared scroll element,
@@ -623,6 +657,12 @@ export default function SettingsModal({
 
           </div>
         </div>
+        <button
+          className="sm-resize-grip"
+          aria-label="Resize settings"
+          title="Drag to resize"
+          onPointerDown={beginResize}
+        />
       </div>
     </div>
   );

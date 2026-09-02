@@ -9,6 +9,7 @@ const MAX_TERMINAL_DIMENSION: u16 = 512;
 pub const MAX_REQUEST_KIND_BYTES: usize = 64;
 
 const KNOWN_REQUESTS: &[&str] = &[
+    "gateway.routes",
     "session.list",
     "session.preview",
     "session.conversation",

@@ -22,4 +22,8 @@ data class PairedDesktop(
     val serverSpkiFingerprint: String,
     @SerialName("last_seen_epoch_millis")
     val lastSeenEpochMillis: Long?,
+    @SerialName("relay_host")
+    val relayHost: String? = null,
+    @SerialName("relay_port")
+    val relayPort: Int? = null,
 )

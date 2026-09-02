@@ -56,3 +56,9 @@ android/build/
 android/app/build/
 android/.gradle/
 android/local.properties
+
+# Standalone AITerm relay build output and its machine-local secrets.
+relay/target/
+relay/relay.json
+relay-protocol/target/
+relay-protocol/Cargo.lock

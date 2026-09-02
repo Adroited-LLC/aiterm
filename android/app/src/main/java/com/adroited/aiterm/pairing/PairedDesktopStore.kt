@@ -64,7 +64,10 @@ object PairedDesktopJson {
                 desktop.hosts.any { !PairingPayload.isValidHost(it) } ||
                 desktop.port !in 1..65_535 ||
                 !PairingPayload.isValidFingerprint(desktop.serverSpkiFingerprint) ||
-                desktop.lastSeenEpochMillis?.let { it < 0 } == true
+                desktop.lastSeenEpochMillis?.let { it < 0 } == true ||
+                ((desktop.relayHost == null) != (desktop.relayPort == null)) ||
+                desktop.relayHost?.let { !PairingPayload.isValidHost(it) } == true ||
+                desktop.relayPort?.let { it !in 1..65_535 } == true
             ) {
                 throw PairedDesktopStoreException("paired desktop storage contains invalid records")
             }

@@ -6,6 +6,8 @@ import {
   inviteCountdownSeconds,
   inviteToShow,
   listenerAddressOptions,
+  relayLabel,
+  relayServerFromConnectorUrl,
   preferredListenerConfig,
   rebindListener,
   lastSeenLabel,
@@ -151,6 +153,32 @@ test("the active listener remains selectable if interface discovery no longer re
     listenerAddressOptions("192.168.1.10", ["192.168.1.10"]),
     ["192.168.1.10"],
   );
+});
+
+test("relay status explains route and connector state without implying a second backend", () => {
+  assert.equal(relayLabel(enabled), "not configured");
+  const withRelay: RemoteStatus = {
+    ...enabled,
+    relay: {
+      configured: true,
+      connector_url: "wss://control.relay.example.com/v1/connect",
+      public_host: "desk-1234.relay.example.com",
+      public_port: 443,
+      route_id: "desk-1234",
+      state: "connected",
+    },
+  };
+  assert.equal(relayLabel(withRelay), "desk-1234.relay.example.com:443 — connected");
+  assert.equal(relayLabel({ ...withRelay, enabled: false }), "desk-1234.relay.example.com:443 — off");
+});
+
+test("relay settings show one server origin instead of connector internals", () => {
+  assert.equal(
+    relayServerFromConnectorUrl("wss://control.relay.example.com:8443/v1/connect"),
+    "https://control.relay.example.com:8443",
+  );
+  assert.equal(relayServerFromConnectorUrl("https://control.relay.example.com/v1/connect"), null);
+  assert.equal(relayServerFromConnectorUrl("wss://control.relay.example.com/not-connect"), null);
 });
 
 test("changing a running listener restores the old address when the new bind fails", async () => {

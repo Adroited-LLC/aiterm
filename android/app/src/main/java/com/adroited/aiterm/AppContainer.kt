@@ -14,9 +14,11 @@ class AppContainer(context: Context) {
     val terminalKeyBarPreference = TerminalKeyBarPreference(context.applicationContext)
     val pairedDesktopStore = SharedPreferencesPairedDesktopStore(context.applicationContext)
     val deviceKeys = AndroidDeviceKeyStore()
+    val relayAuthorityKeys = AndroidDeviceKeyStore("aiterm-relay-authority-p256-v1")
     val pairingRepository = PairingRepository(
         transport = OkHttpPairingTransport(),
         deviceKeys = deviceKeys,
+        relayAuthorityKeys = relayAuthorityKeys,
         store = pairedDesktopStore,
     )
     val appLock = AppLock().apply {

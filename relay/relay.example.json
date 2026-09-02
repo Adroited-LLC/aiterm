@@ -1,0 +1,20 @@
+{
+  "connector_listen": "127.0.0.1:8080",
+  "ingress_listen": "0.0.0.0:443",
+  "public_domain": "relay.example.com",
+  "provisioning": {
+    "state_file": "/var/lib/aiterm-relay/provisioning.json",
+    "control_origin": "https://control.relay.example.com:8443",
+    "connector_url": "wss://control.relay.example.com:8443/v1/connect",
+    "public_port": 443,
+    "max_routes": 1024,
+    "max_routes_per_ip": 4,
+    "max_routes_per_authority": 8
+  },
+  "routes": [
+    {
+      "id": "replace-with-a-random-route-id",
+      "token_sha256": "replace-with-the-lowercase-sha256-of-a-random-connector-token"
+    }
+  ]
+}

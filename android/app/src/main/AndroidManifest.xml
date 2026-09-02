@@ -3,6 +3,8 @@
 
     <!-- Reaching the paired desktop over LAN or the user's VPN. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Redial promptly when Android moves the remote socket between Wi-Fi, VPN, and cellular. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Android 17+ blocks direct LAN sockets until this runtime permission is granted. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <!-- Scanning the aiterm://pair QR code. Nothing else uses the camera. -->
