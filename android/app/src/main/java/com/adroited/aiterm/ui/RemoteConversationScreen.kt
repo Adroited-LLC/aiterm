@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -1199,11 +1200,26 @@ private fun decodeBoundedPreviewBitmap(data: ByteArray): android.graphics.Bitmap
 private fun ConversationTurn(message: RemotePreviewMessage) {
     when (message.role.lowercase()) {
         "user" -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+            val content = remember(message.text) { splitConversationAttachments(message.text) }
             Box(
                 Modifier.widthIn(max = 330.dp)
                     .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp))
                     .padding(horizontal = 13.dp, vertical = 10.dp),
-            ) { ConversationMarkdown(message.text, MaterialTheme.colorScheme.onPrimaryContainer) }
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (content.text.isNotBlank()) {
+                        ConversationMarkdown(content.text, MaterialTheme.colorScheme.onPrimaryContainer)
+                    }
+                    content.imagePaths.forEach { path ->
+                        ConversationActivityRow(
+                            label = "Image attachment",
+                            summary = path.substringAfterLast('/').ifBlank { path },
+                            detail = path,
+                            foreground = MaterialTheme.colorScheme.onPrimaryContainer,
+                        )
+                    }
+                }
+            }
         }
         "assistant" -> Column(Modifier.fillMaxWidth().padding(end = 14.dp)) {
             ConversationMarkdown(message.text)
@@ -1215,14 +1231,125 @@ private fun ConversationTurn(message: RemotePreviewMessage) {
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
         )
-        else -> Text(
+        "system" -> Text(
             message.text,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             fontFamily = FontFamily.Monospace,
             style = MaterialTheme.typography.labelMedium,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
         )
+        else -> ConversationActivityRow(
+            label = conversationActivityLabel(message.role),
+            summary = conversationActivitySummary(message.text),
+            detail = message.text,
+        )
     }
+}
+
+@Composable
+private fun ConversationActivityRow(
+    label: String,
+    summary: String,
+    detail: String,
+    foreground: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+) {
+    var expanded by rememberSaveable(label, detail) { mutableStateOf(false) }
+    Column(
+        Modifier.fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.58f), RoundedCornerShape(7.dp))
+            .clickable { expanded = !expanded }
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                label,
+                color = MaterialTheme.colorScheme.primary,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                summary,
+                color = foreground,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (expanded) "⌃" else "⌄",
+                color = foreground,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+        if (expanded) {
+            HorizontalDivider(
+                modifier = Modifier.padding(top = 7.dp, bottom = 7.dp),
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+            )
+            SelectionContainer {
+                Text(
+                    detail,
+                    color = foreground,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+internal data class ConversationAttachmentContent(
+    val text: String,
+    val imagePaths: List<String>,
+)
+
+/** Pulls the terminal submission's generated path list out of the human message. */
+internal fun splitConversationAttachments(text: String): ConversationAttachmentContent {
+    val lines = text.lines()
+    val body = mutableListOf<String>()
+    val paths = mutableListOf<String>()
+    var index = 0
+    while (index < lines.size) {
+        if (lines[index].trim() != "Attached images:") {
+            body += lines[index]
+            index += 1
+            continue
+        }
+        var cursor = index + 1
+        val found = mutableListOf<String>()
+        while (cursor < lines.size) {
+            val line = lines[cursor].trim()
+            if (!line.startsWith("- ") || line.length <= 2) break
+            found += line.removePrefix("- ").trim()
+            cursor += 1
+        }
+        if (found.isEmpty()) {
+            body += lines[index]
+            index += 1
+        } else {
+            paths += found
+            index = cursor
+        }
+    }
+    return ConversationAttachmentContent(body.joinToString("\n").trim(), paths)
+}
+
+internal fun conversationActivityLabel(role: String): String = when (role.lowercase()) {
+    "exec", "exec_command", "bash", "shell" -> "Command"
+    "apply_patch", "edit", "write" -> "File edit"
+    "image" -> "Image generation"
+    else -> role.replace('_', ' ').trim().replaceFirstChar(Char::uppercase).ifBlank { "Tool" }
+}
+
+internal fun conversationActivitySummary(text: String): String {
+    val compact = text.trim().replace(Regex("\\s+"), " ")
+    if (compact.isEmpty()) return "No details"
+    return if (compact.length <= 110) compact else compact.take(109).trimEnd() + "…"
 }
 
 @Composable

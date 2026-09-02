@@ -100,6 +100,43 @@ class RemoteConversationScreenTest {
         )
     }
 
+    @Test
+    fun attachedImagePathsBecomeCompactRowsWithoutHidingTheMessage() {
+        val content = splitConversationAttachments(
+            """Compare these two screenshots.
+
+                Attached images:
+                - /home/matt/Projects/aiterm/.aiterm/attachments/one.jpg
+                - /home/matt/Projects/aiterm/.aiterm/attachments/two.jpg""".trimIndent(),
+        )
+
+        assertEquals("Compare these two screenshots.", content.text)
+        assertEquals(
+            listOf(
+                "/home/matt/Projects/aiterm/.aiterm/attachments/one.jpg",
+                "/home/matt/Projects/aiterm/.aiterm/attachments/two.jpg",
+            ),
+            content.imagePaths,
+        )
+    }
+
+    @Test
+    fun ordinaryListsAreNotMistakenForAttachments() {
+        val text = "Files to inspect:\n- first.kt\n- second.kt"
+
+        assertEquals(ConversationAttachmentContent(text, emptyList()), splitConversationAttachments(text))
+    }
+
+    @Test
+    fun toolRowsUseReadableLabelsAndSingleLineSummaries() {
+        assertEquals("Command", conversationActivityLabel("exec"))
+        assertEquals("File edit", conversationActivityLabel("apply_patch"))
+        assertEquals("Read file", conversationActivityLabel("read_file"))
+        assertEquals("cargo test --all", conversationActivitySummary("cargo test\n  --all"))
+        assertTrue(conversationActivitySummary("x".repeat(200)).endsWith("…"))
+        assertTrue(conversationActivitySummary("x".repeat(200)).length <= 110)
+    }
+
     private fun session(
         id: String,
         title: String,
