@@ -108,6 +108,7 @@ fun brandAsset(id: String): String? = when (id.lowercase()) {
     "grok" -> "grok.svg"
     "xai" -> "xai.svg"
     "opencode" -> "opencode.svg"
+    "antigravity" -> "antigravity.svg"
     "gemini", "google" -> "gemini-color.svg"
     "anthropic" -> "claude-color.svg"
     "amazon" -> "aws-color.svg"
@@ -193,6 +194,8 @@ fun agentColor(agent: String): Color = when (agent.lowercase()) {
     "codex" -> Color(0xFF8AB4F8)
     "grok" -> Color(0xFFB0BEC5)
     "opencode" -> Color(0xFFB39DDB)
+    // Google's: a blue, like the desktop's var(--blue) for the same mark.
+    "antigravity" -> Color(0xFF64B5F6)
     "chat" -> Color(0xFF80CBC4)
     else -> Muted
 }
