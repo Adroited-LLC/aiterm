@@ -2181,6 +2181,7 @@ export default function App() {
   const progressRef = useRef(progress);
   progressRef.current = progress;
   const relayCtl = useRelay({
+    prompts: () => settings.bringIn,
     tabs: () => tabsRef.current,
     handle: (key) => handles.current.get(key),
     quietFor: (key) => Date.now() - (lastOutput.current.get(key) ?? 0),

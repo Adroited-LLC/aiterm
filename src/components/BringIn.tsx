@@ -32,17 +32,17 @@ export default function BringIn({ onGo, onClose, onOpenModelAccess }: {
           placeholder="What should they look at? — e.g. is this secure, is there a simpler way. Blank asks for a general second view."
           spellCheck={false}
         />
-        <label className="bringin-auto" title="When the exchange ends, the first agent acts on the outcome — the agreed direction, or its judgment between the views — instead of waiting for you">
+        <label className="bringin-auto" title="The last message tells the first agent you have already approved the outcome, so it proceeds instead of finishing and waiting on you">
           <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
-          Auto-continue — act on the outcome without waiting
+          Auto-approve — the first agent proceeds as approved when they're done
         </label>
         <div className="bringin-foot">
           <label className="bringin-rounds">
             Rounds
             <select className="ns-select" value={rounds} onChange={(e) => setRounds(Number(e.target.value))}>
-              <option value={1}>1 — they speak, the first agent answers</option>
-              <option value={2}>2 — and one reply back</option>
-              <option value={3}>3</option>
+              <option value={1}>1 — they read and write once</option>
+              <option value={2}>2 — they write, the first agent replies, they answer</option>
+              <option value={3}>3 — two replies back and forth</option>
             </select>
           </label>
           <button className="tui-pick" disabled={!ctl.ready || ctl.isApi} onClick={() => onGo(ctl.choice(), focus, rounds, auto)}>
@@ -50,7 +50,7 @@ export default function BringIn({ onGo, onClose, onOpenModelAccess }: {
           </button>
         </div>
         <div className="bringin-note">
-          They open in a tab of their own with this conversation in front of them, write to the first agent directly, and the two go back and forth. Neither edits files while they talk; you have both tabs and decide.
+          They open in a tab of their own, read this session's transcript, and write to the first agent directly. Rounds are how many times they speak; the first agent carries on after the last one. What they are told is in Settings → Bring in.
         </div>
       </div>
     </div>

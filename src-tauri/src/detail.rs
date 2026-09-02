@@ -665,6 +665,29 @@ pub(crate) fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(Stri
     out
 }
 
+/// Where a session's transcript is on disk, for a second agent that will
+/// read it itself rather than be handed a paste of it. A backend that keeps
+/// sessions somewhere other than a file (opencode's database) gets a plain
+/// text export of the conversation under `~/.local/share/aiterm/relay/`.
+#[tauri::command]
+pub async fn session_transcript_path(session_id: String) -> Result<String, String> {
+    crate::run_blocking(move || {
+        let list = crate::agents::backends();
+        let (backend, path) = crate::agents::owner_in(&list, &session_id).ok_or("no transcript for that session")?;
+        if backend.sessions().messages(&session_id).is_none() && path.is_file() {
+            return Ok(path.to_string_lossy().into_owned());
+        }
+        let turns = conversation_sync(&session_id, usize::MAX);
+        let dir = dirs::home_dir().ok_or("no home directory")?.join(".local/share/aiterm/relay");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let f = dir.join(format!("{session_id}.txt"));
+        let text: String = turns.iter().map(|(r, t)| format!("[{r}]\n{t}\n\n")).collect();
+        std::fs::write(&f, text).map_err(|e| e.to_string())?;
+        Ok(f.to_string_lossy().into_owned())
+    })
+    .await
+}
+
 /// The conversation with the work shown: every message, plus each tool
 /// call as a turn named for the tool, and (Codex) reasoning summaries as
 /// "thinking". This is what a phone renders while an agent works — the

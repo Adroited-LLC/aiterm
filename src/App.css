@@ -3970,3 +3970,11 @@ input[type="range"]::-webkit-slider-thumb {
   font: inherit; font-size: 11px; padding: 1px 6px; margin-left: 6px; cursor: pointer;
 }
 .crew-badge.folded { opacity: 0.65; }
+
+/* Bring in: the five prompts, editable. */
+.prompt-edit { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; }
+.prompt-edit-head { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600; color: var(--text); }
+.prompt-edit-head .linkish { margin-left: auto; }
+.prompt-edit-mod { font-size: 10px; color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 8px; padding: 0 6px; }
+.prompt-edit-text { width: 100%; box-sizing: border-box; resize: vertical; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.4; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px; outline: none; }
+.prompt-edit-text:focus { border-color: var(--accent); }

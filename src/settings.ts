@@ -26,6 +26,46 @@ export interface LibrarianSettings {
   auto: boolean;
 }
 
+/** What the two agents are told when one is brought in. Placeholders in
+ *  braces: {a} the first agent, {b} the second, {path} the other agent's
+ *  transcript on disk, {focus} what the user asked for, {text} the message
+ *  being relayed. "" means the one shipped. */
+export interface BringInPrompts {
+  /** The second agent's launch prompt. */
+  opening: string;
+  /** To the first agent, when a reply is expected. */
+  toFirst: string;
+  /** To the first agent, the last message: carry on. */
+  toFirstLast: string;
+  /** To the second agent: the first agent's reply. */
+  toSecond: string;
+  /** Appended to the last message when the user pre-approved the outcome. */
+  approved: string;
+}
+
+export const BRING_IN_DEFAULTS: BringInPrompts = {
+  opening: `You've been brought into a live session as a second agent, alongside {a}.
+Their conversation with the user is in the transcript at {path}. Read it.
+The user asks: {focus}
+Then write your response to {a} directly. The user is reading along.`,
+  toFirst: `{b} was brought in by the user and wrote this to you (their transcript: {path}):
+---
+{text}
+---
+Reply to them directly.`,
+  toFirstLast: `{b} wrote back:
+---
+{text}
+---
+That's the end of the exchange. Take it into account and carry on with the user.`,
+  toSecond: `{a} replied:
+---
+{text}
+---
+Respond to them.`,
+  approved: `The user has already approved the outcome of this exchange. Proceed with it now; do not wait for further sign-off.`,
+};
+
 export interface AppSettings {
   themeId: string;
   /** Rest the pointer on a session row and a card opens beside it with the
@@ -68,6 +108,7 @@ export interface AppSettings {
   /** IANA zone id stamps are written in; "" = this machine's own. */
   timeZone: string;
   librarian: LibrarianSettings;
+  bringIn: BringInPrompts;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -87,6 +128,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   iconSize: 16,
   timeFormat: "relative",
   timeZone: "",
+  bringIn: { opening: "", toFirst: "", toFirstLast: "", toSecond: "", approved: "" },
   librarian: {
     enabled: false,
     engine: "claude",
@@ -127,6 +169,7 @@ export function loadSettings(): AppSettings {
       ...parsed,
       panelScale: { ...DEFAULT_SETTINGS.panelScale, ...(parsed.panelScale ?? {}) },
       librarian: { ...DEFAULT_SETTINGS.librarian, ...(parsed.librarian ?? {}) },
+      bringIn: { ...DEFAULT_SETTINGS.bringIn, ...(parsed.bringIn ?? {}) },
     };
   } catch {
     return DEFAULT_SETTINGS;
