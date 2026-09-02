@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 pub const PAIRING_VERSION: u8 = 1;
 pub const RELAY_PAIRING_VERSION: u8 = 2;
 pub const RELAY_AUTH_PAIRING_VERSION: u8 = 3;
-const DEFAULT_RELAY_SERVER: &str = "https://control.34-23-107-73.sslip.io:8443";
+pub(crate) const DEFAULT_RELAY_SERVER: &str = "https://control.34-23-107-73.sslip.io:8443";
 const DEFAULT_RELAY_PUBLIC_DOMAIN: &str = "34-23-107-73.sslip.io";
 const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(300);
 
@@ -322,7 +322,7 @@ fn desktop_name() -> String {
         .unwrap_or_else(|| "AITerm desktop".to_string())
 }
 
-fn state_root() -> Result<std::path::PathBuf, String> {
+pub(crate) fn state_root() -> Result<std::path::PathBuf, String> {
     dirs::data_dir()
         .map(|dir| dir.join("aiterm/remote"))
         .ok_or_else(|| "no data directory for remote access state".to_string())
