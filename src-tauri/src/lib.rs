@@ -28,6 +28,7 @@ pub mod changes;
 pub mod rendercost;
 pub mod services;
 pub mod sessions;
+pub mod spine;
 pub mod tabs;
 pub mod taskbar;
 pub mod terminal;
