@@ -14,7 +14,7 @@ carries the same pinned-TLS bytes; none of them can read a session.
 Two listeners live on the desktop and both keep working:
 
 - **gateway** (`remote/server.rs`, Matt's) — speaks to the Adroited phone app. Roads: lan, vpn, relay. Untouched by this work.
-- **phone listener** (`remote_api.rs`, 5lime) — speaks to the 5lime phone app. Roads: lan, vpn, relay, iroh. This document is about it.
+- **phone listener** (`remote_api.rs`) — speaks to the `mobile/` phone app (com.fivelime.aiterm). Roads: lan, vpn, relay, iroh. This document is about it.
 
 ## Desktop config (`~/.local/share/aiterm/remote.json`, struct `Config` in remote_api.rs)
 
@@ -33,7 +33,7 @@ using `remote::relay::RelayConfig` verbatim (same `load`/`save`, same 0600).
 A pending enrollment draft is in-memory only, replaced by each new QR, dropped
 when the road is turned off.
 
-## QR (5lime fields, appended to the combined payload by `pair_extension`)
+## QR (phone-listener fields, appended to the combined payload by `pair_extension`)
 
 Existing: `&tp=<port>&tt=<token>&tf=<cert sha256 hex>[&z=<iroh node id>]`
 New:      `[&tr=<relay public host>&tq=<relay port>][&ta=<digest b64url nopad, 32 bytes>]`
@@ -43,7 +43,7 @@ New:      `[&tr=<relay public host>&tq=<relay port>][&ta=<digest b64url nopad, 3
   calls the enroll endpoint below. `ta` absent + `tr` present = route already live.
 - Hosts (`h`) are filtered by `lan_enabled` / `vpn_enabled`: a road that is off
   contributes no addresses. The combined QR still carries the gateway's own `h`
-  list untouched; 5lime hosts are the ones inside `pair_extension` — add them as
+  list untouched; the phone listener's hosts are the ones inside `pair_extension` — add them as
   repeated `th=` so the two lists stay independent. `PairLink` reads `th` when
   present, else falls back to `h`.
 
@@ -90,7 +90,7 @@ remote_phone_relay_clear()                                     // deprovision + 
 next `remote_pair_payload` / combined QR prepares a draft (GET `<server>/v1/info`
 on Matt's `DEFAULT_RELAY_SERVER`, reuse `remote::DEFAULT_RELAY_SERVER`).
 
-## Phone (5lime app)
+## Phone (`mobile/` app)
 
 - `Desktop` gains `relayHost: String = ""`, `relayPort: Int = 0`, `roadOrder: List<String>`
   default `["lan","vpn","relay","iroh"]` (per desktop, editable in settings).
