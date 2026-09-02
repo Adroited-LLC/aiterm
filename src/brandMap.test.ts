@@ -96,6 +96,6 @@ test("usage sources", () => {
   assert.equal(brandForUsageSource("anthropic", "Claude"), "claude");
   assert.equal(brandForUsageSource("codex", "Codex"), "openai"); // Codex wears OpenAI's mark
   assert.equal(brandForUsageSource("grok", "Grok"), "grok");
-  assert.equal(brandForUsageSource("antigravity", "Antigravity"), "antigravity");
+  assert.equal(brandForUsageSource("antigravity", "Antigravity"), "gemini");
   assert.equal(brandForUsageSource("provider:abc", "OpenRouter"), "openrouter");
 });

@@ -108,7 +108,7 @@ fun brandAsset(id: String): String? = when (id.lowercase()) {
     "grok" -> "grok.svg"
     "xai" -> "xai.svg"
     "opencode" -> "opencode.svg"
-    "antigravity" -> "antigravity.svg"
+    "antigravity" -> "gemini-color.svg"
     "gemini", "google" -> "gemini-color.svg"
     "anthropic" -> "claude-color.svg"
     "amazon" -> "aws-color.svg"
