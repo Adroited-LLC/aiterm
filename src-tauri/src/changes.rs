@@ -510,7 +510,7 @@ fn merge_artifacts(
         let raw = PathBuf::from(&artifact.path);
         let candidate = if raw.is_absolute() { raw } else { root.join(raw) };
         let Ok(path) = candidate.canonicalize() else { continue };
-        if !path.starts_with(&root) {
+        if !path.starts_with(&root) && !shares_git_repository(&root, &path) {
             continue;
         }
         let path_text = path.to_string_lossy().into_owned();
@@ -543,6 +543,18 @@ fn merge_artifacts(
     changes.sort_by(|left, right| right.at.cmp(&left.at));
     changes.truncate(KEEP);
     changes
+}
+
+/// A session may intentionally do its work in a linked Git worktree rather
+/// than the checkout it started in. Git's common directory is the stable
+/// repository identity shared by the main checkout and every linked tree.
+fn shares_git_repository(root: &Path, path: &Path) -> bool {
+    let Some(parent) = path.parent() else { return false };
+    let Ok(root_repo) = git2::Repository::discover(root) else { return false };
+    let Ok(path_repo) = git2::Repository::discover(parent) else { return false };
+    let Ok(root_common) = root_repo.commondir().canonicalize() else { return false };
+    let Ok(path_common) = path_repo.commondir().canonicalize() else { return false };
+    root_common == path_common
 }
 
 /// Session ids with at least one recorded artifact — straight off the
