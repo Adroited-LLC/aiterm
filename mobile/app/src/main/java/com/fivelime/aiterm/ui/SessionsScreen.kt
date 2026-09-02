@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -290,7 +291,9 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 // Amounts worth a line: a balance that is not the one already
                 // on the closed row, and not zero.
                 val amounts = u.amounts.filter { it !== credit && it.amount != 0.0 }
-                val hasMore = u.bars.isNotEmpty() || amounts.isNotEmpty() || (!healthy && u.detail.isNotBlank())
+                // A tap only where it shows something the closed row does not:
+                // a source with one weekly bar and nothing else is already told.
+                val hasMore = u.bars.any { it !== weekly } || amounts.isNotEmpty() || (!healthy && u.detail.isNotBlank())
                 Column(
                     Modifier.fillMaxWidth()
                         .let { m ->
@@ -298,47 +301,39 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                                 expandedUsage = if (expanded) expandedUsage - u.id else expandedUsage + u.id
                             } else m
                         }
-                        .padding(horizontal = 20.dp, vertical = 8.dp),
+                        .padding(horizontal = 28.dp, vertical = 6.dp),
                 ) {
-                    // The closed row is three things: who, and one number —
-                    // how much of the week is gone, or the balance. A mark
-                    // appears only when something is wrong.
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        AgentIcon(u.id.removePrefix("provider:"), 16.dp)
-                        Spacer(Modifier.width(10.dp))
-                        Text(u.name, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                    // The closed row is a name and one value in a shared
+                    // right-hand column: the week gone, the balance, or the
+                    // trouble. Sized like the menu items below it.
+                    val value: String?
+                    val tint: androidx.compose.ui.graphics.Color
+                    when {
+                        !healthy -> { value = u.state.replace('_', ' '); tint = Amber }
+                        weekly != null -> {
+                            value = "${weekly.percent.toInt()}%"
+                            tint = when { weekly.percent < 50 -> Muted; weekly.percent < 80 -> Amber; else -> Red }
+                        }
+                        credit != null -> { value = (if (credit.currency == "USD") "$" else "") + "%.2f".format(credit.amount); tint = Muted }
+                        else -> { value = null; tint = Muted }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp)) {
+                        AgentIcon(u.id.removePrefix("provider:"), 20.dp)
+                        Spacer(Modifier.width(16.dp))
+                        Text(
+                            u.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1,
+                            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+                        )
                         if (expanded && u.plan.isNotBlank()) {
-                            Spacer(Modifier.width(6.dp))
                             Text(u.plan, style = MaterialTheme.typography.labelSmall, color = Muted, maxLines = 1)
+                            Spacer(Modifier.width(12.dp))
                         }
-                        if (!healthy) {
-                            Spacer(Modifier.width(8.dp))
-                            Dot(Amber)
-                        }
-                        Spacer(Modifier.weight(1f))
-                        when {
-                            weekly != null -> {
-                                LinearProgressIndicator(
-                                    progress = { (weekly.percent / 100.0).toFloat().coerceIn(0f, 1f) },
-                                    modifier = Modifier.width(56.dp),
-                                    color = when { weekly.percent < 50 -> Muted; weekly.percent < 80 -> Amber; else -> Red },
-                                    trackColor = Surface1,
-                                )
-                                Spacer(Modifier.width(10.dp))
-                                Text(
-                                    "${weekly.percent.toInt()}%", style = MaterialTheme.typography.bodySmall,
-                                    color = Muted, modifier = Modifier.width(36.dp), textAlign = TextAlign.End,
-                                )
-                            }
-                            credit != null -> Text(
-                                (if (credit.currency == "USD") "$" else "") + "%.2f".format(credit.amount),
-                                style = MaterialTheme.typography.bodySmall, color = Muted,
-                            )
-                            else -> {}
+                        if (value != null) {
+                            Text(value, style = MaterialTheme.typography.bodyMedium, color = tint, maxLines = 1)
                         }
                     }
                     if (expanded) {
-                        Column(Modifier.padding(start = 26.dp, top = 6.dp)) {
+                        Column(Modifier.padding(start = 36.dp, bottom = 4.dp)) {
                             u.bars.forEach { b -> UsageBarRow(b) }
                             amounts.forEach { am -> UsageAmountRow(am) }
                             if (!healthy && u.detail.isNotBlank()) {
