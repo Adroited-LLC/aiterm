@@ -24,7 +24,7 @@ test("ink is not an accent; the theme steps in for those engines", () => {
   assert.equal(brandAccent("codex"), null); // #fff
   assert.equal(agentAccent("codex"), "var(--green)");
   assert.equal(agentAccent("grok"), "var(--magenta)");
-  assert.equal(agentAccent("antigravity"), "var(--blue)");
+  assert.equal(agentAccent("antigravity"), "#1C69FF"); // Gemini brings its own blue
   assert.equal(agentAccent("claude"), BRANDS.claude.color);
   assert.deepEqual(agentTint("shell"), { className: "" });
   assert.equal(agentTint("claude").className, " branded");
