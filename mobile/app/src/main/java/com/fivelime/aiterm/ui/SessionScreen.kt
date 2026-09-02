@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,9 +54,6 @@ import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
@@ -592,9 +591,11 @@ private fun ImageCard(vm: AppViewModel, f: FileEntry) {
     }
 }
 
-/** Who joins, what they look at, how long they talk — a bottom sheet,
- *  full width, nothing crushed. The desktop runs the relay; the whole
- *  exchange appears in this conversation, live. */
+/** Who joins, what they look at, how long they talk — a bottom sheet
+ *  built for a thumb: the choices are steps down a card, the note to them
+ *  sits last so the keyboard has it in view, the body scrolls, and the
+ *  button stays put beneath it whatever the keyboard does. The desktop
+ *  runs the relay; the whole exchange appears in this conversation, live. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun BringInDialog(vm: AppViewModel, s: Session, onDismiss: () -> Unit) {
@@ -604,122 +605,102 @@ private fun BringInDialog(vm: AppViewModel, s: Session, onDismiss: () -> Unit) {
     var focus by remember { mutableStateOf("") }
     var rounds by remember { mutableStateOf(2) }
     var auto by remember { mutableStateOf(false) }
+    var modelPicker by remember { mutableStateOf(false) }
     // API choices (OpenRouter et al) need a model; CLIs default to their own.
     val sel = vm.agents.firstOrNull { it.id == agentId }
     var model by remember(agentId) {
         mutableStateOf(if (agentId.startsWith("api:")) vm.agents.firstOrNull { it.id == agentId }?.models?.firstOrNull()?.id else null)
     }
+    val host = s.agent.replaceFirstChar { it.uppercase() }
+    val lengths = listOf(
+        "1" to "Quick — they read the session and write once",
+        "2" to "Normal — they write, $host replies, they answer",
+        "3" to "Long — two replies back and forth",
+    )
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = Surface1,
     ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
-            Text("Bring in a second agent", style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "They read this chat and talk it out with ${s.agent.replaceFirstChar { it.uppercase() }} right here. No files change; you decide after.",
-                style = MaterialTheme.typography.bodySmall, color = Muted,
-            )
-            Spacer(Modifier.height(16.dp))
-            vm.agents.forEach { a ->
-                Row(
-                    Modifier.fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(if (agentId == a.id) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f) else Color.Transparent)
-                        .clickable { agentId = a.id }
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    AgentIcon(a.id, 24.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Text(a.display_name, style = MaterialTheme.typography.bodyLarge)
-                    if (a.id == s.agent) {
-                        Spacer(Modifier.width(8.dp))
-                        Text("already here", style = MaterialTheme.typography.labelSmall, color = Muted)
-                    }
-                    Spacer(Modifier.weight(1f))
-                    RadioButton(selected = agentId == a.id, onClick = { agentId = a.id })
-                }
-            }
-            if (!sel?.models.isNullOrEmpty()) {
-                Spacer(Modifier.height(6.dp))
-                var modelPicker by remember { mutableStateOf(false) }
-                Row(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable { modelPicker = true }
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Model", style = MaterialTheme.typography.labelMedium, color = Muted)
-                    Spacer(Modifier.weight(1f))
-                    model?.let { AgentIcon(modelBrand(it, agentId.removePrefix("api:")), 16.dp); Spacer(Modifier.width(6.dp)) }
-                    Text(
-                        sel!!.models.firstOrNull { it.id == model }?.display_name ?: "Default",
-                        style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    )
-                    Icon(Icons.Filled.KeyboardArrowDown, null, tint = Muted)
-                }
-                if (modelPicker) {
-                    ModelPickerSheet(
-                        models = sel.models,
-                        fallbackBrand = agentId.removePrefix("api:"),
-                        allowDefault = !agentId.startsWith("api:"),
-                        onPick = { model = it; modelPicker = false },
-                        onDismiss = { modelPicker = false },
-                    )
-                }
-            }
-            Spacer(Modifier.height(14.dp))
-            OutlinedTextField(
-                value = focus, onValueChange = { focus = it },
-                placeholder = { Text("What should they look at? (optional)", color = Muted) },
-                minLines = 2, maxLines = 4,
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(16.dp))
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                listOf(1 to "Quick", 2 to "Normal", 3 to "Long").forEachIndexed { i, (n, label) ->
-                    SegmentedButton(
-                        selected = rounds == n,
-                        onClick = { rounds = n },
-                        shape = SegmentedButtonDefaults.itemShape(i, 3),
-                    ) { Text(label) }
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-            Text(
-                when (rounds) {
-                    1 -> "They read the session and write once."
-                    2 -> "They write, ${s.agent.replaceFirstChar { it.uppercase() }} replies, they answer."
-                    else -> "Two replies back and forth."
-                },
-                style = MaterialTheme.typography.labelSmall, color = Muted,
-                modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable { auto = !auto }
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        Column(Modifier.fillMaxWidth().imePadding().navigationBarsPadding()) {
+            Column(
+                Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("Auto-approve", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "When they finish, ${s.agent.replaceFirstChar { it.uppercase() }} proceeds as approved instead of waiting for you",
-                        style = MaterialTheme.typography.labelSmall, color = Muted,
-                    )
+                Text("Bring in a second agent", style = MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "They read this chat and talk it out with $host right here. No files change; you decide after.",
+                    style = MaterialTheme.typography.bodySmall, color = Muted,
+                )
+                Spacer(Modifier.height(16.dp))
+                Column(
+                    Modifier.fillMaxWidth().background(Bg, RoundedCornerShape(18.dp)).padding(horizontal = 14.dp, vertical = 4.dp),
+                ) {
+                    ChoiceRow("Agent") {
+                        PickerChip(
+                            label = sel?.display_name ?: "Choose",
+                            options = vm.agents.map { it.id to (if (it.id == s.agent) "${it.display_name}  ·  already here" else it.display_name) },
+                            onPick = { agentId = it },
+                            leading = { AgentIcon(agentId, 16.dp) },
+                            icon = { id -> AgentIcon(id, 20.dp) },
+                        )
+                    }
+                    if (!sel?.models.isNullOrEmpty()) {
+                        HorizontalDivider(color = Surface2)
+                        ChoiceRow("Model") {
+                            ChipButton(
+                                label = sel!!.models.firstOrNull { it.id == model }?.display_name ?: "Default",
+                                onClick = { modelPicker = true },
+                                leading = model?.let { { AgentIcon(modelBrand(it, agentId.removePrefix("api:")), 16.dp) } },
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = Surface2)
+                    ChoiceRow("Length") {
+                        PickerChip(
+                            label = lengths.first { it.first == rounds.toString() }.second.substringBefore(" —"),
+                            options = lengths,
+                            onPick = { rounds = it.toInt() },
+                        )
+                    }
+                    HorizontalDivider(color = Surface2)
+                    ChoiceRow("Auto-approve") {
+                        androidx.compose.material3.Switch(checked = auto, onCheckedChange = { auto = it })
+                    }
                 }
-                androidx.compose.material3.Switch(checked = auto, onCheckedChange = { auto = it })
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (auto) "When they finish, $host proceeds as approved instead of waiting for you."
+                    else "When they finish, $host waits for you before going on.",
+                    style = MaterialTheme.typography.labelSmall, color = Muted,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+                Spacer(Modifier.height(14.dp))
+                OutlinedTextField(
+                    value = focus, onValueChange = { focus = it },
+                    label = { Text("What should they look at?") },
+                    placeholder = { Text("Optional", color = Muted) },
+                    minLines = 2, maxLines = 5,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
             }
-            Spacer(Modifier.height(12.dp))
             Button(
                 onClick = { vm.bringIn(s, agentId, model, focus.trim(), rounds, auto); onDismiss() },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 12.dp),
                 shape = RoundedCornerShape(14.dp),
             ) { Text("Bring them in", modifier = Modifier.padding(vertical = 4.dp)) }
         }
+    }
+    if (modelPicker && sel != null) {
+        ModelPickerSheet(
+            models = sel.models,
+            fallbackBrand = agentId.removePrefix("api:"),
+            allowDefault = !agentId.startsWith("api:"),
+            onPick = { model = it; modelPicker = false },
+            onDismiss = { modelPicker = false },
+        )
     }
 }
 

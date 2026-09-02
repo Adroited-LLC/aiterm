@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -69,6 +70,24 @@ fun AttachmentChips(vm: AppViewModel) {
 }
 
 /** A pill that opens a menu — the model / effort / harness pickers. */
+/** The look of a choice: a pill with an optional mark, the label and a
+ *  chevron. `PickerChip` opens a menu from it; a caller with its own picker
+ *  (a searchable sheet) uses it bare. */
+@Composable
+fun ChipButton(label: String, onClick: () -> Unit, leading: (@Composable () -> Unit)? = null) {
+    Row(
+        Modifier.background(Surface2, RoundedCornerShape(16.dp)).clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        leading?.let { it(); Spacer(Modifier.width(6.dp)) }
+        Text(
+            label, style = MaterialTheme.typography.labelLarge, color = Color(0xFFE6EAF2),
+            maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 220.dp),
+        )
+        Icon(Icons.Filled.KeyboardArrowDown, null, tint = Muted, modifier = Modifier.size(16.dp))
+    }
+}
+
 /** A chip that opens a menu of `options` (id to name). `leading` draws before
  *  the label; `icon` draws a mark beside each row of the menu, by id. */
 @Composable
@@ -80,14 +99,7 @@ fun PickerChip(
     icon: (@Composable (String) -> Unit)? = null,
 ) {
     var open by remember { mutableStateOf(false) }
-    Row(
-        Modifier.background(Surface2, RoundedCornerShape(16.dp)).clickable { open = true }.padding(horizontal = 10.dp, vertical = 7.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        leading?.let { it(); Spacer(Modifier.width(6.dp)) }
-        Text(label, style = MaterialTheme.typography.labelLarge, color = Color(0xFFE6EAF2))
-        Icon(Icons.Filled.KeyboardArrowDown, null, tint = Muted, modifier = Modifier.size(16.dp))
-    }
+    ChipButton(label, onClick = { open = true }, leading = leading)
     DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
         options.forEach { (id, name) ->
             DropdownMenuItem(

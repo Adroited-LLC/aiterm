@@ -207,7 +207,7 @@ fun NewSessionScreen(vm: AppViewModel, outer: PaddingValues) {
 
 /** One step: what it is on the left, the choice on the right. */
 @Composable
-private fun ChoiceRow(label: String, fill: Boolean = false, choice: @Composable RowScope.() -> Unit) {
+fun ChoiceRow(label: String, fill: Boolean = false, choice: @Composable RowScope.() -> Unit) {
     Row(Modifier.fillMaxWidth().height(52.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(label, style = MaterialTheme.typography.bodyMedium, color = Muted, modifier = Modifier.width(72.dp))
         if (!fill) Spacer(Modifier.weight(1f))
