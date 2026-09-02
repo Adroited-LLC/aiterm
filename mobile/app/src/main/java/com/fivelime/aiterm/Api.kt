@@ -104,7 +104,22 @@ data class Status(
     val hosts: List<String> = emptyList(),
     /** iroh node id, when this desktop can be dialed by key. */
     val iroh: String? = null,
+    /** The live AITerm Relay route, never a draft; null when the relay road
+     *  is off or nothing is enrolled yet. */
+    val relay: RelayRoute? = null,
+    /** Which roads the desktop has switched on. */
+    val roads: RoadFlags? = null,
 )
+
+@Serializable
+data class RelayRoute(val host: String, val port: Int)
+
+@Serializable
+data class RoadFlags(val lan: Boolean = false, val vpn: Boolean = false, val relay: Boolean = false, val iroh: Boolean = false)
+
+/** What `POST /v1/relay/enroll` hands back: the route that just went live. */
+@Serializable
+data class RelayEnrolled(val host: String, val port: Int)
 
 class ApiError(val code: Int, message: String) : Exception(message)
 
@@ -138,6 +153,14 @@ class Api(val baseUrl: String, private val token: String, fingerprint: String, c
     private val empty = ByteArray(0).toRequestBody(null)
 
     suspend fun status(): Status = json.decodeFromString(call(req("/v1/status")))
+    /** Sign the desktop's pending relay draft into a live route. Both
+     *  fields base64url, no padding: the phone's compressed P-256 key and a
+     *  DER ECDSA signature over the QR's `ta` digest. 409 = no draft
+     *  waiting, 400 = the signature does not fit, 502 = the relay said no. */
+    suspend fun relayEnroll(authorityPublicKeyB64Url: String, signatureDerB64Url: String): RelayEnrolled {
+        val body = json.encodeToString(RelayEnrollBody.serializer(), RelayEnrollBody(authorityPublicKeyB64Url, signatureDerB64Url))
+        return json.decodeFromString(call(req("/v1/relay/enroll").post(jsonBody(body))))
+    }
     suspend fun sessions(): SessionsResponse = json.decodeFromString(call(req("/v1/sessions")))
     suspend fun conversation(id: String): List<Turn> = json.decodeFromString(call(req("/v1/sessions/$id/conversation")))
     suspend fun agents(): List<Agent> = json.decodeFromString(call(req("/v1/agents")))
@@ -256,6 +279,7 @@ class Api(val baseUrl: String, private val token: String, fingerprint: String, c
     @Serializable private data class BringInBody(val agent_id: String, val model: String? = null, val focus: String, val rounds: Int, val auto: Boolean = false)
     @Serializable private data class StarBody(val on: Boolean)
     @Serializable private data class RenameBody(val title: String)
+    @Serializable private data class RelayEnrollBody(val authority_public_key: String, val signature_der: String)
     @Serializable private data class InputBody(val text: String, val enter: Boolean = true)
     @Serializable private data class NewSessionBody(
         val agent_id: String, val cwd: String, val prompt: String?,
