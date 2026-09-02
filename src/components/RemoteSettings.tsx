@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
 import { listen } from "@tauri-apps/api/event";
 import Row from "./SettingsRow";
-import RoadCard from "./RoadCard";
+import RoadCard, { type RoadOrderControls } from "./RoadCard";
 import {
   irohState,
   lanState,
+  movedRoad,
   reachSummary,
   relayState,
+  roadOrderOf,
   vpnState,
   type Road,
 } from "./remoteRoads.ts";
@@ -50,6 +52,7 @@ import {
   phoneRemoteSetName,
   phoneRemoteSetPort,
   phoneRemoteSetRoad,
+  phoneRemoteSetRoadOrder,
   phoneRemoteStatus,
 } from "../ipc";
 
@@ -286,6 +289,223 @@ export default function RemoteSettings() {
       ? "For a phone that pairs through the gateway."
       : "For a phone that pairs through the phone listener.";
 
+  // The cards in the order phones try them. ▲/▼ swap neighbours; the
+  // desktop publishes the new order and phones without their own pick it up.
+  const order = roadOrderOf(pstatus);
+  const moveRoad = (road: Road, dir: -1 | 1) => {
+    const next = movedRoad(order, road, dir);
+    if (next !== order) runPhone(phoneRemoteSetRoadOrder(next));
+  };
+  const orderOf = (road: Road): RoadOrderControls => ({
+    up: order.indexOf(road) > 0,
+    down: order.indexOf(road) < order.length - 1,
+    onUp: () => moveRoad(road, -1),
+    onDown: () => moveRoad(road, 1),
+  });
+  const cards: Record<Road, ReactElement> = {
+    lan: (
+      <RoadCard
+        key="lan"
+        order={orderOf("lan")}
+        name="Direct (LAN)"
+        desc="Same Wi-Fi or wired network. No servers involved."
+        state={lan}
+        disabled={!pstatus}
+        onToggle={(on) => setRoad("lan", on)}
+      >
+        {status && (
+          <Row
+            label="Gateway address"
+            desc="Choose a LAN or VPN address to bind. Applying a live change briefly reconnects phones."
+          >
+            <div className="remote-listener-control">
+              <select
+                className="set-select mono"
+                value={address}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setAddress(next);
+                  if (!status.enabled) saveListenerPreference({ address: next, port });
+                }}
+              >
+                {addressOptions.length === 0 && <option value="">No LAN or VPN address</option>}
+                {addressOptions.map((candidate) => (
+                  <option key={candidate} value={candidate}>{candidate}</option>
+                ))}
+              </select>
+              {status.enabled && status.address && status.port !== null &&
+                (address !== status.address || port !== status.port) && (
+                  <button
+                    className="set-recheck"
+                    disabled={!address}
+                    onClick={() => {
+                      const current = { address: status.address!, port: status.port! };
+                      const target = { address, port };
+                      setError(null);
+                      rebindListener(
+                        current,
+                        target,
+                        remoteStop,
+                        (config) => remoteStart(config.address, config.port),
+                      )
+                        .then(() => saveListenerPreference(target))
+                        .catch((cause) => {
+                          setAddress(current.address);
+                          setPort(current.port);
+                          saveListenerPreference(current);
+                          setError(String(cause));
+                        })
+                        .finally(() => { refresh().catch(() => setStatus(null)); });
+                    }}
+                  >Apply</button>
+                )}
+            </div>
+          </Row>
+        )}
+        {status && (
+          <Row label="Gateway port">
+            <input
+              className="set-input"
+              type="number"
+              min={1024}
+              max={65535}
+              value={port}
+              onChange={(e) => {
+                const next = Number(e.target.value) || DEFAULT_PORT;
+                setPort(next);
+                if (!status.enabled) saveListenerPreference({ address, port: next });
+              }}
+            />
+          </Row>
+        )}
+        {pstatus && (
+          <Row
+            label="Phone listener port"
+            desc={pportError ?? "Changing it moves the listener and the router mapping at once. Phones must scan a new QR afterwards — the port is in it."}
+          >
+            <input
+              type="number" min={1024} max={65535} value={pport}
+              onChange={(e) => setPport(e.target.value)}
+              onFocus={() => { editing.current = true; }}
+              onBlur={() => { editing.current = false; commitPort(); }} onKeyDown={blurOnEnter}
+              style={{ width: 90 }}
+            />
+          </Row>
+        )}
+        {pstatus && (
+          <Row
+            label="Advertised addresses"
+            desc="Every address the QR carries for the phone listener, best first. A road that is off contributes none."
+            wide
+          >
+            {pstatus.addresses.length === 0
+              ? <span className="diag-val">{pstatus.running ? "none found" : "listener off"}</span>
+              : <code className="diag-val">{pstatus.addresses.join("  ")}</code>}
+          </Row>
+        )}
+      </RoadCard>
+    ),
+    vpn: (
+      <RoadCard
+        key="vpn"
+        order={orderOf("vpn")}
+        name="VPN (Tailscale / WireGuard)"
+        desc="Your own private network. Works anywhere both devices are on the VPN."
+        state={vpn}
+        disabled={!pstatus}
+        onToggle={(on) => setRoad("vpn", on)}
+      >
+        <div className="sgroup-foot road-note">
+          Nothing to set. The VPN address goes into the QR alongside the LAN
+          ones, and the phone prefers it whenever it is not on this network.
+          {pstatus?.vpn?.interface ? ` Interface: ${pstatus.vpn.interface}.` : ""}
+        </div>
+      </RoadCard>
+    ),
+    relay: (
+      <RoadCard
+        key="relay"
+        order={orderOf("relay")}
+        name="AITerm Relay"
+        desc="A relay run by AITerm forwards encrypted bytes when there is no direct path. It cannot read sessions."
+        state={relay}
+        disabled={!pstatus}
+        onToggle={(on) => setRoad("relay", on)}
+      >
+        <Row label="Relay server" desc="Set by AITerm. Both apps enroll here." wide>
+          <code className="diag-val">{relayServer}</code>
+        </Row>
+        {status?.relay?.configured && (
+          <Row
+            label="Gateway route"
+            desc={gatewayOn ? "Turn the gateway off under Listeners to remove its route." : "Deprovisions the route on the relay and forgets it here."}
+          >
+            {confirmRelay === "gateway" ? (
+              <span style={{ display: "inline-flex", gap: 8 }}>
+                <button className="act-btn danger" onClick={() => { setConfirmRelay(null); run(remoteRelayClear()); }}>Remove</button>
+                <button className="act-btn" onClick={() => setConfirmRelay(null)}>Keep</button>
+              </span>
+            ) : (
+              <button className="set-recheck" disabled={gatewayOn} onClick={() => setConfirmRelay("gateway")}>Remove relay</button>
+            )}
+          </Row>
+        )}
+        {pstatus?.relay?.configured && (
+          <Row
+            label="Phone listener route"
+            desc="Deprovisions the route on the relay and forgets it here. The next phone to connect makes a new one."
+          >
+            {confirmRelay === "phone" ? (
+              <span style={{ display: "inline-flex", gap: 8 }}>
+                <button className="act-btn danger" onClick={() => { setConfirmRelay(null); runPhone(phoneRemoteRelayClear(), () => setPair(null)); }}>Remove</button>
+                <button className="act-btn" onClick={() => setConfirmRelay(null)}>Keep</button>
+              </span>
+            ) : (
+              <button className="set-recheck" onClick={() => setConfirmRelay("phone")}>Remove relay</button>
+            )}
+          </Row>
+        )}
+        <div className="sgroup-foot road-note">
+          A paired phone enrolls the phone listener's route by itself the next
+          time it connects while this is on — no new pairing. Only the gateway
+          (the AITerm phone app) needs a pairing to create its route.
+        </div>
+      </RoadCard>
+    ),
+    iroh: (
+      <RoadCard
+        key="iroh"
+        order={orderOf("iroh")}
+        name="iroh (peer-to-peer)"
+        desc="Direct peer-to-peer when it can, public iroh relays when it can't. Nothing of ours in the middle. Phone listener only."
+        state={iroh}
+        disabled={!pstatus}
+        onToggle={(on) => setRoad("iroh", on)}
+      >
+        {pstatus?.iroh_node && (
+          <Row label="Node id" desc="What the phone dials. It is in the QR." wide>
+            <code className="diag-val" style={{ fontSize: 11 }}>{pstatus.iroh_node}</code>
+          </Row>
+        )}
+        <Row
+          label="Relay server"
+          desc="Run your own iroh relay for a fully private path; leave empty for the public ones."
+        >
+          <input
+            type="text"
+            value={irohRelay}
+            placeholder="iroh default (n0)"
+            onChange={(e) => setIrohRelay(e.target.value)}
+            onFocus={() => { editing.current = true; }}
+            onBlur={() => { editing.current = false; commitIrohRelay(); }}
+            onKeyDown={blurOnEnter}
+            style={{ width: 220 }}
+          />
+        </Row>
+      </RoadCard>
+    ),
+  };
+
   return (
     <>
       <div className="sgroup">
@@ -353,194 +573,11 @@ export default function RemoteSettings() {
 
       <div className="sgroup">
         <div className="sgroup-title">Ways to reach this desktop</div>
+        <div className="sgroup-foot road-order-note">
+          Phones try roads in this order; a phone can set its own order in its settings.
+        </div>
         <div className="road-list">
-          <RoadCard
-            name="Direct (LAN)"
-            desc="Same Wi-Fi or wired network. No servers involved."
-            state={lan}
-            disabled={!pstatus}
-            onToggle={(on) => setRoad("lan", on)}
-          >
-            {status && (
-              <Row
-                label="Gateway address"
-                desc="Choose a LAN or VPN address to bind. Applying a live change briefly reconnects phones."
-              >
-                <div className="remote-listener-control">
-                  <select
-                    className="set-select mono"
-                    value={address}
-                    onChange={(e) => {
-                      const next = e.target.value;
-                      setAddress(next);
-                      if (!status.enabled) saveListenerPreference({ address: next, port });
-                    }}
-                  >
-                    {addressOptions.length === 0 && <option value="">No LAN or VPN address</option>}
-                    {addressOptions.map((candidate) => (
-                      <option key={candidate} value={candidate}>{candidate}</option>
-                    ))}
-                  </select>
-                  {status.enabled && status.address && status.port !== null &&
-                    (address !== status.address || port !== status.port) && (
-                      <button
-                        className="set-recheck"
-                        disabled={!address}
-                        onClick={() => {
-                          const current = { address: status.address!, port: status.port! };
-                          const target = { address, port };
-                          setError(null);
-                          rebindListener(
-                            current,
-                            target,
-                            remoteStop,
-                            (config) => remoteStart(config.address, config.port),
-                          )
-                            .then(() => saveListenerPreference(target))
-                            .catch((cause) => {
-                              setAddress(current.address);
-                              setPort(current.port);
-                              saveListenerPreference(current);
-                              setError(String(cause));
-                            })
-                            .finally(() => { refresh().catch(() => setStatus(null)); });
-                        }}
-                      >Apply</button>
-                    )}
-                </div>
-              </Row>
-            )}
-            {status && (
-              <Row label="Gateway port">
-                <input
-                  className="set-input"
-                  type="number"
-                  min={1024}
-                  max={65535}
-                  value={port}
-                  onChange={(e) => {
-                    const next = Number(e.target.value) || DEFAULT_PORT;
-                    setPort(next);
-                    if (!status.enabled) saveListenerPreference({ address, port: next });
-                  }}
-                />
-              </Row>
-            )}
-            {pstatus && (
-              <Row
-                label="Phone listener port"
-                desc={pportError ?? "Changing it moves the listener and the router mapping at once. Phones must scan a new QR afterwards — the port is in it."}
-              >
-                <input
-                  type="number" min={1024} max={65535} value={pport}
-                  onChange={(e) => setPport(e.target.value)}
-                  onFocus={() => { editing.current = true; }}
-                  onBlur={() => { editing.current = false; commitPort(); }} onKeyDown={blurOnEnter}
-                  style={{ width: 90 }}
-                />
-              </Row>
-            )}
-            {pstatus && (
-              <Row
-                label="Advertised addresses"
-                desc="Every address the QR carries for the phone listener, best first. A road that is off contributes none."
-                wide
-              >
-                {pstatus.addresses.length === 0
-                  ? <span className="diag-val">{pstatus.running ? "none found" : "listener off"}</span>
-                  : <code className="diag-val">{pstatus.addresses.join("  ")}</code>}
-              </Row>
-            )}
-          </RoadCard>
-
-          <RoadCard
-            name="VPN (Tailscale / WireGuard)"
-            desc="Your own private network. Works anywhere both devices are on the VPN."
-            state={vpn}
-            disabled={!pstatus}
-            onToggle={(on) => setRoad("vpn", on)}
-          >
-            <div className="sgroup-foot road-note">
-              Nothing to set. The VPN address goes into the QR alongside the LAN
-              ones, and the phone prefers it whenever it is not on this network.
-              {pstatus?.vpn?.interface ? ` Interface: ${pstatus.vpn.interface}.` : ""}
-            </div>
-          </RoadCard>
-
-          <RoadCard
-            name="AITerm Relay"
-            desc="A relay run by AITerm forwards encrypted bytes when there is no direct path. It cannot read sessions."
-            state={relay}
-            disabled={!pstatus}
-            onToggle={(on) => setRoad("relay", on)}
-          >
-            <Row label="Relay server" desc="Set by AITerm. Both apps enroll here." wide>
-              <code className="diag-val">{relayServer}</code>
-            </Row>
-            {status?.relay?.configured && (
-              <Row
-                label="Gateway route"
-                desc={gatewayOn ? "Turn the gateway off under Listeners to remove its route." : "Deprovisions the route on the relay and forgets it here."}
-              >
-                {confirmRelay === "gateway" ? (
-                  <span style={{ display: "inline-flex", gap: 8 }}>
-                    <button className="act-btn danger" onClick={() => { setConfirmRelay(null); run(remoteRelayClear()); }}>Remove</button>
-                    <button className="act-btn" onClick={() => setConfirmRelay(null)}>Keep</button>
-                  </span>
-                ) : (
-                  <button className="set-recheck" disabled={gatewayOn} onClick={() => setConfirmRelay("gateway")}>Remove relay</button>
-                )}
-              </Row>
-            )}
-            {pstatus?.relay?.configured && (
-              <Row
-                label="Phone listener route"
-                desc="Deprovisions the route on the relay and forgets it here. The next pairing makes a new one."
-              >
-                {confirmRelay === "phone" ? (
-                  <span style={{ display: "inline-flex", gap: 8 }}>
-                    <button className="act-btn danger" onClick={() => { setConfirmRelay(null); runPhone(phoneRemoteRelayClear(), () => setPair(null)); }}>Remove</button>
-                    <button className="act-btn" onClick={() => setConfirmRelay(null)}>Keep</button>
-                  </span>
-                ) : (
-                  <button className="set-recheck" onClick={() => setConfirmRelay("phone")}>Remove relay</button>
-                )}
-              </Row>
-            )}
-            <div className="sgroup-foot road-note">
-              A route is created the first time a phone pairs while this is on —
-              the phone authorizes it; nothing is enrolled by the desktop alone.
-            </div>
-          </RoadCard>
-
-          <RoadCard
-            name="iroh (peer-to-peer)"
-            desc="Direct peer-to-peer when it can, public iroh relays when it can't. Nothing of ours in the middle. Phone listener only."
-            state={iroh}
-            disabled={!pstatus}
-            onToggle={(on) => setRoad("iroh", on)}
-          >
-            {pstatus?.iroh_node && (
-              <Row label="Node id" desc="What the phone dials. It is in the QR." wide>
-                <code className="diag-val" style={{ fontSize: 11 }}>{pstatus.iroh_node}</code>
-              </Row>
-            )}
-            <Row
-              label="Relay server"
-              desc="Run your own iroh relay for a fully private path; leave empty for the public ones."
-            >
-              <input
-                type="text"
-                value={irohRelay}
-                placeholder="iroh default (n0)"
-                onChange={(e) => setIrohRelay(e.target.value)}
-                onFocus={() => { editing.current = true; }}
-                onBlur={() => { editing.current = false; commitIrohRelay(); }}
-                onKeyDown={blurOnEnter}
-                style={{ width: 220 }}
-              />
-            </Row>
-          </RoadCard>
+          {order.map((road) => cards[road])}
         </div>
         {pstatus?.error && <div className="set-notice">{pstatus.error}</div>}
       </div>

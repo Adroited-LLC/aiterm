@@ -1232,6 +1232,9 @@ export interface PhoneRemoteStatus {
   relay: PhoneRemoteRelay;
   /** Custom iroh relay URL; null = iroh's default relays. */
   iroh_relay_url: string | null;
+  /** The order phones try the roads, most preferred first — published in
+   *  /v1/status; a phone that has not set its own order adopts it. */
+  road_order: PhoneRemoteRoad[];
 }
 export type PhoneRemoteRoad = "lan" | "vpn" | "relay" | "iroh";
 export interface PhoneRemoteRoads {
@@ -1255,8 +1258,12 @@ export interface PhoneRemoteRelay {
   port: number | null;
   /** The relay control server routes are enrolled with. */
   server: string;
-  /** A QR is out with a digest the phone has not signed yet. */
+  /** An enrollment draft is waiting: any paired phone signs it from
+   *  /v1/status (no new pairing), and a QR carries it as `ta`. */
   pending_enrollment: boolean;
+  /** The relay server could not be reached when a draft was wanted; no
+   *  draft is waiting until the next try. */
+  error: string | null;
 }
 export interface PhoneRemoteClient {
   id: number;
@@ -1285,10 +1292,14 @@ export const phoneRemotePairPayload = () => invoke<PhonePairPayload>("remote_pai
 /** iroh on/off, live — the LAN route is untouched either way. */
 export const phoneRemoteSetIroh = (on: boolean) =>
   invoke<PhoneRemoteStatus>("remote_set_iroh", { on });
-/** One road on or off, live. Relay on with no route prepares nothing by
- *  itself — the next QR offers enrollment. */
+/** One road on or off, live. Relay on with no route prepares an enrollment
+ *  draft that a paired phone signs by itself. */
 export const phoneRemoteSetRoad = (road: PhoneRemoteRoad, on: boolean) =>
   invoke<PhoneRemoteStatus>("remote_set_road", { road, on });
+/** The order phones try the roads: all four, each once. Phones that have
+ *  not set their own order pick it up on their next status read. */
+export const phoneRemoteSetRoadOrder = (order: PhoneRemoteRoad[]) =>
+  invoke<PhoneRemoteStatus>("remote_set_road_order", { order });
 /** A custom iroh relay (null = default). Restarts a running tunnel. */
 export const phoneRemoteSetIrohRelayUrl = (url: string | null) =>
   invoke<PhoneRemoteStatus>("remote_set_iroh_relay_url", { url });

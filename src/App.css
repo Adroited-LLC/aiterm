@@ -4104,6 +4104,23 @@ input[type="range"]::-webkit-slider-thumb {
 .road-dot.on { background: var(--green); }
 .road-dot.warn { background: var(--yellow); }
 .road-disclose { flex-shrink: 0; margin-top: 1px; }
+/* ▲/▼: the card's place in the order phones try the roads. */
+.road-order { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; margin-top: 1px; }
+.road-move {
+  width: 18px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 8px;
+  line-height: 1;
+  cursor: pointer;
+}
+.road-move:hover:not(:disabled) { color: var(--text); border-color: var(--text-faint); }
+.road-move:disabled { opacity: 0.35; cursor: default; }
+.road-order-note { margin-top: 4px; }
 .road-body {
   margin-top: 8px;
   padding-top: 2px;

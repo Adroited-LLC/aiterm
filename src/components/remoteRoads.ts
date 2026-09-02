@@ -99,15 +99,27 @@ export function vpnState(p: PhoneRemoteStatus | null): RoadState {
   return { on, dot: p?.running ? "on" : "warn", text: bits.join(" · ") + (p?.running ? "" : " — phone listener is off") };
 }
 
-/** The phone listener's relay route in a phrase. */
+/**
+ * The phone listener's relay route in a phrase, in order of precedence:
+ * the relay server unreachable; a live route with its connector state; a
+ * draft waiting while a phone is connected (it is enrolling now); a draft
+ * waiting with no phone on; the road off. A paired phone signs the draft
+ * by itself, so no line ever asks for a pairing.
+ */
 export function phoneRelayLine(p: PhoneRemoteStatus | null): string {
   const r = p?.relay;
   if (!r) return "Phone listener: not available";
-  if (r.pending_enrollment) return "Phone listener: waiting for a phone to pair";
-  if (!r.configured) return "Phone listener: no route yet — it is created the next time a phone pairs";
-  const where = r.host ? ` · ${r.host}${r.port ? `:${r.port}` : ""}` : "";
-  if (!p?.running) return `Phone listener: route saved, listener off${where}`;
-  return `Phone listener: ${r.state}${where}`;
+  if (!p?.roads?.relay) return "Phone listener: off";
+  if (r.error) return `Phone listener: relay unreachable — ${r.error}`;
+  if (r.configured) {
+    const where = r.host ? ` · ${r.host}${r.port ? `:${r.port}` : ""}` : "";
+    if (!p.running) return `Phone listener: route saved, listener off${where}`;
+    return `Phone listener: ${r.state}${where}`;
+  }
+  if (r.pending_enrollment && p.clients.length > 0) {
+    return "Phone listener: enrolling with the connected phone…";
+  }
+  return "Phone listener: route is created when a phone connects — no new pairing needed";
 }
 
 /** The gateway's relay route in a phrase, from Matt's relayLabel. */
@@ -122,12 +134,18 @@ export function relayState(status: RemoteStatus | null, p: PhoneRemoteStatus | n
   const gatewayLive = !!status?.enabled && status.relay?.state === "connected";
   const phoneLive = !!p?.running && p.relay?.state === "connected";
   const anyRoute = !!status?.relay?.configured || !!p?.relay?.configured;
+  // No route anywhere is not a wait on a pairing: the phone listener's
+  // route arrives by itself from a connected phone, and the gateway's own
+  // line below says what it needs.
+  const text = gatewayLive || phoneLive
+    ? "Connected"
+    : anyRoute ? "Route saved, not connected"
+    : p?.relay?.error ? "Relay server unreachable"
+    : "No route yet";
   return {
     on,
     dot: gatewayLive || phoneLive ? "on" : "warn",
-    text: gatewayLive || phoneLive
-      ? "Connected"
-      : anyRoute ? "Route saved, not connected" : "Waiting for the first phone to pair",
+    text,
     lines: [gatewayRelayLine(status), phoneRelayLine(p)],
   };
 }
@@ -138,6 +156,31 @@ export function irohState(p: PhoneRemoteStatus | null): RoadState {
   if (!p?.running) return { on, dot: "warn", text: "Phone listener is off" };
   if (!p.iroh_node) return { on, dot: "warn", text: "Starting the iroh node…" };
   return { on, dot: "on", text: `On · node ${shortNodeId(p.iroh_node)}` };
+}
+
+/** The four road ids as the panel lists them: the desktop's order, made
+ *  whole the way the backend does it — unknown ids dropped, any missing
+ *  appended in default order — so a card is never lost to a bad value. */
+export const ROAD_IDS: Road[] = ["lan", "vpn", "relay", "iroh"];
+
+export function roadOrderOf(p: PhoneRemoteStatus | null): Road[] {
+  const seen: Road[] = [];
+  for (const id of p?.road_order ?? []) {
+    if ((ROAD_IDS as string[]).includes(id) && !seen.includes(id)) seen.push(id);
+  }
+  for (const id of ROAD_IDS) if (!seen.includes(id)) seen.push(id);
+  return seen;
+}
+
+/** The order with `road` moved one step; unchanged at the ends. */
+export function movedRoad(order: Road[], road: Road, dir: -1 | 1): Road[] {
+  const i = order.indexOf(road);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= order.length) return order;
+  const next = order.slice();
+  next[i] = order[j];
+  next[j] = order[i];
+  return next;
 }
 
 /** The panel's headline: which roads a phone can actually use right now. */
