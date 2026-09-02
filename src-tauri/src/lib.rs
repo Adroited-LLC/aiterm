@@ -21,6 +21,7 @@ pub mod providers;
 pub mod pty;
 pub mod remote;
 pub mod remote_api;
+pub mod remote_roads;
 pub mod iroh_tunnel;
 pub mod changes;
 pub mod rendercost;
