@@ -69,8 +69,16 @@ fun AttachmentChips(vm: AppViewModel) {
 }
 
 /** A pill that opens a menu — the model / effort / harness pickers. */
+/** A chip that opens a menu of `options` (id to name). `leading` draws before
+ *  the label; `icon` draws a mark beside each row of the menu, by id. */
 @Composable
-fun PickerChip(label: String, options: List<Pair<String, String>>, onPick: (String) -> Unit, leading: (@Composable () -> Unit)? = null) {
+fun PickerChip(
+    label: String,
+    options: List<Pair<String, String>>,
+    onPick: (String) -> Unit,
+    leading: (@Composable () -> Unit)? = null,
+    icon: (@Composable (String) -> Unit)? = null,
+) {
     var open by remember { mutableStateOf(false) }
     Row(
         Modifier.background(Surface2, RoundedCornerShape(16.dp)).clickable { open = true }.padding(horizontal = 10.dp, vertical = 7.dp),
@@ -81,6 +89,12 @@ fun PickerChip(label: String, options: List<Pair<String, String>>, onPick: (Stri
         Icon(Icons.Filled.KeyboardArrowDown, null, tint = Muted, modifier = Modifier.size(16.dp))
     }
     DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-        options.forEach { (id, name) -> DropdownMenuItem(text = { Text(name) }, onClick = { open = false; onPick(id) }) }
+        options.forEach { (id, name) ->
+            DropdownMenuItem(
+                text = { Text(name) },
+                leadingIcon = icon?.let { { it(id) } },
+                onClick = { open = false; onPick(id) },
+            )
+        }
     }
 }

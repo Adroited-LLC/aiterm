@@ -106,7 +106,7 @@ fun brandAsset(id: String): String? = when (id.lowercase()) {
     "codex" -> "openai.svg"
     "openai" -> "openai.svg"
     "grok" -> "grok.svg"
-    "xai" -> "xai.svg"
+    "xai", "x-ai" -> "xai.svg"
     "opencode" -> "opencode.svg"
     "antigravity" -> "gemini-color.svg"
     "gemini", "google" -> "gemini-color.svg"
@@ -143,15 +143,23 @@ fun brandAsset(id: String): String? = when (id.lowercase()) {
  *  need to be white. The colour marks are left alone. */
 private fun isMono(asset: String) = !asset.contains("-color")
 
+/** An engine's mark: its brand's, or a letter. */
 @Composable
-fun AgentIcon(id: String, size: Dp = 28.dp) {
-    val asset = brandAsset(id)
+fun AgentIcon(id: String, size: Dp = 28.dp) = BrandMark(brandAsset(id), id, size)
+
+/** A model's mark: its brand's by id, its engine's for a CLI, else a letter. */
+@Composable
+fun ModelIcon(agentId: String, modelId: String, size: Dp = 28.dp) = BrandMark(modelAsset(agentId, modelId), modelId, size)
+
+@Composable
+fun BrandMark(asset: String?, id: String, size: Dp = 28.dp) {
     // A mark that cannot be drawn — no asset for the id, or a load that
     // failed — is a lettered avatar, never an empty gap in the row.
-    val failed = androidx.compose.runtime.remember(id) { androidx.compose.runtime.mutableStateOf(false) }
+    val failed = androidx.compose.runtime.remember(asset) { androidx.compose.runtime.mutableStateOf(false) }
     if (asset == null || failed.value) {
+        val letter = id.substringAfterLast('/').trimStart('~').take(1).uppercase()
         Box(Modifier.size(size).background(agentColor(id).copy(alpha = 0.18f), CircleShape), contentAlignment = Alignment.Center) {
-            Text(id.take(1).uppercase(), color = agentColor(id), fontWeight = FontWeight.Bold)
+            Text(letter, color = agentColor(id), fontWeight = FontWeight.Bold)
         }
         return
     }

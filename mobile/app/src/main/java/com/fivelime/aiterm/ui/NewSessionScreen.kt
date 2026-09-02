@@ -140,6 +140,8 @@ fun NewSessionScreen(vm: AppViewModel, outer: PaddingValues) {
                             label = model?.display_name ?: "Model",
                             options = agent!!.models.map { it.id to it.display_name },
                             onPick = { id -> model = agent!!.models.find { it.id == id } },
+                            leading = { model?.let { ModelIcon(agent!!.id, it.id, 16.dp) } },
+                            icon = { id -> ModelIcon(agent!!.id, id, 20.dp) },
                         )
                         if (!model?.efforts.isNullOrEmpty()) PickerChip(
                             label = effort?.replaceFirstChar { it.uppercase() } ?: "Auto",
