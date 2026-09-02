@@ -233,17 +233,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             pairing = true
             try {
-                // The QR's addresses, then — when the desktop has one — its
-                // iroh node id via the local bridge, so pairing succeeds even
-                // on a network where no address is reachable at all.
+                // Every road the QR offers, in the default order: its
+                // addresses, the relay route it names, and — when the
+                // desktop has one — its iroh node id via the local bridge,
+                // so pairing succeeds even on a network where no address is
+                // reachable at all.
                 val bridge = if (link.iroh.isNotEmpty()) IrohBridge.urlFor(getApplication(), link.iroh) else null
-                val candidates = link.candidates + listOfNotNull(bridge)
-                for (url in candidates) {
-                    // The bridge deserves more patience than an address: its
-                    // first reach includes discovery and the relay handshake.
-                    val patience = if (url == bridge) 15L else 4L
+                val draft = Desktop(
+                    link.candidates.first(), link.token, link.name, link.candidates, link.fingerprint, link.iroh,
+                    relayHost = link.relayHost, relayPort = link.relayPort,
+                )
+                for (c in Roads.candidates(draft, bridge)) {
+                    val url = c.url
                     val t0 = System.currentTimeMillis()
-                    val status = try { Api(url, link.token, link.fingerprint, patience).status() } catch (e: IOException) {
+                    val status = try { Api(url, link.token, link.fingerprint, c.patienceSeconds).status() } catch (e: IOException) {
                         android.util.Log.i("Aiterm", "pair probe $url → ${e.javaClass.simpleName}: ${e.message} in ${System.currentTimeMillis() - t0}ms")
                         continue
                     } catch (e: ApiError) {
@@ -251,12 +254,50 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     android.util.Log.i("Aiterm", "pair probe $url → ok in ${System.currentTimeMillis() - t0}ms")
                     if (status.api != 1) { notice = "This desktop speaks a newer protocol — update the app"; return@launch }
-                    val d = Desktop(url, link.token, status.name, link.candidates, link.fingerprint, link.iroh)
+                    // The relay route: what the desktop reports live, else
+                    // what the QR named; then, when the QR carried a draft,
+                    // sign it so the route goes live now. A refusal here is
+                    // not a failed pairing — the desktop is reached; the
+                    // relay road stays empty until a status poll fills it.
+                    var relayHost = status.relay?.host ?: link.relayHost
+                    var relayPort = status.relay?.port ?: link.relayPort
+                    link.relayAuthorization?.let { digest ->
+                        try {
+                            val key = b64url(RelayAuthority.publicKeyCompressed())
+                            val sig = b64url(RelayAuthority.sign(digest))
+                            val r = Api(url, link.token, link.fingerprint, c.patienceSeconds).relayEnroll(key, sig)
+                            relayHost = r.host; relayPort = r.port
+                            android.util.Log.i("Aiterm", "relay enrolled: ${r.host}:${r.port}")
+                        } catch (e: Exception) {
+                            android.util.Log.w("Aiterm", "relay enrollment failed (paired anyway): ${e.javaClass.simpleName}: ${e.message}")
+                        }
+                    }
+                    val d = draft.copy(
+                        baseUrl = url, name = status.name.ifBlank { link.name },
+                        relayHost = relayHost, relayPort = relayPort,
+                    )
                     adopt(d)
                     return@launch
                 }
                 notice = "Could not reach ${link.name} at ${link.hosts.joinToString()} — same Wi‑Fi or Tailscale?"
             } finally { pairing = false }
+        }
+    }
+
+    private fun b64url(bytes: ByteArray): String = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+    /** The order this desktop's roads are tried, from the settings screen.
+     *  Saved on the desktop's entry and applied at once: the next sprint
+     *  (now) commits and upgrades by the new order. */
+    fun setRoadOrder(d: Desktop, order: List<String>) {
+        val clean = Roads.order(order).map { it.id }
+        if (clean == d.roadOrder) return
+        val nd = d.copy(roadOrder = clean)
+        desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
+        store.saveAll(desktops)
+        if (desktop?.fingerprint == nd.fingerprint) {
+            desktop = nd
+            if (foreground) { connectJob?.cancel(); connect() }
         }
     }
 
@@ -317,7 +358,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 launch {
                     val bridge = if (d.iroh.isNotEmpty())
                         runCatching { IrohBridge.urlFor(getApplication(), d.iroh) }.getOrNull() else null
-                    val urls = (listOf(d.baseUrl) + d.candidates + listOfNotNull(bridge)).distinct()
+                    val urls = Roads.candidates(d, bridge).map { it.url }
+                    if (urls.isEmpty()) { reachable = reachable + (d.fingerprint to false); return@launch }
                     val answers = kotlinx.coroutines.channels.Channel<Boolean>(urls.size)
                     urls.forEach { url ->
                         viewModelScope.launch {
@@ -375,21 +417,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun onStop() { foreground = false; pausedAt = System.currentTimeMillis(); disconnect() }
 
-    /** Prefer-order for probing: Tailscale/CGNAT, then LAN, then everything
-     *  else — the public address last. "Last good" is no tiebreak worth
+    /** Which road is "more local": the desktop's own road order, LAN →
+     *  VPN → relay → iroh by default. "Last good" is no tiebreak worth
      *  having: after a day out it is the public IP, and from inside the LAN
      *  most routers refuse to hairpin their own port mapping, so the LAN
      *  address must win whenever it answers. */
-    private fun rank(url: String): Int {
-        val host = url.removePrefix("https://").substringBefore(':').substringBefore('/')
-        val o = host.split('.').mapNotNull { it.toIntOrNull() }
-        if (o.size != 4) return 1 // a hostname: a VPN or mDNS name, LAN-ish
-        return when {
-            o[0] == 100 && o[1] in 64..127 -> 0
-            o[0] == 10 || (o[0] == 192 && o[1] == 168) || (o[0] == 172 && o[1] in 16..31) -> 0
-            else -> 2
-        }
-    }
+    private fun rank(d: Desktop, c: Candidate): Int = Roads.rank(d, c.road)
 
     private fun connect() {
         val d = desktop ?: return
@@ -410,7 +443,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // Locality still wins the day: losing probes keep running below,
             // and a more local answer switches the connection live.
             val myGen = ++connectGen
-            val urls = (listOf(d.baseUrl) + d.ordered.drop(1).sortedBy { rank(it) } + listOfNotNull(bridge)).distinct()
+            val byRoad = Roads.candidates(d, bridge)
+            val last = byRoad.firstOrNull { it.url == d.baseUrl }
+            val cands = listOfNotNull(last) + byRoad.filter { it !== last }
+            val urls = cands.map { it.url }
             // Probes live on the outer scope, not this coroutine: a losing
             // probe blocks in OkHttp until its own timeout, and it must not
             // hold up committing to the address that already answered.
@@ -422,28 +458,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     r.getOrNull()
                 }
             }
-            var chosen: Pair<String, Status>? = null
-            for ((i, p) in probes.withIndex()) { val s = p.await(); if (s != null) { chosen = urls[i] to s; break } }
+            var chosen: Pair<Candidate, Status>? = null
+            for ((i, p) in probes.withIndex()) { val s = p.await(); if (s != null) { chosen = cands[i] to s; break } }
             // Probes past the winner stay alive — see the better-route watch
             // at the bottom of this function.
             if (chosen == null) { android.util.Log.i("Aiterm", "no address reachable; retry in 3s"); connected = false; scheduleRetry(); return@launch }
-            val (reachable, status) = chosen
-            android.util.Log.i("Aiterm", "using $reachable")
+            val (won, status) = chosen
+            val reachable = won.url
+            android.util.Log.i("Aiterm", "using $reachable (${won.road.id})")
             // The desktop reports every address it answers on right now;
             // adopt that list so a DHCP move or new public IP never strands
             // us with only the addresses the QR knew at pairing time.
-            // The bridge answers on a loopback port, not the desktop's own;
-            // fresh addresses keep the desktop's real port instead.
-            val port = if (reachable == bridge)
-                (listOf(d.baseUrl) + d.candidates).firstOrNull { !it.contains("//127.0.0.1:") }?.substringAfterLast(':')
-                    ?: reachable.substringAfterLast(':')
-            else reachable.substringAfterLast(':')
-            val fresh = status.hosts.map { "https://$it:$port" }
-            val candidates = (fresh.ifEmpty { d.candidates } + reachable).distinct()
+            // The bridge and the relay answer on ports of their own, not the
+            // desktop's; fresh addresses keep the desktop's real port instead,
+            // and only a direct winner joins the address list — the other
+            // roads are rebuilt from the node id and the relay route.
+            val direct = won.road == Road.LAN || won.road == Road.VPN
+            val port = if (direct) reachable.substringAfterLast(':')
+            else Roads.directUrls(d).firstOrNull()?.substringAfterLast(':') ?: reachable.substringAfterLast(':')
+            val fresh = status.hosts.map { "https://${if (it.contains(':')) "[$it]" else it}:$port" }
+            val candidates = (fresh.ifEmpty { d.candidates } + listOfNotNull(reachable.takeIf { direct })).distinct()
             val iroh = status.iroh ?: d.iroh
             val name = status.name.ifBlank { d.name }
-            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh || name != d.name) {
-                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh, name = name)
+            val relayHost = status.relay?.host ?: ""
+            val relayPort = status.relay?.port ?: 0
+            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh || name != d.name ||
+                relayHost != d.relayHost || relayPort != d.relayPort) {
+                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh, name = name,
+                    relayHost = relayHost, relayPort = relayPort)
                 desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
                 store.saveAll(desktops)
                 desktop = nd
@@ -458,7 +500,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             for ((i, p) in probes.withIndex()) {
                 val s = runCatching { p.await() }.getOrNull() ?: continue
                 val url = urls[i]
-                if (url == reachable || rank(url) >= rank(reachable)) continue
+                if (url == reachable || rank(d, cands[i]) >= rank(d, won)) continue
                 if (myGen != connectGen || !foreground) return@launch
                 android.util.Log.i("Aiterm", "more local $url answered after commit; switching from $reachable")
                 val cur = desktops.find { it.fingerprint == d.fingerprint } ?: return@launch
