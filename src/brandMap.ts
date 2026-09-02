@@ -89,7 +89,7 @@ const AGENT_BRAND: Record<string, string> = {
   grok: "grok",
   opencode: "opencode",
   gemini: "gemini",
-  antigravity: "antigravity",
+  antigravity: "gemini",
 };
 
 /** Per-engine hue from the theme for the marks whose own colour is ink: the
@@ -254,7 +254,7 @@ export function brandForUsageSource(id: string, name: string): string | null {
   if (id === "anthropic") return "claude";
   if (id === "codex") return "openai";
   if (id === "grok") return "grok";
-  if (id === "antigravity") return "antigravity";
+  if (id === "antigravity") return "gemini";
   if (id.startsWith("provider:")) return brandForName(name) ?? brandForName(id.slice(9));
   return brandForName(id) ?? brandForName(name);
 }
