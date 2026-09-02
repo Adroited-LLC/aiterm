@@ -631,6 +631,7 @@ private fun RemoteConversationContent(
     val context = LocalContext.current
     val normalizer = remember(context) { TerminalImageNormalizer(context) }
     val messages = if (state.previewSessionId == session.id) state.previewMessages else emptyList()
+    val timeline = remember(messages) { conversationTimeline(messages) }
     val listState = rememberLazyListState()
     val working = state.sessionActivity[session.id] == "output"
     var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
@@ -657,8 +658,8 @@ private fun RemoteConversationContent(
             }
         }
     }
-    LaunchedEffect(messages.size, working) {
-        val itemCount = messages.size + if (working) 1 else 0
+    LaunchedEffect(messages.size, timeline.size, working) {
+        val itemCount = timeline.size + if (working) 1 else 0
         if (itemCount == 0) return@LaunchedEffect
         if (!positionedAtNewest) {
             listState.scrollToItem(itemCount - 1)
@@ -860,8 +861,11 @@ private fun RemoteConversationContent(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    itemsIndexed(messages) { _, message ->
-                        ConversationTurn(message)
+                    itemsIndexed(timeline) { _, item ->
+                        when (item) {
+                            is ConversationTimelineItem.Turn -> ConversationTurn(item.message)
+                            is ConversationTimelineItem.ActivityGroup -> ConversationActivityGroup(item.messages)
+                        }
                     }
                     if (working) {
                         item(key = "working") { ConversationWorkingRow(session.agent) }
@@ -1302,6 +1306,99 @@ private fun ConversationActivityRow(
         }
     }
 }
+
+@Composable
+private fun ConversationActivityGroup(messages: List<RemotePreviewMessage>) {
+    var expanded by rememberSaveable(
+        messages.firstOrNull()?.role,
+        messages.firstOrNull()?.text,
+    ) { mutableStateOf(false) }
+    Column(
+        Modifier.fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.30f), RoundedCornerShape(7.dp)),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "Activity",
+                color = MaterialTheme.colorScheme.primary,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "${messages.size} steps",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                if (expanded) "⌃" else "⌄",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+        if (expanded) {
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
+            )
+            Column(
+                modifier = Modifier.padding(start = 8.dp, top = 6.dp, end = 6.dp, bottom = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                messages.forEach { message ->
+                    ConversationActivityRow(
+                        label = conversationActivityLabel(message.role),
+                        summary = conversationActivitySummary(message.text),
+                        detail = message.text,
+                    )
+                }
+            }
+        }
+    }
+}
+
+internal sealed interface ConversationTimelineItem {
+    data class Turn(val message: RemotePreviewMessage) : ConversationTimelineItem
+    data class ActivityGroup(val messages: List<RemotePreviewMessage>) : ConversationTimelineItem
+}
+
+/** Consecutive machine activity is one transcript group; human-readable turns remain independent. */
+internal fun conversationTimeline(messages: List<RemotePreviewMessage>): List<ConversationTimelineItem> {
+    val output = mutableListOf<ConversationTimelineItem>()
+    val activity = mutableListOf<RemotePreviewMessage>()
+    fun flushActivity() {
+        when (activity.size) {
+            0 -> Unit
+            1 -> output += ConversationTimelineItem.Turn(activity.single())
+            else -> output += ConversationTimelineItem.ActivityGroup(activity.toList())
+        }
+        activity.clear()
+    }
+    messages.forEach { message ->
+        if (isConversationActivity(message.role)) {
+            activity += message
+        } else {
+            flushActivity()
+            output += ConversationTimelineItem.Turn(message)
+        }
+    }
+    flushActivity()
+    return output
+}
+
+internal fun isConversationActivity(role: String): Boolean = role.lowercase() !in setOf(
+    "user",
+    "assistant",
+    "thinking",
+    "system",
+)
 
 internal data class ConversationAttachmentContent(
     val text: String,

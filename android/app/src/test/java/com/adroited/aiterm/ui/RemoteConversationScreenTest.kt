@@ -1,5 +1,6 @@
 package com.adroited.aiterm.ui
 
+import com.adroited.aiterm.remote.RemotePreviewMessage
 import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.remote.RemoteTab
 import com.adroited.aiterm.remote.TerminalSize
@@ -135,6 +136,35 @@ class RemoteConversationScreenTest {
         assertEquals("cargo test --all", conversationActivitySummary("cargo test\n  --all"))
         assertTrue(conversationActivitySummary("x".repeat(200)).endsWith("…"))
         assertTrue(conversationActivitySummary("x".repeat(200)).length <= 110)
+    }
+
+    @Test
+    fun consecutiveToolCallsBecomeOneExpandableTimelineGroup() {
+        val user = RemotePreviewMessage("user", "Please test it.")
+        val command = RemotePreviewMessage("exec", "cargo test")
+        val edit = RemotePreviewMessage("apply_patch", "src/main.rs")
+        val read = RemotePreviewMessage("read_file", "src/main.rs")
+        val assistant = RemotePreviewMessage("assistant", "Everything passes.")
+
+        val timeline = conversationTimeline(listOf(user, command, edit, read, assistant))
+
+        assertEquals(3, timeline.size)
+        assertEquals(ConversationTimelineItem.Turn(user), timeline[0])
+        assertEquals(
+            ConversationTimelineItem.ActivityGroup(listOf(command, edit, read)),
+            timeline[1],
+        )
+        assertEquals(ConversationTimelineItem.Turn(assistant), timeline[2])
+    }
+
+    @Test
+    fun aSingleToolCallDoesNotGainAnUnnecessarySecondDisclosureLayer() {
+        val command = RemotePreviewMessage("exec", "pwd")
+
+        assertEquals(
+            listOf(ConversationTimelineItem.Turn(command)),
+            conversationTimeline(listOf(command)),
+        )
     }
 
     private fun session(
