@@ -762,7 +762,17 @@ impl AgentBackend for AntigravityBackend {
     /// `--effort` straight from `agy --help` 1.1.24. Permissions are the
     /// resolver's, and a session id is not something agy will take.
     fn launch(&self, spec: &LaunchSpec) -> String {
-        let mut cmd = String::from("agy");
+        // agy records no workspace for a plain launch — `WorkspaceURIs: null`,
+        // and a conversation that never runs a command has no `Cwd` in its
+        // transcript either — so its row had no folder, and adoption (which
+        // matches on the folder) never bound the tab: every session-bound
+        // action from the phone — bring-in first of all — then failed with
+        // "open the session on the desktop first". `--add-dir` puts the
+        // launch directory in the conversation's trajectory metadata as a
+        // `file://` URI, which `cwd_from_db` reads. The shell expands `$PWD`:
+        // the command runs through `$SHELL -i -c` in the tab's directory.
+        // [observed: agy 1.1.24, 2026-09-02]
+        let mut cmd = String::from("agy --add-dir \"$PWD\"");
         if let Some(p) = prompt_of(spec) {
             cmd.push_str(&format!(" -i {}", q(p)));
         }
@@ -961,7 +971,7 @@ mod tests {
 
     #[test]
     fn launch_spells_the_flags_agy_documents() {
-        assert_eq!(AntigravityBackend.launch(&LaunchSpec::default()), "agy");
+        assert_eq!(AntigravityBackend.launch(&LaunchSpec::default()), "agy --add-dir \"$PWD\"");
         let cmd = AntigravityBackend.launch(&LaunchSpec {
             model: Some("gemini-3.1-pro-high".into()),
             effort: Some("low".into()),
@@ -969,7 +979,7 @@ mod tests {
             provider: None,
             prompt: Some("  say it's done  ".into()),
         });
-        assert_eq!(cmd, "agy -i 'say it'\\''s done' --model 'gemini-3.1-pro-high' --effort 'low'");
+        assert_eq!(cmd, "agy --add-dir \"$PWD\" -i 'say it'\\''s done' --model 'gemini-3.1-pro-high' --effort 'low'");
         assert_eq!(
             AntigravityBackend.resume("8733080f-ff82-4f52-a73a-094777650e1c").unwrap(),
             "agy --conversation '8733080f-ff82-4f52-a73a-094777650e1c'"
