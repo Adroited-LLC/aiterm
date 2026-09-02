@@ -1469,6 +1469,38 @@ impl TabRegistry {
             .collect()
     }
 
+    /// Recent terminal cadence for each running, session-backed tab.
+    ///
+    /// This is presentation metadata only: the tab registry remains the
+    /// lifecycle authority and callers must not infer completion from an idle
+    /// terminal. Keeping the projection here avoids a second mobile session
+    /// registry while letting authenticated clients distinguish active output
+    /// from an open-but-quiet session.
+    pub fn session_activities(&self) -> Vec<(String, String)> {
+        let tabs = {
+            let maps = self.inner.maps.lock().unwrap();
+            maps.order
+                .iter()
+                .filter_map(|id| maps.by_id.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        tabs.into_iter()
+            .filter_map(|tab| {
+                let live = tab.live.lock().unwrap();
+                if live.descriptor.state != TabState::Running {
+                    return None;
+                }
+                let session_id = live.descriptor.session_id.clone()?;
+                drop(live);
+                let recent = tab.last_activity.lock().unwrap().elapsed() < Duration::from_secs(10);
+                Some((
+                    session_id,
+                    if recent { "output" } else { "idle" }.to_string(),
+                ))
+            })
+            .collect()
+    }
+
     pub fn get(&self, id: &TabId) -> Result<TabDescriptor, TabError> {
         let tab = self.inner.tab(id)?;
         let descriptor = tab.live.lock().unwrap().descriptor.clone();

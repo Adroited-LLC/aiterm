@@ -2,9 +2,11 @@ package com.adroited.aiterm.ui
 
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -31,7 +34,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -42,6 +47,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,12 +69,14 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.adroited.aiterm.remote.ConnectionState
+import com.adroited.aiterm.remote.RemoteAgentChoice
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemotePreviewMessage
 import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.remote.RemoteSessionChange
 import com.adroited.aiterm.remote.RemoteTab
 import com.adroited.aiterm.remote.RemoteUploadProgress
+import com.adroited.aiterm.remote.RemoteUsageSource
 import java.io.File
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.delay
@@ -111,7 +119,10 @@ fun RemoteDesktopScreen(
                 state = state,
                 session = selected,
                 onBack = { page = PAGE_SESSIONS },
-                onRefresh = { viewModel.previewSession(selected.id) },
+                onRefresh = {
+                    viewModel.previewSession(selected.id)
+                    viewModel.client.refreshSessions()
+                },
                 onOpenTerminal = {
                     state.tabs.firstOrNull { it.sessionId == selected.id }
                         ?.let { viewModel.selectTab(it.id) }
@@ -119,6 +130,7 @@ fun RemoteDesktopScreen(
                     page = PAGE_TERMINAL
                 },
                 onSend = viewModel::sendConversationPrompt,
+                onBringIn = viewModel.client::bringInSession,
                 onLoadFiles = viewModel::sessionChanges,
                 onLoadFile = viewModel::sessionFilePreview,
             )
@@ -130,6 +142,9 @@ fun RemoteDesktopScreen(
             onBack = onBack,
             onReconnect = viewModel::reconnect,
             onRefresh = { viewModel.client.refreshSessions() },
+            onLoadUsage = viewModel.client::refreshUsage,
+            onStarSession = viewModel.client::starSession,
+            onRenameSession = viewModel.client::renameSession,
             onOpenSession = { session ->
                 selectedSessionId = session.id
                 viewModel.previewSession(session.id)
@@ -151,12 +166,63 @@ private fun RemoteSessionDashboard(
     onBack: () -> Unit,
     onReconnect: () -> Unit,
     onRefresh: () -> Unit,
+    onLoadUsage: () -> Unit,
+    onStarSession: (String, Boolean) -> Unit,
+    onRenameSession: (String, String) -> Unit,
     onOpenSession: (RemoteSession) -> Unit,
     onOpenTerminal: () -> Unit,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
-    val sessions = remember(state.sessions, state.tabs, query) {
-        conversationSessions(state.sessions, state.tabs, query)
+    var agentFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var filesOnly by rememberSaveable { mutableStateOf(false) }
+    var activeOnly by rememberSaveable { mutableStateOf(false) }
+    var foldedCrews by remember { mutableStateOf(emptySet<String>()) }
+    var renameTarget by remember { mutableStateOf<RemoteSession?>(null) }
+    var showUsage by remember { mutableStateOf(false) }
+    val agents = remember(state.sessions) { state.sessions.map { it.agent }.distinct().sorted() }
+    val sessions = remember(
+        state.sessions,
+        state.tabs,
+        state.sessionsWithFiles,
+        state.starredSessions,
+        state.broughtInSessions,
+        query,
+        agentFilter,
+        filesOnly,
+        activeOnly,
+        foldedCrews,
+    ) {
+        conversationSessions(
+            sessions = state.sessions,
+            tabs = state.tabs,
+            query = query,
+            starred = state.starredSessions,
+            withFiles = state.sessionsWithFiles,
+            broughtIn = state.broughtInSessions,
+            agentFilter = agentFilter,
+            filesOnly = filesOnly,
+            activeOnly = activeOnly,
+            foldedCrews = foldedCrews,
+        )
+    }
+    renameTarget?.let { session ->
+        SessionRenameDialog(
+            session = session,
+            onRename = { title ->
+                onRenameSession(session.id, title)
+                renameTarget = null
+            },
+            onDismiss = { renameTarget = null },
+        )
+    }
+    if (showUsage) {
+        UsageDialog(sources = state.usage, onDismiss = { showUsage = false })
+    }
+    LaunchedEffect(state.connection) {
+        while (state.connection == ConnectionState.Connected) {
+            delay(3_000)
+            onRefresh()
+        }
     }
     Scaffold(
         topBar = {
@@ -169,7 +235,10 @@ private fun RemoteSessionDashboard(
                     }
                 },
                 actions = {
-                    TextButton(onClick = onRefresh) { Text("Refresh") }
+                    TextButton(onClick = {
+                        onLoadUsage()
+                        showUsage = true
+                    }) { Text("Usage") }
                     TextButton(onClick = onOpenTerminal) { Text("Terminal") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
@@ -198,6 +267,33 @@ private fun RemoteSessionDashboard(
                 singleLine = true,
                 shape = RoundedCornerShape(14.dp),
             )
+            LazyRow(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                contentPadding = PaddingValues(bottom = 7.dp),
+            ) {
+                items(agents, key = { "agent:$it" }) { agent ->
+                    FilterChip(
+                        selected = agentFilter == agent,
+                        onClick = { agentFilter = agent.takeUnless { it == agentFilter } },
+                        label = { Text(agent.replaceFirstChar(Char::uppercase), maxLines = 1) },
+                    )
+                }
+                item(key = "files") {
+                    FilterChip(
+                        selected = filesOnly,
+                        onClick = { filesOnly = !filesOnly },
+                        label = { Text("Has files") },
+                    )
+                }
+                item(key = "active") {
+                    FilterChip(
+                        selected = activeOnly,
+                        onClick = { activeOnly = !activeOnly },
+                        label = { Text("Active") },
+                    )
+                }
+            }
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -223,6 +319,26 @@ private fun RemoteSessionDashboard(
                         SessionDashboardRow(
                             session = session,
                             live = isConversationSessionLive(session, state.tabs),
+                            activity = state.sessionActivity[session.id],
+                            starred = session.id in state.starredSessions,
+                            hasFiles = session.id in state.sessionsWithFiles,
+                            satellite = state.broughtInSessions[session.id]?.let { parent ->
+                                sessions.any { it.id == parent }
+                            } == true,
+                            crewAgents = state.broughtInSessions
+                                .filterValues { it == session.id }
+                                .keys
+                                .mapNotNull { child -> state.sessions.firstOrNull { it.id == child }?.agent },
+                            crewFolded = session.id in foldedCrews,
+                            onToggleCrew = {
+                                foldedCrews = if (session.id in foldedCrews) {
+                                    foldedCrews - session.id
+                                } else {
+                                    foldedCrews + session.id
+                                }
+                            },
+                            onToggleStar = { onStarSession(session.id, session.id !in state.starredSessions) },
+                            onRename = { renameTarget = session },
                             onClick = { onOpenSession(session) },
                         )
                     }
@@ -230,6 +346,87 @@ private fun RemoteSessionDashboard(
             }
         }
     }
+}
+
+@Composable
+private fun UsageDialog(sources: List<RemoteUsageSource>, onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Usage") },
+        text = {
+            if (sources.isEmpty()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Text("Reading usage from the desktop…")
+                }
+            } else {
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 520.dp)) {
+                    items(sources, key = { it.id }) { source ->
+                        Column(Modifier.fillMaxWidth().padding(vertical = 9.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    source.name,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                source.plan.takeIf(String::isNotBlank)?.let {
+                                    Text(it, style = MaterialTheme.typography.labelMedium)
+                                }
+                            }
+                            source.account.takeIf(String::isNotBlank)?.let {
+                                Text(
+                                    it,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (source.state != "ok" && source.state != "no_balance") {
+                                Text(
+                                    source.detail.ifBlank { source.state.replace('_', ' ') },
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            source.bars.forEach { bar ->
+                                Spacer(Modifier.height(7.dp))
+                                Row {
+                                    Text(bar.label, style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
+                                    Text("${bar.percent.toInt()}%", style = MaterialTheme.typography.labelMedium)
+                                }
+                                LinearProgressIndicator(
+                                    progress = { (bar.percent / 100.0).toFloat() },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    color = when (bar.severity) {
+                                        "critical" -> MaterialTheme.colorScheme.error
+                                        "warning" -> Color(0xFFFFC857)
+                                        else -> MaterialTheme.colorScheme.primary
+                                    },
+                                )
+                            }
+                            source.amounts.forEach { amount ->
+                                Text(
+                                    buildString {
+                                        append(amount.label)
+                                        append(": ")
+                                        if (amount.currency == "USD") append('$')
+                                        append("%.2f".format(amount.amount))
+                                        amount.of?.let { append(" of %.2f".format(it)) }
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            source.notes.forEach {
+                                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
 }
 
 @Composable
@@ -247,15 +444,34 @@ private fun DashboardEmptyState(connection: ConnectionState) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SessionDashboardRow(session: RemoteSession, live: Boolean, onClick: () -> Unit) {
+private fun SessionDashboardRow(
+    session: RemoteSession,
+    live: Boolean,
+    activity: String?,
+    starred: Boolean,
+    hasFiles: Boolean,
+    satellite: Boolean,
+    crewAgents: List<String>,
+    crewFolded: Boolean,
+    onToggleCrew: () -> Unit,
+    onToggleStar: () -> Unit,
+    onRename: () -> Unit,
+    onClick: () -> Unit,
+) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+        Modifier.fillMaxWidth()
+            .combinedClickable(onClick = onClick, onLongClick = onRename)
+            .padding(start = if (satellite) 30.dp else 14.dp, end = 14.dp, top = 11.dp, bottom = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (satellite) {
+            Text("↳", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(6.dp))
+        }
         Box(
-            Modifier.size(38.dp)
+            Modifier.size(if (satellite) 30.dp else 38.dp)
                 .background(agentColor(session.agent).copy(alpha = 0.16f), CircleShape),
             contentAlignment = Alignment.Center,
         ) {
@@ -267,38 +483,115 @@ private fun SessionDashboardRow(session: RemoteSession, live: Boolean, onClick: 
         }
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (starred) {
+                    Text(
+                        "★",
+                        color = Color(0xFFFFC857),
+                        modifier = Modifier.clickable(onClick = onToggleStar).padding(end = 5.dp),
+                    )
+                }
+                Text(
+                    session.title.ifBlank { "Untitled session" },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+            }
             Text(
-                session.title.ifBlank { "Untitled session" },
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                "${session.agent} · ${session.projectPath.trimEnd('/').substringAfterLast('/').ifBlank { session.projectPath }}",
+                buildString {
+                    append(relativeSessionTime(session.lastActive).lowercase())
+                    append(" · ")
+                    append(session.projectPath.trimEnd('/').substringAfterLast('/').ifBlank { session.projectPath })
+                    session.branch?.takeIf(String::isNotBlank)?.let { append(" · "); append(it) }
+                    if (session.forked) append(" · fork")
+                    if (hasFiles) append(" · files")
+                },
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Column(horizontalAlignment = Alignment.End) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier.size(7.dp).background(
-                        if (live) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.outline,
-                        CircleShape,
-                    ),
-                )
-                Spacer(Modifier.width(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (!starred) {
                 Text(
-                    if (live) "LIVE" else relativeSessionTime(session.lastActive),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (live) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    "☆",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.clickable(onClick = onToggleStar).padding(4.dp),
                 )
+            }
+            if (crewAgents.isNotEmpty()) {
+                Text(
+                    crewAgents.take(3).joinToString("") { it.take(1).uppercase() } +
+                        (if (crewAgents.size > 3) "+${crewAgents.size - 3}" else "") +
+                        (if (crewFolded) " ›" else " ⌄"),
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.background(
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                        RoundedCornerShape(9.dp),
+                    ).clickable(onClick = onToggleCrew).padding(horizontal = 7.dp, vertical = 6.dp),
+                )
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(7.dp).background(
+                            when {
+                                activity == "attention" -> MaterialTheme.colorScheme.error
+                                activity == "output" -> MaterialTheme.colorScheme.primary
+                                live -> MaterialTheme.colorScheme.tertiary
+                                else -> MaterialTheme.colorScheme.outline
+                            },
+                            CircleShape,
+                        ),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        when {
+                            activity == "attention" -> "NEEDS YOU"
+                            activity == "output" -> "WORKING"
+                            live -> "OPEN"
+                            else -> relativeSessionTime(session.lastActive)
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = when {
+                            activity == "attention" -> MaterialTheme.colorScheme.error
+                            activity == "output" -> MaterialTheme.colorScheme.primary
+                            live -> MaterialTheme.colorScheme.tertiary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                }
             }
         }
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+}
+
+@Composable
+private fun SessionRenameDialog(
+    session: RemoteSession,
+    onRename: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var draft by remember(session.id) { mutableStateOf(session.title) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename session") },
+        text = {
+            OutlinedTextField(
+                value = draft,
+                onValueChange = { draft = it },
+                singleLine = true,
+                supportingText = { Text("Leave empty to restore the generated name.") },
+            )
+        },
+        confirmButton = { TextButton(onClick = { onRename(draft) }) { Text("Rename") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -315,6 +608,7 @@ private fun RemoteConversationContent(
         List<TerminalAttachmentImage>,
         (RemoteUploadProgress) -> Unit,
     ) -> Result<Unit>,
+    onBringIn: (String, String, String?, String?, String, Int, Boolean) -> Unit,
     onLoadFiles: suspend (String) -> Result<List<RemoteSessionChange>>,
     onLoadFile: suspend (String, String, Int) -> Result<RemoteSessionFilePreview>,
 ) {
@@ -324,6 +618,7 @@ private fun RemoteConversationContent(
     var attachments by remember(session.id) { mutableStateOf(TerminalAttachmentDraft()) }
     var showImageSources by remember(session.id) { mutableStateOf(false) }
     var showFiles by remember(session.id) { mutableStateOf(false) }
+    var showBringIn by remember(session.id) { mutableStateOf(false) }
     var filesLoading by remember(session.id) { mutableStateOf(false) }
     var files by remember(session.id) { mutableStateOf<List<RemoteSessionChange>>(emptyList()) }
     var filesError by remember(session.id) { mutableStateOf<String?>(null) }
@@ -336,6 +631,15 @@ private fun RemoteConversationContent(
     val normalizer = remember(context) { TerminalImageNormalizer(context) }
     val messages = if (state.previewSessionId == session.id) state.previewMessages else emptyList()
     val listState = rememberLazyListState()
+    val working = state.sessionActivity[session.id] == "output"
+    var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
+    val awayFromNewest by remember(session.id) {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            val last = layout.visibleItemsInfo.lastOrNull()?.index ?: 0
+            layout.totalItemsCount > 0 && last < layout.totalItemsCount - 1
+        }
+    }
     val latestAttachments by rememberUpdatedState(attachments)
 
     BackHandler(enabled = !sending && !attachments.preparing, onBack = onBack)
@@ -352,8 +656,16 @@ private fun RemoteConversationContent(
             }
         }
     }
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+    LaunchedEffect(messages.size, working) {
+        val itemCount = messages.size + if (working) 1 else 0
+        if (itemCount == 0) return@LaunchedEffect
+        if (!positionedAtNewest) {
+            listState.scrollToItem(itemCount - 1)
+            positionedAtNewest = true
+        } else {
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            if (lastVisible >= itemCount - 3) listState.animateScrollToItem(itemCount - 1)
+        }
     }
 
     fun updateAttachments(
@@ -470,7 +782,7 @@ private fun RemoteConversationContent(
                             filesLoading = false
                         }
                     }) { Text("Files") }
-                    TextButton(onClick = onRefresh) { Text("Refresh") }
+                    TextButton(onClick = { showBringIn = true }) { Text("Bring in") }
                     TextButton(onClick = onOpenTerminal) { Text("Terminal") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
@@ -536,18 +848,40 @@ private fun RemoteConversationContent(
                 Spacer(Modifier.height(8.dp))
                 TextButton(onClick = onRefresh) { Text("Retry") }
             }
-            messages.isEmpty() -> Box(
+            messages.isEmpty() && !working -> Box(
                 Modifier.fillMaxSize().padding(padding),
                 contentAlignment = Alignment.Center,
             ) { Text("No conversation history yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            else -> LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                itemsIndexed(messages) { _, message ->
-                    ConversationTurn(message)
+            else -> Box(Modifier.fillMaxSize().padding(padding)) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    itemsIndexed(messages) { _, message ->
+                        ConversationTurn(message)
+                    }
+                    if (working) {
+                        item(key = "working") { ConversationWorkingRow(session.agent) }
+                    }
+                }
+                if (awayFromNewest) {
+                    Text(
+                        "Newest ↓",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.align(Alignment.BottomCenter)
+                            .padding(bottom = 10.dp)
+                            .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(50))
+                            .clickable {
+                                scope.launch {
+                                    val end = listState.layoutInfo.totalItemsCount - 1
+                                    if (end >= 0) listState.animateScrollToItem(end)
+                                }
+                            }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                    )
                 }
             }
         }
@@ -578,6 +912,17 @@ private fun RemoteConversationContent(
                     ) { handlePickerResult(it) }
                 }) { Text("Camera") }
             },
+        )
+    }
+    if (showBringIn) {
+        BringInDialog(
+            session = session,
+            agents = state.agents,
+            onBringIn = { agent, model, effort, focus, rounds, auto ->
+                onBringIn(session.id, agent, model, effort, focus, rounds, auto)
+                showBringIn = false
+            },
+            onDismiss = { showBringIn = false },
         )
     }
     if (showFiles) {
@@ -650,6 +995,140 @@ private fun RemoteConversationContent(
                     filePreview = null
                 }) { Text("Done") }
             },
+        )
+    }
+}
+
+@Composable
+private fun BringInDialog(
+    session: RemoteSession,
+    agents: List<RemoteAgentChoice>,
+    onBringIn: (String, String?, String?, String, Int, Boolean) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val choices = remember(agents, session.agent) { agents.filter { it.id != session.agent } }
+    var agentId by remember(choices) { mutableStateOf(choices.firstOrNull()?.id) }
+    val agent = choices.firstOrNull { it.id == agentId }
+    var model by remember(agentId) { mutableStateOf<String?>(null) }
+    var effort by remember(agentId, model) { mutableStateOf<String?>(null) }
+    var focus by remember(session.id) { mutableStateOf("") }
+    var rounds by remember(session.id) { mutableStateOf(2) }
+    var auto by remember(session.id) { mutableStateOf(false) }
+    val efforts = agent?.models?.firstOrNull { it.id == model }?.efforts.orEmpty()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Bring in a second agent") },
+        text = {
+            Column {
+                Text(
+                    "They read this session and talk it through in a desktop tab. The exchange appears here as it lands.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(12.dp))
+                if (choices.isEmpty()) {
+                    Text("No other agent is available on this desktop.")
+                } else {
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        items(choices, key = RemoteAgentChoice::id) { choice ->
+                            FilterChip(
+                                selected = agentId == choice.id,
+                                onClick = { agentId = choice.id },
+                                label = { Text(choice.displayName) },
+                            )
+                        }
+                    }
+                    if (agent?.models?.isNotEmpty() == true) {
+                        Text("Model", style = MaterialTheme.typography.labelMedium)
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            item(key = "default") {
+                                FilterChip(
+                                    selected = model == null,
+                                    onClick = { model = null },
+                                    label = { Text("Default") },
+                                )
+                            }
+                            items(agent.models, key = { it.id }) { option ->
+                                FilterChip(
+                                    selected = model == option.id,
+                                    onClick = { model = option.id },
+                                    label = { Text(option.displayName) },
+                                )
+                            }
+                        }
+                    }
+                    if (efforts.isNotEmpty()) {
+                        Text("Effort", style = MaterialTheme.typography.labelMedium)
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            item(key = "default") {
+                                FilterChip(
+                                    selected = effort == null,
+                                    onClick = { effort = null },
+                                    label = { Text("Default") },
+                                )
+                            }
+                            items(efforts, key = { it }) { option ->
+                                FilterChip(
+                                    selected = effort == option,
+                                    onClick = { effort = option },
+                                    label = { Text(option) },
+                                )
+                            }
+                        }
+                    }
+                    OutlinedTextField(
+                        value = focus,
+                        onValueChange = { focus = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("What should they look at? (optional)") },
+                        minLines = 2,
+                        maxLines = 4,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        items(listOf(1, 2, 3), key = { it }) { count ->
+                            FilterChip(
+                                selected = rounds == count,
+                                onClick = { rounds = count },
+                                label = { Text(if (count == 1) "Quick" else if (count == 2) "Normal" else "Long") },
+                            )
+                        }
+                        item(key = "auto") {
+                            FilterChip(
+                                selected = auto,
+                                onClick = { auto = !auto },
+                                label = { Text("Auto-approve") },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    agentId?.let { onBringIn(it, model, effort, focus.trim(), rounds, auto) }
+                },
+                enabled = agentId != null,
+            ) { Text("Bring them in") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun ConversationWorkingRow(agent: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
+        Spacer(Modifier.width(9.dp))
+        Text(
+            "${agent.replaceFirstChar(Char::uppercase)} is working…",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
 }
@@ -766,18 +1245,47 @@ internal fun conversationSessions(
     sessions: List<RemoteSession>,
     tabs: List<RemoteTab>,
     query: String,
+    starred: Set<String> = emptySet(),
+    withFiles: Set<String> = emptySet(),
+    broughtIn: Map<String, String> = emptyMap(),
+    agentFilter: String? = null,
+    filesOnly: Boolean = false,
+    activeOnly: Boolean = false,
+    foldedCrews: Set<String> = emptySet(),
 ): List<RemoteSession> {
     val needle = query.trim().lowercase()
-    return sessions.asSequence()
+    val sorted = sessions.asSequence()
         .filter { session ->
             needle.isEmpty() || listOf(session.title, session.agent, session.projectPath, session.groupPath)
                 .any { needle in it.lowercase() }
         }
+        .filter { agentFilter == null || it.agent == agentFilter }
+        .filter { !filesOnly || it.id in withFiles }
+        .filter { !activeOnly || isConversationSessionLive(it, tabs) }
         .sortedWith(
-            compareByDescending<RemoteSession> { isConversationSessionLive(it, tabs) }
+            compareByDescending<RemoteSession> { it.id in starred }
+                .thenByDescending { isConversationSessionLive(it, tabs) }
                 .thenByDescending { it.lastActive },
         )
         .toList()
+    if (broughtIn.isEmpty()) return sorted
+    val visibleIds = sorted.mapTo(hashSetOf()) { it.id }
+    val result = ArrayList<RemoteSession>(sorted.size)
+    val placed = hashSetOf<String>()
+    for (session in sorted) {
+        if (session.id in placed) continue
+        if (broughtIn[session.id] in visibleIds) continue
+        result += session
+        placed += session.id
+        if (session.id !in foldedCrews) {
+            sorted.filterTo(result) { child ->
+                broughtIn[child.id] == session.id && placed.add(child.id)
+            }
+        } else {
+            sorted.filter { child -> broughtIn[child.id] == session.id }.forEach { placed += it.id }
+        }
+    }
+    return result
 }
 
 private fun relativeSessionTime(lastActive: Long, nowMillis: Long = System.currentTimeMillis()): String {

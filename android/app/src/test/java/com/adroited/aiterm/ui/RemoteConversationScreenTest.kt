@@ -48,6 +48,58 @@ class RemoteConversationScreenTest {
         assertFalse(isConversationSessionLive(session("other", "Other"), listOf(liveTab)))
     }
 
+    @Test
+    fun dashboardFiltersComposeAndStarsStayFirst() {
+        val sessions = listOf(
+            session("claude", "Claude", agent = "claude", lastActive = 30),
+            session("live", "Live", lastActive = 20),
+            session("star", "Star", lastActive = 10),
+        )
+
+        assertEquals(
+            listOf("star", "live", "claude"),
+            conversationSessions(sessions, listOf(liveTab), "", starred = setOf("star")).map { it.id },
+        )
+        assertEquals(
+            listOf("live"),
+            conversationSessions(sessions, listOf(liveTab), "", activeOnly = true).map { it.id },
+        )
+        assertEquals(
+            listOf("claude"),
+            conversationSessions(sessions, listOf(liveTab), "", agentFilter = "claude").map { it.id },
+        )
+        assertEquals(
+            listOf("star"),
+            conversationSessions(sessions, listOf(liveTab), "", withFiles = setOf("star"), filesOnly = true)
+                .map { it.id },
+        )
+    }
+
+    @Test
+    fun broughtInSessionsSitBelowTheirMasterAndCanBeFolded() {
+        val sessions = listOf(
+            session("child", "Second agent", lastActive = 30),
+            session("other", "Other", lastActive = 20),
+            session("master", "Main work", lastActive = 10),
+        )
+        val lineage = mapOf("child" to "master")
+
+        assertEquals(
+            listOf("other", "master", "child"),
+            conversationSessions(sessions, emptyList(), "", broughtIn = lineage).map { it.id },
+        )
+        assertEquals(
+            listOf("other", "master"),
+            conversationSessions(
+                sessions,
+                emptyList(),
+                "",
+                broughtIn = lineage,
+                foldedCrews = setOf("master"),
+            ).map { it.id },
+        )
+    }
+
     private fun session(
         id: String,
         title: String,

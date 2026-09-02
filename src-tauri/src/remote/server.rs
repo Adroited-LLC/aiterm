@@ -1251,6 +1251,32 @@ struct SessionIdPayload {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SessionStarPayload {
+    session_id: String,
+    on: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRenamePayload {
+    session_id: String,
+    title: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionBringInPayload {
+    session_id: String,
+    agent_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+    focus: String,
+    rounds: u8,
+    auto: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionConversationRequest {
     session_id: String,
     #[serde(default = "default_conversation_chars")]
@@ -1358,6 +1384,20 @@ struct TabListPayload {
 #[derive(Serialize)]
 struct SessionListPayload {
     sessions: Vec<crate::sessions::Session>,
+}
+
+#[derive(Serialize)]
+struct SessionRosterPayload {
+    sessions: Vec<crate::sessions::Session>,
+    with_files: Vec<String>,
+    stars: Vec<String>,
+    brought_in: HashMap<String, String>,
+    activity: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct UsagePayload {
+    sources: Vec<crate::usage::UsageSource>,
 }
 
 #[derive(Serialize)]
@@ -1947,6 +1987,18 @@ impl RemoteServices {
                 let routes = routes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                 Ok(DispatchOutcome::frames(vec![response(request_id, "gateway.routes", &routes)?]))
             }
+            "usage.report" => {
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "usage.report",
+                    &UsagePayload {
+                        sources: crate::usage::usage_report(),
+                    },
+                )?]))
+            }
             "session.list" => {
                 if !request.payload().is_empty() {
                     return Err("protocol.invalid_payload");
@@ -1956,6 +2008,139 @@ impl RemoteServices {
                     request_id,
                     "session.list",
                     &SessionListPayload { sessions },
+                )?]))
+            }
+            "session.roster" => {
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
+                let sessions = self.sessions.list().map_err(|error| error.code())?;
+                let session_ids = sessions
+                    .iter()
+                    .map(|session| session.id.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                let mut with_files = self
+                    .app
+                    .as_ref()
+                    .map(crate::changes::sessions_with_files)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|id| session_ids.contains(id.as_str()))
+                    .collect::<Vec<_>>();
+                with_files.sort();
+                let stars = crate::sessions::session_stars()
+                    .into_iter()
+                    .filter(|id| session_ids.contains(id.as_str()))
+                    .collect();
+                let brought_in = crate::sessions::session_brought_in()
+                    .into_iter()
+                    .filter(|(child, parent)| {
+                        session_ids.contains(child.as_str())
+                            && session_ids.contains(parent.as_str())
+                    })
+                    .collect();
+                let activity = self
+                    .registry
+                    .session_activities()
+                    .into_iter()
+                    .filter(|(id, _)| session_ids.contains(id.as_str()))
+                    .collect();
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.roster",
+                    &SessionRosterPayload {
+                        sessions,
+                        with_files,
+                        stars,
+                        brought_in,
+                        activity,
+                    },
+                )?]))
+            }
+            "session.star" => {
+                let payload: SessionStarPayload = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                crate::sessions::set_star(&payload.session_id, payload.on)
+                    .map_err(|_| "session.metadata_failed")?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.star",
+                    &SuccessPayload { ok: true },
+                )?]))
+            }
+            "session.rename" => {
+                let payload: SessionRenamePayload = decode_payload(request)?;
+                if payload.title.len() > MAX_TITLE_BYTES {
+                    return Err("protocol.invalid_payload");
+                }
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                crate::sessions::rename_session(&payload.session_id, &payload.title)
+                    .map_err(|_| "session.metadata_failed")?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.rename",
+                    &SuccessPayload { ok: true },
+                )?]))
+            }
+            "session.bring_in" => {
+                let payload: SessionBringInPayload = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                bounded(&payload.agent_id, MAX_IDENTIFIER_BYTES)?;
+                bounded(&payload.focus, MAX_TITLE_BYTES)?;
+                if payload.agent_id.is_empty()
+                    || !(1..=3).contains(&payload.rounds)
+                    || payload
+                        .model
+                        .as_deref()
+                        .is_some_and(|value| bounded(value, MAX_IDENTIFIER_BYTES).is_err())
+                    || payload
+                        .effort
+                        .as_deref()
+                        .is_some_and(|value| bounded(value, MAX_IDENTIFIER_BYTES).is_err())
+                {
+                    return Err("protocol.invalid_payload");
+                }
+                let agent = self
+                    .agents
+                    .list()
+                    .into_iter()
+                    .find(|agent| agent.id == payload.agent_id)
+                    .ok_or("agent.unavailable")?;
+                if let Some(model) = payload.model.as_deref() {
+                    let model = agent
+                        .models
+                        .iter()
+                        .find(|candidate| candidate.id == model)
+                        .ok_or("agent.invalid_model")?;
+                    if payload
+                        .effort
+                        .as_deref()
+                        .is_some_and(|effort| !model.efforts.iter().any(|candidate| candidate == effort))
+                    {
+                        return Err("agent.invalid_effort");
+                    }
+                }
+                let is_open = self.registry.list().into_iter().any(|tab| {
+                    tab.state() == &TabState::Running
+                        && tab_matches_session(&tab, &payload.session_id)
+                });
+                if !is_open {
+                    return Err("session.tab_not_found");
+                }
+                let app = self.app.as_ref().ok_or("remote.unsupported")?;
+                use tauri::Emitter;
+                app.emit("remote://bring-in", &payload)
+                    .map_err(|_| "remote.operation_failed")?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.bring_in",
+                    &SuccessPayload { ok: true },
                 )?]))
             }
             "session.preview" => {

@@ -74,6 +74,15 @@ struct SessionListReply {
     sessions: Vec<SessionReply>,
 }
 
+#[derive(Deserialize)]
+struct SessionRosterReply {
+    sessions: Vec<SessionReply>,
+    with_files: Vec<String>,
+    stars: Vec<String>,
+    brought_in: std::collections::HashMap<String, String>,
+    activity: std::collections::HashMap<String, String>,
+}
+
 #[derive(Deserialize, Debug, PartialEq, Eq)]
 struct SessionReply {
     id: String,
@@ -1245,6 +1254,29 @@ async fn remote_session_list_matches_desktop_service_result() {
     assert_eq!(remote.sessions[0].agent, desktop[0].agent);
     assert_eq!(remote.sessions[0].title, desktop[0].title);
     assert_eq!(remote.sessions[0].project_path, desktop[0].project_path);
+    gateway.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_session_roster_adds_mobile_metadata_without_changing_session_list() {
+    let fixture = Fixture::new("roster-metadata");
+    fixture.write_session(
+        "12121212-1212-4212-8212-121212121212",
+        "Roster session",
+        "/fixture/project",
+    );
+    let (gateway, mut socket) = start(&fixture).await;
+
+    socket.send(empty_request(71, "session.roster")).await.unwrap();
+    let envelope = receive(&mut socket).await;
+    let roster: SessionRosterReply = decode(&envelope.payload);
+
+    assert_eq!(envelope.kind, "session.roster");
+    assert_eq!(roster.sessions.len(), 1);
+    assert!(roster.with_files.is_empty());
+    assert!(roster.stars.is_empty());
+    assert!(roster.brought_in.is_empty());
+    assert!(roster.activity.is_empty());
     gateway.stop().await.unwrap();
 }
 

@@ -130,6 +130,28 @@ pub fn record_brought_in(second_session: &str, master_session: &str) -> Result<(
     save_metadata("brought_in.json", &lineage)
 }
 
+/// Record a desktop-owned second-agent exchange for every session-list UI.
+/// The exchange itself stays in the renderer because it owns the two terminal
+/// handles; this command only publishes durable lineage.
+#[tauri::command]
+pub fn relay_report(
+    app: tauri::AppHandle,
+    session_id: String,
+    b_session_id: Option<String>,
+    b_name: String,
+    phase: String,
+    round: u32,
+    rounds: u32,
+    note: String,
+) {
+    let _ = (b_name, phase, round, rounds, note);
+    if let Some(second) = b_session_id.as_deref() {
+        let _ = record_brought_in(second, &session_id);
+    }
+    use tauri::Emitter;
+    let _ = app.emit("sessions://changed", ());
+}
+
 #[tauri::command]
 pub fn session_star(app: tauri::AppHandle, session_id: String, on: bool) -> Result<(), String> {
     set_star(&session_id, on)?;

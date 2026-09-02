@@ -29,7 +29,7 @@ import { useLibrarian } from "./librarian";
 import BringIn from "./components/BringIn";
 import { useRelay } from "./relay";
 import {
-  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
+  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -44,7 +44,7 @@ import {
   ProjectInfo, Session,
   TrashedSession,
   agentCaps,
-  listProjects, listSessions, materializeFork,
+  listProjects, listSessions, materializeFork, relayReport,
   reindexSessions, sessionFork, uiLog, usageReport,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
   drainSessionEvents,
@@ -2278,6 +2278,64 @@ export default function App() {
     format: settings.timeFormat,
     setFormat: (f: AppSettings["timeFormat"]) => setSettings((s) => ({ ...s, timeFormat: f })),
   }), [settings.timeFormat]);
+
+  // The exchange remains desktop-owned: report its durable crew lineage so
+  // every session-list client sees the second agent under its master.
+  useEffect(() => {
+    const relay = relayCtl.relay;
+    if (!relay) return;
+    const first = tabs.find((tab) => tab.key === relay.aKey);
+    if (!first?.sessionId) return;
+    const second = tabs.find((tab) => tab.key === relay.bKey);
+    relayReport(
+      first.sessionId,
+      second?.sessionId ?? null,
+      relay.bName,
+      relay.phase,
+      relay.round,
+      relay.rounds,
+      relay.note,
+    ).catch(() => {});
+  }, [relayCtl.relay, tabs]);
+
+  // Authenticated phones can request the same desktop-owned exchange. This
+  // listener starts no network service; the existing gateway emits a local
+  // Tauri event after it has authenticated and validated the request.
+  const remoteBringInRef = useRef({ tabs, start: relayCtl.start });
+  remoteBringInRef.current = { tabs, start: relayCtl.start };
+  useEffect(() => {
+    const unlisten = listen<{
+      session_id: string;
+      agent_id: string;
+      model: string | null;
+      effort: string | null;
+      focus: string;
+      rounds: number;
+      auto: boolean;
+    }>("remote://bring-in", (event) => {
+      const request = event.payload;
+      const tab = remoteBringInRef.current.tabs.find(
+        (candidate) => candidate.sessionId === request.session_id,
+      );
+      if (!tab) {
+        setNotice("The phone asked to bring in an agent, but that session is not open.");
+        return;
+      }
+      void remoteBringInRef.current.start({
+        aKey: tab.key,
+        choice: {
+          kind: "agent",
+          agentId: request.agent_id,
+          model: request.model,
+          effort: request.effort,
+        },
+        focus: request.focus,
+        rounds: request.rounds,
+        auto: request.auto,
+      });
+    });
+    return () => { unlisten.then((dispose) => dispose()); };
+  }, []);
 
   return (
     <TimeFormatContext.Provider value={timeFormatCtx}>

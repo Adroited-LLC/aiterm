@@ -124,6 +124,7 @@ pub fn run() {
             sessions::session_titles,
             sessions::session_stars,
             sessions::session_brought_in,
+            sessions::relay_report,
             sessions::session_star,
             sessions::session_status,
             sessions::session_preview,
