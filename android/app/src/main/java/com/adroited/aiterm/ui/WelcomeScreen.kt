@@ -41,10 +41,12 @@ private val TerminalSignal = Color(0xFF72D5B5)
 
 @Composable
 fun WelcomeScreen(
-    hasPairedDesktop: Boolean,
-    onContinue: () -> Unit,
+    onUnlock: () -> Unit,
+    unlockError: String? = null,
+    modifier: Modifier = Modifier,
 ) {
     Scaffold(
+        modifier = modifier,
         containerColor = MaterialTheme.colorScheme.background,
         bottomBar = {
             Surface(
@@ -55,18 +57,39 @@ fun WelcomeScreen(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Button(
-                        onClick = onContinue,
-                        modifier = Modifier.fillMaxWidth().widthIn(max = 552.dp).height(54.dp),
-                        shape = RoundedCornerShape(15.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                        ),
+                    Column(
+                        modifier = Modifier.fillMaxWidth().widthIn(max = 552.dp),
                     ) {
                         Text(
-                            if (hasPairedDesktop) "Open my desktops" else "Pair my desktop",
-                            style = MaterialTheme.typography.labelLarge,
+                            text = "AITerm is locked",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
                         )
+                        Text(
+                            text = "Unlock with a strong biometric or your device PIN.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        unlockError?.let { error ->
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                text = error,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        Button(
+                            onClick = onUnlock,
+                            modifier = Modifier.fillMaxWidth().height(54.dp),
+                            shape = RoundedCornerShape(15.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                            ),
+                        ) {
+                            Text("Unlock AITerm", style = MaterialTheme.typography.labelLarge)
+                        }
                     }
                 }
             }

@@ -17,27 +17,29 @@ class WelcomeScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComposeTestActivity>()
 
     @Test
-    fun newInstallationExplainsTheProductAndStartsPairing() {
-        var continueRequests = 0
+    fun lockedLaunchExplainsTheProductAndStartsUnlock() {
+        var unlockRequests = 0
         compose.setContent {
-            WelcomeScreen(hasPairedDesktop = false, onContinue = { continueRequests++ })
+            WelcomeScreen(onUnlock = { unlockRequests++ })
         }
 
         compose.onNodeWithText("Leave the desk.\nKeep the session.").assertIsDisplayed()
         compose.onNodeWithText("Continue live work").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Send what the task needs").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Connect your way").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("Pair my desktop").assertIsDisplayed().performClick()
+        compose.onNodeWithText("AITerm is locked").assertIsDisplayed()
+        compose.onNodeWithText("Unlock AITerm").assertIsDisplayed().performClick()
 
-        compose.runOnIdle { assertEquals(1, continueRequests) }
+        compose.runOnIdle { assertEquals(1, unlockRequests) }
     }
 
     @Test
-    fun upgradedInstallationWithAPairContinuesToItsDesktopList() {
+    fun unlockFailureIsVisibleWithoutReplacingTheWelcome() {
         compose.setContent {
-            WelcomeScreen(hasPairedDesktop = true, onContinue = {})
+            WelcomeScreen(onUnlock = {}, unlockError = "Authentication was not recognized. Try again.")
         }
 
-        compose.onNodeWithText("Open my desktops").assertIsDisplayed()
+        compose.onNodeWithText("Leave the desk.\nKeep the session.").assertIsDisplayed()
+        compose.onNodeWithText("Authentication was not recognized. Try again.").assertIsDisplayed()
     }
 }

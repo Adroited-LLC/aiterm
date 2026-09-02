@@ -24,12 +24,9 @@ object DesktopsRoute
 object PairingRoute
 
 @Serializable
-object WelcomeRoute
-
-@Serializable
 data class TerminalRoute(val deviceId: String)
 
-/** The navigation shell, including the installation-local first-run welcome. */
+/** The navigation shell. Locked launches render the safe welcome surface above this graph. */
 @Composable
 fun AitermApp(
     navController: NavHostController = rememberNavController(),
@@ -45,25 +42,7 @@ fun AitermApp(
         if (locked) {
             LockedContent(onUnlock = onRequestUnlock, error = unlockError)
         } else {
-            val showWelcome = container.firstRunPreference.shouldShowWelcome()
-            val hasPairedDesktop = runCatching { container.pairedDesktopStore.all().isNotEmpty() }
-                .getOrDefault(false)
-            NavHost(
-                navController = navController,
-                startDestination = if (showWelcome) WelcomeRoute else DesktopsRoute,
-            ) {
-                composable<WelcomeRoute> {
-                    WelcomeScreen(
-                        hasPairedDesktop = hasPairedDesktop,
-                        onContinue = {
-                            container.firstRunPreference.completeWelcome()
-                            navController.navigate(DesktopsRoute) {
-                                popUpTo<WelcomeRoute> { inclusive = true }
-                            }
-                            if (!hasPairedDesktop) navController.navigate(PairingRoute)
-                        },
-                    )
-                }
+            NavHost(navController = navController, startDestination = DesktopsRoute) {
                 composable<DesktopsRoute> {
                     DesktopListScreen(
                         store = container.pairedDesktopStore,
