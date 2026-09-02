@@ -332,10 +332,15 @@ fn cwd_from_db(root: &Path, id: &str) -> Option<String> {
         }
         let Ok(bytes) = std::fs::read(&path) else { continue };
         let brain = root.join("brain");
-        if let Some(cwd) = file_uris_in(&bytes)
-            .into_iter()
-            .find(|p| !Path::new(p).starts_with(&brain) && Path::new(p).is_dir())
-        {
+        // A protobuf tag byte that happens to be printable rides on the
+        // end of the real path (`…/harness-auditj`, seen live 09-02), so a
+        // candidate is also tried with its last one or two bytes cut off.
+        if let Some(cwd) = file_uris_in(&bytes).into_iter().find_map(|p| {
+            (0..=2)
+                .filter_map(|cut| p.get(..p.len().checked_sub(cut)?))
+                .find(|c| c.len() > 1 && !Path::new(c).starts_with(&brain) && Path::new(c).is_dir())
+                .map(str::to_owned)
+        }) {
             return Some(cwd);
         }
     }
