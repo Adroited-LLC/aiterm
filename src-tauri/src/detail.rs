@@ -613,7 +613,7 @@ pub async fn session_conversation(session_id: String, max_chars: usize) -> Vec<(
     crate::run_blocking(move || conversation_sync(&session_id, max_chars)).await
 }
 
-fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)> {
+pub(crate) fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)> {
     let list = crate::agents::backends();
     let Some((backend, path)) = crate::agents::owner_in(&list, session_id) else { return vec![] };
     let mut turns: Vec<(String, String)> = match backend.sessions().messages(session_id) {

@@ -94,9 +94,13 @@ pub fn load_brought_in() -> std::collections::HashMap<String, String> {
 
 pub(crate) fn apply_session_names(sessions: &mut [Session]) {
     let titles: std::collections::HashMap<String, String> = load_metadata("titles.json");
+    // The librarian's names come second: a name set by hand always wins.
+    let named = crate::librarian::names();
     for session in sessions {
         if let Some(title) = titles.get(&session.id).filter(|title| !title.trim().is_empty()) {
             session.title = title.clone();
+        } else if let Some(name) = named.get(&session.id) {
+            session.title = name.clone();
         }
     }
 }
@@ -960,12 +964,19 @@ fn parse_session_from(mut file: File, path: &Path, dir_cwd: Option<&str>) -> Opt
     // Fork stubs omit cwd; backfill from a sibling session's cwd in the same
     // project dir so they still group under the right project.
     let project_path = cwd.or_else(|| dir_cwd.map(String::from))?;
-    // Noise filters: scratch sessions in /tmp, and sessions with no human
-    // content at all (memory summarizer runs, local-command-only sessions).
-    if project_path == "/tmp" || project_path.starts_with("/tmp/") {
+    // Noise filters: sessions in a scratch directory — /tmp, and the state
+    // and job directories other programs run Claude in (a routine's triage
+    // agent under ~/.local/state, Claude Code's own job specimens under
+    // ~/.claude/jobs). Those are that program's sessions, not the person's,
+    // and clutter the list by the hundred. `promptSource: "sdk"` is NOT the
+    // test: sessions typed through an SDK-driven front end carry it too.
+    if is_scratch_dir(&project_path) {
         return None;
     }
-    let title = title.or(summary).or(first_prompt).or(ai_title)?;
+    // A title Claude wrote (its `ai-title`, a few seconds into the session)
+    // reads better than the prompt it was written from; the prompt is the
+    // fallback while the title has not landed yet.
+    let title = title.or(summary).or(ai_title).or(first_prompt)?;
 
     Some(Session {
         id,
@@ -979,6 +990,21 @@ fn parse_session_from(mut file: File, path: &Path, dir_cwd: Option<&str>) -> Opt
         fork_parent: None, // filled in from job state by the caller
         last_active: mtime,
     })
+}
+
+/// A directory a program works in rather than a project a person opens:
+/// `/tmp`, and under the home directory `.local/state`, `.claude/jobs` and
+/// `.cache`. A session there is the program's.
+fn is_scratch_dir(path: &str) -> bool {
+    let under = |root: &str| path == root || path.starts_with(&format!("{root}/"));
+    if under("/tmp") {
+        return true;
+    }
+    let Some(home) = dirs::home_dir() else { return false };
+    let home = home.to_string_lossy();
+    [".local/state", ".claude/jobs", ".cache"]
+        .iter()
+        .any(|d| under(&format!("{home}/{d}")))
 }
 
 /// Parse one explicitly rooted transcript for the shared session service.
@@ -9393,6 +9419,61 @@ mod tests {
         let s = parse_session(&real_session, None).expect("real session kept");
         assert_eq!(s.title, "hey fix the login bug");
         assert_eq!(s.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn claudes_own_title_outranks_the_prompt_it_was_written_from() {
+        let dir = std::env::temp_dir().join("aiterm-test-ai-title-rank");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("55555555-5555-4555-8555-555555555555.jsonl");
+        std::fs::write(&f, concat!(
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/home/x/proj","promptSource":"typed","message":{"role":"user","content":"write me a 500 word article about squirrels"}}"#, "\n",
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"text","text":"Sure."}]}}"#, "\n",
+            r#"{"type":"ai-title","aiTitle":"Squirrels article","sessionId":"x"}"#, "\n",
+        )).unwrap();
+        let s = parse_session(&f, None).expect("kept");
+        assert_eq!(s.title, "Squirrels article");
+        // Before the title lands, the prompt stands in.
+        let early = dir.join("55555555-5555-4555-8555-555555555556.jsonl");
+        std::fs::write(&early,
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/home/x/proj","promptSource":"typed","message":{"role":"user","content":"write me a 500 word article about squirrels"}}"#).unwrap();
+        assert_eq!(parse_session(&early, None).unwrap().title, "write me a 500 word article about squirrels");
+        // A name the person gave still wins over both.
+        let named = dir.join("55555555-5555-4555-8555-555555555557.jsonl");
+        std::fs::write(&named, concat!(
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/home/x/proj","message":{"role":"user","content":"write me a 500 word article about squirrels"}}"#, "\n",
+            r#"{"type":"ai-title","aiTitle":"Squirrels article","sessionId":"x"}"#, "\n",
+            r#"{"type":"custom-title","customTitle":"Rodent content","sessionId":"x"}"#, "\n",
+        )).unwrap();
+        assert_eq!(parse_session(&named, None).unwrap().title, "Rodent content");
+    }
+
+    #[test]
+    fn a_session_in_a_programs_scratch_dir_is_not_listed() {
+        let home = dirs::home_dir().unwrap();
+        let home = home.to_string_lossy();
+        assert!(is_scratch_dir("/tmp"));
+        assert!(is_scratch_dir("/tmp/x"));
+        assert!(is_scratch_dir(&format!("{home}/.local/state/acc-audit-watch/repo")));
+        assert!(is_scratch_dir(&format!("{home}/.claude/jobs/8f258164/tmp/claude-specimen")));
+        assert!(is_scratch_dir(&format!("{home}/.cache/thing")));
+        assert!(!is_scratch_dir(&format!("{home}/nanoclaw")));
+        assert!(!is_scratch_dir(&format!("{home}/.local/share/aiterm")));
+        assert!(!is_scratch_dir("/tmpfs/proj"));
+        assert!(!is_scratch_dir(&format!("{home}/.claude/worktrees/x")));
+
+        let dir = std::env::temp_dir().join("aiterm-test-scratch-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("66666666-6666-4666-8666-666666666661.jsonl");
+        std::fs::write(&f, format!(
+            r##"{{"type":"user","uuid":"u1","parentUuid":null,"cwd":"{home}/.local/state/acc-audit-watch/repo","promptSource":"sdk","message":{{"role":"user","content":"# Origin-side triage agent"}}}}"##)).unwrap();
+        assert!(parse_session(&f, None).is_none(), "a routine's session is dropped");
+        // The same prompt source from a real project is the person's session
+        // — typed through an SDK-driven front end — and stays.
+        let g = dir.join("66666666-6666-4666-8666-666666666662.jsonl");
+        std::fs::write(&g, format!(
+            r##"{{"type":"user","uuid":"u1","parentUuid":null,"cwd":"{home}/nanoclaw","entrypoint":"sdk-cli","promptSource":"sdk","message":{{"role":"user","content":"what is Matt working on?"}}}}"##)).unwrap();
+        assert_eq!(parse_session(&g, None).unwrap().title, "what is Matt working on?");
     }
 
     #[test]
