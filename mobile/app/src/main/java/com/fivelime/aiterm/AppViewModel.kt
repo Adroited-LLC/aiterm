@@ -257,24 +257,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // The relay route: what the desktop reports live, else
                     // what the QR named; then, when the QR carried a draft,
                     // sign it so the route goes live now. A refusal here is
-                    // not a failed pairing — the desktop is reached; the
-                    // relay road stays empty until a status poll fills it.
+                    // not a failed pairing — the desktop is reached, and the
+                    // next status answer offers the draft again.
                     var relayHost = status.relay?.host ?: link.relayHost
                     var relayPort = status.relay?.port ?: link.relayPort
                     link.relayAuthorization?.let { digest ->
-                        try {
-                            val key = b64url(RelayAuthority.publicKeyCompressed())
-                            val sig = b64url(RelayAuthority.sign(digest))
-                            val r = Api(url, link.token, link.fingerprint, c.patienceSeconds).relayEnroll(key, sig)
-                            relayHost = r.host; relayPort = r.port
-                            android.util.Log.i("Aiterm", "relay enrolled: ${r.host}:${r.port}")
-                        } catch (e: Exception) {
-                            android.util.Log.w("Aiterm", "relay enrollment failed (paired anyway): ${e.javaClass.simpleName}: ${e.message}")
-                        }
+                        enrollTried[link.fingerprint] = b64url(digest)
+                        enrollRelay(Api(url, link.token, link.fingerprint, c.patienceSeconds), digest)?.let { relayHost = it.host; relayPort = it.port }
                     }
                     val d = draft.copy(
                         baseUrl = url, name = status.name.ifBlank { link.name },
                         relayHost = relayHost, relayPort = relayPort,
+                        roadOrder = status.road_order?.takeIf { Roads.isComplete(it) }?.let { Roads.order(it).map { r -> r.id } } ?: draft.roadOrder,
                     )
                     adopt(d)
                     return@launch
@@ -286,19 +280,92 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun b64url(bytes: ByteArray): String = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
 
-    /** The order this desktop's roads are tried, from the settings screen.
-     *  Saved on the desktop's entry and applied at once: the next sprint
-     *  (now) commits and upgrades by the new order. */
-    fun setRoadOrder(d: Desktop, order: List<String>) {
-        val clean = Roads.order(order).map { it.id }
-        if (clean == d.roadOrder) return
-        val nd = d.copy(roadOrder = clean)
+    // ---- the relay road, enrolled over the pairing that already exists
+
+    /** Sign a relay enrollment digest and hand it to the desktop, which
+     *  registers the route and answers with it live. The one function for
+     *  both ways a digest reaches the phone: the QR's `ta` at pairing, and
+     *  `relay_enroll` in any status answer afterwards. Null when it did not
+     *  go through — never fatal to anything around it. */
+    private suspend fun enrollRelay(api: Api, digest: ByteArray): RelayEnrolled? = try {
+        val key = b64url(RelayAuthority.publicKeyCompressed())
+        val sig = b64url(RelayAuthority.sign(digest))
+        api.relayEnroll(key, sig).also { android.util.Log.i("Aiterm", "relay enrolled: ${it.host}:${it.port}") }
+    } catch (e: Exception) {
+        android.util.Log.w("Aiterm", "relay enrollment failed: ${e.javaClass.simpleName}: ${e.message}")
+        null
+    }
+
+    /** Per desktop (by fingerprint), the last digest this phone signed — a
+     *  digest the desktop refused is not signed again on every status read;
+     *  a fresh draft is a fresh digest and gets its one attempt. */
+    private val enrollTried = HashMap<String, String>()
+
+    /** Per desktop, the road order it last published — what "Use desktop's
+     *  order" goes back to before the next status answer arrives. */
+    private val publishedOrder = HashMap<String, List<String>>()
+
+    /** A draft waiting in a status answer, and no live route: sign it and
+     *  keep the route that comes back. This is how a phone paired over any
+     *  road — iroh, the LAN — gains the relay road with no new QR. Runs
+     *  off every status result: the connect sprint, `status_changed`, the
+     *  drawer's reachability probe. */
+    private fun enrollFromStatus(api: Api, fingerprint: String, status: Status) {
+        val digest = status.relay_enroll?.digest ?: return
+        if (status.relay != null || enrollTried[fingerprint] == digest) return
+        enrollTried[fingerprint] = digest
+        val bytes = PairLink.decodeBase64Url(digest)?.takeIf { it.size == 32 }
+        if (bytes == null) { android.util.Log.w("Aiterm", "relay enrollment digest unreadable; ignoring"); return }
+        android.util.Log.i("Aiterm", "relay enrollment offered in status; signing it")
+        viewModelScope.launch {
+            val r = enrollRelay(api, bytes) ?: return@launch
+            val cur = desktops.find { it.fingerprint == fingerprint } ?: return@launch
+            replace(cur.copy(relayHost = r.host, relayPort = r.port))
+        }
+    }
+
+    /** What every status answer teaches about a desktop's roads: its name,
+     *  iroh node, live relay route, and — unless the person set their own
+     *  here — its road order. The caller stores the copy. */
+    private fun roadsFrom(d: Desktop, status: Status): Desktop {
+        val published = status.road_order?.takeIf { Roads.isComplete(it) }?.let { Roads.order(it).map { r -> r.id } }
+        if (published != null) publishedOrder[d.fingerprint] = published
+        return d.copy(
+            iroh = status.iroh ?: d.iroh,
+            name = status.name.ifBlank { d.name },
+            relayHost = status.relay?.host ?: "",
+            relayPort = status.relay?.port ?: 0,
+            roadOrder = if (!d.roadOrderCustom && published != null) published else d.roadOrder,
+        )
+    }
+
+    /** One desktop's entry, replaced and saved; shown too when it is the
+     *  one on screen. */
+    private fun replace(nd: Desktop) {
         desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
         store.saveAll(desktops)
-        if (desktop?.fingerprint == nd.fingerprint) {
-            desktop = nd
-            if (foreground) { connectJob?.cancel(); connect() }
-        }
+        if (desktop?.fingerprint == nd.fingerprint) desktop = nd
+    }
+
+    /** The order this desktop's roads are tried, from the settings screen.
+     *  Saved on the desktop's entry as the person's own — the desktop's
+     *  published order no longer applies — and used at once: the next
+     *  sprint (now) commits and upgrades by the new order. */
+    fun setRoadOrder(d: Desktop, order: List<String>) {
+        val clean = Roads.order(order).map { it.id }
+        if (clean == d.roadOrder && d.roadOrderCustom) return
+        replace(d.copy(roadOrder = clean, roadOrderCustom = true))
+        if (desktop?.fingerprint == d.fingerprint && foreground && clean != d.roadOrder) { connectJob?.cancel(); connect() }
+    }
+
+    /** Back to following the desktop: the flag clears, the order it last
+     *  published applies now, and every status answer keeps it current. */
+    fun useDesktopRoadOrder(d: Desktop) {
+        val published = publishedOrder[d.fingerprint]
+        val nd = d.copy(roadOrderCustom = false, roadOrder = published ?: d.roadOrder)
+        if (nd == d) return
+        replace(nd)
+        if (desktop?.fingerprint == d.fingerprint && foreground && nd.roadOrder != d.roadOrder) { connectJob?.cancel(); connect() }
     }
 
     /** Rename a session everywhere at once: optimistically here, durably on
@@ -363,7 +430,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val answers = kotlinx.coroutines.channels.Channel<Boolean>(urls.size)
                     urls.forEach { url ->
                         viewModelScope.launch {
-                            answers.send(runCatching { Api(url, d.token, d.fingerprint).status() }.isSuccess)
+                            val api = Api(url, d.token, d.fingerprint)
+                            val r = runCatching { api.status() }
+                            // A status answer is a status answer: the
+                            // desktop's roads (and a waiting relay draft)
+                            // are taken up even for a desktop not shown.
+                            r.getOrNull()?.let { s ->
+                                val cur = desktops.find { it.fingerprint == d.fingerprint } ?: d
+                                val nd = roadsFrom(cur, s)
+                                if (nd != cur) replace(nd)
+                                enrollFromStatus(api, d.fingerprint, s)
+                            }
+                            answers.send(r.isSuccess)
                         }
                     }
                     repeat(urls.size) {
@@ -478,18 +556,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             else Roads.directUrls(d).firstOrNull()?.substringAfterLast(':') ?: reachable.substringAfterLast(':')
             val fresh = status.hosts.map { "https://${if (it.contains(':')) "[$it]" else it}:$port" }
             val candidates = (fresh.ifEmpty { d.candidates } + listOfNotNull(reachable.takeIf { direct })).distinct()
-            val iroh = status.iroh ?: d.iroh
-            val name = status.name.ifBlank { d.name }
-            val relayHost = status.relay?.host ?: ""
-            val relayPort = status.relay?.port ?: 0
-            if (reachable != d.baseUrl || candidates != d.candidates || iroh != d.iroh || name != d.name ||
-                relayHost != d.relayHost || relayPort != d.relayPort) {
-                val nd = d.copy(baseUrl = reachable, candidates = candidates, iroh = iroh, name = name,
-                    relayHost = relayHost, relayPort = relayPort)
+            val nd = roadsFrom(d, status).copy(baseUrl = reachable, candidates = candidates)
+            if (nd != d) {
                 desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
                 store.saveAll(desktops)
                 desktop = nd
             }
+            // A relay draft waiting over there is signed now, over this
+            // pairing — the route goes live without a new QR.
+            enrollFromStatus(Api(reachable, d.token, d.fingerprint), d.fingerprint, status)
             if (!foreground) return@launch // backgrounded while probing
             openEvents(Api(reachable, d.token, d.fingerprint))
             // Better-route watch: the remembered winner got us on fast, but a
@@ -533,22 +608,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     when (type) {
                         "sessions_changed", "session_exit" -> refresh()
                         "status_changed" -> {
-                            // A road was switched or a relay route enrolled
+                            // A road was switched, a relay draft prepared or
+                            // a route enrolled, or the road order edited
                             // over there; re-read what this desktop offers
                             // so the next dial (and the Connection order
-                            // notes) see it without a reconnect.
+                            // notes) see it without a reconnect — and sign
+                            // a waiting draft while we are here.
                             val cur = desktop ?: return@launch
                             val status = runCatching { a.status() }.getOrNull() ?: return@launch
-                            val iroh = status.iroh ?: cur.iroh
-                            val name = status.name.ifBlank { cur.name }
-                            val relayHost = status.relay?.host ?: ""
-                            val relayPort = status.relay?.port ?: 0
-                            if (iroh != cur.iroh || name != cur.name || relayHost != cur.relayHost || relayPort != cur.relayPort) {
-                                val nd = cur.copy(iroh = iroh, name = name, relayHost = relayHost, relayPort = relayPort)
-                                desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
-                                store.saveAll(desktops)
-                                desktop = nd
-                            }
+                            val nd = roadsFrom(cur, status)
+                            if (nd != cur) replace(nd)
+                            enrollFromStatus(a, cur.fingerprint, status)
+                            // The desktop's order changed and this phone
+                            // follows it: the next sprint dials by it.
+                            if (nd.roadOrder != cur.roadOrder && foreground) { connectJob?.cancel(); connect() }
                         }
                         "relay" -> {
                             val sid = obj["session_id"]?.jsonPrimitive?.content ?: return@launch

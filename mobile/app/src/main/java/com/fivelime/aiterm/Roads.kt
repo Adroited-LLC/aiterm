@@ -36,6 +36,11 @@ object Roads {
      *  Roads it leaves out are never dialed. */
     fun order(order: List<String>): List<Road> = order.mapNotNull { Road.byId(it) }.distinct()
 
+    /** Every road, each once — the only order worth adopting from a
+     *  desktop: anything less would leave a road undialed. */
+    fun isComplete(order: List<String>): Boolean =
+        order.size == Road.entries.size && order(order).size == Road.entries.size
+
     /** Which road a bare host rides when dialed directly. RFC1918 and
      *  link-local are `lan`; 100.64/10 (Tailscale/CGNAT), fc00::/7 (ULA —
      *  Tailscale's v6) and any other host, name or public address, are

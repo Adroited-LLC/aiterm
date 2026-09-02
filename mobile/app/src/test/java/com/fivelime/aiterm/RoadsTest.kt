@@ -60,6 +60,16 @@ class RoadsTest {
         assertEquals(4L, c.first().patienceSeconds)
     }
 
+    @Test fun onlyAWholeOrderIsCompleteEnoughToAdopt() {
+        assertTrue(Roads.isComplete(listOf("lan", "vpn", "relay", "iroh")))
+        assertTrue(Roads.isComplete(listOf("iroh", "relay", "vpn", "lan")))
+        assertFalse(Roads.isComplete(listOf("lan", "vpn", "relay")))
+        assertFalse(Roads.isComplete(listOf("lan", "vpn", "relay", "bogus")))
+        assertFalse(Roads.isComplete(listOf("lan", "lan", "relay", "iroh")))
+        assertFalse(Roads.isComplete(listOf("lan", "vpn", "relay", "iroh", "lan")))
+        assertFalse(Roads.isComplete(emptyList()))
+    }
+
     @Test fun orderIsHonouredAndMissingRoadsSkipped() {
         val d = desk(iroh = "n".repeat(64), relayHost = "r.example", relayPort = 443, order = listOf("iroh", "relay", "bogus", "lan"))
         val c = Roads.candidates(d, "https://127.0.0.1:41234")

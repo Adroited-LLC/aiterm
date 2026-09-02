@@ -107,12 +107,25 @@ data class Status(
     /** The live AITerm Relay route, never a draft; null when the relay road
      *  is off or nothing is enrolled yet. */
     val relay: RelayRoute? = null,
+    /** An enrollment draft waiting for any paired phone to sign — the same
+     *  digest a QR carries as `ta`. Present only while no route lives;
+     *  the phone signs it once and the route comes back live. */
+    val relay_enroll: RelayEnroll? = null,
+    /** Why no draft is waiting: the desktop could not reach the relay. */
+    val relay_error: String? = null,
     /** Which roads the desktop has switched on. */
     val roads: RoadFlags? = null,
+    /** The desktop's own road order, most preferred first. A phone that
+     *  has not set its own order follows it. */
+    val road_order: List<String>? = null,
 )
 
 @Serializable
 data class RelayRoute(val host: String, val port: Int)
+
+/** A waiting enrollment draft: its 32-byte digest, base64url no padding. */
+@Serializable
+data class RelayEnroll(val digest: String)
 
 @Serializable
 data class RoadFlags(val lan: Boolean = false, val vpn: Boolean = false, val relay: Boolean = false, val iroh: Boolean = false)
@@ -155,8 +168,10 @@ class Api(val baseUrl: String, private val token: String, fingerprint: String, c
     suspend fun status(): Status = json.decodeFromString(call(req("/v1/status")))
     /** Sign the desktop's pending relay draft into a live route. Both
      *  fields base64url, no padding: the phone's compressed P-256 key and a
-     *  DER ECDSA signature over the QR's `ta` digest. 409 = no draft
-     *  waiting, 400 = the signature does not fit, 502 = the relay said no. */
+     *  DER ECDSA signature over the draft digest (the QR's `ta`, or
+     *  `relay_enroll.digest` from status). 409 = no draft waiting, 400 =
+     *  the signature does not fit (or the draft was replaced — read status
+     *  again), 502 = the relay said no. */
     suspend fun relayEnroll(authorityPublicKeyB64Url: String, signatureDerB64Url: String): RelayEnrolled {
         val body = json.encodeToString(RelayEnrollBody.serializer(), RelayEnrollBody(authorityPublicKeyB64Url, signatureDerB64Url))
         return json.decodeFromString(call(req("/v1/relay/enroll").post(jsonBody(body))))

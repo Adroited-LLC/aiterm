@@ -22,6 +22,11 @@ data class Desktop(
     /** The roads to try, most preferred first — see Roads.kt. A desktop
      *  stored before roads existed gets the default and never notices. */
     val roadOrder: List<String> = DEFAULT_ROAD_ORDER,
+    /** The person set `roadOrder` here, on the phone. Until they do, the
+     *  order follows what the desktop publishes in every status answer;
+     *  "Use desktop's order" in Settings clears this. Entries stored
+     *  before the flag existed follow the desktop. */
+    val roadOrderCustom: Boolean = false,
 ) {
     /** The address that answered last, then the rest in the QR's order. */
     val ordered: List<String> get() = listOf(baseUrl) + candidates.filter { it != baseUrl }

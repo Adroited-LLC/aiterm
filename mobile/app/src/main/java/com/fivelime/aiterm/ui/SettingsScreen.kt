@@ -24,6 +24,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -104,6 +105,15 @@ fun SettingsScreen(vm: AppViewModel, outer: PaddingValues) {
                     modifier = Modifier.padding(horizontal = 20.dp),
                 )
                 RoadOrder(d, onChange = { vm.setRoadOrder(d, it) })
+                Text(
+                    if (d.roadOrderCustom) "Your own order. ${d.name} publishes one too."
+                    else "Following the order set on ${d.name}. Move a road to set your own.",
+                    style = MaterialTheme.typography.bodySmall, color = Muted,
+                    modifier = Modifier.padding(horizontal = 20.dp),
+                )
+                TextButton(enabled = d.roadOrderCustom, onClick = { vm.useDesktopRoadOrder(d) }, modifier = Modifier.padding(start = 8.dp)) {
+                    Text("Use desktop's order")
+                }
             }
         }
     }
