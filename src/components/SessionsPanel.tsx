@@ -473,6 +473,16 @@ export default function SessionsPanel({
     const ids = new Set(filtered.map((s) => s.id));
     return new Set(Object.entries(broughtIn).filter(([k, m]) => ids.has(k) && ids.has(m)).map(([k]) => k));
   }, [filtered, broughtIn]);
+  /** Master → how many of its brought-in agents still exist. The lineage
+   *  store remembers deleted ones; the badge must not. */
+  const crewCount = useMemo(() => {
+    const ids = new Set(sessions.map((s) => s.id));
+    const m = new Map<string, number>();
+    for (const [k, master] of Object.entries(broughtIn)) {
+      if (ids.has(k)) m.set(master, (m.get(master) ?? 0) + 1);
+    }
+    return m;
+  }, [sessions, broughtIn]);
   const groupMembers = useMemo(() => {
     const m = new Map<string, Session[]>();
     for (const g of groups) {
@@ -927,7 +937,7 @@ export default function SessionsPanel({
             )}
             <span className="session-title">{s.title}</span>
             {(() => {
-              const crew = Object.values(broughtIn).filter((m) => m === s.id).length;
+              const crew = crewCount.get(s.id) ?? 0;
               if (!crew) return null;
               const folded = foldedCrews.has(s.id);
               return (
