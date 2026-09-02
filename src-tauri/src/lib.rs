@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod antigravity;
 pub mod cache;
 pub mod chat;
 pub mod claudecfg;
