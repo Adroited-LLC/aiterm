@@ -532,6 +532,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 viewModelScope.launch {
                     when (type) {
                         "sessions_changed", "session_exit" -> refresh()
+                        "status_changed" -> {
+                            // A road was switched or a relay route enrolled
+                            // over there; re-read what this desktop offers
+                            // so the next dial (and the Connection order
+                            // notes) see it without a reconnect.
+                            val cur = desktop ?: return@launch
+                            val status = runCatching { a.status() }.getOrNull() ?: return@launch
+                            val iroh = status.iroh ?: cur.iroh
+                            val name = status.name.ifBlank { cur.name }
+                            val relayHost = status.relay?.host ?: ""
+                            val relayPort = status.relay?.port ?: 0
+                            if (iroh != cur.iroh || name != cur.name || relayHost != cur.relayHost || relayPort != cur.relayPort) {
+                                val nd = cur.copy(iroh = iroh, name = name, relayHost = relayHost, relayPort = relayPort)
+                                desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
+                                store.saveAll(desktops)
+                                desktop = nd
+                            }
+                        }
                         "relay" -> {
                             val sid = obj["session_id"]?.jsonPrimitive?.content ?: return@launch
                             relays = relays + (sid to RelayInfo(

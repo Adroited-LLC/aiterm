@@ -93,7 +93,7 @@ test("base urls resolve by host label", () => {
 
 test("usage sources", () => {
   assert.equal(brandForUsageSource("anthropic", "Claude"), "claude");
-  assert.equal(brandForUsageSource("codex", "Codex"), "codex");
+  assert.equal(brandForUsageSource("codex", "Codex"), "openai"); // Codex wears OpenAI's mark
   assert.equal(brandForUsageSource("grok", "Grok"), "grok");
   assert.equal(brandForUsageSource("provider:abc", "OpenRouter"), "openrouter");
 });
