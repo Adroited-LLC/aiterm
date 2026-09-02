@@ -198,6 +198,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     // ---- settings
 
     var showSettings by mutableStateOf(false)
+    /** The drawer's usage section is folded until asked for, every launch. */
+    var usageOpen by mutableStateOf(false)
     var themeName by mutableStateOf(store.theme); private set
     var timeZone by mutableStateOf(store.timeZone); private set
     var biometric by mutableStateOf(store.biometric); private set

@@ -274,12 +274,26 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 }
             }
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
-            Text("USAGE", style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp))
-            if (vm.usage.isEmpty()) {
+            // The whole section folds, and starts folded: the menu is for
+            // getting somewhere; usage is a look when wanted.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().clickable { vm.usageOpen = !vm.usageOpen }
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+            ) {
+                Text("USAGE", style = MaterialTheme.typography.labelSmall, color = Muted)
+                Spacer(Modifier.weight(1f))
+                Icon(
+                    if (vm.usageOpen) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowRight,
+                    if (vm.usageOpen) "Hide usage" else "Show usage",
+                    tint = Muted, modifier = Modifier.size(18.dp),
+                )
+            }
+            if (vm.usageOpen && vm.usage.isEmpty()) {
                 Text("Nothing reported yet", color = Muted, style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
             }
-            vm.usage.forEach { u ->
+            if (vm.usageOpen) vm.usage.forEach { u ->
                 val expanded = u.id in expandedUsage
                 val weekly = u.bars.firstOrNull {
                     it.kind.startsWith("weekly") || it.kind == "grok_period" || it.label.contains("week", ignoreCase = true)
