@@ -4037,3 +4037,14 @@ input[type="range"]::-webkit-slider-thumb {
 .road-listeners > summary::-webkit-details-marker { display: none; }
 .road-listeners > summary::before { content: "▸ "; }
 .road-listeners[open] > summary::before { content: "▾ "; }
+
+/* Workspace crews: brought-in agents nest under their master, as on the phone. */
+.session-item.satellite { margin-left: 18px; }
+.sat-mark { color: var(--text-faint); display: inline-flex; margin-right: 2px; flex: none; }
+.crew-badge {
+  display: inline-flex; align-items: center; gap: 3px; flex: none;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent); border: none; border-radius: 8px;
+  font: inherit; font-size: 11px; padding: 1px 6px; margin-left: 6px; cursor: pointer;
+}
+.crew-badge.folded { opacity: 0.65; }
