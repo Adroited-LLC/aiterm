@@ -66,7 +66,7 @@ export function lanState(status: RemoteStatus | null, p: PhoneRemoteStatus | nul
   const parts: string[] = [];
   const hosts = (p?.running ? p.addresses : []).filter((h) => classifyHost(h) === "lan");
   if (hosts.length) parts.push(`Advertising ${hosts.join(", ")}`);
-  if (status?.enabled) parts.push(`AITerm app gateway on ${listenerLabel(status)}`);
+  if (status?.enabled) parts.push(`Gateway on ${listenerLabel(status)}`);
   if (parts.length === 0) {
     return {
       on,
@@ -96,24 +96,24 @@ export function vpnState(p: PhoneRemoteStatus | null): RoadState {
   if (vpn.interface && vpn.kind !== "tailscale") bits.push(vpn.interface);
   if (vpn.address) bits.push(vpn.address);
   if (vpn.magic_dns) bits.push(vpn.magic_dns);
-  return { on, dot: p?.running ? "on" : "warn", text: bits.join(" · ") + (p?.running ? "" : " — 5lime listener is off") };
+  return { on, dot: p?.running ? "on" : "warn", text: bits.join(" · ") + (p?.running ? "" : " — phone listener is off") };
 }
 
 /** The phone listener's relay route in a phrase. */
 export function phoneRelayLine(p: PhoneRemoteStatus | null): string {
   const r = p?.relay;
-  if (!r) return "5lime app: not available";
-  if (r.pending_enrollment) return "5lime app: waiting for a phone to pair";
-  if (!r.configured) return "5lime app: no route yet — it is created the next time a phone pairs";
+  if (!r) return "Phone listener: not available";
+  if (r.pending_enrollment) return "Phone listener: waiting for a phone to pair";
+  if (!r.configured) return "Phone listener: no route yet — it is created the next time a phone pairs";
   const where = r.host ? ` · ${r.host}${r.port ? `:${r.port}` : ""}` : "";
-  if (!p?.running) return `5lime app: route saved, listener off${where}`;
-  return `5lime app: ${r.state}${where}`;
+  if (!p?.running) return `Phone listener: route saved, listener off${where}`;
+  return `Phone listener: ${r.state}${where}`;
 }
 
 /** The gateway's relay route in a phrase, from Matt's relayLabel. */
 export function gatewayRelayLine(status: RemoteStatus | null): string {
-  if (!status?.relay?.configured) return "AITerm app: no route yet — the first approved phone creates it";
-  return `AITerm app: ${relayLabel(status)}`;
+  if (!status?.relay?.configured) return "Gateway: no route yet — the first approved phone creates it";
+  return `Gateway: ${relayLabel(status)}`;
 }
 
 export function relayState(status: RemoteStatus | null, p: PhoneRemoteStatus | null): RoadState {
@@ -135,7 +135,7 @@ export function relayState(status: RemoteStatus | null, p: PhoneRemoteStatus | n
 export function irohState(p: PhoneRemoteStatus | null): RoadState {
   const on = !!p?.roads?.iroh;
   if (!on) return { on, dot: "off", text: "Off" };
-  if (!p?.running) return { on, dot: "warn", text: "5lime listener is off" };
+  if (!p?.running) return { on, dot: "warn", text: "Phone listener is off" };
   if (!p.iroh_node) return { on, dot: "warn", text: "Starting the iroh node…" };
   return { on, dot: "on", text: `On · node ${shortNodeId(p.iroh_node)}` };
 }

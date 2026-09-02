@@ -89,7 +89,7 @@ function saveListenerPreference(config: ListenerConfig) {
  * card with a switch, a dot, and its own settings behind a disclosure. Any
  * set of roads can be on at once (docs/remote-roads.md). Under "Listeners",
  * collapsed, the two sockets that actually answer: the gateway (the AITerm
- * phone app, per-device trust) and the phone listener (the 5lime app, token
+ * phone app, per-device trust) and the phone listener (the phone listener, token
  * trust). Either, or both, can be on.
  *
  * Pairing is one button. With both listeners on it mints a combined QR —
@@ -103,7 +103,7 @@ function saveListenerPreference(config: ListenerConfig) {
  * here ("forget every phone").
  */
 export default function RemoteSettings() {
-  // ---- gateway (AITerm app) state
+  // ---- gateway state
   const [status, setStatus] = useState<RemoteStatus | null>(null);
   const [addresses, setAddresses] = useState<string[]>([]);
   const [address, setAddress] = useState<string>("");
@@ -116,7 +116,7 @@ export default function RemoteSettings() {
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
-  // ---- phone listener (5lime app) state
+  // ---- phone listener state
   const [pstatus, setPstatus] = useState<PhoneRemoteStatus | null>(null);
   const [pair, setPair] = useState<PhonePairPayload | null>(null);
   const [pairError, setPairError] = useState<string | null>(null);
@@ -281,10 +281,10 @@ export default function RemoteSettings() {
     ?? DEFAULT_RELAY_SERVER;
 
   const qrAudience = gatewayOn && phoneOn
-    ? "Either AITerm phone app can scan this — each reads its own half."
+    ? "Either phone app can scan this — each reads its own half."
     : gatewayOn
-      ? "For the AITerm phone app."
-      : "For the 5lime phone app.";
+      ? "For a phone that pairs through the gateway."
+      : "For a phone that pairs through the phone listener.";
 
   return (
     <>
@@ -345,7 +345,7 @@ export default function RemoteSettings() {
             </div>
           )}
           <div className="sgroup-foot">
-            Which app? One QR pairs both the AITerm app and the 5lime app — each
+            One QR carries both the gateway and the phone listener — each phone app
             reads its own half. Every road below that is on rides in the code.
           </div>
         </div>
@@ -363,7 +363,7 @@ export default function RemoteSettings() {
           >
             {status && (
               <Row
-                label="AITerm app gateway address"
+                label="Gateway address"
                 desc="Choose a LAN or VPN address to bind. Applying a live change briefly reconnects phones."
               >
                 <div className="remote-listener-control">
@@ -411,7 +411,7 @@ export default function RemoteSettings() {
               </Row>
             )}
             {status && (
-              <Row label="AITerm app gateway port">
+              <Row label="Gateway port">
                 <input
                   className="set-input"
                   type="number"
@@ -428,7 +428,7 @@ export default function RemoteSettings() {
             )}
             {pstatus && (
               <Row
-                label="5lime app listener port"
+                label="Phone listener port"
                 desc={pportError ?? "Changing it moves the listener and the router mapping at once. Phones must scan a new QR afterwards — the port is in it."}
               >
                 <input
@@ -443,7 +443,7 @@ export default function RemoteSettings() {
             {pstatus && (
               <Row
                 label="Advertised addresses"
-                desc="Every address the QR carries for the 5lime app, best first. A road that is off contributes none."
+                desc="Every address the QR carries for the phone listener, best first. A road that is off contributes none."
                 wide
               >
                 {pstatus.addresses.length === 0
@@ -479,7 +479,7 @@ export default function RemoteSettings() {
             </Row>
             {status?.relay?.configured && (
               <Row
-                label="AITerm app route"
+                label="Gateway route"
                 desc={gatewayOn ? "Turn the gateway off under Listeners to remove its route." : "Deprovisions the route on the relay and forgets it here."}
               >
                 {confirmRelay === "gateway" ? (
@@ -494,7 +494,7 @@ export default function RemoteSettings() {
             )}
             {pstatus?.relay?.configured && (
               <Row
-                label="5lime app route"
+                label="Phone listener route"
                 desc="Deprovisions the route on the relay and forgets it here. The next pairing makes a new one."
               >
                 {confirmRelay === "phone" ? (
@@ -515,7 +515,7 @@ export default function RemoteSettings() {
 
           <RoadCard
             name="iroh (peer-to-peer)"
-            desc="Direct peer-to-peer when it can, public iroh relays when it can't. Nothing of ours in the middle. 5lime app only."
+            desc="Direct peer-to-peer when it can, public iroh relays when it can't. Nothing of ours in the middle. Phone listener only."
             state={iroh}
             disabled={!pstatus}
             onToggle={(on) => setRoad("iroh", on)}
@@ -550,14 +550,14 @@ export default function RemoteSettings() {
           <summary className="sgroup-title">Listeners</summary>
           <div className="sgroup-rows">
             <Row
-              label="AITerm app gateway"
+              label="Gateway"
               desc={status
                 ? gatewayOn
                   ? `On · ${listenerLabel(status)} · per-device approval. Fingerprint ${fingerprintLabel(status.fingerprint ?? "")}`
-                  : "Off. The structured-API listener the AITerm app talks to; phones are approved one by one."
+                  : "Off. The structured-API listener; phones are approved one by one."
                 : "Not available."}
             >
-              <label className="sw" aria-label="AITerm app gateway">
+              <label className="sw" aria-label="Gateway">
                 <input
                   type="checkbox"
                   checked={gatewayOn}
@@ -573,20 +573,20 @@ export default function RemoteSettings() {
               </label>
             </Row>
             <Row
-              label="5lime app listener"
+              label="Phone listener"
               desc={pstatus
                 ? pstatus.running
                   ? `On · port ${pstatus.port} · one shared secret. ${pstatus.fingerprint ? `Fingerprint ${fingerprintLabel(pstatus.fingerprint)}` : ""}`
-                  : "Off. Nothing listens for the 5lime app until you turn it on."
+                  : "Off. The token-paired listener; nothing listens until you turn it on."
                 : "Not available."}
             >
-              <label className="sw" aria-label="5lime app listener">
+              <label className="sw" aria-label="Phone listener">
                 <input type="checkbox" checked={phoneOn} disabled={!pstatus} onChange={(e) => togglePhone(e.target.checked)} />
                 <span className="sw-track"><span className="sw-knob" /></span>
               </label>
             </Row>
             {pstatus && (
-              <Row label="This machine's name" desc="What the 5lime app shows for this desktop">
+              <Row label="This machine's name" desc="What a paired phone shows for this desktop">
                 <input
                   type="text" value={pname}
                   onChange={(e) => setPname(e.target.value)}
@@ -609,7 +609,7 @@ export default function RemoteSettings() {
               </Row>
             )}
             {pstatus && (
-              <Row label="Forget every phone" desc="Rotates the 5lime app secret. Each phone must scan a new QR to reconnect.">
+              <Row label="Forget every phone" desc="Rotates the phone listener secret. Each phone must scan a new QR to reconnect.">
                 {confirmForget ? (
                   <span style={{ display: "inline-flex", gap: 8 }}>
                     <button className="act-btn danger" onClick={forget}>Forget</button>
@@ -628,7 +628,7 @@ export default function RemoteSettings() {
         <div className="sgroup">
           <div className="sgroup-title">Connected now</div>
           <div className="sgroup-rows">
-            <Row label="5lime app" desc={pstatus.clients.length === 0
+            <Row label="Phone listener" desc={pstatus.clients.length === 0
               ? (pstatus.running ? "No phone is connected." : "Listener off.")
               : `${pstatus.clients.length} ${pstatus.clients.length === 1 ? "phone" : "phones"} holding a live connection.`} wide={pstatus.clients.length > 0}>
               {pstatus.clients.length > 0 && (
@@ -648,7 +648,7 @@ export default function RemoteSettings() {
 
       {status && (
         <div className="sgroup">
-          <div className="sgroup-title">Paired phones (AITerm app)</div>
+          <div className="sgroup-title">Paired phones (gateway)</div>
           <div className="sgroup-rows">
             {devices.length === 0 ? (
               <div className="sgroup-foot">No phones paired.</div>
