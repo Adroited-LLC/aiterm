@@ -1667,6 +1667,53 @@ fn grok_events_state(text: &str) -> Option<Option<&'static str>> {
     saw_bracket.then(|| open_turn.then_some("working"))
 }
 
+/// The verdict from an antigravity transcript tail
+/// (`~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`).
+/// [observed: agy 1.1.24]
+///
+/// agy writes one record per step, and the step's `type` says where the
+/// turn is: a `USER_INPUT` is a prompt the model has not answered; a
+/// `PLANNER_RESPONSE` carrying `tool_calls` is a call whose result has not
+/// landed — attention when one of them is `ask_question`,
+/// `ask_permission` or `ask_custom_permission`, the tools agy lists for
+/// putting a question to the person; a `GENERIC` step is that result, which
+/// the model now has to act on; a `PLANNER_RESPONSE` with `content` and no
+/// calls is the answer, and the turn is over. `SYSTEM_MESSAGE` (the
+/// "server restart" notice every resume adds) changes nothing. No process
+/// check, exactly as grok's events arm: a killed run mid-turn reads working
+/// until its next resume, which is the inference's known limit. And on an
+/// account with `toolPermission: always-proceed` (this one) the ask_* tools
+/// never fire, so attention never does either.
+///
+/// Nested option as [`grok_events_state`]: outer `None` = no record in the
+/// tail; `Some(None)` = idle; `Some(Some(_))` = working or attention.
+fn antigravity_transcript_state(text: &str) -> Option<Option<&'static str>> {
+    let mut verdict: Option<Option<&'static str>> = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("USER_INPUT") | Some("GENERIC") => verdict = Some(Some("working")),
+            Some("PLANNER_RESPONSE") => {
+                let calls = v.get("tool_calls").and_then(|c| c.as_array()).filter(|c| !c.is_empty());
+                verdict = Some(match calls {
+                    Some(calls) => {
+                        let asks = calls.iter().any(|c| {
+                            matches!(
+                                c.get("name").and_then(|n| n.as_str()),
+                                Some("ask_question" | "ask_permission" | "ask_custom_permission")
+                            )
+                        });
+                        Some(if asks { "attention" } else { "working" })
+                    }
+                    None => None,
+                });
+            }
+            _ => {}
+        }
+    }
+    verdict
+}
+
 /// When the transcript's verdict replaces what the terminal reported.
 /// Cadence may promote to working, but it must not HOLD working against a
 /// transcript that says a person is being waited on: codex's TUI keeps
@@ -1728,6 +1775,15 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
                 return verdict;
             }
         }
+    }
+    // Antigravity: the transcript sits under `…/antigravity-cli/brain/<id>/`
+    // and its step types say where the turn is — the generic parser below
+    // knows none of them, so the verdict comes from the tail alone.
+    // [observed: agy 1.1.24]
+    if path.to_string_lossy().contains("/antigravity-cli/brain/") {
+        return tail_of(&path, 256 * 1024)
+            .and_then(|text| antigravity_transcript_state(&text))
+            .flatten();
     }
     let stale = std::fs::metadata(&path)
         .ok()
@@ -2638,6 +2694,54 @@ mod tests {
             r#"{"ts":"2026-08-31T13:47:04.034Z","type":"permission_resolved","tool_name":"write","decision":"allow","wait_ms":0}"#, "\n",
         );
         assert_eq!(grok_events_state(text), Some(Some("working")));
+    }
+
+    // antigravity_transcript_state — step records below are verbatim from
+    // real agy 1.1.24 conversations on this machine (2026-09-02); the
+    // ask_question call is the one shape not observed, because this account
+    // runs toolPermission=always-proceed and nothing ever asks.
+
+    const AGY_INPUT: &str = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-09-02T16:12:18Z","content":"<USER_REQUEST>\nReply with exactly: pong5\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-09-02T12:12:18-04:00.\n</ADDITIONAL_METADATA>"}"#;
+    const AGY_CALL: &str = r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-02T15:56:15Z","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"ls -la /home/john/nanoclaw/projects/google_ads/\"","Cwd":"\"/home/john/nanoclaw\"","RequestedTerminalID":"\"\"","RunPersistent":"false","WaitMsBeforeAsync":"5000","toolAction":"\"Listing google ads dir\"","toolSummary":"\"List files in projects/google_ads\""}}]}"#;
+    const AGY_RESULT: &str = r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-09-02T15:55:58Z","content":"Created At: 2026-09-02T11:55:58-04:00\nCompleted At: 2026-09-02T11:56:15-04:00\n\nThe command exited with code 0.\nOutput:\n","truncated_fields":["content"]}"#;
+    const AGY_SYSTEM: &str = r#"{"step_index":3,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-09-02T16:06:37Z","content":"The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-09-02T16:06:37Z sender=system priority=MESSAGE_PRIORITY_LOW content=[Notice] All your subagents and background tasks have been stopped due to server restart.\n</SYSTEM_MESSAGE>"}"#;
+    const AGY_ANSWER: &str = r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-02T16:12:18Z","content":"pong5"}"#;
+
+    #[test]
+    fn an_unanswered_antigravity_prompt_is_working() {
+        assert_eq!(antigravity_transcript_state(AGY_INPUT), Some(Some("working")));
+        // The server-restart notice a resume adds does not answer anything.
+        let resumed = [AGY_INPUT, AGY_SYSTEM].join("\n");
+        assert_eq!(antigravity_transcript_state(&resumed), Some(Some("working")));
+    }
+
+    #[test]
+    fn an_open_antigravity_tool_call_is_working_and_so_is_its_result() {
+        let open = [AGY_INPUT, AGY_CALL].join("\n");
+        assert_eq!(antigravity_transcript_state(&open), Some(Some("working")));
+        // The result landed: the model has it to act on, the turn goes on.
+        let landed = [AGY_INPUT, AGY_CALL, AGY_RESULT].join("\n");
+        assert_eq!(antigravity_transcript_state(&landed), Some(Some("working")));
+    }
+
+    #[test]
+    fn an_antigravity_answer_is_an_idle_verdict_not_a_fallback() {
+        let done = [AGY_INPUT, AGY_ANSWER].join("\n");
+        assert_eq!(antigravity_transcript_state(&done), Some(None));
+        // A tail cut to the answer alone still says idle.
+        assert_eq!(antigravity_transcript_state(AGY_ANSWER), Some(None));
+        assert_eq!(antigravity_transcript_state(""), None);
+        assert_eq!(antigravity_transcript_state("not json\n"), None);
+    }
+
+    #[test]
+    fn an_unanswered_antigravity_question_is_attention() {
+        let ask = r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-02T16:20:00Z","tool_calls":[{"name":"ask_question","args":{"Question":"\"Overwrite the file?\"","toolSummary":"\"Ask before overwriting\""}}]}"#;
+        let text = [AGY_INPUT, ask].join("\n");
+        assert_eq!(antigravity_transcript_state(&text), Some(Some("attention")));
+        // Answered: the result is a GENERIC step, and the turn is working again.
+        let answered = [AGY_INPUT, ask, AGY_RESULT].join("\n");
+        assert_eq!(antigravity_transcript_state(&answered), Some(Some("working")));
     }
 
     #[test]
