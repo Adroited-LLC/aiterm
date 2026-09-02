@@ -19,7 +19,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
@@ -82,9 +81,10 @@ private fun TerminalAttachmentTile(
     val preview by produceState<Bitmap?>(null, item.image.file, item.image.length) {
         value = withContext(Dispatchers.IO) { decodePreview(item.image.file.path) }
     }
-    DisposableEffect(preview) {
-        onDispose { preview?.recycle() }
-    }
+    // Compose can retain this bitmap in a recorded graphics layer for a frame
+    // after the tile leaves composition. Recycling it here races that draw and
+    // crashes with "Canvas: trying to use a recycled bitmap". These previews
+    // are sampled to at most 192 px, so let Android reclaim them normally.
     val borderColor = when (item.state) {
         TerminalAttachmentUploadState.Failed -> MaterialTheme.colorScheme.error
         TerminalAttachmentUploadState.Uploading -> Color(0xFF63D3E1)

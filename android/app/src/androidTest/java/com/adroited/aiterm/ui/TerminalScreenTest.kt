@@ -1,5 +1,6 @@
 package com.adroited.aiterm.ui
 
+import android.graphics.Bitmap
 import android.net.Uri
 import android.view.WindowInsets
 import androidx.compose.foundation.layout.Box
@@ -19,6 +20,7 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onAllNodesWithTag
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -143,6 +145,32 @@ class TerminalScreenTest {
         compose.runOnIdle {
             assertTrue(store.draftFor("tab-camera").attachments.items.isEmpty())
             assertTrue(!normalized.file.exists())
+        }
+    }
+
+    @Test
+    fun removingADecodedAttachmentLeavesComposeInChargeOfBitmapLifetime() {
+        val store = TerminalDraftStore()
+        val image = normalizedImage("preview-lifetime")
+        store.updateAttachments("tab-preview-lifetime") { it.add(image).draft }
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-preview-lifetime"),
+                draftStore = store,
+            )
+        }
+
+        compose.waitUntil(5_000) {
+            compose.onAllNodesWithContentDescription("Attached image")
+                .fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithTag("terminal-image-remove-preview-lifetime").performClick()
+        compose.waitForIdle()
+
+        compose.runOnIdle {
+            assertTrue(store.draftFor("tab-preview-lifetime").attachments.items.isEmpty())
+            assertTrue(!image.file.exists())
         }
     }
 
@@ -1292,7 +1320,14 @@ class TerminalScreenTest {
 
     private fun normalizedImage(id: String): NormalizedTerminalImage {
         val file = File(compose.activity.cacheDir, "terminal-image-drafts/test-$id.jpg")
-            .apply { parentFile?.mkdirs(); writeBytes(byteArrayOf(0xff.toByte(), id.length.toByte(), 0xd9.toByte())) }
+            .apply {
+                parentFile?.mkdirs()
+                val bitmap = Bitmap.createBitmap(80, 40, Bitmap.Config.ARGB_8888)
+                outputStream().use { output ->
+                    check(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output))
+                }
+                bitmap.recycle()
+            }
         return NormalizedTerminalImage(
             id = id,
             file = file,
