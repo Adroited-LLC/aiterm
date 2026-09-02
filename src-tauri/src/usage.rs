@@ -41,6 +41,20 @@
 //!   "sibling rotation" and "refresh-token double-spend", which is a rotating
 //!   refresh token, and spending it from here would sign the CLI out. An
 //!   expired token is reported as *rejected* with "open grok", not repaired.
+//! * **Antigravity** — `agy -p /usage --output-format json`, the CLI's own
+//!   read-only slash command, which answers without a model call and
+//!   without leaving a conversation behind (verified: no new
+//!   `conversations/<id>.db` after a slash-only run). Its
+//!   `command.data.groups[].buckets[]` carry `remaining_fraction` and
+//!   `reset_time` for two groups (Gemini; Claude and GPT) × two windows
+//!   (weekly; 5-hour). The backend endpoint is
+//!   `daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+//!   behind a consumer OAuth token in the OS keyring with a private request
+//!   proto, so the CLI is the supported path — at ~1–2 s per spawn (it
+//!   starts a language server every time), so the answer is cached for five
+//!   minutes and never fetched twice at once. `/credits` rides along for G1
+//!   credits. The account email is read off the CLI's own log, the only
+//!   place it is written. [observed: agy 1.1.24]
 //! * **API providers** — `GET {base_url}/credits` with the saved bearer token.
 //!   Verified against OpenRouter, which answers
 //!   `{"data":{"total_credits":…,"total_usage":…}}`. Any provider whose reply
@@ -80,7 +94,9 @@ use serde::Serialize;
 pub struct UsageBar {
     /// Stable-ish key for React lists and for picking a bar out by meaning:
     /// "session" | "weekly_all" | "weekly_scoped" from Anthropic, or
-    /// "codex_primary" | "codex_secondary", or "grok_period".
+    /// "codex_primary" | "codex_secondary", or "grok_period", or
+    /// Antigravity's "weekly_gemini" | "five_hour_gemini" |
+    /// "weekly_claude_gpt" | "five_hour_claude_gpt".
     pub kind: String,
     /// Human label: "Current session", "All models", "Fable", "Weekly limit".
     pub label: String,
@@ -117,7 +133,7 @@ pub struct UsageAmount {
 /// see the module note on why silence is not an acceptable way to say "no".
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct UsageSource {
-    /// "anthropic" | "codex" | "grok" | "provider:<provider id>".
+    /// "anthropic" | "codex" | "grok" | "antigravity" | "provider:<provider id>".
     pub id: String,
     pub name: String,
     /// "ok" — the numbers below are real.
@@ -954,6 +970,193 @@ fn grok_source() -> Option<UsageSource> {
 }
 
 // ---------------------------------------------------------------------------
+// Antigravity
+// ---------------------------------------------------------------------------
+
+/// The four buckets `/usage` reports, by their ids. [observed: agy 1.1.24]
+/// The weekly kinds start with `weekly` so the phone's headline-bar rule
+/// picks them without an arm of its own.
+fn antigravity_bar_kind(bucket_id: &str) -> Option<(&'static str, &'static str)> {
+    match bucket_id {
+        "gemini-weekly" => Some(("weekly_gemini", "Gemini weekly")),
+        "gemini-5h" => Some(("five_hour_gemini", "Gemini 5-hour")),
+        "3p-weekly" => Some(("weekly_claude_gpt", "Claude & GPT weekly")),
+        "3p-5h" => Some(("five_hour_claude_gpt", "Claude & GPT 5-hour")),
+        _ => None,
+    }
+}
+
+/// Turn `agy -p /usage --output-format json` — its exit code and stdout —
+/// into a source. `remaining_fraction` is what is *left*; a bar's `percent`
+/// is what is used, as every other source expresses it, so it is inverted
+/// here. A non-zero exit is agy refusing (signed out, no network to sign in
+/// with) and reads as rejected with "open agy", the way grok's expired token
+/// does; output that is not the JSON shape is unreachable.
+pub fn parse_antigravity(exit: i32, body: &str) -> UsageSource {
+    let mut src = UsageSource::blank("antigravity", "Antigravity");
+    if exit != 0 {
+        src.state = "rejected".into();
+        src.detail = format!("agy could not answer /usage (exit {exit}). Open agy once and sign in.");
+        return src;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        src.state = "unreachable".into();
+        src.detail = "agy did not answer /usage with JSON.".into();
+        return src;
+    };
+    if v.get("status").and_then(|s| s.as_str()) != Some("SUCCESS") {
+        src.state = "rejected".into();
+        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("no reason given");
+        src.detail = format!("agy refused /usage — {err}. Open agy once and sign in.");
+        return src;
+    }
+    let Some(groups) = v.pointer("/command/data/groups").and_then(|g| g.as_array()) else {
+        src.state = "unreachable".into();
+        src.detail = "agy answered, but with no usage in it.".into();
+        return src;
+    };
+    for group in groups {
+        let group_name = group.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        for bucket in group.get("buckets").and_then(|b| b.as_array()).into_iter().flatten() {
+            let Some(remaining) = bucket.get("remaining_fraction").and_then(|r| r.as_f64()) else {
+                continue;
+            };
+            let id = bucket.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let (kind, label) = match antigravity_bar_kind(id) {
+                Some((k, l)) => (k.to_string(), l.to_string()),
+                None => (
+                    format!(
+                        "{}_{}",
+                        bucket.get("window").and_then(|w| w.as_str()).unwrap_or("window"),
+                        id
+                    ),
+                    format!(
+                        "{group_name} {}",
+                        bucket.get("name").and_then(|n| n.as_str()).unwrap_or(id)
+                    ),
+                ),
+            };
+            let percent = ((1.0 - remaining) * 100.0).clamp(0.0, 100.0);
+            src.bars.push(UsageBar {
+                kind,
+                label,
+                percent,
+                severity: severity_for(percent).to_string(),
+                resets_at: bucket
+                    .get("reset_time")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    if src.bars.is_empty() {
+        src.state = "unreachable".into();
+        src.detail = "agy answered, but with no usage in it.".into();
+    }
+    src
+}
+
+/// `agy -p /credits --output-format json` → a G1 credit balance, only when
+/// there is one: `{"remaining_credits":0,…}` is the ordinary state of an
+/// account not buying credits, and a zero row would read as "out".
+/// [observed: agy 1.1.24]
+pub fn parse_antigravity_credits(body: &str) -> Option<UsageAmount> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let credits = v.pointer("/command/data/remaining_credits")?.as_f64()?;
+    (credits > 0.0).then(|| UsageAmount {
+        label: "G1 credits".into(),
+        amount: credits,
+        of: None,
+        // agy names no unit for these.
+        currency: String::new(),
+        sense: "remaining".into(),
+    })
+}
+
+/// The signed-in account, out of the CLI's own log — the only place it is
+/// written (`applyAuthResult: email=…, authMethod=consumer`); no config or
+/// auth file under `~/.gemini` carries it, and the token in the keyring is
+/// not looked at. `cli.log` at the store root is a symlink to the newest log;
+/// the `log/` directory is walked newest-first when it is not there.
+/// [observed: agy 1.1.24]
+fn antigravity_account() -> Option<String> {
+    let root = crate::antigravity::store_root()?;
+    let mut candidates = vec![root.join("cli.log")];
+    if let Ok(dir) = std::fs::read_dir(root.join("log")) {
+        let mut logs: Vec<std::path::PathBuf> = dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "log"))
+            .collect();
+        logs.sort();
+        candidates.extend(logs.into_iter().rev().take(5));
+    }
+    for path in candidates {
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if meta.len() > 4 * 1024 * 1024 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        if let Some(email) = antigravity_email_in(&text) {
+            return Some(email);
+        }
+    }
+    None
+}
+
+fn antigravity_email_in(log: &str) -> Option<String> {
+    let i = log.find("applyAuthResult: email=")? + "applyAuthResult: email=".len();
+    let rest = &log[i..];
+    let end = rest.find(|c: char| c == ',' || c.is_whitespace()).unwrap_or(rest.len());
+    let email = rest[..end].trim();
+    (!email.is_empty()).then(|| email.to_string())
+}
+
+static ANTIGRAVITY_CACHE: std::sync::Mutex<Option<(std::time::Instant, UsageSource)>> =
+    std::sync::Mutex::new(None);
+
+/// `None` when agy is not installed here — same rule as Codex and Grok: an
+/// absent tool gets no row. The answer is held for five minutes, and the
+/// lock is held across the spawn so two pollers (the desktop strip and the
+/// phone) cannot start two agy processes: the second waits and gets the
+/// first's answer.
+fn antigravity_source() -> Option<UsageSource> {
+    let bin = crate::antigravity::agy_bin()?;
+    let mut cache = ANTIGRAVITY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, src)) = cache.as_ref() {
+        if at.elapsed().as_secs() < 300 {
+            return Some(src.clone());
+        }
+    }
+    let run = |slash: &str| {
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.args(["-p", slash, "--output-format", "json"]);
+        if let Some(home) = dirs::home_dir() {
+            cmd.current_dir(home);
+        }
+        crate::antigravity::run_capped(cmd, std::time::Duration::from_secs(8))
+    };
+    let mut src = match run("/usage") {
+        Err(e) => UsageSource::failed(
+            "antigravity",
+            "Antigravity",
+            "unreachable",
+            &format!("agy did not answer /usage — {e}"),
+        ),
+        Ok((code, out)) => parse_antigravity(code, &out),
+    };
+    if src.state == "ok" {
+        if let Ok((0, out)) = run("/credits") {
+            src.amounts.extend(parse_antigravity_credits(&out));
+        }
+        src.account = antigravity_account().unwrap_or_default();
+    }
+    *cache = Some((std::time::Instant::now(), src.clone()));
+    Some(src)
+}
+
+// ---------------------------------------------------------------------------
 // Configured API providers
 // ---------------------------------------------------------------------------
 
@@ -1076,6 +1279,7 @@ pub fn usage_report() -> Vec<UsageSource> {
         let claude = s.spawn(anthropic_source);
         let codex = s.spawn(codex_source);
         let grok = s.spawn(grok_source);
+        let antigravity = s.spawn(antigravity_source);
         let provider_jobs: Vec<_> = providers
             .iter()
             .map(|p| s.spawn(move || provider_source(p)))
@@ -1092,6 +1296,9 @@ pub fn usage_report() -> Vec<UsageSource> {
         }
         if let Ok(Some(g)) = grok.join() {
             out.push(g);
+        }
+        if let Ok(Some(a)) = antigravity.join() {
+            out.push(a);
         }
         for j in provider_jobs {
             if let Ok(p) = j.join() {
@@ -1359,6 +1566,103 @@ mod tests {
         assert_eq!(parse_grok(200, r#"{"config":{}}"#).state, "unreachable");
     }
 
+    /// `agy -p /usage --output-format json` 1.1.24, verbatim, captured
+    /// 2026-09-02.
+    const ANTIGRAVITY_BODY: &str = r#"{"conversation_id":"","status":"SUCCESS","response":"Gemini Models\tWeekly Limit Remaining\t98%\t2026-09-09T15:55:56Z\nGemini Models\tFive Hour Limit Remaining\t96%\t2026-09-02T20:55:56Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t2026-09-09T16:04:32Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-02T21:04:32Z\n","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"usage","data":{"description":"Within each group, models share a weekly limit and a 5-hour limit. Quota is consumed proportionally to the cost of the tokens. Thus, limits will last longer with shorter tasks or using more cost-effective models. The 5-hour limit smooths out aggregate demand to fairly distribute global capacity across all users, while your weekly limit is tied directly to your individual tier.","groups":[{"name":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","description":"You have used some of your weekly limit, it will fully refresh in 6 days, 23 hours.","window":"weekly","remaining_fraction":0.9805102944374084,"reset_time":"2026-09-09T15:55:56Z"},{"id":"gemini-5h","name":"Five Hour Limit Remaining","description":"You have used some of your 5-hour limit, it will fully refresh in 4 hours, 51 minutes.","window":"5h","remaining_fraction":0.9574214220046997,"reset_time":"2026-09-02T20:55:56Z"}]},{"name":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1,"reset_time":"2026-09-09T16:04:32Z"},{"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1,"reset_time":"2026-09-02T21:04:32Z"}]}]}}}"#;
+
+    /// `agy -p /credits --output-format json` 1.1.24, verbatim.
+    const ANTIGRAVITY_CREDITS: &str = r#"{"conversation_id":"","status":"SUCCESS","response":"Remaining credits\t0\nUpgrade\thttps://antigravity.google/g1-upgrade\n","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"credits","data":{"remaining_credits":0,"upgrade_uri":"https://antigravity.google/g1-upgrade"}}}"#;
+
+    #[test]
+    fn antigravity_buckets_become_four_bars_of_used_percent() {
+        let src = parse_antigravity(0, ANTIGRAVITY_BODY);
+        assert_eq!(src.state, "ok", "{}", src.detail);
+        assert_eq!(src.id, "antigravity");
+        assert_eq!(src.name, "Antigravity");
+        let kinds: Vec<&str> = src.bars.iter().map(|b| b.kind.as_str()).collect();
+        assert_eq!(kinds, ["weekly_gemini", "five_hour_gemini", "weekly_claude_gpt", "five_hour_claude_gpt"]);
+        let labels: Vec<&str> = src.bars.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["Gemini weekly", "Gemini 5-hour", "Claude & GPT weekly", "Claude & GPT 5-hour"]);
+        // remaining 0.9805 → 1.95% used, never 98%.
+        assert!((src.bars[0].percent - 1.9489705562).abs() < 1e-6, "got {}", src.bars[0].percent);
+        assert!((src.bars[1].percent - 4.2578577995).abs() < 1e-6, "got {}", src.bars[1].percent);
+        assert_eq!(src.bars[2].percent, 0.0);
+        assert_eq!(src.bars[3].percent, 0.0);
+        assert_eq!(src.bars[0].resets_at, "2026-09-09T15:55:56Z");
+        assert_eq!(src.bars[1].resets_at, "2026-09-02T20:55:56Z");
+        assert!(src.bars.iter().all(|b| b.severity == "normal"));
+        assert!(src.amounts.is_empty());
+        assert_eq!(src.account, "", "the parser does not know who; the source fills that in");
+    }
+
+    #[test]
+    fn antigravity_severity_follows_what_is_used() {
+        let body = r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.05,"reset_time":"2026-09-09T15:55:56Z"},{"id":"gemini-5h","window":"5h","remaining_fraction":0.2,"reset_time":""},{"id":"new-bucket","name":"Daily Limit Remaining","window":"daily","remaining_fraction":0.5}]}]}}}"#;
+        let src = parse_antigravity(0, body);
+        assert_eq!(src.bars[0].severity, "critical");
+        assert_eq!(src.bars[1].severity, "warning");
+        assert_eq!(src.bars[1].resets_at, "");
+        // A bucket agy has not named yet is still shown, under its own id.
+        assert_eq!(src.bars[2].kind, "daily_new-bucket");
+        assert_eq!(src.bars[2].label, "Gemini Models Daily Limit Remaining");
+        assert_eq!(src.bars[2].percent, 50.0);
+    }
+
+    #[test]
+    fn antigravity_credits_show_only_when_there_are_any() {
+        assert_eq!(parse_antigravity_credits(ANTIGRAVITY_CREDITS), None, "0 is not a balance");
+        let some = ANTIGRAVITY_CREDITS.replace(r#""remaining_credits":0"#, r#""remaining_credits":250"#);
+        let a = parse_antigravity_credits(&some).unwrap();
+        assert_eq!(a.label, "G1 credits");
+        assert_eq!(a.amount, 250.0);
+        assert_eq!(a.sense, "remaining");
+        assert_eq!(a.currency, "");
+        assert_eq!(parse_antigravity_credits("nope"), None);
+    }
+
+    #[test]
+    fn antigravity_failures_are_told_apart() {
+        let rejected = parse_antigravity(1, "");
+        assert_eq!(rejected.state, "rejected");
+        assert!(rejected.detail.contains("Open agy"), "{}", rejected.detail);
+        let refused = parse_antigravity(0, r#"{"conversation_id":"","status":"ERROR","response":"","error":"not authenticated"}"#);
+        assert_eq!(refused.state, "rejected");
+        assert!(refused.detail.contains("not authenticated"), "{}", refused.detail);
+        assert_eq!(parse_antigravity(0, "Fetching...").state, "unreachable");
+        // 200-shaped with no usage in it is not "0% used".
+        assert_eq!(parse_antigravity(0, r#"{"status":"SUCCESS","command":{"name":"usage","data":{}}}"#).state, "unreachable");
+        assert_eq!(parse_antigravity(0, r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}}"#).state, "unreachable");
+    }
+
+    /// The log line, verbatim from `log/cli-20260902_121215.log` with the
+    /// glog prefix kept.
+    #[test]
+    fn antigravity_account_is_read_off_the_log() {
+        let log = "ERROR: logging before google.Init: I0902 12:12:16.101 60 auth.go:212] applyAuthResult: email=john.m.allison@gmail.com, authMethod=consumer, quotaProject=\nnext line\n";
+        assert_eq!(antigravity_email_in(log).as_deref(), Some("john.m.allison@gmail.com"));
+        assert_eq!(antigravity_email_in("nothing here"), None);
+    }
+
+    /// Runs the real `agy`. Ignored so `cargo test` stays offline; run with
+    /// `cargo test --lib -- --ignored --nocapture usage::tests::antigravity_live`.
+    /// Prints, never fails: an absent or signed-out agy is a fact, not a bug.
+    #[test]
+    #[ignore = "runs agy"]
+    fn antigravity_live_answers() {
+        match antigravity_source() {
+            None => println!("agy is not installed here"),
+            Some(src) => {
+                println!("antigravity: state={} account={} detail={}", src.state, src.account, src.detail);
+                for b in &src.bars {
+                    println!("  {} ({}) {:.2}% used, {}, resets {}", b.label, b.kind, b.percent, b.severity, b.resets_at);
+                }
+                for a in &src.amounts {
+                    println!("  {} {} {}", a.label, a.amount, a.sense);
+                }
+            }
+        }
+    }
+
     /// The live OpenRouter reply, curled with a real key while this was written.
     #[test]
     fn openrouter_credits_are_the_difference_not_the_total() {
@@ -1430,6 +1734,10 @@ mod tests {
             None => println!("grok is not installed here"),
             Some(g) => check(g),
         }
+        match antigravity_source() {
+            None => println!("agy is not installed here"),
+            Some(a) => check(a),
+        }
         match std::env::var("OPENROUTER_API_KEY") {
             Err(_) => println!("OPENROUTER_API_KEY unset — skipped the provider path"),
             Ok(key) => check(provider_source(
@@ -1455,6 +1763,7 @@ mod tests {
             parse_anthropic(200, ANTHROPIC_BODY),
             parse_codex(200, CODEX_BODY),
             parse_grok(200, GROK_BODY),
+            parse_antigravity(0, ANTIGRAVITY_BODY),
             parse_provider_credits(
                 "openrouter",
                 "OpenRouter",
