@@ -2367,6 +2367,7 @@ export default function App() {
                   canResume={(session) => capsOf(session.agent).resume}
                 />
               ) : <SessionsPanel
+                hoverSummary={settings.sessionHover}
                 sessions={displayedSessions}
                 projects={projects}
                 activeProject={activeProject}

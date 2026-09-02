@@ -180,6 +180,8 @@ interface Props {
    *  project or group header. The panel has already excluded anything a per-row
    *  🗑 would refuse. */
   onTrashSessions: (sessions: Session[]) => void;
+  /** Open the summary card when the pointer rests on a row. */
+  hoverSummary?: boolean;
 }
 
 /** How many recent rows render before "Show all" — a screen and a half of
@@ -193,6 +195,7 @@ export default function SessionsPanel({
   onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
+  hoverSummary = true,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
@@ -317,6 +320,7 @@ export default function SessionsPanel({
   const flyCache = useRef<Map<string, SessionDetail>>(new Map());
   const [flyDetail, setFlyDetail] = useState<SessionDetail | null>(null);
   const flyEnter = (s: Session, el: HTMLElement, running: boolean) => {
+    if (!hoverSummary) return;
     if (flyTimer.current) window.clearTimeout(flyTimer.current);
     flyTimer.current = window.setTimeout(() => {
       const r = el.getBoundingClientRect();
