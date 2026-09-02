@@ -2353,12 +2353,22 @@ export default function App() {
 
   // The phone watches the relay too: report each phase change against the
   // sessions the two tabs run, so a phone looking at either sees the crew.
+  // One relay runs at a time: a new bring-in supersedes one in flight. The
+  // superseded one is reported stopped against ITS session, or the phone
+  // watching that session would show "waiting" for ever.
+  const lastRelayReport = useRef<{ aSid: string; bSid: string | null; bName: string; round: number; rounds: number; inFlight: boolean } | null>(null);
   useEffect(() => {
     const r = relayCtl.relay;
     if (!r) return;
     const aTab = tabs.find((t) => t.key === r.aKey);
     if (!aTab?.sessionId) return;
     const bTab = tabs.find((t) => t.key === r.bKey);
+    const prev = lastRelayReport.current;
+    if (prev && prev.inFlight && prev.aSid !== aTab.sessionId) {
+      relayReport(prev.aSid, prev.bSid, prev.bName, "stopped", prev.round, prev.rounds, "replaced by a newer bring-in").catch(() => {});
+    }
+    const inFlight = r.phase === "opening" || r.phase === "waitB" || r.phase === "waitA";
+    lastRelayReport.current = { aSid: aTab.sessionId, bSid: bTab?.sessionId ?? null, bName: r.bName, round: r.round, rounds: r.rounds, inFlight };
     relayReport(aTab.sessionId, bTab?.sessionId ?? null, r.bName, r.phase, r.round, r.rounds, r.note).catch(() => {});
   }, [relayCtl.relay, tabs]);
 

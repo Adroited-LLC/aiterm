@@ -20,7 +20,7 @@
 //! trash is a separate piece of work, so the button is withheld rather than
 //! wired to something that half-works.
 
-use crate::agents::{q, detect_cli, AgentBackend, Caps, Detection, LaunchSpec, ModelOption, PermissionMode};
+use crate::agents::{prompt_of, q, detect_cli, AgentBackend, Caps, Detection, LaunchSpec, ModelOption, PermissionMode};
 use crate::sessions::{Session, SessionProvider};
 use std::path::{Path, PathBuf};
 
@@ -628,6 +628,13 @@ impl AgentBackend for GrokBackend {
         if let Some(id) = spec.session_id.as_deref().filter(|s| !s.is_empty()) {
             cmd.push_str(&format!(" --session-id {}", q(id)));
         }
+        // `grok [OPTIONS] [PROMPT]` — the first thing to say goes last, as a
+        // positional, the way claude and codex take it. It was dropped here
+        // once: a brought-in Grok opened to an empty prompt and sat there
+        // while the relay waited on a reply that could never come.
+        if let Some(p) = prompt_of(spec) {
+            cmd.push_str(&format!(" {}", q(p)));
+        }
         cmd
     }
 }
@@ -819,6 +826,18 @@ mod tests {
         assert_eq!(
             cmd,
             "grok --model 'grok-4.6' --reasoning-effort 'xhigh' --session-id 'e63b0f22-7d69-4084-aaf3-733816255e8e'"
+        );
+        // The opening prompt rides along as the positional, after the flags.
+        let with_prompt = GrokBackend.launch(&LaunchSpec {
+            model: Some("grok-4.6".into()),
+            effort: None,
+            session_id: Some("e63b0f22-7d69-4084-aaf3-733816255e8e".into()),
+            provider: None,
+            prompt: Some("  you've been brought in  ".into()),
+        });
+        assert_eq!(
+            with_prompt,
+            "grok --model 'grok-4.6' --session-id 'e63b0f22-7d69-4084-aaf3-733816255e8e' 'you'\\''ve been brought in'"
         );
         assert_eq!(
             GrokBackend.resume("e63b0f22-7d69-4084-aaf3-733816255e8e").unwrap(),
