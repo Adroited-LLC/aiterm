@@ -2221,7 +2221,7 @@ export default function App() {
    *  yet means ask for one first. */
   const launchFromHome = useCallback(async (prompt: string) => {
     if (!emptyCtl.ready) {
-      setNotice("Nothing to start yet — set up the API tab, or install claude, codex or grok.");
+      setNotice("Nothing to start yet — set up the API tab, or install claude, codex, grok or antigravity.");
       return;
     }
     let cwd = homeCwd;

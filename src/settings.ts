@@ -18,7 +18,7 @@ export interface LibrarianSettings {
   enabled: boolean;
   /** How the model is reached: an installed CLI in its print mode — which
    *  runs on the plan already paid for — or an API provider. */
-  engine: "claude" | "codex" | "grok" | "api";
+  engine: "claude" | "codex" | "grok" | "antigravity" | "api";
   /** Provider id from Model access; only for `engine: "api"`. */
   providerId: string;
   /** Model id in the engine's spelling; "" means the CLI's default. */

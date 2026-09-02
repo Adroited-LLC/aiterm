@@ -3064,6 +3064,9 @@ input[type="range"]::-webkit-slider-thumb {
 .agent-icon.codex, .agent-icon.openai { color: var(--green); }
 .agent-icon.api { color: var(--blue); }
 .agent-icon.grok { color: var(--magenta); }
+/* Antigravity is Google's: the same blue the API socket wears, since its
+   mark is drawn in ink and needs a hue from the theme. */
+.agent-icon.antigravity { color: var(--blue); }
 /* OpenCode runs the same API models the socket marks, so it takes the hue next
    to it rather than an unrelated fifth — related engines, related colour. */
 .agent-icon.opencode { color: var(--cyan); }

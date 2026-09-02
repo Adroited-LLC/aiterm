@@ -268,7 +268,7 @@ export default function StartControls({ ctl, onOpenModelAccess, allowApi = true 
       )}
       {agents.length === 0 && !isApi && (
         <div className="empty-note">
-          No agent CLI installed — install claude, codex or grok
+          No agent CLI installed — install claude, codex, grok or antigravity
           {allowApi ? ", or use the API tab" : ""}.
         </div>
       )}

@@ -347,7 +347,7 @@ export interface UsageAmount {
 /** One service's answer. Always present, even when it could not be reached:
  *  see `usage.rs` on why an absent row is not an acceptable way to say "no". */
 export interface UsageSource {
-  /** "anthropic" | "codex" | "grok" | "provider:<id>". */
+  /** "anthropic" | "codex" | "grok" | "antigravity" | "provider:<id>". */
   id: string;
   name: string;
   /** "ok" | "signed_out" | "unreachable" | "rejected" | "limited" | "no_balance".

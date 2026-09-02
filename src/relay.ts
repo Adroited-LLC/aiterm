@@ -45,17 +45,19 @@ const CONTEXT_CHARS = 24_000;
  * invisible to the phone, and its ticking spinner kept the state on
  * "working"). Codex: `-a never` auto-approves inside a read-only sandbox
  * [observed: codex-cli 0.150.1]. Claude and grok: plan mode reads without
- * asking [observed: Claude Code 2.1.251, grok 1.0.13]. An engine not listed
- * keeps its stored mode.
+ * asking [observed: Claude Code 2.1.251, grok 1.0.13]; antigravity's `--mode
+ * plan` is the same idea [agy 1.1.24 --help]. An engine not listed keeps
+ * its stored mode.
  */
 const RELAY_PERMISSIONS: Record<string, string> = {
   codex: "-a never -s read-only",
   claude: "--permission-mode plan --allow-dangerously-skip-permissions",
   grok: "--permission-mode plan",
+  antigravity: "--mode plan",
 };
 
 function engineName(agentId: string | undefined, model?: string | null): string {
-  const base = agentId === "claude" ? "Claude Code" : agentId === "codex" ? "Codex" : agentId === "grok" ? "Grok" : agentId ?? "the other agent";
+  const base = agentId === "claude" ? "Claude Code" : agentId === "codex" ? "Codex" : agentId === "grok" ? "Grok" : agentId === "antigravity" ? "Antigravity" : agentId ?? "the other agent";
   return model ? `${base} (${model})` : base;
 }
 

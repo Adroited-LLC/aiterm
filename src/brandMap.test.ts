@@ -6,7 +6,7 @@ import {
 } from "./brandMap.ts";
 
 test("every engine has a mark; the non-vendors do not", () => {
-  for (const a of ["claude", "codex", "grok", "opencode"]) assert.ok(brandForAgent(a), a);
+  for (const a of ["claude", "codex", "grok", "opencode", "antigravity"]) assert.ok(brandForAgent(a), a);
   assert.equal(brandForAgent("api"), null);
   assert.equal(brandForAgent("shell"), null);
 });
@@ -24,6 +24,7 @@ test("ink is not an accent; the theme steps in for those engines", () => {
   assert.equal(brandAccent("codex"), null); // #fff
   assert.equal(agentAccent("codex"), "var(--green)");
   assert.equal(agentAccent("grok"), "var(--magenta)");
+  assert.equal(agentAccent("antigravity"), "var(--blue)");
   assert.equal(agentAccent("claude"), BRANDS.claude.color);
   assert.deepEqual(agentTint("shell"), { className: "" });
   assert.equal(agentTint("claude").className, " branded");
@@ -95,5 +96,6 @@ test("usage sources", () => {
   assert.equal(brandForUsageSource("anthropic", "Claude"), "claude");
   assert.equal(brandForUsageSource("codex", "Codex"), "codex");
   assert.equal(brandForUsageSource("grok", "Grok"), "grok");
+  assert.equal(brandForUsageSource("antigravity", "Antigravity"), "antigravity");
   assert.equal(brandForUsageSource("provider:abc", "OpenRouter"), "openrouter");
 });
