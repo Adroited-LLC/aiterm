@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "aiterm"
-version = "0.10.66"
+version = "0.10.67"
 dependencies = [
  "aiterm-relay-protocol",
  "alacritty_terminal",
