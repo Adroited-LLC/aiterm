@@ -1224,6 +1224,39 @@ export interface PhoneRemoteStatus {
   iroh_enabled: boolean;
   /** The reach-from-anywhere address: this desktop's iroh node id. */
   iroh_node: string | null;
+  /** Which roads are on — see docs/remote-roads.md. */
+  roads: PhoneRemoteRoads;
+  /** What the VPN road sees on this machine right now. */
+  vpn: PhoneRemoteVpn;
+  /** The relay road: enrolled route, connector state, pending draft. */
+  relay: PhoneRemoteRelay;
+  /** Custom iroh relay URL; null = iroh's default relays. */
+  iroh_relay_url: string | null;
+}
+export type PhoneRemoteRoad = "lan" | "vpn" | "relay" | "iroh";
+export interface PhoneRemoteRoads {
+  lan: boolean;
+  vpn: boolean;
+  relay: boolean;
+  iroh: boolean;
+}
+export interface PhoneRemoteVpn {
+  detected: boolean;
+  kind: "tailscale" | "wireguard" | "other" | null;
+  interface: string | null;
+  address: string | null;
+  /** Tailscale's MagicDNS name for this machine, when the CLI answers. */
+  magic_dns: string | null;
+}
+export interface PhoneRemoteRelay {
+  configured: boolean;
+  state: "off" | "connecting" | "connected" | "retrying";
+  host: string | null;
+  port: number | null;
+  /** The relay control server routes are enrolled with. */
+  server: string;
+  /** A QR is out with a digest the phone has not signed yet. */
+  pending_enrollment: boolean;
 }
 export interface PhoneRemoteClient {
   id: number;
@@ -1252,6 +1285,15 @@ export const phoneRemotePairPayload = () => invoke<PhonePairPayload>("remote_pai
 /** iroh on/off, live — the LAN route is untouched either way. */
 export const phoneRemoteSetIroh = (on: boolean) =>
   invoke<PhoneRemoteStatus>("remote_set_iroh", { on });
+/** One road on or off, live. Relay on with no route prepares nothing by
+ *  itself — the next QR offers enrollment. */
+export const phoneRemoteSetRoad = (road: PhoneRemoteRoad, on: boolean) =>
+  invoke<PhoneRemoteStatus>("remote_set_road", { road, on });
+/** A custom iroh relay (null = default). Restarts a running tunnel. */
+export const phoneRemoteSetIrohRelayUrl = (url: string | null) =>
+  invoke<PhoneRemoteStatus>("remote_set_iroh_relay_url", { url });
+/** Forget the phone relay route: release it at the relay, delete the file, stop the connector. */
+export const phoneRemoteRelayClear = () => invoke<PhoneRemoteStatus>("remote_phone_relay_clear");
 /** One QR that pairs either phone app: the gateway invite with the phone
  *  listener's fields riding behind under their own names. */
 export const remoteBeginPairingCombined = () => invoke<PairingInvite>("remote_begin_pairing_combined");

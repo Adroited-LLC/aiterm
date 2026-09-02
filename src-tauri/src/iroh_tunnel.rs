@@ -15,7 +15,7 @@
 
 use iroh::endpoint::{presets, Connection, Endpoint, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::SecretKey;
+use iroh::{RelayMode, RelayUrl, SecretKey};
 
 pub const ALPN: &[u8] = b"aiterm/remote/0";
 
@@ -98,11 +98,19 @@ async fn pump(mut send: SendStream, mut recv: RecvStream, port: u16) {
     tokio::join!(up, down);
 }
 
-/// Bind the endpoint and start forwarding to the local listener.
-pub async fn start(secret: SecretKey, port: u16) -> Result<Tunnel, String> {
-    let endpoint = Endpoint::builder(presets::N0)
+/// Bind the endpoint and start forwarding to the local listener. With a
+/// `relay_url` the endpoint uses that relay alone instead of n0's — for a
+/// person who runs their own iroh-relay and wants no third party even for
+/// the fallback path.
+pub async fn start(secret: SecretKey, port: u16, relay_url: Option<String>) -> Result<Tunnel, String> {
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec()]);
+    if let Some(url) = relay_url {
+        let url: RelayUrl = url.parse().map_err(|e| format!("iroh relay URL {url:?} is invalid: {e}"))?;
+        builder = builder.relay_mode(RelayMode::custom([url]));
+    }
+    let endpoint = builder
         .bind()
         .await
         .map_err(|e| format!("iroh bind failed: {e}"))?;

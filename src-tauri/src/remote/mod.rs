@@ -718,7 +718,7 @@ pub async fn remote_begin_pairing_combined(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
     let (mut payload, now) = begin_pairing_payload(&state).await?;
-    if let Some(ext) = crate::remote_api::pair_extension(&app) {
+    if let Some(ext) = crate::remote_api::pair_extension(&app).await {
         payload.push_str(&ext);
     }
     let svg = pairing_qr_svg(&payload).ok_or("the pairing payload could not be rendered")?;

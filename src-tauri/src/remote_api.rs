@@ -43,6 +43,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 
+use crate::remote::relay::{RelayConfig, RelayConnectionState, RelayConnectorHandle, RelayEnrollmentDraft};
+use crate::remote_roads::{self, VpnStatus};
+
 const DEFAULT_PORT: u16 = 8877;
 /// Bumped when a phone would misread an older desktop. The phone checks it.
 const API_VERSION: u32 = 1;
@@ -65,6 +68,20 @@ pub struct Config {
     /// but a person who wants LAN/VPN only can turn just this off.
     #[serde(default = "default_true")]
     pub iroh_enabled: bool,
+    /// The direct roads (`docs/remote-roads.md`): private addresses on the
+    /// same network, and tunnel addresses (Tailscale, WireGuard…). Each
+    /// decides whether its addresses go in the QR and in `/v1/status`.
+    #[serde(default = "default_true")]
+    pub lan_enabled: bool,
+    #[serde(default = "default_true")]
+    pub vpn_enabled: bool,
+    /// The AITerm relay road. Off by default; it carries nothing until a
+    /// phone enrolls a route (`phone-relay.json`), which the next QR offers.
+    #[serde(default)]
+    pub relay_enabled: bool,
+    /// A custom iroh relay URL. None = iroh's default (n0) relays.
+    #[serde(default)]
+    pub iroh_relay_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -80,9 +97,16 @@ impl Default for Config {
             name: hostname(),
             iroh_secret: crate::iroh_tunnel::new_secret_hex(),
             iroh_enabled: true,
+            lan_enabled: true,
+            vpn_enabled: true,
+            relay_enabled: false,
+            iroh_relay_url: None,
         }
     }
 }
+
+/// The phone listener's relay route, beside the gateway's `relay.json`.
+const PHONE_RELAY_FILE: &str = "phone-relay.json";
 
 fn hostname() -> String {
     std::fs::read_to_string("/etc/hostname")
@@ -156,6 +180,9 @@ pub enum Event {
     },
     /// The machine's name was edited; phones show the new one at once.
     Renamed { name: String },
+    /// The desktop's roads changed — hosts, a relay route enrolled or
+    /// cleared. The phone re-reads `/v1/status`.
+    StatusChanged,
     Ping,
 }
 
@@ -187,11 +214,33 @@ pub struct ClientInfo {
     pub since: u64,
 }
 
+/// The relay road's state: the enrolled route (persisted), its connector
+/// while the listener runs, and the draft a QR is waiting on.
+#[derive(Default)]
+struct PhoneRelay {
+    config: Option<RelayConfig>,
+    handle: Option<RelayConnectorHandle>,
+    /// In memory only: replaced by each new QR, dropped when the road is off.
+    draft: Option<RelayEnrollmentDraft>,
+}
+
+fn load_phone_relay() -> Option<RelayConfig> {
+    let root = crate::remote::state_root().ok()?;
+    match RelayConfig::load_named(&root, PHONE_RELAY_FILE) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::diag!("remote", "phone relay route ignored: {e}");
+            None
+        }
+    }
+}
+
 pub struct RemoteState {
     config: Mutex<Config>,
     running: Mutex<Option<Running>>,
     /// The iroh endpoint while listening — the reach-from-anywhere path.
     tunnel: Mutex<Option<crate::iroh_tunnel::Tunnel>>,
+    phone_relay: Mutex<PhoneRelay>,
     reach: Mutex<Reach>,
     clients: Mutex<HashMap<u64, ClientInfo>>,
     next_client: std::sync::atomic::AtomicU64,
@@ -231,6 +280,7 @@ impl Default for RemoteState {
             config: Mutex::new(load_config()),
             running: Mutex::new(None),
             tunnel: Mutex::new(None),
+            phone_relay: Mutex::new(PhoneRelay { config: load_phone_relay(), ..Default::default() }),
             reach: Mutex::new(Reach { upnp: "off".into(), public_ip: None }),
             clients: Mutex::new(HashMap::new()),
             next_client: std::sync::atomic::AtomicU64::new(1),
@@ -435,26 +485,25 @@ fn start(app: &AppHandle) -> Result<(), String> {
     }
     // The iroh endpoint rides alongside: a config without a key yet (created
     // before this existed) gets one now, so its node id is stable from here on.
-    let secret = {
+    let (secret, relay_url, relay_road) = {
         let mut cfg = state.config.lock().unwrap();
         if crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret).is_none() {
             cfg.iroh_secret = crate::iroh_tunnel::new_secret_hex();
             save_config(&cfg);
         }
-        if cfg.iroh_enabled {
+        let secret = if cfg.iroh_enabled {
             crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret)
         } else {
             None
-        }
+        };
+        (secret, cfg.iroh_relay_url.clone(), cfg.relay_enabled)
     };
     if let Some(secret) = secret {
-        let app2 = app.clone();
-        tauri::async_runtime::spawn(async move {
-            match crate::iroh_tunnel::start(secret, port).await {
-                Ok(t) => *app2.state::<RemoteState>().tunnel.lock().unwrap() = Some(t),
-                Err(e) => crate::diag!("remote", "{e}"),
-            }
-        });
+        spawn_tunnel(app, secret, port, relay_url);
+    }
+    // The relay road rides alongside too, when it is on and a route exists.
+    if relay_road {
+        start_phone_relay(state.inner(), port);
     }
     *state.running.lock().unwrap() = Some(Running { port, handle, upnp_alive: alive });
     *state.last_error.lock().unwrap() = None;
@@ -475,6 +524,41 @@ fn stop(app: &AppHandle) {
     let tunnel = state.tunnel.lock().unwrap().take();
     if let Some(tunnel) = tunnel {
         tauri::async_runtime::spawn(crate::iroh_tunnel::stop(tunnel));
+    }
+    stop_phone_relay(state.inner());
+}
+
+/// Bind the iroh endpoint on the runtime and keep it in state once it is up.
+fn spawn_tunnel(app: &AppHandle, secret: iroh::SecretKey, port: u16, relay_url: Option<String>) {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::iroh_tunnel::start(secret, port, relay_url).await {
+            Ok(t) => *app2.state::<RemoteState>().tunnel.lock().unwrap() = Some(t),
+            Err(e) => crate::diag!("remote", "{e}"),
+        }
+    });
+}
+
+/// Start the relay connector for the enrolled phone route, if there is one
+/// and it is not already running. `RelayConnectorHandle::start` spawns on
+/// tokio, so it is called from inside the runtime whatever thread we are on.
+fn start_phone_relay(state: &RemoteState, port: u16) {
+    let mut relay = state.phone_relay.lock().unwrap();
+    if relay.handle.is_some() {
+        return;
+    }
+    let Some(config) = relay.config.clone() else { return };
+    let local = SocketAddr::from(([127, 0, 0, 1], port));
+    let runtime = tauri::async_runtime::handle();
+    let _enter = runtime.inner().enter();
+    relay.handle = Some(RelayConnectorHandle::start(config, local));
+    crate::diag!("remote", "phone relay connector started for {}:{}", relay.config.as_ref().map(|c| c.public_host.as_str()).unwrap_or(""), relay.config.as_ref().map(|c| c.public_port).unwrap_or(0));
+}
+
+fn stop_phone_relay(state: &RemoteState) {
+    let handle = state.phone_relay.lock().unwrap().handle.take();
+    if let Some(handle) = handle {
+        tauri::async_runtime::spawn(handle.stop());
     }
 }
 
@@ -501,6 +585,58 @@ pub struct RemoteStatus {
     pub iroh_enabled: bool,
     /// The reach-from-anywhere address: this desktop's iroh node id.
     pub iroh_node: Option<String>,
+    /// Which roads are on. See `docs/remote-roads.md`.
+    pub roads: Roads,
+    /// What the VPN road sees on this machine right now.
+    pub vpn: VpnStatus,
+    /// The relay road: enrolled route, connector state, pending draft.
+    pub relay: PhoneRelayStatus,
+    /// Custom iroh relay URL; None = iroh's default relays.
+    pub iroh_relay_url: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct Roads {
+    pub lan: bool,
+    pub vpn: bool,
+    pub relay: bool,
+    pub iroh: bool,
+}
+
+impl Roads {
+    fn of(cfg: &Config) -> Roads {
+        Roads { lan: cfg.lan_enabled, vpn: cfg.vpn_enabled, relay: cfg.relay_enabled, iroh: cfg.iroh_enabled }
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct PhoneRelayStatus {
+    pub configured: bool,
+    /// "off" | "connecting" | "connected" | "retrying"
+    pub state: String,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub server: String,
+    pub pending_enrollment: bool,
+}
+
+fn phone_relay_status(state: &RemoteState) -> PhoneRelayStatus {
+    let relay = state.phone_relay.lock().unwrap();
+    let conn = relay.handle.as_ref().map(RelayConnectorHandle::state).unwrap_or_default();
+    PhoneRelayStatus {
+        configured: relay.config.is_some(),
+        state: match conn {
+            RelayConnectionState::Off => "off",
+            RelayConnectionState::Connecting => "connecting",
+            RelayConnectionState::Connected => "connected",
+            RelayConnectionState::Retrying => "retrying",
+        }
+        .into(),
+        host: relay.config.as_ref().map(|c| c.public_host.clone()),
+        port: relay.config.as_ref().map(|c| c.public_port),
+        server: crate::remote::DEFAULT_RELAY_SERVER.into(),
+        pending_enrollment: relay.config.is_none() && relay.draft.is_some(),
+    }
 }
 
 fn status_of(app: &AppHandle) -> RemoteStatus {
@@ -515,8 +651,7 @@ fn status_of(app: &AppHandle) -> RemoteStatus {
         enabled: cfg.enabled,
         running,
         port: cfg.port,
-        name: cfg.name,
-        addresses: addresses(),
+        addresses: addresses(&cfg),
         upnp: reach.upnp,
         public_address: reach.public_ip.map(|ip| ip.to_string()),
         fingerprint: identity().ok().map(|i| i.fingerprint),
@@ -524,6 +659,11 @@ fn status_of(app: &AppHandle) -> RemoteStatus {
         error,
         iroh_enabled: cfg.iroh_enabled,
         iroh_node: crate::iroh_tunnel::node_id_of(&cfg.iroh_secret),
+        roads: Roads::of(&cfg),
+        vpn: remote_roads::vpn_status(),
+        relay: phone_relay_status(&state),
+        iroh_relay_url: cfg.iroh_relay_url.clone(),
+        name: cfg.name,
     }
 }
 
@@ -559,38 +699,25 @@ pub fn remote_set_port(app: AppHandle, port: u16) -> Result<RemoteStatus, String
 }
 
 /// IPv4 addresses on real interfaces, ordered so the one a phone is most
-/// likely to share comes first: a Tailscale address (100.64/10) beats the
-/// LAN, which beats anything else. Loopback is never a candidate — a phone
-/// cannot reach it.
-fn addresses() -> Vec<String> {
-    let mut found: Vec<(u8, String)> = if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|i| !i.is_loopback())
-        .filter_map(|i| match i.ip() {
-            std::net::IpAddr::V4(v4) => {
-                let o = v4.octets();
-                let rank = if o[0] == 100 && (64..128).contains(&o[1]) {
-                    0
-                } else if o[0] == 10 || o[0] == 192 && o[1] == 168 || o[0] == 172 && (16..32).contains(&o[1]) {
-                    1
-                } else if o[0] == 169 && o[1] == 254 {
-                    return None;
-                } else {
-                    2
-                };
-                // Container bridges are reachable by nothing a person holds.
-                if i.name.starts_with("docker") || i.name.starts_with("br-") || i.name.starts_with("virbr") {
-                    return None;
-                }
-                Some((rank, v4.to_string()))
-            }
-            _ => None,
-        })
-        .collect();
-    found.sort();
-    found.dedup();
-    found.into_iter().map(|(_, a)| a).collect()
+/// likely to share comes first: a VPN address (Tailscale's 100.64/10, a
+/// `wg*` tunnel) beats the LAN, which beats anything else. A road that is
+/// off contributes nothing. Loopback is never a candidate — a phone cannot
+/// reach it. The rules live in `remote_roads`.
+fn addresses(cfg: &Config) -> Vec<String> {
+    remote_roads::advertised(cfg.lan_enabled, cfg.vpn_enabled)
+}
+
+/// The host list a QR and `/v1/status` carry: the roads' addresses, then
+/// the router-reported public address — the port-forward path, which is
+/// the LAN road seen from outside, so it follows `lan_enabled`.
+fn hosts_of(state: &RemoteState, cfg: &Config) -> Vec<String> {
+    let mut hosts = addresses(cfg);
+    if cfg.lan_enabled {
+        if let Some(ip) = state.reach.lock().unwrap().public_ip {
+            hosts.push(ip.to_string());
+        }
+    }
+    hosts
 }
 
 #[tauri::command]
@@ -633,33 +760,149 @@ pub fn remote_rotate_token(app: AppHandle) -> RemoteStatus {
 /// LAN route either way; only the reach-from-anywhere path changes.
 #[tauri::command]
 pub fn remote_set_iroh(app: AppHandle, on: bool) -> RemoteStatus {
+    let _ = set_road(&app, "iroh", on);
+    status_of(&app)
+}
+
+/// Turn one road on or off, live. `lan`/`vpn` change what the QR and
+/// `/v1/status` advertise; `relay` starts or stops the connector for an
+/// enrolled route (turning it on with no route prepares nothing by itself —
+/// the next QR offers enrollment); `iroh` is `remote_set_iroh`.
+#[tauri::command]
+pub fn remote_set_road(app: AppHandle, road: String, on: bool) -> Result<RemoteStatus, String> {
+    set_road(&app, &road, on)?;
+    Ok(status_of(&app))
+}
+
+fn set_road(app: &AppHandle, road: &str, on: bool) -> Result<(), String> {
     let state = app.state::<RemoteState>();
-    let (changed, port, secret) = {
+    let (changed, port, secret, relay_url) = {
         let mut cfg = state.config.lock().unwrap();
-        let changed = cfg.iroh_enabled != on;
-        cfg.iroh_enabled = on;
+        let field = match road {
+            "lan" => &mut cfg.lan_enabled,
+            "vpn" => &mut cfg.vpn_enabled,
+            "relay" => &mut cfg.relay_enabled,
+            "iroh" => &mut cfg.iroh_enabled,
+            _ => return Err(format!("no such road: {road}")),
+        };
+        let changed = *field != on;
+        *field = on;
         if changed {
             save_config(&cfg);
         }
-        (changed, cfg.port, crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret))
+        (changed, cfg.port, crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret), cfg.iroh_relay_url.clone())
+    };
+    if !changed {
+        return Ok(());
+    }
+    let running = state.running.lock().unwrap().is_some();
+    match road {
+        "iroh" if running => {
+            if on {
+                if let Some(secret) = secret {
+                    spawn_tunnel(app, secret, port, relay_url);
+                }
+            } else if let Some(tunnel) = state.tunnel.lock().unwrap().take() {
+                tauri::async_runtime::spawn(crate::iroh_tunnel::stop(tunnel));
+            }
+        }
+        "relay" => {
+            if on {
+                if running {
+                    start_phone_relay(&state, port);
+                }
+            } else {
+                state.phone_relay.lock().unwrap().draft = None;
+                stop_phone_relay(&state);
+            }
+        }
+        _ => {}
+    }
+    // Phones re-read their host list; the panel re-reads status.
+    notify(app, Event::StatusChanged);
+    let _ = app.emit("remote://clients", ());
+    Ok(())
+}
+
+/// Point iroh at a relay of one's own (or back at the default with None).
+/// A running tunnel restarts on the new relay; the node id does not change.
+#[tauri::command]
+pub fn remote_set_iroh_relay_url(app: AppHandle, url: Option<String>) -> Result<RemoteStatus, String> {
+    let url = url.map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
+    if let Some(u) = &url {
+        u.parse::<iroh::RelayUrl>().map_err(|e| format!("Not a relay URL: {e}"))?;
+    }
+    let state = app.state::<RemoteState>();
+    let (changed, port, secret) = {
+        let mut cfg = state.config.lock().unwrap();
+        let changed = cfg.iroh_relay_url != url;
+        cfg.iroh_relay_url = url.clone();
+        if changed {
+            save_config(&cfg);
+        }
+        let secret = if cfg.iroh_enabled { crate::iroh_tunnel::secret_from_hex(&cfg.iroh_secret) } else { None };
+        (changed, cfg.port, secret)
     };
     let running = state.running.lock().unwrap().is_some();
     if changed && running {
-        if on {
-            if let Some(secret) = secret {
-                let app2 = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    match crate::iroh_tunnel::start(secret, port).await {
-                        Ok(t) => *app2.state::<RemoteState>().tunnel.lock().unwrap() = Some(t),
-                        Err(e) => crate::diag!("remote", "{e}"),
-                    }
-                });
-            }
-        } else if let Some(tunnel) = state.tunnel.lock().unwrap().take() {
-            tauri::async_runtime::spawn(crate::iroh_tunnel::stop(tunnel));
+        if let Some(secret) = secret {
+            let old = state.tunnel.lock().unwrap().take();
+            let app2 = app.clone();
+            // Stop before start: the same key must not be bound twice.
+            tauri::async_runtime::spawn(async move {
+                if let Some(old) = old {
+                    crate::iroh_tunnel::stop(old).await;
+                }
+                match crate::iroh_tunnel::start(secret, port, url).await {
+                    Ok(t) => *app2.state::<RemoteState>().tunnel.lock().unwrap() = Some(t),
+                    Err(e) => crate::diag!("remote", "{e}"),
+                }
+            });
         }
     }
-    status_of(&app)
+    Ok(status_of(&app))
+}
+
+/// Forget the phone relay route: release it at the relay server when it
+/// was provisioned by pairing, delete `phone-relay.json`, stop the
+/// connector. The road's on/off setting is untouched — the next QR offers
+/// a fresh enrollment.
+#[tauri::command]
+pub async fn remote_phone_relay_clear(app: AppHandle) -> Result<RemoteStatus, String> {
+    let state = app.state::<RemoteState>();
+    let (config, handle) = {
+        let mut relay = state.phone_relay.lock().unwrap();
+        relay.draft = None;
+        (relay.config.clone(), relay.handle.take())
+    };
+    if let Some(handle) = handle {
+        handle.stop().await;
+    }
+    let removal = match &config {
+        Some(config) => config.deprovision().await,
+        None => Ok(()),
+    };
+    if let Err(e) = removal {
+        // The route stays; put its connector back so state matches disk.
+        let (port, relay_road) = {
+            let cfg = state.config.lock().unwrap();
+            (cfg.port, cfg.relay_enabled)
+        };
+        if relay_road && state.running.lock().unwrap().is_some() {
+            start_phone_relay(&state, port);
+        }
+        return Err(e);
+    }
+    let root = crate::remote::state_root()?;
+    match std::fs::remove_file(root.join(PHONE_RELAY_FILE)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("could not remove the phone relay route: {e}")),
+    }
+    state.phone_relay.lock().unwrap().config = None;
+    notify(&app, Event::StatusChanged);
+    let _ = app.emit("remote://clients", ());
+    Ok(status_of(&app))
 }
 
 #[tauri::command]
@@ -688,18 +931,16 @@ pub struct PairPayload {
 /// certificate the phone will trust and nothing else. The token is the only
 /// secret and this is the only place it leaves the desktop.
 #[tauri::command]
-pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
+pub async fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
     let state = app.state::<RemoteState>();
     if state.running.lock().unwrap().is_none() {
         return Err("Turn remote access on first".into());
     }
+    prepare_phone_relay_draft(&app).await;
     let cfg = state.config.lock().unwrap().clone();
-    let public_ip = state.reach.lock().unwrap().public_ip;
-    let mut addrs = addresses();
-    if let Some(ip) = public_ip {
-        addrs.push(ip.to_string());
-    }
-    if addrs.is_empty() {
+    let addrs = hosts_of(&state, &cfg);
+    let (relay, digest) = phone_relay_fields(&state, &cfg);
+    if addrs.is_empty() && relay.is_none() && !cfg.iroh_enabled {
         return Err("No network address a phone could reach".into());
     }
     let fingerprint = identity()?.fingerprint;
@@ -722,6 +963,16 @@ pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
             uri.push_str(&id);
         }
     }
+    // The relay road, under the same names the combined QR uses.
+    if let Some((host, port)) = &relay {
+        uri.push_str("&tr=");
+        uri.push_str(&percent_encode(host));
+        uri.push_str(&format!("&tq={port}"));
+    }
+    if let Some(digest) = &digest {
+        uri.push_str("&ta=");
+        uri.push_str(&remote_roads::b64url(digest));
+    }
     let code = qrcode::QrCode::new(uri.as_bytes()).map_err(|e| e.to_string())?;
     let svg = code
         .render::<qrcode::render::svg::Color>()
@@ -732,26 +983,72 @@ pub fn remote_pair_payload(app: AppHandle) -> Result<PairPayload, String> {
 }
 
 /// The phone-listener's fields for a combined pairing QR, namespaced so they
-/// ride beside the gateway's own (`p`/`f`/`s` belong to the gateway there):
-/// `&tp=<port>&tt=<token>&tf=<cert sha256>[&z=<iroh node id>]`. `None` while
+/// ride beside the gateway's own (`p`/`f`/`s`/`h` belong to the gateway
+/// there): `&tp=<port>&tt=<token>&tf=<cert sha256>[&th=<host>…][&z=<iroh
+/// node id>][&tr=<relay host>&tq=<relay port>][&ta=<digest>]`. `None` while
 /// the listener is off — a combined QR then simply carries no phone-listener
 /// route. The token leaves the desktop only inside a rendered QR, same as in
-/// `remote_pair_payload`.
-pub(crate) fn pair_extension(app: &AppHandle) -> Option<String> {
+/// `remote_pair_payload`. Async because a relay draft is minted here when
+/// the relay road is on and no route exists yet.
+pub(crate) async fn pair_extension(app: &AppHandle) -> Option<String> {
     let state = app.try_state::<RemoteState>()?;
     if state.running.lock().unwrap().is_none() {
         return None;
     }
+    prepare_phone_relay_draft(app).await;
     let cfg = state.config.lock().unwrap().clone();
     let fingerprint = identity().ok()?.fingerprint;
-    let mut ext = format!("&tp={}&tt={}&tf={}", cfg.port, cfg.token, fingerprint);
-    if cfg.iroh_enabled {
-        if let Some(id) = crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) {
-            ext.push_str("&z=");
-            ext.push_str(&id);
-        }
+    let hosts = hosts_of(&state, &cfg);
+    let iroh = if cfg.iroh_enabled { crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) } else { None };
+    let (relay, digest) = phone_relay_fields(&state, &cfg);
+    Some(remote_roads::pair_fields(
+        cfg.port,
+        &cfg.token,
+        &fingerprint,
+        &hosts,
+        iroh.as_deref(),
+        relay.as_ref().map(|(h, p)| (h.as_str(), *p)),
+        digest.as_ref(),
+    ))
+}
+
+/// What the QR says about the relay road: the live route, or the draft's
+/// route plus the digest the phone must sign. Nothing when the road is off.
+fn phone_relay_fields(state: &RemoteState, cfg: &Config) -> (Option<(String, u16)>, Option<[u8; 32]>) {
+    if !cfg.relay_enabled {
+        return (None, None);
     }
-    Some(ext)
+    let relay = state.phone_relay.lock().unwrap();
+    if let Some(c) = &relay.config {
+        return (Some((c.public_host.clone(), c.public_port)), None);
+    }
+    if let Some(d) = &relay.draft {
+        let (host, port) = d.public_endpoint();
+        return (Some((host.to_string(), port)), Some(*d.authorization_digest()));
+    }
+    (None, None)
+}
+
+/// With the relay road on and no route yet, ask the relay server for a
+/// route and keep the draft for the QR being minted. Each QR gets its own;
+/// an earlier draft is replaced. Failure is a log line — the QR then simply
+/// carries no relay fields and the phone pairs over the other roads.
+async fn prepare_phone_relay_draft(app: &AppHandle) {
+    let state = app.state::<RemoteState>();
+    let wanted = {
+        let cfg = state.config.lock().unwrap();
+        let relay = state.phone_relay.lock().unwrap();
+        cfg.relay_enabled && relay.config.is_none()
+    };
+    if !wanted {
+        return;
+    }
+    let Ok(id) = identity() else { return };
+    let Some(spki) = remote_roads::hex_to_b64url(&id.fingerprint) else { return };
+    match RelayConfig::prepare_enrollment(crate::remote::DEFAULT_RELAY_SERVER, &spki).await {
+        Ok(draft) => state.phone_relay.lock().unwrap().draft = Some(draft),
+        Err(e) => crate::diag!("remote", "relay setup was unavailable while pairing: {e}"),
+    }
 }
 
 fn percent_encode(s: &str) -> String {
@@ -802,6 +1099,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/terminal/{tab}/close", post(terminal_close))
         .route("/v1/events", get(events))
         .route("/v1/previews", post(make_preview))
+        .route("/v1/relay/enroll", post(relay_enroll))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
         // Below the auth layer on purpose: preview paths carry their own
         // unguessable ticket. See `make_preview`.
@@ -1080,18 +1378,89 @@ async fn status(State(ctx): State<Ctx>) -> Response {
     // last — the same list the QR carries. The phone refreshes its
     // candidates from this on every connect, so a DHCP move or a new
     // public IP never strands it with only stale addresses.
-    let mut hosts = addresses();
-    if let Some(ip) = state.reach.lock().unwrap().public_ip {
-        hosts.push(ip.to_string());
-    }
+    let hosts = hosts_of(&state, &cfg);
+    // The relay road as a live route only — never a draft, which is the
+    // QR's business.
+    let relay = {
+        let r = state.phone_relay.lock().unwrap();
+        match (&r.config, cfg.relay_enabled) {
+            (Some(c), true) => serde_json::json!({ "host": c.public_host, "port": c.public_port }),
+            _ => serde_json::Value::Null,
+        }
+    };
     Json(serde_json::json!({
         "api": API_VERSION,
         "name": cfg.name,
         "version": env!("CARGO_PKG_VERSION"),
         "hosts": hosts,
         "iroh": if cfg.iroh_enabled { crate::iroh_tunnel::node_id_of(&cfg.iroh_secret) } else { None },
+        "relay": relay,
+        "roads": Roads::of(&cfg),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct EnrollBody {
+    /// base64url nopad, 33-byte compressed SEC1 P-256 point.
+    authority_public_key: String,
+    /// base64url nopad, DER ECDSA over the draft digest.
+    signature_der: String,
+}
+
+/// The phone answers the QR's `ta`: it signed the draft digest with its
+/// authority key, and the desktop — after checking the signature itself —
+/// registers the route with the relay, keeps it, and starts the connector.
+/// 409 when nothing is pending, 400 when the answer does not verify, 502
+/// when the relay server refused.
+async fn relay_enroll(State(ctx): State<Ctx>, Json(b): Json<EnrollBody>) -> Response {
+    let state = ctx.app.state::<RemoteState>();
+    let draft = {
+        let cfg = state.config.lock().unwrap();
+        let relay = state.phone_relay.lock().unwrap();
+        if !cfg.relay_enabled || relay.config.is_some() {
+            None
+        } else {
+            relay.draft.clone()
+        }
+    };
+    let Some(draft) = draft else {
+        return err(StatusCode::CONFLICT, "no relay enrollment is pending");
+    };
+    let (Some(key), Some(sig)) = (
+        remote_roads::b64url_decode(&b.authority_public_key),
+        remote_roads::b64url_decode(&b.signature_der),
+    ) else {
+        return err(StatusCode::BAD_REQUEST, "authority_public_key and signature_der must be base64url");
+    };
+    if let Err(e) = remote_roads::verify_enrollment(draft.authorization_digest(), &key, &sig) {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    let config = match draft.register(&key, &sig).await {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_GATEWAY, e),
+    };
+    let root = match crate::remote::state_root() {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    if let Err(e) = config.save_named(&root, PHONE_RELAY_FILE) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    let port = state.config.lock().unwrap().port;
+    {
+        let mut relay = state.phone_relay.lock().unwrap();
+        relay.draft = None;
+        relay.config = Some(config.clone());
+        if let Some(old) = relay.handle.take() {
+            tokio::spawn(old.stop());
+        }
+    }
+    start_phone_relay(&state, port);
+    crate::diag!("remote", "phone relay route enrolled: {}:{}", config.public_host, config.public_port);
+    notify(&ctx.app, Event::StatusChanged);
+    let _ = ctx.app.emit("remote://clients", ());
+    Json(serde_json::json!({ "host": config.public_host, "port": config.public_port })).into_response()
 }
 
 async fn agents(State(ctx): State<Ctx>) -> Response {
