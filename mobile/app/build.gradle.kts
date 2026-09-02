@@ -55,4 +55,5 @@ dependencies {
     implementation("net.java.dev.jna:jna:5.15.0@aar")
     implementation(libs.coil.svg)
     debugImplementation(libs.compose.ui.tooling)
+    testImplementation("junit:junit:4.13.2")
 }
