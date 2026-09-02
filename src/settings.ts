@@ -9,12 +9,11 @@ export interface PanelScales {
   agent: number;
 }
 
-/** The librarian: a small model that names, tags and threads sessions. Off
- *  until a provider and model are chosen — it spends money, a little. */
+/** The librarian: a small model that names sessions whose engine did not
+ *  name them itself. Off until it is switched on — it spends a little. */
 export interface LibrarianSettings {
-  /** The master switch. Off: no runs, no Threads tab, no names in the
-   *  list, and the rest of the pane is not shown. What was catalogued
-   *  stays on disk for when it is turned back on. */
+  /** The master switch. Off: no runs, and the rest of the pane is not
+   *  shown. Names already written stay on disk and in the list. */
   enabled: boolean;
   /** How the model is reached: an installed CLI in its print mode — which
    *  runs on the plan already paid for — or an API provider. */
@@ -23,19 +22,8 @@ export interface LibrarianSettings {
   providerId: string;
   /** Model id in the engine's spelling; "" means the CLI's default. */
   model: string;
-  /** Catalogue new sessions on its own, a little after they go quiet. */
+  /** Name new sessions on its own, a little after they go quiet. */
   auto: boolean;
-  /** After a run, take one look at everything and merge threads that are
-   *  the same work. Sessions are read eight at a time, so without this the
-   *  same project ends up in several threads. */
-  tidyAfterRun: boolean;
-  /** Show the librarian's names in the session list, in place of the raw
-   *  first prompt. The original stays in the tooltip. */
-  renameRows: boolean;
-  /** The system prompt for reading sessions; "" means the one shipped. */
-  promptCatalogue: string;
-  /** The system prompt for the tidy pass; "" means the one shipped. */
-  promptTidy: string;
 }
 
 export interface AppSettings {
@@ -105,10 +93,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
     providerId: "",
     model: "haiku",
     auto: true,
-    tidyAfterRun: true,
-    renameRows: true,
-    promptCatalogue: "",
-    promptTidy: "",
   },
 };
 

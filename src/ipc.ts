@@ -1037,53 +1037,31 @@ export const diagLogTail = (lines: number) => invoke<string>("diag_log_tail", { 
  *  "it is behaving oddly" conversation, answered without a scavenger hunt. */
 export const diagEnvironment = () => invoke<[string, string][]>("diag_environment");
 
-// --- Structured sessions and Librarian ---------------------------------
+// --- Librarian: names for sessions ----------------------------------------
 
 export interface LibEntry {
+  /** The name; "" when the engine titled the session itself and the
+   *  librarian left it alone. */
   name: string;
-  tags: string[];
-  thread: string;
-  summary: string;
-  next: string;
   seen: number;
   at: number;
   model: string;
-  user_tags: string[];
-}
-
-export interface LibThread {
-  name: string;
-  description: string;
-  tags: string[];
-  created: number;
-  user_tags: string[];
 }
 
 export interface LibStore {
   sessions: Record<string, LibEntry>;
-  threads: Record<string, LibThread>;
   spent: number;
-  tidied_sessions: number;
-  tidied_at: number;
-}
-
-export interface LibTidyReport {
-  threads_before: number;
-  threads_after: number;
-  filed: number;
-  cost: number;
 }
 
 export interface LibRunReport {
   done: number;
+  skipped: number;
   remaining: number;
   cost: number;
   errors: string[];
 }
 
-export const EMPTY_LIB: LibStore = {
-  sessions: {}, threads: {}, spent: 0, tidied_sessions: 0, tidied_at: 0,
-};
+export const EMPTY_LIB: LibStore = { sessions: {}, spent: 0 };
 
 export type LibEngine =
   | { kind: "api"; providerId: string; model: string }
@@ -1094,21 +1072,8 @@ export const librarianRun = (
   engine: LibEngine,
   sessions: { id: string; lastActive: number }[],
   max: number,
-  prompt: string | null,
-) => invoke<LibRunReport>("librarian_run", { engine, sessions, max, prompt });
-export const LIBRARIAN_DIR_SUFFIX = "/.config/aiterm/librarian";
-export const librarianTidy = (engine: LibEngine, prompt: string | null) =>
-  invoke<LibTidyReport>("librarian_tidy", { engine, prompt });
-export const librarianDefaultPrompts = () =>
-  invoke<{ catalogue: string; tidy: string }>("librarian_default_prompts");
+) => invoke<LibRunReport>("librarian_run", { engine, sessions, max });
 export const librarianForget = () => invoke<void>("librarian_forget");
-export const librarianRenameThread = (id: string, name: string) =>
-  invoke<void>("librarian_rename_thread", { id, name });
-export const librarianTag = (
-  target: { kind: "thread" | "session"; id: string },
-  tag: string,
-  on: boolean,
-) => invoke<void>("librarian_tag", { target, tag, on });
 
 export const sessionConversation = (sessionId: string, maxChars: number) =>
   invoke<[string, string][]>("session_conversation", { sessionId, maxChars });

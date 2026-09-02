@@ -25,12 +25,11 @@ import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
-import ThreadsView from "./components/ThreadsView";
-import { isCurrent, useLibrarian } from "./librarian";
+import { useLibrarian } from "./librarian";
 import BringIn from "./components/BringIn";
 import { useRelay } from "./relay";
 import {
-  BookOpen, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, Users, X,
+  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -467,17 +466,9 @@ export default function App() {
   );
 
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  // Its names reach the list through the backend (`apply_session_names`),
+  // the same way a name set by hand does, so the phone sees them too.
   const librarian = useLibrarian(settings.librarian, sessions);
-  const [showThreads, setShowThreads] = useState(false);
-  const displayedSessions = useMemo(() => {
-    if (!settings.librarian.enabled || !settings.librarian.renameRows) return sessions;
-    return sessions.map((session) => {
-      const entry = librarian.store.sessions[session.id];
-      return entry && isCurrent(librarian.store, session)
-        ? { ...session, title: entry.name || session.title }
-        : session;
-    });
-  }, [sessions, settings.librarian.enabled, settings.librarian.renameRows, librarian.store]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   /** Where the settings window should open, when a caller has somewhere in
    *  mind. Cleared on close so the ⚙ button still opens on the first tab. */
@@ -2302,13 +2293,6 @@ export default function App() {
             title="Toggle sessions panel"
             onClick={() => setShowSessions(!showSessions)}
           ><Icon of={PanelLeft} /></button>
-          {settings.librarian.enabled && (
-            <button
-              className={"icon-btn" + (showThreads ? " on" : "")}
-              title={showThreads ? "Show sessions" : "Show librarian threads"}
-              onClick={() => setShowThreads((shown) => !shown)}
-            ><Icon of={BookOpen} /></button>
-          )}
           <button
             className={"icon-btn" + (showExplorer ? " on" : "")}
             title="Toggle file explorer"
@@ -2353,22 +2337,9 @@ export default function App() {
         {showSessions && (
           <>
             <div className="panel sessions" style={{ width: sizes.left, ...zoomFor("sessions") }}>
-              {showThreads && settings.librarian.enabled ? (
-                <ThreadsView
-                  lib={librarian}
-                  sessions={displayedSessions}
-                  liveIds={liveShown}
-                  onSelect={selectSession}
-                  onResume={resumeSession}
-                  onOpenSettings={() => {
-                    setSettingsTarget({ tab: "librarian", provider: null });
-                    setShowSettingsModal(true);
-                  }}
-                  canResume={(session) => capsOf(session.agent).resume}
-                />
-              ) : <SessionsPanel
+              <SessionsPanel
                 hoverSummary={settings.sessionHover}
-                sessions={displayedSessions}
+                sessions={sessions}
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
@@ -2425,7 +2396,7 @@ export default function App() {
                 onTrashDelete={deleteTrashed}
                 onTrashEmpty={emptyTrash}
                 onTrashSessions={trashSessions}
-              />}
+              />
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
           </>
