@@ -20,6 +20,8 @@ export interface RemoteStatus {
   port: number | null;
   /** SHA-256 of the listener's SPKI, base64url. The phone pins this. */
   fingerprint: string | null;
+  /** Control origin used for the next phone-authorized relay enrollment. */
+  relay_server: string;
   relay?: RelayStatus;
 }
 
