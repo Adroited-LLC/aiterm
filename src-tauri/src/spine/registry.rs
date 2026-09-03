@@ -36,6 +36,24 @@ const COALESCE: Duration = Duration::from_millis(250);
 /// keeping up. Its own channel on purpose: a burst here must not push the
 /// coarse `remote_api::Event`s out of theirs.
 const BROADCAST_CAPACITY: usize = 1024;
+/// Retry cadence for a source that is not there yet, once the fast phase
+/// below has given up on it. `open_adapter` asks every backend in turn
+/// until one claims the id, and codex's claim rescans its whole session
+/// tree — not something to spend every 2 s on forever for a session whose
+/// engine died at launch and will never write anything.
+const SLOW_OPEN_RETRY: Duration = Duration::from_secs(10);
+/// How long to retry at the 2 s tick before dropping to the cadence above.
+/// A CLI writes its first transcript line within a second or two of
+/// starting; a minute of nothing means something else is wrong.
+const FAST_OPEN_RETRY_FOR: Duration = Duration::from_secs(60);
+
+/// How long after the last write to a session's files its phase verdict can
+/// still move on its own. `transcript_verdict` flips an open codex turn from
+/// working to attention once the file has been quiet for 45 s, and nothing
+/// writes to mark that — so the stamp gate below must not start skipping
+/// until past it.
+const VERDICT_SETTLES_AFTER: Duration = Duration::from_secs(60);
+
 /// How long a `GET …/spine` waits for a just-started tail to finish reading
 /// history. Answering the first call empty leaves the phone on a blank
 /// screen until something else happens to move.
@@ -58,10 +76,11 @@ struct SessionLog {
     live: bool,
     /// `bootstrap()` has returned; a waiting GET can stop waiting.
     ready: bool,
-    /// The last phase pushed. The terminal publishes cadence four times a
-    /// second while output flows; without this the ring would be nothing
-    /// but identical `working` events.
-    last_phase: Option<Phase>,
+    /// The last phase pushed, with its detail. The terminal publishes
+    /// cadence four times a second while output flows and the phase tick
+    /// runs every 2 s; without this the ring would be nothing but identical
+    /// `working` events.
+    last_phase: Option<(Phase, String)>,
 }
 
 impl SessionLog {
@@ -203,20 +222,24 @@ impl Spine {
         )));
     }
 
-    /// Bridge a terminal activity verdict onto the spine, for a session
-    /// that already has a tail. Deliberately does not start one: a phase
-    /// with no content behind it is not worth opening a transcript for.
-    pub fn push_phase_if_tailed(&self, session_id: &str, phase: Phase) {
+    /// Record a phase for a session that already has a tail, unless it is
+    /// the one already standing.
+    pub fn push_phase_if_tailed(&self, session_id: &str, phase: Phase, detail: &str) {
         let agent = {
             let mut sessions = self.sessions.lock().unwrap();
             let Some(log) = sessions.get_mut(session_id) else { return };
-            if !log.tailing() || log.last_phase == Some(phase) {
+            // Deliberately not started here: a phase with no content behind
+            // it is not worth opening a transcript for.
+            if !log.tailing() {
                 return;
             }
-            log.last_phase = Some(phase);
+            if log.last_phase.as_ref().is_some_and(|(p, d)| *p == phase && d == detail) {
+                return;
+            }
+            log.last_phase = Some((phase, detail.to_string()));
             log.agent.clone()
         };
-        self.push(session_id, &agent, now_ms(), Kind::Phase { phase, detail: String::new() });
+        self.push(session_id, &agent, now_ms(), Kind::Phase { phase, detail: detail.to_string() });
     }
 
     fn agent_of(&self, session_id: &str) -> Option<String> {
@@ -322,7 +345,10 @@ pub fn push_phase(app: &AppHandle, session_id: &str, activity: &str) {
         _ => return,
     };
     let Some(spine) = app.try_state::<Arc<Spine>>() else { return };
-    spine.push_phase_if_tailed(session_id, phase);
+    // No detail: cadence is bytes on a pty, which knows no reason. The 2 s
+    // tick below carries the reason when there is one, and wins any tie by
+    // arriving with the same phase and a fuller detail.
+    spine.push_phase_if_tailed(session_id, phase, "");
 }
 
 /// Answer `GET /v1/sessions/{id}/spine`: register interest, wait out a
@@ -342,23 +368,186 @@ pub async fn read_after(
     Some((spine.epoch(), spine.is_live(session_id), spine.after(session_id, after_seq)))
 }
 
+// -------------------------------------------------------------- the phase
+
+/// The driver's phase half: works out what the session is doing every tick
+/// and pushes it when it moved.
+///
+/// The verdict itself comes from `remote_api::activity_verdict`, the same
+/// function the sessions list uses — the two cannot disagree about a
+/// session. Only the transcript half is cached here: reading it is a tail
+/// read of up to 256 KB per tick, and it cannot have changed while none of
+/// the files it reads have.
+struct PhaseGate {
+    /// The files `transcript_verdict` will read for this session.
+    paths: Vec<PathBuf>,
+    /// (len, mtime) of each of them at the last read.
+    stamp: Option<Vec<(u64, u64)>>,
+    /// What that read said, held until one of the files moves.
+    transcript: Option<(&'static str, &'static str)>,
+}
+
+impl PhaseGate {
+    async fn new(session_id: &str) -> Self {
+        let sid = session_id.to_string();
+        let paths = crate::run_blocking(move || phase_sources(&sid)).await;
+        Self { paths, stamp: None, transcript: None }
+    }
+
+    async fn tick(&mut self, spine: &Spine, app: &AppHandle, session_id: &str) {
+        // A session whose transcript has not appeared yet (a tab that just
+        // opened) resolves to nothing; keep asking, cheaply, until it does.
+        if self.paths.is_empty() {
+            self.paths = PhaseGate::new(session_id).await.paths;
+        }
+        let sid = session_id.to_string();
+        let paths = self.paths.clone();
+        let last = self.stamp.clone();
+        let (stamp, fresh) = crate::run_blocking(move || {
+            let (stamp, quiet) = stamp_of(&paths);
+            if stamp.is_some() && stamp == last && quiet > VERDICT_SETTLES_AFTER {
+                return (stamp, None); // nothing it reads moved, and nothing will
+            }
+            let verdict = crate::remote_api::transcript_verdict(&sid);
+            (stamp, Some(verdict))
+        })
+        .await;
+        self.stamp = stamp;
+        if let Some(verdict) = fresh {
+            self.transcript = verdict;
+        }
+        // Cadence is read every tick either way: it is an in-memory flag,
+        // and a terminal falling quiet is exactly the change the cached
+        // transcript half cannot see.
+        let cadence = app.try_state::<Arc<crate::tabs::TabRegistry>>().and_then(|tabs| {
+            tabs.session_activities()
+                .into_iter()
+                .find(|(id, _)| id == session_id)
+                .map(|(_, a)| a)
+        });
+        let (activity, detail) =
+            crate::remote_api::activity_verdict(cadence.as_deref(), self.transcript);
+        let phase = match activity {
+            "working" => Phase::Working,
+            "attention" => Phase::NeedsYou,
+            _ => Phase::Idle,
+        };
+        spine.push_phase_if_tailed(session_id, phase, detail);
+    }
+}
+
+/// The files whose changes can move a session's phase verdict: its
+/// transcript, plus grok's `events.jsonl` beside it — `transcript_verdict`
+/// prefers that file's explicit turn and permission records over the
+/// inference it falls back to.
+fn phase_sources(session_id: &str) -> Vec<PathBuf> {
+    let list = crate::agents::backends();
+    let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(dir) = path.parent().filter(|d| d.file_name().is_some_and(|n| n == session_id)) {
+        out.push(dir.join("events.jsonl"));
+    }
+    out.push(path);
+    out
+}
+
+/// (len, mtime seconds) for each path that exists, and how long ago the most
+/// recent of them was written. `None` when none of them do.
+fn stamp_of(paths: &[PathBuf]) -> (Option<Vec<(u64, u64)>>, Duration) {
+    let mut out = Vec::new();
+    let mut newest = Duration::MAX;
+    for path in paths {
+        let Ok(meta) = std::fs::metadata(path) else { continue };
+        let modified = meta.modified().ok();
+        let secs = modified
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Some(age) = modified.and_then(|t| t.elapsed().ok()) {
+            newest = newest.min(age);
+        }
+        out.push((meta.len(), secs));
+    }
+    if out.is_empty() {
+        (None, Duration::ZERO)
+    } else {
+        (Some(out), newest)
+    }
+}
+
 // ------------------------------------------------------------- the driver
+
+/// Open the session's adapter, waiting for its source to exist.
+///
+/// A session launched a moment ago has an id and a bound tab before its
+/// engine has written anything, and every `open` resolves through the files
+/// on disk — claude's through `owner_in`, grok's through its session
+/// directory — so it can only succeed once the first one is there. Retrying
+/// is the whole mechanism: there is no path to watch before the adapter
+/// exists to name one.
+///
+/// Nothing is pushed and `live` stays false until it opens. `ready` is set
+/// after the first failure so a `GET …/spine` on a session with nothing to
+/// show yet answers at once instead of sitting out its bootstrap grace.
+///
+/// `None` when the session was reaped while waiting.
+async fn open_when_it_exists(
+    spine: &Arc<Spine>,
+    app: &AppHandle,
+    session_id: &str,
+    agent: &str,
+) -> Option<Box<dyn Adapter>> {
+    let short = short(session_id);
+    let mut tick = tokio::time::interval(TICK);
+    let mut slow = tokio::time::interval(SLOW_OPEN_RETRY);
+    // The slow interval goes unpolled for the whole fast minute; on Burst
+    // (the default) it would then fire its missed ticks back to back and
+    // retry six times in a row before settling.
+    slow.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reap = tokio::time::interval(REAP_EVERY);
+    reap.tick().await;
+    let waiting_since = Instant::now();
+    let mut tries: u32 = 0;
+    loop {
+        let (a, s) = (agent.to_string(), session_id.to_string());
+        if let Some(adapter) = crate::run_blocking(move || super::open_adapter(&a, &s)).await {
+            if tries > 0 {
+                crate::diag!(
+                    "spine",
+                    "{agent} source for {short} appeared after {}s",
+                    waiting_since.elapsed().as_secs()
+                );
+            }
+            return Some(adapter);
+        }
+        if tries == 0 {
+            crate::diag!("spine", "{agent} has no source for {short} yet; waiting for one");
+            // Not live, and nothing to hand back — but do not make a phone
+            // wait out the grace period to be told so.
+            spine.set_flags(session_id, Some(false), Some(true));
+        }
+        tries = tries.saturating_add(1);
+        let fast = waiting_since.elapsed() < FAST_OPEN_RETRY_FOR;
+        tokio::select! {
+            _ = tick.tick(), if fast => {}
+            _ = slow.tick(), if !fast => {}
+            _ = reap.tick() => {
+                if !spine.still_wanted(app, session_id) {
+                    crate::diag!("spine", "gave up waiting for {agent} source for {short}");
+                    return None;
+                }
+            }
+        }
+    }
+}
 
 /// One tokio task per tailed session: open the adapter, replay history,
 /// then poll on every change of a watched file and on the fallback tick
 /// until nobody wants this session any more.
 async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: String) {
     let short = short(&session_id);
-    let opened = {
-        let (a, s) = (agent.clone(), session_id.clone());
-        crate::run_blocking(move || super::open_adapter(&a, &s)).await
-    };
-    let Some(adapter) = opened else {
-        crate::diag!("spine", "{agent} has no adapter for {short}; nothing to tail");
-        // Ready, so a waiting GET answers at once; not live, so the phone
-        // knows to keep using the conversation poll.
-        spine.set_flags(&session_id, Some(false), Some(true));
-        return;
+    let Some(adapter) = open_when_it_exists(&spine, &app, &session_id, &agent).await else {
+        return; // reaped while waiting for a source that never appeared
     };
     spine.set_flags(&session_id, Some(super::is_native(&agent)), None);
 
@@ -385,8 +574,13 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
 
     let mut tick = tokio::time::interval(TICK);
     tick.tick().await; // the first tick is immediate; skip it
+    // A slow poll (a big transcript, a busy blocking pool) must not be paid
+    // back with a burst of catch-up polls the moment it returns.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut reap = tokio::time::interval(REAP_EVERY);
     reap.tick().await;
+    let mut phase = PhaseGate::new(&session_id).await;
+    phase.tick(&spine, &app, &session_id).await;
 
     loop {
         tokio::select! {
@@ -409,6 +603,9 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
             // ring drops what came before it and the phone re-fetches.
             spine.push(&session_id, &agent, ts, kind);
         }
+        // After the content, so a phase never claims a turn ended before
+        // the text of it is in the log.
+        phase.tick(&spine, &app, &session_id).await;
     }
     crate::diag!("spine", "tail stopped for {short}: no tab bound and no interest");
 }

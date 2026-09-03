@@ -35,18 +35,34 @@ Kinds:
 | `agent_text` | `id`, `text`, `done` | Assistant prose. `text` is the FULL text of this block so far, never a delta. Upsert by `id`. `done:false` means more may come for this id. |
 | `agent_thought` | `id`, `text`, `done` | Reasoning, same rules as `agent_text`. |
 | `tool_call` | `id`, `tool`, `title`, `category`, `input`, `status` | A tool was invoked. Appears the moment the call is issued. `input` is a one-line summary, clipped. |
-| `tool_call_update` | `id`, `status`, `output` | Status moved; `output` (clipped, optional) is the result when there is one. Upsert by `id`. |
+| `tool_call_update` | `id`, `status`, `output` | Status moved; `output` (clipped, optional) is the result when there is one. Upsert by `id`. An absent `output` means "no change" — never "clear it"; the consumer keeps whatever it already holds for that id. |
 | `turn_started` | `turn` | A turn opened (a person spoke; the engine is going to answer). |
 | `turn_ended` | `turn`, `reason` | `completed` \| `interrupted` \| `error` \| `unknown`. |
 | `phase` | `phase`, `detail` | `working` \| `needs_you` \| `idle`. Status, not content. `detail` is human text ("running Bash", "permission: Edit foo.rs"). |
-| `reset` | — | History was rebuilt (a `/clear`, a file replaced). The phone drops everything it holds for this session and fetches from `after=0`. |
+| `reset` | — | History was rebuilt (a `/clear`, a file replaced). The phone drops everything it holds for this session and fetches from `after=0`. It carries `ts = now`: there is no source record behind it to take a time from. |
 
 `category` ∈ `read` \| `edit` \| `execute` \| `search` \| `fetch` \| `think` \| `other`.
 `status` ∈ `pending` \| `running` \| `completed` \| `failed` \| `cancelled`.
 
-Ids are stable across re-reads of the same source (a message uuid + block
-index for Claude, a tool call id where the engine has one, a line ordinal
-where it does not). A consumer that sees an id twice replaces, never appends.
+Ids are stable across re-reads of the same source. A consumer that sees an
+id twice replaces, never appends. What each engine builds one from, as the
+adapters found them in real files:
+
+- **Claude** — the API `message.id` plus `apiBlockIndex`, which together
+  name one content block of one assistant message. Transcripts written
+  before Claude Code 2.1.252 have no `apiBlockIndex`; those fall back to
+  the line's own `uuid`.
+- **Grok** — the line ordinal of the FIRST chunk of a run, so every chunk
+  that folds into one block shares the block's id. Tool calls use the
+  engine's own `toolCallId` instead.
+- **The legacy adapter** — the turn's ordinal, which is all a re-derived
+  conversation has.
+
+A `tool_call` re-issued under an id that already exists is not a mistake:
+it is how a card gets filled in. Grok writes the call first and the human
+`title` and kind on a second line, so the second `tool_call` carries the
+better text. Merge it like any other upsert, and keep any `output` already
+held for that id — a re-issued call never carries one.
 
 ## Endpoints
 
@@ -57,6 +73,12 @@ where it does not). A consumer that sees an id twice replaces, never appends.
   `live` is false when the session is served by the legacy adapter
   (an engine with no native adapter yet: the conversation is re-derived
   from `conversation_rich` on a slow poll and diffed into events).
+  When the call is what STARTS the tail it waits up to 2 s for the
+  adapter's `bootstrap()` to land before answering, so a phone opening a
+  session gets its history in that one request rather than a blank screen
+  and a wait for the next event. A tail that is already running answers
+  immediately; an agent with no adapter at all answers at once with
+  `live:false` and no events.
 - The existing WebSocket `/v1/events` now also carries
   `{"type":"spine", …SpineEvent fields flattened…}` for every session with
   a running tail. The phone ignores sessions it is not looking at.
@@ -68,8 +90,10 @@ where it does not). A consumer that sees an id twice replaces, never appends.
 2. On a `spine` WS event for that session: if `epoch` differs → go to 1.
    If `seq == lastSeq + 1` → apply. Otherwise → `GET …/spine?after=lastSeq`
    and apply what comes back (dedupe by `seq`).
-3. Apply = upsert by `id` for `agent_text`/`agent_thought`/`tool_call`/
-   `tool_call_update`; append for `user_message`; `reset` → clear and go to 1.
+3. Apply = upsert by `id` for every kind that carries one, `user_message`
+   included — Grok folds a pasted image and its caption into one message
+   across two chunks, so the same id arrives twice with more text the
+   second time. Append only when the id is new. `reset` → clear and go to 1.
 4. Never rebuild the list from scratch on a normal event. Rows are keyed by
    id so a growing block re-renders in place.
 5. On WS reconnect: `GET …/spine?after=lastSeq`.
@@ -84,9 +108,74 @@ where it does not). A consumer that sees an id twice replaces, never appends.
 - A tail stops when: no tab is bound AND no interest for 15 minutes.
 - Adapter driver: `bootstrap()` once (history → events, seq assigned in
   order), then `poll()` on every change of any `watch_paths()` file
-  (notify, 250 ms coalesce) and on a 2 s fallback tick.
-- Phase events from the terminal (OSC progress / bell) are bridged onto
-  the spine by the registry so a consumer has one stream.
+  (notify, 250 ms coalesce) and on a 2 s fallback tick. The notify watch
+  is on the parent DIRECTORY of each watched path, not the file: a
+  `/clear` replaces the transcript, and a watch on the old inode goes
+  quiet.
+- `open_adapter` is retried until it succeeds. A session launched a moment
+  ago has an id and a bound tab before its engine has written anything,
+  and every adapter's `open` resolves through files on disk — so the first
+  try fails and there is no path to watch yet either. The driver retries on
+  its 2 s tick for the first minute, then every 10 s (`open_adapter` asks
+  each backend in turn and codex's answer rescans its whole session tree).
+  Nothing is pushed and `live` stays false until it opens; the tail is
+  still reaped on the usual rule if the source never appears.
+- A tail that was reaped and later starts again pushes a `Reset` before it
+  bootstraps. A phone may still hold the history from the first run, and
+  replaying it would append every `user_message` a second time. `seq`
+  keeps counting across the restart; only `epoch` ever resets it.
+- The ring drops everything before a `Reset` as it stores one. The
+  consumer is about to refetch from `after=0` anyway, and the dropped
+  events are usually the bulk of the ring. The `Reset` itself stays, so a
+  phone catching up on `after=lastSeq` still sees it.
+
+## Phase — where the verdict comes from
+
+`phase` is not the adapter's. Adapters read content; what a session is
+DOING is decided by one function, `remote_api::activity_verdict`, which the
+sessions list (`GET /v1/sessions`) and the spine's driver both call. There
+is one rule, so the phone's list and the session it opens can never
+disagree about a session.
+
+Two inputs:
+
+- **Terminal cadence** — bytes on the tab's pty in the last 10 s
+  (`TabRegistry::session_activities`, which spells it `output`). Immediate,
+  and blind: it cannot tell working from waiting-on-a-person.
+- **The transcript** — `remote_api::transcript_verdict`, a tail read of the
+  session's own files: grok's `events.jsonl` (`permission_requested` →
+  attention, with the reason `permission`), antigravity's step types,
+  codex's open turn that has written nothing for 45 s (`approval`),
+  opencode's store. Returns the verdict and a short reason, or nothing.
+
+The transcript outranks cadence when cadence is idle, and when the
+transcript says `attention` against a cadence `working` — codex's TUI
+animates through its own approval dialog, so cadence alone holds `working`
+forever. Cadence is never demoted to idle from the transcript side.
+
+Two paths push it, both through the same dedupe:
+
+- The tabs registry bridge, on every cadence change, for immediacy. No
+  detail: bytes on a pty know no reason.
+- The driver's 2 s tick, which is the authority — it is what carries
+  `attention` and its reason.
+
+Both are dropped when the (phase, detail) pair is the one already standing.
+Cadence fires four times a second while output flows; without that the ring
+would be nothing but identical `working` events. The tick's transcript read
+is skipped whenever the length and mtime of every file it reads are
+unchanged AND the newest of them is more than 60 s old — past that a
+verdict can no longer flip on its own, and before it, codex's 45 s
+staleness rule still can. Cadence is re-read every tick regardless: a
+terminal falling quiet is the one change a cached transcript cannot see.
+
+A phase is only ever pushed for a session that already has a tail. Neither
+path starts one — a phase with no content behind it is not worth opening a
+transcript for.
+
+A duplicate `phase` is harmless: it is status, not content, and applying
+the same one twice changes nothing. The dedupe above is there to keep the
+ring from filling with them, not because a consumer would mind.
 
 ## Adapter contract
 
@@ -113,8 +202,32 @@ file), `poll()` returns a `Reset` followed by the rebuilt history.
 | engine | content | phase / turns |
 |---|---|---|
 | claude | `~/.claude/projects/<proj>/<id>.jsonl`, one line per content block (thinking, text, tool_use) + `user` lines carrying `tool_result`. Skip `isSidechain` and `isMeta`. | `user` line → `turn_started`; `system` `turn_duration` → `turn_ended`; terminal activity → `phase`. Hooks later. |
-| grok | `~/.grok/sessions/<cwd>/<id>/updates.jsonl` — ACP `session/update` lines: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `_x.ai` `turn_completed`. Consecutive chunks of one kind fold into one block (id = ordinal of the first line). | `events.jsonl`: `turn_started`, `first_token`, `tool_started`, `permission_requested` → `phase needs_you`, `permission_resolved`, `turn_completed`. |
-| others | legacy adapter over `conversation_rich`. | terminal activity only. |
+| grok | `~/.grok/sessions/<cwd>/<id>/updates.jsonl` — ACP `session/update` lines: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, and `_x.ai` `turn_completed` (in updates.jsonl, not events.jsonl). Consecutive chunks of one kind fold into one block (id = ordinal of the first line). | `events.jsonl`: `turn_started`, `turn_ended` (with `outcome`), `permission_requested` / `permission_resolved`, `tool_started` / `tool_completed` (with `outcome`), `first_token`, and `phase_changed` (ignored — it describes the TUI, not the session). |
+| others | legacy adapter over `conversation_rich`. | the phase verdict above. |
+
+Two things the adapters learned that the vocabulary above does not say:
+
+- **Claude's `turn_ended.reason` is only ever `completed`.** The transcript
+  has no record for an interruption — it arrives as a `user` text block
+  reading "[Request interrupted by user]", which is prose, not an event.
+  `interrupted` will have to come from a hook or from `phase`.
+- **Grok's `permission_requested` fires for every tool, yolo mode
+  included** — it is the harness announcing a check, not necessarily a
+  prompt on screen. Only a request still unresolved at the END of a poll
+  batch is a person being waited on, so that is the only one the adapter
+  reports as `needs_you`.
+
+The legacy adapter has no ids, no timestamps and no streaming to work
+with — `conversation_rich` returns `(role, text)` turns — so: ids are the
+turn's ordinal (`legacy:<n>`), `ts` is when it was read, `done` is always
+true, and the role IS the tool name for anything that is not `user`,
+`assistant` or `thinking`. The one exception is `system`, which on that
+path is only ever the "earlier turns omitted for length" marker
+`conversation_rich` inserts when a conversation is over budget: it is prose
+about the conversation, not a tool that ran, so it maps to `agent_text`.
+The last turn is never treated as settled (a growing assistant block is
+re-emitted under its own id, which upserts); a shorter list, or a settled
+turn that changed, is a `Reset` and a full replay.
 
 ## Ownership while it is being built
 

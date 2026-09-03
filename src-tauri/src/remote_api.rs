@@ -1723,23 +1723,28 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     let t_running = t0.elapsed();
     let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
     let open = tabs.bound_sessions();
-    let mut activity: HashMap<String, String> = tabs.session_activities().into_iter().collect();
+    let cadence: HashMap<String, String> = tabs.session_activities().into_iter().collect();
     // A terminal that reports nothing (Codex has no progress sequence) is
     // not idle — ask its transcript. Only for sessions with a live process.
     let candidates: Vec<String> = open.iter().chain(running.iter()).cloned().collect();
-    let busy = crate::run_blocking(move || {
+    let busy: HashMap<String, (&'static str, &'static str)> = crate::run_blocking(move || {
         candidates
             .into_iter()
-            .filter_map(|id| transcript_state(&id).map(|s| (id, s)))
-            .collect::<Vec<(String, &'static str)>>()
+            .filter_map(|id| transcript_verdict(&id).map(|v| (id, v)))
+            .collect()
     })
     .await;
-    for (id, st) in busy {
-        let e = activity.entry(id).or_insert_with(|| "idle".into());
-        if transcript_outranks(e, st) {
-            *e = st.into();
-        }
-    }
+    // One verdict per session either source knows about, decided by the
+    // same function the spine's phase tick calls — the two cannot disagree
+    // about a session because there is only one rule.
+    let activity: HashMap<String, String> = cadence
+        .keys()
+        .chain(busy.keys())
+        .map(|id| {
+            let v = activity_verdict(cadence.get(id).map(String::as_str), busy.get(id).copied());
+            (id.clone(), v.0.to_string())
+        })
+        .collect();
     let t_busy = t0.elapsed();
     // Which sessions produced files, for the phone's "has files" filter.
     let with_files: Vec<String> = crate::changes::sessions_with_files(&ctx.app).into_iter().collect();
@@ -1787,7 +1792,7 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
 /// `task_started` and `task_complete` events; Claude's last message is the
 /// person's until the assistant answers. Reads only the tail of the file.
 fn transcript_busy(session_id: &str) -> bool {
-    transcript_state(session_id).is_some()
+    transcript_verdict(session_id).is_some()
 }
 
 /// The tail of `path`, at most `keep` bytes. `None` for a missing file or a
@@ -1918,16 +1923,49 @@ fn transcript_outranks(terminal: &str, transcript: &str) -> bool {
     terminal == "idle" || (transcript == "attention" && terminal == "working")
 }
 
-/// `Some("working")`, `Some("attention")` — codex mid-approval, or a grok
-/// permission prompt — or `None`.
+/// The single place one session's activity is decided: the tab's output
+/// cadence, corrected by what the session's own files say. The sessions
+/// list and the spine's phase tick both come through here, so neither can
+/// hold a verdict the other would not.
+///
+/// Returns the verdict and a short human detail — "" when the source has
+/// nothing to add beyond the state itself.
+pub(crate) fn activity_verdict(
+    terminal: Option<&str>,
+    transcript: Option<(&'static str, &'static str)>,
+) -> (&'static str, &'static str) {
+    // `session_activities` spells cadence "output"; the phone's session
+    // state, the spine's phases and `transcript_outranks` all speak
+    // working/attention/idle. Normalising here is what lets the rule below
+    // fire at all: against the raw "output" spelling `transcript_outranks`
+    // matched neither arm, so a codex parked on an approval kept reading as
+    // busy — the exact case that rule was written for.
+    let cadence: &'static str = match terminal {
+        Some("output" | "working") => "working",
+        Some("attention") => "attention",
+        _ => "idle",
+    };
+    match transcript {
+        Some((state, detail)) if transcript_outranks(cadence, state) => (state, detail),
+        _ => (cadence, ""),
+    }
+}
+
+/// `Some(("working", …))`, `Some(("attention", …))` — codex mid-approval, or
+/// a grok permission prompt — or `None`.
 /// Public within the crate: the pty layer consults it before believing a
-/// quiet terminal means an idle session.
+/// quiet terminal means an idle session, and the spine's phase tick turns
+/// it into a `phase` event.
 /// Codex writes nothing while its approval prompt is up, so "waiting on a
 /// person" is read as: a turn in progress whose last act is a tool call
 /// with no output, and a transcript that has gone quiet. Grok ≥1.0.13 writes
 /// explicit events instead ([`grok_events_state`]), which short-circuit that
 /// inference for grok sessions only.
-pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
+///
+/// The second half is a short human reason, "" when there is none. It is
+/// never inferred: each return below names only what the record it read
+/// actually says.
+pub(crate) fn transcript_verdict(session_id: &str) -> Option<(&'static str, &'static str)> {
     // OpenCode sessions live in a SQLite store, not a transcript file —
     // `owner_in` resolves one to `opencode.db` itself, and the tail read
     // below then fails UTF-8 on binary SQLite into a silent `None`, every
@@ -1945,7 +1983,7 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
             Some((true, dir))
                 if crate::sessions::opencode_process_alive(session_id, dir.as_deref()) =>
             {
-                Some("working")
+                Some(("working", ""))
             }
             _ => None,
         };
@@ -1962,7 +2000,11 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
     if let Some(dir) = path.parent().filter(|d| d.file_name().is_some_and(|n| n == session_id)) {
         if let Some(text) = tail_of(&dir.join("events.jsonl"), 256 * 1024) {
             if let Some(verdict) = grok_events_state(&text) {
-                return verdict;
+                // That function returns attention for exactly one reason —
+                // an unresolved `permission_requested`; nothing else in
+                // events.jsonl can produce it — so naming the reason here
+                // reads the record rather than guessing at it.
+                return verdict.map(|s| (s, if s == "attention" { "permission" } else { "" }));
             }
         }
     }
@@ -1973,7 +2015,10 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
     if path.to_string_lossy().contains("/antigravity-cli/brain/") {
         return tail_of(&path, 256 * 1024)
             .and_then(|text| antigravity_transcript_state(&text))
-            .flatten();
+            .flatten()
+            // agy's only attention is an unanswered `ask_question` /
+            // `ask_permission` / `ask_custom_permission` call.
+            .map(|s| (s, if s == "attention" { "permission" } else { "" }));
     }
     let stale = std::fs::metadata(&path)
         .ok()
@@ -2046,7 +2091,7 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
         }
     }
     match state {
-        Some(true) if pending_call && stale => Some("attention"),
+        Some(true) if pending_call && stale => Some(("attention", "a tool call is waiting")),
         // Codex asks for command approval BEFORE writing the exec record, so
         // a dialog can be up with NO unanswered call on disk — a live stuck
         // approval showed exactly that: open turn, all steps completed, phone
@@ -2056,8 +2101,8 @@ pub(crate) fn transcript_state(session_id: &str) -> Option<&'static str> {
         // a person being waited on — or a wedge, which wants the same glance.
         // Claude keeps the pending-call requirement: its long silent Bash
         // calls are routine, and its prompts ring the terminal bell instead.
-        Some(true) if saw_codex && stale => Some("attention"),
-        Some(true) => Some("working"),
+        Some(true) if saw_codex && stale => Some(("attention", "approval")),
+        Some(true) => Some(("working", "")),
         _ => None,
     }
 }
@@ -2838,6 +2883,42 @@ mod tests {
         assert!(!transcript_outranks("working", "working"));
         assert!(!transcript_outranks("working", "idle"));
         assert!(!transcript_outranks("attention", "working"));
+    }
+
+    /// The one rule both the sessions list and the spine's phase tick obey.
+    /// The cases that matter: cadence is spelled "output" by the tab
+    /// registry and must still lose to a transcript that says a person is
+    /// being waited on, and the reason rides along with the verdict.
+    #[test]
+    fn one_verdict_serves_the_sessions_list_and_the_spine() {
+        // Nothing known at all.
+        assert_eq!(activity_verdict(None, None), ("idle", ""));
+        // Cadence alone, in the spelling `session_activities` actually uses.
+        assert_eq!(activity_verdict(Some("output"), None), ("working", ""));
+        assert_eq!(activity_verdict(Some("idle"), None), ("idle", ""));
+        // A quiet terminal takes any transcript verdict, reason and all.
+        assert_eq!(
+            activity_verdict(Some("idle"), Some(("working", ""))),
+            ("working", "")
+        );
+        assert_eq!(
+            activity_verdict(Some("idle"), Some(("attention", "permission"))),
+            ("attention", "permission")
+        );
+        // The regression this function exists for: a codex whose TUI keeps
+        // animating through its approval dialog reads "output" forever, and
+        // must still come out as attention.
+        assert_eq!(
+            activity_verdict(Some("output"), Some(("attention", "approval"))),
+            ("attention", "approval")
+        );
+        // But output is never demoted to idle by a transcript with nothing
+        // to say — output is output.
+        assert_eq!(activity_verdict(Some("output"), None), ("working", ""));
+        assert_eq!(
+            activity_verdict(Some("output"), Some(("working", ""))),
+            ("working", "")
+        );
     }
 
     /// The phone reads `type` to route the frame and `kind` to render it,
