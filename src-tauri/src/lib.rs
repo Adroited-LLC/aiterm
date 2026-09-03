@@ -49,6 +49,7 @@ pub fn run() {
     let pty = pty::PtyManager::default();
     let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
     let application_services = services::ApplicationServices::default();
+    let startup_services = application_services.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -185,6 +186,7 @@ pub fn run() {
             remote::remote_relay_configure,
             remote::remote_relay_server_set,
             remote::remote_relay_clear,
+            remote::remote_start_on_launch_set,
             remote::remote_begin_pairing,
             remote::remote_pending_pairings,
             remote::remote_approve_device,
@@ -228,6 +230,15 @@ pub fn run() {
             // Track files produced by active sessions. The structured mobile
             // API reads this ledger; it does not replace tab/session ownership.
             changes::start(app.handle());
+
+            // An explicit opt-in restores the same local gateway and saved
+            // private relay route. With no setting (the default), startup
+            // remains entirely offline as before.
+            remote::start_on_launch(
+                app.handle().clone(),
+                tabs.clone(),
+                startup_services.clone(),
+            );
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.

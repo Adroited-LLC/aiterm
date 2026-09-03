@@ -1132,6 +1132,13 @@ export const remoteStart = (address: string, port: number) =>
  *  turning remote access off is not the same statement as distrusting a phone. */
 export const remoteStop = () => invoke<RemoteStatus>("remote_stop");
 
+/** Persist whether the saved relay route should return when AITerm opens. */
+export const remoteStartOnLaunchSet = (
+  enabled: boolean,
+  address: string,
+  port: number,
+) => invoke<RemoteStatus>("remote_start_on_launch_set", { enabled, address, port });
+
 export const remoteRelayConfigure = (
   connectorUrl: string,
   publicHost: string,

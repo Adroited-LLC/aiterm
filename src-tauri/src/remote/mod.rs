@@ -5,13 +5,15 @@ pub mod server;
 pub mod terminal;
 pub mod uploads;
 
-use auth::{DeviceStore, PendingPairing, TrustedDevice};
+use auth::{
+    set_private_permissions, write_private_file, DeviceStore, PendingPairing, TrustedDevice,
+};
 use qrcode::{EcLevel, QrCode};
 use relay::{
     RelayConfig, RelayConnectionState, RelayConnectorHandle, RelayEnrollmentDraft,
     RelayServerConfig,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use server::{
     GatewayHandle, RemoteGateway, RemoteServices, TlsIdentity, MAX_ADVERTISED_HOSTS,
 };
@@ -27,6 +29,8 @@ pub const RELAY_PAIRING_VERSION: u8 = 2;
 pub const RELAY_AUTH_PAIRING_VERSION: u8 = 3;
 const DEFAULT_RELAY_SERVER: &str = "https://control.34-23-107-73.sslip.io:8443";
 const DEFAULT_RELAY_PUBLIC_DOMAIN: &str = "34-23-107-73.sslip.io";
+const STARTUP_CONFIG_FILE: &str = "startup.json";
+const DEFAULT_REMOTE_PORT: u16 = 8443;
 const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(300);
 
 // --- The pairing URI ---------------------------------------------------
@@ -331,6 +335,91 @@ fn state_root() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| "no data directory for remote access state".to_string())
 }
 
+/// The only remote state restored when AITerm opens. Relay credentials remain
+/// in `relay.json`; this file records the user's explicit decision to bring
+/// the listener and that saved private route back online automatically.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteStartupConfig {
+    enabled: bool,
+    address: String,
+    port: u16,
+}
+
+impl Default for RemoteStartupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: String::new(),
+            port: DEFAULT_REMOTE_PORT,
+        }
+    }
+}
+
+impl RemoteStartupConfig {
+    fn validated(self) -> Result<Self, String> {
+        if self.port < 1024 {
+            return Err("remote access port must be between 1024 and 65535".into());
+        }
+        if self.enabled {
+            let address: IpAddr = self
+                .address
+                .parse()
+                .map_err(|_| "the saved remote access address is invalid".to_string())?;
+            if !is_shareable_address(address) {
+                return Err("remote access will not bind loopback or a link-local address".into());
+            }
+        }
+        Ok(self)
+    }
+
+    fn load(root: &std::path::Path) -> Result<Self, String> {
+        let path = root.join(STARTUP_CONFIG_FILE);
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(format!("could not read remote startup setting: {error}")),
+        };
+        serde_json::from_slice::<Self>(&bytes)
+            .map_err(|error| format!("remote startup setting is corrupt: {error}"))?
+            .validated()
+    }
+
+    fn save(&self, root: &std::path::Path) -> Result<(), String> {
+        let validated = self.clone().validated()?;
+        std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+        set_private_permissions(root, 0o700).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&validated).map_err(|error| error.to_string())?;
+        let temporary = root.join(format!(
+            ".{STARTUP_CONFIG_FILE}.{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        write_private_file(&temporary, &bytes).map_err(|error| error.to_string())?;
+        if let Err(error) = std::fs::rename(&temporary, root.join(STARTUP_CONFIG_FILE)) {
+            let _ = std::fs::remove_file(temporary);
+            return Err(error.to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Prefer the address the person selected, but do not let a missing VPN or a
+/// changed DHCP lease strand the relay after a reboot. The listener binds the
+/// whole address family; this chosen address is its local connector target.
+fn startup_listener(
+    config: &RemoteStartupConfig,
+    found: Vec<IpAddr>,
+) -> Result<(String, u16), String> {
+    let shareable = shareable_addresses(found);
+    let address = shareable
+        .iter()
+        .find(|candidate| candidate.as_str() == config.address)
+        .or_else(|| shareable.first())
+        .cloned()
+        .ok_or_else(|| "remote access found no shareable LAN or VPN address".to_string())?;
+    Ok((address, config.port))
+}
+
 fn unix_millis(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -355,6 +444,7 @@ fn relay_certificate_dns(
 #[derive(Clone, Debug, Serialize)]
 pub struct RemoteStatusView {
     pub enabled: bool,
+    pub start_on_launch: bool,
     pub address: Option<String>,
     pub port: Option<u16>,
     pub fingerprint: Option<String>,
@@ -392,6 +482,8 @@ struct Inner {
     relay_server: Option<RelayServerConfig>,
     relay_config_loaded: bool,
     relay: Option<RelayConnectorHandle>,
+    startup: RemoteStartupConfig,
+    startup_loaded: bool,
     starting: bool,
 }
 
@@ -421,6 +513,18 @@ impl Inner {
             });
             self.relay_config_loaded = true;
         }
+        if !self.startup_loaded {
+            self.startup = match RemoteStartupConfig::load(&state_root()?) {
+                Ok(config) => config,
+                Err(error) => {
+                    // This preference grants no trust. Fail closed without
+                    // preventing manual remote access from being repaired.
+                    crate::diag!("remote", "ignoring invalid launch setting: {error}");
+                    RemoteStartupConfig::default()
+                }
+            };
+            self.startup_loaded = true;
+        }
         Ok(())
     }
 
@@ -438,6 +542,7 @@ impl Inner {
     fn status(&self) -> RemoteStatusView {
         RemoteStatusView {
             enabled: self.gateway.is_some(),
+            start_on_launch: self.startup.enabled,
             address: self.bound.map(|addr| addr.ip().to_string()),
             port: self.bound.map(|addr| addr.port()),
             fingerprint: self.fingerprint.clone(),
@@ -572,6 +677,10 @@ pub async fn remote_relay_clear(
         if inner.gateway.is_some() || inner.starting {
             return Err("turn remote access off before removing relay settings".into());
         }
+        if inner.startup.enabled {
+            inner.startup.enabled = false;
+            inner.startup.save(&state_root()?)?;
+        }
         inner.starting = true;
         inner.relay_config.clone()
     };
@@ -594,18 +703,41 @@ pub async fn remote_relay_clear(
 }
 
 #[tauri::command]
+pub async fn remote_start_on_launch_set(
+    state: tauri::State<'_, RemoteState>,
+    enabled: bool,
+    address: String,
+    port: u16,
+) -> Result<RemoteStatusView, String> {
+    let mut inner = state.inner.lock().await;
+    inner.load_relay_config()?;
+    if enabled && inner.relay_config.is_none() {
+        return Err("set up a relay before enabling automatic startup".into());
+    }
+    let config = RemoteStartupConfig {
+        enabled,
+        address,
+        port,
+    }
+    .validated()?;
+    config.save(&state_root()?)?;
+    inner.startup = config;
+    inner.startup_loaded = true;
+    Ok(inner.status())
+}
+
+#[tauri::command]
 pub async fn remote_interfaces(
     _state: tauri::State<'_, RemoteState>,
 ) -> Result<Vec<String>, String> {
     Ok(shareable_addresses(local_addresses()))
 }
 
-#[tauri::command]
-pub async fn remote_start(
+async fn start_remote(
     app: tauri::AppHandle,
-    state: tauri::State<'_, RemoteState>,
-    tabs: tauri::State<'_, Arc<crate::tabs::TabRegistry>>,
-    services: tauri::State<'_, crate::services::ApplicationServices>,
+    state: &RemoteState,
+    tabs: Arc<crate::tabs::TabRegistry>,
+    services: crate::services::ApplicationServices,
     address: String,
     port: u16,
 ) -> Result<RemoteStatusView, String> {
@@ -671,7 +803,7 @@ pub async fn remote_start(
         SocketAddr::new(listen_ip, port),
         devices,
         identity,
-        RemoteServices::from_application_services(tabs.inner().clone(), services.inner())
+        RemoteServices::from_application_services(tabs, &services)
             .with_app_handle(app)
             .with_gateway_routes(routes, port, relay_host, relay_port),
     )
@@ -689,6 +821,85 @@ pub async fn remote_start(
     }
     inner.gateway = Some(gateway);
     Ok(inner.status())
+}
+
+#[tauri::command]
+pub async fn remote_start(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, RemoteState>,
+    tabs: tauri::State<'_, Arc<crate::tabs::TabRegistry>>,
+    services: tauri::State<'_, crate::services::ApplicationServices>,
+    address: String,
+    port: u16,
+) -> Result<RemoteStatusView, String> {
+    start_remote(
+        app,
+        state.inner(),
+        tabs.inner().clone(),
+        services.inner().clone(),
+        address,
+        port,
+    ).await
+}
+
+/// Restore remote access only after an explicit opt-in. Failure is diagnostic,
+/// never fatal to the desktop: a missing interface or an offline relay should
+/// not stop AITerm itself from opening.
+pub fn start_on_launch(
+    app: tauri::AppHandle,
+    tabs: Arc<crate::tabs::TabRegistry>,
+    services: crate::services::ApplicationServices,
+) {
+    let root = match state_root() {
+        Ok(root) => root,
+        Err(error) => {
+            crate::diag!("remote", "could not read launch setting: {error}");
+            return;
+        }
+    };
+    let config = match RemoteStartupConfig::load(&root) {
+        Ok(config) if config.enabled => config,
+        Ok(_) => return,
+        Err(error) => {
+            crate::diag!("remote", "could not read launch setting: {error}");
+            return;
+        }
+    };
+    match RelayConfig::load(&root) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            crate::diag!(
+                "remote",
+                "automatic startup skipped: no relay route is configured"
+            );
+            return;
+        }
+        Err(error) => {
+            crate::diag!("remote", "automatic startup skipped: {error}");
+            return;
+        }
+    }
+    let (address, port) = match startup_listener(&config, local_addresses()) {
+        Ok(listener) => listener,
+        Err(error) => {
+            crate::diag!("remote", "automatic startup skipped: {error}");
+            return;
+        }
+    };
+    tauri::async_runtime::spawn(async move {
+        use tauri::Manager;
+        let state = app.state::<RemoteState>();
+        match start_remote(app.clone(), state.inner(), tabs, services, address, port).await {
+            Ok(status) => crate::diag!(
+                "remote",
+                "started automatically on {}:{}; relay={:?}",
+                status.address.as_deref().unwrap_or("?"),
+                status.port.unwrap_or_default(),
+                status.relay.state,
+            ),
+            Err(error) => crate::diag!("remote", "automatic startup failed: {error}"),
+        }
+    });
 }
 
 #[tauri::command]
@@ -852,6 +1063,69 @@ pub async fn remote_revoke_device(
 #[cfg(test)]
 mod listener_advertisement_tests {
     use super::*;
+
+    fn temporary_remote_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("aiterm-remote-startup-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn relay_startup_is_opt_in_and_round_trips_its_listener() {
+        let root = temporary_remote_root();
+        assert_eq!(
+            RemoteStartupConfig::load(&root).unwrap(),
+            RemoteStartupConfig::default()
+        );
+
+        let selected = RemoteStartupConfig {
+            enabled: true,
+            address: "10.0.0.151".into(),
+            port: 9443,
+        };
+        selected.save(&root).unwrap();
+        assert_eq!(RemoteStartupConfig::load(&root).unwrap(), selected);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relay_startup_prefers_the_saved_address_then_survives_network_changes() {
+        let config = RemoteStartupConfig {
+            enabled: true,
+            address: "10.8.0.2".into(),
+            port: 8443,
+        };
+        assert_eq!(
+            startup_listener(
+                &config,
+                vec!["192.168.1.20".parse().unwrap(), "10.8.0.2".parse().unwrap()],
+            )
+            .unwrap(),
+            ("10.8.0.2".into(), 8443),
+        );
+        assert_eq!(
+            startup_listener(&config, vec!["192.168.1.21".parse().unwrap()]).unwrap(),
+            ("192.168.1.21".into(), 8443),
+            "a missing VPN or a changed DHCP lease must not strand the relay",
+        );
+    }
+
+    #[test]
+    fn relay_startup_rejects_unsafe_listener_settings() {
+        assert!(RemoteStartupConfig {
+            enabled: true,
+            address: "127.0.0.1".into(),
+            port: 8443,
+        }
+        .validated()
+        .is_err());
+        assert!(RemoteStartupConfig {
+            enabled: true,
+            address: "10.0.0.151".into(),
+            port: 443,
+        }
+        .validated()
+        .is_err());
+    }
 
     #[test]
     fn selected_relay_server_domain_is_covered_before_a_route_exists() {
