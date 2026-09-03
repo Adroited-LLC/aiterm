@@ -28,6 +28,7 @@ import {
   remoteRevokeDevice,
   remoteRelayClear,
   remoteRelayConfigure,
+  remoteRelayServerSet,
   remoteStart,
   remoteStatus,
   remoteStop,
@@ -75,6 +76,7 @@ export default function RemoteAccessSettings() {
   const [addresses, setAddresses] = useState<string[]>([]);
   const [address, setAddress] = useState<string>("");
   const [port, setPort] = useState(DEFAULT_PORT);
+  const [relayServer, setRelayServer] = useState(DEFAULT_RELAY_SERVER);
   const [relayConnectorUrl, setRelayConnectorUrl] = useState("");
   const [relayPublicHost, setRelayPublicHost] = useState("");
   const [relayPublicPort, setRelayPublicPort] = useState(443);
@@ -109,6 +111,7 @@ export default function RemoteAccessSettings() {
         );
         setAddress(initial.address);
         setPort(initial.port);
+        setRelayServer(currentStatus.relay_server || DEFAULT_RELAY_SERVER);
         setRelayConnectorUrl(currentStatus.relay?.connector_url ?? "");
         setRelayPublicHost(currentStatus.relay?.public_host ?? "");
         setRelayPublicPort(currentStatus.relay?.public_port ?? 443);
@@ -158,6 +161,7 @@ export default function RemoteAccessSettings() {
   if (!status) {
     return <div className="sgroup-foot">Looking…</div>;
   }
+  const relayServerChanged = relayServer.trim() !== status.relay_server;
 
   return (
     <>
@@ -170,10 +174,27 @@ export default function RemoteAccessSettings() {
             wide
           >
             <div className="remote-managed-relay">
-              <code className="diag-val">
-                {relayServerFromConnectorUrl(status.relay?.connector_url) ?? DEFAULT_RELAY_SERVER}
-              </code>
+              <input
+                className="set-input mono"
+                value={relayServer}
+                list="aiterm-relay-servers"
+                placeholder={DEFAULT_RELAY_SERVER}
+                aria-label="Relay server"
+                spellCheck={false}
+                onChange={(event) => setRelayServer(event.target.value)}
+              />
+              <datalist id="aiterm-relay-servers">
+                <option value={DEFAULT_RELAY_SERVER}>AITerm Relay</option>
+                {status.relay_server !== DEFAULT_RELAY_SERVER && (
+                  <option value={status.relay_server}>Saved relay server</option>
+                )}
+              </datalist>
               <div className="remote-relay-actions">
+                <button
+                  className="set-recheck"
+                  disabled={status.enabled || status.relay?.configured || !relayServer.trim() || !relayServerChanged}
+                  onClick={() => run(remoteRelayServerSet(relayServer))}
+                >Save server</button>
                 {status.relay?.configured && (
                   <button
                     className="set-recheck"
@@ -183,9 +204,13 @@ export default function RemoteAccessSettings() {
                 )}
               </div>
               <div className="sgroup-foot">
-                {status.relay?.configured
-                  ? relayLabel(status)
-                  : "Pair and approve a phone. LAN, VPN, and relay setup complete together."}
+                {status.relay?.configured && relayServerChanged
+                  ? `Current route remains on ${relayServerFromConnectorUrl(status.relay.connector_url) ?? "its existing server"}. Turn remote access off, remove it, then save this server.`
+                  : status.relay?.configured
+                    ? relayLabel(status)
+                    : relayServerChanged
+                      ? "Save this server before turning remote access on. AITerm verifies its control identity and public domain first."
+                      : "Pair and approve a phone. LAN, VPN, and relay setup complete together."}
               </div>
             </div>
           </Row>
@@ -201,7 +226,7 @@ export default function RemoteAccessSettings() {
                   () => saveListenerPreference({ address, port }),
                 )
               }
-              disabled={!status.enabled && !address}
+              disabled={!status.enabled && (!address || relayServerChanged)}
             >
               {status.enabled ? "Turn off" : "Turn on"}
             </button>
@@ -363,7 +388,7 @@ export default function RemoteAccessSettings() {
           >
             <button
               className="set-recheck"
-              disabled={!status.enabled}
+              disabled={!status.enabled || relayServerChanged}
               onClick={() => {
                 setError(null);
                 setNow(Date.now());

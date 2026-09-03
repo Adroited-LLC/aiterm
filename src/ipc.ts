@@ -1142,6 +1142,9 @@ export const remoteRelayConfigure = (
   connectorUrl, publicHost, publicPort, routeId, token,
 });
 
+export const remoteRelayServerSet = (server: string) =>
+  invoke<RemoteStatus>("remote_relay_server_set", { server });
+
 /** Asks a managed relay to mint one private route for this desktop. The
  * connector secret is returned directly to Rust and never enters JavaScript. */
 export const remoteRelayClear = () => invoke<RemoteStatus>("remote_relay_clear");

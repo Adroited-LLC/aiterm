@@ -22,6 +22,7 @@ const enabled: RemoteStatus = {
   address: "192.168.1.20",
   port: 8443,
   fingerprint: "n1oZ8kQ2xr7Yv0bDq3sTfLmE5wUcJhAaP9gRkNzXeIo",
+  relay_server: "https://control.relay.example.com",
 };
 const disabled: RemoteStatus = { ...enabled, enabled: false };
 
@@ -127,7 +128,13 @@ test("the listener selector restores the live or saved address instead of the fi
 
   assert.deepEqual(
     preferredListenerConfig(
-      { enabled: false, address: null, port: null, fingerprint: null },
+      {
+        enabled: false,
+        address: null,
+        port: null,
+        fingerprint: null,
+        relay_server: "https://control.relay.example.com",
+      },
       interfaces,
       saved,
     ),
@@ -135,7 +142,13 @@ test("the listener selector restores the live or saved address instead of the fi
   );
   assert.deepEqual(
     preferredListenerConfig(
-      { enabled: true, address: "10.8.0.4", port: 8555, fingerprint: "pin" },
+      {
+        enabled: true,
+        address: "10.8.0.4",
+        port: 8555,
+        fingerprint: "pin",
+        relay_server: "https://control.relay.example.com",
+      },
       interfaces,
       { address: "192.168.1.10", port: 8443 },
     ),

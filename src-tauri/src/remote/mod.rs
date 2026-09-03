@@ -7,7 +7,10 @@ pub mod uploads;
 
 use auth::{DeviceStore, PendingPairing, TrustedDevice};
 use qrcode::{EcLevel, QrCode};
-use relay::{RelayConfig, RelayConnectionState, RelayConnectorHandle, RelayEnrollmentDraft};
+use relay::{
+    RelayConfig, RelayConnectionState, RelayConnectorHandle, RelayEnrollmentDraft,
+    RelayServerConfig,
+};
 use serde::Serialize;
 use server::{
     GatewayHandle, RemoteGateway, RemoteServices, TlsIdentity, MAX_ADVERTISED_HOSTS,
@@ -334,6 +337,19 @@ fn unix_millis(time: SystemTime) -> u64 {
         .as_millis() as u64
 }
 
+fn relay_certificate_dns(
+    relay_config: Option<&RelayConfig>,
+    relay_server: Option<&RelayServerConfig>,
+) -> Vec<String> {
+    relay_config
+        .map(|config| vec![config.public_host.clone()])
+        .or_else(|| {
+            relay_server
+                .map(|server| vec![format!("*.{}", server.public_domain)])
+        })
+        .unwrap_or_else(|| vec![format!("*.{DEFAULT_RELAY_PUBLIC_DOMAIN}")])
+}
+
 // --- Desktop state and commands ----------------------------------------
 
 #[derive(Clone, Debug, Serialize)]
@@ -342,6 +358,7 @@ pub struct RemoteStatusView {
     pub address: Option<String>,
     pub port: Option<u16>,
     pub fingerprint: Option<String>,
+    pub relay_server: String,
     pub relay: RelayStatusView,
 }
 
@@ -372,6 +389,7 @@ struct Inner {
     fingerprint: Option<String>,
     advertised_hosts: Option<Vec<IpAddr>>,
     relay_config: Option<RelayConfig>,
+    relay_server: Option<RelayServerConfig>,
     relay_config_loaded: bool,
     relay: Option<RelayConnectorHandle>,
     starting: bool,
@@ -385,7 +403,22 @@ pub struct RemoteState {
 impl Inner {
     fn load_relay_config(&mut self) -> Result<(), String> {
         if !self.relay_config_loaded {
-            self.relay_config = RelayConfig::load(&state_root()?)?;
+            let root = state_root()?;
+            self.relay_config = RelayConfig::load(&root)?;
+            self.relay_server = Some(match RelayServerConfig::load(&root)? {
+                Some(server) => server,
+                None => match self
+                    .relay_config
+                    .as_ref()
+                    .and_then(RelayServerConfig::from_route)
+                {
+                    Some(server) => server,
+                    None => RelayServerConfig::known(
+                        DEFAULT_RELAY_SERVER,
+                        DEFAULT_RELAY_PUBLIC_DOMAIN,
+                    )?,
+                },
+            });
             self.relay_config_loaded = true;
         }
         Ok(())
@@ -408,6 +441,11 @@ impl Inner {
             address: self.bound.map(|addr| addr.ip().to_string()),
             port: self.bound.map(|addr| addr.port()),
             fingerprint: self.fingerprint.clone(),
+            relay_server: self
+                .relay_server
+                .as_ref()
+                .map(|value| value.control_origin.clone())
+                .unwrap_or_else(|| DEFAULT_RELAY_SERVER.to_string()),
             relay: RelayStatusView {
                 configured: self.relay_config.is_some(),
                 connector_url: self.relay_config.as_ref().map(|value| value.connector_url.clone()),
@@ -499,6 +537,32 @@ pub async fn remote_relay_configure(
 }
 
 #[tauri::command]
+pub async fn remote_relay_server_set(
+    state: tauri::State<'_, RemoteState>,
+    server: String,
+) -> Result<RemoteStatusView, String> {
+    {
+        let mut inner = state.inner.lock().await;
+        inner.load_relay_config()?;
+        if inner.gateway.is_some() || inner.starting {
+            return Err("turn remote access off before changing the relay server".into());
+        }
+        if inner.relay_config.is_some() {
+            return Err("remove the current relay route before changing its server".into());
+        }
+        inner.starting = true;
+    }
+    let discovered = RelayServerConfig::discover(server.trim()).await;
+    let mut inner = state.inner.lock().await;
+    inner.starting = false;
+    let selected = discovered?;
+    selected.save(&state_root()?)?;
+    inner.relay_server = Some(selected);
+    inner.relay_config_loaded = true;
+    Ok(inner.status())
+}
+
+#[tauri::command]
 pub async fn remote_relay_clear(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<RemoteStatusView, String> {
@@ -572,7 +636,10 @@ pub async fn remote_start(
             }
         }
     };
-    let relay_config = state.inner.lock().await.relay_config.clone();
+    let (relay_config, relay_server) = {
+        let inner = state.inner.lock().await;
+        (inner.relay_config.clone(), inner.relay_server.clone())
+    };
     let advertised_hosts = match advertised_hosts(ip, local_addresses()) {
         Ok(hosts) => hosts,
         Err(error) => {
@@ -581,9 +648,7 @@ pub async fn remote_start(
         }
     };
     let identity = match state_root().and_then(|root| {
-        let relay_dns = relay_config.as_ref()
-            .map(|config| vec![config.public_host.clone()])
-            .unwrap_or_else(|| vec![format!("*.{DEFAULT_RELAY_PUBLIC_DOMAIN}")]);
+        let relay_dns = relay_certificate_dns(relay_config.as_ref(), relay_server.as_ref());
         TlsIdentity::load_or_create_with_dns(root.join("tls"), &advertised_hosts, &relay_dns)
             .map_err(|e| e.to_string())
     }) {
@@ -651,7 +716,7 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
 pub async fn remote_begin_pairing(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
-    let (devices, fingerprint, needs_relay) = {
+    let (devices, fingerprint, needs_relay, relay_server) = {
         let mut inner = state.inner.lock().await;
         inner.load_relay_config()?;
         if inner.gateway.is_none() {
@@ -661,10 +726,15 @@ pub async fn remote_begin_pairing(
             inner.devices()?,
             inner.fingerprint.clone().ok_or("the remote identity is unavailable")?,
             inner.relay_config.is_none(),
+            inner
+                .relay_server
+                .as_ref()
+                .map(|value| value.control_origin.clone())
+                .unwrap_or_else(|| DEFAULT_RELAY_SERVER.to_string()),
         )
     };
     let draft = if needs_relay {
-        match RelayConfig::prepare_enrollment(DEFAULT_RELAY_SERVER, &fingerprint).await {
+        match RelayConfig::prepare_enrollment(&relay_server, &fingerprint).await {
             Ok(draft) => Some(draft),
             Err(error) => {
                 tracing::warn!(error = %error, "relay setup was unavailable during pairing");
@@ -782,6 +852,32 @@ pub async fn remote_revoke_device(
 #[cfg(test)]
 mod listener_advertisement_tests {
     use super::*;
+
+    #[test]
+    fn selected_relay_server_domain_is_covered_before_a_route_exists() {
+        let server = RelayServerConfig::known(
+            "https://control.custom.example.com",
+            "relay.custom.example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            relay_certificate_dns(None, Some(&server)),
+            vec!["*.relay.custom.example.com"]
+        );
+
+        let route = RelayConfig {
+            connector_url: "wss://control.custom.example.com/v1/connect".into(),
+            public_host: "desktop-1234.relay.custom.example.com".into(),
+            public_port: 443,
+            route_id: "desktop-1234".into(),
+            token: "x".repeat(43),
+            managed: true,
+        };
+        assert_eq!(
+            relay_certificate_dns(Some(&route), Some(&server)),
+            vec!["desktop-1234.relay.custom.example.com"]
+        );
+    }
 
     #[test]
     fn pairing_invite_hosts_are_the_exact_frozen_start_host_list() {
