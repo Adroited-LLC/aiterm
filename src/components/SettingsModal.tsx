@@ -9,6 +9,7 @@ import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
 import RemoteAccessSettings from "./RemoteAccessSettings";
 import LibrarianPane from "./LibrarianPane";
+import BringInPane from "./BringInPane";
 import type { LibrarianCtl } from "../librarian";
 import ClaudeConfig from "./agent-config/ClaudeConfig";
 import {
@@ -53,6 +54,7 @@ export type SettingsTab =
   | "agents"
   | "models"
   | "librarian"
+  | "bringin"
   | "remote"
   | "diagnostics";
 type Tab = SettingsTab;
@@ -63,6 +65,7 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "agents", label: "Agents" },
   { key: "models", label: "Model access" },
   { key: "librarian", label: "Librarian" },
+  { key: "bringin", label: "Bring in" },
   { key: "remote", label: "Remote access" },
   { key: "diagnostics", label: "Diagnostics" },
 ];
@@ -345,6 +348,9 @@ export default function SettingsModal({
                     ))}
                   </div>
                 </Row>
+                <Row label="Session summary on hover" desc="Rest the pointer on a session row and a card opens beside it with the summary, files and tasks">
+                  <Switch checked={settings.sessionHover} onChange={(on) => set({ sessionHover: on })} label="Session summary on hover" />
+                </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
                     <button
@@ -563,6 +569,9 @@ export default function SettingsModal({
             </>}
 
             {tab === "remote" && <RemoteAccessSettings />}
+            {tab === "bringin" && (
+              <BringInPane prompts={settings.bringIn} onChange={(next) => onChange({ ...settings, bringIn: next })} />
+            )}
             {tab === "librarian" && (
               <LibrarianPane
                 cfg={settings.librarian}
@@ -607,6 +616,13 @@ export default function SettingsModal({
                             <div className="agent-path">
                               Sessions are listed and searchable. Codex names its own
                               sessions, so aiterm adopts the id once it starts.
+                            </div>
+                          )}
+                          {a.id === "antigravity" && a.available && (
+                            <div className="agent-path">
+                              Sessions are listed, searchable and resumable; a new one is
+                              adopted from agy's store a moment after launch, and usage
+                              comes from its own /usage.
                             </div>
                           )}
                           {/* How much this engine asks before acting, applied

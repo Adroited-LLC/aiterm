@@ -44,6 +44,11 @@ data class RemoteClientState(
     val pendingTransfers: Int = 0,
     val tabs: List<RemoteTab> = emptyList(),
     val sessions: List<RemoteSession> = emptyList(),
+    val sessionsWithFiles: Set<String> = emptySet(),
+    val starredSessions: Set<String> = emptySet(),
+    val broughtInSessions: Map<String, String> = emptyMap(),
+    val sessionActivity: Map<String, String> = emptyMap(),
+    val usage: List<RemoteUsageSource> = emptyList(),
     val previewSessionId: String? = null,
     val previewMessages: List<RemotePreviewMessage> = emptyList(),
     val previewLoadingSessionId: String? = null,
@@ -563,8 +568,54 @@ class RemoteClient(
         requestScrollback(mutableScrollback.value.size, count)
 
     fun refreshSessions() {
-        launchRequest("session.list", byteArrayOf()) { payload ->
-            mutableState.value = mutableState.value.copy(sessions = RemoteCommands.sessions(payload))
+        launchRequest("session.roster", byteArrayOf()) { payload ->
+            val roster = RemoteCommands.sessionRoster(payload)
+            mutableState.value = mutableState.value.copy(
+                sessions = roster.sessions,
+                sessionsWithFiles = roster.withFiles,
+                starredSessions = roster.stars,
+                broughtInSessions = roster.broughtIn,
+                sessionActivity = roster.activity,
+            )
+        }
+    }
+
+    fun refreshUsage() {
+        launchRequest("usage.report", byteArrayOf()) { payload ->
+            mutableState.value = mutableState.value.copy(usage = RemoteCommands.usage(payload))
+        }
+    }
+
+    fun starSession(sessionId: String, on: Boolean) {
+        launchRequest("session.star", RemoteCommands.starSession(sessionId, on)) { refreshSessions() }
+    }
+
+    fun renameSession(sessionId: String, title: String) {
+        launchRequest("session.rename", RemoteCommands.renameSession(sessionId, title)) { refreshSessions() }
+    }
+
+    fun bringInSession(
+        sessionId: String,
+        agentId: String,
+        model: String?,
+        effort: String?,
+        focus: String,
+        rounds: Int,
+        auto: Boolean,
+    ) {
+        val request = {
+            launchRequest(
+                "session.bring_in",
+                RemoteCommands.bringInSession(sessionId, agentId, model, effort, focus, rounds, auto),
+            ) { refreshSessions() }
+        }
+        if (mutableState.value.tabs.any { it.sessionId == sessionId }) {
+            request()
+        } else {
+            launchRequest("session.open", RemoteCommands.openSession(sessionId, TerminalSize(80, 24))) { payload ->
+                selectTab(RemoteCommands.openedSessionTab(payload))
+                request()
+            }
         }
     }
 

@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
-  Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionDetail,
+  Caps, ProjectInfo, Session, SessionDetail, TrashedSession, homeAbbrev, searchSessions, sessionBroughtIn, sessionDetail,
 } from "../ipc";
 import SessionFlyout from "./SessionFlyout";
 import NewSessionMenu, { StartChoice, StartPoint } from "./NewSessionMenu";
 import AgentIcon from "./AgentIcon";
 import Icon from "./Icon";
 import {
-  ChevronsDownUp, ChevronsUpDown, Folder, GitBranch, GitFork, Play, RefreshCw, Search,
-  Settings as SettingsIcon, Trash2, X,
+  ChevronsDownUp, ChevronsUpDown, CornerDownRight, Folder, GitBranch, GitFork, Play, RefreshCw, Search,
+  Settings as SettingsIcon, Trash2, Users, X,
 } from "lucide-react";
 import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
@@ -180,7 +181,13 @@ interface Props {
    *  project or group header. The panel has already excluded anything a per-row
    *  🗑 would refuse. */
   onTrashSessions: (sessions: Session[]) => void;
+  /** Open the summary card when the pointer rests on a row. */
+  hoverSummary?: boolean;
 }
+
+/** How many recent rows render before "Show all" — a screen and a half of
+ *  history; everything stays reachable through search. */
+const RECENT_WINDOW = 80;
 
 export default function SessionsPanel({
   sessions, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
@@ -189,9 +196,25 @@ export default function SessionsPanel({
   onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
   pending, onSelectPending, onExitPending, onRefresh,
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
+  hoverSummary = true,
 }: Props) {
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
+  /** Brought-in session → the master it joined, from the same lineage store
+   *  the phone reads; and which masters have their crew folded away. */
+  const [broughtIn, setBroughtIn] = useState<Record<string, string>>({});
+  const [foldedCrews, setFoldedCrews] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    const load = () => { sessionBroughtIn().then(setBroughtIn).catch(() => {}); };
+    load();
+    const un = listen("sessions://changed", load);
+    return () => { un.then((f) => f()); };
+  }, []);
+  /** The recent list renders a window, not the archive: 500+ rows of DOM
+   *  reconciled on every transcript-append reload is what made typing lag
+   *  [measured 2026-08-31]. Search always looks at everything; "Show all"
+   *  opens the rest for a browse. */
+  const [showAllRecent, setShowAllRecent] = useState(false);
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   // Resuming a session that's still running stops it first, which throws away
   // whatever it was mid-way through — worth one click of confirmation.
@@ -308,6 +331,7 @@ export default function SessionsPanel({
   const flyCache = useRef<Map<string, SessionDetail>>(new Map());
   const [flyDetail, setFlyDetail] = useState<SessionDetail | null>(null);
   const flyEnter = (s: Session, el: HTMLElement, running: boolean) => {
+    if (!hoverSummary) return;
     if (flyTimer.current) window.clearTimeout(flyTimer.current);
     flyTimer.current = window.setTimeout(() => {
       const r = el.getBoundingClientRect();
@@ -419,10 +443,46 @@ export default function SessionsPanel({
   // otherwise strand the fork in a group of its own instead of listing it
   // beside the session it branched from. Rows still spawn in `project_path`.
   const grouped = useMemo(() => new Set(groups.flatMap((g) => g.members)), [groups]);
+  /** Glue each master's brought-in agents directly beneath it (left out
+   *  while folded); a satellite whose master is not in the list stays where
+   *  it is, as a row of its own. Mirrors the phone. */
+  const glueCrew = (list: Session[]): Session[] => {
+    const out: Session[] = [];
+    const placed = new Set<string>();
+    for (const s of list) {
+      if (placed.has(s.id)) continue;
+      const master = broughtIn[s.id];
+      if (master && list.some((x) => x.id === master)) continue;
+      out.push(s); placed.add(s.id);
+      for (const k of list) {
+        if (broughtIn[k.id] === s.id && !placed.has(k.id)) {
+          placed.add(k.id);
+          if (!foldedCrews.has(s.id)) out.push(k);
+        }
+      }
+    }
+    return out;
+  };
   const ungrouped = useMemo(
-    () => applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"]),
-    [filtered, grouped, orders],
+    () => glueCrew(applyOrder(filtered.filter((s) => !grouped.has(s.group_path)), orders["recent"])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filtered, grouped, orders, broughtIn, foldedCrews],
   );
+  /** Rows drawn indented: brought-in agents whose master is in the list. */
+  const satellites = useMemo(() => {
+    const ids = new Set(filtered.map((s) => s.id));
+    return new Set(Object.entries(broughtIn).filter(([k, m]) => ids.has(k) && ids.has(m)).map(([k]) => k));
+  }, [filtered, broughtIn]);
+  /** Master → how many of its brought-in agents still exist. The lineage
+   *  store remembers deleted ones; the badge must not. */
+  const crewCount = useMemo(() => {
+    const ids = new Set(sessions.map((s) => s.id));
+    const m = new Map<string, number>();
+    for (const [k, master] of Object.entries(broughtIn)) {
+      if (ids.has(k)) m.set(master, (m.get(master) ?? 0) + 1);
+    }
+    return m;
+  }, [sessions, broughtIn]);
   const groupMembers = useMemo(() => {
     const m = new Map<string, Session[]>();
     for (const g of groups) {
@@ -811,7 +871,7 @@ export default function SessionsPanel({
           };
         }}
         className={
-          "session-item" +
+          "session-item" + (satellites.has(s.id) ? " satellite" : "") +
           // Only the single focused session tints — not every session that
           // happens to share the active project. Multi-highlight is opt-in
           // via ctrl/shift-click (builds the `selected` set below).
@@ -858,6 +918,11 @@ export default function SessionsPanel({
         </div>
         <div className="session-text">
           <div className="session-title-row">
+            {satellites.has(s.id) && (
+              <span className="sat-mark" title="Brought into the session above">
+                <Icon of={CornerDownRight} size="sm" />
+              </span>
+            )}
             {s.forked && (
               <span
                 className="fork-mark"
@@ -871,6 +936,25 @@ export default function SessionsPanel({
               </span>
             )}
             <span className="session-title">{s.title}</span>
+            {(() => {
+              const crew = crewCount.get(s.id) ?? 0;
+              if (!crew) return null;
+              const folded = foldedCrews.has(s.id);
+              return (
+                <button
+                  className={"crew-badge" + (folded ? " folded" : "")}
+                  title={folded ? `${crew} brought-in agent${crew === 1 ? "" : "s"} — click to show` : `${crew} brought-in agent${crew === 1 ? "" : "s"} — click to fold`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setFoldedCrews((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(s.id)) next.delete(s.id); else next.add(s.id);
+                      return next;
+                    });
+                  }}
+                ><Icon of={Users} size="sm" />+{crew}</button>
+              );
+            })()}
             {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
           {(opts.showPath || (opts.showBranch && s.branch)) && (
@@ -1382,7 +1466,19 @@ export default function SessionsPanel({
             className={"ungrouped" + (dragOver === "ungrouped" ? " over" : "")}
             data-drop="ungrouped"
           >
-            {sectionOpen("recent:all") && ungrouped.map((s) => renderItem(s, "recent"))}
+            {sectionOpen("recent:all") &&
+              (query.trim() || showAllRecent ? ungrouped : ungrouped.slice(0, RECENT_WINDOW))
+                .map((s) => renderItem(s, "recent"))}
+            {sectionOpen("recent:all") && !query.trim() && ungrouped.length > RECENT_WINDOW && (
+              <button
+                className="tui-plain session-show-all"
+                onClick={() => setShowAllRecent((v) => !v)}
+              >
+                {showAllRecent
+                  ? `Show the first ${RECENT_WINDOW} — the full list is what makes the app slow`
+                  : `Show all ${ungrouped.length} — search reaches them regardless`}
+              </button>
+            )}
             {filtered.length === 0 && <div className="empty-note">No sessions found</div>}
           </div>
         </div>

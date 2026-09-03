@@ -25,12 +25,11 @@ import FileView from "./components/FileView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
-import ThreadsView from "./components/ThreadsView";
-import { isCurrent, useLibrarian } from "./librarian";
+import { useLibrarian } from "./librarian";
 import BringIn from "./components/BringIn";
 import { useRelay } from "./relay";
 import {
-  BookOpen, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, Users, X,
+  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -45,7 +44,7 @@ import {
   ProjectInfo, Session,
   TrashedSession,
   agentCaps,
-  listProjects, listSessions, materializeFork,
+  listProjects, listSessions, materializeFork, relayReport,
   reindexSessions, sessionFork, uiLog, usageReport,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
   drainSessionEvents,
@@ -467,17 +466,9 @@ export default function App() {
   );
 
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  // Its names reach the list through the backend (`apply_session_names`),
+  // the same way a name set by hand does, so the phone sees them too.
   const librarian = useLibrarian(settings.librarian, sessions);
-  const [showThreads, setShowThreads] = useState(false);
-  const displayedSessions = useMemo(() => {
-    if (!settings.librarian.enabled || !settings.librarian.renameRows) return sessions;
-    return sessions.map((session) => {
-      const entry = librarian.store.sessions[session.id];
-      return entry && isCurrent(librarian.store, session)
-        ? { ...session, title: entry.name || session.title }
-        : session;
-    });
-  }, [sessions, settings.librarian.enabled, settings.librarian.renameRows, librarian.store]);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   /** Where the settings window should open, when a caller has somewhere in
    *  mind. Cleared on close so the ⚙ button still opens on the first tab. */
@@ -709,15 +700,37 @@ export default function App() {
 
   // Event-driven refresh: Claude's transcripts changed (backend debounces).
   // A refusal lands in the transcript too, so the same event checks for one.
+  // The reload is throttled: the watcher fires on every transcript-append
+  // burst, so with any session writing (one usually is) this event arrives
+  // every ~2s — and each unthrottled reload shipped 500+ rows over IPC and
+  // reconciled them all, which is what made every click and keystroke queue
+  // behind render work [measured 2026-08-31]. Trailing-edge, so the last
+  // burst of a quiet-down still lands, at most LIST_RELOAD_MS late.
+  const lastListReload = useRef(0);
+  const listReloadTimer = useRef<number | null>(null);
+  const throttledSessionReload = useCallback(() => {
+    const LIST_RELOAD_MS = 4000;
+    const since = Date.now() - lastListReload.current;
+    if (since >= LIST_RELOAD_MS) {
+      lastListReload.current = Date.now();
+      refreshSessionList();
+    } else if (listReloadTimer.current === null) {
+      listReloadTimer.current = window.setTimeout(() => {
+        listReloadTimer.current = null;
+        lastListReload.current = Date.now();
+        refreshSessionList();
+      }, LIST_RELOAD_MS - since);
+    }
+  }, [refreshSessionList]);
   useEffect(() => {
     const un = listen("sessions://changed", () => {
-      refreshSessionList();
+      throttledSessionReload();
       checkRefusal();
     });
     return () => {
       un.then((f) => f());
     };
-  }, [refreshSessionList, checkRefusal]);
+  }, [throttledSessionReload, checkRefusal]);
 
   // NOTE: there used to be a large effect here that watched for newly-appeared
   // sessions and decided some of them "superseded" older rows — hiding those
@@ -2168,6 +2181,7 @@ export default function App() {
   const progressRef = useRef(progress);
   progressRef.current = progress;
   const relayCtl = useRelay({
+    prompts: () => settings.bringIn,
     tabs: () => tabsRef.current,
     handle: (key) => handles.current.get(key),
     quietFor: (key) => Date.now() - (lastOutput.current.get(key) ?? 0),
@@ -2199,7 +2213,7 @@ export default function App() {
    *  yet means ask for one first. */
   const launchFromHome = useCallback(async (prompt: string) => {
     if (!emptyCtl.ready) {
-      setNotice("Nothing to start yet — set up the API tab, or install claude, codex or grok.");
+      setNotice("Nothing to start yet — set up the API tab, or install claude, codex, grok or antigravity.");
       return;
     }
     let cwd = homeCwd;
@@ -2265,6 +2279,64 @@ export default function App() {
     setFormat: (f: AppSettings["timeFormat"]) => setSettings((s) => ({ ...s, timeFormat: f })),
   }), [settings.timeFormat]);
 
+  // The exchange remains desktop-owned: report its durable crew lineage so
+  // every session-list client sees the second agent under its master.
+  useEffect(() => {
+    const relay = relayCtl.relay;
+    if (!relay) return;
+    const first = tabs.find((tab) => tab.key === relay.aKey);
+    if (!first?.sessionId) return;
+    const second = tabs.find((tab) => tab.key === relay.bKey);
+    relayReport(
+      first.sessionId,
+      second?.sessionId ?? null,
+      relay.bName,
+      relay.phase,
+      relay.round,
+      relay.rounds,
+      relay.note,
+    ).catch(() => {});
+  }, [relayCtl.relay, tabs]);
+
+  // Authenticated phones can request the same desktop-owned exchange. This
+  // listener starts no network service; the existing gateway emits a local
+  // Tauri event after it has authenticated and validated the request.
+  const remoteBringInRef = useRef({ tabs, start: relayCtl.start });
+  remoteBringInRef.current = { tabs, start: relayCtl.start };
+  useEffect(() => {
+    const unlisten = listen<{
+      session_id: string;
+      agent_id: string;
+      model: string | null;
+      effort: string | null;
+      focus: string;
+      rounds: number;
+      auto: boolean;
+    }>("remote://bring-in", (event) => {
+      const request = event.payload;
+      const tab = remoteBringInRef.current.tabs.find(
+        (candidate) => candidate.sessionId === request.session_id,
+      );
+      if (!tab) {
+        setNotice("The phone asked to bring in an agent, but that session is not open.");
+        return;
+      }
+      void remoteBringInRef.current.start({
+        aKey: tab.key,
+        choice: {
+          kind: "agent",
+          agentId: request.agent_id,
+          model: request.model,
+          effort: request.effort,
+        },
+        focus: request.focus,
+        rounds: request.rounds,
+        auto: request.auto,
+      });
+    });
+    return () => { unlisten.then((dispose) => dispose()); };
+  }, []);
+
   return (
     <TimeFormatContext.Provider value={timeFormatCtx}>
     <div className="app">
@@ -2280,13 +2352,6 @@ export default function App() {
             title="Toggle sessions panel"
             onClick={() => setShowSessions(!showSessions)}
           ><Icon of={PanelLeft} /></button>
-          {settings.librarian.enabled && (
-            <button
-              className={"icon-btn" + (showThreads ? " on" : "")}
-              title={showThreads ? "Show sessions" : "Show librarian threads"}
-              onClick={() => setShowThreads((shown) => !shown)}
-            ><Icon of={BookOpen} /></button>
-          )}
           <button
             className={"icon-btn" + (showExplorer ? " on" : "")}
             title="Toggle file explorer"
@@ -2331,21 +2396,9 @@ export default function App() {
         {showSessions && (
           <>
             <div className="panel sessions" style={{ width: sizes.left, ...zoomFor("sessions") }}>
-              {showThreads && settings.librarian.enabled ? (
-                <ThreadsView
-                  lib={librarian}
-                  sessions={displayedSessions}
-                  liveIds={liveShown}
-                  onSelect={selectSession}
-                  onResume={resumeSession}
-                  onOpenSettings={() => {
-                    setSettingsTarget({ tab: "librarian", provider: null });
-                    setShowSettingsModal(true);
-                  }}
-                  canResume={(session) => capsOf(session.agent).resume}
-                />
-              ) : <SessionsPanel
-                sessions={displayedSessions}
+              <SessionsPanel
+                hoverSummary={settings.sessionHover}
+                sessions={sessions}
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}
@@ -2402,7 +2455,7 @@ export default function App() {
                 onTrashDelete={deleteTrashed}
                 onTrashEmpty={emptyTrash}
                 onTrashSessions={trashSessions}
-              />}
+              />
             </div>
             <div className="splitter v" onMouseDown={() => startDrag("left")} />
           </>

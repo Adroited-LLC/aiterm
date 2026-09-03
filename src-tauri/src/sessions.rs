@@ -94,9 +94,13 @@ pub fn load_brought_in() -> std::collections::HashMap<String, String> {
 
 pub(crate) fn apply_session_names(sessions: &mut [Session]) {
     let titles: std::collections::HashMap<String, String> = load_metadata("titles.json");
+    // The librarian's names come second: a name set by hand always wins.
+    let named = crate::librarian::names();
     for session in sessions {
         if let Some(title) = titles.get(&session.id).filter(|title| !title.trim().is_empty()) {
             session.title = title.clone();
+        } else if let Some(name) = named.get(&session.id) {
+            session.title = name.clone();
         }
     }
 }
@@ -106,12 +110,46 @@ pub fn session_brought_in() -> std::collections::HashMap<String, String> {
     load_brought_in()
 }
 
+/// A deleted session leaves the lineage: as a brought-in agent, and as a
+/// master — otherwise the crew badge keeps counting a tab that is gone.
+pub fn forget_brought_in(session_id: &str) {
+    let Ok(_guard) = metadata_lock().lock() else { return };
+    let mut lineage: std::collections::HashMap<String, String> = load_metadata("brought_in.json");
+    let before = lineage.len();
+    lineage.retain(|k, v| k != session_id && v != session_id);
+    if lineage.len() != before {
+        let _ = save_metadata("brought_in.json", &lineage);
+    }
+}
+
 pub fn record_brought_in(second_session: &str, master_session: &str) -> Result<(), String> {
     let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
     let mut lineage: std::collections::HashMap<String, String> =
         load_metadata("brought_in.json");
     lineage.insert(second_session.to_owned(), master_session.to_owned());
     save_metadata("brought_in.json", &lineage)
+}
+
+/// Record a desktop-owned second-agent exchange for every session-list UI.
+/// The exchange itself stays in the renderer because it owns the two terminal
+/// handles; this command only publishes durable lineage.
+#[tauri::command]
+pub fn relay_report(
+    app: tauri::AppHandle,
+    session_id: String,
+    b_session_id: Option<String>,
+    b_name: String,
+    phase: String,
+    round: u32,
+    rounds: u32,
+    note: String,
+) {
+    let _ = (b_name, phase, round, rounds, note);
+    if let Some(second) = b_session_id.as_deref() {
+        let _ = record_brought_in(second, &session_id);
+    }
+    use tauri::Emitter;
+    let _ = app.emit("sessions://changed", ());
 }
 
 #[tauri::command]
@@ -411,6 +449,32 @@ pub trait SessionProvider: Send + Sync {
 
 pub struct ClaudeProvider;
 
+/// Parsed claude rows by transcript path, keyed on (mtime_ms, len) — see the
+/// scan loop. Parsing a transcript costs ~8ms of file reads, and 426 of them
+/// cost every /v1/sessions poll ~3 seconds — the whole of the phone's "really
+/// bad delay" [measured 2026-08-31: claude 426 rows in 3266ms; every other
+/// engine single-digit ms]. A row is a pure function of its file, so a warm
+/// scan fstats each already-opened descriptor and re-parses only what moved.
+/// `None` remembers "this file parses to no session", so a malformed file is
+/// not re-read every poll either. An entry for a deleted file lingers, unused
+/// — rows are only read back for paths discovered this scan — and a few
+/// hundred stale rows of a few hundred bytes are not worth eviction machinery.
+static CLAUDE_SCAN_CACHE: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, (u64, u64, Option<Session>)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The cache key, off the open descriptor — never a path re-traversal.
+fn mtime_len_of(file: &std::fs::File) -> Option<(u64, u64)> {
+    let md = file.metadata().ok()?;
+    let m = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((m, md.len()))
+}
+
 fn scan_claude_root_bounded(
     root: &Path,
     budget: &mut DiscoveryBudget,
@@ -459,14 +523,51 @@ fn scan_claude_root_bounded(
             }
             files.push((project.child_path(&name), file));
         }
-        let dir_cwd = files
-            .iter()
-            .find_map(|(_, file)| file.try_clone().ok().and_then(read_first_cwd_from));
+        // Split cache hits from files whose (mtime, len) moved. Only the
+        // moved ones are parsed; the budget already counted them all — it
+        // bounds discovery, not parsing.
+        let mut cache = CLAUDE_SCAN_CACHE.lock().unwrap();
+        let mut ordered: Vec<std::path::PathBuf> = Vec::with_capacity(files.len());
+        let mut fresh: Vec<(std::path::PathBuf, std::fs::File, (u64, u64))> = Vec::new();
+        let mut held: Vec<std::fs::File> = Vec::new();
         for (path, file) in files {
-            if let Some(session) = parse_session_from(file, &path, dir_cwd.as_deref()) {
-                sessions.push((session, path));
+            let Some(key) = mtime_len_of(&file) else {
+                continue;
+            };
+            ordered.push(path.clone());
+            if cache
+                .get(&path)
+                .is_some_and(|(m, l, _)| (*m, *l) == key)
+            {
+                held.push(file);
+            } else {
+                fresh.push((path, file, key));
             }
         }
+        // The shared cwd is only found when something actually needs parsing:
+        // it reads file heads, which is exactly the cost the cache skips. A
+        // cached neighbour's descriptor still serves — a /fork stub being
+        // parsed fresh borrows the cwd its (cached) siblings recorded.
+        let dir_cwd = if fresh.is_empty() {
+            None
+        } else {
+            fresh
+                .iter()
+                .map(|(_, file, _)| file)
+                .chain(held.iter())
+                .find_map(|file| file.try_clone().ok().and_then(read_first_cwd_from))
+        };
+        drop(held);
+        for (path, file, key) in fresh {
+            let row = parse_session_from(file, &path, dir_cwd.as_deref());
+            cache.insert(path.clone(), (key.0, key.1, row));
+        }
+        for path in ordered {
+            if let Some((_, _, Some(session))) = cache.get(&path) {
+                sessions.push((session.clone(), path));
+            }
+        }
+        drop(cache);
         if budget.remaining() == 0 {
             break;
         }
@@ -893,12 +994,19 @@ fn parse_session_from(mut file: File, path: &Path, dir_cwd: Option<&str>) -> Opt
     // Fork stubs omit cwd; backfill from a sibling session's cwd in the same
     // project dir so they still group under the right project.
     let project_path = cwd.or_else(|| dir_cwd.map(String::from))?;
-    // Noise filters: scratch sessions in /tmp, and sessions with no human
-    // content at all (memory summarizer runs, local-command-only sessions).
-    if project_path == "/tmp" || project_path.starts_with("/tmp/") {
+    // Noise filters: sessions in a scratch directory — /tmp, and the state
+    // and job directories other programs run Claude in (a routine's triage
+    // agent under ~/.local/state, Claude Code's own job specimens under
+    // ~/.claude/jobs). Those are that program's sessions, not the person's,
+    // and clutter the list by the hundred. `promptSource: "sdk"` is NOT the
+    // test: sessions typed through an SDK-driven front end carry it too.
+    if is_scratch_dir(&project_path) {
         return None;
     }
-    let title = title.or(summary).or(first_prompt).or(ai_title)?;
+    // A title Claude wrote (its `ai-title`, a few seconds into the session)
+    // reads better than the prompt it was written from; the prompt is the
+    // fallback while the title has not landed yet.
+    let title = title.or(summary).or(ai_title).or(first_prompt)?;
 
     Some(Session {
         id,
@@ -912,6 +1020,21 @@ fn parse_session_from(mut file: File, path: &Path, dir_cwd: Option<&str>) -> Opt
         fork_parent: None, // filled in from job state by the caller
         last_active: mtime,
     })
+}
+
+/// A directory a program works in rather than a project a person opens:
+/// `/tmp`, and under the home directory `.local/state`, `.claude/jobs` and
+/// `.cache`. A session there is the program's.
+fn is_scratch_dir(path: &str) -> bool {
+    let under = |root: &str| path == root || path.starts_with(&format!("{root}/"));
+    if under("/tmp") {
+        return true;
+    }
+    let Some(home) = dirs::home_dir() else { return false };
+    let home = home.to_string_lossy();
+    [".local/state", ".claude/jobs", ".cache"]
+        .iter()
+        .any(|d| under(&format!("{home}/{d}")))
 }
 
 /// Parse one explicitly rooted transcript for the shared session service.
@@ -1049,13 +1172,17 @@ pub async fn session_delete(session_id: String) -> Result<(), String> {
     crate::run_blocking(move || {
         sessions
             .delete(&session_id)
-            .map_err(|error| error.message().to_owned())
+            .map_err(|error| error.message().to_owned())?;
+        forget_brought_in(&session_id);
+        Ok(())
     })
     .await
 }
 
 pub(crate) fn session_delete_service(session_id: &str) -> Result<(), String> {
-    session_delete_sync(session_id.to_owned())
+    session_delete_sync(session_id.to_owned())?;
+    forget_brought_in(session_id);
+    Ok(())
 }
 
 fn session_delete_sync(session_id: String) -> Result<(), String> {
@@ -6395,7 +6522,7 @@ pub async fn session_artifacts(session_id: String) -> Vec<Artifact> {
     crate::run_blocking(move || session_artifacts_sync(session_id)).await
 }
 
-fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
+pub(crate) fn session_artifacts_sync(session_id: String) -> Vec<Artifact> {
     let list = crate::agents::backends();
     if let Some((owner, _)) = crate::agents::owner_in(&list, &session_id) {
         if !owner.caps().tasks {
@@ -9282,6 +9409,61 @@ mod tests {
         let s = parse_session(&real_session, None).expect("real session kept");
         assert_eq!(s.title, "hey fix the login bug");
         assert_eq!(s.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn claudes_own_title_outranks_the_prompt_it_was_written_from() {
+        let dir = std::env::temp_dir().join("aiterm-test-ai-title-rank");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("55555555-5555-4555-8555-555555555555.jsonl");
+        std::fs::write(&f, concat!(
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/home/x/proj","promptSource":"typed","message":{"role":"user","content":"write me a 500 word article about squirrels"}}"#, "\n",
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[{"type":"text","text":"Sure."}]}}"#, "\n",
+            r#"{"type":"ai-title","aiTitle":"Squirrels article","sessionId":"x"}"#, "\n",
+        )).unwrap();
+        let s = parse_session(&f, None).expect("kept");
+        assert_eq!(s.title, "Squirrels article");
+        // Before the title lands, the prompt stands in.
+        let early = dir.join("55555555-5555-4555-8555-555555555556.jsonl");
+        std::fs::write(&early,
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/home/x/proj","promptSource":"typed","message":{"role":"user","content":"write me a 500 word article about squirrels"}}"#).unwrap();
+        assert_eq!(parse_session(&early, None).unwrap().title, "write me a 500 word article about squirrels");
+        // A name the person gave still wins over both.
+        let named = dir.join("55555555-5555-4555-8555-555555555557.jsonl");
+        std::fs::write(&named, concat!(
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/home/x/proj","message":{"role":"user","content":"write me a 500 word article about squirrels"}}"#, "\n",
+            r#"{"type":"ai-title","aiTitle":"Squirrels article","sessionId":"x"}"#, "\n",
+            r#"{"type":"custom-title","customTitle":"Rodent content","sessionId":"x"}"#, "\n",
+        )).unwrap();
+        assert_eq!(parse_session(&named, None).unwrap().title, "Rodent content");
+    }
+
+    #[test]
+    fn a_session_in_a_programs_scratch_dir_is_not_listed() {
+        let home = dirs::home_dir().unwrap();
+        let home = home.to_string_lossy();
+        assert!(is_scratch_dir("/tmp"));
+        assert!(is_scratch_dir("/tmp/x"));
+        assert!(is_scratch_dir(&format!("{home}/.local/state/acc-audit-watch/repo")));
+        assert!(is_scratch_dir(&format!("{home}/.claude/jobs/8f258164/tmp/claude-specimen")));
+        assert!(is_scratch_dir(&format!("{home}/.cache/thing")));
+        assert!(!is_scratch_dir(&format!("{home}/nanoclaw")));
+        assert!(!is_scratch_dir(&format!("{home}/.local/share/aiterm")));
+        assert!(!is_scratch_dir("/tmpfs/proj"));
+        assert!(!is_scratch_dir(&format!("{home}/.claude/worktrees/x")));
+
+        let dir = std::env::temp_dir().join("aiterm-test-scratch-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("66666666-6666-4666-8666-666666666661.jsonl");
+        std::fs::write(&f, format!(
+            r##"{{"type":"user","uuid":"u1","parentUuid":null,"cwd":"{home}/.local/state/acc-audit-watch/repo","promptSource":"sdk","message":{{"role":"user","content":"# Origin-side triage agent"}}}}"##)).unwrap();
+        assert!(parse_session(&f, None).is_none(), "a routine's session is dropped");
+        // The same prompt source from a real project is the person's session
+        // — typed through an SDK-driven front end — and stays.
+        let g = dir.join("66666666-6666-4666-8666-666666666662.jsonl");
+        std::fs::write(&g, format!(
+            r##"{{"type":"user","uuid":"u1","parentUuid":null,"cwd":"{home}/nanoclaw","entrypoint":"sdk-cli","promptSource":"sdk","message":{{"role":"user","content":"what is Matt working on?"}}}}"##)).unwrap();
+        assert_eq!(parse_session(&g, None).unwrap().title, "what is Matt working on?");
     }
 
     #[test]

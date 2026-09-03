@@ -1,9 +1,9 @@
 /**
- * Settings → Librarian: which model reads the sessions, how it is reached,
+ * Settings → Librarian: which model names the sessions, how it is reached,
  * whether it runs on its own, and what it has done so far.
  */
 import { useEffect, useState } from "react";
-import { AgentChoice, ProviderView, agentChoices, librarianDefaultPrompts, providerModels, providersList } from "../ipc";
+import { AgentChoice, ProviderView, agentChoices, providerModels, providersList } from "../ipc";
 import { LibrarianCtl } from "../librarian";
 import { LibrarianSettings } from "../settings";
 import Row from "./SettingsRow";
@@ -32,12 +32,9 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
   const [agents, setAgents] = useState<AgentChoice[]>([]);
   /** The chosen API provider's whole catalogue, for the model select. */
   const [catalogue, setCatalogue] = useState<string[] | null>(null);
-  const [defaults, setDefaults] = useState<{ catalogue: string; tidy: string } | null>(null);
-  const [showPrompts, setShowPrompts] = useState(false);
   useEffect(() => {
     providersList().then(setProviders).catch(() => {});
     agentChoices().then(setAgents).catch(() => {});
-    librarianDefaultPrompts().then(setDefaults).catch(() => {});
   }, []);
   useEffect(() => {
     setCatalogue(null);
@@ -57,8 +54,9 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
     const small = a?.models.find((m) => /haiku|mini|flash|fast|lite/i.test(m.id))?.id ?? "";
     set({ engine, model: engine === "api" ? "anthropic/claude-haiku-4.5" : small });
   };
-  const counted = Object.keys(lib.store.sessions).length;
-  const threads = Object.keys(lib.store.threads).length;
+  const looked = Object.keys(lib.store.sessions).length;
+  const left = looked - lib.named;
+  const n = (k: number, one: string, many = one + "s") => `${k} ${k === 1 ? one : many}`;
 
   return (
     <>
@@ -66,7 +64,7 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
         <div className="sgroup-rows">
           <Row
             label="Librarian"
-            desc="A small model reads each session once — the opening prompt, the last exchange, the files touched — and writes a short name, a few tags, the thread of work it belongs to, and where it left off. That feeds the Threads tab in the sidebar and, if you like, the names in the session list. Off: no tab, no runs; what it has written is kept for when it is on again."
+            desc="Names sessions in the list. Engines that title their own sessions — Claude Code, Grok, Antigravity — are left alone. For the rest, a small model reads the conversation and writes a short title in place of the first prompt. A name you set by hand always wins."
           >
             <Switch checked={cfg.enabled} onChange={(on) => set({ enabled: on })} label="Librarian on" />
           </Row>
@@ -130,16 +128,9 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
               />
             )}
           </Row>
-          <Row label="Run on its own" desc="A minute or so after sessions go quiet, read any it has not seen. Otherwise only when you press Catalogue.">
+          <Row label="Run on its own" desc="A few minutes after a session goes quiet, name it if it has no title yet. Otherwise only when you press Name now.">
             <Switch checked={cfg.auto} onChange={(on) => set({ auto: on })} label="Automatic" />
           </Row>
-          <Row label="Tidy up after each run" desc="Sessions are read eight at a time, so the same project can end up in several threads. This takes one look at everything afterwards and merges them, and files loose sessions where they belong.">
-            <Switch checked={cfg.tidyAfterRun} onChange={(on) => set({ tidyAfterRun: on })} label="Tidy after run" />
-          </Row>
-          <Row label="Use its names in the session list" desc="In place of the raw first prompt. The original stays in the tooltip.">
-            <Switch checked={cfg.renameRows} onChange={(on) => set({ renameRows: on })} label="Rename rows" />
-          </Row>
-
         </div>
       </div>
 
@@ -147,10 +138,10 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
         <div className="sgroup-title">So far</div>
         <div className="sgroup-rows">
           <Row
-            label={`${counted} session${counted === 1 ? "" : "s"} read, ${threads} thread${threads === 1 ? "" : "s"}`}
+            label={looked === 0 ? "Nothing named yet" : `${n(lib.named, "session")} named${left > 0 ? `, ${left} left to ${left === 1 ? "its" : "their"} engine` : ""}`}
             desc={
               (lib.store.spent > 0 ? `About $${lib.store.spent.toFixed(3)} spent through API providers, where they reported a cost. ` : "") +
-              (lib.pending.length ? `${lib.pending.length} session${lib.pending.length === 1 ? "" : "s"} waiting to be read.` : "Everything current has been read.")
+              (lib.pending.length ? `${n(lib.pending.length, "session")} waiting to be looked at.` : "Everything current has been looked at.")
             }
           >
             <button
@@ -161,81 +152,26 @@ export default function LibrarianPane({ cfg, onChange, lib, onOpenModelAccess }:
             >
               {lib.running
                 ? <><Icon of={Loader2} size="sm" className="spin" /> {lib.progress ? `${lib.progress.done} of ${lib.progress.total}` : "Reading…"}</>
-                : `Catalogue now${lib.pending.length ? ` (${lib.pending.length})` : ""}`}
+                : `Name now${lib.pending.length ? ` (${lib.pending.length})` : ""}`}
             </button>
-            {lib.running && <button className="tui-plain" onClick={lib.stop} title="Stop after this batch">Stop</button>}
+            {lib.running && <button className="tui-plain" onClick={lib.stop} title="Stop after the current one">Stop</button>}
           </Row>
           {lib.report && (
             <div className="sgroup-foot">
-              Last run: {lib.report.done} read{lib.report.remaining ? `, ${lib.report.remaining} still to go` : ""}
+              Last run: {n(lib.report.done, "session")} named
+              {lib.report.skipped ? `, ${lib.report.skipped} already titled by ${lib.report.skipped === 1 ? "its" : "their"} engine` : ""}
+              {lib.report.remaining ? `, ${lib.report.remaining} still to go` : ""}
               {lib.report.cost > 0 ? `, $${lib.report.cost.toFixed(4)}` : ""}.
               {lib.report.errors.map((e, i) => <div key={i} className="lib-error">{e}</div>)}
             </div>
           )}
-          <Row label="Tidy up now" desc={lib.tidyDue ? "Sessions have been read since the last tidy." : threads > 0 ? "Merge threads that are the same work; file loose sessions." : "Nothing to tidy yet."}>
-            <button className="tui-plain" disabled={!lib.ready || lib.running || lib.tidying || threads === 0} onClick={() => void lib.tidy()}>
-              {lib.tidying ? <><Icon of={Loader2} size="sm" className="spin" /> Tidying…</> : "Tidy up"}
-            </button>
-          </Row>
-          {lib.tidyReport && !("error" in lib.tidyReport) && (
-            <div className="sgroup-foot">
-              Last tidy: {lib.tidyReport.threads_before} threads → {lib.tidyReport.threads_after}
-              {lib.tidyReport.filed ? `, ${lib.tidyReport.filed} loose session${lib.tidyReport.filed === 1 ? "" : "s"} filed` : ""}.
-            </div>
-          )}
-        </div>
-      </div>
-
-      <div className="sgroup">
-        <div className="sgroup-title">Prompts</div>
-        <div className="sgroup-rows">
-          <Row label="What the model is told" desc="The system prompts for the two passes. Edit them to change how sessions are named and grouped; what follows each — the session excerpts, the thread list — is built by aiterm and stays the same. Blank means the one shipped.">
-            <button className="tui-plain" onClick={() => setShowPrompts((v) => !v)}>{showPrompts ? "Hide" : "Edit"}</button>
-          </Row>
-          {showPrompts && defaults && (
-            <>
-              <div className="lib-prompt">
-                <div className="lib-prompt-head">
-                  <span>Reading sessions</span>
-                  {cfg.promptCatalogue.trim() && cfg.promptCatalogue.trim() !== defaults.catalogue
-                    ? <span className="lib-prompt-mod">edited</span> : null}
-                  <button className="linkish" onClick={() => set({ promptCatalogue: "" })} disabled={!cfg.promptCatalogue}>Reset</button>
-                </div>
-                <textarea
-                  className="lib-prompt-text"
-                  value={cfg.promptCatalogue || defaults.catalogue}
-                  onChange={(e) => set({ promptCatalogue: e.target.value === defaults.catalogue ? "" : e.target.value })}
-                  spellCheck={false}
-                  rows={12}
-                />
-              </div>
-              <div className="lib-prompt">
-                <div className="lib-prompt-head">
-                  <span>Tidying up</span>
-                  {cfg.promptTidy.trim() && cfg.promptTidy.trim() !== defaults.tidy
-                    ? <span className="lib-prompt-mod">edited</span> : null}
-                  <button className="linkish" onClick={() => set({ promptTidy: "" })} disabled={!cfg.promptTidy}>Reset</button>
-                </div>
-                <textarea
-                  className="lib-prompt-text"
-                  value={cfg.promptTidy || defaults.tidy}
-                  onChange={(e) => set({ promptTidy: e.target.value === defaults.tidy ? "" : e.target.value })}
-                  spellCheck={false}
-                  rows={12}
-                />
-              </div>
-              <div className="sgroup-foot">
-                Each must end by asking for JSON in the shape aiterm reads — an array of one object per session for reading, an object with a <code>threads</code> list for tidying — or nothing will be written.
-              </div>
-            </>
-          )}
         </div>
       </div>
 
       <div className="sgroup">
         <div className="sgroup-rows">
-          <Row label="Start over" desc="Forget every name, tag and thread — for a different model, or a first pass that went wrong. Sessions themselves are untouched.">
-            <button className="tui-plain" disabled={lib.running || counted === 0} onClick={() => void lib.forget()}>Forget everything</button>
+          <Row label="Start over" desc="Forget every name it wrote — for a different model, or a first pass that went wrong. Sessions themselves, and names you set by hand, are untouched.">
+            <button className="tui-plain" disabled={lib.running || looked === 0} onClick={() => void lib.forget()}>Forget everything</button>
           </Row>
         </div>
       </div>

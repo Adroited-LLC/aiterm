@@ -167,6 +167,7 @@ mod tests {
     use super::*;
     use crate::agents::{ClaudeBackend, CodexBackend, OpenCodeBackend};
     use crate::grok::GrokBackend;
+    use crate::antigravity::AntigravityBackend;
 
     #[test]
     fn nothing_stored_means_the_engines_first_mode() {
@@ -182,6 +183,7 @@ mod tests {
         assert_eq!(mode_for_in(&store, &CodexBackend).unwrap().flags, &[] as &[&str]);
         assert_eq!(mode_for_in(&store, &GrokBackend).unwrap().flags, &[] as &[&str]);
         assert_eq!(mode_for_in(&store, &OpenCodeBackend).unwrap().flags, &[] as &[&str]);
+        assert_eq!(mode_for_in(&store, &AntigravityBackend).unwrap().flags, &[] as &[&str]);
     }
 
     #[test]
@@ -200,13 +202,15 @@ mod tests {
     #[test]
     fn every_mode_is_spelled_the_way_its_engine_documents() {
         let store = serde_json::json!({"permission": {
-            "claude": "acceptEdits", "codex": "never", "grok": "bypassPermissions", "opencode": "auto"
+            "claude": "acceptEdits", "codex": "never", "grok": "bypassPermissions", "opencode": "auto",
+            "antigravity": "accept-edits"
         }});
         let flags = |b: &dyn AgentBackend| mode_for_in(&store, b).unwrap().flags.join(" ");
         assert_eq!(flags(&ClaudeBackend), "--permission-mode acceptEdits --allow-dangerously-skip-permissions");
         assert_eq!(flags(&CodexBackend), "-a never -s workspace-write");
         assert_eq!(flags(&GrokBackend), "--always-approve");
         assert_eq!(flags(&OpenCodeBackend), "--auto");
+        assert_eq!(flags(&AntigravityBackend), "--mode accept-edits");
     }
 
     #[test]
@@ -214,7 +218,7 @@ mod tests {
         let store = serde_json::json!({"permission": {"grok": "auto"}});
         let view = view_in(&store, &crate::agents::backends());
         let ids: Vec<&str> = view.iter().map(|v| v.agent_id.as_str()).collect();
-        assert_eq!(ids, ["claude", "codex", "grok", "opencode"], "the API chat engine has no switch");
+        assert_eq!(ids, ["claude", "codex", "grok", "opencode", "antigravity"], "the API chat engine has no switch");
         let grok = view.iter().find(|v| v.agent_id == "grok").unwrap();
         assert_eq!(grok.selected, "auto");
         assert!(grok.modes.iter().any(|m| m.id == "bypassPermissions"));

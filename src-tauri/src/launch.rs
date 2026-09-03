@@ -181,7 +181,7 @@ pub fn resolve_in(
                 .iter()
                 .find(|b| b.accepts_api(provider) && b.detect().available)?;
             let spec = LaunchSpec {
-                model: Some(backend.api_model_slug(&model_id)),
+                model: Some(backend.api_model_slug(provider, &model_id)),
                 effort: None,
                 session_id: mint_for(&**backend),
                 provider: Some(provider_id.clone()),
@@ -516,7 +516,7 @@ mod tests {
         fn accepts_api(&self, provider: &Provider) -> bool {
             self.accepts_anything || (self.accepts_openrouter_only && provider.is_openrouter())
         }
-        fn api_model_slug(&self, model_id: &str) -> String {
+        fn api_model_slug(&self, _provider: &Provider, model_id: &str) -> String {
             if self.prefix_models {
                 format!("openrouter/{model_id}")
             } else {
@@ -580,6 +580,10 @@ mod tests {
 
     fn local() -> Provider {
         provider("local", "http://localhost:8080/v1")
+    }
+
+    fn undeclared() -> Provider {
+        provider("unit-test-undeclared", "https://unit-test-undeclared.invalid/v1")
     }
 
     /* ---- routing -------------------------------------------------------- */
@@ -1088,8 +1092,8 @@ mod tests {
     #[test]
     fn the_all_accepting_fallback_is_last_in_the_registry() {
         let list = crate::agents::backends();
-        let first = list.iter().position(|b| b.accepts_api(&local()));
-        assert_eq!(first, Some(list.len() - 1), "a backend sits behind the fallback");
+        let fallback = list.iter().position(|b| b.id() == "api");
+        assert_eq!(fallback, Some(list.len() - 1), "a backend sits behind the fallback");
     }
 
     /// The chat harness is always available, so an API model resolves on a
@@ -1098,8 +1102,8 @@ mod tests {
     fn an_api_model_always_resolves_through_the_real_registry() {
         let plan = resolve_in(
             &crate::agents::backends(),
-            &[local()],
-            LaunchRequest::ApiModel { provider_id: "local".into(), model_id: "m".into(), prompt: None },
+            &[undeclared()],
+            LaunchRequest::ApiModel { provider_id: "unit-test-undeclared".into(), model_id: "m".into(), prompt: None },
         )
         .expect("no engine would run an API model");
         assert_eq!(plan.agent_id, "api");

@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod antigravity;
 pub mod cache;
 pub mod chat;
 pub mod claudecfg;
@@ -79,11 +80,8 @@ pub fn run() {
             librarian::librarian_run,
             librarian::librarian_pending,
             librarian::librarian_forget,
-            librarian::librarian_rename_thread,
-            librarian::librarian_tidy,
-            librarian::librarian_tag,
-            librarian::librarian_default_prompts,
             detail::session_conversation,
+            detail::session_transcript_path,
             changes::session_changes,
             changes::read_file_base64,
             agents::detect_agents,
@@ -126,6 +124,7 @@ pub fn run() {
             sessions::session_titles,
             sessions::session_stars,
             sessions::session_brought_in,
+            sessions::relay_report,
             sessions::session_star,
             sessions::session_status,
             sessions::session_preview,

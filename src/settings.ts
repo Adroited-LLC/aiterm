@@ -9,37 +9,68 @@ export interface PanelScales {
   agent: number;
 }
 
-/** The librarian: a small model that names, tags and threads sessions. Off
- *  until a provider and model are chosen — it spends money, a little. */
+/** The librarian: a small model that names sessions whose engine did not
+ *  name them itself. Off until it is switched on — it spends a little. */
 export interface LibrarianSettings {
-  /** The master switch. Off: no runs, no Threads tab, no names in the
-   *  list, and the rest of the pane is not shown. What was catalogued
-   *  stays on disk for when it is turned back on. */
+  /** The master switch. Off: no runs, and the rest of the pane is not
+   *  shown. Names already written stay on disk and in the list. */
   enabled: boolean;
   /** How the model is reached: an installed CLI in its print mode — which
    *  runs on the plan already paid for — or an API provider. */
-  engine: "claude" | "codex" | "grok" | "api";
+  engine: "claude" | "codex" | "grok" | "antigravity" | "api";
   /** Provider id from Model access; only for `engine: "api"`. */
   providerId: string;
   /** Model id in the engine's spelling; "" means the CLI's default. */
   model: string;
-  /** Catalogue new sessions on its own, a little after they go quiet. */
+  /** Name new sessions on its own, a little after they go quiet. */
   auto: boolean;
-  /** After a run, take one look at everything and merge threads that are
-   *  the same work. Sessions are read eight at a time, so without this the
-   *  same project ends up in several threads. */
-  tidyAfterRun: boolean;
-  /** Show the librarian's names in the session list, in place of the raw
-   *  first prompt. The original stays in the tooltip. */
-  renameRows: boolean;
-  /** The system prompt for reading sessions; "" means the one shipped. */
-  promptCatalogue: string;
-  /** The system prompt for the tidy pass; "" means the one shipped. */
-  promptTidy: string;
 }
+
+/** What the two agents are told when one is brought in. Placeholders in
+ *  braces: {a} the first agent, {b} the second, {path} the other agent's
+ *  transcript on disk, {focus} what the user asked for, {text} the message
+ *  being relayed. "" means the one shipped. */
+export interface BringInPrompts {
+  /** The second agent's launch prompt. */
+  opening: string;
+  /** To the first agent, when a reply is expected. */
+  toFirst: string;
+  /** To the first agent, the last message: carry on. */
+  toFirstLast: string;
+  /** To the second agent: the first agent's reply. */
+  toSecond: string;
+  /** Appended to the last message when the user pre-approved the outcome. */
+  approved: string;
+}
+
+export const BRING_IN_DEFAULTS: BringInPrompts = {
+  opening: `You've been brought into a live session as a second agent, alongside {a}.
+Their conversation with the user is in the transcript at {path}. Read it.
+The user asks: {focus}
+Then write your response to {a} directly. The user is reading along.`,
+  toFirst: `{b} was brought in by the user and wrote this to you (their transcript: {path}):
+---
+{text}
+---
+Reply to them directly.`,
+  toFirstLast: `{b} wrote back:
+---
+{text}
+---
+That's the end of the exchange. Take it into account and carry on with the user.`,
+  toSecond: `{a} replied:
+---
+{text}
+---
+Respond to them.`,
+  approved: `The user has already approved the outcome of this exchange. Proceed with it now; do not wait for further sign-off.`,
+};
 
 export interface AppSettings {
   themeId: string;
+  /** Rest the pointer on a session row and a card opens beside it with the
+   *  session's summary, files and tasks. Off, the list is just a list. */
+  sessionHover: boolean;
   /** Accent override; null = theme default. */
   accent: string | null;
   /** UI font family for panels; "" = system default stack. */
@@ -77,10 +108,12 @@ export interface AppSettings {
   /** IANA zone id stamps are written in; "" = this machine's own. */
   timeZone: string;
   librarian: LibrarianSettings;
+  bringIn: BringInPrompts;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
   themeId: "warp-dark",
+  sessionHover: true,
   accent: null,
   uiFont: "",
   termFont: "",
@@ -95,16 +128,13 @@ export const DEFAULT_SETTINGS: AppSettings = {
   iconSize: 16,
   timeFormat: "relative",
   timeZone: "",
+  bringIn: { opening: "", toFirst: "", toFirstLast: "", toSecond: "", approved: "" },
   librarian: {
     enabled: false,
     engine: "claude",
     providerId: "",
     model: "haiku",
     auto: true,
-    tidyAfterRun: true,
-    renameRows: true,
-    promptCatalogue: "",
-    promptTidy: "",
   },
 };
 
@@ -139,6 +169,7 @@ export function loadSettings(): AppSettings {
       ...parsed,
       panelScale: { ...DEFAULT_SETTINGS.panelScale, ...(parsed.panelScale ?? {}) },
       librarian: { ...DEFAULT_SETTINGS.librarian, ...(parsed.librarian ?? {}) },
+      bringIn: { ...DEFAULT_SETTINGS.bringIn, ...(parsed.bringIn ?? {}) },
     };
   } catch {
     return DEFAULT_SETTINGS;
