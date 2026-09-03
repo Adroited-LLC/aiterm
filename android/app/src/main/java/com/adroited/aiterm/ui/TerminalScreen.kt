@@ -700,7 +700,16 @@ private fun ConnectionRail(state: RemoteClientState, onReconnect: () -> Unit) {
             .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(state.connection.label(), style = MaterialTheme.typography.labelMedium)
+        val path = state.connectedEndpoint?.path
+        val label = if (
+            state.connection == ConnectionState.Connected &&
+            path != null && path != com.adroited.aiterm.remote.RemotePath.UNKNOWN
+        ) {
+            "${state.connection.label()} · ${path.name}"
+        } else {
+            state.connection.label()
+        }
+        Text(label, style = MaterialTheme.typography.labelMedium)
         state.lastError?.let {
             Text("  $it", modifier = Modifier.weight(1f), maxLines = 1)
         } ?: Spacer(Modifier.weight(1f))

@@ -8,6 +8,7 @@ import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
 import RemoteAccessSettings from "./RemoteAccessSettings";
+import SettingsSwitch from "./SettingsSwitch";
 import LibrarianPane from "./LibrarianPane";
 import BringInPane from "./BringInPane";
 import type { LibrarianCtl } from "../librarian";
@@ -95,24 +96,6 @@ function Group({ title, children }: { title?: string; children: ReactNode }) {
       {title && <div className="sgroup-title">{title}</div>}
       <div className="sgroup-rows">{children}</div>
     </div>
-  );
-}
-
-/** A switch, for settings that are on or off. */
-function Switch({ checked, onChange, label }: {
-  checked: boolean;
-  onChange: (on: boolean) => void;
-  label: string;
-}) {
-  return (
-    <label className="sw" aria-label={label}>
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-      />
-      <span className="sw-track"><span className="sw-knob" /></span>
-    </label>
   );
 }
 
@@ -349,7 +332,7 @@ export default function SettingsModal({
                   </div>
                 </Row>
                 <Row label="Session summary on hover" desc="Rest the pointer on a session row and a card opens beside it with the summary, files and tasks">
-                  <Switch checked={settings.sessionHover} onChange={(on) => set({ sessionHover: on })} label="Session summary on hover" />
+                  <SettingsSwitch checked={settings.sessionHover} onChange={(on) => set({ sessionHover: on })} label="Session summary on hover" />
                 </Row>
                 <Row label="Accent" desc="Used for selection, focus, and the active tab">
                   <div className="accent-row">
@@ -523,7 +506,7 @@ export default function SettingsModal({
                       : "Log every call from the UI, with arguments and timings, to trace.log. Costs nothing while off."
                   }
                 >
-                  <Switch checked={tracing} onChange={toggleTrace} label="Verbose trace" />
+                  <SettingsSwitch checked={tracing} onChange={toggleTrace} label="Verbose trace" />
                 </Row>
               </Group>
               <Group title="This build">

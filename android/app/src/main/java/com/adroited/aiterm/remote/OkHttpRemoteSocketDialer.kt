@@ -4,6 +4,10 @@ import com.adroited.aiterm.pairing.PairedDesktop
 import com.adroited.aiterm.pairing.tls13Context
 import com.adroited.aiterm.security.PinnedSpkiTrustManager
 import java.security.SecureRandom
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketAddress
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -15,6 +19,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.ConnectionSpec
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
@@ -25,11 +31,12 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import javax.net.SocketFactory
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /** Opens only TLS 1.3 WebSockets whose SPKI and hostname both match pairing. */
-class OkHttpRemoteSocketDialer : RemoteSocketDialer {
+class OkHttpRemoteSocketDialer : DirectRemoteSocketDialer {
     override suspend fun open(desktop: PairedDesktop): RemoteBinarySocket = coroutineScope {
         require(desktop.hosts.isNotEmpty())
         val client = pinnedClient(desktop.serverSpkiFingerprint)
@@ -43,7 +50,11 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
                 var opened: RemoteBinarySocket? = null
                 try {
                     delay(routeDelayMillis(candidate.route))
-                    opened = openEndpoint(client, endpoint(candidate.host, candidate.port))
+                    opened = openEndpoint(
+                        client,
+                        endpoint(candidate.host, candidate.port),
+                        candidate.route.remotePath,
+                    )
                     if (winner.complete(opened)) opened = null
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -67,6 +78,32 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
         }
     }
 
+    override suspend fun openDirect(
+        desktop: PairedDesktop,
+        offer: RemoteDirectOffer,
+    ): RemoteBinarySocket = withContext(Dispatchers.IO) {
+        val relayHost = desktop.relayHost
+            ?: throw RemoteProtocolException("a relay route is required for a direct connection")
+        val relayPort = desktop.relayPort
+            ?: throw RemoteProtocolException("a relay route is required for a direct connection")
+        val tunnel = try {
+            NativeDirectTunnel.start(desktop, offer)
+        } catch (error: UnsatisfiedLinkError) {
+            throw RemoteProtocolException("direct QUIC is not available on this device", error)
+        }
+        try {
+            val client = pinnedClient(
+                desktop.serverSpkiFingerprint,
+                RedirectingSocketFactory(tunnel.localPort),
+            )
+            val socket = openEndpoint(client, endpoint(relayHost, relayPort), RemotePath.DIRECT)
+            TunnelOwnedSocket(socket, tunnel)
+        } catch (error: Exception) {
+            tunnel.close()
+            throw error
+        }
+    }
+
     internal fun routeDelayMillis(route: Route): Long = when (route) {
         Route.LAN -> 0L
         Route.VPN -> VPN_FALLBACK_DELAY_MILLIS
@@ -75,6 +112,13 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
 
     internal data class Endpoint(val host: String, val port: Int, val route: Route)
     internal enum class Route { LAN, VPN, RELAY }
+
+    private val Route.remotePath: RemotePath
+        get() = when (this) {
+            Route.LAN -> RemotePath.LAN
+            Route.VPN -> RemotePath.VPN
+            Route.RELAY -> RemotePath.RELAY
+        }
 
     internal fun orderedEndpoints(desktop: PairedDesktop): List<Endpoint> {
         val direct = desktop.hosts.map { host ->
@@ -97,7 +141,10 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
             octets[0] == 127
     }
 
-    private fun pinnedClient(fingerprint: String): OkHttpClient {
+    private fun pinnedClient(
+        fingerprint: String,
+        socketFactory: SocketFactory = SocketFactory.getDefault(),
+    ): OkHttpClient {
         val trustManager = PinnedSpkiTrustManager(fingerprint)
         val sslContext = tls13Context().apply {
             init(null, arrayOf(trustManager), SecureRandom())
@@ -109,9 +156,55 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
         // replaces CA path validation, never endpoint-name validation.
         return OkHttpClient.Builder()
             .connectTimeout(5, TimeUnit.SECONDS)
+            .socketFactory(socketFactory)
             .sslSocketFactory(sslContext.socketFactory, trustManager)
             .connectionSpecs(listOf(tls13Only))
             .build()
+    }
+
+    private class TunnelOwnedSocket(
+        private val delegate: RemoteBinarySocket,
+        private val tunnel: NativeDirectTunnel,
+    ) : RemoteBinarySocket by delegate {
+        override fun close() {
+            delegate.close()
+            tunnel.close()
+        }
+    }
+
+    private class RedirectingSocketFactory(private val localPort: Int) : SocketFactory() {
+        override fun createSocket(): Socket = RedirectingSocket(localPort)
+
+        override fun createSocket(host: String, port: Int): Socket =
+            createSocket().apply { connect(InetSocketAddress(host, port)) }
+
+        override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+            createSocket().apply {
+                bind(InetSocketAddress(localHost, localPort))
+                connect(InetSocketAddress(host, port))
+            }
+
+        override fun createSocket(host: InetAddress, port: Int): Socket =
+            createSocket().apply { connect(InetSocketAddress(host, port)) }
+
+        override fun createSocket(
+            address: InetAddress,
+            port: Int,
+            localAddress: InetAddress,
+            localPort: Int,
+        ): Socket = createSocket().apply {
+            bind(InetSocketAddress(localAddress, localPort))
+            connect(InetSocketAddress(address, port))
+        }
+    }
+
+    private class RedirectingSocket(private val localPort: Int) : Socket() {
+        override fun connect(endpoint: SocketAddress?) = connect(endpoint, 0)
+
+        override fun connect(endpoint: SocketAddress?, timeout: Int) {
+            val ipv4Loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
+            super.connect(InetSocketAddress(ipv4Loopback, localPort), timeout)
+        }
     }
 
     private fun endpoint(host: String, port: Int): HttpUrl = HttpUrl.Builder()
@@ -122,7 +215,11 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
         .addPathSegment("ws")
         .build()
 
-    private suspend fun openEndpoint(client: OkHttpClient, url: HttpUrl): RemoteBinarySocket =
+    private suspend fun openEndpoint(
+        client: OkHttpClient,
+        url: HttpUrl,
+        path: RemotePath,
+    ): RemoteBinarySocket =
         suspendCancellableCoroutine { continuation ->
             val incoming = Channel<ByteArray>(MAX_QUEUED_FRAMES)
             val reference = AtomicReference<WebSocket?>()
@@ -133,7 +230,7 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
                     val socket = OkHttpBinarySocket(
                         reference,
                         incoming,
-                        RemoteEndpoint(url.host, url.port),
+                        RemoteEndpoint(url.host, url.port, path),
                     )
                     if (opened.compareAndSet(null, socket) && continuation.isActive) {
                         continuation.resume(socket)

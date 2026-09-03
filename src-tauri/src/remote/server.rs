@@ -1,4 +1,5 @@
 use super::auth::{set_private_permissions, write_private_file, DeviceStore, PairingOutcome};
+use super::direct::DirectTunnelService;
 use super::model::{
     decode_exact, encode_terminal_frame, RemoteEvent, RemoteRequest, TerminalSize, PROTOCOL_VERSION,
 };
@@ -8,8 +9,7 @@ use super::terminal::{
     TransferChunk, TransferPlan,
 };
 use super::uploads::{
-    AttachmentStore, UploadBegin, UploadError, UploadErrorKind, UploadSet,
-    PARTIAL_ATTACHMENT_TTL,
+    AttachmentStore, UploadBegin, UploadError, UploadErrorKind, UploadSet, PARTIAL_ATTACHMENT_TTL,
 };
 use crate::launch::LaunchRequest;
 use crate::services::agents::AgentService;
@@ -114,7 +114,12 @@ impl TlsIdentity {
                 if identity.covers(&subject_alt_ips, &subject_alt_dns)? {
                     Ok(identity)
                 } else {
-                    Self::reissue_certificate(&cert_path, identity, &subject_alt_ips, &subject_alt_dns)
+                    Self::reissue_certificate(
+                        &cert_path,
+                        identity,
+                        &subject_alt_ips,
+                        &subject_alt_dns,
+                    )
                 }
             }
             (false, false) => Self::generate(root, &subject_alt_ips, &subject_alt_dns),
@@ -125,7 +130,11 @@ impl TlsIdentity {
         }
     }
 
-    fn generate(root: &Path, subject_alt_ips: &[IpAddr], subject_alt_dns: &[String]) -> Result<Self, GatewayError> {
+    fn generate(
+        root: &Path,
+        subject_alt_ips: &[IpAddr],
+        subject_alt_dns: &[String],
+    ) -> Result<Self, GatewayError> {
         let signing_key = rcgen::KeyPair::generate().map_err(GatewayError::tls)?;
         let certificate_der = issue_certificate(&signing_key, subject_alt_ips, subject_alt_dns)?;
         let private_key_der = signing_key.serialize_der();
@@ -175,17 +184,26 @@ impl TlsIdentity {
         &self.certificate_der
     }
 
+    pub(crate) fn private_key_der(&self) -> &[u8] {
+        &self.private_key_der
+    }
+
     pub fn spki_fingerprint(&self) -> &str {
         &self.spki_fingerprint
     }
 
-    fn covers(&self, subject_alt_ips: &[IpAddr], subject_alt_dns: &[String]) -> Result<bool, GatewayError> {
+    fn covers(
+        &self,
+        subject_alt_ips: &[IpAddr],
+        subject_alt_dns: &[String],
+    ) -> Result<bool, GatewayError> {
         let certificate_der = CertificateDer::from(self.certificate_der.as_slice());
         let parsed = rustls::server::ParsedCertificate::try_from(&certificate_der)
             .map_err(GatewayError::tls)?;
         let localhost = ServerName::try_from("localhost").map_err(GatewayError::tls)?;
         let dns_names = subject_alt_dns.iter().map(|name| {
-            let probe = name.strip_prefix("*.")
+            let probe = name
+                .strip_prefix("*.")
                 .map(|suffix| format!("route-check.{suffix}"))
                 .unwrap_or_else(|| name.clone());
             ServerName::try_from(probe).expect("relay DNS names were validated before use")
@@ -241,7 +259,8 @@ fn bounded_subject_alt_dns(subject_alt_dns: &[String]) -> Result<Vec<String>, Ga
     let mut unique = Vec::with_capacity(subject_alt_dns.len().min(4));
     for name in subject_alt_dns {
         let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
-        let validation_name = normalized.strip_prefix("*.")
+        let validation_name = normalized
+            .strip_prefix("*.")
             .map(|suffix| format!("route-check.{suffix}"))
             .unwrap_or_else(|| normalized.clone());
         if normalized != *name || ServerName::try_from(validation_name).is_err() {
@@ -250,7 +269,9 @@ fn bounded_subject_alt_dns(subject_alt_dns: &[String]) -> Result<Vec<String>, Ga
                 "gateway relay host must be a normalized DNS name",
             ));
         }
-        if unique.contains(&normalized) { continue; }
+        if unique.contains(&normalized) {
+            continue;
+        }
         if unique.len() == 4 {
             return Err(GatewayError::new(
                 "gateway.too_many_advertised_dns",
@@ -356,7 +377,8 @@ mod relay_certificate_tests {
 
     #[test]
     fn wildcard_relay_certificate_covers_a_route_created_after_startup() {
-        let root = std::env::temp_dir().join(format!("aiterm-relay-wildcard-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-relay-wildcard-{}", uuid::Uuid::new_v4()));
         let ips = ["192.168.1.20".parse().unwrap()];
         let dns = vec!["*.relay.example.com".to_string()];
         let identity = TlsIdentity::load_or_create_with_dns(&root, &ips, &dns).unwrap();
@@ -500,11 +522,11 @@ impl DeviceUploadRegistry {
                 // same remembered phone while the first socket still exists.
                 Arc::strong_count(&lease.set) > 1
                     || now.saturating_duration_since(
-                    *lease
-                        .touched
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                ) <= PARTIAL_ATTACHMENT_TTL
+                        *lease
+                            .touched
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    ) <= PARTIAL_ATTACHMENT_TTL
             });
     }
 }
@@ -520,6 +542,7 @@ pub struct RemoteServices {
     app: Option<tauri::AppHandle>,
     routes: Option<Arc<std::sync::RwLock<GatewayRoutesPayload>>>,
     web_previews: WebPreviewStore,
+    direct_tunnel: Option<Arc<DirectTunnelService>>,
 }
 
 impl RemoteServices {
@@ -541,6 +564,7 @@ impl RemoteServices {
             app: None,
             routes: None,
             web_previews: WebPreviewStore::default(),
+            direct_tunnel: None,
         }
     }
 
@@ -584,6 +608,11 @@ impl RemoteServices {
             relay_host,
             relay_port,
         })));
+        self
+    }
+
+    pub fn with_direct_tunnel(mut self, direct_tunnel: Arc<DirectTunnelService>) -> Self {
+        self.direct_tunnel = Some(direct_tunnel);
         self
     }
 
@@ -678,7 +707,9 @@ impl GatewayHandle {
 
     pub fn set_relay_route(&self, host: String, port: u16) {
         if let Some(routes) = &self.routes {
-            let mut routes = routes.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut routes = routes
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             routes.relay_host = Some(host);
             routes.relay_port = Some(port);
         }
@@ -2007,8 +2038,8 @@ fn file_mime(path: &Path) -> &'static str {
         "webp" => "image/webp",
         "gif" => "image/gif",
         "svg" => "image/svg+xml",
-        "txt" | "md" | "rs" | "kt" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml"
-        | "yaml" | "yml" | "css" | "html" => "text/plain",
+        "txt" | "md" | "rs" | "kt" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml" | "yaml"
+        | "yml" | "css" | "html" => "text/plain",
         _ => "application/octet-stream",
     }
 }
@@ -2208,7 +2239,10 @@ async fn serve_web_preview(
     query: Option<String>,
 ) -> Response {
     let Some(target) = state.services.web_previews.resolve(&ticket) else {
-        return web_preview_error(StatusCode::NOT_FOUND, "Preview expired. Reopen it from AITerm.");
+        return web_preview_error(
+            StatusCode::NOT_FOUND,
+            "Preview expired. Reopen it from AITerm.",
+        );
     };
     match target {
         WebPreviewTarget::Static(preview) => serve_static_web_preview(preview, &rest).await,
@@ -2230,13 +2264,19 @@ async fn serve_static_web_preview(preview: Arc<StaticWebPreview>, rest: &str) ->
         return web_preview_error(StatusCode::FORBIDDEN, "That preview path is not available.");
     }
     let Some(path) = preview.files.get(key).cloned() else {
-        return web_preview_error(StatusCode::NOT_FOUND, "That file was not produced by this session.");
+        return web_preview_error(
+            StatusCode::NOT_FOUND,
+            "That file was not produced by this session.",
+        );
     };
     let mime = web_preview_mime(&path);
     let read = tokio::task::spawn_blocking(move || read_web_preview_file(&path)).await;
     match read {
         Ok(Ok(bytes)) => web_preview_response(StatusCode::OK, mime, bytes),
-        _ => web_preview_error(StatusCode::NOT_FOUND, "That preview file is no longer available."),
+        _ => web_preview_error(
+            StatusCode::NOT_FOUND,
+            "That preview file is no longer available.",
+        ),
     }
 }
 
@@ -2266,7 +2306,10 @@ fn read_web_preview_file(path: &Path) -> Result<Vec<u8>, ()> {
 async fn proxy_web_preview(port: u16, rest: &str, query: Option<&str>) -> Response {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(mut url) = url::Url::parse(&format!("http://127.0.0.1:{port}/")) else {
-        return web_preview_error(StatusCode::BAD_GATEWAY, "The preview server address is invalid.");
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The preview server address is invalid.",
+        );
     };
     url.set_path(&format!("/{}", rest.trim_start_matches('/')));
     url.set_query(query);
@@ -2275,10 +2318,11 @@ async fn proxy_web_preview(port: u16, rest: &str, query: Option<&str>) -> Respon
         None => url.path().to_string(),
     };
     let work = async {
-        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
-        let request = format!(
-            "GET {target} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-        );
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        let request =
+            format!("GET {target} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
         socket.write_all(request.as_bytes()).await.ok()?;
         let mut bytes = Vec::new();
         socket
@@ -2289,15 +2333,24 @@ async fn proxy_web_preview(port: u16, rest: &str, query: Option<&str>) -> Respon
         Some(bytes)
     };
     let Ok(Some(raw)) = tokio::time::timeout(Duration::from_secs(20), work).await else {
-        return web_preview_error(StatusCode::BAD_GATEWAY, "The session's preview server did not answer.");
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The session's preview server did not answer.",
+        );
     };
     let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return web_preview_error(StatusCode::BAD_GATEWAY, "The preview server returned an invalid response.");
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The preview server returned an invalid response.",
+        );
     };
     let head = String::from_utf8_lossy(&raw[..split]);
     let body = raw[split + 4..].to_vec();
     if body.len() as u64 > WEB_PREVIEW_RESPONSE_LIMIT {
-        return web_preview_error(StatusCode::BAD_GATEWAY, "The preview response is too large.");
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The preview response is too large.",
+        );
     }
     let status = head
         .lines()
@@ -2339,7 +2392,11 @@ fn web_preview_response(status: StatusCode, mime: &str, body: Vec<u8>) -> Respon
 }
 
 fn web_preview_error(status: StatusCode, message: &'static str) -> Response {
-    web_preview_response(status, "text/plain; charset=utf-8", message.as_bytes().to_vec())
+    web_preview_response(
+        status,
+        "text/plain; charset=utf-8",
+        message.as_bytes().to_vec(),
+    )
 }
 
 fn web_preview_mime(path: &Path) -> &'static str {
@@ -2432,10 +2489,19 @@ impl RemoteServices {
         let request_id = request.request_id();
         match request.kind() {
             "gateway.routes" => {
-                if !request.payload().is_empty() { return Err("protocol.invalid_payload"); }
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
                 let routes = self.routes.as_ref().ok_or("remote.unsupported")?;
-                let routes = routes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-                Ok(DispatchOutcome::frames(vec![response(request_id, "gateway.routes", &routes)?]))
+                let routes = routes
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "gateway.routes",
+                    &routes,
+                )?]))
             }
             "usage.report" => {
                 if !request.payload().is_empty() {
@@ -2568,11 +2634,9 @@ impl RemoteServices {
                         .iter()
                         .find(|candidate| candidate.id == model)
                         .ok_or("agent.invalid_model")?;
-                    if payload
-                        .effort
-                        .as_deref()
-                        .is_some_and(|effort| !model.efforts.iter().any(|candidate| candidate == effort))
-                    {
+                    if payload.effort.as_deref().is_some_and(|effort| {
+                        !model.efforts.iter().any(|candidate| candidate == effort)
+                    }) {
                         return Err("agent.invalid_effort");
                     }
                 }
@@ -2637,7 +2701,8 @@ impl RemoteServices {
             }
             "session.changes" => {
                 let payload: SessionIdPayload = decode_payload(request)?;
-                let session = self.sessions
+                let session = self
+                    .sessions
                     .find(&payload.session_id)
                     .map_err(|error| error.code())?;
                 let app = self.app.as_ref().ok_or("remote.unsupported")?;
@@ -2670,7 +2735,8 @@ impl RemoteServices {
             }
             "file.read" => {
                 let payload: FileReadRequest = decode_payload(request)?;
-                let session = self.sessions
+                let session = self
+                    .sessions
                     .find(&payload.session_id)
                     .map_err(|error| error.code())?;
                 bounded(&payload.path, MAX_PATH_BYTES)?;
@@ -4588,6 +4654,39 @@ async fn run_authenticated_socket(
                     let _ = outbound.controls.try_send(EgressControl::Close);
                     break;
                 }
+                if request.kind() == "transport.direct" {
+                    let frame = if !request.payload().is_empty() {
+                        error_response(
+                            request.request_id(),
+                            "transport.invalid_direct_request",
+                            "direct connection setup does not accept a payload",
+                        )
+                    } else if let Some(service) = &services.direct_tunnel {
+                        match service.prepare().await {
+                            Ok(offer) => {
+                                match response(request.request_id(), "transport.direct", &offer) {
+                                    Ok(frame) => frame,
+                                    Err(_) => break,
+                                }
+                            }
+                            Err(error) => error_response(
+                                request.request_id(),
+                                "transport.direct_unavailable",
+                                &error,
+                            ),
+                        }
+                    } else {
+                        error_response(
+                            request.request_id(),
+                            "transport.direct_unavailable",
+                            "direct connections require an active relay route",
+                        )
+                    };
+                    if enqueue_event(&outbound, frame).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if request.kind() == "terminal.attach"
                     && attachments.len() >= MAX_ATTACHMENTS_PER_CONNECTION
                 {
@@ -4977,13 +5076,16 @@ mod request_guard_tests {
             kind: kind.into(),
             at: 1,
             session_id: Some("session-1".into()),
-            bytes: std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+            bytes: std::fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
         }
     }
 
     #[test]
     fn static_web_preview_prefers_index_and_exposes_only_recorded_siblings() {
-        let root = std::env::temp_dir().join(format!("aiterm-web-preview-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-web-preview-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("assets")).unwrap();
         let index = root.join("index.html");
         let landing = root.join("landing.html");
@@ -5021,13 +5123,17 @@ mod request_guard_tests {
             .unwrap();
 
         assert_eq!(ticket.len(), 43);
-        assert!(matches!(store.resolve(ticket), Some(WebPreviewTarget::Port(5173))));
+        assert!(matches!(
+            store.resolve(ticket),
+            Some(WebPreviewTarget::Port(5173))
+        ));
         assert!(store.resolve("not-a-ticket").is_none());
     }
 
     #[test]
     fn upload_registry_keeps_one_set_for_an_idle_live_socket_and_expires_a_disconnected_one() {
-        let root = std::env::temp_dir().join(format!("aiterm-upload-lease-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-upload-lease-{}", uuid::Uuid::new_v4()));
         let registry = DeviceUploadRegistry::new(AttachmentStore::new(root.clone()).unwrap());
         let live = registry.lease("phone-1");
         *live.touched.lock().unwrap() =
@@ -5065,8 +5171,9 @@ mod request_guard_tests {
             count,
         };
 
-        let first = read_file_chunk_from_ledger(request(&path, 0, 4), std::slice::from_ref(&change))
-            .unwrap();
+        let first =
+            read_file_chunk_from_ledger(request(&path, 0, 4), std::slice::from_ref(&change))
+                .unwrap();
         assert_eq!(first.data, b"abcd");
         assert_eq!(first.total, 6);
         assert!(!first.eof);
@@ -5569,8 +5676,7 @@ async fn handle_pairing(mut socket: WebSocket, state: GatewayState, peer_ip: IpA
         &request.public_key,
         (!request.relay_authority_public_key.is_empty())
             .then_some(request.relay_authority_public_key.as_slice()),
-        (!request.relay_signature_der.is_empty())
-            .then_some(request.relay_signature_der.as_slice()),
+        (!request.relay_signature_der.is_empty()).then_some(request.relay_signature_der.as_slice()),
         peer_ip,
         SystemTime::now(),
     ) {

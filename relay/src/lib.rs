@@ -1,6 +1,6 @@
-use aiterm_relay_protocol::{enrollment_digest, Frame};
-use axum::extract::ConnectInfo;
+use aiterm_relay_protocol::{enrollment_digest, DirectCookie, DirectId, DirectPacket, Frame};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ConnectInfo;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
@@ -30,11 +31,20 @@ const CONNECTOR_QUEUE: usize = 256;
 const STREAM_QUEUE: usize = 32;
 const MAX_STREAMS_PER_CONNECTOR: usize = 128;
 const MAX_PROVISION_ATTEMPTS_PER_MINUTE: u32 = 30;
+const DIRECT_TTL: Duration = Duration::from_secs(30);
+const MAX_DIRECT_RENDEZVOUS: usize = 4096;
+const MAX_DIRECT_PER_ROUTE: usize = 8;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct RelayConfig {
     pub connector_listen: SocketAddr,
     pub ingress_listen: SocketAddr,
+    #[serde(default)]
+    pub direct_listen: Option<SocketAddr>,
+    #[serde(default)]
+    pub direct_public_host: Option<String>,
+    #[serde(default)]
+    pub direct_public_port: Option<u16>,
     pub public_domain: String,
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
@@ -101,17 +111,40 @@ struct Connector {
 #[derive(Clone)]
 struct RelayState {
     public_domain: Arc<str>,
+    direct_public_host: Arc<str>,
+    direct_public_port: u16,
     routes: Arc<RwLock<HashMap<String, RouteAuth>>>,
     provisioning: Option<Arc<ProvisioningState>>,
     connectors: Arc<Mutex<HashMap<String, Connector>>>,
     next_generation: Arc<AtomicU64>,
     next_stream: Arc<AtomicU64>,
+    direct: Arc<Mutex<HashMap<DirectId, DirectRendezvous>>>,
+}
+
+struct DirectRendezvous {
+    route: String,
+    desktop_cookie: DirectCookie,
+    phone_cookie: DirectCookie,
+    desktop: Option<SocketAddr>,
+    phone: Option<SocketAddr>,
+    created: Instant,
 }
 
 impl RelayState {
     fn from_config(config: &RelayConfig) -> Result<Self, String> {
         let public_domain = normalize_dns_name(&config.public_domain)
             .ok_or_else(|| "public_domain is not a valid DNS name".to_string())?;
+        let direct_public_host = match config.direct_public_host.as_deref() {
+            Some(value) => normalize_dns_name(value)
+                .ok_or_else(|| "direct_public_host is not a valid DNS name".to_string())?,
+            None => public_domain.clone(),
+        };
+        let direct_public_port = config
+            .direct_public_port
+            .unwrap_or(config.ingress_listen.port());
+        if direct_public_port == 0 {
+            return Err("direct_public_port must be nonzero".into());
+        }
         let mut routes = HashMap::new();
         for route in &config.routes {
             if !valid_route_id(&route.id) || routes.contains_key(&route.id) {
@@ -126,19 +159,28 @@ impl RelayState {
             let stored = load_provisioning_store(&provisioning.state_file)?;
             for route in &stored.routes {
                 if !valid_route_id(&route.id) || routes.contains_key(&route.id) {
-                    return Err(format!("invalid or duplicate provisioned route {}", route.id));
+                    return Err(format!(
+                        "invalid or duplicate provisioned route {}",
+                        route.id
+                    ));
                 }
-                let token_sha256 = decode_hex_32(&route.token_sha256)
-                    .ok_or_else(|| format!("provisioned route {} has an invalid token hash", route.id))?;
+                let token_sha256 = decode_hex_32(&route.token_sha256).ok_or_else(|| {
+                    format!("provisioned route {} has an invalid token hash", route.id)
+                })?;
                 for (label, value) in [
                     ("authority fingerprint", &route.authority_fingerprint),
                     ("desktop identity", &route.desktop_spki_sha256),
                 ] {
                     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
                         .decode(value.as_bytes())
-                        .map_err(|_| format!("provisioned route {} has an invalid {label}", route.id))?;
+                        .map_err(|_| {
+                            format!("provisioned route {} has an invalid {label}", route.id)
+                        })?;
                     if decoded.len() != 32 {
-                        return Err(format!("provisioned route {} has an invalid {label}", route.id));
+                        return Err(format!(
+                            "provisioned route {} has an invalid {label}",
+                            route.id
+                        ));
                     }
                 }
                 routes.insert(route.id.clone(), RouteAuth { token_sha256 });
@@ -156,11 +198,14 @@ impl RelayState {
         };
         Ok(Self {
             public_domain: public_domain.into(),
+            direct_public_host: direct_public_host.into(),
+            direct_public_port,
             routes: Arc::new(RwLock::new(routes)),
             provisioning,
             connectors: Arc::new(Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             next_stream: Arc::new(AtomicU64::new(1)),
+            direct: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -173,18 +218,23 @@ pub async fn run(config: RelayConfig) -> Result<(), String> {
     let ingress_listener = TcpListener::bind(config.ingress_listen)
         .await
         .map_err(|error| format!("phone ingress listener: {error}"))?;
-    run_with_listeners(state, connector_listener, ingress_listener).await
+    let direct_listener = UdpSocket::bind(config.direct_listen.unwrap_or(config.ingress_listen))
+        .await
+        .map_err(|error| format!("direct rendezvous listener: {error}"))?;
+    run_with_listeners(state, connector_listener, ingress_listener, direct_listener).await
 }
 
 async fn run_with_listeners(
     state: RelayState,
     connector_listener: TcpListener,
     ingress_listener: TcpListener,
+    direct_listener: UdpSocket,
 ) -> Result<(), String> {
     let app = Router::new()
         .route("/v1/connect/{route}", get(connector_upgrade))
         .route("/v1/info", get(relay_info))
         .route("/v1/provision", post(provision_route))
+        .route("/v1/direct/{route}", post(prepare_direct))
         .route("/v1/routes/{route}", delete(deprovision_route))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone());
@@ -192,10 +242,142 @@ async fn run_with_listeners(
         connector_listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     );
-    let ingress_server = serve_ingress(ingress_listener, state);
+    let ingress_server = serve_ingress(ingress_listener, state.clone());
+    let direct_server = serve_direct(direct_listener, state.clone());
     tokio::select! {
         result = connector_server => result.map_err(|error| format!("connector server: {error}")),
         result = ingress_server => result,
+        result = direct_server => result,
+    }
+}
+
+#[derive(Serialize)]
+struct DirectPrepareView {
+    id: String,
+    desktop_cookie: String,
+    phone_cookie: String,
+    host: String,
+    port: u16,
+    expires_in_millis: u64,
+}
+
+async fn prepare_direct(
+    State(state): State<RelayState>,
+    Path(route): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(expected) = state.routes.read().await.get(&route).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(token) = bearer_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    if !bool::from(actual.ct_eq(&expected.token_sha256)) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let mut direct = state.direct.lock().await;
+    reap_direct(&mut direct);
+    if direct.len() >= MAX_DIRECT_RENDEZVOUS
+        || direct.values().filter(|value| value.route == route).count() >= MAX_DIRECT_PER_ROUTE
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "direct connection limit reached",
+        )
+            .into_response();
+    }
+    let mut id = [0u8; aiterm_relay_protocol::DIRECT_ID_BYTES];
+    loop {
+        OsRng.fill_bytes(&mut id);
+        if !direct.contains_key(&id) {
+            break;
+        }
+    }
+    let mut desktop_cookie = [0u8; aiterm_relay_protocol::DIRECT_COOKIE_BYTES];
+    let mut phone_cookie = [0u8; aiterm_relay_protocol::DIRECT_COOKIE_BYTES];
+    OsRng.fill_bytes(&mut desktop_cookie);
+    OsRng.fill_bytes(&mut phone_cookie);
+    direct.insert(
+        id,
+        DirectRendezvous {
+            route,
+            desktop_cookie,
+            phone_cookie,
+            desktop: None,
+            phone: None,
+            created: Instant::now(),
+        },
+    );
+    Json(DirectPrepareView {
+        id: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id),
+        desktop_cookie: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(desktop_cookie),
+        phone_cookie: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(phone_cookie),
+        host: state.direct_public_host.to_string(),
+        port: state.direct_public_port,
+        expires_in_millis: DIRECT_TTL.as_millis() as u64,
+    })
+    .into_response()
+}
+
+fn reap_direct(direct: &mut HashMap<DirectId, DirectRendezvous>) {
+    direct.retain(|_, value| value.created.elapsed() < DIRECT_TTL);
+}
+
+async fn serve_direct(socket: UdpSocket, state: RelayState) -> Result<(), String> {
+    let mut bytes = [0u8; aiterm_relay_protocol::MAX_DIRECT_PACKET_BYTES];
+    loop {
+        let (count, peer) = socket
+            .recv_from(&mut bytes)
+            .await
+            .map_err(|error| format!("direct rendezvous receive: {error}"))?;
+        let Ok(packet) = DirectPacket::decode(&bytes[..count]) else {
+            continue;
+        };
+        let (id, cookie, desktop) = match packet {
+            DirectPacket::BindDesktop { id, cookie } => (id, cookie, true),
+            DirectPacket::BindPhone { id, cookie } => (id, cookie, false),
+            _ => continue,
+        };
+        let peers = {
+            let mut direct = state.direct.lock().await;
+            reap_direct(&mut direct);
+            let Some(rendezvous) = direct.get_mut(&id) else {
+                continue;
+            };
+            let expected = if desktop {
+                &rendezvous.desktop_cookie
+            } else {
+                &rendezvous.phone_cookie
+            };
+            if !bool::from(cookie.ct_eq(expected)) {
+                continue;
+            }
+            if desktop {
+                rendezvous.desktop = Some(peer);
+            } else {
+                rendezvous.phone = Some(peer);
+            }
+            (rendezvous.desktop, rendezvous.phone)
+        };
+        let _ = socket
+            .send_to(&DirectPacket::Bound { id }.encode(), peer)
+            .await;
+        if let (Some(desktop), Some(phone)) = peers {
+            let _ = socket
+                .send_to(&DirectPacket::Peer { id, address: phone }.encode(), desktop)
+                .await;
+            let _ = socket
+                .send_to(
+                    &DirectPacket::Peer {
+                        id,
+                        address: desktop,
+                    }
+                    .encode(),
+                    phone,
+                )
+                .await;
+        }
     }
 }
 
@@ -246,7 +428,8 @@ async fn relay_info(State(state): State<RelayState>) -> Response {
         connector_url: provisioning.config.connector_url.clone(),
         public_domain: state.public_domain.to_string(),
         public_port: provisioning.config.public_port,
-    }).into_response()
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -270,7 +453,11 @@ async fn provision_route(
     };
     let source_ip = forwarded_ip(&headers, peer);
     if !allow_provision_attempt(provisioning, source_ip).await {
-        return (StatusCode::TOO_MANY_REQUESTS, "relay setup request limit reached").into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "relay setup request limit reached",
+        )
+            .into_response();
     }
     if !valid_route_id(&request.route_id) {
         return (StatusCode::BAD_REQUEST, "invalid route id").into_response();
@@ -279,14 +466,16 @@ async fn provision_route(
         return (StatusCode::BAD_REQUEST, "invalid connector credential hash").into_response();
     };
     let Ok(desktop_spki) = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(request.desktop_spki_sha256.as_bytes()) else {
+        .decode(request.desktop_spki_sha256.as_bytes())
+    else {
         return (StatusCode::BAD_REQUEST, "invalid desktop identity").into_response();
     };
     let Ok(desktop_spki): Result<[u8; 32], _> = desktop_spki.try_into() else {
         return (StatusCode::BAD_REQUEST, "invalid desktop identity").into_response();
     };
     let Ok(authority_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(request.authority_public_key.as_bytes()) else {
+        .decode(request.authority_public_key.as_bytes())
+    else {
         return (StatusCode::BAD_REQUEST, "invalid phone authority key").into_response();
     };
     let Ok(authority) = VerifyingKey::from_sec1_bytes(&authority_bytes) else {
@@ -294,10 +483,15 @@ async fn provision_route(
     };
     let canonical_authority = authority.to_encoded_point(true);
     if canonical_authority.as_bytes() != authority_bytes.as_slice() {
-        return (StatusCode::BAD_REQUEST, "phone authority key is not canonical").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "phone authority key is not canonical",
+        )
+            .into_response();
     }
-    let Ok(signature_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(request.signature_der.as_bytes()) else {
+    let Ok(signature_bytes) =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(request.signature_der.as_bytes())
+    else {
         return (StatusCode::BAD_REQUEST, "invalid phone authority signature").into_response();
     };
     let Ok(signature) = Signature::from_der(&signature_bytes) else {
@@ -315,23 +509,46 @@ async fn provision_route(
     let authority_fingerprint = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(canonical_authority.as_bytes()));
     let mut stored = provisioning.store.lock().await;
-    if stored.routes.iter().any(|route| route.id == request.route_id)
+    if stored
+        .routes
+        .iter()
+        .any(|route| route.id == request.route_id)
         || state.routes.read().await.contains_key(&request.route_id)
     {
         return StatusCode::CONFLICT.into_response();
     }
-    if stored.routes.iter().filter(|route| route.source_ip == source_ip).count()
+    if stored
+        .routes
+        .iter()
+        .filter(|route| route.source_ip == source_ip)
+        .count()
         >= provisioning.config.max_routes_per_ip
     {
-        return (StatusCode::TOO_MANY_REQUESTS, "route limit reached for this address").into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "route limit reached for this address",
+        )
+            .into_response();
     }
     if state.routes.read().await.len() >= provisioning.config.max_routes {
-        return (StatusCode::SERVICE_UNAVAILABLE, "relay route capacity reached").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay route capacity reached",
+        )
+            .into_response();
     }
-    if stored.routes.iter().filter(|route| route.authority_fingerprint == authority_fingerprint).count()
+    if stored
+        .routes
+        .iter()
+        .filter(|route| route.authority_fingerprint == authority_fingerprint)
+        .count()
         >= provisioning.config.max_routes_per_authority
     {
-        return (StatusCode::TOO_MANY_REQUESTS, "route limit reached for this phone authority").into_response();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "route limit reached for this phone authority",
+        )
+            .into_response();
     }
     let record = ProvisionedRoute {
         id: request.route_id.clone(),
@@ -347,19 +564,25 @@ async fn provision_route(
     let mut next = stored.clone();
     next.routes.push(record);
     if persist_provisioning_store(&provisioning.config.state_file, &next).is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "could not persist relay route").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not persist relay route",
+        )
+            .into_response();
     }
-    state.routes.write().await.insert(
-        request.route_id.clone(),
-        RouteAuth { token_sha256 },
-    );
+    state
+        .routes
+        .write()
+        .await
+        .insert(request.route_id.clone(), RouteAuth { token_sha256 });
     *stored = next;
     Json(ProvisionedRouteView {
         connector_url: provisioning.config.connector_url.clone(),
         public_host: format!("{}.{}", request.route_id, state.public_domain),
         public_port: provisioning.config.public_port,
         route_id: request.route_id,
-    }).into_response()
+    })
+    .into_response()
 }
 
 async fn allow_provision_attempt(provisioning: &ProvisioningState, source_ip: IpAddr) -> bool {
@@ -404,7 +627,11 @@ async fn deprovision_route(
     let mut next = stored.clone();
     next.routes.remove(position);
     if persist_provisioning_store(&provisioning.config.state_file, &next).is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "could not persist relay route").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not persist relay route",
+        )
+            .into_response();
     }
     state.routes.write().await.remove(&route);
     if let Some(connector) = state.connectors.lock().await.remove(&route) {
@@ -458,13 +685,17 @@ fn load_provisioning_store(path: &FilePath) -> Result<ProvisioningStore, String>
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|error| format!("could not parse {}: {error}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ProvisioningStore::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ProvisioningStore::default())
+        }
         Err(error) => Err(format!("could not read {}: {error}", path.display())),
     }
 }
 
 fn persist_provisioning_store(path: &FilePath, store: &ProvisioningStore) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| "provisioned route path has no parent".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "provisioned route path has no parent".to_string())?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     let temporary = path.with_extension("tmp");
     let bytes = serde_json::to_vec_pretty(store).map_err(|error| error.to_string())?;
@@ -766,7 +997,7 @@ fn parse_client_hello_sni(bytes: &[u8]) -> Result<String, ParseHelloError> {
     let session_len = *take(&hello, &mut at, 1)?.first().unwrap() as usize;
     take(&hello, &mut at, session_len)?;
     let cipher_len = read_u16(&hello, &mut at)? as usize;
-    if cipher_len == 0 || cipher_len % 2 != 0 {
+    if cipher_len == 0 || !cipher_len.is_multiple_of(2) {
         return Err(ParseHelloError::Invalid);
     }
     take(&hello, &mut at, cipher_len)?;
@@ -884,13 +1115,19 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "aiterm-relay-provision-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         let state_file = root.join("provisioning.json");
         let control_origin = "https://control.relay.example.com:8443";
         let config = RelayConfig {
             connector_listen: "127.0.0.1:1".parse().unwrap(),
             ingress_listen: "127.0.0.1:2".parse().unwrap(),
+            direct_listen: None,
+            direct_public_host: None,
+            direct_public_port: None,
             public_domain: "relay.example.com".into(),
             routes: Vec::new(),
             provisioning: Some(ProvisioningConfig {
@@ -915,7 +1152,8 @@ mod tests {
         let request = ProvisionRouteRequest {
             route_id: route_id.into(),
             token_sha256: hex_bytes(&token_sha256),
-            desktop_spki_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(desktop_spki),
+            desktop_spki_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(desktop_spki),
             authority_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(authority_public.as_bytes()),
             signature_der: base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -927,13 +1165,22 @@ mod tests {
             ConnectInfo(peer),
             HeaderMap::new(),
             Json(request),
-        ).await;
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 8192).await.unwrap();
         let provisioned: ProvisionedRouteView = serde_json::from_slice(&body).unwrap();
-        assert!(provisioned.public_host.starts_with(&format!("{}.", provisioned.route_id)));
+        assert!(provisioned
+            .public_host
+            .starts_with(&format!("{}.", provisioned.route_id)));
         assert_eq!(
-            state.routes.read().await.get(&provisioned.route_id).unwrap().token_sha256,
+            state
+                .routes
+                .read()
+                .await
+                .get(&provisioned.route_id)
+                .unwrap()
+                .token_sha256,
             token_sha256,
         );
 
@@ -949,13 +1196,15 @@ mod tests {
             Json(ProvisionRouteRequest {
                 route_id: route_id.into(),
                 token_sha256: hex_bytes(&token_sha256),
-                desktop_spki_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(desktop_spki),
+                desktop_spki_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(desktop_spki),
                 authority_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .encode(authority_public.as_bytes()),
                 signature_der: base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .encode(replay_signature.to_der().as_bytes()),
             }),
-        ).await;
+        )
+        .await;
         assert_eq!(replay.status(), StatusCode::CONFLICT);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -968,9 +1217,13 @@ mod tests {
         let connector_addr = connector_listener.local_addr().unwrap();
         let ingress_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ingress_addr = ingress_listener.local_addr().unwrap();
+        let direct_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = RelayConfig {
             connector_listen: connector_addr,
             ingress_listen: ingress_addr,
+            direct_listen: None,
+            direct_public_host: None,
+            direct_public_port: None,
             public_domain: "relay.example.com".into(),
             provisioning: None,
             routes: vec![RouteConfig {
@@ -983,6 +1236,7 @@ mod tests {
             state,
             connector_listener,
             ingress_listener,
+            direct_listener,
         ));
 
         let mut request = format!("ws://{connector_addr}/v1/connect/desk-1234")
@@ -1049,9 +1303,13 @@ mod tests {
         let connector_addr = connector_listener.local_addr().unwrap();
         let ingress_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ingress_addr = ingress_listener.local_addr().unwrap();
+        let direct_listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let config = RelayConfig {
             connector_listen: connector_addr,
             ingress_listen: ingress_addr,
+            direct_listen: None,
+            direct_public_host: None,
+            direct_public_port: None,
             public_domain: "relay.example.com".into(),
             provisioning: None,
             routes: vec![
@@ -1070,6 +1328,7 @@ mod tests {
             state,
             connector_listener,
             ingress_listener,
+            direct_listener,
         ));
 
         let (mut connector_a, _) =
@@ -1109,6 +1368,111 @@ mod tests {
         read_b.unwrap();
         assert_eq!(reply_a, b"reply from desktop a");
         assert_eq!(reply_b, b"reply from desktop b");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_rendezvous_requires_role_cookies_and_returns_observed_addresses() {
+        let config = RelayConfig {
+            connector_listen: "127.0.0.1:1".parse().unwrap(),
+            ingress_listen: "127.0.0.1:2".parse().unwrap(),
+            direct_listen: None,
+            direct_public_host: None,
+            direct_public_port: None,
+            public_domain: "relay.example.com".into(),
+            provisioning: None,
+            routes: Vec::new(),
+        };
+        let state = RelayState::from_config(&config).unwrap();
+        let id = [7; aiterm_relay_protocol::DIRECT_ID_BYTES];
+        let desktop_cookie = [8; aiterm_relay_protocol::DIRECT_COOKIE_BYTES];
+        let phone_cookie = [9; aiterm_relay_protocol::DIRECT_COOKIE_BYTES];
+        state.direct.lock().await.insert(
+            id,
+            DirectRendezvous {
+                route: "desktop-test".into(),
+                desktop_cookie,
+                phone_cookie,
+                desktop: None,
+                phone: None,
+                created: Instant::now(),
+            },
+        );
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_direct(listener, state));
+        let desktop = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let phone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let desktop_address = desktop.local_addr().unwrap();
+        let phone_address = phone.local_addr().unwrap();
+        let mut bytes = [0u8; aiterm_relay_protocol::MAX_DIRECT_PACKET_BYTES];
+
+        phone
+            .send_to(
+                &DirectPacket::BindPhone {
+                    id,
+                    cookie: [0; aiterm_relay_protocol::DIRECT_COOKIE_BYTES],
+                }
+                .encode(),
+                relay,
+            )
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(30), phone.recv_from(&mut bytes))
+                .await
+                .is_err()
+        );
+
+        desktop
+            .send_to(
+                &DirectPacket::BindDesktop {
+                    id,
+                    cookie: desktop_cookie,
+                }
+                .encode(),
+                relay,
+            )
+            .await
+            .unwrap();
+        let (count, _) = desktop.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(
+            DirectPacket::decode(&bytes[..count]).unwrap(),
+            DirectPacket::Bound { id }
+        );
+        phone
+            .send_to(
+                &DirectPacket::BindPhone {
+                    id,
+                    cookie: phone_cookie,
+                }
+                .encode(),
+                relay,
+            )
+            .await
+            .unwrap();
+        let (count, _) = phone.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(
+            DirectPacket::decode(&bytes[..count]).unwrap(),
+            DirectPacket::Bound { id }
+        );
+        let (count, _) = phone.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(
+            DirectPacket::decode(&bytes[..count]).unwrap(),
+            DirectPacket::Peer {
+                id,
+                address: desktop_address,
+            }
+        );
+        let (count, _) = desktop.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(
+            DirectPacket::decode(&bytes[..count]).unwrap(),
+            DirectPacket::Peer {
+                id,
+                address: phone_address,
+            }
+        );
 
         server.abort();
     }

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import Row from "./SettingsRow";
+import SettingsSwitch from "./SettingsSwitch";
 import {
   fingerprintLabel,
   inviteCountdownSeconds,
@@ -30,6 +31,7 @@ import {
   remoteRelayConfigure,
   remoteRelayServerSet,
   remoteStart,
+  remoteStartOnLaunchSet,
   remoteStatus,
   remoteStop,
 } from "../ipc";
@@ -232,6 +234,20 @@ export default function RemoteAccessSettings() {
             </button>
           </Row>
           <Row
+            label="Start relay when AITerm opens"
+            desc="Restores remote access with this address and port, then reconnects the saved private relay route. Off by default."
+          >
+            <SettingsSwitch
+              checked={status.start_on_launch}
+              disabled={!status.relay?.configured || !address || relayServerChanged}
+              label="Start relay when AITerm opens"
+              onChange={(enabled) => run(
+                remoteStartOnLaunchSet(enabled, address, port),
+                () => saveListenerPreference({ address, port }),
+              )}
+            />
+          </Row>
+          <Row
             label="Address"
             desc="Preferred local address. AITerm listens on the other shareable LAN/VPN addresses too, so phones can switch routes automatically."
           >
@@ -242,7 +258,12 @@ export default function RemoteAccessSettings() {
                 onChange={(e) => {
                   const next = e.target.value;
                   setAddress(next);
-                  if (!status.enabled) saveListenerPreference({ address: next, port });
+                  if (!status.enabled) {
+                    saveListenerPreference({ address: next, port });
+                    if (status.start_on_launch) {
+                      run(remoteStartOnLaunchSet(true, next, port));
+                    }
+                  }
                 }}
               >
                 {addressOptions.length === 0 && <option value="">No LAN or VPN address</option>}
@@ -265,7 +286,12 @@ export default function RemoteAccessSettings() {
                         remoteStop,
                         (config) => remoteStart(config.address, config.port),
                       )
-                        .then(() => saveListenerPreference(target))
+                        .then(async () => {
+                          saveListenerPreference(target);
+                          if (status.start_on_launch) {
+                            await remoteStartOnLaunchSet(true, target.address, target.port);
+                          }
+                        })
                         .catch((cause) => {
                           setAddress(current.address);
                           setPort(current.port);
@@ -288,7 +314,12 @@ export default function RemoteAccessSettings() {
               onChange={(e) => {
                 const next = Number(e.target.value) || DEFAULT_PORT;
                 setPort(next);
-                if (!status.enabled) saveListenerPreference({ address, port: next });
+                if (!status.enabled) {
+                  saveListenerPreference({ address, port: next });
+                  if (status.start_on_launch) {
+                    run(remoteStartOnLaunchSet(true, address, next));
+                  }
+                }
               }}
             />
           </Row>
