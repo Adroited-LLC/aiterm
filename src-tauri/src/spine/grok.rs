@@ -17,6 +17,32 @@
 //!            "_meta":{"eventId":"<session>-<n>","agentTimestampMs":1787956221679,…}}}
 //! ```
 //!
+//! Every `sessionUpdate` seen across 22 sessions, and what becomes of it:
+//! `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk` fold
+//! into blocks; `tool_call` / `tool_call_update` are the cards;
+//! `turn_completed` ends the turn; `task_backgrounded` / `task_completed`
+//! and `subagent_spawned` / `subagent_finished` are long-running work that
+//! outlives the line that started it (below); `plan` is the checklist.
+//! `session_recap`, `current_mode_update` and `image_compressed` are still
+//! ignored — none of them is content, and none means "waiting for you".
+//!
+//! Work that outlives its own tool call comes in two flavours, and both
+//! leave a card grok has already marked `completed` while the thing it
+//! names is still running:
+//!
+//! - a **backgrounded task** — `task_backgrounded` names the card, then the
+//!   card's own `tool_call_update` says `completed` with the text
+//!   "Background task … started". The card is held open instead, and
+//!   `task_completed` (which quotes only a task id, hence the map) closes
+//!   it with the real output and exit code.
+//! - a **subagent** — the `spawn_subagent` card closes the same way with
+//!   "Subagent started in background". The child gets a second card of its
+//!   own, keyed by `subagent_id`, open until `subagent_finished`. The child
+//!   writes an entire session of its own under
+//!   `~/.grok/sessions/<cwd>/<child_session_id>/`; NOTHING it streams
+//!   appears in the parent's `updates.jsonl`, so watching it live would
+//!   mean a second adapter on that directory.
+//!
 //! `events.jsonl` beside it is a different shape entirely — flat objects
 //! keyed by `type`, with an ISO-8601 `ts`, no `params` wrapper:
 //!
@@ -55,6 +81,19 @@ pub struct GrokAdapter {
     /// is plenty — the two lines are written in the same millisecond — and
     /// dropping the rest keeps a long session's bookkeeping bounded.
     completed: [HashSet<String>; 2],
+    /// Backgrounded task id → the tool card that launched it. The two are
+    /// often the same string, but not always: a task grok has to name for
+    /// itself gets a fresh uuid (9 of 29 observed), and `task_completed`
+    /// only ever quotes the TASK id. Kept for the life of the session; a
+    /// task can outlive several turns.
+    tasks: HashMap<String, String>,
+    /// Cards whose task is still running in the background, so the
+    /// `completed` grok writes the moment the launch returns can be held
+    /// back — the command it describes has not finished.
+    background: HashSet<String>,
+    /// The ordinal of the first `plan` line. Every later revision upserts
+    /// that same row rather than stacking a second checklist under it.
+    plan: Option<u64>,
 }
 
 /// A run of consecutive same-kind chunks, folded into one block. Grok emits
@@ -82,6 +121,9 @@ pub fn open(session_id: &str) -> Option<GrokAdapter> {
         run: None,
         turn: "0".to_string(),
         completed: Default::default(),
+        tasks: Default::default(),
+        background: Default::default(),
+        plan: None,
     })
 }
 
@@ -115,6 +157,9 @@ impl GrokAdapter {
         self.run = None;
         self.turn = "0".to_string();
         self.completed = Default::default();
+        self.tasks = Default::default();
+        self.background = Default::default();
+        self.plan = None;
         let mut out = vec![(now_ms(), Kind::Reset)];
         let updates = self.updates.take().unwrap_or_default();
         let events = self.events.take().unwrap_or_default();
@@ -190,10 +235,36 @@ impl GrokAdapter {
                     };
                     out.push((ts, Kind::TurnEnded { turn: self.turn.clone(), reason: reason.into() }));
                 }
-                // `plan`, `task_backgrounded`, `task_completed`,
-                // `subagent_spawned`, `subagent_finished`, `session_recap`,
-                // `current_mode_update`, `image_compressed`: state the phone
-                // does not render, and none of them means "waiting for you".
+                // The card grok just issued belongs to a process that
+                // outlives it; hold the card open and remember the task.
+                "task_backgrounded" => {
+                    self.close_run(&mut out);
+                    self.task_backgrounded(update, ts, &mut out);
+                }
+                "task_completed" => {
+                    self.close_run(&mut out);
+                    self.task_completed(update, ts, &mut out);
+                }
+                "subagent_spawned" => {
+                    self.close_run(&mut out);
+                    if let Some(k) = subagent_card(update) {
+                        out.push((ts, k));
+                    }
+                }
+                "subagent_finished" => {
+                    self.close_run(&mut out);
+                    if let Some(k) = subagent_result(update) {
+                        out.push((ts, k));
+                    }
+                }
+                // The checklist grok keeps.
+                "plan" => {
+                    self.close_run(&mut out);
+                    self.plan(ordinal, update, ts, &mut out);
+                }
+                // `session_recap`, `current_mode_update`, `image_compressed`:
+                // state the phone does not render, and none of them means
+                // "waiting for you".
                 _ => {}
             }
         }
@@ -266,6 +337,17 @@ impl GrokAdapter {
                 out.push((ts, k));
             }
         }
+        // A backgrounded card is closed by grok the instant the LAUNCH
+        // returns — `completed`, output "Background task … started" — while
+        // the command itself runs on for minutes. That is the placeholder
+        // the phone was left holding. Drop every update on such a card: the
+        // note put there by `task_backgrounded` stands (an absent event
+        // changes nothing), and `task_completed` is what really ends it.
+        // The re-issued ToolCall above still passes, because it is how the
+        // card gets its real title, and it carries no output of its own.
+        if self.background.contains(id) {
+            return;
+        }
         let status = status.unwrap_or(ToolStatus::Running);
         let output = tool_output(&update["content"]);
         // The start-of-run line only earns a second event when it brought
@@ -276,6 +358,108 @@ impl GrokAdapter {
         if status == ToolStatus::Completed {
             self.completed[0].insert(id.to_string());
         }
+    }
+
+    /// Grok moved a command off the turn: it keeps running while the model
+    /// goes on with something else, and its real result arrives later as a
+    /// `task_completed` — often several turns later, sometimes never.
+    ///
+    /// ```text
+    /// {"sessionUpdate":"task_backgrounded","tool_call_id":"call-…-10",
+    ///  "task_id":"call-…-10","command":"…","cwd":"…","output_file":"…",
+    ///  "description":"Run agy print mode to observe auth prompt"}
+    /// ```
+    ///
+    /// `task_id` equals `tool_call_id` for 20 of 29 observed tasks and is a
+    /// fresh uuid for the other 9, so the pairing has to be remembered here:
+    /// it is the only line that ever carries both. [observed: grok 1.0.13]
+    fn task_backgrounded(&mut self, update: &Value, ts: u64, out: &mut Vec<(u64, Kind)>) {
+        let Some(call) = update["tool_call_id"].as_str() else { return };
+        if let Some(task) = update["task_id"].as_str() {
+            self.tasks.insert(task.to_string(), call.to_string());
+        }
+        self.background.insert(call.to_string());
+        let what = one_line(&update["description"]);
+        let what = if what.is_empty() { one_line(&update["command"]) } else { what };
+        let note = match what.is_empty() {
+            true => "running in the background…".to_string(),
+            false => format!("running in the background… {what}"),
+        };
+        out.push((
+            ts,
+            Kind::ToolCallUpdate {
+                id: call.to_string(),
+                status: ToolStatus::Running,
+                output: Some(clip(&note, OUTPUT_MAX)),
+            },
+        ));
+    }
+
+    /// The background command finished. Everything is under `task_snapshot`,
+    /// which names only the TASK id — hence the map — and carries the whole
+    /// captured `output`, an `exit_code`, a `signal` and a `truncated` flag.
+    ///
+    /// A task whose backgrounding we never saw (a session resumed past it)
+    /// has no card to update, so one is opened and closed in the same
+    /// breath rather than dropping the work on the floor.
+    fn task_completed(&mut self, update: &Value, ts: u64, out: &mut Vec<(u64, Kind)>) {
+        let snap = &update["task_snapshot"];
+        let Some(task) = snap["task_id"].as_str() else { return };
+        let id = match self.tasks.remove(task) {
+            Some(call) => {
+                self.background.remove(&call);
+                call
+            }
+            None => {
+                let id = format!("task-{task}");
+                let title = one_line(&snap["description"]);
+                let command = one_line(&snap["command"]);
+                out.push((
+                    ts,
+                    Kind::ToolCall {
+                        id: id.clone(),
+                        tool: snap["kind"].as_str().unwrap_or("task").to_string(),
+                        title: if title.is_empty() { command.clone() } else { title },
+                        category: ToolCategory::Execute,
+                        input: clip(&command, INPUT_MAX),
+                        status: ToolStatus::Running,
+                    },
+                ));
+                id
+            }
+        };
+        let ok = snap["signal"].is_null() && snap["exit_code"].as_i64().unwrap_or(0) == 0;
+        out.push((
+            ts,
+            Kind::ToolCallUpdate {
+                id,
+                status: if ok { ToolStatus::Completed } else { ToolStatus::Failed },
+                output: Some(task_result(snap)),
+            },
+        ));
+    }
+
+    /// The checklist, as one thought block that is rewritten in place. The
+    /// id is the ordinal of the FIRST plan line of the session, so the 2 or
+    /// 3 revisions a session writes upsert one row instead of stacking.
+    fn plan(&mut self, ordinal: u64, update: &Value, ts: u64, out: &mut Vec<(u64, Kind)>) {
+        let Some(entries) = update["entries"].as_array().filter(|e| !e.is_empty()) else { return };
+        let id = format!("p{}", *self.plan.get_or_insert(ordinal));
+        let text = entries
+            .iter()
+            .map(|e| {
+                // `priority` is on every entry and is `medium` on all 117
+                // observed: it says nothing, so it is not shown.
+                let mark = match e["status"].as_str() {
+                    Some("completed") => "[x]",
+                    Some("in_progress") => "[~]",
+                    _ => "[ ]",
+                };
+                format!("{mark} {}", e["content"].as_str().unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push((ts, Kind::AgentThought { id, text: clip(&text, OUTPUT_MAX), done: true }));
     }
 
     fn parse_events(&mut self, lines: &[String]) -> Vec<(u64, Kind)> {
@@ -397,6 +581,95 @@ fn tool_card(update: &Value, status: ToolStatus) -> Option<Kind> {
         input: summarize(&update["rawInput"]),
         status,
     })
+}
+
+/// A subagent, as a card of its own.
+///
+/// ```text
+/// {"sessionUpdate":"subagent_spawned","subagent_id":"01a02be1-…",
+///  "parent_session_id":"…","child_session_id":"01a02be1-…",
+///  "subagent_type":"general-purpose","description":"SWFL agent ICP research",
+///  "capability_mode":"all","model":"grok-4.6"}
+/// ```
+///
+/// The `spawn_subagent` tool call that issued it gets its own card, closed
+/// a millisecond later with "Subagent started in background" — that card is
+/// the launch. This one is the child's life, and it stays open for the
+/// minutes the child actually runs. Its id is the subagent's, which is the
+/// only handle `subagent_finished` carries.
+fn subagent_card(update: &Value) -> Option<Kind> {
+    let id = update["subagent_id"].as_str()?;
+    let kind = update["subagent_type"].as_str().unwrap_or("subagent");
+    let title = one_line(&update["description"]);
+    let input = [("type", kind), ("model", update["model"].as_str().unwrap_or_default())]
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(Kind::ToolCall {
+        id: format!("sub-{id}"),
+        tool: "subagent".to_string(),
+        title: if title.is_empty() { kind.to_string() } else { title },
+        category: ToolCategory::Think,
+        input: clip(&input, INPUT_MAX),
+        status: ToolStatus::Running,
+    })
+}
+
+/// The child is done: a `status`, a little accounting, and the summary it
+/// handed back. Nothing the child did on the way is here — it wrote its own
+/// session under `~/.grok/sessions/<cwd>/<child_session_id>/`, and not one
+/// line of it reaches the parent's `updates.jsonl`. [observed: grok 1.0.13]
+fn subagent_result(update: &Value) -> Option<Kind> {
+    let id = update["subagent_id"].as_str()?;
+    let status = match update["status"].as_str() {
+        Some("completed") => ToolStatus::Completed,
+        Some("cancelled") => ToolStatus::Cancelled,
+        _ => ToolStatus::Failed,
+    };
+    let mut head = update["status"].as_str().unwrap_or("finished").to_string();
+    if let Some(n) = update["tool_calls"].as_u64() {
+        head.push_str(&format!(" · {n} tool calls"));
+    }
+    if let Some(ms) = update["duration_ms"].as_u64() {
+        head.push_str(&format!(" · {} s", ms / 1000));
+    }
+    let body = update["output"].as_str().unwrap_or_default();
+    let text = if body.is_empty() { head } else { format!("{head}\n{body}") };
+    Some(Kind::ToolCallUpdate { id: format!("sub-{id}"), status, output: Some(clip(&text, OUTPUT_MAX)) })
+}
+
+/// What a finished background task showed: the reason it stopped when that
+/// is not "cleanly", then its captured output. `exit_code` is null whenever
+/// a `signal` is set (`killed`, `timeout`, `signal 15`), and `truncated`
+/// says grok itself already cut the capture. [observed: grok 1.0.13]
+fn task_result(snap: &Value) -> String {
+    let mut marks = Vec::new();
+    match snap["signal"].as_str() {
+        Some(sig) => marks.push(format!("[{sig}]")),
+        None => match snap["exit_code"].as_i64() {
+            Some(0) | None => {}
+            Some(code) => marks.push(format!("[exit {code}]")),
+        },
+    }
+    if snap["truncated"].as_bool() == Some(true) {
+        marks.push("[truncated]".to_string());
+    }
+    let body = snap["output"].as_str().unwrap_or_default();
+    if body.is_empty() {
+        marks.push("(no output)".to_string());
+        return marks.join(" ");
+    }
+    let text =
+        if marks.is_empty() { body.to_string() } else { format!("{} {body}", marks.join(" ")) };
+    clip(&text, OUTPUT_MAX)
+}
+
+/// A JSON string field as one line of card text: whitespace collapsed, so a
+/// heredoc of a command does not arrive as forty lines.
+fn one_line(v: &Value) -> String {
+    v.as_str().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The card's mark. The ACP `kind` is only on the fill-in line; the first
@@ -589,6 +862,9 @@ mod tests {
             run: None,
             turn: "0".to_string(),
             completed: Default::default(),
+            tasks: Default::default(),
+            background: Default::default(),
+            plan: None,
         }
     }
 
@@ -620,6 +896,31 @@ mod tests {
     const CALL_DONE: &str = r#"{"timestamp":1787956222,"method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-A-0","status":"completed","content":[{"type":"content","content":{"type":"text","text":"1→# aiterm"}}],"rawOutput":{"ok":true}},"_meta":{"eventId":"S-65","agentTimestampMs":1787956222790}}}"#;
     const TURN_DONE: &str = r#"{"timestamp":1787956230,"method":"_x.ai/session/update","params":{"sessionId":"S","update":{"sessionUpdate":"turn_completed","prompt_id":"P","stop_reason":"end_turn","usage":{"inputTokens":48927,"outputTokens":1504,"totalTokens":50431,"numTurns":3}},"_meta":{"eventId":"S-1345","agentTimestampMs":1787956230527}}}"#;
     const PLAN: &str = r#"{"timestamp":1787956223,"method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"plan","entries":[{"content":"Load skills","priority":"medium","status":"in_progress"}]},"_meta":{"eventId":"S-70","agentTimestampMs":1787956223000}}}"#;
+    /// The same plan, later: the first entry done and a second one added.
+    const PLAN_GROWN: &str = r#"{"timestamp":1787956240,"method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"plan","entries":[{"content":"Load skills","priority":"medium","status":"completed"},{"content":"Serve, verify, commit","priority":"medium","status":"pending"}]},"_meta":{"totalTokens":63524,"eventId":"S-806","agentTimestampMs":1787956240196,"updateType":"Plan","updateParams":{"planSteps":2}}}}"#;
+
+    // A backgrounded command, from ~/.grok/sessions/…/5d992ea4-… and
+    // …/01a063df-…: the card, the fill-in, the `task_backgrounded` that
+    // takes it off the turn, the `completed` grok writes the moment the
+    // LAUNCH returns, and the `task_completed` that really ends it.
+    const BG_CALL: &str = r#"{"timestamp":1787956807,"method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"tool_call","toolCallId":"call-B-1","title":"run_terminal_command","rawInput":{"command":"uv run main.py","description":"Start Zip Atlas server on port 8810"},"_meta":{"x.ai/tool":{"version":1,"name":"run_terminal_command","kind":"execute","namespace":"grok_build","label":"Run Command","read_only":false}}},"_meta":{"eventId":"S-771","agentTimestampMs":1787956807742,"updateType":"ToolCall","updateParams":{"toolCallId":"call-B-1","title":"run_terminal_command","kind":"Other","status":"Pending"}}}}"#;
+    const BG_FILL: &str = r#"{"timestamp":1787956807,"method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-B-1","kind":"execute","title":"Execute `uv run main.py`","content":[{"type":"content","content":{"type":"text","text":"Start Zip Atlas server on port 8810"}}],"locations":[],"rawInput":{"variant":"Bash","command":"uv run main.py","description":"Start Zip Atlas server on port 8810","is_background":false},"_meta":{"x.ai/tool":{"version":1,"name":"run_terminal_command","kind":"execute","namespace":"grok_build","label":"Run Command","read_only":false}}},"_meta":{"eventId":"S-772","agentTimestampMs":1787956807743,"updateType":"ToolCallUpdate","updateParams":{"toolCallId":"call-B-1","status":null}}}}"#;
+    /// `task_id` == `tool_call_id`: 20 of the 29 observed tasks.
+    const BG: &str = r#"{"timestamp":1787956807,"method":"_x.ai/session/update","params":{"sessionId":"S","update":{"sessionUpdate":"task_backgrounded","tool_call_id":"call-B-1","task_id":"call-B-1","command":"uv run main.py","cwd":"/home/admin/AI-OS","output_file":"/home/admin/.grok/sessions/%2Fhome%2Fadmin%2FAI-OS/S/terminal/call-B-1.log","description":"Start Zip Atlas server on port 8810"},"_meta":{"eventId":"S-774","agentTimestampMs":1787956807756}}}"#;
+    /// The other 9: grok named the task itself, and only this line ever
+    /// carries both names.
+    const BG_ALIAS: &str = r#"{"timestamp":1787956807,"method":"_x.ai/session/update","params":{"sessionId":"S","update":{"sessionUpdate":"task_backgrounded","tool_call_id":"call-B-1","task_id":"01a04a87-c84c-7140-9dc2-a14a69970efb","command":"uv run main.py","cwd":"/home/admin/AI-OS","output_file":"/home/admin/.grok/sessions/%2Fhome%2Fadmin%2FAI-OS/S/terminal/call-B-1.log","description":"Start Zip Atlas server on port 8810"},"_meta":{"eventId":"S-774","agentTimestampMs":1787956807756}}}"#;
+    /// The placeholder: `completed`, seconds in, with the process still up.
+    const BG_PLACEHOLDER: &str = r#"{"timestamp":1787956807,"method":"session/update","params":{"sessionId":"S","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-B-1","status":"completed","title":"[bg] uv run main.py (01a04a87)","content":[{"type":"content","content":{"type":"text","text":"Background task 01a04a87-c84c-7140-9dc2-a14a69970efb started"}}],"rawOutput":{"type":"BackgroundTaskStarted","task_id":"01a04a87-c84c-7140-9dc2-a14a69970efb","task_type":"bash","status":"running","command":"uv run main.py"}},"_meta":{"eventId":"S-775","agentTimestampMs":1787956807757}}}"#;
+    const TASK_DONE: &str = r#"{"timestamp":1787956950,"method":"_x.ai/session/update","params":{"sessionId":"S","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"call-B-1","command":"uv run main.py","cwd":"/home/admin/AI-OS","start_time":{"secs_since_epoch":1787956807,"nanos_since_epoch":756265349},"end_time":{"secs_since_epoch":1787956950,"nanos_since_epoch":864763157},"output":"serving on :8810\n","output_file":"/home/admin/.grok/sessions/%2Fhome%2Fadmin%2FAI-OS/S/terminal/call-B-1.log","truncated":false,"output_total_bytes":17,"exit_code":0,"signal":null,"completed":true,"kind":"bash","block_waited":false,"explicitly_killed":false,"kill_result_delivered":false,"owner_session_id":"S","description":"Start Zip Atlas server on port 8810","is_backgrounded":true},"will_wake":true},"_meta":{"eventId":"S-776","agentTimestampMs":1787956950865}}}"#;
+    /// The aliased task's end. Exit 2, so the card fails; and with no
+    /// `task_backgrounded` in front of it, the only line that could have
+    /// named the card, this is also the orphan case.
+    const TASK_FAILED: &str = r#"{"timestamp":1787956807,"method":"_x.ai/session/update","params":{"sessionId":"S","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"01a04a87-c84c-7140-9dc2-a14a69970efb","command":"uv run main.py","cwd":"/home/admin/AI-OS","start_time":{"secs_since_epoch":1787956807,"nanos_since_epoch":756265349},"end_time":{"secs_since_epoch":1787956807,"nanos_since_epoch":864763157},"output":"error: Failed to spawn: `main.py`\n  Caused by: No such file or directory (os error 2)\n","output_file":"/home/admin/.grok/sessions/%2Fhome%2Fadmin%2FAI-OS/S/terminal/call-B-1.log","truncated":false,"output_total_bytes":86,"exit_code":2,"signal":null,"completed":true,"kind":"bash","block_waited":false,"explicitly_killed":false,"kill_result_delivered":false,"owner_session_id":"S","description":"Start Zip Atlas server on port 8810","is_backgrounded":true},"will_wake":true},"_meta":{"eventId":"S-776","agentTimestampMs":1787956807865}}}"#;
+
+    // A subagent, from ~/.grok/sessions/…/01a03132-…, its report shortened.
+    const SUB_SPAWNED: &str = r#"{"timestamp":1787532086,"method":"_x.ai/session/update","params":{"sessionId":"S","update":{"sessionUpdate":"subagent_spawned","subagent_id":"01a03137-0bb1-74a0-9a4f-cf1b27783f4c","parent_session_id":"S","parent_prompt_id":"bf091f58-993b-45b9-95d2-ed75ba73ac93","child_session_id":"01a03137-0bb1-74a0-9a4f-cf1b27783f4c","subagent_type":"explore","description":"Trace click conversion code","effective_context_source":"new","capability_mode":"read-only","role":"explore","model":"grok-4.6"},"_meta":{"eventId":"S-552","agentTimestampMs":1787532086196}}}"#;
+    const SUB_FINISHED: &str = r#"{"timestamp":1787532422,"method":"_x.ai/session/update","params":{"sessionId":"S","update":{"sessionUpdate":"subagent_finished","subagent_id":"01a03137-0bb1-74a0-9a4f-cf1b27783f4c","child_session_id":"01a03137-0bb1-74a0-9a4f-cf1b27783f4c","status":"completed","tool_calls":31,"turns":1,"duration_ms":336120,"tokens_used":91504,"output":"Full audit is in `/tmp/affiliate-audit/grok-codepaths.md`.","will_wake":false},"_meta":{"eventId":"S-4957","agentTimestampMs":1787532422316}}}"#;
 
     const EV_TURN_STARTED: &str = r#"{"ts":"2026-08-28T22:30:19.612Z","type":"turn_started","session_id":"S","turn_number":0,"model_id":"grok-4.6","yolo_mode":true,"conversation_message_count":3,"session_relationship":"primary","schema_version":"1.0"}"#;
     const EV_PERM_REQ: &str = r#"{"ts":"2026-08-28T22:30:22.787Z","type":"permission_requested","tool_name":"read_file"}"#;
@@ -735,13 +1036,168 @@ mod tests {
         let d = tmpdir("turnend");
         write(&d, "updates.jsonl", &format!("{USER}\n{SAY}\n{PLAN}\n{TURN_DONE}\n"));
         let got = adapter(&d).bootstrap();
-        // `plan` says nothing, but it does end the prose block.
+        // `plan` ends the prose block, and speaks for itself.
         assert_eq!(
             kinds(&got)[2..],
             [
                 &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: false },
                 &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: true },
+                &Kind::AgentThought { id: "p3".into(), text: "[~] Load skills".into(), done: true },
                 &Kind::TurnEnded { turn: "1".into(), reason: "completed".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plan_is_one_thought_row_that_is_rewritten_in_place() {
+        let d = tmpdir("plan");
+        write(&d, "updates.jsonl", &format!("{PLAN}\n{SAY}\n{PLAN_GROWN}\n"));
+        let got = adapter(&d).bootstrap();
+        // Both revisions carry the FIRST plan line's ordinal, so the phone
+        // upserts one checklist instead of stacking two.
+        assert_eq!(
+            kinds(&got),
+            vec![
+                &Kind::AgentThought { id: "p1".into(), text: "[~] Load skills".into(), done: true },
+                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: false },
+                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: true },
+                &Kind::AgentThought {
+                    id: "p1".into(),
+                    text: "[x] Load skills\n[ ] Serve, verify, commit".into(),
+                    done: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_backgrounded_card_stays_open_until_its_task_completes() {
+        let d = tmpdir("bg");
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{BG_CALL}\n{BG}\n{BG_FILL}\n{BG_PLACEHOLDER}\n{SAY}\n{TASK_DONE}\n"),
+        );
+        let got = adapter(&d).bootstrap();
+        assert_eq!(
+            kinds(&got),
+            vec![
+                &Kind::ToolCall {
+                    id: "call-B-1".into(),
+                    tool: "run_terminal_command".into(),
+                    title: "run_terminal_command".into(),
+                    category: ToolCategory::Execute,
+                    input: "command=uv run main.py description=Start Zip Atlas server on port 8810"
+                        .into(),
+                    status: ToolStatus::Pending,
+                },
+                // The note that replaces the placeholder.
+                &Kind::ToolCallUpdate {
+                    id: "call-B-1".into(),
+                    status: ToolStatus::Running,
+                    output: Some(
+                        "running in the background… Start Zip Atlas server on port 8810".into()
+                    ),
+                },
+                // The fill-in still brings the real title; its own update,
+                // and the `completed` placeholder after it, are dropped.
+                &Kind::ToolCall {
+                    id: "call-B-1".into(),
+                    tool: "run_terminal_command".into(),
+                    title: "Execute `uv run main.py`".into(),
+                    category: ToolCategory::Execute,
+                    input: "command=uv run main.py description=Start Zip Atlas server on port 8810 is_background=false".into(),
+                    status: ToolStatus::Running,
+                },
+                &Kind::AgentText { id: "a5".into(), text: "I'll start ".into(), done: false },
+                &Kind::AgentText { id: "a5".into(), text: "I'll start ".into(), done: true },
+                &Kind::ToolCallUpdate {
+                    id: "call-B-1".into(),
+                    status: ToolStatus::Completed,
+                    output: Some("serving on :8810\n".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_task_grok_named_for_itself_still_finds_its_card() {
+        let d = tmpdir("bg-alias");
+        // task_id is a uuid, tool_call_id is the card: only the
+        // `task_backgrounded` line knows they are the same thing.
+        write(&d, "updates.jsonl", &format!("{BG_CALL}\n{BG_ALIAS}\n{TASK_FAILED}\n"));
+        let got = adapter(&d).bootstrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            got[2].1,
+            Kind::ToolCallUpdate {
+                id: "call-B-1".into(),
+                status: ToolStatus::Failed,
+                output: Some(
+                    "[exit 2] error: Failed to spawn: `main.py`\n  Caused by: No such file or directory (os error 2)\n"
+                        .into()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn a_task_with_no_card_to_land_on_gets_one_of_its_own() {
+        let d = tmpdir("bg-orphan");
+        // The same end, with the backgrounding never seen — a session
+        // resumed past it. Nothing is dropped: a card is opened and closed.
+        write(&d, "updates.jsonl", &format!("{TASK_FAILED}\n"));
+        let got = adapter(&d).bootstrap();
+        assert_eq!(
+            kinds(&got),
+            vec![
+                &Kind::ToolCall {
+                    id: "task-01a04a87-c84c-7140-9dc2-a14a69970efb".into(),
+                    tool: "bash".into(),
+                    title: "Start Zip Atlas server on port 8810".into(),
+                    category: ToolCategory::Execute,
+                    input: "uv run main.py".into(),
+                    status: ToolStatus::Running,
+                },
+                &Kind::ToolCallUpdate {
+                    id: "task-01a04a87-c84c-7140-9dc2-a14a69970efb".into(),
+                    status: ToolStatus::Failed,
+                    output: Some(
+                        "[exit 2] error: Failed to spawn: `main.py`\n  Caused by: No such file or directory (os error 2)\n"
+                            .into()
+                    ),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subagent_is_a_card_of_its_own_from_spawn_to_report() {
+        let d = tmpdir("subagent");
+        write(&d, "updates.jsonl", &format!("{SUB_SPAWNED}\n{SAY}\n{SUB_FINISHED}\n"));
+        let got = adapter(&d).bootstrap();
+        let id = "sub-01a03137-0bb1-74a0-9a4f-cf1b27783f4c";
+        assert_eq!(
+            kinds(&got),
+            vec![
+                &Kind::ToolCall {
+                    id: id.into(),
+                    tool: "subagent".into(),
+                    title: "Trace click conversion code".into(),
+                    category: ToolCategory::Think,
+                    input: "type=explore model=grok-4.6".into(),
+                    status: ToolStatus::Running,
+                },
+                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: false },
+                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: true },
+                &Kind::ToolCallUpdate {
+                    id: id.into(),
+                    status: ToolStatus::Completed,
+                    output: Some(
+                        "completed · 31 tool calls · 336 s\nFull audit is in `/tmp/affiliate-audit/grok-codepaths.md`."
+                            .into()
+                    ),
+                },
             ]
         );
     }
@@ -903,6 +1359,20 @@ mod tests {
                 })
                 .collect();
             assert!(open.len() <= 1, "{dir:?} left blocks open: {open:?}");
+            // Every update lands on a card that was opened for it: no
+            // status or output is dealt out to an id the phone never saw.
+            let cards: std::collections::BTreeSet<&String> = out
+                .iter()
+                .filter_map(|(_, k)| match k {
+                    Kind::ToolCall { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            for (_, k) in &out {
+                if let Kind::ToolCallUpdate { id, .. } = k {
+                    assert!(cards.contains(id), "{dir:?} update with no card: {id}");
+                }
+            }
         }
         println!("{histogram:#?}");
     }
