@@ -2382,7 +2382,24 @@ export default function App() {
     document.body.classList.add("dragging");
   };
 
-  const showRight = showExplorer || showGit;
+  /** The home screen has the centre pane. Nothing else is on screen: no
+   *  session, no preview, no file. */
+  const onHome = activeTab === null && !previewSession && !fileOnScreen;
+  /**
+   * Explorer and Agent are about a session, and home has none — so on home
+   * they were two empty columns saying "select a project" and "tasks appear
+   * here", taking a third of the width to tell you nothing. They are not
+   * rendered here. The toggles are untouched: the choice is remembered, it
+   * just has nothing to show yet, and both panels come back the moment a
+   * session tab is on screen.
+   *
+   * Repository is not in this list on purpose. It reads `activeProject`,
+   * which the sidebar sets whether or not a tab is open, so it has real
+   * content on home.
+   */
+  const explorerOnScreen = showExplorer && !onHome;
+  const agentOnScreen = showAgent && !onHome;
+  const showRight = explorerOnScreen || showGit;
 
   const timeFormatCtx = useMemo(() => ({
     format: settings.timeFormat,
@@ -2475,8 +2492,8 @@ export default function App() {
             onClick={() => setShowSessions(!showSessions)}
           ><Icon of={PanelLeft} /></button>
           <button
-            className={"icon-btn" + (showExplorer ? " on" : "")}
-            title="Toggle file explorer"
+            className={"icon-btn" + (explorerOnScreen ? " on" : "")}
+            title={onHome ? "File explorer — opens with a session" : "Toggle file explorer"}
             onClick={() => setShowExplorer(!showExplorer)}
           ><Icon of={FolderOpen} /></button>
           <button
@@ -2485,8 +2502,8 @@ export default function App() {
             onClick={() => setShowGit(!showGit)}
           ><Icon of={GitBranch} /></button>
           <button
-            className={"icon-btn" + (showAgent ? " on" : "")}
-            title="Toggle tasks panel"
+            className={"icon-btn" + (agentOnScreen ? " on" : "")}
+            title={onHome ? "Tasks panel — opens with a session" : "Toggle tasks panel"}
             onClick={() => setShowAgent(!showAgent)}
           ><Icon of={ListChecks} /></button>
           <button
@@ -2869,7 +2886,7 @@ export default function App() {
             {/* The preview pane sits above the file layer, and the start view
                 would show through under it — neither is drawn while a file
                 tab is the one on screen. */}
-            {activeTab === null && !previewSession && !fileOnScreen && (
+            {onHome && (
               <HomeDashboard
                 sessions={sessions}
                 liveIds={homeFleetTabs.live}
@@ -3003,9 +3020,9 @@ export default function App() {
             <div className="right-col" ref={rightColRef} style={{ width: sizes.right }}>
               <div
                 className="right-top"
-                style={{ height: showAgent ? `${(1 - sizes.agentFrac) * 100}%` : "100%" }}
+                style={{ height: agentOnScreen ? `${(1 - sizes.agentFrac) * 100}%` : "100%" }}
               >
-                {showExplorer && (
+                {explorerOnScreen && (
                   <div
                     className="panel explorer"
                     style={{ width: showGit ? `${sizes.explorerFrac * 100}%` : "100%", ...zoomFor("explorer") }}
@@ -3017,7 +3034,7 @@ export default function App() {
                     <FileExplorer root={activeProject} refreshKey={explorerRefresh} onOpenFile={openFileTab} />
                   </div>
                 )}
-                {showExplorer && showGit && (
+                {explorerOnScreen && showGit && (
                   <div className="splitter v" onMouseDown={() => startDrag("rightsplit")} />
                 )}
                 {showGit && (
@@ -3034,7 +3051,7 @@ export default function App() {
                   </div>
                 )}
               </div>
-              {showAgent && (
+              {agentOnScreen && (
                 <>
                   <div className="splitter h" onMouseDown={() => startDrag("agentsplit")} />
                   <div className="panel agent" style={{ flex: 1, minHeight: 0, ...zoomFor("agent") }}>
