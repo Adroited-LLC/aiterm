@@ -368,6 +368,36 @@ export interface UsageSource {
 // would both double the request rate and let the two views disagree.
 export const usageReport = () => invoke<UsageSource[]>("usage_report");
 
+/** What a session's spine log says it is doing — `spine/ipc.rs`. */
+export type SpinePhase = "working" | "needs_you" | "idle";
+
+export interface SpineTool {
+  /** The adapter's human title: "Edit foo.rs", "Bash". */
+  title: string;
+  /** "pending" | "running" | "completed" | "failed" | "cancelled". */
+  status: string;
+}
+
+/** One session as the fleet board draws it. A snapshot of the registry's
+ *  ring, not a feed: no transcript is read and no tail is started, so the
+ *  home screen can poll it while it is on screen. */
+export interface SpineOverview {
+  session_id: string;
+  agent: string;
+  phase: SpinePhase;
+  /** The phase's human half: "running Bash", "permission: Edit foo.rs". */
+  detail: string;
+  turn_open: boolean;
+  /** Ms; null when no turn is open — nothing for a timer to count from. */
+  turn_started_ts: number | null;
+  /** Last line of the most recent assistant block, clipped to 120. */
+  last_text: string | null;
+  last_tool: SpineTool | null;
+}
+
+/** Every session the spine holds a log for. Cheap — see `spine/ipc.rs`. */
+export const spineOverview = () => invoke<SpineOverview[]>("spine_overview");
+
 export interface FontFamily {
   name: string;
   /** Fixed-pitch per fontconfig — the set worth offering for a terminal. */

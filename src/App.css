@@ -3852,6 +3852,100 @@ input[type="range"]::-webkit-slider-thumb {
 .home-engine-bar > span { display: block; height: 100%; border-radius: 4px; background: var(--brand, var(--accent)); }
 .home-engine-n { width: 32px; text-align: right; font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 
+/* ---------- the fleet board ---------- */
+/* Three groups down one column, most urgent first, with the group heading
+   carrying the count. The rows are the point: 15px titles, one line of what
+   the session is doing under each, and the time in a fixed right column so
+   the eye can run down it. */
+.fleet { display: flex; flex-direction: column; gap: 24px; }
+.fleet-empty {
+  color: var(--text-faint); font-size: 13px;
+  padding: 16px; text-align: center;
+  border: 1px dashed var(--border); border-radius: 10px;
+}
+.fleet-group { display: flex; flex-direction: column; gap: 8px; }
+.fleet-head {
+  display: flex; align-items: center; gap: 8px; margin: 0;
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.fleet-group.needs .fleet-head { color: var(--red); }
+.fleet-group.running .fleet-head { color: var(--yellow); }
+.fleet-count {
+  font-size: 11px; font-weight: 700; letter-spacing: 0;
+  border-radius: 10px; padding: 1px 8px;
+  color: currentColor; background: color-mix(in srgb, currentColor 16%, transparent);
+}
+.fleet-all {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 2px;
+  background: none; border: none; padding: 2px 4px; border-radius: 5px;
+  color: var(--text-dim); font: inherit; font-size: 11.5px; letter-spacing: 0;
+  text-transform: none; cursor: pointer;
+}
+.fleet-all:hover { color: var(--text); background: var(--bg-hover); }
+
+.fleet-rows { display: flex; flex-direction: column; gap: 2px; }
+/* The row is one button; the ▶ beside it is a second one, so neither is
+   nested inside the other. */
+.fleet-row-wrap { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.fleet-row {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 10px; border-radius: 8px;
+  background: none; border: 1px solid transparent; color: var(--text);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.fleet-row:hover { background: var(--bg-hover); }
+.fleet-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.fleet-row-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.fleet-row-title {
+  font-size: 15px; color: var(--text); line-height: 1.25;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.fleet-row-sub {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  font-size: 12px; color: var(--text-faint);
+}
+.fleet-row-where { flex: none; max-width: 40%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fleet-branch { flex: none; display: inline-flex; align-items: center; gap: 3px; }
+/* What it is doing, and the only part of the line allowed to be long. */
+.fleet-row-detail {
+  min-width: 0; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.fleet-row-when {
+  flex: none; width: 76px; text-align: right;
+  font-size: 12px; font-weight: 400; color: var(--text-faint);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.fleet-row-go {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; border-radius: 7px;
+  background: none; border: 1px solid transparent; color: var(--text-faint); cursor: pointer;
+  opacity: 0;
+}
+.fleet-row-wrap:hover .fleet-row-go, .fleet-row-go:focus-visible { opacity: 1; }
+.fleet-row-go:hover { color: var(--text); border-color: var(--border); background: var(--bg-raised); }
+.fleet-row-go:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* The spine's phases, as one dot on the engine mark. Idle draws nothing —
+   "not doing anything" is the absence of a signal, not a grey signal. */
+.fleet-dot {
+  position: absolute; right: -3px; bottom: -3px;
+  width: 8px; height: 8px; border-radius: 50%;
+  border: 2px solid var(--bg-panel);
+}
+.fleet-dot.working { background: var(--yellow); animation: pulse 1.4s ease-in-out infinite; }
+.fleet-dot.needs_you { background: var(--red); }
+
+.fleet-proj { display: flex; flex-direction: column; gap: 2px; }
+.fleet-proj + .fleet-proj { margin-top: 12px; }
+.fleet-proj-head {
+  font-size: 12px; color: var(--text-faint); padding: 0 10px 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 /* Librarian pane: the engine tabs and a run's errors. */
 .lib-engines { display: flex; gap: 4px; flex-wrap: wrap; }
 .lib-engines .ns-agent-tab { flex: none; font-size: 12px; padding: 5px 9px; }

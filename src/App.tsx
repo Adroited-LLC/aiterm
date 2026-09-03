@@ -2299,6 +2299,44 @@ export default function App() {
     void newSession(cwd, emptyCtl.choice(), prompt.trim() || undefined);
   }, [newSession, emptyCtl, homeCwd]);
 
+  /**
+   * What the desktop knows about its own tabs, in the shape the fleet board
+   * wants it: session ids, not tab keys.
+   *
+   * The board asks the spine first and only falls back to this, so what it is
+   * really for is the cold start (before the first poll answers) and the
+   * sessions the spine has no log for. `otherAlerts` is the leftover the
+   * mapping cannot express — a plain shell waiting on you is not a session,
+   * and dropping it would make the board quieter than the truth.
+   */
+  const homeFleetTabs = useMemo(() => {
+    const ids = new Set(sessions.map((s) => s.id));
+    const live = new Set<string>();
+    const attention = new Set<string>();
+    const busy = new Set<string>();
+    const sessionTabs = new Set<TabId>();
+    for (const t of tabs) {
+      if (!t.slotId || !ids.has(t.slotId)) continue;
+      sessionTabs.add(t.key);
+      live.add(t.slotId);
+      if (attention.has(t.key)) attention.add(t.slotId);
+      if (progress.has(t.key)) busy.add(t.slotId);
+    }
+    return {
+      live, attention, busy,
+      otherAlerts: alerts.filter((a) => !sessionTabs.has(a.key)),
+    };
+  }, [sessions, tabs, attention, progress, alerts]);
+
+  /** "Show all" on the board: the whole list is the sidebar's job, so open it
+   *  and put the cursor in its search box rather than growing a second one. */
+  const showAllSessions = useCallback(() => {
+    setShowSessions(true);
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLInputElement>(".panel.sessions .search-input")?.focus();
+    });
+  }, []);
+
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
   const rightColRef = useRef<HTMLDivElement>(null);
@@ -2834,11 +2872,14 @@ export default function App() {
             {activeTab === null && !previewSession && !fileOnScreen && (
               <HomeDashboard
                 sessions={sessions}
-                liveIds={new Set(tabs.map((t) => t.slotId).filter((k): k is string => !!k))}
-                alerts={alerts}
+                liveIds={homeFleetTabs.live}
+                attentionIds={homeFleetTabs.attention}
+                busyIds={homeFleetTabs.busy}
+                otherAlerts={homeFleetTabs.otherAlerts}
                 onSelect={selectSession}
                 onResume={(s) => { void resumeSession(s); }}
                 onGoTab={(key) => setActiveTab(key)}
+                onShowAll={showAllSessions}
                 controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />}
                 ready={emptyCtl.ready}
                 cwd={homeCwd}
