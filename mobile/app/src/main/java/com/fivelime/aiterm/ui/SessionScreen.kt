@@ -585,16 +585,23 @@ private fun Caret() {
     Box(Modifier.padding(top = 2.dp).size(width = 7.dp, height = 14.dp).background(Accent.copy(alpha = a), RoundedCornerShape(2.dp)))
 }
 
-/** The agent's reasoning: quiet, italic, folded to a line. */
+/** The agent's reasoning: quiet, italic, folded to a line. Folded, the
+ *  markdown marks come off so `**Checking the request**` reads as words;
+ *  opened, it renders like any answer. */
 @Composable
 private fun ThoughtBlock(item: Item.Thought) {
     var expanded by remember { mutableStateOf(false) }
-    Text(
-        item.text, style = MaterialTheme.typography.bodySmall, color = Muted,
-        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
-        maxLines = if (expanded) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis,
-        modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 4.dp, vertical = 2.dp),
-    )
+    val mod = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 4.dp, vertical = 2.dp)
+    if (expanded) {
+        Box(mod) { MarkdownText(item.text, color = Muted) }
+    } else {
+        Text(
+            remember(item.text) { markdownPlain(item.text).replace('\n', ' ') },
+            style = MaterialTheme.typography.bodySmall, color = Muted,
+            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+            maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = mod,
+        )
+    }
 }
 
 /** A tool call, live: the mark its category earns, what it was asked to do,
