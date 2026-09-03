@@ -27,7 +27,7 @@ import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
 import { useLibrarian } from "./librarian";
 import BringIn from "./components/BringIn";
-import { useRelay } from "./relay";
+import { engineName, useRelay } from "./relay";
 import {
   FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
@@ -2689,6 +2689,7 @@ export default function App() {
           )}
           {showBringIn && rootObj?.sessionId && !previewSession && (
             <BringIn
+              host={engineName(rootObj.agentId)}
               onClose={() => setShowBringIn(false)}
               onOpenModelAccess={openModelAccess}
               onGo={(choice, focus, rounds, auto) => {
