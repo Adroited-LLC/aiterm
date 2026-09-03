@@ -121,7 +121,25 @@ export function useStartChoice(reloadKey?: unknown) {
   };
 }
 
-type Ctl = ReturnType<typeof useStartChoice>;
+export type Ctl = ReturnType<typeof useStartChoice>;
+
+/**
+ * The model and effort in one line, for a row that stands in for the two
+ * pickers until it is opened.
+ *
+ * "Default model · Default effort" is the honest reading of the blank state —
+ * the same words the two `<select>`s show — rather than a guess at what the
+ * engine would pick, which this side does not know.
+ */
+export function describePickers(ctl: Ctl): string {
+  if (ctl.isApi) {
+    if (!ctl.apiModel) return "No model chosen";
+    const [, modelId] = JSON.parse(ctl.apiModel) as [string, string];
+    return modelId;
+  }
+  const model = ctl.models.find((m) => m.id === ctl.model)?.display_name ?? "Default model";
+  return `${model} · ${ctl.effort || "Default effort"}`;
+}
 
 /**
  * What the API tab is waiting on, and where its setup should land.
@@ -151,6 +169,11 @@ function apiSetup(all: ProviderView[]): { text: string; provider?: string } {
 
 interface Props {
   ctl: Ctl;
+  /** Which half to draw. The home screen places the engine tabs and the two
+   *  pickers in different rows — the pickers behind a summary that expands —
+   *  so it renders this twice rather than growing a second component that
+   *  would drift from the ＋ menu's. "all" is one block, as everywhere else. */
+  only?: "all" | "tabs" | "selects";
   /** Some callers need a real CLI because they rely on its launch-time
    *  sandbox controls. Keep the general launcher unchanged while allowing
    *  those constrained flows to omit the API/OpenCode path entirely. */
@@ -162,7 +185,7 @@ interface Props {
   onOpenModelAccess?: (providerId?: string) => void;
 }
 
-export default function StartControls({ ctl, onOpenModelAccess, allowApi = true }: Props) {
+export default function StartControls({ ctl, onOpenModelAccess, allowApi = true, only = "all" }: Props) {
   const {
     agents, agentId, model, effort, models, efforts, providers, allProviders, apiModel,
     isApi, apiReady, pickAgent, pickModel, setEffort, setApiModel,
@@ -172,6 +195,63 @@ export default function StartControls({ ctl, onOpenModelAccess, allowApi = true 
     if (apiReady) pickAgent(API_SOURCE);
     else onOpenModelAccess?.(setup?.provider);
   };
+  const selects = (
+  <div className="ns-selects">
+    {isApi ? (
+      <>
+      {/* The vendor of the chosen model, since a native select cannot
+          draw one per option. */}
+      <BrandIcon
+        name={brandForModel(apiModel ? (JSON.parse(apiModel) as [string, string])[1] : null)}
+        size={14}
+        className="ns-model-brand"
+      />
+      <select
+        className="ns-select"
+        value={apiModel}
+        onChange={(e) => setApiModel(e.target.value)}
+        title="A model from a configured provider"
+      >
+        {providers.map((p) => (
+          <optgroup key={p.id} label={p.name}>
+            {p.startup_models.map((m) => (
+              <option key={m} value={JSON.stringify([p.id, m])}>{m}</option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+      </>
+    ) : (
+      <select
+        className="ns-select"
+        value={model}
+        onChange={(e) => pickModel(e.target.value)}
+        disabled={models.length === 0}
+        title={models.length ? "Model" : "This source publishes no model list"}
+      >
+        <option value="">Default model</option>
+        {models.map((m) => (
+          <option key={m.id} value={m.id}>{m.display_name}</option>
+        ))}
+      </select>
+    )}
+    <select
+      className="ns-select"
+      value={effort}
+      onChange={(e) => setEffort(e.target.value)}
+      disabled={isApi || efforts.length === 0}
+      title={
+        isApi ? "API models take no effort setting" : efforts.length ? "Effort" : "Pick a model first"
+      }
+    >
+      <option value="">Default effort</option>
+      {efforts.map((e) => (
+        <option key={e} value={e}>{e}</option>
+      ))}
+    </select>
+  </div>
+  );
+  if (only === "selects") return selects;
   return (
     <div className="ns-agents">
       <div className="ns-agent-tabs">
@@ -198,60 +278,7 @@ export default function StartControls({ ctl, onOpenModelAccess, allowApi = true 
           </button>
         )}
       </div>
-      <div className="ns-selects">
-        {isApi ? (
-          <>
-          {/* The vendor of the chosen model, since a native select cannot
-              draw one per option. */}
-          <BrandIcon
-            name={brandForModel(apiModel ? (JSON.parse(apiModel) as [string, string])[1] : null)}
-            size={14}
-            className="ns-model-brand"
-          />
-          <select
-            className="ns-select"
-            value={apiModel}
-            onChange={(e) => setApiModel(e.target.value)}
-            title="A model from a configured provider"
-          >
-            {providers.map((p) => (
-              <optgroup key={p.id} label={p.name}>
-                {p.startup_models.map((m) => (
-                  <option key={m} value={JSON.stringify([p.id, m])}>{m}</option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
-          </>
-        ) : (
-          <select
-            className="ns-select"
-            value={model}
-            onChange={(e) => pickModel(e.target.value)}
-            disabled={models.length === 0}
-            title={models.length ? "Model" : "This source publishes no model list"}
-          >
-            <option value="">Default model</option>
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>{m.display_name}</option>
-            ))}
-          </select>
-        )}
-        <select
-          className="ns-select"
-          value={effort}
-          onChange={(e) => setEffort(e.target.value)}
-          disabled={isApi || efforts.length === 0}
-          title={
-            isApi ? "API models take no effort setting" : efforts.length ? "Effort" : "Pick a model first"
-          }
-        >
-          <option value="">Default effort</option>
-          {efforts.map((e) => (
-            <option key={e} value={e}>{e}</option>
-          ))}
-        </select>
-      </div>
+      {only === "all" && selects}
       {isApi && (
         <div className="empty-note">
           Runs in OpenCode where it can, and aiterm's own chat console

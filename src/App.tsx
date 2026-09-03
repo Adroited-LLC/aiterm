@@ -6,7 +6,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import { StartChoice } from "./components/NewSessionMenu";
-import StartControls, { useStartChoice } from "./components/StartControls";
+import StartControls, { describePickers, useStartChoice } from "./components/StartControls";
 import TerminalView, { TermHandle, TermProgress, TermTab } from "./components/TerminalView";
 import AlertBell, { Alert } from "./components/AlertBell";
 import FileExplorer from "./components/FileExplorer";
@@ -101,6 +101,9 @@ interface PanelToggles {
 }
 // Composer starts closed: it is opt-in chrome, not something to force on a
 // first run. Everything else matches how the app has always opened.
+/** One panel's worth of right-hand column — what home leaves Repository. */
+const HOME_RIGHT_WIDTH = 320;
+
 const DEFAULT_PANELS: PanelToggles = {
   sessions: true, explorer: true, git: true, composer: false, agent: true,
 };
@@ -2299,6 +2302,59 @@ export default function App() {
     void newSession(cwd, emptyCtl.choice(), prompt.trim() || undefined);
   }, [newSession, emptyCtl, homeCwd]);
 
+  /**
+   * What the desktop knows about its own tabs, in the shape the fleet board
+   * wants it: session ids, not tab keys.
+   *
+   * The board asks the spine first and only falls back to this, so what it is
+   * really for is the cold start (before the first poll answers) and the
+   * sessions the spine has no log for. `otherAlerts` is the leftover the
+   * mapping cannot express — a plain shell waiting on you is not a session,
+   * and dropping it would make the board quieter than the truth.
+   */
+  const homeFleetTabs = useMemo(() => {
+    const ids = new Set(sessions.map((s) => s.id));
+    const live = new Set<string>();
+    const attention = new Set<string>();
+    const busy = new Set<string>();
+    const sessionTabs = new Set<TabId>();
+    for (const t of tabs) {
+      if (!t.slotId || !ids.has(t.slotId)) continue;
+      sessionTabs.add(t.key);
+      live.add(t.slotId);
+      if (attention.has(t.key)) attention.add(t.slotId);
+      if (progress.has(t.key)) busy.add(t.slotId);
+    }
+    return {
+      live, attention, busy,
+      otherAlerts: alerts.filter((a) => !sessionTabs.has(a.key)),
+    };
+  }, [sessions, tabs, attention, progress, alerts]);
+
+  /** "Show all" on the board: the whole list is the sidebar's job, so open it
+   *  and put the cursor in its search box rather than growing a second one. */
+  const showAllSessions = useCallback(() => {
+    setShowSessions(true);
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLInputElement>(".panel.sessions .search-input")?.focus();
+    });
+  }, []);
+
+  /** The quiet half of the home screen's action row: a shell in the working
+   *  folder, on the same slot id the sidebar's "new shell" uses, so the two
+   *  never open two terminals on one directory. */
+  const openHomeTerminal = useCallback(async () => {
+    let cwd = homeCwd;
+    if (!cwd) {
+      try {
+        const picked = await openDialog({ directory: true, title: "Open a terminal in…" });
+        if (typeof picked !== "string") return;
+        cwd = picked;
+      } catch { return; }
+    }
+    void openTab(basename(cwd), cwd, null, `shell:${cwd}`);
+  }, [homeCwd, openTab]);
+
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
   const rightColRef = useRef<HTMLDivElement>(null);
@@ -2344,7 +2400,24 @@ export default function App() {
     document.body.classList.add("dragging");
   };
 
-  const showRight = showExplorer || showGit;
+  /** The home screen has the centre pane. Nothing else is on screen: no
+   *  session, no preview, no file. */
+  const onHome = activeTab === null && !previewSession && !fileOnScreen;
+  /**
+   * Explorer and Agent are about a session, and home has none — so on home
+   * they were two empty columns saying "select a project" and "tasks appear
+   * here", taking a third of the width to tell you nothing. They are not
+   * rendered here. The toggles are untouched: the choice is remembered, it
+   * just has nothing to show yet, and both panels come back the moment a
+   * session tab is on screen.
+   *
+   * Repository is not in this list on purpose. It reads `activeProject`,
+   * which the sidebar sets whether or not a tab is open, so it has real
+   * content on home.
+   */
+  const explorerOnScreen = showExplorer && !onHome;
+  const agentOnScreen = showAgent && !onHome;
+  const showRight = explorerOnScreen || showGit;
 
   const timeFormatCtx = useMemo(() => ({
     format: settings.timeFormat,
@@ -2437,8 +2510,8 @@ export default function App() {
             onClick={() => setShowSessions(!showSessions)}
           ><Icon of={PanelLeft} /></button>
           <button
-            className={"icon-btn" + (showExplorer ? " on" : "")}
-            title="Toggle file explorer"
+            className={"icon-btn" + (explorerOnScreen ? " on" : "")}
+            title={onHome ? "File explorer — opens with a session" : "Toggle file explorer"}
             onClick={() => setShowExplorer(!showExplorer)}
           ><Icon of={FolderOpen} /></button>
           <button
@@ -2447,8 +2520,8 @@ export default function App() {
             onClick={() => setShowGit(!showGit)}
           ><Icon of={GitBranch} /></button>
           <button
-            className={"icon-btn" + (showAgent ? " on" : "")}
-            title="Toggle tasks panel"
+            className={"icon-btn" + (agentOnScreen ? " on" : "")}
+            title={onHome ? "Tasks panel — opens with a session" : "Toggle tasks panel"}
             onClick={() => setShowAgent(!showAgent)}
           ><Icon of={ListChecks} /></button>
           <button
@@ -2831,19 +2904,27 @@ export default function App() {
             {/* The preview pane sits above the file layer, and the start view
                 would show through under it — neither is drawn while a file
                 tab is the one on screen. */}
-            {activeTab === null && !previewSession && !fileOnScreen && (
+            {onHome && (
               <HomeDashboard
                 sessions={sessions}
-                liveIds={new Set(tabs.map((t) => t.slotId).filter((k): k is string => !!k))}
-                alerts={alerts}
+                liveIds={homeFleetTabs.live}
+                attentionIds={homeFleetTabs.attention}
+                busyIds={homeFleetTabs.busy}
+                otherAlerts={homeFleetTabs.otherAlerts}
                 onSelect={selectSession}
                 onResume={(s) => { void resumeSession(s); }}
                 onGoTab={(key) => setActiveTab(key)}
-                controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />}
+                onShowAll={showAllSessions}
+                controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} only="tabs" />}
+                pickers={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} only="selects" />}
+                pickerSummary={describePickers(emptyCtl)}
+                usage={usageSources}
                 ready={emptyCtl.ready}
                 cwd={homeCwd}
                 onPickCwd={pickHomeCwd}
+                onSetCwd={setHomeCwdPick}
                 onLaunch={launchFromHome}
+                onOpenTerminal={openHomeTerminal}
               />
             )}
             {previewSession && !fileOnScreen && (
@@ -2958,13 +3039,25 @@ export default function App() {
 
         {showRight && (
           <>
-            <div className="splitter v" onMouseDown={() => startDrag("right")} />
-            <div className="right-col" ref={rightColRef} style={{ width: sizes.right }}>
+            {/* On home the column holds Repository alone and is fixed at a
+                single panel's width, so the launcher keeps its 760 and the
+                page still composes at 1400. A width nothing can change is
+                not a width to offer a drag handle for, so the splitter is
+                there as the divider and inert until a session is up. */}
+            <div
+              className={"splitter v" + (onHome ? " locked" : "")}
+              onMouseDown={onHome ? undefined : () => startDrag("right")}
+            />
+            <div
+              className="right-col"
+              ref={rightColRef}
+              style={{ width: onHome ? Math.min(sizes.right, HOME_RIGHT_WIDTH) : sizes.right }}
+            >
               <div
                 className="right-top"
-                style={{ height: showAgent ? `${(1 - sizes.agentFrac) * 100}%` : "100%" }}
+                style={{ height: agentOnScreen ? `${(1 - sizes.agentFrac) * 100}%` : "100%" }}
               >
-                {showExplorer && (
+                {explorerOnScreen && (
                   <div
                     className="panel explorer"
                     style={{ width: showGit ? `${sizes.explorerFrac * 100}%` : "100%", ...zoomFor("explorer") }}
@@ -2976,7 +3069,7 @@ export default function App() {
                     <FileExplorer root={activeProject} refreshKey={explorerRefresh} onOpenFile={openFileTab} />
                   </div>
                 )}
-                {showExplorer && showGit && (
+                {explorerOnScreen && showGit && (
                   <div className="splitter v" onMouseDown={() => startDrag("rightsplit")} />
                 )}
                 {showGit && (
@@ -2993,7 +3086,7 @@ export default function App() {
                   </div>
                 )}
               </div>
-              {showAgent && (
+              {agentOnScreen && (
                 <>
                   <div className="splitter h" onMouseDown={() => startDrag("agentsplit")} />
                   <div className="panel agent" style={{ flex: 1, minHeight: 0, ...zoomFor("agent") }}>

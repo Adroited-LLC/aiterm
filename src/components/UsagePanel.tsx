@@ -84,7 +84,7 @@ export function mergeUsage(
 }
 
 /** Relative "resets in 3h 55m" from an ISO timestamp; "" if unknown/past. */
-function resetsIn(iso: string): string {
+export function resetsIn(iso: string): string {
   if (!iso) return "";
   const ms = new Date(iso).getTime() - Date.now();
   if (!isFinite(ms)) return "";
@@ -122,7 +122,7 @@ function amountLine(a: UsageAmount): string {
 }
 
 /** The one number a chip shows, and the colour it shows it in. */
-function headline(s: UsageSource): { text: string; severity: string } {
+export function headline(s: UsageSource): { text: string; severity: string } {
   if (s.bars.length) {
     // The worst window is the one that will stop you, so it is the one that
     // belongs in a single-number summary.

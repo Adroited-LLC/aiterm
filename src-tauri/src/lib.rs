@@ -163,6 +163,7 @@ pub fn run() {
             opencode_agent::opencode_dispatch,
             opencode_agent::opencode_default_target,
             hooklink::drain_session_events,
+            spine::ipc::spine_overview,
             trace::trace_set,
             trace::trace_status,
             usage::usage_report,

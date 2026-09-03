@@ -14,7 +14,7 @@ use tauri::{AppHandle, Manager};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use super::{now_ms, Adapter, Kind, Phase, SpineEvent};
+use super::{now_ms, Adapter, Kind, Phase, SpineEvent, ToolStatus};
 
 /// Ring bounds, whichever comes first. 5 000 events is a long day's session;
 /// 4 MB is where keeping history stops being free.
@@ -61,6 +61,12 @@ const VERDICT_SETTLES_AFTER: Duration = Duration::from_secs(60);
 /// which asks every backend in turn — not a per-tick cost now that the tick
 /// is a second.
 const RESOLVE_SOURCES_EVERY: Duration = Duration::from_secs(5);
+
+/// How far back `Spine::overview` will walk one session's ring looking for
+/// its last line of prose and its last tool card. Both are normally within a
+/// few events of the end; this only bounds the session that has emitted
+/// nothing else for a very long time.
+const OVERVIEW_SCAN: usize = 400;
 
 /// How long a `GET …/spine` waits for a just-started tail to finish reading
 /// history. Answering the first call empty leaves the phone on a blank
@@ -220,6 +226,68 @@ impl Spine {
             .unwrap_or_default()
     }
 
+    /// Every session with a log, folded to one row each — see
+    /// [`super::ipc::spine_overview`], which is the only caller.
+    ///
+    /// The phase comes from `last_phase`, which the registry already keeps so
+    /// it can dedupe pushes; only the text and the tool card need looking for,
+    /// and the walk that finds them runs backwards and stops on the first of
+    /// each. `OVERVIEW_SCAN` bounds the pathological case — a session that
+    /// has said nothing but tool output for thousands of events.
+    pub fn overview(&self) -> Vec<super::ipc::SessionOverview> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions
+            .iter()
+            .map(|(id, log)| {
+                let (phase, detail) = match &log.last_phase {
+                    Some((p, d)) => (phase_word(*p).to_string(), d.clone()),
+                    None => ("idle".to_string(), String::new()),
+                };
+                let (turn_open, turn_started_ts) = match log.turn {
+                    Some((true, ts)) => (true, Some(ts)),
+                    _ => (false, None),
+                };
+                let mut last_text: Option<String> = None;
+                let mut last_tool: Option<super::ipc::OverviewTool> = None;
+                // Status updates land AFTER the call that they are about, so a
+                // backwards walk meets them first; hold them until the call
+                // itself turns up and carries the title.
+                let mut updates: HashMap<&str, ToolStatus> = HashMap::new();
+                for ev in log.events.iter().rev().take(OVERVIEW_SCAN) {
+                    match &ev.kind {
+                        Kind::AgentText { text, .. } if last_text.is_none() => {
+                            last_text = last_line(text);
+                        }
+                        Kind::ToolCallUpdate { id, status, .. } => {
+                            updates.entry(id.as_str()).or_insert(*status);
+                        }
+                        Kind::ToolCall { id, title, status, .. } if last_tool.is_none() => {
+                            let status = updates.get(id.as_str()).copied().unwrap_or(*status);
+                            last_tool = Some(super::ipc::OverviewTool {
+                                title: super::clip(title, 80),
+                                status: status_word(status).to_string(),
+                            });
+                        }
+                        _ => {}
+                    }
+                    if last_text.is_some() && last_tool.is_some() {
+                        break;
+                    }
+                }
+                super::ipc::SessionOverview {
+                    session_id: id.clone(),
+                    agent: log.agent.clone(),
+                    phase,
+                    detail,
+                    turn_open,
+                    turn_started_ts,
+                    last_text,
+                    last_tool,
+                }
+            })
+            .collect()
+    }
+
     /// Whether this session's adapter reads the engine's own source, as
     /// opposed to the legacy re-derivation (or nothing at all).
     pub fn is_live(&self, session_id: &str) -> bool {
@@ -370,6 +438,40 @@ fn phase_of(activity: &str) -> Phase {
         "attention" => Phase::NeedsYou,
         _ => Phase::Idle,
     }
+}
+
+/// A `Phase` as the wire spells it. The enum's own serde renaming would do
+/// this too, but only through a serializer — and `overview` needs the word
+/// itself, in a `String` field beside a detail that is already one.
+fn phase_word(p: Phase) -> &'static str {
+    match p {
+        Phase::Working => "working",
+        Phase::NeedsYou => "needs_you",
+        Phase::Idle => "idle",
+    }
+}
+
+/// A `ToolStatus` as the wire spells it, for the same reason.
+fn status_word(s: ToolStatus) -> &'static str {
+    match s {
+        ToolStatus::Pending => "pending",
+        ToolStatus::Running => "running",
+        ToolStatus::Completed => "completed",
+        ToolStatus::Failed => "failed",
+        ToolStatus::Cancelled => "cancelled",
+    }
+}
+
+/// The last non-blank line of a block, whitespace collapsed and clipped to a
+/// row's worth. `None` for a block that is all whitespace — a row would
+/// rather show nothing than an empty quotation.
+fn last_line(text: &str) -> Option<String> {
+    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
+    let flat: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    Some(super::clip(&flat, 120))
 }
 
 /// Roughly what one event costs to hold, for the byte bound. Exact JSON
