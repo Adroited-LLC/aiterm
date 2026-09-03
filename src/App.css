@@ -3898,6 +3898,39 @@ input[type="range"]::-webkit-slider-thumb {
 .home-engine-bar > span { display: block; height: 100%; border-radius: 4px; background: var(--brand, var(--accent)); }
 .home-engine-n { width: 32px; text-align: right; font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
 
+/* ---------- usage, on home ---------- */
+/* The same reading as the top bar's strip, given room: a bar each, the worst
+   number as a number, and the reset time where the service publishes one.
+   A grid, not five flex rows, so every column lines up down the block. */
+.home-usage { display: flex; flex-direction: column; gap: 8px; }
+.home-usage-rows { display: flex; flex-direction: column; gap: 8px; }
+/* Every row carries the same template rather than a subgrid, which is one
+   less thing to be true of the WebKit build this ships against. */
+.home-usage-row { display: grid; grid-template-columns: 150px 1fr 44px 108px; gap: 12px; align-items: center; }
+.home-usage-row.stale { opacity: 0.65; }
+.home-usage-name {
+  display: flex; align-items: center; gap: 7px; min-width: 0;
+  font-size: 13px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.home-usage-track {
+  height: 6px; border-radius: 3px; background: var(--bg-raised); overflow: hidden;
+  display: block; min-width: 0;
+}
+.home-usage-fill { display: block; height: 100%; border-radius: 3px; background: #4a9eff; }
+.home-usage-fill.sev-warning { background: #e0a34e; }
+.home-usage-fill.sev-severe, .home-usage-fill.sev-critical { background: #e05a4e; }
+.home-usage-n {
+  font-size: 13px; color: var(--text); text-align: right;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.home-usage-n.sev-warning { color: #e0a34e; }
+.home-usage-n.sev-critical, .home-usage-n.sev-severe { color: #e05a4e; }
+.home-usage-reset {
+  font-size: 12px; font-weight: 400; color: var(--text-faint); text-align: right;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 /* ---------- the fleet board ---------- */
 /* Three groups down one column, most urgent first, with the group heading
    carrying the count. The rows are the point: 15px titles, one line of what

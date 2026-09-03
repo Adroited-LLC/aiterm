@@ -18,6 +18,8 @@ import type { TabId } from "../ipc";
 import { Alert } from "./AlertBell";
 import Icon from "./Icon";
 import FleetBoard from "./FleetBoard";
+import HomeUsage from "./HomeUsage";
+import type { UsageSourceAt } from "./UsagePanel";
 import { useSpineOverview } from "../useSpineOverview";
 import {
   ChevronDown, CornerDownLeft, Folder, FolderOpen, SlidersHorizontal, TerminalSquare,
@@ -102,7 +104,7 @@ function FolderControl({
 
 export default function HomeDashboard({
   sessions, liveIds, attentionIds, busyIds, otherAlerts, onSelect, onResume, onGoTab,
-  onShowAll, controls, pickers, pickerSummary, ready, cwd, onPickCwd, onSetCwd,
+  onShowAll, controls, pickers, pickerSummary, usage, ready, cwd, onPickCwd, onSetCwd,
   onLaunch, onOpenTerminal,
 }: {
   sessions: Session[];
@@ -128,6 +130,8 @@ export default function HomeDashboard({
   pickers: ReactNode;
   /** Those two in one line, for the collapsed row. */
   pickerSummary: string;
+  /** The same reading the top bar's strip draws — passed, never fetched. */
+  usage: UsageSourceAt[];
   /** Whether there is anything to start; the box still takes typing. */
   ready: boolean;
   /** The folder the session opens in, or null when none is known yet. */
@@ -228,6 +232,8 @@ export default function HomeDashboard({
           </button>
         </div>
       </section>
+
+      <HomeUsage sources={usage} />
 
       <FleetBoard
         sessions={sessions}

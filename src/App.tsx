@@ -2915,6 +2915,7 @@ export default function App() {
                 controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} only="tabs" />}
                 pickers={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} only="selects" />}
                 pickerSummary={describePickers(emptyCtl)}
+                usage={usageSources}
                 ready={emptyCtl.ready}
                 cwd={homeCwd}
                 onPickCwd={pickHomeCwd}
