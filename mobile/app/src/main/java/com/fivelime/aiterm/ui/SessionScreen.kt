@@ -108,6 +108,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -207,22 +208,35 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     // it [observed 2026-09-03, intermittent, long sessions]. So for the
     // first second, any frame whose layout does not end at the last item's
     // end is corrected — unless a finger is on the list, which wins.
+    //
+    // And the list stays INVISIBLE until a real layout says it is at the
+    // end: the first frame is drawn before the jump lands, and a person
+    // saw the top of the transcript flash by on every open [John,
+    // 2026-09-03]. A few frames of plain ground instead, then the end.
+    var landed by remember(s.id) { mutableStateOf(false) }
     LaunchedEffect(s.id) {
         snapshotFlow { vm.items.size }.first { it > 0 }
         val start = withFrameNanos { it }
         var now = start
-        while (now - start < 1_200_000_000L) {
-            now = withFrameNanos { it }
-            if (list.isScrollInProgress) break
-            val info = list.layoutInfo
-            val total = info.totalItemsCount
-            if (total == 0) continue
-            val last = info.visibleItemsInfo.lastOrNull() ?: continue
-            val atEnd = last.index == total - 1 && last.offset + last.size <= info.viewportEndOffset + 1
-            if (atEnd) continue
-            val end = info.visibleItemsInfo.firstOrNull { it.index == total - 1 }
-            val viewport = info.viewportEndOffset - info.viewportStartOffset
-            list.scrollToItem(total - 1, ((end?.size ?: 0) - viewport).coerceAtLeast(0))
+        try {
+            while (now - start < 1_200_000_000L) {
+                now = withFrameNanos { it }
+                if (list.isScrollInProgress) break
+                // Whatever the layout is doing, half a second of blank is the
+                // most a person should wait to see their session.
+                if (now - start > 500_000_000L) landed = true
+                val info = list.layoutInfo
+                val total = info.totalItemsCount
+                if (total == 0) continue
+                val last = info.visibleItemsInfo.lastOrNull() ?: continue
+                val atEnd = last.index == total - 1 && last.offset + last.size <= info.viewportEndOffset + 1
+                if (atEnd) { landed = true; continue }
+                val end = info.visibleItemsInfo.firstOrNull { it.index == total - 1 }
+                val viewport = info.viewportEndOffset - info.viewportStartOffset
+                list.scrollToItem(total - 1, ((end?.size ?: 0) - viewport).coerceAtLeast(0))
+            }
+        } finally {
+            landed = true
         }
     }
 
@@ -369,7 +383,7 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 LazyColumn(
                     state = list,
-                    modifier = Modifier.fillMaxSize().drawWithContent {
+                    modifier = Modifier.fillMaxSize().graphicsLayer { alpha = if (landed) 1f else 0f }.drawWithContent {
                         drawContent()
                         val info = list.layoutInfo
                         val total = info.totalItemsCount
