@@ -333,6 +333,19 @@ pub fn ensure_tail_for(app: &AppHandle, session_id: &str) {
     });
 }
 
+/// An adapter's event onto the log. A phase goes through the same dedupe
+/// the verdict tick uses: grok's events.jsonl says idle at turn end and
+/// the tick says it again two seconds later, and the phone does not need
+/// to hear it twice. [observed: spine test grok, 2026-09-02]
+fn push_from_adapter(spine: &Spine, session_id: &str, agent: &str, ts: u64, kind: Kind) {
+    match kind {
+        Kind::Phase { phase, detail } => spine.push_phase_if_tailed(session_id, phase, &detail),
+        kind => {
+            spine.push(session_id, agent, ts, kind);
+        }
+    }
+}
+
 /// Bridge the terminal's activity verdict onto the spine.
 pub fn push_phase(app: &AppHandle, session_id: &str, activity: &str) {
     let phase = match activity {
@@ -561,7 +574,7 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
     let (mut adapter, history) = step(adapter, |a| a.bootstrap()).await;
     let count = history.len();
     for (ts, kind) in history {
-        spine.push(&session_id, &agent, ts, kind);
+        push_from_adapter(&spine, &session_id, &agent, ts, kind);
     }
     spine.set_flags(&session_id, None, Some(true));
     crate::diag!("spine", "tail up for {agent} {short}: {count} events from history");
@@ -601,7 +614,7 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
         for (ts, kind) in events {
             // A Reset from the adapter is pushed like anything else; the
             // ring drops what came before it and the phone re-fetches.
-            spine.push(&session_id, &agent, ts, kind);
+            push_from_adapter(&spine, &session_id, &agent, ts, kind);
         }
         // After the content, so a phase never claims a turn ended before
         // the text of it is in the log.
