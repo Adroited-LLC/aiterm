@@ -6,7 +6,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
 import { StartChoice } from "./components/NewSessionMenu";
-import StartControls, { useStartChoice } from "./components/StartControls";
+import StartControls, { describePickers, useStartChoice } from "./components/StartControls";
 import TerminalView, { TermHandle, TermProgress, TermTab } from "./components/TerminalView";
 import AlertBell, { Alert } from "./components/AlertBell";
 import FileExplorer from "./components/FileExplorer";
@@ -2337,6 +2337,21 @@ export default function App() {
     });
   }, []);
 
+  /** The quiet half of the home screen's action row: a shell in the working
+   *  folder, on the same slot id the sidebar's "new shell" uses, so the two
+   *  never open two terminals on one directory. */
+  const openHomeTerminal = useCallback(async () => {
+    let cwd = homeCwd;
+    if (!cwd) {
+      try {
+        const picked = await openDialog({ directory: true, title: "Open a terminal in…" });
+        if (typeof picked !== "string") return;
+        cwd = picked;
+      } catch { return; }
+    }
+    void openTab(basename(cwd), cwd, null, `shell:${cwd}`);
+  }, [homeCwd, openTab]);
+
   // --- splitter dragging ---
   const dragging = useRef<null | "left" | "right" | "rightsplit" | "agentsplit">(null);
   const rightColRef = useRef<HTMLDivElement>(null);
@@ -2897,11 +2912,15 @@ export default function App() {
                 onResume={(s) => { void resumeSession(s); }}
                 onGoTab={(key) => setActiveTab(key)}
                 onShowAll={showAllSessions}
-                controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} />}
+                controls={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} only="tabs" />}
+                pickers={<StartControls ctl={emptyCtl} onOpenModelAccess={openModelAccess} only="selects" />}
+                pickerSummary={describePickers(emptyCtl)}
                 ready={emptyCtl.ready}
                 cwd={homeCwd}
                 onPickCwd={pickHomeCwd}
+                onSetCwd={setHomeCwdPick}
                 onLaunch={launchFromHome}
+                onOpenTerminal={openHomeTerminal}
               />
             )}
             {previewSession && !fileOnScreen && (

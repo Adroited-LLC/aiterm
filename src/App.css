@@ -3739,10 +3739,13 @@ input[type="range"]::-webkit-slider-thumb {
   padding: 24px 32px 32px;
   display: flex; flex-direction: column;
 }
+/* One column, wide enough that a prompt box, a segmented control of five
+   engines and a session title with its project all have room on one line —
+   and no wider, because a 1920px-wide row of text is not readable. */
 .home-inner {
-  margin: auto;
-  width: 100%; max-width: 640px;
-  display: flex; flex-direction: column; gap: 12px;
+  margin: 0 auto;
+  width: 100%; max-width: 760px;
+  display: flex; flex-direction: column; gap: 24px;
 }
 .home-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
 .home-greeting h1 { font-size: 30px; font-weight: 700; margin: 0 0 4px; letter-spacing: -0.02em; color: var(--text); }
@@ -3766,11 +3769,52 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* The start controls at their ordinary size — the page is a launcher, not
    a billboard. These outrank the `.empty-start-controls` size-ups. */
-.home-start { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px 12px; }
-.home-start .empty-start-controls { width: 100%; gap: 8px; }
-.home-start .empty-start-controls .ns-agent-tab { font-size: 12px; padding: 6px 8px; gap: 6px; }
-.home-start .empty-start-controls .ns-agent-tab .agent-icon { font-size: 15px; }
-.home-start .empty-start-controls .ns-select { font-size: 12.5px; padding: 5px 24px 5px 8px; }
+/* Where → which engine → which model → what to do → go. The prompt is the
+   dominant element; everything above it is one line each. */
+.home-start { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
+/* The ＋ menu's block rules itself off from what follows; here the card's
+   own spacing does that job. */
+.home-engines .ns-agents { gap: 0; border-bottom: none; padding-bottom: 0; margin-bottom: 0; }
+.home-engines .ns-agent-tabs { width: 100%; }
+.home-engines .ns-agent-tab { flex: 1; justify-content: center; font-size: 12.5px; padding: 7px 8px; gap: 6px; }
+.home-engines .ns-agent-tab .agent-icon { font-size: 15px; }
+.home-engines .empty-note { margin-top: 8px; }
+
+/* A row that reads as a value you can change: lead icon, the value, a caret. */
+.home-field {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); font: inherit; font-size: 13px;
+  padding: 8px 10px; cursor: pointer; text-align: left;
+}
+.home-field:hover { border-color: var(--text-faint); background: var(--bg-hover); }
+.home-field:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.home-field-lead { flex: none; color: var(--text-dim); }
+.home-field-value { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.home-field-caret { flex: none; color: var(--text-faint); transition: transform 120ms ease; }
+.home-field-caret.up { transform: rotate(180deg); }
+
+.home-folder { position: relative; }
+.home-menu {
+  position: absolute; z-index: 30; left: 0; right: 0; top: calc(100% + 4px);
+  background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px #0008; padding: 4px; max-height: 320px; overflow-y: auto;
+}
+.home-menu-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0;
+  background: none; border: none; border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 12.5px;
+  padding: 6px 8px; cursor: pointer; text-align: left;
+}
+.home-menu-item span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.home-menu-item:hover { background: var(--bg-hover); }
+.home-menu-item.on { color: var(--accent); }
+.home-menu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.home-menu-rule { height: 1px; background: var(--border); margin: 4px 2px; }
+
+.home-pickers { display: flex; gap: 8px; }
+.home-pickers .ns-selects { display: flex; gap: 8px; width: 100%; align-items: center; }
+.home-pickers .ns-select { flex: 1; min-width: 0; font-size: 13px; padding: 7px 26px 7px 10px; }
 
 /* The prompt box: type, glance up at the pickers, Enter. */
 .home-prompt {
@@ -3782,20 +3826,22 @@ input[type="range"]::-webkit-slider-thumb {
 .home-prompt-input {
   width: 100%; box-sizing: border-box; resize: none;
   background: transparent; border: none; outline: none;
-  color: var(--text); font: inherit; font-size: 13.5px; line-height: 1.45;
-  padding: 10px 12px 6px;
+  color: var(--text); font: inherit; font-size: 14px; line-height: 1.5;
+  padding: 12px; min-height: 96px;
 }
 .home-prompt-input::placeholder { color: var(--text-faint); }
-.home-prompt-foot { display: flex; align-items: center; gap: 8px; padding: 4px 6px 6px 8px; }
-.home-cwd {
-  display: inline-flex; align-items: center; gap: 5px; min-width: 0;
-  background: none; border: 1px solid transparent; border-radius: 5px;
-  color: var(--text-dim); font-size: 11.5px; padding: 3px 7px; cursor: pointer;
-}
-.home-cwd span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.home-cwd:hover { color: var(--text); border-color: var(--border); background: var(--bg-hover); }
-.home-go { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 5px 11px; }
+
+.home-actions { display: flex; align-items: center; gap: 12px; }
+.home-go { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 8px 16px; }
 .home-go:disabled { opacity: 0.5; cursor: default; }
+/* Secondary, and quiet about it: no border, no fill, until you go near it. */
+.home-quiet {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: none; border: 1px solid transparent; border-radius: 7px;
+  color: var(--text-dim); font: inherit; font-size: 13px; padding: 8px 12px; cursor: pointer;
+}
+.home-quiet:hover { color: var(--text); background: var(--bg-hover); }
+.home-quiet:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 
 .home-list { display: flex; flex-direction: column; }
