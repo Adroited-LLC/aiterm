@@ -13,15 +13,19 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -62,6 +66,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -620,6 +625,7 @@ private fun RemoteConversationContent(
     val timeline = remember(messages) { conversationTimeline(messages) }
     val listState = rememberLazyListState()
     val working = state.sessionActivity[session.id] == "output"
+    val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
     var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
     val awayFromNewest by remember(session.id) {
         derivedStateOf {
@@ -653,6 +659,12 @@ private fun RemoteConversationContent(
         } else {
             val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
             if (lastVisible >= itemCount - 3) listState.animateScrollToItem(itemCount - 1)
+        }
+    }
+    LaunchedEffect(imeBottom) {
+        if (imeBottom > 0) {
+            val newest = timeline.size + if (working) 1 else 0
+            if (newest > 0) listState.scrollToItem(newest - 1)
         }
     }
 
@@ -738,7 +750,6 @@ private fun RemoteConversationContent(
     }
 
     Scaffold(
-        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
                 navigationIcon = {
@@ -779,6 +790,7 @@ private fun RemoteConversationContent(
         bottomBar = {
             Column(
                 Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)
+                    .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                     .padding(horizontal = 10.dp, vertical = 8.dp),
             ) {
                 sendError?.let {
