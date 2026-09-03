@@ -52,6 +52,9 @@ pub fn run() {
     trace::init();
     let pty = pty::PtyManager::default();
     let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
+    // The spine's epoch is set the moment this is built: a phone that sees a
+    // new one knows the desktop restarted and its seq numbers started over.
+    let spine = std::sync::Arc::new(spine::Spine::new());
     let application_services = services::ApplicationServices::default();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -59,6 +62,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty)
         .manage(tabs.clone())
+        .manage(spine)
         .manage(application_services)
         .manage(changes::ChangeLedger::default())
         .manage(watcher::WatchState::default())

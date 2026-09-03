@@ -11,6 +11,9 @@ use std::path::PathBuf;
 pub mod claude;
 pub mod grok;
 pub mod legacy;
+pub mod registry;
+
+pub use registry::{ensure_tail_for, push_phase, read_after, resolve_agent, Spine};
 
 /// What kind of thing a tool call is, so a card can wear the right mark
 /// without knowing the engine's tool names.

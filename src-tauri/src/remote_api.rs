@@ -193,6 +193,11 @@ pub enum Event {
     /// The desktop's roads changed — hosts, a relay route enrolled or
     /// cleared. The phone re-reads `/v1/status`.
     StatusChanged,
+    /// One spine event, flattened: `{"type":"spine","seq":…,"kind":"agent_text",…}`.
+    /// Never sent through `notify` — it rides its own broadcast channel
+    /// (`spine::Spine::subscribe`) so that bootstrapping a long session
+    /// cannot lag a phone out of the coarse events above.
+    Spine(crate::spine::SpineEvent),
     Ping,
 }
 
@@ -1242,6 +1247,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/dirs", post(make_dir))
         .route("/v1/sessions/{id}", get(detail))
         .route("/v1/sessions/{id}/conversation", get(conversation))
+        .route("/v1/sessions/{id}/spine", get(spine))
         .route("/v1/sessions/{id}/open", post(open))
         .route("/v1/sessions/{id}/input", post(input))
         .route("/v1/sessions/{id}/rename", post(rename))
@@ -2517,6 +2523,24 @@ async fn conversation(Path(id): Path<String>, Query(q): Query<ConversationQuery>
     Json(turns).into_response()
 }
 
+#[derive(Deserialize)]
+struct SpineQuery {
+    after: Option<u64>,
+}
+
+/// The spine's replay: everything after `after` for one session. Asking
+/// registers interest, which is what starts (or keeps) the adapter tail —
+/// see `docs/spine.md`. `live` false means the session is served by the
+/// legacy adapter and the events are re-derived, not read from the engine.
+async fn spine(State(ctx): State<Ctx>, Path(id): Path<String>, Query(q): Query<SpineQuery>) -> Response {
+    match crate::spine::read_after(&ctx.app, &id, q.after.unwrap_or(0)).await {
+        Some((epoch, live, events)) => {
+            Json(serde_json::json!({ "epoch": epoch, "live": live, "events": events })).into_response()
+        }
+        None => err(StatusCode::NOT_FOUND, "no such session"),
+    }
+}
+
 /// Open (resume) a session in a desktop tab. The renderer owns tabs, so this
 /// is a request to it, answered by `sessions.open` growing on the next list.
 async fn open(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
@@ -2719,6 +2743,7 @@ async fn events(
 ) -> Response {
     let state = ctx.app.state::<RemoteState>();
     let rx = state.events.subscribe();
+    let spine_rx = ctx.app.state::<std::sync::Arc<crate::spine::Spine>>().subscribe();
     let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_string();
     let info = ClientInfo {
         id: state.next_client.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -2734,18 +2759,41 @@ async fn events(
         crate::diag!("remote", "phone connected: {} ({}) from {}", info.device, info.os, info.address);
         app.state::<RemoteState>().clients.lock().unwrap().insert(id, info);
         let _ = app.emit("remote://clients", ());
-        stream_events(socket, rx).await;
+        stream_events(socket, rx, spine_rx).await;
         app.state::<RemoteState>().clients.lock().unwrap().remove(&id);
         let _ = app.emit("remote://clients", ());
         crate::diag!("remote", "phone disconnected");
     })
 }
 
-async fn stream_events(mut socket: WebSocket, mut rx: broadcast::Receiver<Event>) {
+async fn stream_events(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<Event>,
+    mut spine_rx: broadcast::Receiver<crate::spine::SpineEvent>,
+) {
     let mut ping = tokio::time::interval(Duration::from_secs(20));
     ping.tick().await; // the first tick is immediate; skip it
+    // Cleared if the spine's channel ever closes, so a closed receiver
+    // cannot spin this loop. It lives as long as the app, so this is
+    // belt-and-braces.
+    let mut spine_open = true;
     loop {
         tokio::select! {
+            ev = spine_rx.recv(), if spine_open => {
+                let ev = match ev {
+                    Ok(ev) => Event::Spine(ev),
+                    // A phone that missed spine events heals itself: the seq
+                    // gap sends it back to GET …/spine?after=lastSeq. Making
+                    // this a SessionsChanged would have it re-read the whole
+                    // world instead, for nothing.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => { spine_open = false; continue }
+                };
+                let Ok(text) = serde_json::to_string(&ev) else { continue };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
             ev = rx.recv() => {
                 let ev = match ev {
                     Ok(ev) => ev,
@@ -2790,6 +2838,39 @@ mod tests {
         assert!(!transcript_outranks("working", "working"));
         assert!(!transcript_outranks("working", "idle"));
         assert!(!transcript_outranks("attention", "working"));
+    }
+
+    /// The phone reads `type` to route the frame and `kind` to render it,
+    /// both at the top level of one flat object. `Event` is internally
+    /// tagged and `SpineEvent` carries its own `kind` tag through a
+    /// `#[serde(flatten)]`, so this is the one place the two taggings meet.
+    #[test]
+    fn a_spine_frame_carries_both_tags_at_the_top_level() {
+        let ev = Event::Spine(crate::spine::SpineEvent {
+            seq: 42,
+            epoch: 1788390000123,
+            session_id: "abc".into(),
+            agent: "claude".into(),
+            ts: 1788390012345,
+            kind: crate::spine::Kind::AgentText {
+                id: "m1:0".into(),
+                text: "on it".into(),
+                done: false,
+            },
+        });
+        let json: serde_json::Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(json["type"], "spine");
+        assert_eq!(json["kind"], "agent_text");
+        assert_eq!(json["seq"], 42);
+        assert_eq!(json["epoch"], 1788390000123u64);
+        assert_eq!(json["session_id"], "abc");
+        assert_eq!(json["agent"], "claude");
+        assert_eq!(json["ts"], 1788390012345u64);
+        assert_eq!(json["id"], "m1:0");
+        assert_eq!(json["text"], "on it");
+        assert_eq!(json["done"], false);
+        // Nothing nested: the phone parses one flat object.
+        assert!(json.as_object().unwrap().values().all(|v| !v.is_object()));
     }
 
     #[test]

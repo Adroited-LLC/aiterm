@@ -2136,6 +2136,12 @@ pub fn start_desktop_registry_bridge(
                             TabRegistryEvent::Removed { .. } => Vec::new(),
                         };
                         for session_id in sessions {
+                            // A bound tab is standing interest in a session:
+                            // the spine tails it whether or not a phone has
+                            // asked, so the history is already there when one
+                            // does. Snapshot events cover tabs that were
+                            // already bound when this bridge started.
+                            crate::spine::ensure_tail_for(&app, &session_id);
                             crate::changes::track(&app, session_id);
                         }
                         let unexpected_exits = unexpected_desktop_exits(&change);
@@ -2149,6 +2155,11 @@ pub fn start_desktop_registry_bridge(
                 }
                 while let Ok(session_id) = activity.try_recv() {
                     crate::changes::touch(&app, &session_id);
+                    // The same verdict onto the spine, so a consumer has one
+                    // stream instead of two. Only for sessions already being
+                    // tailed, and only when the phase actually changed — this
+                    // fires four times a second while output flows.
+                    crate::spine::push_phase(&app, &session_id, "output");
                     // A phone shows "working" off terminal cadence the moment
                     // bytes flow; the transcript upgrades or overrides this on
                     // the next sessions poll.
