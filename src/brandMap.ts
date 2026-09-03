@@ -252,7 +252,7 @@ export function brandForUrl(url: string | null | undefined): string | null {
  *  mark, the CLIs their own, and an API provider whatever its name resolves to. */
 export function brandForUsageSource(id: string, name: string): string | null {
   if (id === "anthropic") return "claude";
-  if (id === "codex") return "openai";
+  if (id === "codex") return "codex";
   if (id === "grok") return "grok";
   if (id === "antigravity") return "gemini";
   if (id.startsWith("provider:")) return brandForName(name) ?? brandForName(id.slice(9));

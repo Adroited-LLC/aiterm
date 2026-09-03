@@ -2863,11 +2863,11 @@ mod tests {
         }
     }
 
-    /// OpenCode keys its catalog by its own provider ids, so it takes
-    /// OpenRouter and nothing else; the harness takes everything, which is what
-    /// makes it a usable last resort.
+    /// OpenCode always takes OpenRouter and may take endpoints declared in the
+    /// user's OpenCode config. An unrelated endpoint still reaches the chat
+    /// harness, which is the all-accepting last resort.
     #[test]
-    fn only_the_harness_accepts_a_provider_that_is_not_openrouter() {
+    fn an_undeclared_provider_is_left_for_the_chat_harness() {
         let openrouter = crate::providers::Provider {
             id: "openrouter".into(),
             name: "OpenRouter".into(),
@@ -2878,13 +2878,15 @@ mod tests {
             policy: Default::default(),
             routes: Default::default(),
         };
-        let local = crate::providers::Provider {
-            base_url: "http://localhost:8080/v1".into(),
+        let undeclared = crate::providers::Provider {
+            id: "unit-test-undeclared".into(),
+            name: "Unit test undeclared provider".into(),
+            base_url: "https://unit-test-undeclared.invalid/v1".into(),
             ..openrouter.clone()
         };
         assert!(OpenCodeBackend.accepts_api(&openrouter));
-        assert!(!OpenCodeBackend.accepts_api(&local));
-        assert!(ChatBackend.accepts_api(&openrouter) && ChatBackend.accepts_api(&local));
+        assert!(!OpenCodeBackend.accepts_api(&undeclared));
+        assert!(ChatBackend.accepts_api(&openrouter) && ChatBackend.accepts_api(&undeclared));
         assert!(!ClaudeBackend.accepts_api(&openrouter));
         assert!(!CodexBackend.accepts_api(&openrouter));
     }
