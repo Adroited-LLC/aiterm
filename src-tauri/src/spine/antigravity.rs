@@ -98,6 +98,8 @@ pub struct AntigravityAdapter {
     turn: Option<String>,
     /// Whether the last thing we said on the phase channel was `NeedsYou`.
     asking: bool,
+    /// The agy store, for the db that holds what the transcript cut.
+    root: PathBuf,
 }
 
 /// A tool call with its output still to come.
@@ -132,6 +134,7 @@ pub fn open(session_id: &str) -> Option<AntigravityAdapter> {
         orphans: BTreeMap::new(),
         turn: None,
         asking: false,
+        root,
     })
 }
 
@@ -295,7 +298,10 @@ impl AntigravityAdapter {
                 },
             ));
         }
-        let content = v.get("content").and_then(|c| c.as_str()).unwrap_or_default().trim();
+        // A long answer is logged with its middle cut out; the db has it whole.
+        let logged = v.get("content").and_then(|c| c.as_str()).unwrap_or_default().trim();
+        let content = crate::antigravity::recover_truncated(&self.root, &self.id, index, logged);
+        let content = content.trim();
         if !content.is_empty() {
             out.push((
                 ts,
@@ -685,6 +691,7 @@ mod tests {
             orphans: BTreeMap::new(),
             turn: None,
             asking: false,
+            root: PathBuf::from("/nonexistent"),
         }
     }
 

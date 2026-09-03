@@ -227,6 +227,13 @@ fn write_tool_of(name: &str) -> Option<&'static str> {
 /// resume adds) are skipped, matching what grok's view does with tool output.
 /// [observed: agy 1.1.24]
 pub fn parse_messages(text: &str) -> Vec<(String, String)> {
+    parse_messages_with(text, &|_, content| content.to_string())
+}
+
+/// [`parse_messages`] with a hand that can put back what agy cut: `recover`
+/// gets each `PLANNER_RESPONSE`'s `step_index` and its `content` as logged,
+/// and returns the content to show. See [`recover_truncated`].
+pub fn parse_messages_with(text: &str, recover: &dyn Fn(u64, &str) -> String) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| {
             let v: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -240,7 +247,10 @@ pub fn parse_messages(text: &str) -> Vec<(String, String)> {
                     (!body.is_empty()).then(|| ("user".to_string(), body.to_string()))
                 }
                 "PLANNER_RESPONSE" => {
-                    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
+                    let logged = v.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
+                    let index = v.get("step_index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    let content = if logged.is_empty() { String::new() } else { recover(index, logged) };
+                    let content = content.trim();
                     if !content.is_empty() {
                         return Some(("assistant".to_string(), content.to_string()));
                     }
@@ -284,6 +294,72 @@ pub fn first_run_command_cwd(text: &str) -> Option<String> {
                     .filter(|c| c.starts_with('/'))
             })
         })
+}
+
+/// agy logs a step's `content` in `transcript.jsonl` capped near 4 KiB: the
+/// head and the tail are kept and the middle is replaced by a line reading
+/// `<truncated N bytes>`, with `"truncated_fields":["content"]` on the
+/// record. The whole text still sits in `conversations/<id>.db`, table
+/// `steps`, column `step_payload`, row `idx` = `step_index`, as one protobuf
+/// blob — and a protobuf string is its bytes, contiguous. So the middle is
+/// the N bytes between the logged head and the logged tail in that blob.
+/// [observed: agy 1.1.25, 2026-09-03 — a 5.7 KB answer logged as 4116 chars]
+const TRUNCATED_MARK: &str = "<truncated ";
+
+/// `content` with its `<truncated N bytes>` gap filled from `payload`, or
+/// `None` when there is no gap, the head or tail cannot be found in the
+/// blob, or the bytes between them are not the N the marker promised.
+pub fn splice_truncated(content: &str, payload: &[u8]) -> Option<String> {
+    let at = content.find(TRUNCATED_MARK)?;
+    let rest = &content[at + TRUNCATED_MARK.len()..];
+    let close = rest.find(" bytes>")?;
+    let n: usize = rest[..close].parse().ok()?;
+    let mark_end = at + TRUNCATED_MARK.len() + close + " bytes>".len();
+    // agy puts the marker on a line of its own; those two newlines are the
+    // marker's, not the text's.
+    let head = content[..at].strip_suffix('\n').unwrap_or(&content[..at]);
+    let tail = content[mark_end..].strip_prefix('\n').unwrap_or(&content[mark_end..]);
+    if head.is_empty() && tail.is_empty() {
+        return None;
+    }
+    let h = find_bytes(payload, head.as_bytes(), 0)?;
+    let middle_start = h + head.len();
+    let t = find_bytes(payload, tail.as_bytes(), middle_start)?;
+    if t - middle_start != n {
+        return None;
+    }
+    let middle = std::str::from_utf8(&payload[middle_start..t]).ok()?;
+    Some(format!("{head}{middle}{tail}"))
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from);
+    }
+    hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
+}
+
+/// [`splice_truncated`] against the conversation's own db: the content as
+/// agy wrote it when the marker is there and the db row has the whole, the
+/// logged content untouched otherwise. Read-only; a missing or locked db is
+/// the untouched case, never an error.
+pub(crate) fn recover_truncated(root: &Path, id: &str, step_index: u64, content: &str) -> String {
+    if !content.contains(TRUNCATED_MARK) {
+        return content.to_string();
+    }
+    let db = root.join("conversations").join(format!("{id}.db"));
+    let recovered = (|| -> Option<String> {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .ok()?;
+        let payload: Vec<u8> = conn
+            .query_row("SELECT step_payload FROM steps WHERE idx = ?1", [step_index as i64], |r| r.get(0))
+            .ok()?;
+        splice_truncated(content, &payload)
+    })();
+    recovered.unwrap_or_else(|| content.to_string())
 }
 
 /// Every `file://` URI in a blob of bytes, in order, without parsing the
@@ -581,7 +657,8 @@ impl SessionProvider for AntigravitySessions {
     /// default reader would make nothing of it.
     fn messages(&self, session_id: &str) -> Option<Vec<(String, String)>> {
         let text = std::fs::read_to_string(transcript_of(session_id)?).ok()?;
-        Some(parse_messages(&text))
+        let root = store_root()?;
+        Some(parse_messages_with(&text, &|index, content| recover_truncated(&root, session_id, index, content)))
     }
 
     fn detail(&self, session_id: &str) -> Option<crate::detail::SessionDetail> {
@@ -789,6 +866,36 @@ impl AgentBackend for AntigravityBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_truncated_answer_is_made_whole_from_its_blob() {
+        let full = "Spider monkeys keep mental maps of hundreds of individual canopy trees across their range, and bark at predators (jaguars, humans) or rival males.";
+        let head = "Spider monkeys keep mental maps of hundreds of ";
+        let tail = "ors (jaguars, humans) or rival males.";
+        let cut = full.len() - head.len() - tail.len();
+        let logged = format!("{head}\n<truncated {cut} bytes>\n{tail}");
+        // Protobuf around the string: any bytes, the string contiguous.
+        let mut payload = vec![0x0a, 0x91, 0x01];
+        payload.extend_from_slice(full.as_bytes());
+        payload.extend_from_slice(&[0x12, 0x02, 0x08, 0x01]);
+        assert_eq!(splice_truncated(&logged, &payload).as_deref(), Some(full));
+        // The marker promises a size; a blob whose gap is another size is
+        // not this step, and the logged text stands.
+        let wrong = format!("{head}\n<truncated {} bytes>\n{tail}", cut + 1);
+        assert_eq!(splice_truncated(&wrong, &payload), None);
+        // No marker, nothing to do.
+        assert_eq!(splice_truncated(full, &payload), None);
+        // parse_messages_with hands the step to the recoverer.
+        let line = format!(
+            "{{\"step_index\":3,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"content\":{},\"truncated_fields\":[\"content\"]}}",
+            serde_json::to_string(&logged).unwrap()
+        );
+        let msgs = parse_messages_with(&line, &|index, c| {
+            assert_eq!(index, 3);
+            splice_truncated(c, &payload).unwrap_or_else(|| c.to_string())
+        });
+        assert_eq!(msgs, vec![("assistant".to_string(), full.to_string())]);
+    }
 
     // Every record below is verbatim from the real store, agy 1.1.24,
     // 2026-09-02 (tool outputs shortened, nothing reshaped).
