@@ -3,6 +3,7 @@ package com.fivelime.aiterm.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
@@ -72,6 +73,23 @@ fun MarkdownText(text: String, color: Color = MaterialTheme.colorScheme.onSurfac
                 }
                 is Block.Rule -> HorizontalDivider(color = Muted.copy(alpha = 0.3f))
                 is Block.Table -> MarkdownTable(b, color)
+                is Block.ListBlock -> Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    b.items.forEach { it ->
+                        // A hanging indent: the marker in its own column, the
+                        // text beside it, wrapped lines staying under the text
+                        // — an item three levels deep still reads as one.
+                        Row(Modifier.padding(start = (it.level * 16).dp)) {
+                            Text(
+                                it.marker, color = color, style = MaterialTheme.typography.bodyMedium, lineHeight = 20.sp,
+                                modifier = Modifier.width(if (it.marker.length > 1) 24.dp else 16.dp),
+                            )
+                            Text(
+                                inline(it.text), color = color, style = MaterialTheme.typography.bodyMedium, lineHeight = 20.sp,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
                 is Block.Para -> Text(
                     inline(b.text), color = color, style = MaterialTheme.typography.bodyMedium,
                     fontWeight = if (b.heading > 0) FontWeight.SemiBold else null,
@@ -85,8 +103,7 @@ fun MarkdownText(text: String, color: Color = MaterialTheme.colorScheme.onSurfac
                         1 -> 27.sp
                         2 -> 25.sp
                         3 -> 22.sp
-                        // List items sit a touch tighter than prose lines.
-                        else -> if (b.list) 20.sp else 21.sp
+                        else -> 21.sp
                     },
                 )
             }
@@ -105,17 +122,27 @@ private fun gapBefore(prev: Block?, cur: Block): Dp {
     if (cur is Block.Code || prev is Block.Code || cur is Block.Table || prev is Block.Table) return 10.dp
     // A list right after the line that introduces it ("…they serve as
     // canopy engineers:") hangs closer than a fresh paragraph would.
-    if (cur is Block.Para && cur.list && prev is Block.Para && !prev.list && prev.text.trimEnd().endsWith(":")) return 6.dp
+    if (cur is Block.ListBlock && prev is Block.Para && prev.text.trimEnd().endsWith(":")) return 6.dp
     return 10.dp
 }
 
 private sealed class Block {
-    data class Para(val text: String, val heading: Int = 0, val list: Boolean = false) : Block()
+    data class Para(val text: String, val heading: Int = 0) : Block()
+    data class ListBlock(val items: List<ListItem>) : Block()
     data class Quote(val text: String) : Block()
     data class Code(val text: String) : Block()
     data class Table(val header: List<String>, val rows: List<List<String>>, val align: List<TextAlign>) : Block()
     data object Rule : Block()
 }
+
+private data class ListItem(val level: Int, val marker: String, val text: String)
+
+private val BULLET = Regex("^(\\s*)[-*+•]\\s+(.*)")
+private val NUMBERED = Regex("^(\\s*)(\\d+)[.)]\\s+(.*)")
+
+/** Nesting from leading whitespace. Agents indent by two or by four; either
+ *  way one step is one level, and a tab is four. */
+private fun level(ws: String): Int = (ws.replace("\t", "    ").length + 3) / 4
 
 private val TABLE_SEP = Regex("^\\|?\\s*:?-+:?\\s*(\\|\\s*:?-+:?\\s*)*\\|?$")
 
@@ -144,12 +171,14 @@ private fun cells(line: String): List<String> {
 private fun splitBlocks(text: String): List<Block> {
     val out = mutableListOf<Block>()
     val para = StringBuilder()
-    var paraIsList = true
     var code: StringBuilder? = null
     var table: MutableList<String>? = null
+    val list = mutableListOf<ListItem>()
+    fun flushList() { if (list.isNotEmpty()) out += Block.ListBlock(list.toList()); list.clear() }
     fun flush() {
-        if (para.isNotBlank()) out += Block.Para(para.toString().trimEnd(), list = paraIsList)
-        para.clear(); paraIsList = true
+        flushList()
+        if (para.isNotBlank()) out += Block.Para(para.toString().trimEnd())
+        para.clear()
     }
     fun flushTable() {
         val t = table ?: return
@@ -190,22 +219,34 @@ private fun splitBlocks(text: String): List<Block> {
             h != null -> { flush(); out += Block.Para(h.groupValues[2], heading = h.groupValues[1].length) }
             Regex("^\\s*([-*_])\\s*\\1\\s*\\1[-*_\\s]*$").matches(line) -> { flush(); out += Block.Rule }
             line.startsWith("> ") || line == ">" -> { flush(); out += Block.Quote(line.removePrefix(">").trimStart()) }
-            line.isBlank() -> flush()
+            // A blank line inside a list is the list's own air, not its end:
+            // the next item continues it. Anything else ends it.
+            line.isBlank() -> if (list.isEmpty()) flush() else if (para.isNotEmpty()) flush()
             else -> {
-                val bullet = Regex("^(\\s*)[-*+]\\s+(.*)").find(line)
-                val num = Regex("^(\\s*)(\\d+)[.)]\\s+(.*)").find(line)
-                val shown = when {
-                    bullet != null -> indent(bullet.groupValues[1]) + "• " + bullet.groupValues[2]
-                    num != null -> indent(num.groupValues[1]) + num.groupValues[2] + ". " + num.groupValues[3]
-                    else -> line
+                val bullet = BULLET.find(line)
+                val num = NUMBERED.find(line)
+                when {
+                    bullet != null -> {
+                        if (para.isNotEmpty()) flush()
+                        val lv = level(bullet.groupValues[1])
+                        list += ListItem(lv, if (lv == 0) "•" else if (lv == 1) "◦" else "▪", bullet.groupValues[2])
+                    }
+                    num != null -> {
+                        if (para.isNotEmpty()) flush()
+                        list += ListItem(level(num.groupValues[1]), num.groupValues[2] + ".", num.groupValues[3])
+                    }
+                    // An indented line under an item is the item, wrapped by
+                    // hand; it joins the item rather than starting a paragraph.
+                    list.isNotEmpty() && raw.startsWith(" ") && para.isEmpty() -> {
+                        val last = list.removeAt(list.size - 1)
+                        list += last.copy(text = last.text + " " + line.trim())
+                    }
+                    else -> {
+                        flushList()
+                        if (para.isNotEmpty()) para.append('\n')
+                        para.append(line)
+                    }
                 }
-                // A list and the prose around it are different blocks: the
-                // list's items sit tight, the prose gets paragraph air.
-                val isItem = bullet != null || num != null
-                if (para.isNotEmpty() && isItem != paraIsList) flush()
-                if (para.isNotEmpty()) para.append('\n')
-                para.append(shown)
-                paraIsList = isItem
             }
         }
     }
@@ -214,9 +255,6 @@ private fun splitBlocks(text: String): List<Block> {
     flush()
     return out
 }
-
-/** A nested item's indent, widened so the level reads on a phone. */
-private fun indent(ws: String): String = "    ".repeat(ws.length / 2)
 
 private val CELL_MAX = 220.dp
 private val CELL_MIN = 56.dp
