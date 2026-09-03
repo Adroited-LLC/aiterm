@@ -276,8 +276,39 @@ private fun MarkdownTable(t: Block.Table, color: Color) {
     }
 }
 
+/** The inline HTML markdown allows and agents actually write — `<br>` in a
+ *  table cell above all (114 of them in one Ads comparison, 2026-09-03),
+ *  plus bold, italic, code and strike tags — turned into the markdown
+ *  marks the renderer already knows; the common entities decoded. Anything
+ *  else in angle brackets is left as written: `<USER_REQUEST>`, `List<T>`
+ *  and a stray `<truncated …>` are text, not markup. */
+private val HTML_BR = Regex("<br\\s*/?>", RegexOption.IGNORE_CASE)
+private val HTML_MARK = Regex("</?(b|strong|i|em|code|s|del|strike|u|sub|sup)>", RegexOption.IGNORE_CASE)
+private val ENTITY = Regex("&(amp|lt|gt|quot|apos|nbsp|#39|#x27);")
+fun htmlToMarkdown(s: String): String {
+    if ('<' !in s && '&' !in s) return s
+    return s.replace(HTML_BR, "\n")
+        .replace(HTML_MARK) { m ->
+            when (m.groupValues[1].lowercase()) {
+                "b", "strong" -> "**"
+                "i", "em" -> "*"
+                "code" -> "`"
+                "s", "del", "strike" -> "~~"
+                else -> "" // u, sub, sup: no mark here; the words stay
+            }
+        }
+        .replace(ENTITY) { m ->
+            when (m.groupValues[1]) {
+                "amp" -> "&"; "lt" -> "<"; "gt" -> ">"; "quot" -> "\""
+                "apos", "#39", "#x27" -> "'"; "nbsp" -> "\u00A0"
+                else -> m.value
+            }
+        }
+}
+
 /** Inline spans: `code`, ***both***, **bold**, __bold__, *italic*, _italic_,
- *  ~~gone~~, and [links](https://…) that open in the browser. */
+ *  ~~gone~~, and [links](https://…) that open in the browser. HTML that
+ *  markdown allows inline is folded in first, see [htmlToMarkdown]. */
 private val INLINE = Regex(
     "(`[^`]+`)" +
         "|(\\*\\*\\*[^*]+\\*\\*\\*)" +
@@ -292,7 +323,7 @@ private val INLINE = Regex(
 
 /** The text with its markdown marks taken off — for a one-line fold where
  *  `**Checking the request**` should read as its words. */
-fun markdownPlain(s: String): String = s
+fun markdownPlain(s: String): String = htmlToMarkdown(s)
     .replace(Regex("(?m)^#{1,6}\\s+"), "")
     .replace(Regex("(?m)^\\s*[-*+]\\s+"), "• ")
     .replace(Regex("\\*{1,3}([^*]+)\\*{1,3}"), "$1")
@@ -301,7 +332,8 @@ fun markdownPlain(s: String): String = s
     .replace(Regex("~~([^~]+)~~"), "$1")
     .trim()
 
-private fun inline(s: String): AnnotatedString = buildAnnotatedString {
+private fun inline(raw: String): AnnotatedString = buildAnnotatedString {
+    val s = htmlToMarkdown(raw)
     var i = 0
     for (m in INLINE.findAll(s)) {
         if (m.range.first < i) continue
