@@ -162,81 +162,61 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
 
     val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
 
-    // New content lands at the bottom, where the eye is. The made strip and
-    // the working row are extra items past the last message. The FIRST fill
-    // jumps straight to the end — animating from the top replays the whole
-    // transcript and looks glitchy on a long session. After that, follow
-    // with a short animation, but only when already reading the end:
-    // someone scrolled up into history stays where they are.
+    // The list is PINNED to its end, the way a chat is: whatever moves the
+    // end out of view — the first fill landing a frame before the layout,
+    // a block growing as it streams, a thumbnail or a table taking its
+    // height a frame late, and above all the viewport SHRINKING after the
+    // landing: a crew banner or the relay banner arriving in the bottom
+    // bar a beat after open, the quick keys when the session needs you,
+    // the keyboard — is followed, so long as no finger is on the list. The
+    // bottom-bar case was the one that hid: nothing in the list changed,
+    // so the old follow (keyed on the items) never fired, and a session
+    // that had opened at its end sat a banner's height short of it on
+    // every harness [observed 2026-09-03].
     //
-    // On the spine a block GROWS in place as often as a new one appears, so
-    // the trigger is the tail's own content, not just the count — otherwise
-    // a long answer streams in below the fold, unfollowed.
-    var positioned by remember(s.id) { mutableStateOf(false) }
-    val n = vm.items.size + (if (made.isNotEmpty()) 1 else 0) + (if (working) 1 else 0)
-    val tail = vm.items.lastOrNull()?.let { it.key + ":" + tailSize(it) } ?: ""
-    LaunchedEffect(n, tail) {
-        if (n == 0) return@LaunchedEffect
-        // A growing block can be taller than the screen: land on its END,
-        // not its top, or following it scrolls the newest words back out.
-        val idx = n - 1
-        fun offsetFor(): Int {
-            val info = list.layoutInfo
-            val viewport = info.viewportEndOffset - info.viewportStartOffset
-            val size = info.visibleItemsInfo.firstOrNull { it.index == idx }?.size ?: 0
-            return (size - viewport).coerceAtLeast(0)
-        }
-        if (!positioned) {
-            list.scrollToItem(idx)
-            list.scrollToItem(idx, offsetFor())
-            positioned = true
-            // On this frame the LazyColumn may not have measured yet (it is
-            // composed in the same frame as the first items), so the offset
-            // above can be 0 — the TOP of a tall last message. The settle
-            // effect below re-lands from a real layout.
-        } else {
-            val lastVisible = list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            if (lastVisible >= n - 3) list.animateScrollToItem(idx, offsetFor())
-        }
-    }
-
-    // Landing on the end is not one jump. The first fill can be laid out a
-    // frame after the jump, and for a moment after that the content is
-    // still settling — a thumbnail in the made strip, a file chip, a table
-    // measured on the frame after its text — each adding height below the
-    // fold, so a session that "opened at the bottom" sat a screen short of
-    // it [observed 2026-09-03, intermittent, long sessions]. So for the
-    // first second, any frame whose layout does not end at the last item's
-    // end is corrected — unless a finger is on the list, which wins.
-    //
-    // And the list stays INVISIBLE until a real layout says it is at the
-    // end: the first frame is drawn before the jump lands, and a person
-    // saw the top of the transcript flash by on every open [John,
-    // 2026-09-03]. A few frames of plain ground instead, then the end.
+    // A person scrolling up into history unpins; scrolling back to the
+    // end (or the Newest pill) pins again. And the list stays INVISIBLE
+    // until a real layout says it is at the end — the first frame is drawn
+    // before the jump lands, and the top of the transcript used to flash
+    // by on every open.
     var landed by remember(s.id) { mutableStateOf(false) }
+    var pinned by remember(s.id) { mutableStateOf(true) }
+    fun atEnd(): Boolean {
+        val info = list.layoutInfo
+        val last = info.visibleItemsInfo.lastOrNull() ?: return info.totalItemsCount == 0
+        return last.index == info.totalItemsCount - 1 && last.offset + last.size <= info.viewportEndOffset + 1
+    }
+    // A scroll that ends away from the end unpins; one that ends at it pins.
+    LaunchedEffect(s.id) {
+        snapshotFlow { list.isScrollInProgress }.collect { moving -> if (!moving) pinned = atEnd() }
+    }
     LaunchedEffect(s.id) {
         snapshotFlow { vm.items.size }.first { it > 0 }
         val start = withFrameNanos { it }
-        var now = start
-        try {
-            while (now - start < 1_200_000_000L) {
-                now = withFrameNanos { it }
-                if (list.isScrollInProgress) break
-                // Whatever the layout is doing, half a second of blank is the
-                // most a person should wait to see their session.
-                if (now - start > 500_000_000L) landed = true
-                val info = list.layoutInfo
-                val total = info.totalItemsCount
-                if (total == 0) continue
-                val last = info.visibleItemsInfo.lastOrNull() ?: continue
-                val atEnd = last.index == total - 1 && last.offset + last.size <= info.viewportEndOffset + 1
-                if (atEnd) { landed = true; continue }
-                val end = info.visibleItemsInfo.firstOrNull { it.index == total - 1 }
-                val viewport = info.viewportEndOffset - info.viewportStartOffset
-                list.scrollToItem(total - 1, ((end?.size ?: 0) - viewport).coerceAtLeast(0))
-            }
-        } finally {
-            landed = true
+        // Whatever the layout is doing, half a second of blank is the most
+        // a person should wait to see their session.
+        launch { while (!landed) { if (withFrameNanos { it } - start > 500_000_000L) landed = true } }
+        snapshotFlow {
+            val info = list.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            // Everything that can move the end: how many items, the last
+            // visible one's place and extent, and the viewport itself.
+            listOf(info.totalItemsCount, last?.index ?: -1, last?.let { it.offset + it.size } ?: 0,
+                info.viewportStartOffset, info.viewportEndOffset)
+        }.collect {
+            val total = list.layoutInfo.totalItemsCount
+            if (total == 0 || list.isScrollInProgress) return@collect
+            if (atEnd()) { landed = true; return@collect }
+            if (!pinned) return@collect
+            // Land on the END of the last item: a block taller than the
+            // screen shows its newest words, not its first.
+            val info = list.layoutInfo
+            val end = info.visibleItemsInfo.firstOrNull { it.index == total - 1 }
+            val viewport = info.viewportEndOffset - info.viewportStartOffset
+            val offset = ((end?.size ?: 0) - viewport).coerceAtLeast(0)
+            // Before the first landing, jump; after it, glide — that is a
+            // block growing under the eye, and a jump every token jitters.
+            if (!landed) list.scrollToItem(total - 1, offset) else list.animateScrollToItem(total - 1, offset)
         }
     }
 
@@ -583,16 +563,6 @@ private fun mentionedFiles(text: String): List<String> =
         val p = m.value.removePrefix("file://").trimEnd('.', ',', ':', ';', ')', ']', '"', '\'')
         if ('%' in p) runCatching { android.net.Uri.decode(p) }.getOrDefault(p) else p
     }.distinct().take(6).toList()
-
-/** How much of the tail row there is, so the scroll-follow notices a block
- *  growing in place — the same row, more text. */
-private fun tailSize(i: Item): Int = when (i) {
-    is Item.User -> i.text.length
-    is Item.AgentText -> i.text.length
-    is Item.Thought -> i.text.length
-    is Item.Tool -> i.status.ordinal * 1_000_003 + (i.output?.length ?: 0)
-    is Item.TurnEnd -> 0
-}
 
 @Composable
 private fun ItemView(item: Item, onOpenPath: (String) -> Unit = {}, onHold: (Item) -> Unit = {}) {
