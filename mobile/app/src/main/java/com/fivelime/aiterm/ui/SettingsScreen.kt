@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.height
+import kotlinx.coroutines.launch
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -115,6 +117,23 @@ fun SettingsScreen(vm: AppViewModel, outer: PaddingValues) {
                     Text("Use desktop's order")
                 }
             }
+            Text("DIAGNOSTICS", style = MaterialTheme.typography.labelSmall, color = Muted,
+                modifier = Modifier.padding(start = 20.dp, top = 16.dp, bottom = 4.dp))
+            Text(
+                "The last few hundred things the app did — sessions opened, messages sent, where a transcript landed. Nothing you or an agent wrote. The same lines reach logcat under the tag \"aiterm\".",
+                style = MaterialTheme.typography.bodySmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            val clipboard = androidx.compose.ui.platform.LocalClipboard.current
+            val scope = androidx.compose.runtime.rememberCoroutineScope()
+            Row(Modifier.padding(start = 8.dp)) {
+                TextButton(onClick = {
+                    scope.launch {
+                        clipboard.setClipEntry(androidx.compose.ui.platform.ClipEntry(android.content.ClipData.newPlainText("aiterm diagnostics", com.fivelime.aiterm.Diag.dump())))
+                    }
+                }) { Text("Copy log") }
+                TextButton(onClick = { com.fivelime.aiterm.Diag.clear() }) { Text("Clear") }
+            }
+            Spacer(Modifier.height(16.dp))
         }
     }
 }

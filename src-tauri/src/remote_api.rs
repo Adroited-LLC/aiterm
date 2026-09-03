@@ -2812,6 +2812,7 @@ async fn spine(State(ctx): State<Ctx>, Path(id): Path<String>, Query(q): Query<S
 /// Open (resume) a session in a desktop tab. The renderer owns tabs, so this
 /// is a request to it, answered by `sessions.open` growing on the next list.
 async fn open(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    crate::diag::write("remote", &format!("open {}", &id[..id.len().min(8)]));
     let _ = ctx.app.emit("remote://open-session", serde_json::json!({ "sessionId": id }));
     StatusCode::ACCEPTED.into_response()
 }
@@ -2824,6 +2825,7 @@ struct InputBody {
 }
 
 async fn input(State(ctx): State<Ctx>, Path(id): Path<String>, Json(body): Json<InputBody>) -> Response {
+    crate::diag::write("remote", &format!("input {} ({} chars, enter={})", &id[..id.len().min(8)], body.text.len(), body.enter.unwrap_or(true)));
     let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
     if !tabs.has_session(&id) {
         return err(StatusCode::CONFLICT, "session is not open in a tab — open it first");
@@ -2889,6 +2891,7 @@ pub fn relay_report(
 /// relay (it owns the tabs the two agents talk through). Needs the session
 /// open in a tab — the phone opens it first.
 async fn bring_in(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<BringInBody>) -> Response {
+    crate::diag::write("remote", &format!("bring-in {} <- {} model={:?} rounds={:?} auto={:?}", &id[..id.len().min(8)], b.agent_id, b.model, b.rounds, b.auto));
     let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
     if !tabs.has_session(&id) {
         return err(StatusCode::CONFLICT, "open the session on the desktop first");
@@ -2945,6 +2948,7 @@ async fn rename(State(ctx): State<Ctx>, Path(id): Path<String>, Json(b): Json<Re
 }
 
 async fn interrupt(State(ctx): State<Ctx>, Path(id): Path<String>) -> Response {
+    crate::diag::write("remote", &format!("interrupt {}", &id[..id.len().min(8)]));
     let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
     if !tabs.has_session(&id) {
         return err(StatusCode::CONFLICT, "session is not open in a tab");

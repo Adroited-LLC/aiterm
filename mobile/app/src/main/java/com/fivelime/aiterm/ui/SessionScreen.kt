@@ -98,6 +98,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
+import com.fivelime.aiterm.Diag
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.runtime.snapshotFlow
@@ -183,6 +184,7 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     // by on every open.
     var landed by remember(s.id) { mutableStateOf(false) }
     var pinned by remember(s.id) { mutableStateOf(true) }
+    var seenViewport by remember(s.id) { mutableStateOf(-1) }
     fun atEnd(): Boolean {
         val info = list.layoutInfo
         val last = info.visibleItemsInfo.lastOrNull() ?: return info.totalItemsCount == 0
@@ -216,6 +218,15 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
             val end = info.visibleItemsInfo.firstOrNull { it.index == total - 1 }
             val viewport = info.viewportEndOffset - info.viewportStartOffset
             val offset = ((end?.size ?: 0) - viewport).coerceAtLeast(0)
+            // The first landing, and every later correction that came with a
+            // viewport change (a banner, the keyboard), on the record: this is
+            // the trail for "it opened short of the bottom".
+            val last = info.visibleItemsInfo.lastOrNull()
+            if (!landed || viewport != seenViewport) Diag.log(
+                "land", "${s.id.take(8)} total=$total last=${last?.index}@${last?.let { it.offset + it.size }}/${info.viewportEndOffset} " +
+                    "viewport=$viewport (was $seenViewport) lastSize=${end?.size} offset=$offset ${if (landed) "correct" else "first"}",
+            )
+            seenViewport = viewport
             // Before the first landing, jump; after it, glide — that is a
             // block growing under the eye, and a jump every token jitters.
             if (!landed) list.scrollToItem(total - 1, offset) else list.animateScrollToItem(total - 1, offset)
@@ -329,7 +340,11 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
             }
             }
         },
-    ) { padding ->
+    ) { outerPad ->
+        Column(Modifier.fillMaxSize().padding(outerPad)) {
+        CrewStrip(vm, s)
+        val padding = PaddingValues(0.dp)
+        Box(Modifier.weight(1f)) {
         if (vm.showFiles) {
             FilesList(vm, Modifier.padding(padding))
         } else if (vm.items.isEmpty()) {
@@ -426,6 +441,8 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                     }
                 }
             }
+        }
+        }
         }
     }
 }
@@ -1072,6 +1089,49 @@ private fun MessageSheet(
             action("Select text", Icons.Filled.SelectAll) { selecting = true }
             action("Share", Icons.Filled.Share) { share() }
             Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
+
+/** The session's workspace as a row of tabs: the conversation the crew
+ *  gathers around, then every agent brought into it — one tap moves between
+ *  them, the way the desktop nests them under one tab. A dot says who is
+ *  working (accent) or waiting on you (amber). Only drawn when there is a
+ *  crew; a lone session keeps its full height. */
+@Composable
+private fun CrewStrip(vm: AppViewModel, s: Session) {
+    val masterId = vm.broughtIn[s.id] ?: s.id
+    val ids = listOf(masterId) + vm.broughtIn.filterValues { it == masterId }.keys.sorted()
+    val rows = ids.mapNotNull { id -> vm.sessions.firstOrNull { it.id == id } }
+    if (rows.size < 2) return
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        rows.forEach { r ->
+            val on = r.id == s.id
+            val act = vm.activity[r.id]
+            Row(
+                Modifier.clip(RoundedCornerShape(16.dp))
+                    .background(if (on) Accent.copy(alpha = 0.18f) else Surface1)
+                    .clickable(enabled = !on) { vm.select(r) }
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                AgentIcon(r.agent, 14.dp)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    r.title.ifBlank { if (r.id == masterId) "Session" else r.agent },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (on) Accent else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 170.dp),
+                )
+                if (act == "attention" || act == "working") {
+                    Spacer(Modifier.width(6.dp))
+                    Box(Modifier.size(7.dp).background(if (act == "attention") Amber else Accent, RoundedCornerShape(50)))
+                }
+            }
         }
     }
 }

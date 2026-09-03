@@ -943,6 +943,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     a.open(s.id)
                     delay(3000)
                 }
+                Diag.log("bring-in", "${s.id.take(8)} <- $agentId model=$model rounds=$rounds auto=$auto")
                 a.bringIn(s.id, agentId, model, focus, rounds, auto)
                 relays = relays + (s.id to RelayInfo(agentId.removePrefix("api:"), null, "opening", 1, rounds, ""))
                 notice = "They're in — the exchange shows up right here"
@@ -1006,6 +1007,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private var selectGen = 0
 
     fun select(s: Session?) {
+        Diag.log("select", if (s == null) "none" else "${s.id.take(8)} ${s.agent} open=${s.id in open} running=${s.id in running}")
         selected = s
         selectGen++
         spine.clear(); publishSpine(); noSpine = false; refetchWanted = false; lastSpineAt = 0L
@@ -1028,6 +1030,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     val r = api?.spine(s.id, 0) ?: break
                     if (myGen != selectGen) return@launch
                     spine.replay(r); publishSpine()
+                    Diag.log("spine", "${s.id.take(8)} replay ${r.events.size} events live=${r.live} -> ${spine.items.size} rows, phase=${spine.phase} (try $attempt)")
                     lastSpineAt = System.currentTimeMillis()
                     break
                 } catch (e: ApiError) {
@@ -1035,9 +1038,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     // its 404 carries no message; one that HAS the route says
                     // "no such session" and means it. Only the first is a
                     // reason to fall back to the old whole-transcript poll.
+                    Diag.log("spine", "${s.id.take(8)} replay failed (try $attempt): ${e.code} ${e.message}")
                     if (e.code == 404 && e.message?.contains("session") != true) { noSpine = true; break }
                     if (attempt == 3) notice = describe(e) else delay(1200)
                 } catch (e: Exception) {
+                    Diag.log("spine", "${s.id.take(8)} replay failed (try $attempt): ${e.javaClass.simpleName} ${e.message}")
                     if (attempt == 3) notice = describe(e) else delay(1200)
                 }
             }
@@ -1147,6 +1152,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val a = api ?: return
         viewModelScope.launch {
             sending = true
+            Diag.log("send", "${s.id.take(8)} open=${s.id in open} ${text.length} chars, ${attachments.size} attachments")
             try {
                 if (s.id !in open) {
                     a.open(s.id)
@@ -1178,7 +1184,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return false
     }
 
-    fun openOnDesktop(s: Session) = act { it.open(s.id); notice = "Opening on ${desktop?.name}" }
+    fun openOnDesktop(s: Session) = act { Diag.log("open", "${s.id.take(8)} asked the desktop"); it.open(s.id); notice = "Opening on ${desktop?.name}" }
 
     /** Read a picked file and hand it to the desktop. The path comes back and
      *  rides in the message as text — the agent reads it from there. */

@@ -2448,16 +2448,25 @@ export default function App() {
   // ---- Remote access: a phone asks, the desktop opens. The tab appears here
   // too, so both screens agree about what is running. Refs, not deps: the
   // handlers below are recreated every render and the listener must not be.
-  const remoteRef = useRef({ resumeSession, newSession, tabs, relayStart: relayCtl.start });
-  remoteRef.current = { resumeSession, newSession, tabs, relayStart: relayCtl.start };
+  const remoteRef = useRef({ resumeSession, selectSession, newSession, tabs, relayStart: relayCtl.start });
+  remoteRef.current = { resumeSession, selectSession, newSession, tabs, relayStart: relayCtl.start };
   useEffect(() => {
     const unOpen = listen<{ sessionId: string }>("remote://open-session", async (e) => {
       const id = e.payload.sessionId;
       // The phone's list can be newer than ours — read fresh rather than trust state.
       const list = sessionsRef.current.find((x) => x.id === id) ? sessionsRef.current : await listSessions();
       const s = list.find((x) => x.id === id);
-      if (s) remoteRef.current.resumeSession(s);
-      else setNotice(`The phone asked for a session that is not listed: ${id.slice(0, 8)}…`);
+      if (!s) { setNotice(`The phone asked for a session that is not listed: ${id.slice(0, 8)}…`); return; }
+      // A session already open in a tab is FOCUSED, not resumed. `resumeSession`
+      // stops the live process and relaunches `--resume`, and under the daemon
+      // Claude Code answers a resume of a live conversation with a FORK — a
+      // second transcript with a new id and the same history. The phone asks
+      // to open whenever its "open" list is a refresh behind, so this path
+      // minted a duplicate "Missing notes on CRM opportunity" [2026-09-03].
+      const live = remoteRef.current.tabs.find((t) => t.slotId === s.id || t.sessionId === s.id);
+      uiLog(`remote open-session ${id.slice(0, 8)} → ${live ? "focus tab " + live.key : "resume"}`);
+      if (live) remoteRef.current.selectSession(s);
+      else remoteRef.current.resumeSession(s);
     });
     const unNew = listen<{ agentId: string; cwd: string; prompt: string | null; model: string | null; effort: string | null; title: string | null }>("remote://new-session", (e) => {
       const { agentId, cwd, prompt, model, effort, title } = e.payload;
@@ -2745,6 +2754,27 @@ export default function App() {
                   </button>
                 );
               })}
+              {fileTabs.filter(showsFile).map((f) => (
+                <button
+                  key={f.key}
+                  className={"center-tab sub" + (activeFileTab === f.key ? " on" : "")}
+                  title={f.path}
+                  onClick={() => setActiveFileTab(f.key)}
+                >
+                  {dirtyFiles.has(f.key) && <span className="center-tab-dot" />}
+                  <span className="center-tab-name">{basename(f.path)}</span>
+                  <span
+                    className={"center-tab-close" + (fileCloseArm === f.key ? " arm" : "")}
+                    title={fileCloseArm === f.key
+                      ? "Unsaved changes — click again to discard"
+                      : "Close"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeFileTab(f.key);
+                    }}
+                  ><Icon of={X} size="sm" /></span>
+                </button>
+              ))}
               {!previewSession && rootObj?.sessionId && rootKey !== null && (
                 <div className="strip-right">
                   {(broughtIn[rootObj.sessionId] ?? [])
@@ -2804,27 +2834,6 @@ export default function App() {
                   )}
                 </div>
               )}
-              {fileTabs.filter(showsFile).map((f) => (
-                <button
-                  key={f.key}
-                  className={"center-tab sub" + (activeFileTab === f.key ? " on" : "")}
-                  title={f.path}
-                  onClick={() => setActiveFileTab(f.key)}
-                >
-                  {dirtyFiles.has(f.key) && <span className="center-tab-dot" />}
-                  <span className="center-tab-name">{basename(f.path)}</span>
-                  <span
-                    className={"center-tab-close" + (fileCloseArm === f.key ? " arm" : "")}
-                    title={fileCloseArm === f.key
-                      ? "Unsaved changes — click again to discard"
-                      : "Close"}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      closeFileTab(f.key);
-                    }}
-                  ><Icon of={X} size="sm" /></span>
-                </button>
-              ))}
             </div>
           )}
           <div className="term-stack">

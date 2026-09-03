@@ -759,7 +759,21 @@ body.dragging * { pointer-events: none; }
 .session-group .session-item:hover::after,
 .session-group .session-item.active::after { opacity: 0; }
 .session-item:hover { background: var(--bg-hover); }
-.session-item.active { background: var(--bg-active); }
+/* The row whose tab is showing: an accent bar down its left edge and a
+   tint that reads from across the room, not just a shade of the ground. */
+.session-item.active {
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-active));
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.session-item.active .session-title { color: var(--text); font-weight: 600; }
+/* A running session: its title stays bright, and the badge wears a soft
+   breathing ring beside the green dot, so the live rows read as a set. */
+.session-item.live .session-title { color: var(--text); }
+.session-item.live .agent-badge { animation: live-ring 2.4s ease-in-out infinite; }
+@keyframes live-ring {
+  0%, 100% { box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--green, #3fb950) 55%, transparent); }
+  50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--green, #3fb950) 18%, transparent); }
+}
 .session-item.dragging { opacity: 0.45; }
 
 /* Single/ctrl-click selection — stronger than the project-wide .active tint. */
