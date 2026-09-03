@@ -47,6 +47,7 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -59,6 +60,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -104,6 +107,7 @@ import kotlinx.coroutines.launch
 private const val PAGE_SESSIONS = "sessions"
 private const val PAGE_CONVERSATION = "conversation"
 private const val PAGE_TERMINAL = "terminal"
+private const val PAGE_WEB_PREVIEW = "web_preview"
 
 /** Conversation-first shell inspired by the 5lime client, backed only by our remote protocol. */
 @Composable
@@ -120,9 +124,26 @@ fun RemoteDesktopScreen(
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     var page by rememberSaveable { mutableStateOf(PAGE_SESSIONS) }
     var selectedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var webPreviewUrl by rememberSaveable { mutableStateOf<String?>(null) }
     val selected = selectedSessionId?.let { id -> state.sessions.firstOrNull { it.id == id } }
 
     when (page) {
+        PAGE_WEB_PREVIEW -> {
+            val url = webPreviewUrl
+            if (url == null) {
+                LaunchedEffect(Unit) { page = PAGE_CONVERSATION }
+            } else {
+                RemoteWebPreviewScreen(
+                    url = url,
+                    serverSpkiFingerprint = viewModel.desktopSpkiFingerprint(),
+                    onClose = {
+                        webPreviewUrl = null
+                        page = PAGE_CONVERSATION
+                    },
+                )
+            }
+        }
+
         PAGE_TERMINAL -> RemoteTerminalScreen(
             viewModel = viewModel,
             onBack = {
@@ -150,6 +171,12 @@ fun RemoteDesktopScreen(
                 onBringIn = viewModel.client::bringInSession,
                 onLoadFiles = viewModel::sessionChanges,
                 onLoadFile = viewModel::sessionFilePreview,
+                onProbeWebPreview = viewModel::hasWebPreview,
+                onOpenWebPreview = viewModel::openWebPreview,
+                onShowWebPreview = { url ->
+                    webPreviewUrl = url
+                    page = PAGE_WEB_PREVIEW
+                },
             )
         }
 
@@ -811,6 +838,9 @@ private fun RemoteConversationContent(
     onBringIn: (String, String, String?, String?, String, Int, Boolean) -> Unit,
     onLoadFiles: suspend (String) -> Result<List<RemoteSessionChange>>,
     onLoadFile: suspend (String, String, Int) -> Result<RemoteSessionFilePreview>,
+    onProbeWebPreview: suspend (String) -> Result<Boolean>,
+    onOpenWebPreview: suspend (String) -> Result<String>,
+    onShowWebPreview: (String) -> Unit,
 ) {
     var draft by rememberSaveable(session.id) { mutableStateOf("") }
     var sending by remember(session.id) { mutableStateOf(false) }
@@ -826,6 +856,8 @@ private fun RemoteConversationContent(
     var filePreviewLoading by remember(session.id) { mutableStateOf(false) }
     var filePreview by remember(session.id) { mutableStateOf<RemoteSessionFilePreview?>(null) }
     var filePreviewError by remember(session.id) { mutableStateOf<String?>(null) }
+    var webPreviewAvailable by remember(session.id) { mutableStateOf(false) }
+    var webPreviewOpening by remember(session.id) { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val normalizer = remember(context) { TerminalImageNormalizer(context) }
@@ -856,6 +888,16 @@ private fun RemoteConversationContent(
                 delay(1_500)
                 onRefresh()
             }
+        }
+    }
+    LaunchedEffect(session.id, state.connection) {
+        if (state.connection != ConnectionState.Connected) {
+            webPreviewAvailable = false
+            return@LaunchedEffect
+        }
+        while (true) {
+            onProbeWebPreview(session.id).onSuccess { webPreviewAvailable = it }
+            delay(5_000)
         }
     }
     LaunchedEffect(messages.size, timeline.size, working) {
@@ -989,6 +1031,30 @@ private fun RemoteConversationContent(
                             filesLoading = false
                         }
                     }) { Text("Files") }
+                    if (webPreviewAvailable) {
+                        IconButton(
+                            onClick = {
+                                if (webPreviewOpening) return@IconButton
+                                webPreviewOpening = true
+                                scope.launch {
+                                    onOpenWebPreview(session.id).fold(
+                                        onSuccess = onShowWebPreview,
+                                        onFailure = {
+                                            sendError = it.message ?: "Could not open the webpage preview."
+                                        },
+                                    )
+                                    webPreviewOpening = false
+                                }
+                            },
+                            enabled = !webPreviewOpening,
+                        ) {
+                            if (webPreviewOpening) {
+                                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Filled.Language, contentDescription = "Preview webpage")
+                            }
+                        }
+                    }
                     TextButton(onClick = { showBringIn = true }) { Text("Bring in") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),

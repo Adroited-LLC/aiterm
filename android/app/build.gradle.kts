@@ -70,6 +70,7 @@ dependencies {
     implementation(libs.compose.ui.graphics)
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons.extended)
 
     // Task 8: QR enrollment scans the aiterm://pair payload with CameraX + ML Kit.
     implementation(libs.androidx.camera.core)

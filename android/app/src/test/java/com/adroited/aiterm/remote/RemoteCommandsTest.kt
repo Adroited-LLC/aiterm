@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.cbor.Cbor
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RemoteCommandsTest {
@@ -56,6 +57,34 @@ class RemoteCommandsTest {
 
     @OptIn(ExperimentalSerializationApi::class)
     @Test
+    fun webPreviewReplyAcceptsOnlyAnAvailableTicketPath() {
+        val cbor = Cbor {
+            encodeDefaults = true
+            useDefiniteLengthEncoding = true
+        }
+        val ticket = "/v1/preview/${"a".repeat(43)}/"
+        val available = RemoteCommands.webPreview(
+            cbor.encodeToByteArray(WebPreviewWire.serializer(), WebPreviewWire(true, ticket)),
+        )
+        assertEquals(RemoteWebPreview(true, ticket), available)
+        assertEquals(
+            RemoteWebPreview(false, null),
+            RemoteCommands.webPreview(
+                cbor.encodeToByteArray(WebPreviewWire.serializer(), WebPreviewWire(false, null)),
+            ),
+        )
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.webPreview(
+                cbor.encodeToByteArray(
+                    WebPreviewWire.serializer(),
+                    WebPreviewWire(true, "/v1/preview/../../secret/"),
+                ),
+            )
+        }
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
     fun sessionRosterDecodesNativeMetadataWithoutChangingTheSessionShape() {
         val session = RemoteSession(
             id = "session-1",
@@ -98,6 +127,12 @@ class RemoteCommandsTest {
         val stars: List<String>,
         @SerialName("brought_in") val broughtIn: Map<String, String>,
         val activity: Map<String, String>,
+    )
+
+    @Serializable
+    private data class WebPreviewWire(
+        val available: Boolean,
+        val path: String?,
     )
 
     private fun hex(value: String): ByteArray =

@@ -103,6 +103,11 @@ data class RemoteFileChunk(
     val data: ByteArray,
 )
 
+data class RemoteWebPreview(
+    val available: Boolean,
+    val path: String?,
+)
+
 @Serializable
 data class RemoteModelOption(
     val id: String,
@@ -178,6 +183,13 @@ object RemoteCommands {
     fun previewSession(sessionId: String): ByteArray = session(sessionId)
     fun conversation(sessionId: String, maxChars: Int = 512 * 1_024): ByteArray =
         encode(SessionConversationPayload.serializer(), SessionConversationPayload(sessionId, maxChars))
+    fun webPreview(sessionId: String, open: Boolean): ByteArray {
+        requireIdentifier(sessionId)
+        return encode(
+            SessionWebPreviewRequest.serializer(),
+            SessionWebPreviewRequest(sessionId, open),
+        )
+    }
     fun fileRead(sessionId: String, path: String, offset: Long, count: Int): ByteArray {
         requireIdentifier(sessionId)
         if (path.isBlank() || path.encodeToByteArray().size > MAX_PATH_BYTES || offset < 0 ||
@@ -359,6 +371,14 @@ object RemoteCommands {
             ) malformed()
         }
 
+    fun webPreview(payload: ByteArray): RemoteWebPreview =
+        decode(SessionWebPreviewReply.serializer(), payload).let { reply ->
+            if (
+                reply.path != null && (!reply.available || !WEB_PREVIEW_PATH.matches(reply.path))
+            ) malformed()
+            RemoteWebPreview(reply.available, reply.path)
+        }
+
     fun fileChunk(payload: ByteArray): RemoteFileChunk =
         decode(FileReadReply.serializer(), payload).let {
             if (it.path.isBlank() || it.path.encodeToByteArray().size > MAX_PATH_BYTES ||
@@ -457,6 +477,10 @@ object RemoteCommands {
         @SerialName("session_id") val sessionId: String,
         @SerialName("max_chars") val maxChars: Int,
     )
+    @Serializable private data class SessionWebPreviewRequest(
+        @SerialName("session_id") val sessionId: String,
+        val open: Boolean,
+    )
     @Serializable private data class FileReadRequest(
         @SerialName("session_id") val sessionId: String,
         val path: String,
@@ -537,6 +561,10 @@ object RemoteCommands {
     )
     @Serializable private data class SessionPreviewReply(val messages: List<RemotePreviewMessage>)
     @Serializable private data class SessionChangesReply(val changes: List<RemoteSessionChange>)
+    @Serializable private data class SessionWebPreviewReply(
+        val available: Boolean,
+        val path: String? = null,
+    )
     @Serializable private data class FileReadReply(
         val path: String,
         val mime: String,
@@ -581,4 +609,6 @@ object RemoteCommands {
         @SerialName("attachment_id") val attachmentId: String,
         val exit: RemoteTabExit,
     )
+
+    private val WEB_PREVIEW_PATH = Regex("/v1/preview/[A-Za-z0-9_-]{43}/")
 }

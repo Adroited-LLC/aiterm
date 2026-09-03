@@ -58,6 +58,7 @@ data class RemoteClientState(
     val activeTabId: String? = null,
     val activeTitle: String? = null,
     val lastError: String? = null,
+    val connectedEndpoint: RemoteEndpoint? = null,
 )
 
 data class RemoteRequest(val requestId: Long, val kind: String, val payload: ByteArray)
@@ -149,6 +150,8 @@ class RemoteTransportTerminatedException(
 
 interface RemoteTransport {
     val events: Flow<RemoteServerEvent>
+    val endpoint: RemoteEndpoint?
+        get() = null
     suspend fun connect()
     /** Enqueues in caller order; the transport assigns the wire id when its writer dequeues it. */
     fun request(
@@ -221,7 +224,10 @@ class RemoteClient(
             candidate.connect()
             val selectedTab = synchronized(lifecycleLock) {
                 if (!isCurrent(generation, candidate) || !isUnlocked()) return@synchronized null
-                mutableState.value = mutableState.value.copy(connection = ConnectionState.Connected)
+                mutableState.value = mutableState.value.copy(
+                    connection = ConnectionState.Connected,
+                    connectedEndpoint = candidate.endpoint,
+                )
                 mutableState.value.activeTabId
             }
             if (!isCurrent(generation, candidate) || !isUnlocked()) {
@@ -280,6 +286,7 @@ class RemoteClient(
                             ConnectionState.Disconnected
                         },
                         lastError = error.message ?: "Connection failed",
+                        connectedEndpoint = null,
                     )
                 }
             }
@@ -682,6 +689,11 @@ class RemoteClient(
     suspend fun sessionChanges(sessionId: String): List<RemoteSessionChange> =
         RemoteCommands.sessionChanges(requestResource("session.changes", RemoteCommands.session(sessionId)))
 
+    suspend fun webPreview(sessionId: String, open: Boolean): RemoteWebPreview =
+        RemoteCommands.webPreview(
+            requestResource("session.web_preview", RemoteCommands.webPreview(sessionId, open)),
+        )
+
     suspend fun readFileChunk(
         sessionId: String,
         path: String,
@@ -786,6 +798,7 @@ class RemoteClient(
                         showTakeFocus = false,
                         pendingTransfers = 0,
                         lastError = outcome.message,
+                        connectedEndpoint = null,
                     )
                     reconnect = true
                 }
@@ -824,6 +837,7 @@ class RemoteClient(
                             connection = ConnectionState.Disconnected,
                             pendingTransfers = 0,
                             lastError = "Too many pending terminal transfers",
+                            connectedEndpoint = null,
                         )
                     } else {
                         transfers += event.transferId
@@ -854,6 +868,7 @@ class RemoteClient(
                         readOnly = if (lostFocus) true else mutableState.value.readOnly,
                         showTakeFocus = if (lostFocus) true else mutableState.value.showTakeFocus,
                         lastError = event.message,
+                        connectedEndpoint = if (disconnected) null else mutableState.value.connectedEndpoint,
                     )
                     if (disconnected) {
                         closing = detachTransportLocked()
@@ -1164,7 +1179,10 @@ class RemoteClient(
             rosterAssembler.clear()
             recoveryRequested = false
             scrollbackRequest = null
-            mutableState.value = mutableState.value.copy(connection = connectingState)
+            mutableState.value = mutableState.value.copy(
+                connection = connectingState,
+                connectedEndpoint = null,
+            )
             Triple(previous, jobs, lifecycleGeneration)
         }
         closing.second.forEach(Job::cancel)
