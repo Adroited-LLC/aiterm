@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod grok;
@@ -107,6 +108,7 @@ pub fn open_adapter(agent: &str, session_id: &str) -> Option<Box<dyn Adapter>> {
         "claude" => claude::open(session_id).map(|a| Box::new(a) as Box<dyn Adapter>),
         "grok" => grok::open(session_id).map(|a| Box::new(a) as Box<dyn Adapter>),
         "codex" => codex::open(session_id).map(|a| Box::new(a) as Box<dyn Adapter>),
+        "antigravity" => antigravity::open(session_id).map(|a| Box::new(a) as Box<dyn Adapter>),
         _ => legacy::open(agent, session_id).map(|a| Box::new(a) as Box<dyn Adapter>),
     }
 }
@@ -114,7 +116,7 @@ pub fn open_adapter(agent: &str, session_id: &str) -> Option<Box<dyn Adapter>> {
 /// Whether `agent` has an adapter that reads the engine's own live source
 /// (as opposed to the legacy re-derivation). Reported as `live` to phones.
 pub fn is_native(agent: &str) -> bool {
-    matches!(agent, "claude" | "grok" | "codex")
+    matches!(agent, "claude" | "grok" | "codex" | "antigravity")
 }
 
 /// Milliseconds since the epoch, for stamping.

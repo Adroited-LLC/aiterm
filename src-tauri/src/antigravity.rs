@@ -90,13 +90,13 @@ pub(crate) fn store_root() -> Option<PathBuf> {
 }
 
 /// Ids are uuids in file names; anything else must not reach a path join.
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-fn transcript_path(root: &Path, id: &str) -> PathBuf {
+pub(crate) fn transcript_path(root: &Path, id: &str) -> PathBuf {
     root.join("brain")
         .join(id)
         .join(".system_generated")
@@ -172,7 +172,7 @@ pub fn user_request(content: &str) -> String {
 /// it — `"Cwd":"\"/home/john/nanoclaw\""` — while numbers and booleans are
 /// bare (`"MaxDepth":"3"`). One decode undoes the inner quoting.
 /// [observed: agy 1.1.24; `transcript_full.jsonl` has real types instead]
-fn arg_str(call: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn arg_str(call: &serde_json::Value, key: &str) -> Option<String> {
     let raw = call.get("args")?.get(key)?;
     match raw {
         serde_json::Value::String(s) => {
@@ -191,7 +191,7 @@ fn arg_str(call: &serde_json::Value, key: &str) -> Option<String> {
 /// The one line a person reads for a tool call: agy writes its own
 /// `toolSummary` on every call ("Search memory for Google Ads tools"); the
 /// tool's name stands in when it is missing.
-fn tool_summary(call: &serde_json::Value) -> String {
+pub(crate) fn tool_summary(call: &serde_json::Value) -> String {
     arg_str(call, "toolSummary")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
