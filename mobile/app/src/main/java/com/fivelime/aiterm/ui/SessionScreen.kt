@@ -472,6 +472,10 @@ private fun QuickKeysBar(onKey: (String) -> Unit) {
 @Composable
 private fun WorkingRow(agent: String, detail: String = "") {
     Row(Modifier.padding(start = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        // The engine's own mark leads the row: in a session where a second
+        // agent was brought in, "working" needs a face.
+        AgentIcon(agent, 16.dp)
+        Spacer(Modifier.width(8.dp))
         val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "dots")
         val phase by t.animateFloat(0f, 3f, androidx.compose.animation.core.infiniteRepeatable(
             androidx.compose.animation.core.tween(900, easing = androidx.compose.animation.core.LinearEasing)), label = "phase")
