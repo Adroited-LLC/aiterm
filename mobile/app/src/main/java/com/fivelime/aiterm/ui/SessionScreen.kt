@@ -63,6 +63,20 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -120,6 +134,17 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     }
     val working = state == SessionState.Working
     var draft by remember(s.id) { mutableStateOf("") }
+    // A long-pressed message: its actions come up in a sheet.
+    var heldItem by remember(s.id) { mutableStateOf<Item?>(null) }
+    heldItem?.let { held ->
+        // "Ask again" on an answer resends the last thing the person said
+        // before it.
+        val promptAbove = if (held is Item.AgentText) {
+            val at = vm.items.indexOfFirst { it.key == held.key }
+            (vm.items.take(maxOf(at, 0)).lastOrNull { it is Item.User } as? Item.User)?.let { personSaid(it.text) }?.takeIf { it.isNotEmpty() }
+        } else null
+        MessageSheet(held, promptAbove, onDismiss = { heldItem = null }, onEdit = { draft = it }, onSend = { vm.send(it) })
+    }
     var menu by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     var bringingIn by remember { mutableStateOf(false) }
@@ -343,7 +368,7 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                     // Keyed by the spine's own ids: a block that grows
                     // updates one row in place, it does not re-key the list
                     // under the scroll position.
-                    items(vm.items, key = { it.key }) { item -> ItemView(item, onOpenPath = vm::openMentioned) }
+                    items(vm.items, key = { it.key }) { item -> ItemView(item, onOpenPath = vm::openMentioned, onHold = { heldItem = it }) }
                     // What the session made, right where the conversation ends —
                     // the transcript often never prints a path (tool output is
                     // dropped at phone size), but the desktop's ledger knows.
@@ -522,34 +547,35 @@ private fun tailSize(i: Item): Int = when (i) {
 }
 
 @Composable
-private fun ItemView(item: Item, onOpenPath: (String) -> Unit = {}) {
-    // Long-press selects within a row; taps (chips, tool-card folds,
-    // links) still work as taps.
-    androidx.compose.foundation.text.selection.SelectionContainer {
-        when (item) {
-            is Item.User -> UserBubble(item)
-            is Item.AgentText -> AgentBlock(item, onOpenPath)
-            is Item.Thought -> ThoughtBlock(item)
-            is Item.Tool -> ToolCard(item)
-            // A turn boundary: a hairline, so a long session reads as
-            // exchanges rather than one wall.
-            is Item.TurnEnd -> HorizontalDivider(
-                Modifier.padding(vertical = 4.dp),
-                color = Muted.copy(alpha = if (item.reason == "completed") 0.12f else 0.3f),
-            )
-        }
+private fun ItemView(item: Item, onOpenPath: (String) -> Unit = {}, onHold: (Item) -> Unit = {}) {
+    // A long press on any row brings up its actions — copy, copy as
+    // markdown, select text, share, and for the person's own message, edit
+    // and send again. Taps (chips, tool-card folds, links) still work.
+    when (item) {
+        is Item.User -> UserBubble(item) { onHold(item) }
+        is Item.AgentText -> AgentBlock(item, onOpenPath) { onHold(item) }
+        is Item.Thought -> ThoughtBlock(item) { onHold(item) }
+        is Item.Tool -> ToolCard(item) { onHold(item) }
+        // A turn boundary: a hairline, so a long session reads as
+        // exchanges rather than one wall.
+        is Item.TurnEnd -> HorizontalDivider(
+            Modifier.padding(vertical = 4.dp),
+            color = Muted.copy(alpha = if (item.reason == "completed") 0.12f else 0.3f),
+        )
     }
 }
 
 /** A user turn sits right in the accent colour. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun UserBubble(item: Item.User) {
+private fun UserBubble(item: Item.User, onHold: () -> Unit) {
     val said = personSaid(item.text)
     if (said.isEmpty()) return
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Box(
             Modifier.widthIn(max = 320.dp)
                 .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp))
+                .combinedClickable(onClick = {}, onLongClick = onHold)
                 .padding(12.dp),
         ) { MarkdownText(said, color = MaterialTheme.colorScheme.onPrimaryContainer) }
     }
@@ -558,9 +584,10 @@ private fun UserBubble(item: Item.User) {
 /** The assistant, left, on the ground itself. A block still being written
  *  carries a cursor: the spine says `done:false` while more is coming, and
  *  without it a half-sentence reads as a finished thought. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun AgentBlock(item: Item.AgentText, onOpenPath: (String) -> Unit) {
-    Column(Modifier.fillMaxWidth().padding(end = 12.dp)) {
+private fun AgentBlock(item: Item.AgentText, onOpenPath: (String) -> Unit, onHold: () -> Unit) {
+    Column(Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClick = onHold).padding(end = 12.dp)) {
         MarkdownText(item.text)
         if (!item.done) Caret()
         val paths = remember(item.text) { mentionedFiles(item.text) }
@@ -588,10 +615,11 @@ private fun Caret() {
 /** The agent's reasoning: quiet, italic, folded to a line. Folded, the
  *  markdown marks come off so `**Checking the request**` reads as words;
  *  opened, it renders like any answer. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ThoughtBlock(item: Item.Thought) {
+private fun ThoughtBlock(item: Item.Thought, onHold: () -> Unit) {
     var expanded by remember { mutableStateOf(false) }
-    val mod = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 4.dp, vertical = 2.dp)
+    val mod = Modifier.fillMaxWidth().combinedClickable(onClick = { expanded = !expanded }, onLongClick = onHold).padding(horizontal = 4.dp, vertical = 2.dp)
     if (expanded) {
         Box(mod) { MarkdownText(item.text, color = Muted) }
     } else {
@@ -607,13 +635,14 @@ private fun ThoughtBlock(item: Item.Thought) {
 /** A tool call, live: the mark its category earns, what it was asked to do,
  *  and where it stands. The output is folded behind a tap — the desktop
  *  already clipped it, but a phone screen is not where a diff belongs. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ToolCard(item: Item.Tool) {
+private fun ToolCard(item: Item.Tool, onHold: () -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     val output = item.output?.takeIf { it.isNotBlank() }
     Column(
         Modifier.fillMaxWidth().background(Surface1.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
-            .clickable(enabled = output != null) { expanded = !expanded }
+            .combinedClickable(onClick = { if (output != null) expanded = !expanded }, onLongClick = onHold)
             .padding(horizontal = 10.dp, vertical = 8.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -920,6 +949,107 @@ private fun RelayBanner(vm: AppViewModel, s: Session, r: com.fivelime.aiterm.Rel
             IconButton(onClick = { vm.dismissRelay(s.id) }, modifier = Modifier.size(28.dp)) {
                 Icon(Icons.Filled.Close, "Dismiss", tint = Muted, modifier = Modifier.size(14.dp))
             }
+        }
+    }
+}
+
+
+/** What a held message can do. Copy takes the words (marks off), Copy as
+ *  markdown takes it as written, Select text opens it for a partial
+ *  selection, Share hands it to another app. The person's own message can
+ *  be edited — it lands in the composer to change and send again — or sent
+ *  again as it was; an answer can be asked for again, which sends the
+ *  prompt above it once more. None of these rewrite history: every harness
+ *  here is a CLI whose transcript only grows, so "edit" is a new turn. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MessageSheet(
+    item: Item, promptAbove: String?, onDismiss: () -> Unit,
+    onEdit: (String) -> Unit, onSend: (String) -> Unit,
+) {
+    val clipboard = LocalClipboard.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var selecting by remember { mutableStateOf(false) }
+    val raw = when (item) {
+        is Item.User -> personSaid(item.text)
+        is Item.AgentText -> item.text
+        is Item.Thought -> item.text
+        is Item.Tool -> listOfNotNull(item.title.ifBlank { item.tool }, item.input.takeIf { it.isNotBlank() }, item.output?.takeIf { it.isNotBlank() }).joinToString("\n\n")
+        is Item.TurnEnd -> ""
+    }
+    val plain = if (item is Item.Tool) raw else markdownPlain(raw)
+    val who = when (item) {
+        is Item.User -> "You"
+        is Item.AgentText -> "Answer"
+        is Item.Thought -> "Reasoning"
+        is Item.Tool -> item.title.ifBlank { item.tool }
+        is Item.TurnEnd -> ""
+    }
+    fun copy(text: String, what: String) {
+        scope.launch {
+            clipboard.setClipEntry(ClipEntry(android.content.ClipData.newPlainText("aiterm", text)))
+            android.widget.Toast.makeText(context, "Copied $what", android.widget.Toast.LENGTH_SHORT).show()
+            onDismiss()
+        }
+    }
+    fun share() {
+        val i = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"; putExtra(android.content.Intent.EXTRA_TEXT, raw)
+        }
+        context.startActivity(android.content.Intent.createChooser(i, null))
+        onDismiss()
+    }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = Surface1,
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
+            if (selecting) {
+                // The whole message, rendered, every word selectable: the
+                // system's own handles and Copy do the rest.
+                Row(Modifier.padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Select text", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { selecting = false }) { Icon(Icons.Filled.Close, "Back") }
+                }
+                androidx.compose.foundation.text.selection.SelectionContainer(
+                    Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
+                ) {
+                    if (item is Item.Tool) Text(raw, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    else MarkdownText(raw)
+                }
+                Spacer(Modifier.height(12.dp))
+                return@Column
+            }
+            Column(Modifier.padding(horizontal = 20.dp)) {
+                Text(who, style = MaterialTheme.typography.labelMedium, color = Muted)
+                Text(
+                    plain.replace('\n', ' '), style = MaterialTheme.typography.bodySmall, color = Muted,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            val rowColors = ListItemDefaults.colors(containerColor = Color.Transparent)
+            @Composable fun action(label: String, icon: ImageVector, detail: String? = null, onClick: () -> Unit) = ListItem(
+                headlineContent = { Text(label) },
+                supportingContent = detail?.let { { Text(it, color = Muted, style = MaterialTheme.typography.bodySmall) } },
+                leadingContent = { Icon(icon, null, tint = Accent) },
+                colors = rowColors,
+                modifier = Modifier.clickable(onClick = onClick),
+            )
+            if (item is Item.User) {
+                action("Edit and send again", Icons.Filled.Edit, "Opens in the composer — the original stays as it was") { onEdit(raw); onDismiss() }
+                action("Send again", Icons.Filled.Replay) { onSend(raw); onDismiss() }
+            }
+            if (item is Item.AgentText && promptAbove != null) {
+                action("Ask again", Icons.Filled.Replay, "Sends the prompt above this answer once more") { onSend(promptAbove); onDismiss() }
+            }
+            action(if (item is Item.Tool) "Copy" else "Copy text", Icons.Filled.ContentCopy) { copy(plain, "text") }
+            if (item !is Item.Tool) action("Copy as markdown", Icons.Filled.Code, "As the agent wrote it, marks and all") { copy(raw, "markdown") }
+            action("Select text", Icons.Filled.SelectAll) { selecting = true }
+            action("Share", Icons.Filled.Share) { share() }
+            Spacer(Modifier.height(12.dp))
         }
     }
 }
