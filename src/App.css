@@ -4080,7 +4080,7 @@ input[type="range"]::-webkit-slider-thumb {
 .bringin-auto input { accent-color: var(--accent); }
 
 /* Workspace crews: brought-in agents nest under their master. */
-.session-item.satellite { margin-left: 18px; }
+.session-item.satellite { margin-left: 30px; }
 .sat-mark { color: var(--text-faint); display: inline-flex; margin-right: 2px; }
 .crew-badge {
   display: inline-flex; align-items: center; gap: 3px;
@@ -4158,7 +4158,7 @@ input[type="range"]::-webkit-slider-thumb {
 .road-listeners[open] > summary::before { content: "▾ "; }
 
 /* Workspace crews: brought-in agents nest under their master, as on the phone. */
-.session-item.satellite { margin-left: 18px; }
+.session-item.satellite { margin-left: 30px; }
 .sat-mark { color: var(--text-faint); display: inline-flex; margin-right: 2px; flex: none; }
 .crew-badge {
   display: inline-flex; align-items: center; gap: 3px; flex: none;
