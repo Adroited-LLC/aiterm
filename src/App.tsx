@@ -101,6 +101,9 @@ interface PanelToggles {
 }
 // Composer starts closed: it is opt-in chrome, not something to force on a
 // first run. Everything else matches how the app has always opened.
+/** One panel's worth of right-hand column — what home leaves Repository. */
+const HOME_RIGHT_WIDTH = 320;
+
 const DEFAULT_PANELS: PanelToggles = {
   sessions: true, explorer: true, git: true, composer: false, agent: true,
 };
@@ -3036,8 +3039,20 @@ export default function App() {
 
         {showRight && (
           <>
-            <div className="splitter v" onMouseDown={() => startDrag("right")} />
-            <div className="right-col" ref={rightColRef} style={{ width: sizes.right }}>
+            {/* On home the column holds Repository alone and is fixed at a
+                single panel's width, so the launcher keeps its 760 and the
+                page still composes at 1400. A width nothing can change is
+                not a width to offer a drag handle for, so the splitter is
+                there as the divider and inert until a session is up. */}
+            <div
+              className={"splitter v" + (onHome ? " locked" : "")}
+              onMouseDown={onHome ? undefined : () => startDrag("right")}
+            />
+            <div
+              className="right-col"
+              ref={rightColRef}
+              style={{ width: onHome ? Math.min(sizes.right, HOME_RIGHT_WIDTH) : sizes.right }}
+            >
               <div
                 className="right-top"
                 style={{ height: agentOnScreen ? `${(1 - sizes.agentFrac) * 100}%` : "100%" }}

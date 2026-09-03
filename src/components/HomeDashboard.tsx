@@ -51,12 +51,14 @@ function FolderControl({
     const away = (e: MouseEvent) => {
       if (!box.current?.contains(e.target as Node)) setOpen(false);
     };
-    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    // `KeyboardEvent` here is React's — the import shadows the DOM one — so
+    // the listener takes the DOM type by its global name.
+    const esc = (e: globalThis.KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
     document.addEventListener("mousedown", away);
-    document.addEventListener("keydown", esc as unknown as EventListener);
+    document.addEventListener("keydown", esc);
     return () => {
       document.removeEventListener("mousedown", away);
-      document.removeEventListener("keydown", esc as unknown as EventListener);
+      document.removeEventListener("keydown", esc);
     };
   }, [open]);
 
