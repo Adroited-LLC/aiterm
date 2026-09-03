@@ -440,6 +440,47 @@ pub(crate) fn parse_session_model(json: &str) -> Option<(String, String)> {
 /// archived session is still OpenCode's even though it does not appear in the
 /// sidebar, and claiming otherwise would send it to whichever backend guessed
 /// next.
+/// Is the session's newest assistant message still an open turn?
+///
+/// OpenCode writes `time.completed` onto the assistant message when the turn
+/// ends; while the model is answering the field is NULL and the row updates as
+/// parts stream in. [observed: opencode 1.18.25, read off the db at 1s polling
+/// through a 40s turn]
+///
+/// The answer is `(turn_open, directory)` rather than a verdict, because the
+/// NULL alone must not be believed: a killed run leaves `time.completed` NULL
+/// forever, so the caller pairs it with process liveness — and the directory
+/// is what a fresh launch (whose argv names no session id yet) can be matched
+/// by.
+pub(crate) fn open_turn(session_id: &str) -> Option<(bool, Option<String>)> {
+    if !valid_id(session_id) {
+        return None;
+    }
+    let sql = format!(
+        "select (json_extract(m.data, '$.time.completed') is null) as open, \
+                s.directory as directory \
+         from message m join session s on s.id = m.session_id \
+         where m.session_id = '{session_id}' \
+           and json_extract(m.data, '$.role') = 'assistant' \
+         order by m.time_created desc limit 1"
+    );
+    query(&sql).and_then(|json| parse_open_turn(&json))
+}
+
+/// sqlite3's JSON for the query above → `(turn_open, directory)`. No assistant
+/// row yet — a session before its first reply — is no answer, not "idle": the
+/// caller falls through to whatever other signals it has.
+pub(crate) fn parse_open_turn(json: &str) -> Option<(bool, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        open: Option<i64>,
+        directory: Option<String>,
+    }
+    let rows: Vec<Row> = serde_json::from_str(json.trim()).ok()?;
+    let r = rows.into_iter().next()?;
+    Some((r.open == Some(1), r.directory))
+}
+
 pub fn has_session(session_id: &str) -> bool {
     if !valid_id(session_id) {
         return false;

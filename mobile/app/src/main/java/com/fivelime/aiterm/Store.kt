@@ -13,9 +13,27 @@ data class Desktop(
     val candidates: List<String> = listOf(baseUrl),
     /** SHA-256 of the desktop's certificate, hex. The only thing we trust. */
     val fingerprint: String = "",
+    /** iroh node id, for reaching this desktop when no address works. */
+    val iroh: String = "",
+    /** AITerm Relay route for this desktop's phone listener; "" / 0 = none
+     *  enrolled. Refreshed from every status answer. */
+    val relayHost: String = "",
+    val relayPort: Int = 0,
+    /** The roads to try, most preferred first — see Roads.kt. A desktop
+     *  stored before roads existed gets the default and never notices. */
+    val roadOrder: List<String> = DEFAULT_ROAD_ORDER,
+    /** The person set `roadOrder` here, on the phone. Until they do, the
+     *  order follows what the desktop publishes in every status answer;
+     *  "Use desktop's order" in Settings clears this. Entries stored
+     *  before the flag existed follow the desktop. */
+    val roadOrderCustom: Boolean = false,
 ) {
     /** The address that answered last, then the rest in the QR's order. */
     val ordered: List<String> get() = listOf(baseUrl) + candidates.filter { it != baseUrl }
+    /** The relay dial, or null when no route is enrolled. */
+    val relayUrl: String? get() = if (relayHost.isNotEmpty() && relayPort in 1..65535) "https://${bracket(relayHost)}:$relayPort" else null
+
+    private fun bracket(host: String) = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
 }
 
 /** Private app storage. The tokens are the only secrets; they never leave

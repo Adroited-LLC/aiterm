@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,7 +24,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
@@ -38,8 +39,14 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.DropdownMenu
@@ -52,13 +59,24 @@ import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.RadioButton
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -69,8 +87,23 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
+import com.fivelime.aiterm.Diag
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
+import kotlinx.coroutines.flow.first
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -78,22 +111,47 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.vector.ImageVector
 import com.fivelime.aiterm.AppViewModel
+import com.fivelime.aiterm.Item
 import com.fivelime.aiterm.Session
 import com.fivelime.aiterm.ModelOption
-import com.fivelime.aiterm.Turn
+import com.fivelime.aiterm.SpinePhase
+import com.fivelime.aiterm.ToolCategory
+import com.fivelime.aiterm.ToolStatus
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     val open = s.id in vm.open
     val running = s.id in vm.running
-    val state = vm.stateOf(s)
+    // The spine carries the phase on the same stream as the content, so it
+    // moves with the transcript instead of trailing a list refresh. It only
+    // speaks up when it has something to say: idle falls back to the list's
+    // own view, which knows about on-desktop, running, and a just-sent
+    // message the desktop has not reported yet.
+    val state = when (vm.phase) {
+        SpinePhase.Working -> SessionState.Working
+        SpinePhase.NeedsYou -> SessionState.NeedsYou
+        SpinePhase.Idle -> vm.stateOf(s)
+    }
     val working = state == SessionState.Working
     var draft by remember(s.id) { mutableStateOf("") }
+    // A long-pressed message: its actions come up in a sheet.
+    var heldItem by remember(s.id) { mutableStateOf<Item?>(null) }
+    heldItem?.let { held ->
+        // "Ask again" on an answer resends the last thing the person said
+        // before it.
+        val promptAbove = if (held is Item.AgentText) {
+            val at = vm.items.indexOfFirst { it.key == held.key }
+            (vm.items.take(maxOf(at, 0)).lastOrNull { it is Item.User } as? Item.User)?.let { personSaid(it.text) }?.takeIf { it.isNotEmpty() }
+        } else null
+        MessageSheet(held, promptAbove, onDismiss = { heldItem = null }, onEdit = { draft = it }, onSend = { vm.send(it) })
+    }
     var menu by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf(false) }
     var bringingIn by remember { mutableStateOf(false) }
@@ -105,15 +163,80 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     }
     val list = rememberLazyListState()
 
-    // New content lands at the bottom, where the eye is. The working row is
-    // one extra item past the last turn.
-    LaunchedEffect(vm.turns.size, working) {
-        val n = vm.turns.size + (if (working) 1 else 0)
-        if (n > 0) list.animateScrollToItem(n - 1)
+    val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
+
+    // The list is PINNED to its end, the way a chat is: whatever moves the
+    // end out of view — the first fill landing a frame before the layout,
+    // a block growing as it streams, a thumbnail or a table taking its
+    // height a frame late, and above all the viewport SHRINKING after the
+    // landing: a crew banner or the relay banner arriving in the bottom
+    // bar a beat after open, the quick keys when the session needs you,
+    // the keyboard — is followed, so long as no finger is on the list. The
+    // bottom-bar case was the one that hid: nothing in the list changed,
+    // so the old follow (keyed on the items) never fired, and a session
+    // that had opened at its end sat a banner's height short of it on
+    // every harness [observed 2026-09-03].
+    //
+    // A person scrolling up into history unpins; scrolling back to the
+    // end (or the Newest pill) pins again. And the list stays INVISIBLE
+    // until a real layout says it is at the end — the first frame is drawn
+    // before the jump lands, and the top of the transcript used to flash
+    // by on every open.
+    var landed by remember(s.id) { mutableStateOf(false) }
+    var pinned by remember(s.id) { mutableStateOf(true) }
+    var seenViewport by remember(s.id) { mutableStateOf(-1) }
+    fun atEnd(): Boolean {
+        val info = list.layoutInfo
+        val last = info.visibleItemsInfo.lastOrNull() ?: return info.totalItemsCount == 0
+        return last.index == info.totalItemsCount - 1 && last.offset + last.size <= info.viewportEndOffset + 1
+    }
+    // A scroll that ends away from the end unpins; one that ends at it pins.
+    LaunchedEffect(s.id) {
+        snapshotFlow { list.isScrollInProgress }.collect { moving -> if (!moving) pinned = atEnd() }
+    }
+    LaunchedEffect(s.id) {
+        snapshotFlow { vm.items.size }.first { it > 0 }
+        val start = withFrameNanos { it }
+        // Whatever the layout is doing, half a second of blank is the most
+        // a person should wait to see their session.
+        launch { while (!landed) { if (withFrameNanos { it } - start > 500_000_000L) landed = true } }
+        snapshotFlow {
+            val info = list.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            // Everything that can move the end: how many items, the last
+            // visible one's place and extent, and the viewport itself.
+            listOf(info.totalItemsCount, last?.index ?: -1, last?.let { it.offset + it.size } ?: 0,
+                info.viewportStartOffset, info.viewportEndOffset)
+        }.collect {
+            val total = list.layoutInfo.totalItemsCount
+            if (total == 0 || list.isScrollInProgress) return@collect
+            if (atEnd()) { landed = true; return@collect }
+            if (!pinned) return@collect
+            // Land on the END of the last item: a block taller than the
+            // screen shows its newest words, not its first.
+            val info = list.layoutInfo
+            val end = info.visibleItemsInfo.firstOrNull { it.index == total - 1 }
+            val viewport = info.viewportEndOffset - info.viewportStartOffset
+            val offset = ((end?.size ?: 0) - viewport).coerceAtLeast(0)
+            // The first landing, and every later correction that came with a
+            // viewport change (a banner, the keyboard), on the record: this is
+            // the trail for "it opened short of the bottom".
+            val last = info.visibleItemsInfo.lastOrNull()
+            if (!landed || viewport != seenViewport) Diag.log(
+                "land", "${s.id.take(8)} total=$total last=${last?.index}@${last?.let { it.offset + it.size }}/${info.viewportEndOffset} " +
+                    "viewport=$viewport (was $seenViewport) lastSize=${end?.size} offset=$offset ${if (landed) "correct" else "first"}",
+            )
+            seenViewport = viewport
+            // Before the first landing, jump; after it, glide — that is a
+            // block growing under the eye, and a jump every token jitters.
+            if (!landed) list.scrollToItem(total - 1, offset) else list.animateScrollToItem(total - 1, offset)
+        }
     }
 
+    // Where the composer sits, so a tap there keeps the keyboard.
+    var barBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
     Scaffold(
-        modifier = Modifier.padding(outer).imePadding().dismissKeyboardOnTap(),
+        modifier = Modifier.padding(outer).imePadding().dismissKeyboardOnTapOutside { barBounds },
         containerColor = Bg,
         topBar = {
             TopAppBar(
@@ -177,7 +300,7 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
             )
         },
         bottomBar = {
-            Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
+            Column(Modifier.fillMaxWidth().navigationBarsPadding().onGloballyPositioned { barBounds = it.boundsInRoot() }) {
             vm.relays[s.id]?.let { r -> RelayBanner(vm, s, r) }
             // A brought-in agent parked on a prompt is invisible from here —
             // its dialog lives in its own terminal. Say so on the master's
@@ -217,28 +340,109 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
             }
             }
         },
-    ) { padding ->
+    ) { outerPad ->
+        Column(Modifier.fillMaxSize().padding(outerPad)) {
+        CrewStrip(vm, s)
+        val padding = PaddingValues(0.dp)
+        Box(Modifier.weight(1f)) {
         if (vm.showFiles) {
             FilesList(vm, Modifier.padding(padding))
-        } else if (vm.turns.isEmpty()) {
+        } else if (vm.items.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                 if (vm.loadingTurns) CircularProgressIndicator() else Text("Nothing here yet — say something.", color = Muted)
             }
         } else {
-            LazyColumn(
-                state = list,
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                itemsIndexed(vm.turns) { _, t -> TurnView(t, onOpenPath = vm::openMentioned) }
-                // What the session made, right where the conversation ends —
-                // the transcript often never prints a path (tool output is
-                // dropped at phone size), but the desktop's ledger knows.
-                val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
-                if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
-                if (working) item(key = "working") { WorkingRow(s.agent) }
+            // A LazyColumn draws no scrollbar, so a long transcript gives no
+            // sense of place. Two quiet cues: a thin thumb along the right
+            // edge while scrolling — its height says how much there is, its
+            // position says where you are — and a pill at the foot whenever
+            // the newest message is out of sight, one tap from the end.
+            val scope = rememberCoroutineScope()
+            val thumbColor = Muted
+            val thumbAlpha by animateFloatAsState(
+                targetValue = if (list.isScrollInProgress) 0.5f else 0f,
+                animationSpec = tween(if (list.isScrollInProgress) 80 else 900),
+                label = "thumb",
+            )
+            // Pixel truth for the thumb: remember the real height of every
+            // message the list has laid out, estimate the unseen with the
+            // running average, and place the thumb by pixels — not by item
+            // counts, which jump with every tall or short message and made
+            // the thumb breathe and jitter. Plain map, not state: it feeds
+            // the next draw, it never drives recomposition.
+            val heights = remember(s.id) { HashMap<Int, Int>() }
+            val spacingPx = with(androidx.compose.ui.platform.LocalDensity.current) { 8.dp.toPx() }
+            val awayFromEnd by remember {
+                derivedStateOf {
+                    val info = list.layoutInfo
+                    val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+                    info.totalItemsCount > 0 && last < info.totalItemsCount - 1
+                }
             }
+            Box(Modifier.fillMaxSize().padding(padding)) {
+                LazyColumn(
+                    state = list,
+                    modifier = Modifier.fillMaxSize().graphicsLayer { alpha = if (landed) 1f else 0f }.drawWithContent {
+                        drawContent()
+                        val info = list.layoutInfo
+                        val total = info.totalItemsCount
+                        for (it in info.visibleItemsInfo) heights[it.index] = it.size
+                        val first = info.visibleItemsInfo.firstOrNull()
+                        if (thumbAlpha > 0f && first != null && total > info.visibleItemsInfo.size) {
+                            var knownSum = 0L; var knownN = 0
+                            for ((i, hgt) in heights) if (i < total) { knownSum += hgt; knownN++ }
+                            val avg = if (knownN > 0) knownSum.toFloat() / knownN else 0f
+                            val contentPx = knownSum + avg * (total - knownN) + spacingPx * (total - 1)
+                            val viewport = (info.viewportEndOffset - info.viewportStartOffset).toFloat()
+                            if (contentPx > viewport) {
+                                var before = -first.offset.toFloat()
+                                for (i in 0 until first.index) before += (heights[i]?.toFloat() ?: avg) + spacingPx
+                                val h = (size.height * viewport / contentPx).coerceIn(32.dp.toPx(), size.height * 0.9f)
+                                val progress = (before / (contentPx - viewport)).coerceIn(0f, 1f)
+                                drawRoundRect(
+                                    color = thumbColor,
+                                    topLeft = Offset(size.width - 7.dp.toPx(), progress * (size.height - h)),
+                                    size = Size(3.dp.toPx(), h),
+                                    cornerRadius = CornerRadius(2.dp.toPx()),
+                                    alpha = thumbAlpha,
+                                )
+                            }
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    // Keyed by the spine's own ids: a block that grows
+                    // updates one row in place, it does not re-key the list
+                    // under the scroll position.
+                    items(vm.items, key = { it.key }) { item -> ItemView(item, onOpenPath = vm::openMentioned, onHold = { heldItem = it }) }
+                    // What the session made, right where the conversation ends —
+                    // the transcript often never prints a path (tool output is
+                    // dropped at phone size), but the desktop's ledger knows.
+                    if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
+                    if (working) item(key = "working") { WorkingRow(s.agent, vm.phaseDetail) }
+                }
+                if (awayFromEnd) {
+                    Row(
+                        Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(Surface2)
+                            .clickable {
+                                scope.launch {
+                                    val end = list.layoutInfo.totalItemsCount - 1
+                                    if (end >= 0) list.animateScrollToItem(end)
+                                }
+                            }
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Newest", style = MaterialTheme.typography.labelMedium, color = Muted)
+                        Icon(Icons.Filled.KeyboardArrowDown, "Jump to newest", tint = Muted, modifier = Modifier.size(18.dp))
+                    }
+                }
+            }
+        }
+        }
         }
     }
 }
@@ -283,7 +487,7 @@ fun StartingScreen(vm: AppViewModel, s: AppViewModel.Starting, outer: PaddingVal
                     ) { Text(s.prompt, color = MaterialTheme.colorScheme.onPrimaryContainer) }
                 }
             }
-            WorkingRow(s.agentName)
+            WorkingRow(s.agentId)
         }
     }
 }
@@ -340,8 +544,12 @@ private fun QuickKeysBar(onKey: (String) -> Unit) {
 /** Three dots that breathe. Shown while the desktop reports progress, or
  *  right after a message goes out — before the first progress arrives. */
 @Composable
-private fun WorkingRow(agent: String) {
+private fun WorkingRow(agent: String, detail: String = "") {
     Row(Modifier.padding(start = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        // The engine's own mark leads the row: in a session where a second
+        // agent was brought in, "working" needs a face.
+        AgentIcon(agent, 16.dp)
+        Spacer(Modifier.width(8.dp))
         val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "dots")
         val phase by t.animateFloat(0f, 3f, androidx.compose.animation.core.infiniteRepeatable(
             androidx.compose.animation.core.tween(900, easing = androidx.compose.animation.core.LinearEasing)), label = "phase")
@@ -350,16 +558,16 @@ private fun WorkingRow(agent: String) {
             Box(Modifier.padding(horizontal = 2.dp).size(7.dp).background(Amber.copy(alpha = if (on) 1f else 0.3f), RoundedCornerShape(50)))
         }
         Spacer(Modifier.width(8.dp))
-        Text("$agent is working…", style = MaterialTheme.typography.labelMedium, color = Muted)
+        Text(
+            detail.ifBlank { "$agent is working…" }, style = MaterialTheme.typography.labelMedium,
+            color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
-/** A user turn sits right in the accent colour, the assistant left on a
- *  card, and anything else — a tool call, a system line — is small, dim and
- *  monospace, folded until tapped. */
 /** Codex folds its AGENTS.md and an environment block into the first user
  *  turn; the person only typed the last line. Hide the harness's part. */
-private val HARNESS_BLOCKS = Regex("(?s)<(INSTRUCTIONS|environment_context|user_instructions)>.*?</\\1>\\s*")
+private val HARNESS_BLOCKS = Regex("(?s)<(INSTRUCTIONS|environment_context|user_instructions|recommended_plugins)>.*?</\\1>\\s*")
 private val HARNESS_HEADING = Regex("(?m)^#\\s*AGENTS\\.md instructions for \\S+\\s*$")
 /** What the person typed, with the harness's preamble gone. Empty means
  *  the whole turn was scaffolding — codex sends AGENTS.md as its own
@@ -378,70 +586,146 @@ private fun mentionedFiles(text: String): List<String> =
     }.distinct().take(6).toList()
 
 @Composable
-private fun TurnView(t: Turn, onOpenPath: (String) -> Unit = {}) {
-    // Long-press selects within a turn; taps (chips, tool-card folds,
-    // links) still work as taps.
-    androidx.compose.foundation.text.selection.SelectionContainer {
-        TurnBody(t, onOpenPath)
+private fun ItemView(item: Item, onOpenPath: (String) -> Unit = {}, onHold: (Item) -> Unit = {}) {
+    // A long press on any row brings up its actions — copy, copy as
+    // markdown, select text, share, and for the person's own message, edit
+    // and send again. Taps (chips, tool-card folds, links) still work.
+    when (item) {
+        is Item.User -> UserBubble(item) { onHold(item) }
+        is Item.AgentText -> AgentBlock(item, onOpenPath) { onHold(item) }
+        is Item.Thought -> ThoughtBlock(item) { onHold(item) }
+        is Item.Tool -> ToolCard(item) { onHold(item) }
+        // A turn boundary: a hairline, so a long session reads as
+        // exchanges rather than one wall.
+        is Item.TurnEnd -> HorizontalDivider(
+            Modifier.padding(vertical = 4.dp),
+            color = Muted.copy(alpha = if (item.reason == "completed") 0.12f else 0.3f),
+        )
+    }
+}
+
+/** A user turn sits right in the accent colour. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun UserBubble(item: Item.User, onHold: () -> Unit) {
+    val said = personSaid(item.text)
+    if (said.isEmpty()) return
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+        Box(
+            Modifier.widthIn(max = 320.dp)
+                .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp))
+                .combinedClickable(onClick = {}, onLongClick = onHold)
+                .padding(12.dp),
+        ) { MarkdownText(said, color = MaterialTheme.colorScheme.onPrimaryContainer) }
+    }
+}
+
+/** The assistant, left, on the ground itself. A block still being written
+ *  carries a cursor: the spine says `done:false` while more is coming, and
+ *  without it a half-sentence reads as a finished thought. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun AgentBlock(item: Item.AgentText, onOpenPath: (String) -> Unit, onHold: () -> Unit) {
+    Column(Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClick = onHold).padding(end = 12.dp)) {
+        MarkdownText(item.text)
+        if (!item.done) Caret()
+        val paths = remember(item.text) { mentionedFiles(item.text) }
+        if (paths.isNotEmpty()) Row(
+            Modifier.padding(top = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            paths.forEach { p -> FileChip(p.substringAfterLast('/'), onClick = { onOpenPath(p) }) }
+        }
     }
 }
 
 @Composable
-private fun TurnBody(t: Turn, onOpenPath: (String) -> Unit) {
-    when (t.role) {
-        "user" -> {
-            val said = personSaid(t.text)
-            if (said.isNotEmpty()) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-                Box(
-                    Modifier.widthIn(max = 320.dp).background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp)).padding(12.dp),
-                ) { MarkdownText(said, color = MaterialTheme.colorScheme.onPrimaryContainer) }
-            }
-        }
-        "assistant" -> Column(Modifier.fillMaxWidth().padding(end = 12.dp)) {
-            MarkdownText(t.text)
-            val paths = remember(t.text) { mentionedFiles(t.text) }
-            if (paths.isNotEmpty()) Row(
-                Modifier.padding(top = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                paths.forEach { p -> FileChip(p.substringAfterLast('/'), onClick = { onOpenPath(p) }) }
-            }
-        }
-        "system" -> Text(t.text, style = MaterialTheme.typography.labelSmall, color = Muted,
-            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp), maxLines = 2, overflow = TextOverflow.Ellipsis)
-        // The agent's reasoning summary: quiet, italic, folded to a line.
-        "thinking" -> {
-            var expanded by remember { mutableStateOf(false) }
-            Text(
-                t.text, style = MaterialTheme.typography.bodySmall, color = Muted,
-                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
-                maxLines = if (expanded) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 4.dp, vertical = 2.dp),
-            )
-        }
-        else -> {
-            // A tool call: its name and the first line, the rest on tap.
-            var expanded by remember { mutableStateOf(false) }
-            val first = t.text.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: ""
-            Column(
-                Modifier.fillMaxWidth().background(Surface1.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
-                    .clickable { expanded = !expanded }.padding(horizontal = 10.dp, vertical = 8.dp),
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Build, null, tint = Accent, modifier = Modifier.size(14.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(t.role, style = MaterialTheme.typography.labelMedium, color = Accent)
-                    Spacer(Modifier.width(8.dp))
-                    if (!expanded) Text(first, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace,
-                        color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                if (expanded) Text(
-                    t.text, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Muted,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
-            }
-        }
+private fun Caret() {
+    val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "caret")
+    val a by t.animateFloat(
+        initialValue = 0.15f, targetValue = 0.9f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            androidx.compose.animation.core.tween(650), androidx.compose.animation.core.RepeatMode.Reverse),
+        label = "blink",
+    )
+    Box(Modifier.padding(top = 2.dp).size(width = 7.dp, height = 14.dp).background(Accent.copy(alpha = a), RoundedCornerShape(2.dp)))
+}
+
+/** The agent's reasoning: quiet, italic, folded to a line. Folded, the
+ *  markdown marks come off so `**Checking the request**` reads as words;
+ *  opened, it renders like any answer. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ThoughtBlock(item: Item.Thought, onHold: () -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val mod = Modifier.fillMaxWidth().combinedClickable(onClick = { expanded = !expanded }, onLongClick = onHold).padding(horizontal = 4.dp, vertical = 2.dp)
+    if (expanded) {
+        Box(mod) { MarkdownText(item.text, color = Muted) }
+    } else {
+        Text(
+            remember(item.text) { markdownPlain(item.text).replace('\n', ' ') },
+            style = MaterialTheme.typography.bodySmall, color = Muted,
+            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+            maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = mod,
+        )
     }
+}
+
+/** A tool call, live: the mark its category earns, what it was asked to do,
+ *  and where it stands. The output is folded behind a tap — the desktop
+ *  already clipped it, but a phone screen is not where a diff belongs. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ToolCard(item: Item.Tool, onHold: () -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val output = item.output?.takeIf { it.isNotBlank() }
+    Column(
+        Modifier.fillMaxWidth().background(Surface1.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+            .combinedClickable(onClick = { if (output != null) expanded = !expanded }, onLongClick = onHold)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(toolIcon(item.category), null, tint = Accent, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                item.title.ifBlank { item.tool }, style = MaterialTheme.typography.labelMedium,
+                color = Accent, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            // The mark sits at the right edge, one column down the card.
+            ToolMark(item.status)
+        }
+        if (item.input.isNotBlank()) Text(
+            item.input, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace,
+            color = Muted, maxLines = if (expanded) 6 else 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 3.dp),
+        )
+        if (expanded && output != null) Text(
+            output, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Muted,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+    }
+}
+
+private fun toolIcon(c: ToolCategory): ImageVector = when (c) {
+    ToolCategory.Read -> Icons.Filled.Description
+    ToolCategory.Edit -> Icons.Filled.Edit
+    ToolCategory.Execute -> Icons.Filled.Terminal
+    ToolCategory.Search -> Icons.Filled.Search
+    ToolCategory.Fetch -> Icons.Filled.Language
+    ToolCategory.Think -> Icons.Filled.Psychology
+    ToolCategory.Other -> Icons.Filled.Build
+}
+
+/** Where a call stands, in the width of a dot: breathing while it runs, a
+ *  tick when it lands, red when it did not. */
+@Composable
+private fun ToolMark(status: ToolStatus) = when (status) {
+    ToolStatus.Pending, ToolStatus.Running -> PulsingDot(Amber)
+    ToolStatus.Completed -> Icon(Icons.Filled.Check, "done", tint = Green, modifier = Modifier.size(14.dp))
+    ToolStatus.Failed -> Icon(Icons.Filled.Close, "failed", tint = Red, modifier = Modifier.size(14.dp))
+    ToolStatus.Cancelled -> Dot(Muted)
 }
 
 /** A small tappable pill for a file the conversation mentions. */
@@ -498,9 +782,11 @@ private fun ImageCard(vm: AppViewModel, f: FileEntry) {
     }
 }
 
-/** Who joins, what they look at, how long they talk — a bottom sheet,
- *  full width, nothing crushed. The desktop runs the relay; the whole
- *  exchange appears in this conversation, live. */
+/** Who joins, what they look at, how long they talk — a bottom sheet
+ *  built for a thumb: the choices are steps down a card, the note to them
+ *  sits last so the keyboard has it in view, the body scrolls, and the
+ *  button stays put beneath it whatever the keyboard does. The desktop
+ *  runs the relay; the whole exchange appears in this conversation, live. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun BringInDialog(vm: AppViewModel, s: Session, onDismiss: () -> Unit) {
@@ -510,122 +796,102 @@ private fun BringInDialog(vm: AppViewModel, s: Session, onDismiss: () -> Unit) {
     var focus by remember { mutableStateOf("") }
     var rounds by remember { mutableStateOf(2) }
     var auto by remember { mutableStateOf(false) }
+    var modelPicker by remember { mutableStateOf(false) }
     // API choices (OpenRouter et al) need a model; CLIs default to their own.
     val sel = vm.agents.firstOrNull { it.id == agentId }
     var model by remember(agentId) {
         mutableStateOf(if (agentId.startsWith("api:")) vm.agents.firstOrNull { it.id == agentId }?.models?.firstOrNull()?.id else null)
     }
+    val host = s.agent.replaceFirstChar { it.uppercase() }
+    val lengths = listOf(
+        "1" to "Quick — they read the session and write once",
+        "2" to "Normal — they write, $host replies, they answer",
+        "3" to "Long — two replies back and forth",
+    )
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = Surface1,
     ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
-            Text("Bring in a second agent", style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "They read this chat and talk it out with ${s.agent.replaceFirstChar { it.uppercase() }} right here. No files change; you decide after.",
-                style = MaterialTheme.typography.bodySmall, color = Muted,
-            )
-            Spacer(Modifier.height(16.dp))
-            vm.agents.forEach { a ->
-                Row(
-                    Modifier.fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(if (agentId == a.id) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f) else Color.Transparent)
-                        .clickable { agentId = a.id }
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    AgentIcon(a.id, 24.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Text(a.display_name, style = MaterialTheme.typography.bodyLarge)
-                    if (a.id == s.agent) {
-                        Spacer(Modifier.width(8.dp))
-                        Text("already here", style = MaterialTheme.typography.labelSmall, color = Muted)
-                    }
-                    Spacer(Modifier.weight(1f))
-                    RadioButton(selected = agentId == a.id, onClick = { agentId = a.id })
-                }
-            }
-            if (!sel?.models.isNullOrEmpty()) {
-                Spacer(Modifier.height(6.dp))
-                var modelPicker by remember { mutableStateOf(false) }
-                Row(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable { modelPicker = true }
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("Model", style = MaterialTheme.typography.labelMedium, color = Muted)
-                    Spacer(Modifier.weight(1f))
-                    model?.let { AgentIcon(modelBrand(it, agentId.removePrefix("api:")), 16.dp); Spacer(Modifier.width(6.dp)) }
-                    Text(
-                        sel!!.models.firstOrNull { it.id == model }?.display_name ?: "Default",
-                        style = MaterialTheme.typography.bodyMedium,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    )
-                    Icon(Icons.Filled.KeyboardArrowDown, null, tint = Muted)
-                }
-                if (modelPicker) {
-                    ModelPickerSheet(
-                        models = sel.models,
-                        fallbackBrand = agentId.removePrefix("api:"),
-                        allowDefault = !agentId.startsWith("api:"),
-                        onPick = { model = it; modelPicker = false },
-                        onDismiss = { modelPicker = false },
-                    )
-                }
-            }
-            Spacer(Modifier.height(14.dp))
-            OutlinedTextField(
-                value = focus, onValueChange = { focus = it },
-                placeholder = { Text("What should they look at? (optional)", color = Muted) },
-                minLines = 2, maxLines = 4,
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(16.dp))
-            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                listOf(1 to "Quick", 2 to "Normal", 3 to "Long").forEachIndexed { i, (n, label) ->
-                    SegmentedButton(
-                        selected = rounds == n,
-                        onClick = { rounds = n },
-                        shape = SegmentedButtonDefaults.itemShape(i, 3),
-                    ) { Text(label) }
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-            Text(
-                when (rounds) {
-                    1 -> "They speak once; the agent answers."
-                    2 -> "One exchange, then a reply back."
-                    else -> "Three full exchanges."
-                },
-                style = MaterialTheme.typography.labelSmall, color = Muted,
-                modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-            )
-            Spacer(Modifier.height(12.dp))
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable { auto = !auto }
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        Column(Modifier.fillMaxWidth().imePadding().navigationBarsPadding()) {
+            Column(
+                Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text("Auto-continue", style = MaterialTheme.typography.bodyMedium)
-                    Text(
-                        "When they finish, ${s.agent.replaceFirstChar { it.uppercase() }} acts on the outcome without waiting for you",
-                        style = MaterialTheme.typography.labelSmall, color = Muted,
-                    )
+                Text("Bring in a second agent", style = MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "They read this chat and talk it out with $host right here. No files change; you decide after.",
+                    style = MaterialTheme.typography.bodySmall, color = Muted,
+                )
+                Spacer(Modifier.height(16.dp))
+                Column(
+                    Modifier.fillMaxWidth().background(Bg, RoundedCornerShape(18.dp)).padding(horizontal = 14.dp, vertical = 4.dp),
+                ) {
+                    ChoiceRow("Agent") {
+                        PickerChip(
+                            label = sel?.display_name ?: "Choose",
+                            options = vm.agents.map { it.id to (if (it.id == s.agent) "${it.display_name}  ·  already here" else it.display_name) },
+                            onPick = { agentId = it },
+                            leading = { AgentIcon(agentId, 16.dp) },
+                            icon = { id -> AgentIcon(id, 20.dp) },
+                        )
+                    }
+                    if (!sel?.models.isNullOrEmpty()) {
+                        HorizontalDivider(color = Surface2)
+                        ChoiceRow("Model") {
+                            ChipButton(
+                                label = sel!!.models.firstOrNull { it.id == model }?.display_name ?: "Default",
+                                onClick = { modelPicker = true },
+                                leading = model?.let { { AgentIcon(modelBrand(it, agentId.removePrefix("api:")), 16.dp) } },
+                            )
+                        }
+                    }
+                    HorizontalDivider(color = Surface2)
+                    ChoiceRow("Length") {
+                        PickerChip(
+                            label = lengths.first { it.first == rounds.toString() }.second.substringBefore(" —"),
+                            options = lengths,
+                            onPick = { rounds = it.toInt() },
+                        )
+                    }
+                    HorizontalDivider(color = Surface2)
+                    ChoiceRow("Auto-approve") {
+                        androidx.compose.material3.Switch(checked = auto, onCheckedChange = { auto = it })
+                    }
                 }
-                androidx.compose.material3.Switch(checked = auto, onCheckedChange = { auto = it })
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (auto) "When they finish, $host proceeds as approved instead of waiting for you."
+                    else "When they finish, $host waits for you before going on.",
+                    style = MaterialTheme.typography.labelSmall, color = Muted,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                )
+                Spacer(Modifier.height(14.dp))
+                OutlinedTextField(
+                    value = focus, onValueChange = { focus = it },
+                    label = { Text("What should they look at?") },
+                    placeholder = { Text("Optional", color = Muted) },
+                    minLines = 2, maxLines = 5,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
             }
-            Spacer(Modifier.height(12.dp))
             Button(
                 onClick = { vm.bringIn(s, agentId, model, focus.trim(), rounds, auto); onDismiss() },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 12.dp),
                 shape = RoundedCornerShape(14.dp),
             ) { Text("Bring them in", modifier = Modifier.padding(vertical = 4.dp)) }
         }
+    }
+    if (modelPicker && sel != null) {
+        ModelPickerSheet(
+            models = sel.models,
+            fallbackBrand = agentId.removePrefix("api:"),
+            allowDefault = !agentId.startsWith("api:"),
+            onPick = { model = it; modelPicker = false },
+            onDismiss = { modelPicker = false },
+        )
     }
 }
 
@@ -721,6 +987,150 @@ private fun RelayBanner(vm: AppViewModel, s: Session, r: com.fivelime.aiterm.Rel
         if (finished) {
             IconButton(onClick = { vm.dismissRelay(s.id) }, modifier = Modifier.size(28.dp)) {
                 Icon(Icons.Filled.Close, "Dismiss", tint = Muted, modifier = Modifier.size(14.dp))
+            }
+        }
+    }
+}
+
+
+/** What a held message can do. Copy takes the words (marks off), Copy as
+ *  markdown takes it as written, Select text opens it for a partial
+ *  selection, Share hands it to another app. The person's own message can
+ *  be edited — it lands in the composer to change and send again — or sent
+ *  again as it was; an answer can be asked for again, which sends the
+ *  prompt above it once more. None of these rewrite history: every harness
+ *  here is a CLI whose transcript only grows, so "edit" is a new turn. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MessageSheet(
+    item: Item, promptAbove: String?, onDismiss: () -> Unit,
+    onEdit: (String) -> Unit, onSend: (String) -> Unit,
+) {
+    val clipboard = LocalClipboard.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var selecting by remember { mutableStateOf(false) }
+    val raw = when (item) {
+        is Item.User -> personSaid(item.text)
+        is Item.AgentText -> item.text
+        is Item.Thought -> item.text
+        is Item.Tool -> listOfNotNull(item.title.ifBlank { item.tool }, item.input.takeIf { it.isNotBlank() }, item.output?.takeIf { it.isNotBlank() }).joinToString("\n\n")
+        is Item.TurnEnd -> ""
+    }
+    val plain = if (item is Item.Tool) raw else markdownPlain(raw)
+    val who = when (item) {
+        is Item.User -> "You"
+        is Item.AgentText -> "Answer"
+        is Item.Thought -> "Reasoning"
+        is Item.Tool -> item.title.ifBlank { item.tool }
+        is Item.TurnEnd -> ""
+    }
+    fun copy(text: String, what: String) {
+        scope.launch {
+            clipboard.setClipEntry(ClipEntry(android.content.ClipData.newPlainText("aiterm", text)))
+            android.widget.Toast.makeText(context, "Copied $what", android.widget.Toast.LENGTH_SHORT).show()
+            onDismiss()
+        }
+    }
+    fun share() {
+        val i = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"; putExtra(android.content.Intent.EXTRA_TEXT, raw)
+        }
+        context.startActivity(android.content.Intent.createChooser(i, null))
+        onDismiss()
+    }
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = Surface1,
+    ) {
+        Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
+            if (selecting) {
+                // The whole message, rendered, every word selectable: the
+                // system's own handles and Copy do the rest.
+                Row(Modifier.padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Select text", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { selecting = false }) { Icon(Icons.Filled.Close, "Back") }
+                }
+                androidx.compose.foundation.text.selection.SelectionContainer(
+                    Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
+                ) {
+                    if (item is Item.Tool) Text(raw, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    else MarkdownText(raw)
+                }
+                Spacer(Modifier.height(12.dp))
+                return@Column
+            }
+            Column(Modifier.padding(horizontal = 20.dp)) {
+                Text(who, style = MaterialTheme.typography.labelMedium, color = Muted)
+                Text(
+                    plain.replace('\n', ' '), style = MaterialTheme.typography.bodySmall, color = Muted,
+                    maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            val rowColors = ListItemDefaults.colors(containerColor = Color.Transparent)
+            @Composable fun action(label: String, icon: ImageVector, detail: String? = null, onClick: () -> Unit) = ListItem(
+                headlineContent = { Text(label) },
+                supportingContent = detail?.let { { Text(it, color = Muted, style = MaterialTheme.typography.bodySmall) } },
+                leadingContent = { Icon(icon, null, tint = Accent) },
+                colors = rowColors,
+                modifier = Modifier.clickable(onClick = onClick),
+            )
+            if (item is Item.User) {
+                action("Edit and send again", Icons.Filled.Edit, "Opens in the composer — the original stays as it was") { onEdit(raw); onDismiss() }
+                action("Send again", Icons.Filled.Replay) { onSend(raw); onDismiss() }
+            }
+            if (item is Item.AgentText && promptAbove != null) {
+                action("Ask again", Icons.Filled.Replay, "Sends the prompt above this answer once more") { onSend(promptAbove); onDismiss() }
+            }
+            action(if (item is Item.Tool) "Copy" else "Copy text", Icons.Filled.ContentCopy) { copy(plain, "text") }
+            if (item !is Item.Tool) action("Copy as markdown", Icons.Filled.Code, "As the agent wrote it, marks and all") { copy(raw, "markdown") }
+            action("Select text", Icons.Filled.SelectAll) { selecting = true }
+            action("Share", Icons.Filled.Share) { share() }
+            Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
+
+/** The session's workspace as a row of tabs: the conversation the crew
+ *  gathers around, then every agent brought into it — one tap moves between
+ *  them, the way the desktop nests them under one tab. A dot says who is
+ *  working (accent) or waiting on you (amber). Only drawn when there is a
+ *  crew; a lone session keeps its full height. */
+@Composable
+private fun CrewStrip(vm: AppViewModel, s: Session) {
+    val masterId = vm.broughtIn[s.id] ?: s.id
+    val ids = listOf(masterId) + vm.broughtIn.filterValues { it == masterId }.keys.sorted()
+    val rows = ids.mapNotNull { id -> vm.sessions.firstOrNull { it.id == id } }
+    if (rows.size < 2) return
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        rows.forEach { r ->
+            val on = r.id == s.id
+            val act = vm.activity[r.id]
+            Row(
+                Modifier.clip(RoundedCornerShape(16.dp))
+                    .background(if (on) Accent.copy(alpha = 0.18f) else Surface1)
+                    .clickable(enabled = !on) { vm.select(r) }
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                AgentIcon(r.agent, 14.dp)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    r.title.ifBlank { if (r.id == masterId) "Session" else r.agent },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (on) Accent else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 170.dp),
+                )
+                if (act == "attention" || act == "working") {
+                    Spacer(Modifier.width(6.dp))
+                    Box(Modifier.size(7.dp).background(if (act == "attention") Amber else Accent, RoundedCornerShape(50)))
+                }
             }
         }
     }

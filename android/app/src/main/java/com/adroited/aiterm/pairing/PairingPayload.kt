@@ -103,7 +103,10 @@ class PairingPayload private constructor(
         const val LIFETIME_MILLIS: Long = 5 * 60 * 1_000L
 
         private const val MAX_URI_CHARS = 4_096
-        private const val MAX_HOSTS = 8
+        // Matches the desktop's MAX_ADVERTISED_HOSTS: a docker-heavy machine
+        // legitimately advertises a dozen bridge addresses, and a parser cap
+        // below the advertiser's turned its QR into "not valid" outright.
+        private const val MAX_HOSTS = 16
         private const val MAX_DISPLAY_NAME_CHARS = 128
         private val base64Url = Regex("^[A-Za-z0-9_-]+$")
         private val requiredSingletonFields = setOf("v", "p", "f", "s", "n")
@@ -140,7 +143,13 @@ class PairingPayload private constructor(
                 val separator = component.indexOf('=')
                 if (separator <= 0) return malformed()
                 val key = component.substring(0, separator)
-                if (key !in knownFields) return malformed()
+                // A field this app does not know is another client's, not an
+                // attack: a combined QR carries a second listener's payload
+                // under its own names (`tp`/`tt`/`tf`/`z`), and this desktop
+                // may advertise more transports than this app speaks. Skip
+                // it unread — everything this app will trust stays under the
+                // strict known fields below.
+                if (key !in knownFields) continue
                 val value = decodeQueryValue(component.substring(separator + 1)) ?: return malformed()
                 fields.getOrPut(key) { mutableListOf() } += value
             }

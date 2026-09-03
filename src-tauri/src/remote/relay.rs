@@ -223,7 +223,13 @@ impl RelayConfig {
     }
 
     pub fn load(root: &Path) -> Result<Option<Self>, String> {
-        let path = root.join(CONFIG_FILE);
+        Self::load_named(root, CONFIG_FILE)
+    }
+
+    /// The same file shape under another name — the phone listener keeps its
+    /// own route beside the gateway's `relay.json`.
+    pub fn load_named(root: &Path, file: &str) -> Result<Option<Self>, String> {
+        let path = root.join(file);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -236,11 +242,15 @@ impl RelayConfig {
     }
 
     pub fn save(&self, root: &Path) -> Result<(), String> {
+        self.save_named(root, CONFIG_FILE)
+    }
+
+    pub fn save_named(&self, root: &Path, file: &str) -> Result<(), String> {
         self.validate()?;
         std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
         set_private_permissions(root, 0o700).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
-        write_private_file(&root.join(CONFIG_FILE), &bytes).map_err(|error| error.to_string())
+        write_private_file(&root.join(file), &bytes).map_err(|error| error.to_string())
     }
 
     pub async fn prepare_enrollment(

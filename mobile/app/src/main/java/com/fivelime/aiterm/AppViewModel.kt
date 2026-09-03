@@ -103,10 +103,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *  or the desktop reports activity. Bridges the gap before the agent's
      *  first progress report so "working" shows immediately. */
     private var sentAt = 0L
-    private var turnsWhenSent = -1
+    private var awaitingReply = false
     var agents by mutableStateOf<List<Agent>>(emptyList()); private set
     var selected by mutableStateOf<Session?>(null); private set
-    var turns by mutableStateOf<List<Turn>>(emptyList()); private set
+
+    /** The selected session's spine: what the screen draws, fed by the GET
+     *  once and by "spine" WebSocket frames after. Held here (not in a
+     *  Composable) so a rotation or a trip to Files keeps the transcript. */
+    private val spine = ConversationStore()
+    /** The store's rows, republished after every apply — an immutable list
+     *  of equal data classes, so only the row that moved recomposes. */
+    var items by mutableStateOf<List<Item>>(emptyList()); private set
+    /** The selected session's phase, straight off the spine. */
+    var phase by mutableStateOf(SpinePhase.Idle); private set
+    var phaseDetail by mutableStateOf(""); private set
+    /** When the last spine event or fetch landed — the safety net's clock. */
+    private var lastSpineAt = 0L
+    /** A desktop too old to serve /v1/spine (404): fall back to the whole
+     *  transcript on a slow poll, mapped into the same rows. */
+    private var noSpine = false
+    private var fetchingSpine = false
+    private var refetchWanted = false
     var loadingTurns by mutableStateOf(false); private set
     var sending by mutableStateOf(false); private set
     /** A one-line message for the snackbar. The UI clears it after showing. */
@@ -143,9 +160,63 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     init { runCatching { connectivity.registerDefaultNetworkCallback(netCallback) } }
     override fun onCleared() { runCatching { connectivity.unregisterNetworkCallback(netCallback) } }
 
+    // ---- terminal: a plain shell on the desktop, driven from here
+
+    /** Tab id of the open remote terminal; a screen shows while set. */
+    var terminalTab by mutableStateOf<String?>(null)
+    var terminalTitle by mutableStateOf("Terminal"); private set
+    var terminalLines by mutableStateOf<List<String>>(emptyList()); private set
+    var terminalOpening by mutableStateOf(false); private set
+
+    fun openTerminal() {
+        val a = api ?: return
+        if (terminalOpening) return
+        viewModelScope.launch {
+            terminalOpening = true
+            try {
+                val t = a.terminalOpen(cols = 60, rows = 24)
+                terminalTitle = t.title
+                terminalLines = emptyList()
+                terminalTab = t.tab_id
+            } catch (e: Exception) { notice = describe(e) }
+            finally { terminalOpening = false }
+        }
+    }
+
+    suspend fun pollTerminal(): Boolean {
+        val a = api ?: return false
+        val tab = terminalTab ?: return false
+        return try {
+            terminalLines = a.terminalScreen(tab).lines
+            true
+        } catch (e: ApiError) {
+            // The tab ended on the desktop; the screen has nothing to show.
+            if (e.code == 404) { terminalTab = null; false } else true
+        } catch (_: Exception) { true }
+    }
+
+    fun sendTerminal(text: String, enter: Boolean = true) {
+        val a = api ?: return
+        val tab = terminalTab ?: return
+        viewModelScope.launch {
+            try { a.terminalInput(tab, text, enter) }
+            catch (e: Exception) { notice = describe(e) }
+        }
+    }
+
+    /** Done with it: ends the shell and removes the tab on the desktop too. */
+    fun closeTerminal() {
+        val a = api ?: return
+        val tab = terminalTab ?: return
+        terminalTab = null
+        viewModelScope.launch { runCatching { a.terminalClose(tab) } }
+    }
+
     // ---- settings
 
     var showSettings by mutableStateOf(false)
+    /** The drawer's usage section is folded until asked for, every launch. */
+    var usageOpen by mutableStateOf(false)
     var themeName by mutableStateOf(store.theme); private set
     var timeZone by mutableStateOf(store.timeZone); private set
     var biometric by mutableStateOf(store.biometric); private set
@@ -181,10 +252,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             pairing = true
             try {
-                for (url in link.candidates) {
-                    val patience = 4L
+                // Every road the QR offers, in the default order: its
+                // addresses, the relay route it names, and — when the
+                // desktop has one — its iroh node id via the local bridge,
+                // so pairing succeeds even on a network where no address is
+                // reachable at all.
+                val bridge = if (link.iroh.isNotEmpty()) IrohBridge.urlFor(getApplication(), link.iroh) else null
+                val draft = Desktop(
+                    link.candidates.first(), link.token, link.name, link.candidates, link.fingerprint, link.iroh,
+                    relayHost = link.relayHost, relayPort = link.relayPort,
+                )
+                for (c in Roads.candidates(draft, bridge)) {
+                    val url = c.url
                     val t0 = System.currentTimeMillis()
-                    val status = try { Api(url, link.token, link.fingerprint, patience).status() } catch (e: IOException) {
+                    val status = try { Api(url, link.token, link.fingerprint, c.patienceSeconds).status() } catch (e: IOException) {
                         android.util.Log.i("Aiterm", "pair probe $url → ${e.javaClass.simpleName}: ${e.message} in ${System.currentTimeMillis() - t0}ms")
                         continue
                     } catch (e: ApiError) {
@@ -192,13 +273,118 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     android.util.Log.i("Aiterm", "pair probe $url → ok in ${System.currentTimeMillis() - t0}ms")
                     if (status.api != 1) { notice = "This desktop speaks a newer protocol — update the app"; return@launch }
-                    val d = Desktop(url, link.token, status.name, link.candidates, link.fingerprint)
+                    // The relay route: what the desktop reports live, else
+                    // what the QR named; then, when the QR carried a draft,
+                    // sign it so the route goes live now. A refusal here is
+                    // not a failed pairing — the desktop is reached, and the
+                    // next status answer offers the draft again.
+                    var relayHost = status.relay?.host ?: link.relayHost
+                    var relayPort = status.relay?.port ?: link.relayPort
+                    link.relayAuthorization?.let { digest ->
+                        enrollTried[link.fingerprint] = b64url(digest)
+                        enrollRelay(Api(url, link.token, link.fingerprint, c.patienceSeconds), digest)?.let { relayHost = it.host; relayPort = it.port }
+                    }
+                    val d = draft.copy(
+                        baseUrl = url, name = status.name.ifBlank { link.name },
+                        relayHost = relayHost, relayPort = relayPort,
+                        roadOrder = status.road_order?.takeIf { Roads.isComplete(it) }?.let { Roads.order(it).map { r -> r.id } } ?: draft.roadOrder,
+                    )
                     adopt(d)
                     return@launch
                 }
                 notice = "Could not reach ${link.name} at ${link.hosts.joinToString()} — same Wi‑Fi or Tailscale?"
             } finally { pairing = false }
         }
+    }
+
+    private fun b64url(bytes: ByteArray): String = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+
+    // ---- the relay road, enrolled over the pairing that already exists
+
+    /** Sign a relay enrollment digest and hand it to the desktop, which
+     *  registers the route and answers with it live. The one function for
+     *  both ways a digest reaches the phone: the QR's `ta` at pairing, and
+     *  `relay_enroll` in any status answer afterwards. Null when it did not
+     *  go through — never fatal to anything around it. */
+    private suspend fun enrollRelay(api: Api, digest: ByteArray): RelayEnrolled? = try {
+        val key = b64url(RelayAuthority.publicKeyCompressed())
+        val sig = b64url(RelayAuthority.sign(digest))
+        api.relayEnroll(key, sig).also { android.util.Log.i("Aiterm", "relay enrolled: ${it.host}:${it.port}") }
+    } catch (e: Exception) {
+        android.util.Log.w("Aiterm", "relay enrollment failed: ${e.javaClass.simpleName}: ${e.message}")
+        null
+    }
+
+    /** Per desktop (by fingerprint), the last digest this phone signed — a
+     *  digest the desktop refused is not signed again on every status read;
+     *  a fresh draft is a fresh digest and gets its one attempt. */
+    private val enrollTried = HashMap<String, String>()
+
+    /** Per desktop, the road order it last published — what "Use desktop's
+     *  order" goes back to before the next status answer arrives. */
+    private val publishedOrder = HashMap<String, List<String>>()
+
+    /** A draft waiting in a status answer, and no live route: sign it and
+     *  keep the route that comes back. This is how a phone paired over any
+     *  road — iroh, the LAN — gains the relay road with no new QR. Runs
+     *  off every status result: the connect sprint, `status_changed`, the
+     *  drawer's reachability probe. */
+    private fun enrollFromStatus(api: Api, fingerprint: String, status: Status) {
+        val digest = status.relay_enroll?.digest ?: return
+        if (status.relay != null || enrollTried[fingerprint] == digest) return
+        enrollTried[fingerprint] = digest
+        val bytes = PairLink.decodeBase64Url(digest)?.takeIf { it.size == 32 }
+        if (bytes == null) { android.util.Log.w("Aiterm", "relay enrollment digest unreadable; ignoring"); return }
+        android.util.Log.i("Aiterm", "relay enrollment offered in status; signing it")
+        viewModelScope.launch {
+            val r = enrollRelay(api, bytes) ?: return@launch
+            val cur = desktops.find { it.fingerprint == fingerprint } ?: return@launch
+            replace(cur.copy(relayHost = r.host, relayPort = r.port))
+        }
+    }
+
+    /** What every status answer teaches about a desktop's roads: its name,
+     *  iroh node, live relay route, and — unless the person set their own
+     *  here — its road order. The caller stores the copy. */
+    private fun roadsFrom(d: Desktop, status: Status): Desktop {
+        val published = status.road_order?.takeIf { Roads.isComplete(it) }?.let { Roads.order(it).map { r -> r.id } }
+        if (published != null) publishedOrder[d.fingerprint] = published
+        return d.copy(
+            iroh = status.iroh ?: d.iroh,
+            name = status.name.ifBlank { d.name },
+            relayHost = status.relay?.host ?: "",
+            relayPort = status.relay?.port ?: 0,
+            roadOrder = if (!d.roadOrderCustom && published != null) published else d.roadOrder,
+        )
+    }
+
+    /** One desktop's entry, replaced and saved; shown too when it is the
+     *  one on screen. */
+    private fun replace(nd: Desktop) {
+        desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
+        store.saveAll(desktops)
+        if (desktop?.fingerprint == nd.fingerprint) desktop = nd
+    }
+
+    /** The order this desktop's roads are tried, from the settings screen.
+     *  Saved on the desktop's entry as the person's own — the desktop's
+     *  published order no longer applies — and used at once: the next
+     *  sprint (now) commits and upgrades by the new order. */
+    fun setRoadOrder(d: Desktop, order: List<String>) {
+        val clean = Roads.order(order).map { it.id }
+        if (clean == d.roadOrder && d.roadOrderCustom) return
+        replace(d.copy(roadOrder = clean, roadOrderCustom = true))
+        if (desktop?.fingerprint == d.fingerprint && foreground && clean != d.roadOrder) { connectJob?.cancel(); connect() }
+    }
+
+    /** Back to following the desktop: the flag clears, the order it last
+     *  published applies now, and every status answer keeps it current. */
+    fun useDesktopRoadOrder(d: Desktop) {
+        val published = publishedOrder[d.fingerprint]
+        val nd = d.copy(roadOrderCustom = false, roadOrder = published ?: d.roadOrder)
+        if (nd == d) return
+        replace(nd)
+        if (desktop?.fingerprint == d.fingerprint && foreground && nd.roadOrder != d.roadOrder) { connectJob?.cancel(); connect() }
     }
 
     /** Rename a session everywhere at once: optimistically here, durably on
@@ -242,6 +428,50 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         connect()
     }
 
+    /** fingerprint → whether that desktop answered its last status probe.
+     *  The shown desktop's truth is `connected`; this covers the rest of the
+     *  drawer list, so its dots mean "up right now", not "the one shown". */
+    var reachable by mutableStateOf<Map<String, Boolean>>(emptyMap()); private set
+    private var reachJob: Job? = null
+
+    /** Probe every desktop not being shown, the drawer's moment. The last
+     *  answer stands while a re-probe runs, so a dot never blinks gray on
+     *  every open; first address to answer wins, bridge included. */
+    fun checkDesktops() {
+        if (reachJob?.isActive == true) return
+        reachJob = viewModelScope.launch {
+            desktops.filter { it.fingerprint != desktop?.fingerprint }.forEach { d ->
+                launch {
+                    val bridge = if (d.iroh.isNotEmpty())
+                        runCatching { IrohBridge.urlFor(getApplication(), d.iroh) }.getOrNull() else null
+                    val urls = Roads.candidates(d, bridge).map { it.url }
+                    if (urls.isEmpty()) { reachable = reachable + (d.fingerprint to false); return@launch }
+                    val answers = kotlinx.coroutines.channels.Channel<Boolean>(urls.size)
+                    urls.forEach { url ->
+                        viewModelScope.launch {
+                            val api = Api(url, d.token, d.fingerprint)
+                            val r = runCatching { api.status() }
+                            // A status answer is a status answer: the
+                            // desktop's roads (and a waiting relay draft)
+                            // are taken up even for a desktop not shown.
+                            r.getOrNull()?.let { s ->
+                                val cur = desktops.find { it.fingerprint == d.fingerprint } ?: d
+                                val nd = roadsFrom(cur, s)
+                                if (nd != cur) replace(nd)
+                                enrollFromStatus(api, d.fingerprint, s)
+                            }
+                            answers.send(r.isSuccess)
+                        }
+                    }
+                    repeat(urls.size) {
+                        if (answers.receive()) { reachable = reachable + (d.fingerprint to true); return@launch }
+                    }
+                    reachable = reachable + (d.fingerprint to false)
+                }
+            }
+        }
+    }
+
     /** Unpair one desktop. Forgetting the shown one falls back to the next;
      *  forgetting the last returns the app to the pair screen. */
     fun forget(d: Desktop? = null) {
@@ -265,8 +495,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         files = emptyList(); loadingFiles = false; viewing = null; opening = null; showFiles = false
         browsing = false; browsePath = ""; browseEntries = emptyList()
         composingNew = false; attachments = emptyList()
-        sentAt = 0L; turnsWhenSent = -1
-        agents = emptyList(); selected = null; turns = emptyList(); loadingTurns = false
+        sentAt = 0L; awaitingReply = false
+        agents = emptyList(); selected = null; loadingTurns = false
+        spine.clear(); publishSpine(); noSpine = false
         relays = emptyMap(); previewUrl = null; inlineFiles = emptyMap()
         withFiles = emptySet(); ports = emptyMap(); stars = emptySet(); broughtIn = emptyMap()
         agentFilter = null; filesOnly = false; activeOnly = false
@@ -284,20 +515,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun onStop() { foreground = false; pausedAt = System.currentTimeMillis(); disconnect() }
 
-    /** Prefer-order for probing: LAN/VPN, then everything else. "Last good" is no tiebreak worth
+    /** Which road is "more local": the desktop's own road order, LAN →
+     *  VPN → relay → iroh by default. "Last good" is no tiebreak worth
      *  having: after a day out it is the public IP, and from inside the LAN
      *  most routers refuse to hairpin their own port mapping, so the LAN
      *  address must win whenever it answers. */
-    private fun rank(url: String): Int {
-        val host = url.removePrefix("https://").substringBefore(':').substringBefore('/')
-        val o = host.split('.').mapNotNull { it.toIntOrNull() }
-        if (o.size != 4) return 1 // a hostname: a VPN or mDNS name, LAN-ish
-        return when {
-            o[0] == 100 && o[1] in 64..127 -> 0
-            o[0] == 10 || (o[0] == 192 && o[1] == 168) || (o[0] == 172 && o[1] in 16..31) -> 0
-            else -> 2
-        }
-    }
+    private fun rank(d: Desktop, c: Candidate): Int = Roads.rank(d, c.road)
 
     private fun connect() {
         val d = desktop ?: return
@@ -305,8 +528,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         ws?.cancel()
         connectJob = viewModelScope.launch {
             // The desktop may be on a different address than last time — home
-            // Wi-Fi, USB, or a VPN. Probe every known address and commit to
-            // the first one that answers.
+            // Wi‑Fi, USB, Tailscale. Probe every known address at once and
+            // commit to the most local one that answers. The iroh bridge is
+            // the always-answering last resort: anything more direct wins.
+            val bridge = if (d.iroh.isNotEmpty())
+                runCatching { IrohBridge.urlFor(getApplication(), d.iroh) }.getOrNull() else null
             // The route that won last time goes FIRST, whatever its rank: on
             // client-isolated office Wi‑Fi the bridge answers in ~0.7s while
             // the doomed LAN probe eats its full 4s timeout — and rank-order
@@ -315,7 +541,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // Locality still wins the day: losing probes keep running below,
             // and a more local answer switches the connection live.
             val myGen = ++connectGen
-            val urls = (listOf(d.baseUrl) + d.ordered.drop(1).sortedBy { rank(it) }).distinct()
+            val byRoad = Roads.candidates(d, bridge)
+            val last = byRoad.firstOrNull { it.url == d.baseUrl }
+            val cands = listOfNotNull(last) + byRoad.filter { it !== last }
+            val urls = cands.map { it.url }
             // Probes live on the outer scope, not this coroutine: a losing
             // probe blocks in OkHttp until its own timeout, and it must not
             // hold up committing to the address that already answered.
@@ -327,25 +556,35 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     r.getOrNull()
                 }
             }
-            var chosen: Pair<String, Status>? = null
-            for ((i, p) in probes.withIndex()) { val s = p.await(); if (s != null) { chosen = urls[i] to s; break } }
+            var chosen: Pair<Candidate, Status>? = null
+            for ((i, p) in probes.withIndex()) { val s = p.await(); if (s != null) { chosen = cands[i] to s; break } }
             // Probes past the winner stay alive — see the better-route watch
             // at the bottom of this function.
             if (chosen == null) { android.util.Log.i("Aiterm", "no address reachable; retry in 3s"); connected = false; scheduleRetry(); return@launch }
-            val (reachable, status) = chosen
-            android.util.Log.i("Aiterm", "using $reachable")
+            val (won, status) = chosen
+            val reachable = won.url
+            android.util.Log.i("Aiterm", "using $reachable (${won.road.id})")
             // The desktop reports every address it answers on right now;
             // adopt that list so a DHCP move or new public IP never strands
             // us with only the addresses the QR knew at pairing time.
-            val port = reachable.substringAfterLast(':')
-            val fresh = status.hosts.map { "https://$it:$port" }
-            val candidates = (fresh.ifEmpty { d.candidates } + reachable).distinct()
-            if (reachable != d.baseUrl || candidates != d.candidates) {
-                val nd = d.copy(baseUrl = reachable, candidates = candidates)
+            // The bridge and the relay answer on ports of their own, not the
+            // desktop's; fresh addresses keep the desktop's real port instead,
+            // and only a direct winner joins the address list — the other
+            // roads are rebuilt from the node id and the relay route.
+            val direct = won.road == Road.LAN || won.road == Road.VPN
+            val port = if (direct) reachable.substringAfterLast(':')
+            else Roads.directUrls(d).firstOrNull()?.substringAfterLast(':') ?: reachable.substringAfterLast(':')
+            val fresh = status.hosts.map { "https://${if (it.contains(':')) "[$it]" else it}:$port" }
+            val candidates = (fresh.ifEmpty { d.candidates } + listOfNotNull(reachable.takeIf { direct })).distinct()
+            val nd = roadsFrom(d, status).copy(baseUrl = reachable, candidates = candidates)
+            if (nd != d) {
                 desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
                 store.saveAll(desktops)
                 desktop = nd
             }
+            // A relay draft waiting over there is signed now, over this
+            // pairing — the route goes live without a new QR.
+            enrollFromStatus(Api(reachable, d.token, d.fingerprint), d.fingerprint, status)
             if (!foreground) return@launch // backgrounded while probing
             openEvents(Api(reachable, d.token, d.fingerprint))
             // Better-route watch: the remembered winner got us on fast, but a
@@ -356,7 +595,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             for ((i, p) in probes.withIndex()) {
                 val s = runCatching { p.await() }.getOrNull() ?: continue
                 val url = urls[i]
-                if (url == reachable || rank(url) >= rank(reachable)) continue
+                if (url == reachable || rank(d, cands[i]) >= rank(d, won)) continue
                 if (myGen != connectGen || !foreground) return@launch
                 android.util.Log.i("Aiterm", "more local $url answered after commit; switching from $reachable")
                 val cur = desktops.find { it.fingerprint == d.fingerprint } ?: return@launch
@@ -383,11 +622,34 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // rather than trusting the first answer forever.
         viewModelScope.launch { runCatching { agents = a.agents() } }
         ws = a.events(
-            onOpen = { viewModelScope.launch { connected = true } },
+            onOpen = {
+                viewModelScope.launch {
+                    connected = true
+                    // A dropped WebSocket loses every event it was carrying;
+                    // the first thing a new one owes the screen is the gap.
+                    selected?.let { fetchSpine(it.id) }
+                }
+            },
             onEvent = { type, obj ->
                 viewModelScope.launch {
                     when (type) {
                         "sessions_changed", "session_exit" -> refresh()
+                        "status_changed" -> {
+                            // A road was switched, a relay draft prepared or
+                            // a route enrolled, or the road order edited
+                            // over there; re-read what this desktop offers
+                            // so the next dial (and the Connection order
+                            // notes) see it without a reconnect — and sign
+                            // a waiting draft while we are here.
+                            val cur = desktop ?: return@launch
+                            val status = runCatching { a.status() }.getOrNull() ?: return@launch
+                            val nd = roadsFrom(cur, status)
+                            if (nd != cur) replace(nd)
+                            enrollFromStatus(a, cur.fingerprint, status)
+                            // The desktop's order changed and this phone
+                            // follows it: the next sprint dials by it.
+                            if (nd.roadOrder != cur.roadOrder && foreground) { connectJob?.cancel(); connect() }
+                        }
                         "relay" -> {
                             val sid = obj["session_id"]?.jsonPrimitive?.content ?: return@launch
                             relays = relays + (sid to RelayInfo(
@@ -400,6 +662,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             ))
                             refresh()
                         }
+                        "spine" -> {
+                            // Every session with a running tail is on this
+                            // stream; the phone only draws the one it is
+                            // looking at.
+                            val sid = obj["session_id"]?.jsonPrimitive?.content ?: return@launch
+                            if (sid != selected?.id) return@launch
+                            val ev = SpineEvent.parse(obj) ?: return@launch
+                            lastSpineAt = System.currentTimeMillis()
+                            when (spine.offer(ev)) {
+                                Offer.Applied -> { publishSpine(); afterApplied(ev) }
+                                // A seq was missed, or the desktop restarted:
+                                // ask for what we are short of rather than
+                                // drawing a transcript with a hole in it.
+                                Offer.Gap -> fetchSpine(sid)
+                                Offer.EpochChanged -> { spine.clear(); publishSpine(); fetchSpine(sid, from = 0) }
+                                Offer.Stale -> {}
+                            }
+                        }
                         "file_changed" -> {
                             // The conversation shows produced files inline,
                             // so keep them fresh whether or not the Files
@@ -411,7 +691,19 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             val id = obj["session_id"]?.jsonPrimitive?.content ?: return@launch
                             val a = obj["activity"]?.jsonPrimitive?.content ?: return@launch
                             activity = activity + (id to a)
-                            if (a != "idle") turnsWhenSent = -1
+                            if (a != "idle") awaitingReply = false
+                        }
+                        "renamed" -> {
+                            // The desktop's name was edited over there; wear
+                            // it everywhere at once.
+                            val n = obj["name"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: return@launch
+                            val cur = desktop ?: return@launch
+                            if (cur.name != n) {
+                                val nd = cur.copy(name = n)
+                                desktops = desktops.map { if (it.fingerprint == nd.fingerprint) nd else it }
+                                store.saveAll(desktops)
+                                desktop = nd
+                            }
                         }
                         "attention" -> {
                             val t = obj["title"]?.jsonPrimitive?.content
@@ -485,9 +777,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             broughtIn = r.brought_in
             selected?.let { cur -> sessions.find { it.id == cur.id }?.let { selected = it } }
             if (agents.isEmpty()) agents = runCatching { a.agents() }.getOrDefault(emptyList())
+            // The transcript rides the spine now; a list refresh only
+            // re-reads what the list itself shows.
             selected?.let {
-                turns = a.conversation(it.id)
-                if (turns.size > turnsWhenSent && turns.lastOrNull()?.role == "assistant") turnsWhenSent = -1
                 if (showFiles) files = runCatching { a.files(it.id) }.getOrDefault(files)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -526,7 +818,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stateOf(s: Session): SessionState {
         val a = activity[s.id]
-        val pendingHere = selected?.id == s.id && turnsWhenSent >= 0 && System.currentTimeMillis() - sentAt < 90_000
+        val pendingHere = selected?.id == s.id && awaitingReply && System.currentTimeMillis() - sentAt < 90_000
         return when {
             a == "working" || pendingHere -> SessionState.Working
             a == "attention" -> SessionState.NeedsYou
@@ -651,6 +943,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     a.open(s.id)
                     delay(3000)
                 }
+                Diag.log("bring-in", "${s.id.take(8)} <- $agentId model=$model rounds=$rounds auto=$auto")
                 a.bringIn(s.id, agentId, model, focus, rounds, auto)
                 relays = relays + (s.id to RelayInfo(agentId.removePrefix("api:"), null, "opening", 1, rounds, ""))
                 notice = "They're in — the exchange shows up right here"
@@ -709,14 +1002,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Guards the per-selection conversation poller: bumped on every select,
-     *  so a stale poller stands down instead of writing over a newer one. */
+    /** Guards the per-selection spine work: bumped on every select, so a
+     *  stale watcher stands down instead of writing over a newer one. */
     private var selectGen = 0
 
     fun select(s: Session?) {
+        Diag.log("select", if (s == null) "none" else "${s.id.take(8)} ${s.agent} open=${s.id in open} running=${s.id in running}")
         selected = s
         selectGen++
-        turns = emptyList()
+        spine.clear(); publishSpine(); noSpine = false; refetchWanted = false; lastSpineAt = 0L
         files = emptyList()
         showFiles = false
         browsing = false
@@ -732,30 +1026,106 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // reload it — a person opening a mid-turn session saw its whole
             // HISTORY as blank [observed 2026-08-31]. Retry, briefly.
             for (attempt in 1..3) {
-                try { turns = api?.conversation(s.id) ?: emptyList(); break }
-                catch (e: Exception) { if (attempt == 3) notice = describe(e) else delay(1200) }
+                try {
+                    val r = api?.spine(s.id, 0) ?: break
+                    if (myGen != selectGen) return@launch
+                    spine.replay(r); publishSpine()
+                    Diag.log("spine", "${s.id.take(8)} replay ${r.events.size} events live=${r.live} -> ${spine.items.size} rows, phase=${spine.phase} (try $attempt)")
+                    lastSpineAt = System.currentTimeMillis()
+                    break
+                } catch (e: ApiError) {
+                    // A desktop that predates the spine has no such route and
+                    // its 404 carries no message; one that HAS the route says
+                    // "no such session" and means it. Only the first is a
+                    // reason to fall back to the old whole-transcript poll.
+                    Diag.log("spine", "${s.id.take(8)} replay failed (try $attempt): ${e.code} ${e.message}")
+                    if (e.code == 404 && e.message?.contains("session") != true) { noSpine = true; break }
+                    if (attempt == 3) notice = describe(e) else delay(1200)
+                } catch (e: Exception) {
+                    Diag.log("spine", "${s.id.take(8)} replay failed (try $attempt): ${e.javaClass.simpleName} ${e.message}")
+                    if (attempt == 3) notice = describe(e) else delay(1200)
+                }
             }
             loadingTurns = false
-            // While this session is on screen, follow its transcript: codex
-            // and claude write a message per completed step, so a working
-            // turn streams in step by step instead of arriving as one block
-            // at the end. Cheap — the desktop answers in ~10ms gzipped.
+            if (noSpine) { legacyPoll(s, myGen); return@launch }
+            // The spine arrives over the WebSocket; this is only the safety
+            // net. A WebSocket can die without saying so (the phone changes
+            // network, the desktop's relay hiccups) and the screen would sit
+            // frozen mid-turn, so a working session that has gone quiet for
+            // 20 s gets asked directly.
             while (myGen == selectGen && selected?.id == s.id) {
-                delay(3000)
+                delay(5000)
                 if (myGen != selectGen || selected?.id != s.id) break
-                val fresh = runCatching { api?.conversation(s.id) }.getOrNull() ?: continue
-                if (fresh != turns) {
-                    turns = fresh
-                    // A new message usually means new files — and a scratchpad
-                    // write gets no file_changed event (the watcher covers
-                    // workspaces, not /tmp scratchpads), so the globe for a
-                    // built page never appeared until reopen [observed
-                    // 2026-08-31: car-listing.html, via "wrote", invisible].
-                    loadFiles()
-                }
+                val quiet = System.currentTimeMillis() - lastSpineAt
+                if (quiet > 20_000 && spine.phase == SpinePhase.Working) fetchSpine(s.id)
             }
         }
         loadFiles() // the conversation shows what the session made, inline
+    }
+
+    /** Republish the store for Compose. One assignment per apply: the rows
+     *  are equal data classes, so the list changing identity costs the one
+     *  row that actually changed. */
+    private fun publishSpine() {
+        items = spine.items
+        phase = spine.phase
+        phaseDetail = spine.phaseDetail
+    }
+
+    /** Ask for everything after `from` (default: what we hold) and merge.
+     *  One at a time — a burst of gaps is one question. */
+    private fun fetchSpine(id: String, from: Long? = null) {
+        if (noSpine) return
+        // An event that gaps while a fetch is already in the air would be
+        // dropped and never asked for — the answer was computed before it
+        // existed. Remember that, and go round once more.
+        if (fetchingSpine) { refetchWanted = true; return }
+        val a = api ?: return
+        viewModelScope.launch {
+            fetchingSpine = true
+            try {
+                val r = a.spine(id, from ?: spine.lastSeq)
+                if (selected?.id != id) return@launch
+                spine.replay(r); publishSpine()
+                lastSpineAt = System.currentTimeMillis()
+            } catch (e: Exception) {
+                android.util.Log.w("Aiterm", "spine fetch failed: ${e.message}")
+            } finally {
+                fetchingSpine = false
+                if (refetchWanted && selected?.id == id) { refetchWanted = false; fetchSpine(id) }
+            }
+        }
+    }
+
+    /** What an applied event means beyond the transcript. A file write is
+     *  the only thing the ledger will not tell us in time: a scratchpad
+     *  write gets no file_changed event (the watcher covers workspaces, not
+     *  /tmp), so the globe for a built page never appeared until reopen
+     *  [observed 2026-08-31: car-listing.html, via "wrote", invisible]. */
+    private fun afterApplied(e: SpineEvent) {
+        val k = e.kind
+        if (awaitingReply && (k is SpineKind.AgentText || k is SpineKind.ToolCall)) awaitingReply = false
+        val wroteSomething = when (k) {
+            is SpineKind.ToolCallUpdate -> k.status == ToolStatus.Completed && spine.tool(k.id)?.category == ToolCategory.Edit
+            is SpineKind.ToolCall -> k.status == ToolStatus.Completed && k.category == ToolCategory.Edit
+            else -> false
+        }
+        if (wroteSomething || k is SpineKind.TurnEnded) loadFiles()
+    }
+
+    /** The pre-spine path, for a desktop that has not been updated: the
+     *  whole transcript every 3 s, mapped onto the same rows by ordinal. */
+    private suspend fun legacyPoll(s: Session, myGen: Int) {
+        var last: List<Turn> = emptyList()
+        while (myGen == selectGen && selected?.id == s.id) {
+            val fresh = runCatching { api?.conversation(s.id) }.getOrNull()
+            if (fresh != null && fresh != last) {
+                last = fresh
+                spine.legacy(fresh); publishSpine()
+                loadFiles()
+            }
+            delay(3000)
+        }
     }
 
     // ---- acting
@@ -782,6 +1152,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val a = api ?: return
         viewModelScope.launch {
             sending = true
+            Diag.log("send", "${s.id.take(8)} open=${s.id in open} ${text.length} chars, ${attachments.size} attachments")
             try {
                 if (s.id !in open) {
                     a.open(s.id)
@@ -790,8 +1161,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val full = withAttachments(text)
                 a.input(s.id, full)
                 attachments = emptyList()
-                turns = turns + Turn("user", full)
-                sentAt = System.currentTimeMillis(); turnsWhenSent = turns.size
+                // The bubble appears on tap; the desktop's own user_message
+                // retires the echo when it comes round.
+                spine.echoUser(full, System.currentTimeMillis())
+                publishSpine()
+                sentAt = System.currentTimeMillis(); awaitingReply = true
             } catch (e: Exception) {
                 notice = describe(e)
             } finally { sending = false }
@@ -810,7 +1184,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return false
     }
 
-    fun openOnDesktop(s: Session) = act { it.open(s.id); notice = "Opening on ${desktop?.name}" }
+    fun openOnDesktop(s: Session) = act { Diag.log("open", "${s.id.take(8)} asked the desktop"); it.open(s.id); notice = "Opening on ${desktop?.name}" }
 
     /** Read a picked file and hand it to the desktop. The path comes back and
      *  rides in the message as text — the agent reads it from there. */
@@ -843,7 +1217,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return "$lead\n$files"
     }
     /** Escape: ends the agent's turn, keeps the session. */
-    fun interrupt(s: Session) = act { it.interrupt(s.id); turnsWhenSent = -1 }
+    fun interrupt(s: Session) = act { it.interrupt(s.id); awaitingReply = false }
     fun stop(s: Session) = act { it.stop(s.id); refresh() }
     /** A session this phone just asked for: the next refresh that shows a
      *  session born in that folder (for that agent, when the id names one —

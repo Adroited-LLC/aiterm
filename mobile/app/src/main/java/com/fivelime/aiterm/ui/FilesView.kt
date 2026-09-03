@@ -70,6 +70,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import coil3.compose.AsyncImage
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.layout.ContentScale
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import androidx.compose.ui.graphics.asImageBitmap
 import com.fivelime.aiterm.AppViewModel
 import com.fivelime.aiterm.FileEntry
 import java.io.File
@@ -312,12 +317,84 @@ fun FileViewer(vm: AppViewModel, entry: FileEntry, file: File, outer: PaddingVal
                         }
                     }
                 }
+                "pdf" -> PdfPages(file)
                 else -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(iconFor(entry.kind), null, tint = Muted, modifier = Modifier.size(56.dp))
                     Spacer(Modifier.height(12.dp))
                     Text("${entry.ext.uppercase()} · ${sizeLabel(entry.bytes)}", color = Muted)
                     Spacer(Modifier.height(16.dp))
                     Button(onClick = openWith) { Text("Open with…") }
+                }
+            }
+        }
+    }
+}
+
+
+/** A PDF read like any other file: every page in order, at the screen's
+ *  width, scrolling as one document. Android's own renderer draws each
+ *  page into a bitmap the moment it scrolls near; far pages hold their
+ *  place at the page's proportions and are drawn when they come. Pinch to
+ *  zoom, the way an image does. */
+@Composable
+private fun PdfPages(file: java.io.File) {
+    val renderer = remember(file) {
+        runCatching {
+            android.graphics.pdf.PdfRenderer(android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY))
+        }.getOrNull()
+    }
+    androidx.compose.runtime.DisposableEffect(renderer) { onDispose { runCatching { renderer?.close() } } }
+    if (renderer == null) {
+        Text("Could not open this PDF", color = Muted)
+        return
+    }
+    val widthPx = with(androidx.compose.ui.platform.LocalDensity.current) {
+        androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp.dp.roundToPx()
+    }.coerceAtMost(2400)
+    var scale by remember(file) { mutableStateOf(1f) }
+    var offset by remember(file) { mutableStateOf(Offset.Zero) }
+    // Pages render one at a time: the renderer is not thread-safe, and a
+    // page open while another is open throws.
+    val lock = remember(file) { Any() }
+    LazyColumn(
+        Modifier.fillMaxSize()
+            .pointerInput(file) {
+                detectTransformGestures { _, pan, zoom, _ ->
+                    scale = (scale * zoom).coerceIn(1f, 5f)
+                    offset = if (scale > 1f) offset + pan else Offset.Zero
+                }
+            }
+            .graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y },
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(vertical = 10.dp),
+    ) {
+        items(renderer.pageCount, key = { it }) { i ->
+            var bmp by remember(file, i) { mutableStateOf<android.graphics.Bitmap?>(null) }
+            var ratio by remember(file, i) { mutableStateOf(1.294f) }
+            LaunchedEffect(file, i, widthPx) {
+                val made = withContext(Dispatchers.IO) {
+                    synchronized(lock) {
+                        runCatching {
+                            renderer.openPage(i).use { page ->
+                                ratio = page.height.toFloat() / page.width
+                                val h = (widthPx * ratio).toInt().coerceAtLeast(1)
+                                android.graphics.Bitmap.createBitmap(widthPx, h, android.graphics.Bitmap.Config.ARGB_8888).also { b ->
+                                    b.eraseColor(android.graphics.Color.WHITE)
+                                    page.render(b, null, null, android.graphics.pdf.PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                }
+                            }
+                        }.getOrNull()
+                    }
+                }
+                bmp = made
+            }
+            val hDp = with(androidx.compose.ui.platform.LocalDensity.current) { (widthPx * ratio).toInt().toDp() }
+            Box(Modifier.fillMaxWidth().height(hDp).background(Color.White)) {
+                bmp?.let {
+                    androidx.compose.foundation.Image(
+                        bitmap = it.asImageBitmap(), contentDescription = "Page ${i + 1}",
+                        modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillWidth,
+                    )
                 }
             }
         }

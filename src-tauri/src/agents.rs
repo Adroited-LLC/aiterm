@@ -1784,14 +1784,25 @@ fn pick_adopted(
     known: &[String],
 ) -> Option<String> {
     let known: std::collections::HashSet<&str> = known.iter().map(String::as_str).collect();
+    let fresh = |s: &&Session| s.last_active >= since_ms && !known.contains(s.id.as_str());
     sessions
         .iter()
-        .filter(|s| {
-            s.project_path == cwd && s.last_active >= since_ms && !known.contains(s.id.as_str())
-        })
+        .filter(|s| s.project_path == cwd && fresh(s))
         // Newest, for the case where a directory gains two sessions inside one
         // poll interval. Ours is the one that started later.
         .max_by_key(|s| s.last_active)
+        // An engine that does not record where it ran (antigravity before a
+        // command runs; whatever comes next) yields a row with no folder at
+        // all. Such a row cannot belong to a directory we did not launch in,
+        // so a fresh one is ours by the same absence-not-timestamp argument:
+        // it did not exist when the tab opened. A row with SOME OTHER folder
+        // is still never taken.
+        .or_else(|| {
+            sessions
+                .iter()
+                .filter(|s| s.project_path.is_empty() && fresh(s))
+                .max_by_key(|s| s.last_active)
+        })
         .map(|s| s.id.clone())
 }
 
@@ -2302,6 +2313,27 @@ mod tests {
             row("stale", "/workspace/project", 100),
         ];
         assert_eq!(pick_adopted(&rows, "/workspace/project", 400, &[]), None);
+    }
+
+    #[test]
+    fn adoption_takes_a_fresh_row_that_names_no_folder_at_all() {
+        // agy writes no workspace for a plain chat, so the row has no folder.
+        // It appeared after we launched and was not there before: ours.
+        let rows = vec![
+            row("old-nowhere", "", 100),
+            row("new-nowhere", "", 500),
+            row("elsewhere", "/home/m/aiterm", 600),
+        ];
+        assert_eq!(
+            pick_adopted(&rows, "/workspace/project", 400, &["old-nowhere".into()]),
+            Some("new-nowhere".into())
+        );
+        // A row that names our folder still wins over one that names none.
+        let rows = vec![row("here", "/workspace/project", 450), row("nowhere", "", 500)];
+        assert_eq!(pick_adopted(&rows, "/workspace/project", 400, &[]), Some("here".into()));
+        // Known or stale folder-less rows are left alone, like any other.
+        let rows = vec![row("busy", "", 9_999), row("stale", "", 100)];
+        assert_eq!(pick_adopted(&rows, "/workspace/project", 400, &["busy".into()]), None);
     }
 
     #[test]

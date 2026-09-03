@@ -442,10 +442,10 @@ static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// start to.
 const STRIKES: usize = 2;
 
-/// Tell the desktop session list a name landed. Remote clients learn the
-/// same name through the existing authenticated session-list operation.
+/// Both UIs list the same sessions; tell them a name landed.
 fn announce(app: &Option<tauri::AppHandle>) {
     if let Some(app) = app {
+        crate::remote_api::notify(app, crate::remote_api::Event::SessionsChanged);
         use tauri::Emitter;
         let _ = app.emit("sessions://changed", ());
     }

@@ -405,11 +405,13 @@ export default function SessionsPanel({
   // Written during render, which is safe because `stableOrder` is idempotent:
   // feeding it back its own output returns the same list.
   const shownOrder = useRef<Map<string, string[]>>(new Map());
-  const keepPut = <T,>(key: string, list: T[], id: (t: T) => string): T[] => {
-    const out = stableOrder(list, id, shownOrder.current.get(key));
+  const keepPut = <T,>(key: string, list: T[], id: (t: T) => string, fresh = false): T[] => {
+    const out = fresh ? list : stableOrder(list, id, shownOrder.current.get(key));
     shownOrder.current.set(key, out.map(id));
     return out;
   };
+  /** Whether the pointer is over the panel — while it is, rows hold still. */
+  const [pointerIn, setPointerIn] = useState(false);
 
   useEffect(() => localStorage.setItem(GROUPS_KEY, JSON.stringify(groups)), [groups]);
   useEffect(() => localStorage.setItem(ORDER_KEY, JSON.stringify(orders)), [orders]);
@@ -419,7 +421,15 @@ export default function SessionsPanel({
     // every time an agent writes a line — so with several sessions running the
     // list rearranged itself under the cursor. `keepPut` lets a new session in
     // at the top and then leaves every row where it is.
-    const stable = keepPut("all", sessions, (s) => s.id);
+    // Rows arrive sorted by `last_active`, which moves every time an agent
+    // writes a line — so with several sessions running the list rearranged
+    // itself under the cursor. The order is therefore FROZEN while the pointer
+    // is over the panel (`keepPut` lets a new session in at the top and leaves
+    // every row where it is) and follows recency the rest of the time: the
+    // session being worked on climbs to the top once the pointer has left,
+    // instead of staying wherever it was when the panel was last hovered
+    // [John, 2026-09-03 — "it appears to stay locked into place"].
+    const stable = keepPut("all", sessions, (s) => s.id, !pointerIn);
     const q = query.toLowerCase();
     if (!q) return stable;
     return stable.filter(
@@ -428,7 +438,7 @@ export default function SessionsPanel({
         s.project_path.toLowerCase().includes(q) ||
         (s.branch ?? "").toLowerCase().includes(q),
     );
-  }, [sessions, query]);
+  }, [sessions, query, pointerIn]);
 
   // When searching: ranked full-text hits first, then substring matches the
   // index may have missed (still catching up, etc).
@@ -876,6 +886,7 @@ export default function SessionsPanel({
           // happens to share the active project. Multi-highlight is opt-in
           // via ctrl/shift-click (builds the `selected` set below).
           (isShowing ? " active" : "") +
+          (isRunning ? " live" : "") +
           (selected.has(s.id) ? " selected" : "") +
           (isShowing ? " showing" : "") +
           (isDragging ? " dragging" : "") +
@@ -1208,7 +1219,7 @@ export default function SessionsPanel({
   };
 
   return (
-    <div className="sessions-panel">
+    <div className="sessions-panel" onPointerEnter={() => setPointerIn(true)} onPointerLeave={() => setPointerIn(false)}>
       {fly && (
         <div
           style={{ position: "fixed", left: fly.left, top: fly.top, bottom: fly.bottom, zIndex: 70 }}

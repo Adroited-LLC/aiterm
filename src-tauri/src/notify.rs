@@ -94,9 +94,11 @@ pub fn parse_id(out: &str) -> Option<u32> {
 /// on screen for a prompt already answered is worse than none.
 #[tauri::command]
 pub fn desktop_notify(app: tauri::AppHandle, summary: String, body: String, replaces: u32) -> Option<u32> {
-    // Structured remote attention events are bridged through the canonical
-    // gateway once the PR #20 API facade is registered.
-    let _ = &app;
+    // A phone should hear about a waiting session the same moment the desktop does.
+    crate::remote_api::notify(
+        &app,
+        crate::remote_api::Event::Attention { title: summary.clone(), body: body.clone() },
+    );
     let out = Command::new("gdbus").args(notify_args(&summary, &body, replaces)).output().ok()?;
     parse_id(&String::from_utf8_lossy(&out.stdout))
 }

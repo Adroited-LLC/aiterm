@@ -21,10 +21,14 @@ pub mod permissions;
 pub mod providers;
 pub mod pty;
 pub mod remote;
+pub mod remote_api;
+pub mod remote_roads;
+pub mod iroh_tunnel;
 pub mod changes;
 pub mod rendercost;
 pub mod services;
 pub mod sessions;
+pub mod spine;
 pub mod tabs;
 pub mod taskbar;
 pub mod terminal;
@@ -48,14 +52,17 @@ pub fn run() {
     trace::init();
     let pty = pty::PtyManager::default();
     let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
+    // The spine's epoch is set the moment this is built: a phone that sees a
+    // new one knows the desktop restarted and its seq numbers started over.
+    let spine = std::sync::Arc::new(spine::Spine::new());
     let application_services = services::ApplicationServices::default();
-    let startup_services = application_services.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(pty)
         .manage(tabs.clone())
+        .manage(spine)
         .manage(application_services)
         .manage(changes::ChangeLedger::default())
         .manage(watcher::WatchState::default())
@@ -63,6 +70,7 @@ pub fn run() {
         // then: a desktop that never pairs a phone never grows a
         // trusted-device file.
         .manage(remote::RemoteState::default())
+        .manage(remote_api::RemoteState::default())
         // Wrapped so a debug build logs every IPC call before it dispatches.
         // In release `log_invokes` is the identity function and the generated
         // handler is passed straight through — see `trace.rs`.
@@ -125,7 +133,6 @@ pub fn run() {
             sessions::session_titles,
             sessions::session_stars,
             sessions::session_brought_in,
-            sessions::relay_report,
             sessions::session_star,
             sessions::session_status,
             sessions::session_preview,
@@ -156,6 +163,7 @@ pub fn run() {
             opencode_agent::opencode_dispatch,
             opencode_agent::opencode_default_target,
             hooklink::drain_session_events,
+            spine::ipc::spine_overview,
             trace::trace_set,
             trace::trace_status,
             usage::usage_report,
@@ -184,15 +192,26 @@ pub fn run() {
             remote::remote_start,
             remote::remote_stop,
             remote::remote_relay_configure,
-            remote::remote_relay_server_set,
             remote::remote_relay_clear,
-            remote::remote_start_on_launch_set,
             remote::remote_begin_pairing,
+            remote::remote_begin_pairing_combined,
             remote::remote_pending_pairings,
             remote::remote_approve_device,
             remote::remote_deny_device,
             remote::remote_devices,
             remote::remote_revoke_device,
+            remote_api::remote_api_status,
+            remote_api::remote_set_enabled,
+            remote_api::remote_rotate_token,
+            remote_api::remote_set_name,
+            remote_api::remote_set_iroh,
+            remote_api::remote_set_road,
+            remote_api::remote_set_iroh_relay_url,
+            remote_api::remote_phone_relay_clear,
+            remote_api::remote_set_road_order,
+            remote_api::remote_set_port,
+            remote_api::remote_pair_payload,
+            remote_api::relay_report,
         ]))
         .setup(move |app| {
             if let Err(e) =
@@ -217,9 +236,14 @@ pub fn run() {
                     .unwrap_or_else(|| "?".into())
             );
 
-            // The settings file claude launches load their SessionStart hook
-            // from. Every launch, because it embeds this binary's path.
+            // The settings file claude launches load their hooks from.
+            // Every launch, because it embeds this binary's path.
             hooklink::install();
+
+            // And the app side of the phase hooks: an inotify watch on their
+            // spool, so a permission dialog reaches the phone as it opens
+            // rather than on the next poll of something.
+            hooklink::start_hook_drain(app.handle().clone());
 
             // Push sessions-list refreshes when an agent's transcripts change
             // (new/cleared/forked sessions) instead of waiting for the 30s poll.
@@ -231,14 +255,11 @@ pub fn run() {
             // API reads this ledger; it does not replace tab/session ownership.
             changes::start(app.handle());
 
-            // An explicit opt-in restores the same local gateway and saved
-            // private relay route. With no setting (the default), startup
-            // remains entirely offline as before.
-            remote::start_on_launch(
-                app.handle().clone(),
-                tabs.clone(),
-                startup_services.clone(),
-            );
+            // The phone-protocol listener (with its iroh tunnel), separate
+            // from the remote gateway above and off unless enabled in
+            // Settings. A phone paired earlier expects the desktop to answer
+            // again.
+            remote_api::autostart(app.handle());
 
             // Ask for the saved size less whatever this desktop's decorations
             // add to it. Runs after the plugin's own restore, so it wins.
