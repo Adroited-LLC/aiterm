@@ -493,7 +493,7 @@ private fun WorkingRow(agent: String, detail: String = "") {
 
 /** Codex folds its AGENTS.md and an environment block into the first user
  *  turn; the person only typed the last line. Hide the harness's part. */
-private val HARNESS_BLOCKS = Regex("(?s)<(INSTRUCTIONS|environment_context|user_instructions)>.*?</\\1>\\s*")
+private val HARNESS_BLOCKS = Regex("(?s)<(INSTRUCTIONS|environment_context|user_instructions|recommended_plugins)>.*?</\\1>\\s*")
 private val HARNESS_HEADING = Regex("(?m)^#\\s*AGENTS\\.md instructions for \\S+\\s*$")
 /** What the person typed, with the harness's preamble gone. Empty means
  *  the whole turn was scaffolding — codex sends AGENTS.md as its own
