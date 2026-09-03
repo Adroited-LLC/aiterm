@@ -22,6 +22,7 @@ import {
 import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
 import FileView from "./components/FileView";
+import PdfView, { isPdf } from "./components/PdfView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
 import HomeDashboard from "./components/HomeDashboard";
@@ -2866,12 +2867,16 @@ export default function App() {
                   display: showsFile(f) && f.key === activeFileTab ? "flex" : "none",
                 }}
               >
-                <FileView
-                  path={f.path}
-                  active={showsFile(f) && f.key === activeFileTab}
-                  refreshKey={explorerRefresh}
-                  onDirty={(d) => noteFileDirty(f.key, d)}
-                />
+                {isPdf(f.path) ? (
+                  <PdfView path={f.path} active={showsFile(f) && f.key === activeFileTab} refreshKey={explorerRefresh} />
+                ) : (
+                  <FileView
+                    path={f.path}
+                    active={showsFile(f) && f.key === activeFileTab}
+                    refreshKey={explorerRefresh}
+                    onDirty={(d) => noteFileDirty(f.key, d)}
+                  />
+                )}
               </div>
             ))}
             {activeTab !== null && ended.has(activeTab) && (
