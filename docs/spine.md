@@ -137,7 +137,7 @@ sessions list (`GET /v1/sessions`) and the spine's driver both call. There
 is one rule, so the phone's list and the session it opens can never
 disagree about a session.
 
-Three inputs:
+Four inputs:
 
 - **Terminal cadence** — bytes on the tab's pty in the last 10 s
   (`TabRegistry::session_activities`, which spells it `output`). Immediate,
@@ -154,13 +154,18 @@ Three inputs:
   wherever an event enters the log, so no path can route around it, and
   `Spine::turn_open` hands it to both callers. `None` means no adapter has
   ever reported a turn boundary for this session (the legacy adapter emits
-  neither), and the rule below leaves such a session exactly as it was.
+  neither), and the rule below leaves such a session exactly as it was. A
+  Claude Code `Stop` or `UserPromptSubmit` hook moves this bracket too — see
+  Hooks below.
+- **A Claude Code hook** — the harness saying, as it happens, that a
+  permission dialog is up. `Spine::hook_attention`. See Hooks below.
 
 ```rust
 activity_verdict(
     terminal: Option<&str>,                            // cadence
     transcript: Option<(&'static str, &'static str)>,  // verdict + reason
     turn_open: Option<bool>,                           // the spine's bracket
+    hook_attention: bool,                              // a hook says a person is waited on
 ) -> (&'static str, &'static str)
 ```
 
@@ -182,6 +187,10 @@ The rule, in order:
    animates through its own approval dialog, so cadence alone holds
    `working` forever. Cadence is never demoted to idle from the transcript
    side.
+4. **A hook that says attention outranks all three.** It is the harness's
+   own announcement, not an inference from a file or a pty; nothing below
+   it may demote it, and it stands until another hook or the transcript
+   retires it.
 
 Attention still outranks everything, from either source: a closed turn with
 a permission prompt still up is a person being waited on, not an idle
@@ -208,6 +217,94 @@ verdict can no longer flip on its own, and before it, codex's 45 s
 staleness rule still can. Cadence and the turn bracket are re-read every
 tick regardless: a terminal falling quiet is the one change a cached
 transcript cannot see.
+
+### Hooks — Claude Code's own account of itself
+
+Claude Code is the one engine that will *tell* us what it is doing, as it
+happens. `hooklink` already installed a `SessionStart` hook (the exact
+pid → session link); the same injected settings file now carries the rest,
+all running the same `aiterm --hook-report` binary, matcher-less, with a
+5 s timeout:
+
+```json
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command",
+  "command":"'/usr/bin/aiterm' --hook-report","timeout":5}]}],
+  "UserPromptSubmit":[…],"PreToolUse":[…],"PostToolUse":[…],
+  "Notification":[…],"PermissionRequest":[…],"Stop":[…]}}
+```
+
+`MessageDisplay` is deliberately absent: partial assistant text would
+duplicate on the phone what the transcript adapter already streams as
+blocks.
+
+The hook writes one small file into `~/.local/share/aiterm/hook-events/`,
+named for the nanosecond it was written (`{nanos:020}-{pid}.json`, so name
+order is time order), carrying the payload's own field names — trimmed, not
+reshaped, with `tool_input` reduced to the one key that names what is being
+acted on. `SessionStart` still goes to its own spool (`session-events/`,
+one file per process, polled by the frontend); the two never mix. Both are
+write-then-rename, both swallow every error and exit 0: a hook runs inside
+claude's own path, before and after every tool call.
+
+The app drains the phase spool on an inotify watch of the directory, with a
+2 s tick behind it in case the watch could not be armed. Measured latency
+from the hook process writing the file to the `phase` event's `ts`: 53–55 ms
+[observed 2026-09-02]. Each file is deleted as it is read — a status nobody
+could place is worth nothing a second later — and a session with no tail
+drops on the floor, like every other phase.
+
+| hook | phase | detail |
+|---|---|---|
+| `Notification` `permission_prompt` | `needs_you` | `permission: <tool>`, dug out of the harness's own sentence ("Claude needs your permission to use Bash") |
+| `Notification` `idle_prompt` | `idle` | — |
+| `Notification` anything else | ignored | (`auth_success`, `elicitation_dialog`, `agent_needs_input`, …) |
+| `PermissionRequest` | `needs_you` | `permission: <tool_name>` |
+| `PreToolUse` | `working` | `running <tool>: <command \| file_path \| path \| pattern \| url>`, one line, 60 chars |
+| `PostToolUse` | `working` | "" — the tool is done, and the empty detail is what clears its name |
+| `UserPromptSubmit` | `working` | "", and the turn bracket opens |
+| `Stop` | recomputed | idle unless the transcript says attention, and the turn bracket closes |
+
+Two rules make hook-derived phase outrank the rest, both in
+`activity_verdict`'s one place:
+
+- **A hook that says needs-you is not demoted.** It is the only input here
+  that is not an inference — not a file read after the fact, not bytes on a
+  pty — so `activity_verdict` gained a fourth argument, `hook_attention`,
+  which turns any non-attention verdict into `("attention", "permission")`.
+  Cadence is what would otherwise demote it: claude's TUI redraws its own
+  dialog, so the pty is busy for as long as the person takes to answer. It
+  stands until a later hook retires it (the tool running, the turn ending)
+  or the transcript says attention with a better reason. The sessions list
+  passes the same flag, so the phone's list and the session it opens cannot
+  disagree.
+- **A hook's own words survive the tick.** The phase tick a second later
+  computes `("working", "")` and would blank "running Bash: npm test"; the
+  registry keeps the last hook phase per session and re-applies its detail
+  while that phase is still the standing one.
+
+Hooks emit no `turn_started` / `turn_ended`: the transcript's
+`turn_duration` stays the single source of turn events, and a second one
+from this side would unbalance the bracket the rule above reads. They do
+move the bracket itself — `Stop` closes it, `UserPromptSubmit` opens it —
+because that is the gate cadence is measured against and the hook is a beat
+ahead of the transcript. Without it, `Stop`'s idle was undone 28 ms later
+by the TUI's next repaint and re-corrected 270 ms after that [observed
+live, 2026-09-02]; with it, idle lands 10 ms *before* the transcript's own
+`turn_ended`.
+
+A session aiterm did not launch has no `--settings` flag, so none of its
+hooks fire and nothing changes for it: the transcript path still works. And
+`bypassPermissions` (john's own claude setting) means the permission arm
+never fires in his tabs at all — nothing asks, so nothing is announced.
+
+The payloads, all probed live against Claude Code 2.1.259 on 2026-09-02
+rather than taken from the docs, which are wrong in two places: `PostToolUse`
+carries `tool_response` (not `tool_result`), and `Stop` carries
+`stop_hook_active` + `last_assistant_message` and no `stop_reason` at all —
+which is why `Stop` recomputes a verdict instead of claiming one.
+`PermissionRequest` exists and, unlike grok's `permission_requested`, fires
+only when a dialog is actually displayed: it did not fire for an
+auto-allowed Bash.
 
 ### Antigravity's invisible permission prompt
 
@@ -292,7 +389,7 @@ file), `poll()` returns a `Reset` followed by the rebuilt history.
 
 | engine | content | phase / turns |
 |---|---|---|
-| claude | `~/.claude/projects/<proj>/<id>.jsonl`, one line per content block (thinking, text, tool_use) + `user` lines carrying `tool_result`. Skip `isSidechain` and `isMeta`. | `user` line → `turn_started`; `system` `turn_duration` → `turn_ended`; terminal activity → `phase`. Hooks later. |
+| claude | `~/.claude/projects/<proj>/<id>.jsonl`, one line per content block (thinking, text, tool_use) + `user` lines carrying `tool_result`. Skip `isSidechain` and `isMeta`. | `user` line → `turn_started`; `system` `turn_duration` → `turn_ended`; terminal activity → `phase`; Claude Code's own hooks → `phase` (see Hooks above). |
 | grok | `~/.grok/sessions/<cwd>/<id>/updates.jsonl` — ACP `session/update` lines: `user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, and `_x.ai` `turn_completed` (in updates.jsonl, not events.jsonl). Consecutive chunks of one kind fold into one block (id = ordinal of the first line). | `events.jsonl`: `turn_started`, `turn_ended` (with `outcome`), `permission_requested` / `permission_resolved`, `tool_started` / `tool_completed` (with `outcome`), `first_token`, and `phase_changed` (ignored — it describes the TUI, not the session). Also `_x.ai` `task_backgrounded` / `task_completed` (a backgrounded command: its card stays running and closes from the task result — Grok marks the card completed with a placeholder the moment the launch returns, and the result quotes a task id that differs from the tool call id for 9 of 29 observed tasks; the backgrounded line is the only record of the pairing), `subagent_spawned` / `subagent_finished` (a second card, `sub-<id>`, category think; the child writes its own session directory, invisible from the parent), and ACP `plan` (an `agent_thought` checklist under `p<first line ordinal>`, rewritten in place). |
 | codex | `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`. `response_item` lines carry content under the engine's own ids (`payload.id`, `call_id`); the TUI's mirror (`event_msg` `item_completed`) is the ONLY record that says a tool failed — a command that exits 1 still gets an output reading "Script completed". Almost every tool is one JavaScript `exec`; tool and category are parsed out of the snippet. Reasoning arrives encrypted with an empty summary. | `event_msg` `task_started` / `task_complete` / `turn_aborted` (a real `interrupted`), all under codex's `turn_id`. |
 | antigravity | `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`, one step per line, no ids (id = `<conversation>:<step_index>`, `:<i>` per call, `:thinking`). File order is NOT step order: a parallel call's output can land before the step that issued it, so outputs pair to calls by index arithmetic. A failed tool writes NOTHING — its index is a hole — so a call whose output index is passed by a later step is `failed`; `run_command` alone writes its output whatever the exit code. | `USER_INPUT` opens a turn; a prose-only `PLANNER_RESPONSE` ends it; an unanswered `ask_*` is `needs_you`. Written at step completion, never earlier (the SQLite db is touched once, at startup). |
@@ -327,6 +424,8 @@ turn that changed, is a `Reset` and a full replay.
 - spine core, registry, endpoints, WS, legacy adapter, phase bridge:
   `src-tauri/src/spine/mod.rs`, `spine/legacy.rs`, `remote_api.rs`, `lib.rs`, `tabs.rs`.
 - claude adapter: `src-tauri/src/spine/claude.rs` (+ visibility tweaks in `detail.rs`).
+- Claude Code hooks → phase: `src-tauri/src/hooklink.rs`, the `--hook-report`
+  argv mode in `main.rs`, `push_hook_phase` in `spine/registry.rs`.
 - grok adapter: `src-tauri/src/spine/grok.rs` (+ visibility tweaks in `grok.rs`).
 - phone: `mobile/**`.
 

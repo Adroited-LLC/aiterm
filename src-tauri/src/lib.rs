@@ -235,9 +235,14 @@ pub fn run() {
                     .unwrap_or_else(|| "?".into())
             );
 
-            // The settings file claude launches load their SessionStart hook
-            // from. Every launch, because it embeds this binary's path.
+            // The settings file claude launches load their hooks from.
+            // Every launch, because it embeds this binary's path.
             hooklink::install();
+
+            // And the app side of the phase hooks: an inotify watch on their
+            // spool, so a permission dialog reaches the phone as it opens
+            // rather than on the next poll of something.
+            hooklink::start_hook_drain(app.handle().clone());
 
             // Push sessions-list refreshes when an agent's transcripts change
             // (new/cleared/forked sessions) instead of waiting for the 30s poll.

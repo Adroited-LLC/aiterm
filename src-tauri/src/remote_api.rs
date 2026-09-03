@@ -1747,7 +1747,11 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
             // sessions it is tailing; `None` for the rest, which leaves
             // them on the cadence rule they had before.
             let turn = spine.as_ref().and_then(|s| s.turn_open(id));
-            let v = activity_verdict(cadence.get(id).map(String::as_str), busy.get(id).copied(), turn);
+            // And the same hook state: a session holding a permission
+            // dialog reads needs-you in the list as well as in the session.
+            let hooked = spine.as_ref().is_some_and(|s| s.hook_attention(id));
+            let v =
+                activity_verdict(cadence.get(id).map(String::as_str), busy.get(id).copied(), turn, hooked);
             (id.clone(), v.0.to_string())
         })
         .collect();
@@ -2063,8 +2067,9 @@ fn transcript_outranks(terminal: &str, transcript: &str) -> bool {
 }
 
 /// The single place one session's activity is decided: the tab's output
-/// cadence, corrected by what the session's own files say. The sessions
-/// list and the spine's phase tick both come through here, so neither can
+/// cadence, corrected by what the session's own files say and by what a
+/// Claude Code hook said as it happened. The sessions list and the spine's
+/// phase tick both come through here, so neither can
 /// hold a verdict the other would not.
 ///
 /// Returns the verdict and a short human detail — "" when the source has
@@ -2073,6 +2078,7 @@ pub(crate) fn activity_verdict(
     terminal: Option<&str>,
     transcript: Option<(&'static str, &'static str)>,
     turn_open: Option<bool>,
+    hook_attention: bool,
 ) -> (&'static str, &'static str) {
     // `session_activities` spells cadence "output"; the phone's session
     // state, the spine's phases and `transcript_outranks` all speak
@@ -2098,10 +2104,24 @@ pub(crate) fn activity_verdict(
     if cadence == "working" && turn_open == Some(false) {
         cadence = "idle";
     }
-    match transcript {
+    let verdict = match transcript {
         Some((state, detail)) if transcript_outranks(cadence, state) => (state, detail),
         _ => (cadence, ""),
+    };
+    // A Claude Code hook said a permission dialog is up. That is the harness
+    // announcing its own state as it happens — not a file read after the
+    // fact, not bytes on a pty — so it is the one input here that is not an
+    // inference, and nothing below it may demote it. Cadence in particular
+    // would: claude's TUI redraws its own dialog, so the pty is busy for as
+    // long as the person takes to answer. It stands until a later hook (the
+    // tool running, the turn ending) or the transcript retires it. A
+    // transcript that already says attention keeps its own reason, which is
+    // more specific than this one; the caller replaces even that with the
+    // hook's detail when it has one ("permission: Edit").
+    if hook_attention && verdict.0 != "attention" {
+        return ("attention", "permission");
     }
+    verdict
 }
 
 /// `Some(("working", …))`, `Some(("attention", …))` — codex mid-approval, or
@@ -3095,31 +3115,31 @@ mod tests {
     #[test]
     fn one_verdict_serves_the_sessions_list_and_the_spine() {
         // Nothing known at all.
-        assert_eq!(activity_verdict(None, None, None), ("idle", ""));
+        assert_eq!(activity_verdict(None, None, None, false), ("idle", ""));
         // Cadence alone, in the spelling `session_activities` actually uses.
-        assert_eq!(activity_verdict(Some("output"), None, None), ("working", ""));
-        assert_eq!(activity_verdict(Some("idle"), None, None), ("idle", ""));
+        assert_eq!(activity_verdict(Some("output"), None, None, false), ("working", ""));
+        assert_eq!(activity_verdict(Some("idle"), None, None, false), ("idle", ""));
         // A quiet terminal takes any transcript verdict, reason and all.
         assert_eq!(
-            activity_verdict(Some("idle"), Some(("working", "")), None),
+            activity_verdict(Some("idle"), Some(("working", "")), None, false),
             ("working", "")
         );
         assert_eq!(
-            activity_verdict(Some("idle"), Some(("attention", "permission")), None),
+            activity_verdict(Some("idle"), Some(("attention", "permission")), None, false),
             ("attention", "permission")
         );
         // The regression this function exists for: a codex whose TUI keeps
         // animating through its approval dialog reads "output" forever, and
         // must still come out as attention.
         assert_eq!(
-            activity_verdict(Some("output"), Some(("attention", "approval")), None),
+            activity_verdict(Some("output"), Some(("attention", "approval")), None, false),
             ("attention", "approval")
         );
         // But output is never demoted to idle by a transcript with nothing
         // to say — output is output.
-        assert_eq!(activity_verdict(Some("output"), None, None), ("working", ""));
+        assert_eq!(activity_verdict(Some("output"), None, None, false), ("working", ""));
         assert_eq!(
-            activity_verdict(Some("output"), Some(("working", "")), None),
+            activity_verdict(Some("output"), Some(("working", "")), None, false),
             ("working", "")
         );
     }
@@ -3174,30 +3194,57 @@ mod tests {
     #[test]
     fn a_closed_turn_stops_cadence_from_claiming_work() {
         // Some(false): the answer is finished, whatever the pty is doing.
-        assert_eq!(activity_verdict(Some("output"), None, Some(false)), ("idle", ""));
-        assert_eq!(activity_verdict(Some("working"), None, Some(false)), ("idle", ""));
+        assert_eq!(activity_verdict(Some("output"), None, Some(false), false), ("idle", ""));
+        assert_eq!(activity_verdict(Some("working"), None, Some(false), false), ("idle", ""));
         // Some(true) and None both leave cadence alone.
-        assert_eq!(activity_verdict(Some("output"), None, Some(true)), ("working", ""));
-        assert_eq!(activity_verdict(Some("output"), None, None), ("working", ""));
+        assert_eq!(activity_verdict(Some("output"), None, Some(true), false), ("working", ""));
+        assert_eq!(activity_verdict(Some("output"), None, None, false), ("working", ""));
         // Attention still outranks everything, from either side. A closed
         // turn with a permission prompt still up is a person being waited
         // on, not an idle session.
         assert_eq!(
-            activity_verdict(Some("output"), Some(("attention", "permission")), Some(false)),
+            activity_verdict(Some("output"), Some(("attention", "permission")), Some(false), false),
             ("attention", "permission")
         );
         assert_eq!(
-            activity_verdict(Some("attention"), None, Some(false)),
+            activity_verdict(Some("attention"), None, Some(false), false),
             ("attention", "")
         );
         // And the transcript can still hold a session working against a
         // turn bracket that closed — the gate is on cadence only.
         assert_eq!(
-            activity_verdict(Some("output"), Some(("working", "")), Some(false)),
+            activity_verdict(Some("output"), Some(("working", "")), Some(false), false),
             ("working", "")
         );
         // A closed turn does not invent work out of a quiet terminal.
-        assert_eq!(activity_verdict(Some("idle"), None, Some(false)), ("idle", ""));
+        assert_eq!(activity_verdict(Some("idle"), None, Some(false), false), ("idle", ""));
+    }
+
+    /// A hook is the harness announcing its own state, so it outranks the
+    /// two inputs that are inferences. The case it exists for: claude's TUI
+    /// redraws its permission dialog, so cadence reads "output" for as long
+    /// as the person takes to answer, and without this the tick a second
+    /// later would demote a needs-you the hook had just raised.
+    #[test]
+    fn a_hook_that_says_a_person_is_being_waited_on_is_not_demoted() {
+        assert_eq!(activity_verdict(Some("output"), None, None, true), ("attention", "permission"));
+        assert_eq!(activity_verdict(Some("idle"), None, None, true), ("attention", "permission"));
+        // Including against a transcript that has not caught up — the tool
+        // that is being asked about has not run, so nothing was written.
+        assert_eq!(
+            activity_verdict(Some("output"), Some(("working", "")), Some(true), true),
+            ("attention", "permission")
+        );
+        // A transcript already saying attention keeps its own reason: it is
+        // the more specific of the two.
+        assert_eq!(
+            activity_verdict(Some("output"), Some(("attention", "approval")), None, true),
+            ("attention", "approval")
+        );
+        // And cadence's own attention is left as it was.
+        assert_eq!(activity_verdict(Some("attention"), None, None, true), ("attention", ""));
+        // False changes nothing at all: every other case is the old rule.
+        assert_eq!(activity_verdict(Some("output"), None, None, false), ("working", ""));
     }
 
     /// The phone reads `type` to route the frame and `kind` to render it,
