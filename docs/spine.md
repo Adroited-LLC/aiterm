@@ -108,7 +108,7 @@ held for that id — a re-issued call never carries one.
 - A tail stops when: no tab is bound AND no interest for 15 minutes.
 - Adapter driver: `bootstrap()` once (history → events, seq assigned in
   order), then `poll()` on every change of any `watch_paths()` file
-  (notify, 250 ms coalesce) and on a 2 s fallback tick. The notify watch
+  (notify, 250 ms coalesce) and on a 1 s fallback tick. The notify watch
   is on the parent DIRECTORY of each watched path, not the file: a
   `/clear` replaces the transcript, and a watch on the old inode goes
   quiet.
@@ -116,7 +116,7 @@ held for that id — a re-issued call never carries one.
   ago has an id and a bound tab before its engine has written anything,
   and every adapter's `open` resolves through files on disk — so the first
   try fails and there is no path to watch yet either. The driver retries on
-  its 2 s tick for the first minute, then every 10 s (`open_adapter` asks
+  its 1 s tick for the first minute, then every 10 s (`open_adapter` asks
   each backend in turn and codex's answer rescans its whole session tree).
   Nothing is pushed and `live` stays false until it opens; the tail is
   still reaped on the usual rule if the source never appears.
@@ -137,28 +137,66 @@ sessions list (`GET /v1/sessions`) and the spine's driver both call. There
 is one rule, so the phone's list and the session it opens can never
 disagree about a session.
 
-Two inputs:
+Three inputs:
 
 - **Terminal cadence** — bytes on the tab's pty in the last 10 s
   (`TabRegistry::session_activities`, which spells it `output`). Immediate,
-  and blind: it cannot tell working from waiting-on-a-person.
+  and blind: it cannot tell working from waiting-on-a-person, and it cannot
+  tell an agent thinking from a TUI repainting.
 - **The transcript** — `remote_api::transcript_verdict`, a tail read of the
   session's own files: grok's `events.jsonl` (`permission_requested` →
   attention, with the reason `permission`), antigravity's step types,
   codex's open turn that has written nothing for 45 s (`approval`),
   opencode's store. Returns the verdict and a short reason, or nothing.
+- **The spine's own turn bracket** — whether the adapter's last
+  `turn_started` / `turn_ended` left a turn open. `Spine::push` records it
+  wherever an event enters the log, so no path can route around it, and
+  `Spine::turn_open` hands it to both callers. `None` means no adapter has
+  ever reported a turn boundary for this session (the legacy adapter emits
+  neither), and the rule below leaves such a session exactly as it was.
 
-The transcript outranks cadence when cadence is idle, and when the
-transcript says `attention` against a cadence `working` — codex's TUI
-animates through its own approval dialog, so cadence alone holds `working`
-forever. Cadence is never demoted to idle from the transcript side.
+```rust
+activity_verdict(
+    terminal: Option<&str>,                            // cadence
+    transcript: Option<(&'static str, &'static str)>,  // verdict + reason
+    turn_open: Option<bool>,                           // the spine's bracket
+) -> (&'static str, &'static str)
+```
 
-Two paths push it, both through the same dedupe:
+The rule, in order:
 
-- The tabs registry bridge, on every cadence change, for immediacy. No
-  detail: bytes on a pty know no reason.
-- The driver's 2 s tick, which is the authority — it is what carries
-  `attention` and its reason.
+1. Cadence normalises to working/attention/idle (`session_activities`
+   spells working as `output`).
+2. **A closed turn stops cadence claiming work.** When `turn_open` is
+   `Some(false)`, a cadence of `working` becomes `idle`. A TUI goes on
+   repainting after the answer is finished — a spinner clearing, a footer
+   redrawn, the prompt coming back — and held on its own that kept the
+   phone's header on "working" for the full ten seconds cadence counts as
+   recent, well after the turn had visibly ended
+   [observed: Claude Code, 2026-09-02]. The gate is a gate and not a latch:
+   the next `turn_started` re-opens it, within one poll of the user's line
+   reaching disk.
+3. The transcript outranks cadence when cadence is idle, and when the
+   transcript says `attention` against a cadence `working` — codex's TUI
+   animates through its own approval dialog, so cadence alone holds
+   `working` forever. Cadence is never demoted to idle from the transcript
+   side.
+
+Attention still outranks everything, from either source: a closed turn with
+a permission prompt still up is a person being waited on, not an idle
+session. The gate is on cadence only — a transcript that says `working`
+against a closed bracket is still believed.
+
+Two paths push it, both through the same rule and the same dedupe:
+
+- The tabs registry bridge, on every cadence change, for immediacy — it
+  fires the moment bytes flow, where the tick can be up to a second behind.
+  No transcript half (a 256 KB tail read has no business on the pty's
+  output path) and no detail: cadence knows no reason.
+- The driver's 1 s tick, which is the authority — it is what carries
+  `attention` and its reason. A poll whose batch contained a `turn_started`
+  or `turn_ended` recomputes immediately and skips the cache below, so idle
+  lands with the turn that ended rather than up to a second after it.
 
 Both are dropped when the (phase, detail) pair is the one already standing.
 Cadence fires four times a second while output flows; without that the ring
@@ -166,8 +204,18 @@ would be nothing but identical `working` events. The tick's transcript read
 is skipped whenever the length and mtime of every file it reads are
 unchanged AND the newest of them is more than 60 s old — past that a
 verdict can no longer flip on its own, and before it, codex's 45 s
-staleness rule still can. Cadence is re-read every tick regardless: a
-terminal falling quiet is the one change a cached transcript cannot see.
+staleness rule still can. Cadence and the turn bracket are re-read every
+tick regardless: a terminal falling quiet is the one change a cached
+transcript cannot see.
+
+The tick is a second rather than two because idle has to land within about
+one. A tick that finds nothing changed is two `stat` calls and a compare —
+1.8 µs measured, debug build, on a session watching a 28 MB transcript and
+a 64 KB `events.jsonl`. The read it skips is 3.6 ms on that same session,
+so the gate is what makes the faster tick free. `phase_sources` (the
+`owner_in` walk that finds those files) is only re-run every 5 s while it
+is still finding nothing: a miss costs 2.7 ms, because `owner_in` asks
+every backend and codex's answer rescans its whole session tree.
 
 A phase is only ever pushed for a session that already has a tail. Neither
 path starts one — a phase with no content behind it is not worth opening a

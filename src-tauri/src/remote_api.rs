@@ -1737,11 +1737,16 @@ async fn sessions(State(ctx): State<Ctx>) -> Response {
     // One verdict per session either source knows about, decided by the
     // same function the spine's phase tick calls — the two cannot disagree
     // about a session because there is only one rule.
+    let spine = ctx.app.try_state::<std::sync::Arc<crate::spine::Spine>>();
     let activity: HashMap<String, String> = cadence
         .keys()
         .chain(busy.keys())
         .map(|id| {
-            let v = activity_verdict(cadence.get(id).map(String::as_str), busy.get(id).copied());
+            // The same turn state the spine's own phase tick reads, for
+            // sessions it is tailing; `None` for the rest, which leaves
+            // them on the cadence rule they had before.
+            let turn = spine.as_ref().and_then(|s| s.turn_open(id));
+            let v = activity_verdict(cadence.get(id).map(String::as_str), busy.get(id).copied(), turn);
             (id.clone(), v.0.to_string())
         })
         .collect();
@@ -1933,6 +1938,7 @@ fn transcript_outranks(terminal: &str, transcript: &str) -> bool {
 pub(crate) fn activity_verdict(
     terminal: Option<&str>,
     transcript: Option<(&'static str, &'static str)>,
+    turn_open: Option<bool>,
 ) -> (&'static str, &'static str) {
     // `session_activities` spells cadence "output"; the phone's session
     // state, the spine's phases and `transcript_outranks` all speak
@@ -1940,11 +1946,24 @@ pub(crate) fn activity_verdict(
     // fire at all: against the raw "output" spelling `transcript_outranks`
     // matched neither arm, so a codex parked on an approval kept reading as
     // busy — the exact case that rule was written for.
-    let cadence: &'static str = match terminal {
+    let mut cadence: &'static str = match terminal {
         Some("output" | "working") => "working",
         Some("attention") => "attention",
         _ => "idle",
     };
+    // Cadence is bytes on a pty, and a TUI goes on repainting after the
+    // answer is finished — a spinner clearing, a footer redrawn, the prompt
+    // coming back. Held on its own it kept the phone's header on "working"
+    // for the ten seconds `session_activities` counts as recent, well after
+    // the turn had visibly ended [observed: Claude Code, 2026-09-02]. So
+    // when the spine's adapter has told us the turn is closed, cadence may
+    // no longer promote to working. It may still say attention, and a new
+    // `turn_started` re-opens the gate within a poll of the user's line
+    // being written. `None` — the legacy adapter reports no turns at all —
+    // leaves the old rule exactly as it was.
+    if cadence == "working" && turn_open == Some(false) {
+        cadence = "idle";
+    }
     match transcript {
         Some((state, detail)) if transcript_outranks(cadence, state) => (state, detail),
         _ => (cadence, ""),
@@ -2892,33 +2911,65 @@ mod tests {
     #[test]
     fn one_verdict_serves_the_sessions_list_and_the_spine() {
         // Nothing known at all.
-        assert_eq!(activity_verdict(None, None), ("idle", ""));
+        assert_eq!(activity_verdict(None, None, None), ("idle", ""));
         // Cadence alone, in the spelling `session_activities` actually uses.
-        assert_eq!(activity_verdict(Some("output"), None), ("working", ""));
-        assert_eq!(activity_verdict(Some("idle"), None), ("idle", ""));
+        assert_eq!(activity_verdict(Some("output"), None, None), ("working", ""));
+        assert_eq!(activity_verdict(Some("idle"), None, None), ("idle", ""));
         // A quiet terminal takes any transcript verdict, reason and all.
         assert_eq!(
-            activity_verdict(Some("idle"), Some(("working", ""))),
+            activity_verdict(Some("idle"), Some(("working", "")), None),
             ("working", "")
         );
         assert_eq!(
-            activity_verdict(Some("idle"), Some(("attention", "permission"))),
+            activity_verdict(Some("idle"), Some(("attention", "permission")), None),
             ("attention", "permission")
         );
         // The regression this function exists for: a codex whose TUI keeps
         // animating through its approval dialog reads "output" forever, and
         // must still come out as attention.
         assert_eq!(
-            activity_verdict(Some("output"), Some(("attention", "approval"))),
+            activity_verdict(Some("output"), Some(("attention", "approval")), None),
             ("attention", "approval")
         );
         // But output is never demoted to idle by a transcript with nothing
         // to say — output is output.
-        assert_eq!(activity_verdict(Some("output"), None), ("working", ""));
+        assert_eq!(activity_verdict(Some("output"), None, None), ("working", ""));
         assert_eq!(
-            activity_verdict(Some("output"), Some(("working", ""))),
+            activity_verdict(Some("output"), Some(("working", "")), None),
             ("working", "")
         );
+    }
+
+    /// The spine's turn bracket is the authority over cadence. A closed
+    /// turn means a TUI's repaints no longer read as work; an open one, and
+    /// a session no adapter reports turns for, leave the rule as it was.
+    #[test]
+    fn a_closed_turn_stops_cadence_from_claiming_work() {
+        // Some(false): the answer is finished, whatever the pty is doing.
+        assert_eq!(activity_verdict(Some("output"), None, Some(false)), ("idle", ""));
+        assert_eq!(activity_verdict(Some("working"), None, Some(false)), ("idle", ""));
+        // Some(true) and None both leave cadence alone.
+        assert_eq!(activity_verdict(Some("output"), None, Some(true)), ("working", ""));
+        assert_eq!(activity_verdict(Some("output"), None, None), ("working", ""));
+        // Attention still outranks everything, from either side. A closed
+        // turn with a permission prompt still up is a person being waited
+        // on, not an idle session.
+        assert_eq!(
+            activity_verdict(Some("output"), Some(("attention", "permission")), Some(false)),
+            ("attention", "permission")
+        );
+        assert_eq!(
+            activity_verdict(Some("attention"), None, Some(false)),
+            ("attention", "")
+        );
+        // And the transcript can still hold a session working against a
+        // turn bracket that closed — the gate is on cadence only.
+        assert_eq!(
+            activity_verdict(Some("output"), Some(("working", "")), Some(false)),
+            ("working", "")
+        );
+        // A closed turn does not invent work out of a quiet terminal.
+        assert_eq!(activity_verdict(Some("idle"), None, Some(false)), ("idle", ""));
     }
 
     /// The phone reads `type` to route the frame and `kind` to render it,

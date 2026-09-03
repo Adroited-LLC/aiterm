@@ -27,8 +27,10 @@ const INTEREST_TTL: Duration = Duration::from_secs(15 * 60);
 const REAP_EVERY: Duration = Duration::from_secs(60);
 /// Fallback poll when no watched file moved — and the only poll the legacy
 /// adapter usually gets, since opencode keeps sessions in a database with no
-/// path to watch.
-const TICK: Duration = Duration::from_secs(2);
+/// path to watch. Also the cadence of the phase verdict, which is why it is
+/// a second and not two: idle has to land within about a second of a turn
+/// ending, and a tick that finds nothing changed costs two `stat` calls.
+const TICK: Duration = Duration::from_secs(1);
 /// A transcript append is several lines and lands as several inotify events;
 /// one poll per burst, not one per line.
 const COALESCE: Duration = Duration::from_millis(250);
@@ -54,6 +56,12 @@ const FAST_OPEN_RETRY_FOR: Duration = Duration::from_secs(60);
 /// until past it.
 const VERDICT_SETTLES_AFTER: Duration = Duration::from_secs(60);
 
+/// How often to look again for the files a session's phase verdict reads,
+/// when the last look found none. `phase_sources` goes through `owner_in`,
+/// which asks every backend in turn — not a per-tick cost now that the tick
+/// is a second.
+const RESOLVE_SOURCES_EVERY: Duration = Duration::from_secs(5);
+
 /// How long a `GET …/spine` waits for a just-started tail to finish reading
 /// history. Answering the first call empty leaves the phone on a blank
 /// screen until something else happens to move.
@@ -78,9 +86,14 @@ struct SessionLog {
     ready: bool,
     /// The last phase pushed, with its detail. The terminal publishes
     /// cadence four times a second while output flows and the phase tick
-    /// runs every 2 s; without this the ring would be nothing but identical
-    /// `working` events.
+    /// runs every second; without this the ring would be nothing but
+    /// identical `working` events.
     last_phase: Option<(Phase, String)>,
+    /// Whether a turn is open, and the `ts` of the event that said so.
+    /// `None` means no adapter has ever reported a turn boundary for this
+    /// session — the legacy adapter emits neither — and the cadence rule
+    /// stands unchanged for it.
+    turn: Option<(bool, u64)>,
 }
 
 impl SessionLog {
@@ -95,6 +108,7 @@ impl SessionLog {
             live: false,
             ready: false,
             last_phase: None,
+            turn: None,
         }
     }
 
@@ -155,6 +169,14 @@ impl Spine {
                 kind,
             };
             log.next_seq += 1;
+            // The turn bracket, recorded where nothing can route around it.
+            // It is what lets the phase rule below distinguish a TUI still
+            // redrawing from an agent still working.
+            match &ev.kind {
+                Kind::TurnStarted { .. } => log.turn = Some((true, ev.ts)),
+                Kind::TurnEnded { .. } => log.turn = Some((false, ev.ts)),
+                _ => {}
+            }
             // A reset says everything before it is gone. Keeping the old
             // events would only hand a reconnecting phone history it is
             // about to throw away — and they are the events most likely to
@@ -202,6 +224,13 @@ impl Spine {
         self.sessions.lock().unwrap().get(session_id).is_some_and(|l| l.ready)
     }
 
+    /// Whether a turn is open for this session, or `None` when no adapter
+    /// has ever said. The phase rule treats `None` as "no opinion" and
+    /// falls back to cadence alone.
+    pub fn turn_open(&self, session_id: &str) -> Option<bool> {
+        self.sessions.lock().unwrap().get(session_id).and_then(|l| l.turn).map(|(open, _)| open)
+    }
+
     /// Start the adapter driver for a session if one is not already
     /// running, and mark the session as wanted either way.
     pub fn ensure_tail(self: &Arc<Self>, app: &AppHandle, session_id: &str, agent: &str) {
@@ -242,6 +271,17 @@ impl Spine {
         self.push(session_id, &agent, now_ms(), Kind::Phase { phase, detail: detail.to_string() });
     }
 
+    /// A running tail is what gates a phase push, and a unit test has no
+    /// driver to run. This stands one in for it.
+    #[cfg(test)]
+    fn pretend_tailing(&self, session_id: &str, agent: &str) {
+        let mut sessions = self.sessions.lock().unwrap();
+        let log = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionLog::new(agent));
+        log.tail = Some(tauri::async_runtime::spawn(std::future::pending::<()>()));
+    }
+
     fn agent_of(&self, session_id: &str) -> Option<String> {
         self.agents.lock().unwrap().get(session_id).cloned()
     }
@@ -278,6 +318,15 @@ impl Spine {
             .unwrap()
             .get(session_id)
             .is_some_and(|l| l.last_interest.elapsed() < INTEREST_TTL)
+    }
+}
+
+/// The verdict words `activity_verdict` speaks, as a `Phase`.
+fn phase_of(activity: &str) -> Phase {
+    match activity {
+        "working" => Phase::Working,
+        "attention" => Phase::NeedsYou,
+        _ => Phase::Idle,
     }
 }
 
@@ -346,22 +395,25 @@ fn push_from_adapter(spine: &Spine, session_id: &str, agent: &str, ts: u64, kind
     }
 }
 
-/// Bridge the terminal's activity verdict onto the spine.
+/// Bridge the terminal's cadence onto the spine, for immediacy: this fires
+/// the moment bytes flow, where the tick is up to a second behind.
+///
+/// Through the same rule as the tick, turn gate and all — otherwise a TUI
+/// still repainting after `turn_ended` would re-raise Working half a second
+/// after the tick correctly said Idle, which is the flap this rule exists to
+/// stop. No transcript half: cadence knows no reason, and reading one here
+/// would put a 256 KB tail read on the pty's output path.
 pub fn push_phase(app: &AppHandle, session_id: &str, activity: &str) {
-    let phase = match activity {
-        // The tabs bridge publishes raw terminal cadence as "output"; the
-        // sessions endpoint upgrades it to working/attention/idle before a
-        // phone sees it. Both spellings reach here, so both are accepted.
-        "working" | "output" => Phase::Working,
-        "attention" => Phase::NeedsYou,
-        "idle" => Phase::Idle,
-        _ => return,
-    };
     let Some(spine) = app.try_state::<Arc<Spine>>() else { return };
-    // No detail: cadence is bytes on a pty, which knows no reason. The 2 s
-    // tick below carries the reason when there is one, and wins any tie by
-    // arriving with the same phase and a fuller detail.
-    spine.push_phase_if_tailed(session_id, phase, "");
+    push_cadence(&spine, session_id, activity);
+}
+
+/// [`push_phase`] without the state lookup, so the rule can be exercised
+/// against a bare registry.
+fn push_cadence(spine: &Spine, session_id: &str, activity: &str) {
+    let (verdict, detail) =
+        crate::remote_api::activity_verdict(Some(activity), None, spine.turn_open(session_id));
+    spine.push_phase_if_tailed(session_id, phase_of(verdict), detail);
 }
 
 /// Answer `GET /v1/sessions/{id}/spine`: register interest, wait out a
@@ -394,6 +446,8 @@ pub async fn read_after(
 struct PhaseGate {
     /// The files `transcript_verdict` will read for this session.
     paths: Vec<PathBuf>,
+    /// When those paths were last looked for, while none have been found.
+    looked: Instant,
     /// (len, mtime) of each of them at the last read.
     stamp: Option<Vec<(u64, u64)>>,
     /// What that read said, held until one of the files moves.
@@ -404,21 +458,27 @@ impl PhaseGate {
     async fn new(session_id: &str) -> Self {
         let sid = session_id.to_string();
         let paths = crate::run_blocking(move || phase_sources(&sid)).await;
-        Self { paths, stamp: None, transcript: None }
+        Self { paths, looked: Instant::now(), stamp: None, transcript: None }
     }
 
-    async fn tick(&mut self, spine: &Spine, app: &AppHandle, session_id: &str) {
+    /// Work out what the session is doing and push it if it moved. `force`
+    /// skips the unchanged-files shortcut: a turn boundary just landed and
+    /// the answer has to be right now, not next tick.
+    async fn tick(&mut self, spine: &Spine, app: &AppHandle, session_id: &str, force: bool) {
         // A session whose transcript has not appeared yet (a tab that just
-        // opened) resolves to nothing; keep asking, cheaply, until it does.
-        if self.paths.is_empty() {
-            self.paths = PhaseGate::new(session_id).await.paths;
+        // opened) resolves to nothing; keep asking until it does, but not
+        // on every tick.
+        if self.paths.is_empty() && self.looked.elapsed() > RESOLVE_SOURCES_EVERY {
+            let sid = session_id.to_string();
+            self.paths = crate::run_blocking(move || phase_sources(&sid)).await;
+            self.looked = Instant::now();
         }
         let sid = session_id.to_string();
         let paths = self.paths.clone();
         let last = self.stamp.clone();
         let (stamp, fresh) = crate::run_blocking(move || {
             let (stamp, quiet) = stamp_of(&paths);
-            if stamp.is_some() && stamp == last && quiet > VERDICT_SETTLES_AFTER {
+            if !force && stamp.is_some() && stamp == last && quiet > VERDICT_SETTLES_AFTER {
                 return (stamp, None); // nothing it reads moved, and nothing will
             }
             let verdict = crate::remote_api::transcript_verdict(&sid);
@@ -438,14 +498,12 @@ impl PhaseGate {
                 .find(|(id, _)| id == session_id)
                 .map(|(_, a)| a)
         });
-        let (activity, detail) =
-            crate::remote_api::activity_verdict(cadence.as_deref(), self.transcript);
-        let phase = match activity {
-            "working" => Phase::Working,
-            "attention" => Phase::NeedsYou,
-            _ => Phase::Idle,
-        };
-        spine.push_phase_if_tailed(session_id, phase, detail);
+        let (activity, detail) = crate::remote_api::activity_verdict(
+            cadence.as_deref(),
+            self.transcript,
+            spine.turn_open(session_id),
+        );
+        spine.push_phase_if_tailed(session_id, phase_of(activity), detail);
     }
 }
 
@@ -593,7 +651,7 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
     let mut reap = tokio::time::interval(REAP_EVERY);
     reap.tick().await;
     let mut phase = PhaseGate::new(&session_id).await;
-    phase.tick(&spine, &app, &session_id).await;
+    phase.tick(&spine, &app, &session_id, true).await;
 
     loop {
         tokio::select! {
@@ -611,6 +669,13 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
         }
         let (a, events) = step(adapter, |a| a.poll()).await;
         adapter = a;
+        // A turn opening or closing settles the phase on its own — the
+        // verdict is recomputed now rather than on the next tick, so idle
+        // lands within the poll that saw `turn_ended` instead of up to a
+        // second later.
+        let boundary = events
+            .iter()
+            .any(|(_, k)| matches!(k, Kind::TurnStarted { .. } | Kind::TurnEnded { .. }));
         for (ts, kind) in events {
             // A Reset from the adapter is pushed like anything else; the
             // ring drops what came before it and the phone re-fetches.
@@ -618,7 +683,7 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
         }
         // After the content, so a phase never claims a turn ended before
         // the text of it is in the log.
-        phase.tick(&spine, &app, &session_id).await;
+        phase.tick(&spine, &app, &session_id, boundary).await;
     }
     crate::diag!("spine", "tail stopped for {short}: no tab bound and no interest");
 }
@@ -741,6 +806,87 @@ mod tests {
         assert_eq!(held[0].seq, 3);
     }
 
+    /// The turn bracket is recorded by `push` itself, so no route into the
+    /// log can skip it. A session no adapter has spoken for has no opinion.
+    #[test]
+    fn a_turn_bracket_is_recorded_wherever_it_enters() {
+        let spine = Spine::new();
+        assert_eq!(spine.turn_open("s"), None);
+        spine.push("s", "claude", 1, text("a", "hi"));
+        assert_eq!(spine.turn_open("s"), None, "content says nothing about turns");
+        spine.push("s", "claude", 2, Kind::TurnStarted { turn: "t1".into() });
+        assert_eq!(spine.turn_open("s"), Some(true));
+        spine.push("s", "claude", 3, Kind::TurnEnded { turn: "t1".into(), reason: "completed".into() });
+        assert_eq!(spine.turn_open("s"), Some(false));
+        spine.push("s", "claude", 4, Kind::TurnStarted { turn: "t2".into() });
+        assert_eq!(spine.turn_open("s"), Some(true));
+    }
+
+    fn phases(spine: &Spine, session_id: &str) -> Vec<(Phase, String)> {
+        spine
+            .after(session_id, 0)
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                Kind::Phase { phase, detail } => Some((phase, detail)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bug this rule exists for: Claude's TUI goes on repainting after
+    /// the answer is finished, so cadence held "working" for the ten
+    /// seconds `session_activities` counts as recent and the phone's header
+    /// stayed busy long after the turn visibly ended.
+    #[test]
+    fn idle_lands_with_the_turn_ended_and_later_bytes_do_not_undo_it() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "claude");
+        spine.push("s", "claude", 1, Kind::TurnStarted { turn: "t1".into() });
+        push_cadence(&spine, "s", "output");
+        assert_eq!(phases(&spine, "s"), vec![(Phase::Working, String::new())]);
+
+        // The adapter sees the turn close. The very next cadence push — a
+        // spinner clearing, half a second later — must not raise Working.
+        spine.push("s", "claude", 2, Kind::TurnEnded { turn: "t1".into(), reason: "completed".into() });
+        push_cadence(&spine, "s", "output");
+        assert_eq!(
+            phases(&spine, "s"),
+            vec![(Phase::Working, String::new()), (Phase::Idle, String::new())]
+        );
+
+        // And it stays put however many more repaints arrive.
+        for _ in 0..5 {
+            push_cadence(&spine, "s", "output");
+        }
+        assert_eq!(phases(&spine, "s").len(), 2, "a repainting TUI must not flap the header");
+    }
+
+    /// The gate is a gate, not a latch: the next turn opens it again, and
+    /// the adapter sees the user's line within a poll of it being written.
+    #[test]
+    fn a_new_turn_re_opens_working() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "claude");
+        spine.push("s", "claude", 1, Kind::TurnEnded { turn: "t1".into(), reason: "completed".into() });
+        push_cadence(&spine, "s", "output");
+        spine.push("s", "claude", 2, Kind::TurnStarted { turn: "t2".into() });
+        push_cadence(&spine, "s", "output");
+        assert_eq!(
+            phases(&spine, "s"),
+            vec![(Phase::Idle, String::new()), (Phase::Working, String::new())]
+        );
+    }
+
+    /// A legacy-adapter session reports no turns at all, and must keep the
+    /// cadence rule it had before any of this.
+    #[test]
+    fn a_session_with_no_turn_events_still_works_off_cadence() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "codex");
+        push_cadence(&spine, "s", "output");
+        assert_eq!(phases(&spine, "s"), vec![(Phase::Working, String::new())]);
+    }
+
     #[test]
     fn subscribers_see_every_push_in_order() {
         let spine = Spine::new();
@@ -765,4 +911,5 @@ mod tests {
         assert_eq!(second.agent, "grok");
     }
 }
+
 
