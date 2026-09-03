@@ -103,10 +103,27 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *  or the desktop reports activity. Bridges the gap before the agent's
      *  first progress report so "working" shows immediately. */
     private var sentAt = 0L
-    private var turnsWhenSent = -1
+    private var awaitingReply = false
     var agents by mutableStateOf<List<Agent>>(emptyList()); private set
     var selected by mutableStateOf<Session?>(null); private set
-    var turns by mutableStateOf<List<Turn>>(emptyList()); private set
+
+    /** The selected session's spine: what the screen draws, fed by the GET
+     *  once and by "spine" WebSocket frames after. Held here (not in a
+     *  Composable) so a rotation or a trip to Files keeps the transcript. */
+    private val spine = ConversationStore()
+    /** The store's rows, republished after every apply — an immutable list
+     *  of equal data classes, so only the row that moved recomposes. */
+    var items by mutableStateOf<List<Item>>(emptyList()); private set
+    /** The selected session's phase, straight off the spine. */
+    var phase by mutableStateOf(SpinePhase.Idle); private set
+    var phaseDetail by mutableStateOf(""); private set
+    /** When the last spine event or fetch landed — the safety net's clock. */
+    private var lastSpineAt = 0L
+    /** A desktop too old to serve /v1/spine (404): fall back to the whole
+     *  transcript on a slow poll, mapped into the same rows. */
+    private var noSpine = false
+    private var fetchingSpine = false
+    private var refetchWanted = false
     var loadingTurns by mutableStateOf(false); private set
     var sending by mutableStateOf(false); private set
     /** A one-line message for the snackbar. The UI clears it after showing. */
@@ -478,8 +495,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         files = emptyList(); loadingFiles = false; viewing = null; opening = null; showFiles = false
         browsing = false; browsePath = ""; browseEntries = emptyList()
         composingNew = false; attachments = emptyList()
-        sentAt = 0L; turnsWhenSent = -1
-        agents = emptyList(); selected = null; turns = emptyList(); loadingTurns = false
+        sentAt = 0L; awaitingReply = false
+        agents = emptyList(); selected = null; loadingTurns = false
+        spine.clear(); publishSpine(); noSpine = false
         relays = emptyMap(); previewUrl = null; inlineFiles = emptyMap()
         withFiles = emptySet(); ports = emptyMap(); stars = emptySet(); broughtIn = emptyMap()
         agentFilter = null; filesOnly = false; activeOnly = false
@@ -604,7 +622,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // rather than trusting the first answer forever.
         viewModelScope.launch { runCatching { agents = a.agents() } }
         ws = a.events(
-            onOpen = { viewModelScope.launch { connected = true } },
+            onOpen = {
+                viewModelScope.launch {
+                    connected = true
+                    // A dropped WebSocket loses every event it was carrying;
+                    // the first thing a new one owes the screen is the gap.
+                    selected?.let { fetchSpine(it.id) }
+                }
+            },
             onEvent = { type, obj ->
                 viewModelScope.launch {
                     when (type) {
@@ -637,6 +662,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             ))
                             refresh()
                         }
+                        "spine" -> {
+                            // Every session with a running tail is on this
+                            // stream; the phone only draws the one it is
+                            // looking at.
+                            val sid = obj["session_id"]?.jsonPrimitive?.content ?: return@launch
+                            if (sid != selected?.id) return@launch
+                            val ev = SpineEvent.parse(obj) ?: return@launch
+                            lastSpineAt = System.currentTimeMillis()
+                            when (spine.offer(ev)) {
+                                Offer.Applied -> { publishSpine(); afterApplied(ev) }
+                                // A seq was missed, or the desktop restarted:
+                                // ask for what we are short of rather than
+                                // drawing a transcript with a hole in it.
+                                Offer.Gap -> fetchSpine(sid)
+                                Offer.EpochChanged -> { spine.clear(); publishSpine(); fetchSpine(sid, from = 0) }
+                                Offer.Stale -> {}
+                            }
+                        }
                         "file_changed" -> {
                             // The conversation shows produced files inline,
                             // so keep them fresh whether or not the Files
@@ -648,7 +691,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                             val id = obj["session_id"]?.jsonPrimitive?.content ?: return@launch
                             val a = obj["activity"]?.jsonPrimitive?.content ?: return@launch
                             activity = activity + (id to a)
-                            if (a != "idle") turnsWhenSent = -1
+                            if (a != "idle") awaitingReply = false
                         }
                         "renamed" -> {
                             // The desktop's name was edited over there; wear
@@ -734,9 +777,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             broughtIn = r.brought_in
             selected?.let { cur -> sessions.find { it.id == cur.id }?.let { selected = it } }
             if (agents.isEmpty()) agents = runCatching { a.agents() }.getOrDefault(emptyList())
+            // The transcript rides the spine now; a list refresh only
+            // re-reads what the list itself shows.
             selected?.let {
-                turns = a.conversation(it.id)
-                if (turns.size > turnsWhenSent && turns.lastOrNull()?.role == "assistant") turnsWhenSent = -1
                 if (showFiles) files = runCatching { a.files(it.id) }.getOrDefault(files)
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -775,7 +818,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stateOf(s: Session): SessionState {
         val a = activity[s.id]
-        val pendingHere = selected?.id == s.id && turnsWhenSent >= 0 && System.currentTimeMillis() - sentAt < 90_000
+        val pendingHere = selected?.id == s.id && awaitingReply && System.currentTimeMillis() - sentAt < 90_000
         return when {
             a == "working" || pendingHere -> SessionState.Working
             a == "attention" -> SessionState.NeedsYou
@@ -958,14 +1001,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Guards the per-selection conversation poller: bumped on every select,
-     *  so a stale poller stands down instead of writing over a newer one. */
+    /** Guards the per-selection spine work: bumped on every select, so a
+     *  stale watcher stands down instead of writing over a newer one. */
     private var selectGen = 0
 
     fun select(s: Session?) {
         selected = s
         selectGen++
-        turns = emptyList()
+        spine.clear(); publishSpine(); noSpine = false; refetchWanted = false; lastSpineAt = 0L
         files = emptyList()
         showFiles = false
         browsing = false
@@ -981,30 +1024,103 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             // reload it — a person opening a mid-turn session saw its whole
             // HISTORY as blank [observed 2026-08-31]. Retry, briefly.
             for (attempt in 1..3) {
-                try { turns = api?.conversation(s.id) ?: emptyList(); break }
-                catch (e: Exception) { if (attempt == 3) notice = describe(e) else delay(1200) }
+                try {
+                    val r = api?.spine(s.id, 0) ?: break
+                    if (myGen != selectGen) return@launch
+                    spine.replay(r); publishSpine()
+                    lastSpineAt = System.currentTimeMillis()
+                    break
+                } catch (e: ApiError) {
+                    // A desktop that predates the spine has no such route and
+                    // its 404 carries no message; one that HAS the route says
+                    // "no such session" and means it. Only the first is a
+                    // reason to fall back to the old whole-transcript poll.
+                    if (e.code == 404 && e.message?.contains("session") != true) { noSpine = true; break }
+                    if (attempt == 3) notice = describe(e) else delay(1200)
+                } catch (e: Exception) {
+                    if (attempt == 3) notice = describe(e) else delay(1200)
+                }
             }
             loadingTurns = false
-            // While this session is on screen, follow its transcript: codex
-            // and claude write a message per completed step, so a working
-            // turn streams in step by step instead of arriving as one block
-            // at the end. Cheap — the desktop answers in ~10ms gzipped.
+            if (noSpine) { legacyPoll(s, myGen); return@launch }
+            // The spine arrives over the WebSocket; this is only the safety
+            // net. A WebSocket can die without saying so (the phone changes
+            // network, the desktop's relay hiccups) and the screen would sit
+            // frozen mid-turn, so a working session that has gone quiet for
+            // 20 s gets asked directly.
             while (myGen == selectGen && selected?.id == s.id) {
-                delay(3000)
+                delay(5000)
                 if (myGen != selectGen || selected?.id != s.id) break
-                val fresh = runCatching { api?.conversation(s.id) }.getOrNull() ?: continue
-                if (fresh != turns) {
-                    turns = fresh
-                    // A new message usually means new files — and a scratchpad
-                    // write gets no file_changed event (the watcher covers
-                    // workspaces, not /tmp scratchpads), so the globe for a
-                    // built page never appeared until reopen [observed
-                    // 2026-08-31: car-listing.html, via "wrote", invisible].
-                    loadFiles()
-                }
+                val quiet = System.currentTimeMillis() - lastSpineAt
+                if (quiet > 20_000 && spine.phase == SpinePhase.Working) fetchSpine(s.id)
             }
         }
         loadFiles() // the conversation shows what the session made, inline
+    }
+
+    /** Republish the store for Compose. One assignment per apply: the rows
+     *  are equal data classes, so the list changing identity costs the one
+     *  row that actually changed. */
+    private fun publishSpine() {
+        items = spine.items
+        phase = spine.phase
+        phaseDetail = spine.phaseDetail
+    }
+
+    /** Ask for everything after `from` (default: what we hold) and merge.
+     *  One at a time — a burst of gaps is one question. */
+    private fun fetchSpine(id: String, from: Long? = null) {
+        if (noSpine) return
+        // An event that gaps while a fetch is already in the air would be
+        // dropped and never asked for — the answer was computed before it
+        // existed. Remember that, and go round once more.
+        if (fetchingSpine) { refetchWanted = true; return }
+        val a = api ?: return
+        viewModelScope.launch {
+            fetchingSpine = true
+            try {
+                val r = a.spine(id, from ?: spine.lastSeq)
+                if (selected?.id != id) return@launch
+                spine.replay(r); publishSpine()
+                lastSpineAt = System.currentTimeMillis()
+            } catch (e: Exception) {
+                android.util.Log.w("Aiterm", "spine fetch failed: ${e.message}")
+            } finally {
+                fetchingSpine = false
+                if (refetchWanted && selected?.id == id) { refetchWanted = false; fetchSpine(id) }
+            }
+        }
+    }
+
+    /** What an applied event means beyond the transcript. A file write is
+     *  the only thing the ledger will not tell us in time: a scratchpad
+     *  write gets no file_changed event (the watcher covers workspaces, not
+     *  /tmp), so the globe for a built page never appeared until reopen
+     *  [observed 2026-08-31: car-listing.html, via "wrote", invisible]. */
+    private fun afterApplied(e: SpineEvent) {
+        val k = e.kind
+        if (awaitingReply && (k is SpineKind.AgentText || k is SpineKind.ToolCall)) awaitingReply = false
+        val wroteSomething = when (k) {
+            is SpineKind.ToolCallUpdate -> k.status == ToolStatus.Completed && spine.tool(k.id)?.category == ToolCategory.Edit
+            is SpineKind.ToolCall -> k.status == ToolStatus.Completed && k.category == ToolCategory.Edit
+            else -> false
+        }
+        if (wroteSomething || k is SpineKind.TurnEnded) loadFiles()
+    }
+
+    /** The pre-spine path, for a desktop that has not been updated: the
+     *  whole transcript every 3 s, mapped onto the same rows by ordinal. */
+    private suspend fun legacyPoll(s: Session, myGen: Int) {
+        var last: List<Turn> = emptyList()
+        while (myGen == selectGen && selected?.id == s.id) {
+            val fresh = runCatching { api?.conversation(s.id) }.getOrNull()
+            if (fresh != null && fresh != last) {
+                last = fresh
+                spine.legacy(fresh); publishSpine()
+                loadFiles()
+            }
+            delay(3000)
+        }
     }
 
     // ---- acting
@@ -1039,8 +1155,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val full = withAttachments(text)
                 a.input(s.id, full)
                 attachments = emptyList()
-                turns = turns + Turn("user", full)
-                sentAt = System.currentTimeMillis(); turnsWhenSent = turns.size
+                // The bubble appears on tap; the desktop's own user_message
+                // retires the echo when it comes round.
+                spine.echoUser(full, System.currentTimeMillis())
+                publishSpine()
+                sentAt = System.currentTimeMillis(); awaitingReply = true
             } catch (e: Exception) {
                 notice = describe(e)
             } finally { sending = false }
@@ -1092,7 +1211,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         return "$lead\n$files"
     }
     /** Escape: ends the agent's turn, keeps the session. */
-    fun interrupt(s: Session) = act { it.interrupt(s.id); turnsWhenSent = -1 }
+    fun interrupt(s: Session) = act { it.interrupt(s.id); awaitingReply = false }
     fun stop(s: Session) = act { it.stop(s.id); refresh() }
     /** A session this phone just asked for: the next refresh that shows a
      *  session born in that folder (for that agent, when the id names one —

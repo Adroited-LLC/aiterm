@@ -177,7 +177,14 @@ class Api(val baseUrl: String, private val token: String, fingerprint: String, c
         return json.decodeFromString(call(req("/v1/relay/enroll").post(jsonBody(body))))
     }
     suspend fun sessions(): SessionsResponse = json.decodeFromString(call(req("/v1/sessions")))
+    /** The old whole-transcript read. Kept only as the fallback for a
+     *  desktop too old to serve /v1/spine. */
     suspend fun conversation(id: String): List<Turn> = json.decodeFromString(call(req("/v1/sessions/$id/conversation")))
+    /** Everything on this session's spine after `after` (0 = all). Asking
+     *  is also how the desktop learns a phone is watching: it starts (or
+     *  keeps) the adapter tail. See docs/spine.md. */
+    suspend fun spine(id: String, after: Long): SpineResponse =
+        SpineResponse.parse(json.parseToJsonElement(call(req("/v1/sessions/$id/spine?after=$after"))).jsonObject)
     suspend fun agents(): List<Agent> = json.decodeFromString(call(req("/v1/agents")))
     suspend fun usage(): List<UsageSource> = json.decodeFromString(call(req("/v1/usage")))
     suspend fun search(q: String): List<Session> = json.decodeFromString(call(req("/v1/search?q=" + java.net.URLEncoder.encode(q, "UTF-8"))))

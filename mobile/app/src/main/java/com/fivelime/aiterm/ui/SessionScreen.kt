@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
@@ -40,8 +39,14 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.DropdownMenu
@@ -89,17 +94,30 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.vector.ImageVector
 import com.fivelime.aiterm.AppViewModel
+import com.fivelime.aiterm.Item
 import com.fivelime.aiterm.Session
 import com.fivelime.aiterm.ModelOption
-import com.fivelime.aiterm.Turn
+import com.fivelime.aiterm.SpinePhase
+import com.fivelime.aiterm.ToolCategory
+import com.fivelime.aiterm.ToolStatus
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     val open = s.id in vm.open
     val running = s.id in vm.running
-    val state = vm.stateOf(s)
+    // The spine carries the phase on the same stream as the content, so it
+    // moves with the transcript instead of trailing a list refresh. It only
+    // speaks up when it has something to say: idle falls back to the list's
+    // own view, which knows about on-desktop, running, and a just-sent
+    // message the desktop has not reported yet.
+    val state = when (vm.phase) {
+        SpinePhase.Working -> SessionState.Working
+        SpinePhase.NeedsYou -> SessionState.NeedsYou
+        SpinePhase.Idle -> vm.stateOf(s)
+    }
     val working = state == SessionState.Working
     var draft by remember(s.id) { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
@@ -113,22 +131,39 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     }
     val list = rememberLazyListState()
 
-    // New content lands at the bottom, where the eye is. The working row is
-    // one extra item past the last turn. The FIRST fill jumps straight to
-    // the end — animating from the top replays the whole transcript and
-    // looks glitchy on a long session. After that, follow new turns with a
-    // short animation, but only when already reading the end: someone
-    // scrolled up into history stays where they are.
+    val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
+
+    // New content lands at the bottom, where the eye is. The made strip and
+    // the working row are extra items past the last message. The FIRST fill
+    // jumps straight to the end — animating from the top replays the whole
+    // transcript and looks glitchy on a long session. After that, follow
+    // with a short animation, but only when already reading the end:
+    // someone scrolled up into history stays where they are.
+    //
+    // On the spine a block GROWS in place as often as a new one appears, so
+    // the trigger is the tail's own content, not just the count — otherwise
+    // a long answer streams in below the fold, unfollowed.
     var positioned by remember(s.id) { mutableStateOf(false) }
-    LaunchedEffect(vm.turns.size, working) {
-        val n = vm.turns.size + (if (working) 1 else 0)
+    val n = vm.items.size + (if (made.isNotEmpty()) 1 else 0) + (if (working) 1 else 0)
+    val tail = vm.items.lastOrNull()?.let { it.key + ":" + tailSize(it) } ?: ""
+    LaunchedEffect(n, tail) {
         if (n == 0) return@LaunchedEffect
+        // A growing block can be taller than the screen: land on its END,
+        // not its top, or following it scrolls the newest words back out.
+        val idx = n - 1
+        fun offsetFor(): Int {
+            val info = list.layoutInfo
+            val viewport = info.viewportEndOffset - info.viewportStartOffset
+            val size = info.visibleItemsInfo.firstOrNull { it.index == idx }?.size ?: 0
+            return (size - viewport).coerceAtLeast(0)
+        }
         if (!positioned) {
-            list.scrollToItem(n - 1)
+            list.scrollToItem(idx)
+            list.scrollToItem(idx, offsetFor())
             positioned = true
         } else {
             val lastVisible = list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            if (lastVisible >= n - 3) list.animateScrollToItem(n - 1)
+            if (lastVisible >= n - 3) list.animateScrollToItem(idx, offsetFor())
         }
     }
 
@@ -240,7 +275,7 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
     ) { padding ->
         if (vm.showFiles) {
             FilesList(vm, Modifier.padding(padding))
-        } else if (vm.turns.isEmpty()) {
+        } else if (vm.items.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                 if (vm.loadingTurns) CircularProgressIndicator() else Text("Nothing here yet — say something.", color = Muted)
             }
@@ -305,13 +340,15 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    itemsIndexed(vm.turns) { _, t -> TurnView(t, onOpenPath = vm::openMentioned) }
+                    // Keyed by the spine's own ids: a block that grows
+                    // updates one row in place, it does not re-key the list
+                    // under the scroll position.
+                    items(vm.items, key = { it.key }) { item -> ItemView(item, onOpenPath = vm::openMentioned) }
                     // What the session made, right where the conversation ends —
                     // the transcript often never prints a path (tool output is
                     // dropped at phone size), but the desktop's ledger knows.
-                    val made = vm.files.filter { it.via == "made" || it.via == "edited" || it.via == "wrote" }
                     if (made.isNotEmpty()) item(key = "made") { MadeStrip(vm, made) }
-                    if (working) item(key = "working") { WorkingRow(s.agent) }
+                    if (working) item(key = "working") { WorkingRow(s.agent, vm.phaseDetail) }
                 }
                 if (awayFromEnd) {
                     Row(
@@ -433,7 +470,7 @@ private fun QuickKeysBar(onKey: (String) -> Unit) {
 /** Three dots that breathe. Shown while the desktop reports progress, or
  *  right after a message goes out — before the first progress arrives. */
 @Composable
-private fun WorkingRow(agent: String) {
+private fun WorkingRow(agent: String, detail: String = "") {
     Row(Modifier.padding(start = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "dots")
         val phase by t.animateFloat(0f, 3f, androidx.compose.animation.core.infiniteRepeatable(
@@ -443,13 +480,13 @@ private fun WorkingRow(agent: String) {
             Box(Modifier.padding(horizontal = 2.dp).size(7.dp).background(Amber.copy(alpha = if (on) 1f else 0.3f), RoundedCornerShape(50)))
         }
         Spacer(Modifier.width(8.dp))
-        Text("$agent is working…", style = MaterialTheme.typography.labelMedium, color = Muted)
+        Text(
+            detail.ifBlank { "$agent is working…" }, style = MaterialTheme.typography.labelMedium,
+            color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
-/** A user turn sits right in the accent colour, the assistant left on a
- *  card, and anything else — a tool call, a system line — is small, dim and
- *  monospace, folded until tapped. */
 /** Codex folds its AGENTS.md and an environment block into the first user
  *  turn; the person only typed the last line. Hide the harness's part. */
 private val HARNESS_BLOCKS = Regex("(?s)<(INSTRUCTIONS|environment_context|user_instructions)>.*?</\\1>\\s*")
@@ -470,71 +507,146 @@ private fun mentionedFiles(text: String): List<String> =
         if ('%' in p) runCatching { android.net.Uri.decode(p) }.getOrDefault(p) else p
     }.distinct().take(6).toList()
 
+/** How much of the tail row there is, so the scroll-follow notices a block
+ *  growing in place — the same row, more text. */
+private fun tailSize(i: Item): Int = when (i) {
+    is Item.User -> i.text.length
+    is Item.AgentText -> i.text.length
+    is Item.Thought -> i.text.length
+    is Item.Tool -> i.status.ordinal * 1_000_003 + (i.output?.length ?: 0)
+    is Item.TurnEnd -> 0
+}
+
 @Composable
-private fun TurnView(t: Turn, onOpenPath: (String) -> Unit = {}) {
-    // Long-press selects within a turn; taps (chips, tool-card folds,
+private fun ItemView(item: Item, onOpenPath: (String) -> Unit = {}) {
+    // Long-press selects within a row; taps (chips, tool-card folds,
     // links) still work as taps.
     androidx.compose.foundation.text.selection.SelectionContainer {
-        TurnBody(t, onOpenPath)
+        when (item) {
+            is Item.User -> UserBubble(item)
+            is Item.AgentText -> AgentBlock(item, onOpenPath)
+            is Item.Thought -> ThoughtBlock(item)
+            is Item.Tool -> ToolCard(item)
+            // A turn boundary: a hairline, so a long session reads as
+            // exchanges rather than one wall.
+            is Item.TurnEnd -> HorizontalDivider(
+                Modifier.padding(vertical = 4.dp),
+                color = Muted.copy(alpha = if (item.reason == "completed") 0.12f else 0.3f),
+            )
+        }
+    }
+}
+
+/** A user turn sits right in the accent colour. */
+@Composable
+private fun UserBubble(item: Item.User) {
+    val said = personSaid(item.text)
+    if (said.isEmpty()) return
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+        Box(
+            Modifier.widthIn(max = 320.dp)
+                .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp))
+                .padding(12.dp),
+        ) { MarkdownText(said, color = MaterialTheme.colorScheme.onPrimaryContainer) }
+    }
+}
+
+/** The assistant, left, on the ground itself. A block still being written
+ *  carries a cursor: the spine says `done:false` while more is coming, and
+ *  without it a half-sentence reads as a finished thought. */
+@Composable
+private fun AgentBlock(item: Item.AgentText, onOpenPath: (String) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(end = 12.dp)) {
+        MarkdownText(item.text)
+        if (!item.done) Caret()
+        val paths = remember(item.text) { mentionedFiles(item.text) }
+        if (paths.isNotEmpty()) Row(
+            Modifier.padding(top = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            paths.forEach { p -> FileChip(p.substringAfterLast('/'), onClick = { onOpenPath(p) }) }
+        }
     }
 }
 
 @Composable
-private fun TurnBody(t: Turn, onOpenPath: (String) -> Unit) {
-    when (t.role) {
-        "user" -> {
-            val said = personSaid(t.text)
-            if (said.isNotEmpty()) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-                Box(
-                    Modifier.widthIn(max = 320.dp).background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp)).padding(12.dp),
-                ) { MarkdownText(said, color = MaterialTheme.colorScheme.onPrimaryContainer) }
-            }
-        }
-        "assistant" -> Column(Modifier.fillMaxWidth().padding(end = 12.dp)) {
-            MarkdownText(t.text)
-            val paths = remember(t.text) { mentionedFiles(t.text) }
-            if (paths.isNotEmpty()) Row(
-                Modifier.padding(top = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                paths.forEach { p -> FileChip(p.substringAfterLast('/'), onClick = { onOpenPath(p) }) }
-            }
-        }
-        "system" -> Text(t.text, style = MaterialTheme.typography.labelSmall, color = Muted,
-            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp), maxLines = 2, overflow = TextOverflow.Ellipsis)
-        // The agent's reasoning summary: quiet, italic, folded to a line.
-        "thinking" -> {
-            var expanded by remember { mutableStateOf(false) }
+private fun Caret() {
+    val t = androidx.compose.animation.core.rememberInfiniteTransition(label = "caret")
+    val a by t.animateFloat(
+        initialValue = 0.15f, targetValue = 0.9f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            androidx.compose.animation.core.tween(650), androidx.compose.animation.core.RepeatMode.Reverse),
+        label = "blink",
+    )
+    Box(Modifier.padding(top = 2.dp).size(width = 7.dp, height = 14.dp).background(Accent.copy(alpha = a), RoundedCornerShape(2.dp)))
+}
+
+/** The agent's reasoning: quiet, italic, folded to a line. */
+@Composable
+private fun ThoughtBlock(item: Item.Thought) {
+    var expanded by remember { mutableStateOf(false) }
+    Text(
+        item.text, style = MaterialTheme.typography.bodySmall, color = Muted,
+        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+        maxLines = if (expanded) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 4.dp, vertical = 2.dp),
+    )
+}
+
+/** A tool call, live: the mark its category earns, what it was asked to do,
+ *  and where it stands. The output is folded behind a tap — the desktop
+ *  already clipped it, but a phone screen is not where a diff belongs. */
+@Composable
+private fun ToolCard(item: Item.Tool) {
+    var expanded by remember { mutableStateOf(false) }
+    val output = item.output?.takeIf { it.isNotBlank() }
+    Column(
+        Modifier.fillMaxWidth().background(Surface1.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
+            .clickable(enabled = output != null) { expanded = !expanded }
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(toolIcon(item.category), null, tint = Accent, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(6.dp))
             Text(
-                t.text, style = MaterialTheme.typography.bodySmall, color = Muted,
-                fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
-                maxLines = if (expanded) Int.MAX_VALUE else 2, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(horizontal = 4.dp, vertical = 2.dp),
+                item.title.ifBlank { item.tool }, style = MaterialTheme.typography.labelMedium,
+                color = Accent, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
             )
+            Spacer(Modifier.width(8.dp))
+            // The mark sits at the right edge, one column down the card.
+            ToolMark(item.status)
         }
-        else -> {
-            // A tool call: its name and the first line, the rest on tap.
-            var expanded by remember { mutableStateOf(false) }
-            val first = t.text.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: ""
-            Column(
-                Modifier.fillMaxWidth().background(Surface1.copy(alpha = 0.6f), RoundedCornerShape(10.dp))
-                    .clickable { expanded = !expanded }.padding(horizontal = 10.dp, vertical = 8.dp),
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Build, null, tint = Accent, modifier = Modifier.size(14.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(t.role, style = MaterialTheme.typography.labelMedium, color = Accent)
-                    Spacer(Modifier.width(8.dp))
-                    if (!expanded) Text(first, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace,
-                        color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-                if (expanded) Text(
-                    t.text, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Muted,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
-            }
-        }
+        if (item.input.isNotBlank()) Text(
+            item.input, style = MaterialTheme.typography.labelSmall, fontFamily = FontFamily.Monospace,
+            color = Muted, maxLines = if (expanded) 6 else 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 3.dp),
+        )
+        if (expanded && output != null) Text(
+            output, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = Muted,
+            modifier = Modifier.padding(top = 6.dp),
+        )
     }
+}
+
+private fun toolIcon(c: ToolCategory): ImageVector = when (c) {
+    ToolCategory.Read -> Icons.Filled.Description
+    ToolCategory.Edit -> Icons.Filled.Edit
+    ToolCategory.Execute -> Icons.Filled.Terminal
+    ToolCategory.Search -> Icons.Filled.Search
+    ToolCategory.Fetch -> Icons.Filled.Language
+    ToolCategory.Think -> Icons.Filled.Psychology
+    ToolCategory.Other -> Icons.Filled.Build
+}
+
+/** Where a call stands, in the width of a dot: breathing while it runs, a
+ *  tick when it lands, red when it did not. */
+@Composable
+private fun ToolMark(status: ToolStatus) = when (status) {
+    ToolStatus.Pending, ToolStatus.Running -> PulsingDot(Amber)
+    ToolStatus.Completed -> Icon(Icons.Filled.Check, "done", tint = Green, modifier = Modifier.size(14.dp))
+    ToolStatus.Failed -> Icon(Icons.Filled.Close, "failed", tint = Red, modifier = Modifier.size(14.dp))
+    ToolStatus.Cancelled -> Dot(Muted)
 }
 
 /** A small tappable pill for a file the conversation mentions. */
