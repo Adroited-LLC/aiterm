@@ -202,7 +202,7 @@ pub(crate) fn scan_dir_bounded(
 }
 
 /// The directory for `session_id`, if this is a grok session.
-fn session_dir(session_id: &str) -> Option<PathBuf> {
+pub(crate) fn session_dir(session_id: &str) -> Option<PathBuf> {
     // Cheap enough to search: a handful of cwd directories, one readdir each.
     // The id is not the path — the cwd component is url-encoded, and
     // reproducing grok's encoding to skip the search would be a second
