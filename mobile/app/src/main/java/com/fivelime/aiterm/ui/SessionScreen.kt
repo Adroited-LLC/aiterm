@@ -98,6 +98,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
+import kotlinx.coroutines.flow.first
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -186,9 +189,40 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
             list.scrollToItem(idx)
             list.scrollToItem(idx, offsetFor())
             positioned = true
+            // On this frame the LazyColumn may not have measured yet (it is
+            // composed in the same frame as the first items), so the offset
+            // above can be 0 — the TOP of a tall last message. The settle
+            // effect below re-lands from a real layout.
         } else {
             val lastVisible = list.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
             if (lastVisible >= n - 3) list.animateScrollToItem(idx, offsetFor())
+        }
+    }
+
+    // Landing on the end is not one jump. The first fill can be laid out a
+    // frame after the jump, and for a moment after that the content is
+    // still settling — a thumbnail in the made strip, a file chip, a table
+    // measured on the frame after its text — each adding height below the
+    // fold, so a session that "opened at the bottom" sat a screen short of
+    // it [observed 2026-09-03, intermittent, long sessions]. So for the
+    // first second, any frame whose layout does not end at the last item's
+    // end is corrected — unless a finger is on the list, which wins.
+    LaunchedEffect(s.id) {
+        snapshotFlow { vm.items.size }.first { it > 0 }
+        val start = withFrameNanos { it }
+        var now = start
+        while (now - start < 1_200_000_000L) {
+            now = withFrameNanos { it }
+            if (list.isScrollInProgress) break
+            val info = list.layoutInfo
+            val total = info.totalItemsCount
+            if (total == 0) continue
+            val last = info.visibleItemsInfo.lastOrNull() ?: continue
+            val atEnd = last.index == total - 1 && last.offset + last.size <= info.viewportEndOffset + 1
+            if (atEnd) continue
+            val end = info.visibleItemsInfo.firstOrNull { it.index == total - 1 }
+            val viewport = info.viewportEndOffset - info.viewportStartOffset
+            list.scrollToItem(total - 1, ((end?.size ?: 0) - viewport).coerceAtLeast(0))
         }
     }
 
