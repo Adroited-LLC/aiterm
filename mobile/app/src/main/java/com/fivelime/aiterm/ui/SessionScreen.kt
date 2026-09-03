@@ -413,7 +413,7 @@ fun StartingScreen(vm: AppViewModel, s: AppViewModel.Starting, outer: PaddingVal
                     ) { Text(s.prompt, color = MaterialTheme.colorScheme.onPrimaryContainer) }
                 }
             }
-            WorkingRow(s.agentName)
+            WorkingRow(s.agentId)
         }
     }
 }
