@@ -84,9 +84,33 @@ fun AitermApp(
                         )
                         RemoteDesktopScreen(
                             viewModel = remoteViewModel,
-                            desktopName = desktop.displayName,
+                            desktop = desktop,
+                            pairedDesktops = runCatching { container.pairedDesktopStore.all() }
+                                .getOrDefault(listOf(desktop)),
                             onBack = {
                                 if (!navController.popBackStack()) navController.navigate(DesktopsRoute)
+                            },
+                            onOpenDesktop = { target ->
+                                navController.navigate(TerminalRoute(target.deviceId)) {
+                                    popUpTo(entry.destination.id) { inclusive = true }
+                                }
+                            },
+                            onPairDesktop = { navController.navigate(PairingRoute) },
+                            onForgetDesktop = {
+                                runCatching {
+                                    container.pairedDesktopStore.remove(desktop.deviceId)
+                                    val remaining = container.pairedDesktopStore.all()
+                                    val only = remaining.singleOrNull()
+                                    if (only == null) {
+                                        navController.navigate(DesktopsRoute) {
+                                            popUpTo(entry.destination.id) { inclusive = true }
+                                        }
+                                    } else {
+                                        navController.navigate(TerminalRoute(only.deviceId)) {
+                                            popUpTo(entry.destination.id) { inclusive = true }
+                                        }
+                                    }
+                                }.isSuccess
                             },
                             keyBarPreference = container.terminalKeyBarPreference,
                         )
