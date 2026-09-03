@@ -146,12 +146,6 @@ fun RemoteDesktopScreen(
                     viewModel.previewSession(selected.id)
                     viewModel.client.refreshSessions()
                 },
-                onOpenTerminal = {
-                    state.tabs.firstOrNull { it.sessionId == selected.id }
-                        ?.let { viewModel.selectTab(it.id) }
-                        ?: viewModel.openSession(selected.id, 80, 24)
-                    page = PAGE_TERMINAL
-                },
                 onSend = viewModel::sendConversationPrompt,
                 onBringIn = viewModel.client::bringInSession,
                 onLoadFiles = viewModel::sessionChanges,
@@ -343,9 +337,6 @@ private fun RemoteSessionDashboard(
                             Text(desktop.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             ConnectionLabel(state.connection)
                         }
-                    },
-                    actions = {
-                        TextButton(onClick = onOpenTerminal) { Text("Terminal") }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
                 )
@@ -811,7 +802,6 @@ private fun RemoteConversationContent(
     session: RemoteSession,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
-    onOpenTerminal: () -> Unit,
     onSend: suspend (
         String,
         String,
@@ -1000,7 +990,6 @@ private fun RemoteConversationContent(
                         }
                     }) { Text("Files") }
                     TextButton(onClick = { showBringIn = true }) { Text("Bring in") }
-                    TextButton(onClick = onOpenTerminal) { Text("Terminal") }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
             )

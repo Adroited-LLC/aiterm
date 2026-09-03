@@ -22,7 +22,11 @@ use crate::sessions::{is_system_meta_prompt, line_may_hold_message, line_message
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Serialize, Clone, Debug, Default, PartialEq)]
 pub struct ToolCount {
@@ -705,27 +709,127 @@ pub(crate) fn conversation_rich_service(
     conversation_rich_sync(session_id, max_chars)
 }
 
+const RICH_FILE_CACHE_LIMIT: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RichFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl RichFileIdentity {
+    fn from(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+}
+
+struct RichFileCacheEntry {
+    path: PathBuf,
+    identity: RichFileIdentity,
+    offset: u64,
+    turns: Vec<(String, String)>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct RichFileCache {
+    entries: HashMap<String, RichFileCacheEntry>,
+    clock: u64,
+}
+
+fn rich_file_cache() -> &'static Mutex<RichFileCache> {
+    static CACHE: OnceLock<Mutex<RichFileCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(RichFileCache::default()))
+}
+
+/// Read a growing transcript once, then parse only complete lines appended
+/// since the previous phone refresh. A long-running Codex rollout can exceed
+/// 100 MiB; reparsing it every 1.5 seconds made the structured view visibly
+/// trail the terminal even though the transcript already contained the turn.
+///
+/// The held file's identity and length make replacement (`/clear`) and
+/// truncation reset the cache. A partial final JSONL line is deliberately left
+/// before `offset` so the next append retries it rather than losing a message.
+fn cached_rich_file_events(session_id: &str, path: &Path) -> Vec<(String, String)> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Vec::new();
+    };
+    let identity = RichFileIdentity::from(&metadata);
+    let mut cache = rich_file_cache().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.clock = cache.clock.wrapping_add(1);
+    let now = cache.clock;
+
+    let reset = cache.entries.get(session_id).is_none_or(|entry| {
+        entry.path != path || entry.identity != identity || metadata.len() < entry.offset
+    });
+    if reset {
+        if !cache.entries.contains_key(session_id) && cache.entries.len() >= RICH_FILE_CACHE_LIMIT {
+            if let Some(oldest) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(id, _)| id.clone())
+            {
+                cache.entries.remove(&oldest);
+            }
+        }
+        cache.entries.insert(
+            session_id.to_string(),
+            RichFileCacheEntry {
+                path: path.to_path_buf(),
+                identity,
+                offset: 0,
+                turns: Vec::new(),
+                last_used: now,
+            },
+        );
+    }
+
+    let entry = cache.entries.get_mut(session_id).expect("rich cache entry was inserted");
+    entry.last_used = now;
+    if file.seek(SeekFrom::Start(entry.offset)).is_err() {
+        return entry.turns.clone();
+    }
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_line(&mut line) else {
+            break;
+        };
+        if read == 0 || !line.ends_with('\n') {
+            break;
+        }
+        entry.offset = entry.offset.saturating_add(read as u64);
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim_end()) else {
+            continue;
+        };
+        if value.get("isSidechain").and_then(|flag| flag.as_bool()) == Some(true)
+            || value.get("isMeta").and_then(|flag| flag.as_bool()) == Some(true)
+        {
+            continue;
+        }
+        entry.turns.extend(line_events(&value));
+    }
+    entry.turns.clone()
+}
+
 fn conversation_rich_sync(session_id: &str, max_chars: usize) -> Vec<(String, String)> {
     let list = crate::agents::backends();
     let Some((backend, path)) = crate::agents::owner_in(&list, session_id) else { return vec![] };
     let mut turns: Vec<(String, String)> = match backend.sessions().messages(session_id) {
         Some(m) => m,
-        None => {
-            let Ok(file) = File::open(&path) else { return vec![] };
-            BufReader::new(file)
-                .lines()
-                .map_while(Result::ok)
-                .filter(|l| l.contains("\"type\""))
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
-                .filter(|v| v.get("isSidechain").and_then(|b| b.as_bool()) != Some(true))
-                // Harness-to-model text (a loaded skill's body) rides in
-                // isMeta:true user records; line_message filters it, but this
-                // path parses with line_events — same rule applies.
-                // [observed: Claude Code 2.1.251, 2026-08-31]
-                .filter(|v| v.get("isMeta").and_then(|b| b.as_bool()) != Some(true))
-                .flat_map(|v| line_events(&v))
-                .collect()
-        }
+        None => cached_rich_file_events(session_id, &path),
     };
     turns.retain(|(_, t)| {
         !crate::sessions::is_only_system_block(t) && !is_codex_agents_preamble(t) && !t.trim().is_empty()
@@ -933,14 +1037,59 @@ fn tool_input_summary(input: Option<&serde_json::Value>) -> String {
 
 #[cfg(test)]
 mod conversation_tests {
+    use std::io::Write;
+
+    fn record(role: &str, text: &str) -> String {
+        serde_json::json!({"type": role, "message": {"content": text}}).to_string()
+    }
+
+    #[test]
+    fn rich_file_cache_tails_complete_lines_and_resets_after_truncation() {
+        let root = std::env::temp_dir().join(format!("aiterm-rich-tail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let session_id = format!("rich-tail-{}", uuid::Uuid::new_v4());
+        std::fs::write(&path, format!("{}\n", record("user", "first"))).unwrap();
+
+        assert_eq!(
+            super::cached_rich_file_events(&session_id, &path),
+            vec![("user".into(), "first".into())],
+        );
+
+        let mut append = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(append, "{}", record("assistant", "second")).unwrap();
+        append.flush().unwrap();
+        assert_eq!(super::cached_rich_file_events(&session_id, &path).len(), 1);
+        writeln!(append).unwrap();
+        append.flush().unwrap();
+        assert_eq!(
+            super::cached_rich_file_events(&session_id, &path),
+            vec![("user".into(), "first".into()), ("assistant".into(), "second".into())],
+        );
+        drop(append);
+
+        std::fs::write(&path, format!("{}\n", record("user", "fresh"))).unwrap();
+        assert_eq!(
+            super::cached_rich_file_events(&session_id, &path),
+            vec![("user".into(), "fresh".into())],
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// Print a real session's conversation as the relay would hand it over.
     /// `AITERM_SESSION=<id> cargo test --lib conversation_live -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn conversation_live() {
         let id = std::env::var("AITERM_SESSION").expect("AITERM_SESSION");
-        for (role, text) in super::conversation_sync(&id, 24_000) {
-            println!("[{role}] {}", if text.len() > 300 { format!("{}…", &text[..300]) } else { text });
+        let cold_started = std::time::Instant::now();
+        let _ = super::conversation_rich_sync(&id, 24_000);
+        eprintln!("cold rich read: {:?}", cold_started.elapsed());
+        let warm_started = std::time::Instant::now();
+        let messages = super::conversation_rich_sync(&id, 24_000);
+        eprintln!("warm rich read: {:?}", warm_started.elapsed());
+        for (role, text) in messages {
+            println!("[{role}] {}", super::clip(&text, 300));
         }
     }
 }
