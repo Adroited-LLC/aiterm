@@ -7,12 +7,16 @@ import com.adroited.aiterm.security.DeviceKeyException
 import com.adroited.aiterm.security.DeviceKeys
 import com.adroited.aiterm.security.PinnedSpkiTrustManager
 import com.adroited.aiterm.security.SpkiPinMismatchException
+import com.adroited.aiterm.remote.IrohBridge
+import com.adroited.aiterm.remote.LoopbackRedirectingSocketFactory
+import android.content.Context
 import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLPeerUnverifiedException
+import javax.net.SocketFactory
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -35,7 +39,12 @@ import okio.ByteString.Companion.toByteString
 import org.conscrypt.Conscrypt
 import kotlin.coroutines.resume
 
-data class PairingEndpoint(val host: String, val port: Int)
+data class PairingEndpoint(
+    val host: String,
+    val port: Int,
+    val irohNodeId: String? = null,
+    val irohRelayUrl: String? = null,
+)
 
 sealed interface EnrollmentOutcome {
     data class Approved(val deviceId: String) : EnrollmentOutcome
@@ -137,7 +146,18 @@ class PairingRepository(
         relaySignatureDer: ByteArray?,
         onAwaitingApproval: () -> Unit,
     ): PairingResult {
-        val directEndpoints = payload.hosts.map { PairingEndpoint(it, payload.port) }
+        val directEndpoints = if (payload.networkStack == RemoteNetworkStack.IROH) {
+            listOf(
+                PairingEndpoint(
+                    payload.hosts.first(),
+                    payload.port,
+                    payload.irohNodeId,
+                    payload.irohRelayUrl,
+                ),
+            )
+        } else {
+            payload.hosts.map { PairingEndpoint(it, payload.port) }
+        }
         for (endpoint in directEndpoints + listOfNotNull(payload.relayEndpoint)) {
             val outcome = try {
                 transport.enroll(
@@ -178,6 +198,9 @@ class PairingRepository(
                         lastSeenEpochMillis = null,
                         relayHost = payload.relayHost,
                         relayPort = payload.relayPort,
+                        networkStack = payload.networkStack,
+                        irohNodeId = payload.irohNodeId,
+                        irohRelayUrl = payload.irohRelayUrl,
                     )
                     try {
                         store.save(desktop)
@@ -208,6 +231,7 @@ class PairingRepository(
 }
 
 class OkHttpPairingTransport internal constructor(
+    private val context: Context? = null,
     private val openingChallengeTimeoutMillis: Long = OPENING_CHALLENGE_TIMEOUT_MILLIS,
     private val approvalTimeoutMillis: Long = APPROVAL_TIMEOUT_MILLIS,
 ) : PairingTransport {
@@ -227,8 +251,25 @@ class OkHttpPairingTransport internal constructor(
         onPending: () -> Unit,
     ): EnrollmentOutcome {
         pairingDiagnostic("candidate ${endpoint.host}:${endpoint.port}")
+        val socketFactory = if (endpoint.irohNodeId != null) {
+            val appContext = context
+                ?: return EnrollmentOutcome.Unreachable("Iroh is unavailable without an Android context")
+            try {
+                LoopbackRedirectingSocketFactory(
+                    IrohBridge.localPortFor(
+                        appContext,
+                        endpoint.irohNodeId,
+                        endpoint.irohRelayUrl,
+                    ),
+                )
+            } catch (error: Exception) {
+                return EnrollmentOutcome.Unreachable("Iroh could not reach the desktop: ${error.message}")
+            }
+        } else {
+            SocketFactory.getDefault()
+        }
         val pinnedClient = try {
-            pinnedClient(serverSpkiFingerprint)
+            pinnedClient(serverSpkiFingerprint, socketFactory)
         } catch (error: Exception) {
             pairingDiagnostic("TLS client setup failed: ${error.javaClass.name}")
             return EnrollmentOutcome.Unreachable("TLS 1.3 is unavailable")
@@ -297,7 +338,7 @@ class OkHttpPairingTransport internal constructor(
         }
     }
 
-    private fun pinnedClient(fingerprint: String): PinnedClient {
+    private fun pinnedClient(fingerprint: String, socketFactory: SocketFactory): PinnedClient {
         val trustManager = PinnedSpkiTrustManager(fingerprint)
         val sslContext = tls13Context().apply {
             init(null, arrayOf(trustManager), SecureRandom())
@@ -308,6 +349,7 @@ class OkHttpPairingTransport internal constructor(
         // Deliberately retain OkHttp's default hostname verifier. The SPKI pin
         // replaces CA path validation, not endpoint-name validation.
         val client = baseClient.newBuilder()
+            .socketFactory(socketFactory)
             .sslSocketFactory(sslContext.socketFactory, trustManager)
             .connectionSpecs(listOf(tls13Only))
             .build()

@@ -7,9 +7,7 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{
-    self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError,
-};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -36,6 +34,12 @@ impl TabId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// A TabId from a caller-held string — the phone quotes ids back from
+    /// answers it was given, so this mints no identity, only addresses one.
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        Self(raw.into())
     }
 }
 
@@ -514,6 +518,7 @@ pub trait PtyBackend: Send + Sync + 'static {
     fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<(), String>;
     fn kill(&self, id: u32);
     fn pty_for_descendant(&self, pid: u32) -> Option<u32>;
+    /// Root pid of the PTY's child, when the backend knows it.
     fn child_pid(&self, _id: u32) -> Option<u32> {
         None
     }
@@ -1328,9 +1333,7 @@ impl TabRegistry {
         let desktop_open = launch.desktop_pending;
         {
             let mut maps = self.inner.maps.lock().unwrap();
-            if maps.by_id.len().saturating_add(maps.pending_slots.len())
-                >= MAX_TAB_ROSTER_ENTRIES
-            {
+            if maps.by_id.len().saturating_add(maps.pending_slots.len()) >= MAX_TAB_ROSTER_ENTRIES {
                 return Err(TabError::new(
                     "tab.too_many_tabs",
                     "the recoverable tab roster limit was reached",
@@ -1474,62 +1477,6 @@ impl TabRegistry {
         tabs.into_iter()
             .map(|tab| tab.live.lock().unwrap().descriptor.clone())
             .collect()
-    }
-
-    /// Recent terminal cadence for each running, session-backed tab.
-    ///
-    /// This is presentation metadata only: the tab registry remains the
-    /// lifecycle authority and callers must not infer completion from an idle
-    /// terminal. Keeping the projection here avoids a second mobile session
-    /// registry while letting authenticated clients distinguish active output
-    /// from an open-but-quiet session.
-    pub fn session_activities(&self) -> Vec<(String, String)> {
-        let tabs = {
-            let maps = self.inner.maps.lock().unwrap();
-            maps.order
-                .iter()
-                .filter_map(|id| maps.by_id.get(id).cloned())
-                .collect::<Vec<_>>()
-        };
-        tabs.into_iter()
-            .filter_map(|tab| {
-                let live = tab.live.lock().unwrap();
-                if live.descriptor.state != TabState::Running {
-                    return None;
-                }
-                let session_id = live.descriptor.session_id.clone()?;
-                drop(live);
-                let recent = tab.last_activity.lock().unwrap().elapsed() < Duration::from_secs(10);
-                Some((
-                    session_id,
-                    if recent { "output" } else { "idle" }.to_string(),
-                ))
-            })
-            .collect()
-    }
-
-    /// Root process for a live tab bound to this session. This is enough to
-    /// attribute a loopback listener without making the PTY manager aware of
-    /// sessions or remote-preview policy.
-    pub fn child_pid_for_session(&self, session_id: &str) -> Option<u32> {
-        let tabs = {
-            let maps = self.inner.maps.lock().ok()?;
-            maps.order
-                .iter()
-                .filter_map(|id| maps.by_id.get(id).cloned())
-                .collect::<Vec<_>>()
-        };
-        tabs.into_iter().find_map(|tab| {
-            let live = tab.live.lock().ok()?;
-            let descriptor = &live.descriptor;
-            let matches = descriptor.state == TabState::Running
-                && (descriptor.session_id.as_deref() == Some(session_id)
-                    || descriptor.resumed_id.as_deref() == Some(session_id)
-                    || descriptor.slot_id == session_id);
-            let pty_id = matches.then(|| live.pty.id()).flatten()?;
-            drop(live);
-            self.inner.backend.child_pid(pty_id)
-        })
     }
 
     pub fn get(&self, id: &TabId) -> Result<TabDescriptor, TabError> {
@@ -1880,6 +1827,132 @@ impl TabRegistry {
         let pty_id = self.inner.backend.pty_for_descendant(pid)?;
         self.inner.maps.lock().ok()?.by_pty.get(&pty_id).cloned()
     }
+
+    // Session-keyed views shared by the authenticated remote gateway and the
+    // spine. They address tabs by the session they run rather than by tab id.
+
+    fn cells(&self) -> Vec<Arc<TabCell>> {
+        let maps = self.inner.maps.lock().unwrap();
+        maps.order
+            .iter()
+            .filter_map(|id| maps.by_id.get(id).cloned())
+            .collect()
+    }
+
+    fn cell_for_session(&self, session_id: &str) -> Option<Arc<TabCell>> {
+        self.cells().into_iter().find(|tab| {
+            let live = tab.live.lock().unwrap();
+            live.descriptor.state == TabState::Running
+                && (live.descriptor.session_id.as_deref() == Some(session_id)
+                    || live.descriptor.resumed_id.as_deref() == Some(session_id)
+                    || live.descriptor.slot_id == session_id)
+        })
+    }
+
+    /// Session ids of tabs whose process is still running.
+    pub fn bound_sessions(&self) -> Vec<String> {
+        self.cells()
+            .iter()
+            .filter_map(|tab| {
+                let live = tab.live.lock().unwrap();
+                if live.descriptor.state == TabState::Running {
+                    live.descriptor
+                        .session_id
+                        .clone()
+                        .or_else(|| live.descriptor.resumed_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Whether some running tab is bound to this session.
+    pub fn has_session(&self, session_id: &str) -> bool {
+        self.cell_for_session(session_id).is_some()
+    }
+
+    /// What each bound session's terminal is doing, as cadence evidence:
+    /// "output" while bytes flowed recently, "idle" otherwise. Weak on its
+    /// own — the spine's transcript evidence outranks it before a phone sees
+    /// the resulting phase.
+    pub fn session_activities(&self) -> Vec<(String, String)> {
+        self.cells()
+            .iter()
+            .filter_map(|tab| {
+                let live = tab.live.lock().unwrap();
+                if live.descriptor.state != TabState::Running {
+                    return None;
+                }
+                let session_id = live
+                    .descriptor
+                    .session_id
+                    .clone()
+                    .or_else(|| live.descriptor.resumed_id.clone())?;
+                drop(live);
+                let recent = tab.last_activity.lock().unwrap().elapsed() < Duration::from_secs(10);
+                Some((
+                    session_id,
+                    if recent { "output" } else { "idle" }.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Write into the session's tab as the phone: straight to the PTY,
+    /// ordered against desktop output but not gated on input ownership.
+    pub fn write_session_str(&self, session_id: &str, data: &str) -> Result<(), String> {
+        let tab = self
+            .cell_for_session(session_id)
+            .ok_or_else(|| "session is not open in a tab".to_string())?;
+        let _send_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open().map_err(|e| e.to_string())?;
+        let pty_id = tab
+            .live
+            .lock()
+            .unwrap()
+            .live_pty()
+            .map_err(|e| e.to_string())?;
+        self.inner.backend.write(pty_id, data.as_bytes())
+    }
+
+    /// Raw write into a tab as the phone, keyed by tab id — for tabs that
+    /// run no session at all (a plain shell). Same doctrine as
+    /// `write_session_str`: ordered against output, not gated on input
+    /// ownership, authorized at the listener.
+    pub fn write_tab_str(&self, id: &TabId, data: &str) -> Result<(), String> {
+        let tab = self.inner.tab(id).map_err(|e| e.to_string())?;
+        let _send_order = tab.raw.send_order.lock().unwrap();
+        tab.raw.require_open().map_err(|e| e.to_string())?;
+        let pty_id = tab
+            .live
+            .lock()
+            .unwrap()
+            .live_pty()
+            .map_err(|e| e.to_string())?;
+        self.inner.backend.write(pty_id, data.as_bytes())
+    }
+
+    /// End the process of the session's tab. The tab stays, showing its
+    /// exit — a phone-side stop reads as "something killed it", not as the
+    /// person closing the tab.
+    pub fn kill_session_tab(&self, session_id: &str) -> bool {
+        let Some(tab) = self.cell_for_session(session_id) else {
+            return false;
+        };
+        let Ok(pty_id) = tab.live.lock().unwrap().live_pty() else {
+            return false;
+        };
+        self.inner.backend.kill(pty_id);
+        true
+    }
+
+    /// Root pid of the session's tab process, for port scanning.
+    pub fn child_pid_for_session(&self, session_id: &str) -> Option<u32> {
+        let tab = self.cell_for_session(session_id)?;
+        let pty_id = tab.live.lock().unwrap().live_pty().ok()?;
+        self.inner.backend.child_pid(pty_id)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1960,6 +2033,9 @@ fn emit_desktop_exit(app: &AppHandle, tab_id: &TabId, exit: &TabExit) {
     );
 }
 
+/// Project one registry event into unexpected desktop exits. A tab binding or
+/// losing a session moves the session list, and a Running→Exited transition
+/// is that session's exit.
 fn unexpected_desktop_exits(change: &TabRegistryEvent) -> Vec<(TabId, TabExit)> {
     fn unexpected(tab: &TabDescriptor) -> Option<(TabId, TabExit)> {
         tab.exit()
@@ -2004,6 +2080,12 @@ pub fn start_desktop_registry_bridge(
                             TabRegistryEvent::Removed { .. } => Vec::new(),
                         };
                         for session_id in sessions {
+                            // A bound tab is standing interest in a session:
+                            // the spine tails it whether or not a phone has
+                            // asked, so the history is already there when one
+                            // does. Snapshot events cover tabs that were
+                            // already bound when this bridge started.
+                            crate::spine::ensure_tail_for(&app, &session_id);
                             crate::changes::track(&app, session_id);
                         }
                         let unexpected_exits = unexpected_desktop_exits(&change);
@@ -2017,6 +2099,11 @@ pub fn start_desktop_registry_bridge(
                 }
                 while let Ok(session_id) = activity.try_recv() {
                     crate::changes::touch(&app, &session_id);
+                    // The same verdict onto the spine, so a consumer has one
+                    // stream instead of two. Only for sessions already being
+                    // tailed, and only when the phase actually changed — this
+                    // fires four times a second while output flows.
+                    crate::spine::push_phase(&app, &session_id, "output");
                 }
             }
         })
@@ -2864,11 +2951,12 @@ impl PtySink for TabSink {
                     live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
                 }
                 let changed = if let Some(title) = damage.title {
-                    let other = live.descriptor.text_bytes().saturating_sub(live.descriptor.title.len());
-                    let title = truncate_utf8(
-                        &title,
-                        MAX_TAB_DESCRIPTOR_TEXT_BYTES.saturating_sub(other),
-                    );
+                    let other = live
+                        .descriptor
+                        .text_bytes()
+                        .saturating_sub(live.descriptor.title.len());
+                    let title =
+                        truncate_utf8(&title, MAX_TAB_DESCRIPTOR_TEXT_BYTES.saturating_sub(other));
                     live.descriptor.title = title.clone();
                     live.enqueue_control_all(TabEvent::Title(title));
                     Some(live.descriptor.clone())

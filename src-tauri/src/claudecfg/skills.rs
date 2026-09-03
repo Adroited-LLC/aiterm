@@ -49,8 +49,12 @@ pub struct PluginRoots {
 pub fn enabled_plugins(layer_texts: &[&str]) -> HashMap<String, bool> {
     let mut out = HashMap::new();
     for text in layer_texts {
-        let Ok(root) = serde_json::from_str::<Value>(text) else { continue };
-        let Some(map) = root.get("enabledPlugins").and_then(Value::as_object) else { continue };
+        let Ok(root) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        let Some(map) = root.get("enabledPlugins").and_then(Value::as_object) else {
+            continue;
+        };
         for (id, v) in map {
             if let Some(b) = v.as_bool() {
                 out.insert(id.clone(), b);
@@ -75,7 +79,8 @@ pub fn plugin_roots(installed_plugins_json: &str, enabled: &HashMap<String, bool
         }
     };
     let Some(plugins) = root.get("plugins").and_then(Value::as_object) else {
-        view.errors.push("installed_plugins.json: no \"plugins\" object".into());
+        view.errors
+            .push("installed_plugins.json: no \"plugins\" object".into());
         return view;
     };
     for (id, entries) in plugins {
@@ -85,8 +90,12 @@ pub fn plugin_roots(installed_plugins_json: &str, enabled: &HashMap<String, bool
         }
         // "superpowers@claude-plugins-official" reads better as "superpowers".
         let label = id.split('@').next().unwrap_or(id).to_string();
-        let Some(first) = entries.as_array().and_then(|a| a.first()) else { continue };
-        let Some(path) = first.get("installPath").and_then(Value::as_str) else { continue };
+        let Some(first) = entries.as_array().and_then(|a| a.first()) else {
+            continue;
+        };
+        let Some(path) = first.get("installPath").and_then(Value::as_str) else {
+            continue;
+        };
         view.roots.push((label, format!("{path}/skills")));
     }
     view.roots.sort();
@@ -159,12 +168,19 @@ mod tests {
         let v = plugin_roots(INSTALLED, &all_enabled());
         assert!(v.roots.iter().any(|(label, dir)| label == "superpowers"
             && dir == "/h/.claude/plugins/cache/claude-plugins-official/superpowers/6.2.0/skills"));
-        assert_eq!(v.roots.len(), 2, "one root per installed plugin, not per cached version");
+        assert_eq!(
+            v.roots.len(),
+            2,
+            "one root per installed plugin, not per cached version"
+        );
     }
 
     #[test]
     fn a_plugin_with_no_install_path_is_skipped_rather_than_guessed() {
-        let v = plugin_roots(r#"{"plugins": {"broken@x": [{"scope": "user"}]}}"#, &all_enabled());
+        let v = plugin_roots(
+            r#"{"plugins": {"broken@x": [{"scope": "user"}]}}"#,
+            &all_enabled(),
+        );
         assert!(v.roots.is_empty());
     }
 
@@ -173,14 +189,22 @@ mod tests {
         // Its SKILL.md files are still in the cache, but no session can reach
         // them, so listing them would offer skills that do not exist in use.
         let v = plugin_roots(INSTALLED, &enabled_plugins(&[SETTINGS]));
-        assert!(v.roots.iter().all(|(label, _)| label != "document-skills"), "{:?}", v.roots);
+        assert!(
+            v.roots.iter().all(|(label, _)| label != "document-skills"),
+            "{:?}",
+            v.roots
+        );
         assert_eq!(v.disabled, 1);
     }
 
     #[test]
     fn a_plugin_settings_switched_on_is_kept() {
         let v = plugin_roots(INSTALLED, &enabled_plugins(&[SETTINGS]));
-        assert!(v.roots.iter().any(|(label, _)| label == "superpowers"), "{:?}", v.roots);
+        assert!(
+            v.roots.iter().any(|(label, _)| label == "superpowers"),
+            "{:?}",
+            v.roots
+        );
     }
 
     #[test]
@@ -195,7 +219,10 @@ mod tests {
         // Lowest precedence first, same order the settings resolver is given.
         let on = r#"{"enabledPlugins": {"document-skills@anthropic-agent-skills": true}}"#;
         let map = enabled_plugins(&[SETTINGS, on]);
-        assert_eq!(map.get("document-skills@anthropic-agent-skills"), Some(&true));
+        assert_eq!(
+            map.get("document-skills@anthropic-agent-skills"),
+            Some(&true)
+        );
     }
 
     #[test]
@@ -203,7 +230,11 @@ mod tests {
         let v = plugin_roots("{ not json", &all_enabled());
         assert!(v.roots.is_empty());
         assert_eq!(v.errors.len(), 1, "{:?}", v.errors);
-        assert!(v.errors[0].contains("installed_plugins.json"), "{:?}", v.errors);
+        assert!(
+            v.errors[0].contains("installed_plugins.json"),
+            "{:?}",
+            v.errors
+        );
     }
 
     #[test]
@@ -215,10 +246,14 @@ mod tests {
 
     #[test]
     fn a_skill_is_named_and_described_by_its_frontmatter() {
-        let text = "---\nname: deploy-rpm\ndescription: Install an RPM on Matt's machines\n---\n\nbody\n";
+        let text =
+            "---\nname: deploy-rpm\ndescription: Install an RPM on Matt's machines\n---\n\nbody\n";
         assert_eq!(
             frontmatter(text),
-            ("deploy-rpm".to_string(), "Install an RPM on Matt's machines".to_string())
+            (
+                "deploy-rpm".to_string(),
+                "Install an RPM on Matt's machines".to_string()
+            )
         );
     }
 

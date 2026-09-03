@@ -195,6 +195,7 @@ class RemoteClient(
     private var lifecycleGeneration = 0L
     private var selectionGeneration = 0L
     private val ownedJobs = linkedSetOf<Job>()
+    private val spineConversations = HashMap<String, SpineConversationStore>()
 
     suspend fun connect(): Boolean {
         synchronized(lifecycleLock) {
@@ -701,6 +702,60 @@ class RemoteClient(
                 previewError = null,
             )
         }
+        val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
+        val started = launchRequest(
+            "session.spine",
+            RemoteCommands.spine(sessionId, store.lastSeq),
+            onError = { code, message ->
+                if (code == "remote.unsupported" || code == "protocol.invalid_response") {
+                    previewSessionLegacy(sessionId)
+                } else {
+                    mutableState.value = mutableState.value.copy(
+                        previewLoadingSessionId = null,
+                        previewError = message,
+                    )
+                }
+            },
+            onSuccess = { payload ->
+                val page = RemoteCommands.spinePage(payload)
+                val messages = store.apply(page)
+                val activity = store.phase?.let { phase ->
+                    mutableState.value.sessionActivity + (
+                        sessionId to when (phase) {
+                            "working" -> "output"
+                            "needs_you" -> "attention"
+                            else -> "idle"
+                        }
+                    )
+                } ?: mutableState.value.sessionActivity
+                mutableState.value = mutableState.value.copy(
+                    previewSessionId = sessionId,
+                    previewMessages = messages,
+                    previewLoadingSessionId = null,
+                    previewError = null,
+                    sessionActivity = activity,
+                )
+                if (page.hasMore) previewSession(sessionId)
+            },
+        )
+        if (!started) {
+            synchronized(lifecycleLock) {
+                if (mutableState.value.previewLoadingSessionId == sessionId) {
+                    mutableState.value = mutableState.value.copy(
+                        previewLoadingSessionId = null,
+                        previewError = if (mutableState.value.connection == ConnectionState.Connected) {
+                            "Conversation refresh is busy. Retrying…"
+                        } else {
+                            "The desktop is disconnected."
+                        },
+                    )
+                }
+            }
+        }
+    }
+
+    /** Compatibility with a desktop from before the spine joined our gateway. */
+    private fun previewSessionLegacy(sessionId: String) {
         val started = launchRequest(
             "session.conversation",
             RemoteCommands.conversation(sessionId),
@@ -720,18 +775,10 @@ class RemoteClient(
             },
         )
         if (!started) {
-            synchronized(lifecycleLock) {
-                if (mutableState.value.previewLoadingSessionId == sessionId) {
-                    mutableState.value = mutableState.value.copy(
-                        previewLoadingSessionId = null,
-                        previewError = if (mutableState.value.connection == ConnectionState.Connected) {
-                            "Conversation refresh is busy. Retrying…"
-                        } else {
-                            "The desktop is disconnected."
-                        },
-                    )
-                }
-            }
+            mutableState.value = mutableState.value.copy(
+                previewLoadingSessionId = null,
+                previewError = "Conversation refresh is busy. Retrying…",
+            )
         }
     }
 

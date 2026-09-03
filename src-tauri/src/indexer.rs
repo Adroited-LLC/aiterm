@@ -89,7 +89,9 @@ impl SessionIndex {
     }
 
     fn upsert(&self, s: &Session, mtime: u64, user_text: &str, assistant_text: &str) {
-        let Ok(guard) = self.writer.lock() else { return };
+        let Ok(guard) = self.writer.lock() else {
+            return;
+        };
         let Some(writer) = guard.as_ref() else { return };
         let id_field = self.schema.get_field("session_id").unwrap();
         writer.delete_term(Term::from_field_text(id_field, &s.id));

@@ -53,7 +53,9 @@ fn save_metadata<T: serde::Serialize>(name: &str, value: &T) -> Result<(), Strin
 }
 
 pub fn rename_session(session_id: &str, title: &str) -> Result<(), String> {
-    let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
+    let _guard = metadata_lock()
+        .lock()
+        .map_err(|_| "session metadata lock failed")?;
     let mut titles: std::collections::HashMap<String, String> = load_metadata("titles.json");
     let title = title.trim();
     if title.is_empty() {
@@ -74,7 +76,9 @@ pub fn load_stars() -> Vec<String> {
 }
 
 pub fn set_star(session_id: &str, on: bool) -> Result<(), String> {
-    let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
+    let _guard = metadata_lock()
+        .lock()
+        .map_err(|_| "session metadata lock failed")?;
     let mut stars: Vec<String> = load_metadata("stars.json");
     stars.retain(|candidate| candidate != session_id);
     if on {
@@ -97,7 +101,10 @@ pub(crate) fn apply_session_names(sessions: &mut [Session]) {
     // The librarian's names come second: a name set by hand always wins.
     let named = crate::librarian::names();
     for session in sessions {
-        if let Some(title) = titles.get(&session.id).filter(|title| !title.trim().is_empty()) {
+        if let Some(title) = titles
+            .get(&session.id)
+            .filter(|title| !title.trim().is_empty())
+        {
             session.title = title.clone();
         } else if let Some(name) = named.get(&session.id) {
             session.title = name.clone();
@@ -113,7 +120,9 @@ pub fn session_brought_in() -> std::collections::HashMap<String, String> {
 /// A deleted session leaves the lineage: as a brought-in agent, and as a
 /// master — otherwise the crew badge keeps counting a tab that is gone.
 pub fn forget_brought_in(session_id: &str) {
-    let Ok(_guard) = metadata_lock().lock() else { return };
+    let Ok(_guard) = metadata_lock().lock() else {
+        return;
+    };
     let mut lineage: std::collections::HashMap<String, String> = load_metadata("brought_in.json");
     let before = lineage.len();
     lineage.retain(|k, v| k != session_id && v != session_id);
@@ -123,9 +132,10 @@ pub fn forget_brought_in(session_id: &str) {
 }
 
 pub fn record_brought_in(second_session: &str, master_session: &str) -> Result<(), String> {
-    let _guard = metadata_lock().lock().map_err(|_| "session metadata lock failed")?;
-    let mut lineage: std::collections::HashMap<String, String> =
-        load_metadata("brought_in.json");
+    let _guard = metadata_lock()
+        .lock()
+        .map_err(|_| "session metadata lock failed")?;
+    let mut lineage: std::collections::HashMap<String, String> = load_metadata("brought_in.json");
     lineage.insert(second_session.to_owned(), master_session.to_owned());
     save_metadata("brought_in.json", &lineage)
 }
@@ -144,7 +154,12 @@ pub fn relay_report(
     rounds: u32,
     note: String,
 ) {
-    let _ = (b_name, phase, round, rounds, note);
+    crate::diag!(
+        "relay",
+        "{phase} r{round}/{rounds} a={} b={:?} ({b_name}) {note}",
+        &session_id[..8.min(session_id.len())],
+        b_session_id.as_deref().map(|id| &id[..8.min(id.len())]),
+    );
     if let Some(second) = b_session_id.as_deref() {
         let _ = record_brought_in(second, &session_id);
     }
@@ -167,6 +182,8 @@ pub fn session_rename(
     title: String,
 ) -> Result<(), String> {
     rename_session(&session_id, &title)?;
+    // Every desktop view lists the same sessions; tell them the list moved. (The
+    // transcript watcher can't see titles.json, so say it ourselves.)
     use tauri::Emitter;
     let _ = app.emit("sessions://changed", ());
     Ok(())
@@ -535,10 +552,7 @@ fn scan_claude_root_bounded(
                 continue;
             };
             ordered.push(path.clone());
-            if cache
-                .get(&path)
-                .is_some_and(|(m, l, _)| (*m, *l) == key)
-            {
+            if cache.get(&path).is_some_and(|(m, l, _)| (*m, *l) == key) {
                 held.push(file);
             } else {
                 fresh.push((path, file, key));
@@ -1030,7 +1044,9 @@ fn is_scratch_dir(path: &str) -> bool {
     if under("/tmp") {
         return true;
     }
-    let Some(home) = dirs::home_dir() else { return false };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
     let home = home.to_string_lossy();
     [".local/state", ".claude/jobs", ".cache"]
         .iter()
@@ -6103,6 +6119,50 @@ fn has_conversation(path: &Path) -> bool {
     })
 }
 
+/// Is some live process running this OpenCode session? `time.completed`
+/// staying NULL means "working" only while something is actually running the
+/// session. Two ways a process names one [observed: opencode 1.18.25]:
+///
+/// - a resume carries the id in argv (`opencode --session ses_…`, or the
+///   `$SHELL -ic` wrapper holding that same text), so any argv mentioning the
+///   id counts;
+/// - a fresh launch (`opencode --model … --prompt …`) names no session at
+///   all — the row is minted at the first prompt — so an `opencode` process
+///   whose cwd is the session's directory stands in for it.
+pub(crate) fn opencode_process_alive(session_id: &str, dir: Option<&str>) -> bool {
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in procs.flatten() {
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if args.iter().any(|a| a.contains(session_id)) {
+            return true;
+        }
+        let is_opencode = args
+            .first()
+            .and_then(|a| Path::new(a).file_name().map(|n| n == "opencode"))
+            .unwrap_or(false);
+        if is_opencode {
+            if let (Some(dir), Ok(cwd)) = (dir, std::fs::read_link(entry.path().join("cwd"))) {
+                if cwd == Path::new(dir) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Session ids that currently have a live Claude Code process, read from
 /// `/proc`. A session counts as running if some process names it via
 /// `--session-id <id>` or `--resume <id|/path/<id>.jsonl>`. The UI uses this to
@@ -9427,7 +9487,10 @@ mod tests {
         let early = dir.join("55555555-5555-4555-8555-555555555556.jsonl");
         std::fs::write(&early,
             r#"{"type":"user","uuid":"u1","parentUuid":null,"cwd":"/home/x/proj","promptSource":"typed","message":{"role":"user","content":"write me a 500 word article about squirrels"}}"#).unwrap();
-        assert_eq!(parse_session(&early, None).unwrap().title, "write me a 500 word article about squirrels");
+        assert_eq!(
+            parse_session(&early, None).unwrap().title,
+            "write me a 500 word article about squirrels"
+        );
         // A name the person gave still wins over both.
         let named = dir.join("55555555-5555-4555-8555-555555555557.jsonl");
         std::fs::write(&named, concat!(
@@ -9444,8 +9507,12 @@ mod tests {
         let home = home.to_string_lossy();
         assert!(is_scratch_dir("/tmp"));
         assert!(is_scratch_dir("/tmp/x"));
-        assert!(is_scratch_dir(&format!("{home}/.local/state/acc-audit-watch/repo")));
-        assert!(is_scratch_dir(&format!("{home}/.claude/jobs/8f258164/tmp/claude-specimen")));
+        assert!(is_scratch_dir(&format!(
+            "{home}/.local/state/acc-audit-watch/repo"
+        )));
+        assert!(is_scratch_dir(&format!(
+            "{home}/.claude/jobs/8f258164/tmp/claude-specimen"
+        )));
         assert!(is_scratch_dir(&format!("{home}/.cache/thing")));
         assert!(!is_scratch_dir(&format!("{home}/nanoclaw")));
         assert!(!is_scratch_dir(&format!("{home}/.local/share/aiterm")));
@@ -9457,13 +9524,19 @@ mod tests {
         let f = dir.join("66666666-6666-4666-8666-666666666661.jsonl");
         std::fs::write(&f, format!(
             r##"{{"type":"user","uuid":"u1","parentUuid":null,"cwd":"{home}/.local/state/acc-audit-watch/repo","promptSource":"sdk","message":{{"role":"user","content":"# Origin-side triage agent"}}}}"##)).unwrap();
-        assert!(parse_session(&f, None).is_none(), "a routine's session is dropped");
+        assert!(
+            parse_session(&f, None).is_none(),
+            "a routine's session is dropped"
+        );
         // The same prompt source from a real project is the person's session
         // — typed through an SDK-driven front end — and stays.
         let g = dir.join("66666666-6666-4666-8666-666666666662.jsonl");
         std::fs::write(&g, format!(
             r##"{{"type":"user","uuid":"u1","parentUuid":null,"cwd":"{home}/nanoclaw","entrypoint":"sdk-cli","promptSource":"sdk","message":{{"role":"user","content":"what is Matt working on?"}}}}"##)).unwrap();
-        assert_eq!(parse_session(&g, None).unwrap().title, "what is Matt working on?");
+        assert_eq!(
+            parse_session(&g, None).unwrap().title,
+            "what is Matt working on?"
+        );
     }
 
     #[test]

@@ -53,7 +53,9 @@ fn store_path() -> Option<std::path::PathBuf> {
 }
 
 pub fn load_store() -> Store {
-    let Some(p) = store_path() else { return Store::default() };
+    let Some(p) = store_path() else {
+        return Store::default();
+    };
     std::fs::read_to_string(p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -105,19 +107,31 @@ pub struct Candidate {
 /// through stdin or a private file, never the argv, except for agy, whose
 /// print mode takes the prompt as a flag.
 #[derive(Deserialize, Debug, Clone)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Engine {
-    Api { provider_id: String, model: String },
+    Api {
+        provider_id: String,
+        model: String,
+    },
     /// `agent` is a backend id: claude, codex, grok or antigravity. `model`
     /// in that CLI's spelling, or none for its default.
-    Cli { agent: String, model: Option<String> },
+    Cli {
+        agent: String,
+        model: Option<String>,
+    },
 }
 
 impl Engine {
     fn label(&self) -> String {
         match self {
             Engine::Api { model, .. } => model.clone(),
-            Engine::Cli { agent, model } => format!("{agent}:{}", model.as_deref().unwrap_or("default")),
+            Engine::Cli { agent, model } => {
+                format!("{agent}:{}", model.as_deref().unwrap_or("default"))
+            }
         }
     }
 }
@@ -157,7 +171,12 @@ fn is_current(e: &Entry, last_active: i64) -> bool {
 pub fn pending<'a>(store: &Store, cands: &'a [Candidate]) -> Vec<&'a Candidate> {
     let mut v: Vec<&Candidate> = cands
         .iter()
-        .filter(|c| store.sessions.get(&c.id).map_or(true, |e| !is_current(e, c.last_active)))
+        .filter(|c| {
+            store
+                .sessions
+                .get(&c.id)
+                .map_or(true, |e| !is_current(e, c.last_active))
+        })
         .collect();
     v.sort_by_key(|c| c.last_active);
     v
@@ -180,8 +199,15 @@ fn clip(s: &str, n: usize) -> String {
 /// session summary and agy's annotation all count; opencode's row title,
 /// which starts life as the first message, does not until it differs.
 pub fn engine_titled(d: &crate::detail::SessionDetail) -> bool {
-    let norm = |s: &str| s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>();
-    let Some(title) = d.title.as_deref().map(norm).filter(|t| !t.is_empty()) else { return false };
+    let norm = |s: &str| {
+        s.to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+    };
+    let Some(title) = d.title.as_deref().map(norm).filter(|t| !t.is_empty()) else {
+        return false;
+    };
     let first = d.first_prompt.as_deref().map(norm).unwrap_or_default();
     !(first.starts_with(&title) || title.starts_with(&first) && !first.is_empty())
 }
@@ -197,7 +223,9 @@ const TOTAL_CHARS: usize = 6000;
 /// turns, oldest first, opening turn plus as much of the tail as fits.
 pub fn conversation_text(turns: &[(String, String)]) -> String {
     let mut it = turns.iter();
-    let Some((role, text)) = it.next() else { return String::new() };
+    let Some((role, text)) = it.next() else {
+        return String::new();
+    };
     let first = format!("[{role}] {}", clip(text, FIRST_CHARS));
     let mut used = first.chars().count();
     let mut tail: Vec<String> = Vec::new();
@@ -246,7 +274,9 @@ pub fn parse_title(text: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with("```"))?;
-    let mut s = line.trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c == '>').trim();
+    let mut s = line
+        .trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c == '>')
+        .trim();
     for label in ["Title:", "title:", "Name:", "name:"] {
         if let Some(rest) = s.strip_prefix(label) {
             s = rest.trim();
@@ -266,16 +296,26 @@ pub fn parse_title(text: &str) -> Option<String> {
 /* ---- one non-streaming call ------------------------------------------- */
 
 /// Ask once, whichever way the engine is reached.
-fn ask(engine: &Engine, providers: &[Provider], system: &str, user: &str) -> Result<(String, Option<f64>), String> {
+fn ask(
+    engine: &Engine,
+    providers: &[Provider],
+    system: &str,
+    user: &str,
+) -> Result<(String, Option<f64>), String> {
     match engine {
         Engine::Api { provider_id, model } => {
-            let p = providers.iter().find(|p| &p.id == provider_id).ok_or("that provider is not configured")?;
+            let p = providers
+                .iter()
+                .find(|p| &p.id == provider_id)
+                .ok_or("that provider is not configured")?;
             if p.api_key.is_empty() {
                 return Err(format!("{} has no API key saved", p.name));
             }
             ask_api(p, model, system, user)
         }
-        Engine::Cli { agent, model } => ask_cli(agent, model.as_deref(), system, user).map(|t| (t, None)),
+        Engine::Cli { agent, model } => {
+            ask_cli(agent, model.as_deref(), system, user).map(|t| (t, None))
+        }
     }
 }
 
@@ -291,7 +331,16 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
     match agent {
         "claude" => {
             cmd = std::process::Command::new("claude");
-            cmd.args(["-p", "--output-format", "text", "--no-session-persistence", "--tools", "", "--system-prompt", system]);
+            cmd.args([
+                "-p",
+                "--output-format",
+                "text",
+                "--no-session-persistence",
+                "--tools",
+                "",
+                "--system-prompt",
+                system,
+            ]);
             if let Some(m) = model.filter(|m| !m.is_empty()) {
                 cmd.args(["--model", m]);
             }
@@ -301,7 +350,9 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
             // file of our naming.
             let f = dir.join(format!("codex-last-{}.txt", std::process::id()));
             cmd = std::process::Command::new("codex");
-            cmd.args(["exec", "--ephemeral", "--skip-git-repo-check", "-o"]).arg(&f).arg("-");
+            cmd.args(["exec", "--ephemeral", "--skip-git-repo-check", "-o"])
+                .arg(&f)
+                .arg("-");
             if let Some(m) = model.filter(|m| !m.is_empty()) {
                 cmd.args(["-m", m]);
             }
@@ -309,9 +360,11 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
         }
         "grok" => {
             let f = dir.join(format!("grok-prompt-{}.txt", std::process::id()));
-            crate::providers::write_private(&f, &combined).map_err(|e| format!("could not stage the prompt: {e}"))?;
+            crate::providers::write_private(&f, &combined)
+                .map_err(|e| format!("could not stage the prompt: {e}"))?;
             cmd = std::process::Command::new("grok");
-            cmd.args(["--output-format", "plain", "--prompt-file"]).arg(&f);
+            cmd.args(["--output-format", "plain", "--prompt-file"])
+                .arg(&f);
             if let Some(m) = model.filter(|m| !m.is_empty()) {
                 cmd.args(["--model", m]);
             }
@@ -338,13 +391,19 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("could not run {agent}: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run {agent}: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
         // claude and codex read the prompt here; grok has its file and
         // antigravity its argv, and both get an empty stdin so they cannot
         // wait on a terminal.
         if prompt_file.is_none() && agent != "antigravity" {
-            let text = if agent == "claude" { user.to_string() } else { combined.clone() };
+            let text = if agent == "claude" {
+                user.to_string()
+            } else {
+                combined.clone()
+            };
             let _ = stdin.write_all(text.as_bytes());
         }
     }
@@ -362,7 +421,10 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
     };
     if !out.status.success() && text.trim().is_empty() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("{agent} failed: {}", err.lines().last().unwrap_or("no output").trim()));
+        return Err(format!(
+            "{agent} failed: {}",
+            err.lines().last().unwrap_or("no output").trim()
+        ));
     }
     if text.trim().is_empty() {
         return Err(format!("{agent} replied with nothing"));
@@ -372,7 +434,12 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
 
 /// Ask an API provider once. The key goes to curl over its config stdin,
 /// never the argv, exactly as the chat harness does it.
-fn ask_api(p: &Provider, model: &str, system: &str, user: &str) -> Result<(String, Option<f64>), String> {
+fn ask_api(
+    p: &Provider,
+    model: &str,
+    system: &str,
+    user: &str,
+) -> Result<(String, Option<f64>), String> {
     let mut body = serde_json::json!({
         "model": model,
         "messages": [
@@ -389,15 +456,23 @@ fn ask_api(p: &Provider, model: &str, system: &str, user: &str) -> Result<(Strin
             map.insert("usage".into(), serde_json::json!({"include": true}));
         }
     }
-    let body_path = std::env::temp_dir().join(format!("aiterm-librarian-{}.json", std::process::id()));
+    let body_path =
+        std::env::temp_dir().join(format!("aiterm-librarian-{}.json", std::process::id()));
     crate::providers::write_private(&body_path, &body.to_string())
         .map_err(|e| format!("could not stage the request: {e}"))?;
     let url = format!("{}/chat/completions", p.base_url.trim_end_matches('/'));
     let mut child = std::process::Command::new("curl")
         .args([
-            "-sS", "--connect-timeout", "10", "--max-time", "180",
-            "-H", "Content-Type: application/json",
-            "--config", "-", "--data-binary",
+            "-sS",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "180",
+            "-H",
+            "Content-Type: application/json",
+            "--config",
+            "-",
+            "--data-binary",
         ])
         .arg(format!("@{}", body_path.display()))
         .arg(&url)
@@ -415,7 +490,11 @@ fn ask_api(p: &Provider, model: &str, system: &str, user: &str) -> Result<(Strin
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&body_path);
     if !out.status.success() && out.stdout.is_empty() {
-        return Err(format!("curl could not reach {}: {}", p.name, String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(format!(
+            "curl could not reach {}: {}",
+            p.name,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)
         .map_err(|_| format!("{} sent something that is not JSON", p.name))?;
@@ -442,8 +521,7 @@ static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// start to.
 const STRIKES: usize = 2;
 
-/// Tell the desktop session list a name landed. Remote clients learn the
-/// same name through the existing authenticated session-list operation.
+/// Both UIs list the same sessions; tell them a name landed.
 fn announce(app: &Option<tauri::AppHandle>) {
     if let Some(app) = app {
         use tauri::Emitter;
@@ -457,7 +535,12 @@ fn record(id: &str, name: &str, seen: i64, model: &str, cost: Option<f64>) -> Re
     let mut store = load_store();
     store.sessions.insert(
         id.to_string(),
-        Entry { name: name.to_string(), seen, at: now_ms(), model: model.to_string() },
+        Entry {
+            name: name.to_string(),
+            seen,
+            at: now_ms(),
+            model: model.to_string(),
+        },
     );
     if let Some(c) = cost {
         store.spent += c;
@@ -469,7 +552,12 @@ fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-fn run_sync(app: Option<tauri::AppHandle>, engine: Engine, cands: Vec<Candidate>, max: usize) -> Result<RunReport, String> {
+fn run_sync(
+    app: Option<tauri::AppHandle>,
+    engine: Engine,
+    cands: Vec<Candidate>,
+    max: usize,
+) -> Result<RunReport, String> {
     let _one_at_a_time = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let providers = crate::providers::load_providers();
     let model = engine.label();
@@ -481,7 +569,9 @@ fn run_sync(app: Option<tauri::AppHandle>, engine: Engine, cands: Vec<Candidate>
     let list = crate::agents::backends();
     for c in todo.iter().take(max) {
         let Some(d) = crate::detail::session_detail_sync(c.id.clone()) else {
-            report.errors.push(format!("{}: no transcript to read", short(&c.id)));
+            report
+                .errors
+                .push(format!("{}: no transcript to read", short(&c.id)));
             continue;
         };
         // The engine's own title stands. Marked as seen so the auto run
@@ -501,7 +591,9 @@ fn run_sync(app: Option<tauri::AppHandle>, engine: Engine, cands: Vec<Candidate>
             report.skipped += 1;
             continue;
         }
-        let agent = crate::agents::owner_in(&list, &c.id).map(|(b, _)| b.id().to_string()).unwrap_or_default();
+        let agent = crate::agents::owner_in(&list, &c.id)
+            .map(|(b, _)| b.id().to_string())
+            .unwrap_or_default();
         let prompt = build_prompt(&agent, d.cwd.as_deref().unwrap_or(""), &text);
         match ask(&engine, &providers, SYSTEM, &prompt) {
             Ok((reply, cost)) => match parse_title(&reply) {
@@ -513,7 +605,11 @@ fn run_sync(app: Option<tauri::AppHandle>, engine: Engine, cands: Vec<Candidate>
                     announce(&app);
                 }
                 None => {
-                    report.errors.push(format!("{}: the reply was not a title: {}", short(&c.id), clip(&reply, 80)));
+                    report.errors.push(format!(
+                        "{}: the reply was not a title: {}",
+                        short(&c.id),
+                        clip(&reply, 80)
+                    ));
                     strikes += 1;
                 }
             },
@@ -538,7 +634,12 @@ pub async fn librarian_state() -> Store {
 }
 
 #[tauri::command]
-pub async fn librarian_run(app: tauri::AppHandle, engine: Engine, sessions: Vec<Candidate>, max: usize) -> Result<RunReport, String> {
+pub async fn librarian_run(
+    app: tauri::AppHandle,
+    engine: Engine,
+    sessions: Vec<Candidate>,
+    max: usize,
+) -> Result<RunReport, String> {
     crate::run_blocking(move || run_sync(Some(app), engine, sessions, max)).await
 }
 
@@ -575,16 +676,26 @@ mod tests {
             .into_iter()
             .map(|(s, _)| s)
             .filter(|s| s.agent == "codex")
-            .map(|s| Candidate { id: s.id, last_active: s.last_active as i64 })
+            .map(|s| Candidate {
+                id: s.id,
+                last_active: s.last_active as i64,
+            })
             .collect();
         cands.sort_by_key(|c| std::cmp::Reverse(c.last_active));
         cands.truncate(3);
-        let engine = Engine::Cli { agent: "claude".into(), model: Some("haiku".into()) };
+        let engine = Engine::Cli {
+            agent: "claude".into(),
+            model: Some("haiku".into()),
+        };
         let r = run_sync(None, engine, cands.clone(), 3).unwrap();
         eprintln!("{r:#?}");
         let store = load_store();
         for c in &cands {
-            eprintln!("{} -> {:?}", short(&c.id), store.sessions.get(&c.id).map(|e| &e.name));
+            eprintln!(
+                "{} -> {:?}",
+                short(&c.id),
+                store.sessions.get(&c.id).map(|e| &e.name)
+            );
         }
         let _ = list;
         assert!(r.errors.is_empty(), "{:?}", r.errors);
@@ -592,11 +703,26 @@ mod tests {
 
     #[test]
     fn a_reply_is_read_as_one_title() {
-        assert_eq!(parse_title("Squirrels article\n").as_deref(), Some("Squirrels article"));
-        assert_eq!(parse_title("\"Relay route enrolment.\"").as_deref(), Some("Relay route enrolment"));
-        assert_eq!(parse_title("Title: **Second agent on aiterm**").as_deref(), Some("Second agent on aiterm"));
-        assert_eq!(parse_title("```\nQuick check\n```").as_deref(), Some("Quick check"));
-        assert_eq!(parse_title("# Phone relay pairing\n\nBecause…").as_deref(), Some("Phone relay pairing"));
+        assert_eq!(
+            parse_title("Squirrels article\n").as_deref(),
+            Some("Squirrels article")
+        );
+        assert_eq!(
+            parse_title("\"Relay route enrolment.\"").as_deref(),
+            Some("Relay route enrolment")
+        );
+        assert_eq!(
+            parse_title("Title: **Second agent on aiterm**").as_deref(),
+            Some("Second agent on aiterm")
+        );
+        assert_eq!(
+            parse_title("```\nQuick check\n```").as_deref(),
+            Some("Quick check")
+        );
+        assert_eq!(
+            parse_title("# Phone relay pairing\n\nBecause…").as_deref(),
+            Some("Phone relay pairing")
+        );
         assert_eq!(parse_title("   \n"), None);
         let essay = "This session is about a great many things, chiefly the wiring of a relay and the naming of sessions in a sidebar";
         assert_eq!(parse_title(essay), None);
@@ -610,13 +736,25 @@ mod tests {
             ..Default::default()
         };
         // Claude's ai-title against the raw prompt.
-        assert!(engine_titled(&d(Some("Squirrels article"), Some("write me a 500 word article about squirrels"))));
+        assert!(engine_titled(&d(
+            Some("Squirrels article"),
+            Some("write me a 500 word article about squirrels")
+        )));
         // agy's annotation with no first prompt on record.
-        assert!(engine_titled(&d(Some("Google Ads Performance Review"), None)));
+        assert!(engine_titled(&d(
+            Some("Google Ads Performance Review"),
+            None
+        )));
         // Nothing but the prompt: opencode before it has titled, codex always.
         assert!(!engine_titled(&d(None, Some("hi there"))));
-        assert!(!engine_titled(&d(Some("write me a 500 word article about squirrels"), Some("write me a 500 word article about squirrels"))));
-        assert!(!engine_titled(&d(Some("write me a 500 word article…"), Some("write me a 500 word article about squirrels"))));
+        assert!(!engine_titled(&d(
+            Some("write me a 500 word article about squirrels"),
+            Some("write me a 500 word article about squirrels")
+        )));
+        assert!(!engine_titled(&d(
+            Some("write me a 500 word article…"),
+            Some("write me a 500 word article about squirrels")
+        )));
         assert!(!engine_titled(&d(Some(""), Some("hi"))));
     }
 
@@ -643,7 +781,11 @@ mod tests {
         assert!(t.starts_with("[user] build me a relay"));
         assert!(t.ends_with("[assistant] done: the relay is up"));
         assert!(t.contains("[…]"), "a cut is marked");
-        assert!(t.chars().count() <= TOTAL_CHARS + 200, "{}", t.chars().count());
+        assert!(
+            t.chars().count() <= TOTAL_CHARS + 200,
+            "{}",
+            t.chars().count()
+        );
         assert_eq!(conversation_text(&[]), "");
         let one = vec![("user".to_string(), "hi".to_string())];
         assert_eq!(conversation_text(&one), "[user] hi");
@@ -652,26 +794,70 @@ mod tests {
     #[test]
     fn pending_is_what_is_new_or_has_moved_on() {
         let mut store = Store::default();
-        store.sessions.insert("a".into(), Entry { name: "A".into(), seen: 1_000, ..Default::default() });
-        store.sessions.insert("b".into(), Entry { name: "".into(), seen: 1_000, ..Default::default() });
+        store.sessions.insert(
+            "a".into(),
+            Entry {
+                name: "A".into(),
+                seen: 1_000,
+                ..Default::default()
+            },
+        );
+        store.sessions.insert(
+            "b".into(),
+            Entry {
+                name: "".into(),
+                seen: 1_000,
+                ..Default::default()
+            },
+        );
         let cands = vec![
-            Candidate { id: "a".into(), last_active: 1_000 },          // current
-            Candidate { id: "b".into(), last_active: 50_000 },         // within slack, current
-            Candidate { id: "c".into(), last_active: 5 },              // never seen
-            Candidate { id: "a2".into(), last_active: 9 },             // never seen
+            Candidate {
+                id: "a".into(),
+                last_active: 1_000,
+            }, // current
+            Candidate {
+                id: "b".into(),
+                last_active: 50_000,
+            }, // within slack, current
+            Candidate {
+                id: "c".into(),
+                last_active: 5,
+            }, // never seen
+            Candidate {
+                id: "a2".into(),
+                last_active: 9,
+            }, // never seen
         ];
-        let p: Vec<&str> = pending(&store, &cands).iter().map(|c| c.id.as_str()).collect();
+        let p: Vec<&str> = pending(&store, &cands)
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
         assert_eq!(p, vec!["c", "a2"], "oldest first, current ones left out");
         // Activity past the slack makes an entry stale again.
-        let moved = vec![Candidate { id: "a".into(), last_active: 100_000 }];
+        let moved = vec![Candidate {
+            id: "a".into(),
+            last_active: 100_000,
+        }];
         assert_eq!(pending(&store, &moved).len(), 1);
     }
 
     #[test]
     fn names_are_only_the_named() {
         let mut store = Store::default();
-        store.sessions.insert("a".into(), Entry { name: "A thing".into(), ..Default::default() });
-        store.sessions.insert("b".into(), Entry { name: "".into(), ..Default::default() });
+        store.sessions.insert(
+            "a".into(),
+            Entry {
+                name: "A thing".into(),
+                ..Default::default()
+            },
+        );
+        store.sessions.insert(
+            "b".into(),
+            Entry {
+                name: "".into(),
+                ..Default::default()
+            },
+        );
         let named: BTreeMap<String, String> = store
             .sessions
             .into_iter()

@@ -22,13 +22,18 @@ fn call<T>(f: impl std::future::Future<Output = T>) -> T {
 #[test]
 fn scans_claude_sessions() {
     let sessions = ClaudeProvider.scan();
-    assert!(!sessions.is_empty(), "expected sessions in ~/.claude/projects");
+    assert!(
+        !sessions.is_empty(),
+        "expected sessions in ~/.claude/projects"
+    );
     let s = &sessions[0];
     assert_eq!(s.agent, "claude");
     assert!(!s.title.is_empty());
     assert!(s.project_path.starts_with('/'));
     // Sorted newest-first.
-    assert!(sessions.windows(2).all(|w| w[0].last_active >= w[1].last_active));
+    assert!(sessions
+        .windows(2)
+        .all(|w| w[0].last_active >= w[1].last_active));
 }
 
 #[test]
@@ -36,7 +41,10 @@ fn lists_directories() {
     let entries = call(list_dir(repo())).expect("list_dir on repo root");
     assert!(entries.iter().any(|e| e.name == "src-tauri" && e.is_dir));
     // Dirs sort before files.
-    let first_file = entries.iter().position(|e| !e.is_dir).unwrap_or(entries.len());
+    let first_file = entries
+        .iter()
+        .position(|e| !e.is_dir)
+        .unwrap_or(entries.len());
     assert!(entries[first_file..].iter().all(|e| !e.is_dir));
 }
 
@@ -64,7 +72,12 @@ fn reads_git_repo() {
     // Branch structure browsing: root tree has src-tauri/, subtree lists lib.rs.
     let files = call(git_branch_files(repo(), "main".into(), "".into())).expect("branch files");
     assert!(files.iter().any(|f| f.name == "src-tauri" && f.is_dir));
-    let sub = call(git_branch_files(repo(), "main".into(), "src-tauri/src".into())).expect("subtree");
+    let sub = call(git_branch_files(
+        repo(),
+        "main".into(),
+        "src-tauri/src".into(),
+    ))
+    .expect("subtree");
     assert!(sub.iter().any(|f| f.name == "lib.rs" && !f.is_dir));
     let blog = call(git_branch_log(repo(), "main".into(), 5)).expect("branch log");
     assert!(!blog.is_empty() && !blog[0].summary.is_empty());
@@ -134,7 +147,10 @@ fn deletes_session_to_trash() {
     call(aiterm_lib::sessions::session_delete(id.into())).expect("delete should succeed");
     assert!(!file.exists(), "transcript should leave the project dir");
     let trashed = home.join(".claude/trash").join(format!("{id}.jsonl"));
-    assert!(trashed.exists(), "transcript should land in ~/.claude/trash");
+    assert!(
+        trashed.exists(),
+        "transcript should land in ~/.claude/trash"
+    );
     // Fresh mtime = full keep window (rename alone would keep the old one).
     let age = trashed
         .metadata()
@@ -143,14 +159,19 @@ fn deletes_session_to_trash() {
         .unwrap();
     assert!(age.as_secs() < 60, "trashed file should have a fresh mtime");
     assert!(
-        call(aiterm_lib::sessions::session_delete("../../etc/passwd".into())).is_err(),
+        call(aiterm_lib::sessions::session_delete(
+            "../../etc/passwd".into()
+        ))
+        .is_err(),
         "path traversal must be rejected"
     );
 
     // Trash listing shows it, restore brings it back to a project dir
     // derived from the transcript's cwd.
     assert!(
-        call(aiterm_lib::sessions::trash_list()).iter().any(|t| t.id == id),
+        call(aiterm_lib::sessions::trash_list())
+            .iter()
+            .any(|t| t.id == id),
         "trash_list should include the trashed session"
     );
     call(aiterm_lib::sessions::trash_restore(id.into())).expect("restore should succeed");
@@ -187,7 +208,9 @@ fn restores_a_codex_rollout_to_its_own_store() {
     call(aiterm_lib::sessions::session_delete(id.into())).expect("delete should succeed");
     assert!(!file.exists(), "rollout should leave the codex store");
     assert!(
-        home.join(".claude/trash").join(format!("{id}.origin")).exists(),
+        home.join(".claude/trash")
+            .join(format!("{id}.origin"))
+            .exists(),
         "delete should record where it came from"
     );
 
@@ -197,11 +220,17 @@ fn restores_a_codex_rollout_to_its_own_store() {
         "rollout should return to its own store under its original filename"
     );
     assert!(
-        !home.join(".claude/trash").join(format!("{id}.origin")).exists(),
+        !home
+            .join(".claude/trash")
+            .join(format!("{id}.origin"))
+            .exists(),
         "the origin record should not outlive the restore"
     );
     // Nothing of it should have been left in claude's tree.
-    assert!(!home.join(".claude/projects/-tmp").join(format!("{id}.jsonl")).exists());
+    assert!(!home
+        .join(".claude/projects/-tmp")
+        .join(format!("{id}.jsonl"))
+        .exists());
 
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_dir_all(home.join(".codex/sessions/1999"));
@@ -244,7 +273,8 @@ fn hides_fork_and_orphaned_transcripts() {
         "fork/orphaned transcripts must be hidden"
     );
     assert!(
-        ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermfork01"),
+        ids.iter()
+            .any(|i| i == "00000000-0000-4000-8000-aitermfork01"),
         "real sessions must still be listed"
     );
 
@@ -295,7 +325,11 @@ fn parses_tasks_and_agents_from_transcript() {
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TaskUpdate","id":"u3","input":{"taskId":"3","status":"deleted"}}]}}"#, "\n",
     )).unwrap();
     let tasks2 = call(aiterm_lib::sessions::session_tasks(id2.into()));
-    assert_eq!(tasks2.len(), 2, "deleted tasks drop; TaskCreate list beats stale TodoWrite");
+    assert_eq!(
+        tasks2.len(),
+        2,
+        "deleted tasks drop; TaskCreate list beats stale TodoWrite"
+    );
     assert_eq!(tasks2[0].subject, "first task");
     assert_eq!(tasks2[0].status, "completed");
     assert_eq!(tasks2[1].status, "in_progress");
@@ -308,10 +342,18 @@ fn parses_tasks_and_agents_from_transcript() {
     assert!(by_id("a1").result.as_deref().unwrap().contains("12 tests"));
     assert_eq!(by_id("a2").status, "done");
     assert!(
-        by_id("a2").result.as_deref().unwrap().contains("all tests green"),
+        by_id("a2")
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("all tests green"),
         "full <result> report should win over the <summary> one-liner"
     );
-    assert_eq!(by_id("a3").status, "running", "no notification yet = still running");
+    assert_eq!(
+        by_id("a3").status,
+        "running",
+        "no notification yet = still running"
+    );
     assert_eq!(by_id("a3").agent_type, "grunt");
 
     let _ = std::fs::remove_file(&file);
@@ -343,15 +385,20 @@ fn keeps_both_fork_siblings() {
     let newer = mk("00000000-0000-4000-8000-aitermforknew", "newer fork");
     // Make `older` genuinely older so newest-wins is deterministic.
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::open(&older).unwrap().set_modified(past).unwrap();
+    std::fs::File::open(&older)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
 
     let ids: Vec<String> = ClaudeProvider.scan().into_iter().map(|s| s.id).collect();
     assert!(
-        ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermforknew"),
+        ids.iter()
+            .any(|i| i == "00000000-0000-4000-8000-aitermforknew"),
         "fork should be listed"
     );
     assert!(
-        ids.iter().any(|i| i == "00000000-0000-4000-8000-aitermforkold"),
+        ids.iter()
+            .any(|i| i == "00000000-0000-4000-8000-aitermforkold"),
         "forked parent must stay listed — its context is still resumable"
     );
 
@@ -365,5 +412,8 @@ fn full_text_search_finds_sessions() {
     let r = call(aiterm_lib::indexer::reindex_sessions());
     assert!(r.total > 0, "expected sessions to index");
     let hits = call(aiterm_lib::indexer::search_sessions("aiterm".into()));
-    assert!(!hits.is_empty(), "searching 'aiterm' should hit this session");
+    assert!(
+        !hits.is_empty(),
+        "searching 'aiterm' should hit this session"
+    );
 }

@@ -2,12 +2,12 @@ package com.fivelime.aiterm.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -17,12 +17,10 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.AlertDialog
@@ -75,7 +73,6 @@ fun NewSessionScreen(vm: AppViewModel, outer: PaddingValues) {
     var effort by remember(model) { mutableStateOf(model?.default_effort) }
     var prompt by remember { mutableStateOf("") }
     var title by remember { mutableStateOf("") }
-    var naming by remember { mutableStateOf(false) }
     var folderMenu by remember { mutableStateOf(false) }
     var browsing by remember { mutableStateOf(false) }
     if (browsing) {
@@ -102,14 +99,6 @@ fun NewSessionScreen(vm: AppViewModel, outer: PaddingValues) {
         bottomBar = {
             Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
                 AttachmentChips(vm)
-                if (naming) {
-                    OutlinedTextField(
-                        value = title, onValueChange = { title = it }, singleLine = true,
-                        placeholder = { Text("Name this session (optional)", color = Muted) },
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
-                        shape = RoundedCornerShape(14.dp),
-                    )
-                }
                 Column(
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
                         .background(Surface1, RoundedCornerShape(22.dp)).padding(8.dp),
@@ -124,31 +113,8 @@ fun NewSessionScreen(vm: AppViewModel, outer: PaddingValues) {
                         ),
                     )
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Row(
-                        Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
                         AttachButton(vm)
-                        PickerChip(
-                            label = agent?.display_name ?: "Agent",
-                            options = vm.agents.map { it.id to it.display_name },
-                            onPick = { id -> agent = vm.agents.find { it.id == id } },
-                            leading = { agent?.let { AgentIcon(it.id, 16.dp) } },
-                        )
-                        if (!agent?.models.isNullOrEmpty()) PickerChip(
-                            label = model?.display_name ?: "Model",
-                            options = agent!!.models.map { it.id to it.display_name },
-                            onPick = { id -> model = agent!!.models.find { it.id == id } },
-                        )
-                        if (!model?.efforts.isNullOrEmpty()) PickerChip(
-                            label = effort?.replaceFirstChar { it.uppercase() } ?: "Auto",
-                            options = listOf("" to "Auto") + model!!.efforts.map { it to it.replaceFirstChar { c -> c.uppercase() } },
-                            onPick = { effort = it.ifEmpty { null } },
-                        )
-                        IconButton(onClick = { naming = !naming }) { Icon(Icons.Filled.Edit, "Name the session", tint = if (title.isNotBlank()) Accent else Muted) }
-                    }
-                        Spacer(Modifier.width(6.dp))
+                        Spacer(Modifier.weight(1f))
                         FilledIconButton(
                             onClick = { vm.newSession(agent!!.id, folder.trim(), prompt, model?.id, effort, title) },
                             enabled = canStart,
@@ -182,9 +148,70 @@ fun NewSessionScreen(vm: AppViewModel, outer: PaddingValues) {
                 }
             }
             Text(folder, style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(top = 6.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(20.dp))
+            // The choices, one to a row, top to bottom in the order they
+            // depend on each other: the engine decides the models, the model
+            // the efforts. A row that has nothing to offer is not drawn.
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+                    .background(Surface1, RoundedCornerShape(18.dp)).padding(horizontal = 14.dp, vertical = 4.dp),
+            ) {
+                ChoiceRow("Agent") {
+                    PickerChip(
+                        label = agent?.display_name ?: "Choose",
+                        options = vm.agents.map { it.id to it.display_name },
+                        onPick = { id -> agent = vm.agents.find { it.id == id } },
+                        leading = { agent?.let { AgentIcon(it.id, 16.dp) } },
+                        icon = { id -> AgentIcon(id, 20.dp) },
+                    )
+                }
+                if (!agent?.models.isNullOrEmpty()) {
+                    HorizontalDivider(color = Surface2)
+                    ChoiceRow("Model") {
+                        PickerChip(
+                            label = model?.display_name ?: "Choose",
+                            options = agent!!.models.map { it.id to it.display_name },
+                            onPick = { id -> model = agent!!.models.find { it.id == id } },
+                        )
+                    }
+                }
+                if (!model?.efforts.isNullOrEmpty()) {
+                    HorizontalDivider(color = Surface2)
+                    ChoiceRow("Effort") {
+                        PickerChip(
+                            label = effort?.replaceFirstChar { it.uppercase() } ?: "Auto",
+                            options = listOf("" to "Auto") + model!!.efforts.map { it to it.replaceFirstChar { c -> c.uppercase() } },
+                            onPick = { effort = it.ifEmpty { null } },
+                        )
+                    }
+                }
+                HorizontalDivider(color = Surface2)
+                ChoiceRow("Name", fill = true) {
+                    TextField(
+                        value = title, onValueChange = { title = it }, singleLine = true,
+                        placeholder = { Text("Optional", color = Muted, textAlign = TextAlign.End, modifier = Modifier.fillMaxWidth()) },
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(textAlign = TextAlign.End),
+                        modifier = Modifier.weight(1f),
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent,
+                        ),
+                    )
+                }
+            }
             Spacer(Modifier.weight(1f))
             Text("on ${vm.desktop?.name ?: "desktop"}", style = MaterialTheme.typography.labelMedium, color = Muted, modifier = Modifier.padding(bottom = 12.dp))
         }
+    }
+}
+
+/** One step: what it is on the left, the choice on the right. */
+@Composable
+fun ChoiceRow(label: String, fill: Boolean = false, choice: @Composable RowScope.() -> Unit) {
+    Row(Modifier.fillMaxWidth().height(52.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = Muted, maxLines = 1)
+        Spacer(if (fill) Modifier.width(12.dp) else Modifier.weight(1f))
+        choice()
     }
 }
 

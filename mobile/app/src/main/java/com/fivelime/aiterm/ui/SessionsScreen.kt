@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -24,9 +25,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.SubdirectoryArrowRight
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.HorizontalDivider
@@ -47,6 +48,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -79,6 +82,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.clickable
 import com.fivelime.aiterm.AppViewModel
 import com.fivelime.aiterm.Session
+import com.fivelime.aiterm.UsageAmount
+import com.fivelime.aiterm.UsageBar
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -92,7 +97,7 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
         RenameDialog(current = s.title, onDone = { vm.rename(s, it); renaming = null }, onDismiss = { renaming = null })
     }
     // Opening the drawer is also the moment to freshen what it shows.
-    LaunchedEffect(drawer.isOpen) { if (drawer.isOpen) vm.loadUsage() }
+    LaunchedEffect(drawer.isOpen) { if (drawer.isOpen) { vm.loadUsage(); vm.checkDesktops() } }
     ModalNavigationDrawer(
         drawerState = drawer,
         drawerContent = { AppDrawer(vm, close = { scope.launch { drawer.close() } }) },
@@ -109,6 +114,13 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
                         Dot(if (vm.connected) Green else Muted)
                         Spacer(Modifier.width(10.dp))
                         Text(vm.desktop?.name ?: "Desktop")
+                    }
+                },
+                actions = {
+                    // A blank shell on the desktop, like the home launcher's —
+                    // driven from here.
+                    IconButton(onClick = { vm.openTerminal() }, enabled = vm.connected && !vm.terminalOpening) {
+                        Icon(Icons.Filled.Terminal, "Open a terminal", tint = if (vm.connected) Accent else Muted)
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Bg),
@@ -136,7 +148,8 @@ fun SessionsScreen(vm: AppViewModel, outer: PaddingValues) {
                             s, vm.stateOf(s), showFolder = true,
                             starred = s.id in vm.stars,
                             satellite = vm.broughtIn[s.id] != null && visible.any { it.id == vm.broughtIn[s.id] },
-                            crew = vm.broughtIn.count { it.value == s.id },
+                            crewAgents = vm.broughtIn.filterValues { it == s.id }.keys
+                                .mapNotNull { id -> vm.sessions.find { it.id == id }?.agent },
                             folded = s.id in vm.foldedCrews,
                             onCrewTap = { vm.toggleCrew(s.id) },
                             crewNeedsYou = vm.broughtIn.any { it.value == s.id && vm.activity[it.key] == "attention" },
@@ -214,6 +227,9 @@ private fun filterColors() = FilterChipDefaults.filterChipColors(
  *  page: the list is for sessions. */
 @Composable
 private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
+    /** Usage sources opened up for the full picture; closed rows show only
+     *  the weekly line. */
+    var expandedUsage by remember { mutableStateOf<Set<String>>(emptySet()) }
     ModalDrawerSheet(drawerContainerColor = Bg) {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
             Row(
@@ -232,7 +248,8 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 IconButton(onClick = close) { Icon(Icons.Filled.Close, "Close menu") }
             }
             // Every paired desktop, when there is more than one: tap to
-            // switch. The shown one wears the connection dot.
+            // switch. Every dot is a status — the shown one live, the rest
+            // from the probe the drawer's opening fired.
             if (vm.desktops.size > 1) {
                 HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
                 Text("DESKTOPS", style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp))
@@ -240,7 +257,16 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                     val active = d.fingerprint == vm.desktop?.fingerprint
                     NavigationDrawerItem(
                         label = { Text(d.name, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal) },
-                        icon = { Dot(if (!active) Surface1 else if (vm.connected) Green else Muted) },
+                        icon = {
+                            Dot(
+                                if (active) { if (vm.connected) Green else Muted }
+                                else when (vm.reachable[d.fingerprint]) {
+                                    true -> Green
+                                    false -> Surface1
+                                    null -> Muted // probing, no answer yet
+                                },
+                            )
+                        },
                         selected = active,
                         onClick = { if (!active) { vm.switchTo(d); close() } },
                         modifier = Modifier.padding(horizontal = 12.dp),
@@ -248,66 +274,90 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
                 }
             }
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
-            Text("USAGE", style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(horizontal = 20.dp))
-            if (vm.usage.isEmpty()) {
+            // The whole section folds, and starts folded: the menu is for
+            // getting somewhere; usage is a look when wanted.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().clickable { vm.usageOpen = !vm.usageOpen }
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+            ) {
+                Text("USAGE", style = MaterialTheme.typography.labelSmall, color = Muted)
+                Spacer(Modifier.weight(1f))
+                Icon(
+                    if (vm.usageOpen) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowRight,
+                    if (vm.usageOpen) "Hide usage" else "Show usage",
+                    tint = Muted, modifier = Modifier.size(18.dp),
+                )
+            }
+            if (vm.usageOpen && vm.usage.isEmpty()) {
                 Text("Nothing reported yet", color = Muted, style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
             }
-            vm.usage.forEach { u ->
-                Column(Modifier.padding(horizontal = 20.dp, vertical = 5.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        AgentIcon(u.id.removePrefix("provider:"), 16.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Text(u.name, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
-                        if (u.plan.isNotBlank()) {
-                            Spacer(Modifier.width(6.dp))
-                            Text(u.plan, style = MaterialTheme.typography.labelSmall, color = Muted)
+            if (vm.usageOpen) vm.usage.forEach { u ->
+                val expanded = u.id in expandedUsage
+                val weekly = u.bars.firstOrNull {
+                    it.kind.startsWith("weekly") || it.kind == "grok_period" || it.label.contains("week", ignoreCase = true)
+                }
+                // A local router that publishes no balance is not failing —
+                // there is nothing to bill. It is simply active.
+                val healthy = u.state == "ok" || u.state == "no_balance"
+                val credit = if (weekly == null) u.amounts.firstOrNull() else null
+                // Amounts worth a line: a balance that is not the one already
+                // on the closed row, and not zero.
+                val amounts = u.amounts.filter { it !== credit && it.amount != 0.0 }
+                // A tap only where it shows something the closed row does not:
+                // a source with one weekly bar and nothing else is already told.
+                val hasMore = u.bars.any { it !== weekly } || amounts.isNotEmpty() || (!healthy && u.detail.isNotBlank())
+                Column(
+                    Modifier.fillMaxWidth()
+                        .let { m ->
+                            if (hasMore) m.clickable {
+                                expandedUsage = if (expanded) expandedUsage - u.id else expandedUsage + u.id
+                            } else m
+                        }
+                        .padding(horizontal = 28.dp, vertical = 6.dp),
+                ) {
+                    // The closed row is a name and one value in a shared
+                    // right-hand column: the week gone, the balance, or the
+                    // trouble. Sized like the menu items below it.
+                    val value: String?
+                    val tint: androidx.compose.ui.graphics.Color
+                    when {
+                        !healthy -> { value = u.state.replace('_', ' '); tint = Amber }
+                        weekly != null -> {
+                            value = "${weekly.percent.toInt()}%"
+                            tint = when { weekly.percent < 50 -> Muted; weekly.percent < 80 -> Amber; else -> Red }
+                        }
+                        credit != null -> { value = (if (credit.currency == "USD") "$" else "") + "%.2f".format(credit.amount); tint = Muted }
+                        else -> { value = null; tint = Muted }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp)) {
+                        AgentIcon(u.id.removePrefix("provider:"), 20.dp)
+                        Spacer(Modifier.width(16.dp))
+                        Text(
+                            u.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1,
+                            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+                        )
+                        if (expanded && u.plan.isNotBlank()) {
+                            Text(u.plan, style = MaterialTheme.typography.labelSmall, color = Muted, maxLines = 1)
+                            Spacer(Modifier.width(12.dp))
+                        }
+                        if (value != null) {
+                            Text(value, style = MaterialTheme.typography.bodyMedium, color = tint, maxLines = 1)
                         }
                     }
-                    if (u.state != "ok") {
-                        Text(u.detail.ifBlank { u.state }, style = MaterialTheme.typography.labelSmall, color = Amber)
-                    }
-                    // One line per limit: what it is, how full, when it lets go.
-                    u.bars.forEach { b ->
-                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 3.dp)) {
-                            Text(
-                                b.label, style = MaterialTheme.typography.labelSmall, color = Muted,
-                                modifier = Modifier.width(84.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            )
-                            LinearProgressIndicator(
-                                progress = { (b.percent / 100.0).toFloat().coerceIn(0f, 1f) },
-                                modifier = Modifier.weight(1f),
-                                color = when { b.percent < 50 -> Green; b.percent < 80 -> Amber; else -> Red },
-                                trackColor = Surface1,
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "${b.percent.toInt()}%", style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.width(34.dp), textAlign = TextAlign.End,
-                            )
-                            Text(
-                                resetsIn(b.resets_at), style = MaterialTheme.typography.labelSmall, color = Muted,
-                                modifier = Modifier.width(56.dp), textAlign = TextAlign.End, maxLines = 1,
-                            )
-                        }
-                    }
-                    u.amounts.forEach { am ->
-                        Row(modifier = Modifier.padding(top = 3.dp)) {
-                            Text(am.label, style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.width(84.dp))
-                            Text(
-                                (if (am.currency == "USD") "$" else "") + "%.2f".format(am.amount) + (am.of?.let { " of %.0f".format(it) } ?: ""),
-                                style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold,
-                            )
+                    if (expanded) {
+                        Column(Modifier.padding(start = 36.dp, bottom = 4.dp)) {
+                            u.bars.forEach { b -> UsageBarRow(b) }
+                            amounts.forEach { am -> UsageAmountRow(am) }
+                            if (!healthy && u.detail.isNotBlank()) {
+                                Text(u.detail, style = MaterialTheme.typography.labelSmall, color = Amber,
+                                    modifier = Modifier.padding(top = 4.dp))
+                            }
                         }
                     }
                 }
             }
-            Text(
-                "limit · bar · used · resets in",
-                style = MaterialTheme.typography.labelSmall, color = Muted.copy(alpha = 0.7f),
-                modifier = Modifier.padding(start = 20.dp, top = 2.dp),
-            )
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = Surface1)
             NavigationDrawerItem(
                 label = { Text("Refresh") },
@@ -345,7 +395,7 @@ private fun AppDrawer(vm: AppViewModel, close: () -> Unit) {
 @Composable
 private fun SessionRow(
     s: Session, state: SessionState, showFolder: Boolean, starred: Boolean = false,
-    satellite: Boolean = false, crew: Int = 0, folded: Boolean = false, onCrewTap: () -> Unit = {},
+    satellite: Boolean = false, crewAgents: List<String> = emptyList(), folded: Boolean = false, onCrewTap: () -> Unit = {},
     crewNeedsYou: Boolean = false,
     onLongClick: () -> Unit = {}, onClick: () -> Unit,
 ) {
@@ -369,20 +419,6 @@ private fun SessionRow(
                     Spacer(Modifier.width(5.dp))
                 }
                 Text(s.title.ifBlank { "Untitled" }, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                if (crew > 0) {
-                    Spacer(Modifier.width(6.dp))
-                    Row(
-                        Modifier.clip(RoundedCornerShape(8.dp))
-                            .background(Accent.copy(alpha = if (folded) 0.08f else 0.15f))
-                            .clickable(onClick = onCrewTap)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(Icons.Filled.Groups, null, tint = Accent, modifier = Modifier.size(12.dp))
-                        Spacer(Modifier.width(3.dp))
-                        Text(if (folded) "+$crew ▸" else "+$crew ▾", style = MaterialTheme.typography.labelSmall, color = Accent)
-                    }
-                }
             }
         },
         supportingContent = {
@@ -398,10 +434,36 @@ private fun SessionRow(
         },
         trailingContent = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(6.dp)) {
+                // The state indicator is always the rightmost thing, so the
+                // dots right-align down the list; the crew fold sits beside
+                // it — who is in the crew, by their marks, and a caret,
+                // padded into a real touch target.
+                if (crewAgents.isNotEmpty()) {
+                    Row(
+                        Modifier.clip(RoundedCornerShape(10.dp))
+                            .background(Accent.copy(alpha = if (folded) 0.08f else 0.15f))
+                            .clickable(onClick = onCrewTap)
+                            .padding(start = 8.dp, end = 4.dp, top = 7.dp, bottom = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(3.dp),
+                    ) {
+                        crewAgents.take(3).forEach { AgentIcon(it, 16.dp) }
+                        if (crewAgents.size > 3) {
+                            Text("+${crewAgents.size - 3}", style = MaterialTheme.typography.labelMedium, color = Accent)
+                        }
+                        Icon(
+                            if (folded) Icons.Filled.KeyboardArrowRight else Icons.Filled.KeyboardArrowDown,
+                            if (folded) "Show crew" else "Hide crew",
+                            tint = Accent, modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
                 // A brought-in agent of THIS session is parked on a prompt —
                 // its own row may be folded away, so the master's row says so.
                 if (crewNeedsYou) StateChip("crew needs you", stateColor(SessionState.NeedsYou), pulse = true)
-                stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
+                // Open on the desktop is ambient, not news — a quiet dot, no words.
+                if (state == SessionState.OnDesktop) Dot(stateColor(state))
+                else stateLabel(state)?.let { StateChip(it, stateColor(state), pulse = state == SessionState.Working) }
             }
         },
     )
@@ -412,10 +474,12 @@ fun Dot(color: Color) = Box(Modifier.size(8.dp).background(color, CircleShape))
 
 @Composable
 fun StateChip(label: String, color: Color, pulse: Boolean = false) {
+    // Label first, dot last: the dot is the indicator, and it sits at the
+    // right edge so every row's indicator lines up in one column.
     Row(verticalAlignment = Alignment.CenterVertically) {
-        if (pulse) PulsingDot(color) else Dot(color)
-        Spacer(Modifier.width(6.dp))
         Text(label, style = MaterialTheme.typography.labelSmall, color = color)
+        Spacer(Modifier.width(6.dp))
+        if (pulse) PulsingDot(color) else Dot(color)
     }
 }
 
@@ -462,4 +526,42 @@ internal fun RenameDialog(current: String, onDone: (String) -> Unit, onDismiss: 
         confirmButton = { TextButton(onClick = { onDone(draft) }) { Text("Rename") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+/** One limit line: what it is, how full, when it lets go. */
+@Composable
+private fun UsageBarRow(b: UsageBar) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 5.dp)) {
+        Text(
+            b.label.replace(" limit", ""), style = MaterialTheme.typography.labelSmall, color = Muted,
+            modifier = Modifier.width(64.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+        LinearProgressIndicator(
+            progress = { (b.percent / 100.0).toFloat().coerceIn(0f, 1f) },
+            modifier = Modifier.weight(1f),
+            color = when { b.percent < 50 -> Muted; b.percent < 80 -> Amber; else -> Red },
+            trackColor = Surface1,
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(
+            "${b.percent.toInt()}%", style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.width(36.dp), textAlign = TextAlign.End,
+        )
+        val reset = resetsIn(b.resets_at)
+        Text(
+            if (reset.isBlank()) "" else "· $reset", style = MaterialTheme.typography.labelSmall, color = Muted.copy(alpha = 0.7f),
+            modifier = Modifier.width(64.dp), textAlign = TextAlign.End, maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun UsageAmountRow(am: UsageAmount) {
+    Row(modifier = Modifier.padding(top = 5.dp)) {
+        Text(am.label, style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.width(64.dp))
+        Text(
+            (if (am.currency == "USD") "$" else "") + "%.2f".format(am.amount) + (am.of?.let { " of %.0f".format(it) } ?: ""),
+            style = MaterialTheme.typography.labelSmall,
+        )
+    }
 }

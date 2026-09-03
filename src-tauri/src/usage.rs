@@ -505,7 +505,11 @@ fn anthropic_source() -> UsageSource {
         "anthropic-beta: oauth-2025-04-20".to_string(),
         "Content-Type: application/json".to_string(),
     ];
-    match curl_get("https://api.anthropic.com/api/oauth/usage", &token, &headers) {
+    match curl_get(
+        "https://api.anthropic.com/api/oauth/usage",
+        &token,
+        &headers,
+    ) {
         Err(e) => UsageSource::failed(
             "anthropic",
             "Claude",
@@ -723,7 +727,11 @@ fn codex_source() -> Option<UsageSource> {
         headers.push(format!("chatgpt-account-id: {}", auth.account_id));
     }
     Some(
-        match curl_get("https://chatgpt.com/backend-api/wham/usage", &auth.access_token, &headers) {
+        match curl_get(
+            "https://chatgpt.com/backend-api/wham/usage",
+            &auth.access_token,
+            &headers,
+        ) {
             Err(e) => UsageSource::failed(
                 "codex",
                 "Codex",
@@ -885,7 +893,11 @@ pub fn parse_grok(status: u16, body: &str) -> UsageSource {
             .filter_map(|p| {
                 let name = p.get("product").and_then(|n| n.as_str())?;
                 let pct = p.get("usagePercent").and_then(|u| u.as_f64())?;
-                Some(format!("{} {}%", grok_product_label(name), pct.round() as i64))
+                Some(format!(
+                    "{} {}%",
+                    grok_product_label(name),
+                    pct.round() as i64
+                ))
             })
             .collect();
         if !parts.is_empty() {
@@ -996,7 +1008,8 @@ pub fn parse_antigravity(exit: i32, body: &str) -> UsageSource {
     let mut src = UsageSource::blank("antigravity", "Antigravity");
     if exit != 0 {
         src.state = "rejected".into();
-        src.detail = format!("agy could not answer /usage (exit {exit}). Open agy once and sign in.");
+        src.detail =
+            format!("agy could not answer /usage (exit {exit}). Open agy once and sign in.");
         return src;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
@@ -1006,7 +1019,10 @@ pub fn parse_antigravity(exit: i32, body: &str) -> UsageSource {
     };
     if v.get("status").and_then(|s| s.as_str()) != Some("SUCCESS") {
         src.state = "rejected".into();
-        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("no reason given");
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("no reason given");
         src.detail = format!("agy refused /usage — {err}. Open agy once and sign in.");
         return src;
     }
@@ -1017,7 +1033,12 @@ pub fn parse_antigravity(exit: i32, body: &str) -> UsageSource {
     };
     for group in groups {
         let group_name = group.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        for bucket in group.get("buckets").and_then(|b| b.as_array()).into_iter().flatten() {
+        for bucket in group
+            .get("buckets")
+            .and_then(|b| b.as_array())
+            .into_iter()
+            .flatten()
+        {
             let Some(remaining) = bucket.get("remaining_fraction").and_then(|r| r.as_f64()) else {
                 continue;
             };
@@ -1027,7 +1048,10 @@ pub fn parse_antigravity(exit: i32, body: &str) -> UsageSource {
                 None => (
                     format!(
                         "{}_{}",
-                        bucket.get("window").and_then(|w| w.as_str()).unwrap_or("window"),
+                        bucket
+                            .get("window")
+                            .and_then(|w| w.as_str())
+                            .unwrap_or("window"),
                         id
                     ),
                     format!(
@@ -1093,11 +1117,15 @@ fn antigravity_account() -> Option<String> {
         candidates.extend(logs.into_iter().rev().take(5));
     }
     for path in candidates {
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
         if meta.len() > 4 * 1024 * 1024 {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         if let Some(email) = antigravity_email_in(&text) {
             return Some(email);
         }
@@ -1108,7 +1136,9 @@ fn antigravity_account() -> Option<String> {
 fn antigravity_email_in(log: &str) -> Option<String> {
     let i = log.find("applyAuthResult: email=")? + "applyAuthResult: email=".len();
     let rest = &log[i..];
-    let end = rest.find(|c: char| c == ',' || c.is_whitespace()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c == ',' || c.is_whitespace())
+        .unwrap_or(rest.len());
     let email = rest[..end].trim();
     (!email.is_empty()).then(|| email.to_string())
 }
@@ -1520,7 +1550,10 @@ mod tests {
         assert_eq!(b.severity, "normal");
         assert_eq!(b.resets_at, "2026-08-28T09:08:48.910873+00:00");
         // Chat has no percent and is left out rather than shown as 0%.
-        assert_eq!(src.notes, vec!["Grok Build 19% · Imagine 2% · App Builder 1%"]);
+        assert_eq!(
+            src.notes,
+            vec!["Grok Build 19% · Imagine 2% · App Builder 1%"]
+        );
         // Zero balances and a zero cap are not worth a row.
         assert!(src.amounts.is_empty());
     }
@@ -1544,8 +1577,14 @@ mod tests {
 
     #[test]
     fn grok_labels_are_read_not_guessed() {
-        assert_eq!(grok_period_label("USAGE_PERIOD_TYPE_MONTHLY"), "Monthly limit");
-        assert_eq!(grok_period_label("USAGE_PERIOD_TYPE_FORTNIGHTLY"), "Fortnightly limit");
+        assert_eq!(
+            grok_period_label("USAGE_PERIOD_TYPE_MONTHLY"),
+            "Monthly limit"
+        );
+        assert_eq!(
+            grok_period_label("USAGE_PERIOD_TYPE_FORTNIGHTLY"),
+            "Fortnightly limit"
+        );
         assert_eq!(grok_period_label(""), "Limit");
         assert_eq!(grok_product_label("GrokBuild"), "Grok Build");
         assert_eq!(grok_product_label("GrokAppBuilder"), "App Builder");
@@ -1580,19 +1619,46 @@ mod tests {
         assert_eq!(src.id, "antigravity");
         assert_eq!(src.name, "Antigravity");
         let kinds: Vec<&str> = src.bars.iter().map(|b| b.kind.as_str()).collect();
-        assert_eq!(kinds, ["weekly_gemini", "five_hour_gemini", "weekly_claude_gpt", "five_hour_claude_gpt"]);
+        assert_eq!(
+            kinds,
+            [
+                "weekly_gemini",
+                "five_hour_gemini",
+                "weekly_claude_gpt",
+                "five_hour_claude_gpt"
+            ]
+        );
         let labels: Vec<&str> = src.bars.iter().map(|b| b.label.as_str()).collect();
-        assert_eq!(labels, ["Gemini weekly", "Gemini 5-hour", "Claude & GPT weekly", "Claude & GPT 5-hour"]);
+        assert_eq!(
+            labels,
+            [
+                "Gemini weekly",
+                "Gemini 5-hour",
+                "Claude & GPT weekly",
+                "Claude & GPT 5-hour"
+            ]
+        );
         // remaining 0.9805 → 1.95% used, never 98%.
-        assert!((src.bars[0].percent - 1.9489705562).abs() < 1e-6, "got {}", src.bars[0].percent);
-        assert!((src.bars[1].percent - 4.2578577995).abs() < 1e-6, "got {}", src.bars[1].percent);
+        assert!(
+            (src.bars[0].percent - 1.9489705562).abs() < 1e-6,
+            "got {}",
+            src.bars[0].percent
+        );
+        assert!(
+            (src.bars[1].percent - 4.2578577995).abs() < 1e-6,
+            "got {}",
+            src.bars[1].percent
+        );
         assert_eq!(src.bars[2].percent, 0.0);
         assert_eq!(src.bars[3].percent, 0.0);
         assert_eq!(src.bars[0].resets_at, "2026-09-09T15:55:56Z");
         assert_eq!(src.bars[1].resets_at, "2026-09-02T20:55:56Z");
         assert!(src.bars.iter().all(|b| b.severity == "normal"));
         assert!(src.amounts.is_empty());
-        assert_eq!(src.account, "", "the parser does not know who; the source fills that in");
+        assert_eq!(
+            src.account, "",
+            "the parser does not know who; the source fills that in"
+        );
     }
 
     #[test]
@@ -1610,8 +1676,13 @@ mod tests {
 
     #[test]
     fn antigravity_credits_show_only_when_there_are_any() {
-        assert_eq!(parse_antigravity_credits(ANTIGRAVITY_CREDITS), None, "0 is not a balance");
-        let some = ANTIGRAVITY_CREDITS.replace(r#""remaining_credits":0"#, r#""remaining_credits":250"#);
+        assert_eq!(
+            parse_antigravity_credits(ANTIGRAVITY_CREDITS),
+            None,
+            "0 is not a balance"
+        );
+        let some =
+            ANTIGRAVITY_CREDITS.replace(r#""remaining_credits":0"#, r#""remaining_credits":250"#);
         let a = parse_antigravity_credits(&some).unwrap();
         assert_eq!(a.label, "G1 credits");
         assert_eq!(a.amount, 250.0);
@@ -1625,13 +1696,34 @@ mod tests {
         let rejected = parse_antigravity(1, "");
         assert_eq!(rejected.state, "rejected");
         assert!(rejected.detail.contains("Open agy"), "{}", rejected.detail);
-        let refused = parse_antigravity(0, r#"{"conversation_id":"","status":"ERROR","response":"","error":"not authenticated"}"#);
+        let refused = parse_antigravity(
+            0,
+            r#"{"conversation_id":"","status":"ERROR","response":"","error":"not authenticated"}"#,
+        );
         assert_eq!(refused.state, "rejected");
-        assert!(refused.detail.contains("not authenticated"), "{}", refused.detail);
+        assert!(
+            refused.detail.contains("not authenticated"),
+            "{}",
+            refused.detail
+        );
         assert_eq!(parse_antigravity(0, "Fetching...").state, "unreachable");
         // 200-shaped with no usage in it is not "0% used".
-        assert_eq!(parse_antigravity(0, r#"{"status":"SUCCESS","command":{"name":"usage","data":{}}}"#).state, "unreachable");
-        assert_eq!(parse_antigravity(0, r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}}"#).state, "unreachable");
+        assert_eq!(
+            parse_antigravity(
+                0,
+                r#"{"status":"SUCCESS","command":{"name":"usage","data":{}}}"#
+            )
+            .state,
+            "unreachable"
+        );
+        assert_eq!(
+            parse_antigravity(
+                0,
+                r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}}"#
+            )
+            .state,
+            "unreachable"
+        );
     }
 
     /// The log line, verbatim from `log/cli-20260902_121215.log` with the
@@ -1639,7 +1731,10 @@ mod tests {
     #[test]
     fn antigravity_account_is_read_off_the_log() {
         let log = "ERROR: logging before google.Init: I0902 12:12:16.101 60 auth.go:212] applyAuthResult: email=john.m.allison@gmail.com, authMethod=consumer, quotaProject=\nnext line\n";
-        assert_eq!(antigravity_email_in(log).as_deref(), Some("john.m.allison@gmail.com"));
+        assert_eq!(
+            antigravity_email_in(log).as_deref(),
+            Some("john.m.allison@gmail.com")
+        );
         assert_eq!(antigravity_email_in("nothing here"), None);
     }
 
@@ -1652,9 +1747,15 @@ mod tests {
         match antigravity_source() {
             None => println!("agy is not installed here"),
             Some(src) => {
-                println!("antigravity: state={} account={} detail={}", src.state, src.account, src.detail);
+                println!(
+                    "antigravity: state={} account={} detail={}",
+                    src.state, src.account, src.detail
+                );
                 for b in &src.bars {
-                    println!("  {} ({}) {:.2}% used, {}, resets {}", b.label, b.kind, b.percent, b.severity, b.resets_at);
+                    println!(
+                        "  {} ({}) {:.2}% used, {}, resets {}",
+                        b.label, b.kind, b.percent, b.severity, b.resets_at
+                    );
                 }
                 for a in &src.amounts {
                     println!("  {} {} {}", a.label, a.amount, a.sense);

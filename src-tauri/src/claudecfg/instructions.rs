@@ -60,7 +60,9 @@ fn walk(
     let mut imports = Vec::new();
     if present && depth < MAX_DEPTH {
         for line in body.lines() {
-            let Some(target) = import_of(line) else { continue };
+            let Some(target) = import_of(line) else {
+                continue;
+            };
             let full = resolve_import(path, target);
             if seen.contains(&full) {
                 continue; // a cycle, or the same file pulled in twice
@@ -70,16 +72,22 @@ fn walk(
         }
     }
 
-    Doc { source: source.to_string(), path: path.to_string(), present, lines, imports }
+    Doc {
+        source: source.to_string(),
+        path: path.to_string(),
+        present,
+        lines,
+        imports,
+    }
 }
 
 /// `roots` is (source label, path), in load order.
-pub fn chain(
-    roots: &[(String, String)],
-    read: &mut dyn FnMut(&str) -> Option<String>,
-) -> Vec<Doc> {
+pub fn chain(roots: &[(String, String)], read: &mut dyn FnMut(&str) -> Option<String>) -> Vec<Doc> {
     let mut seen: Vec<String> = roots.iter().map(|(_, p)| p.clone()).collect();
-    roots.iter().map(|(src, p)| walk(src, p, read, &mut seen, 0)).collect()
+    roots
+        .iter()
+        .map(|(src, p)| walk(src, p, read, &mut seen, 0))
+        .collect()
 }
 
 #[cfg(test)]
@@ -88,8 +96,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn reader(files: Vec<(&str, &str)>) -> impl FnMut(&str) -> Option<String> {
-        let map: HashMap<String, String> =
-            files.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = files
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |p: &str| map.get(p).cloned()
     }
 

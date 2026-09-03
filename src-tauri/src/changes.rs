@@ -45,8 +45,20 @@ const SETTLE: Duration = Duration::from_millis(600);
 const RECENT: Duration = Duration::from_secs(20);
 
 const SKIP: &[&str] = &[
-    "/.git/", "/node_modules/", "/target/", "/.cache/", "/__pycache__/", "/.gradle/", "/.kotlin/",
-    "/build/", "/dist/", "/.next/", "/.venv/", "/venv/", "/.mypy_cache/", "/.vite/",
+    "/.git/",
+    "/node_modules/",
+    "/target/",
+    "/.cache/",
+    "/__pycache__/",
+    "/.gradle/",
+    "/.kotlin/",
+    "/build/",
+    "/dist/",
+    "/.next/",
+    "/.venv/",
+    "/venv/",
+    "/.mypy_cache/",
+    "/.vite/",
 ];
 
 struct Inner {
@@ -84,9 +96,16 @@ fn ledger_path() -> Option<PathBuf> {
 }
 
 fn load() -> Vec<Change> {
-    let Some(p) = ledger_path() else { return vec![] };
-    let Ok(text) = std::fs::read_to_string(p) else { return vec![] };
-    let mut v: Vec<Change> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    let Some(p) = ledger_path() else {
+        return vec![];
+    };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return vec![];
+    };
+    let mut v: Vec<Change> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
     if v.len() > KEEP {
         v.drain(..v.len() - KEEP);
     }
@@ -99,7 +118,11 @@ fn append(c: &Change) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+    {
         if let Ok(line) = serde_json::to_string(c) {
             let _ = writeln!(f, "{line}");
         }
@@ -107,7 +130,10 @@ fn append(c: &Change) {
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Start the pump once, at setup. Harness output directories are watched
@@ -122,7 +148,10 @@ pub fn start(app: &AppHandle) {
         // dev server, by git, by builds. Forward only what can matter, or the
         // pump never sees a quiet moment to settle a burst.
         let Ok(ev) = res else { return };
-        if matches!(ev.kind, notify::EventKind::Access(_) | notify::EventKind::Other | notify::EventKind::Any) {
+        if matches!(
+            ev.kind,
+            notify::EventKind::Access(_) | notify::EventKind::Other | notify::EventKind::Any
+        ) {
             return;
         }
         if ev.paths.iter().all(|p| {
@@ -151,7 +180,10 @@ pub fn start(app: &AppHandle) {
         }
     }
     if let Some(home) = dirs::home_dir() {
-        for root in [home.join(".codex").join("generated_images"), home.join(".grok").join("sessions")] {
+        for root in [
+            home.join(".codex").join("generated_images"),
+            home.join(".grok").join("sessions"),
+        ] {
             watch_root(app, root.clone());
             backfill_output_dir(app, &root);
         }
@@ -200,7 +232,9 @@ fn backfill_output_dir(app: &AppHandle, root: &Path) {
         if depth == 0 {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             let Ok(md) = e.metadata() else { continue };
@@ -212,23 +246,52 @@ fn backfill_output_dir(app: &AppHandle, root: &Path) {
         }
     }
     let ledger = app.state::<ChangeLedger>();
-    let known: HashSet<String> = ledger.inner.lock().unwrap().entries.iter().map(|e| e.path.clone()).collect();
+    let known: HashSet<String> = ledger
+        .inner
+        .lock()
+        .unwrap()
+        .entries
+        .iter()
+        .map(|e| e.path.clone())
+        .collect();
     let mut found: Vec<Change> = Vec::new();
     walk(root, 4, &mut |p, md| {
         let path = p.to_string_lossy().into_owned();
-        let Some(sid) = harness_session_of(&path) else { return };
+        let Some(sid) = harness_session_of(&path) else {
+            return;
+        };
         if known.contains(&path) {
             return;
         }
-        let at = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        found.push(Change { path, name, kind: "created".into(), at, session_id: Some(sid), bytes: md.len() });
+        let at = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        found.push(Change {
+            path,
+            name,
+            kind: "created".into(),
+            at,
+            session_id: Some(sid),
+            bytes: md.len(),
+        });
     });
     if found.is_empty() {
         return;
     }
     found.sort_by_key(|c| c.at);
-    crate::diag!("changes", "backfill: {} file(s) under {}", found.len(), root.display());
+    crate::diag!(
+        "changes",
+        "backfill: {} file(s) under {}",
+        found.len(),
+        root.display()
+    );
     let mut inner = ledger.inner.lock().unwrap();
     for c in found {
         append(&c);
@@ -271,9 +334,16 @@ pub fn track(app: &AppHandle, session_id: String) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let sessions = crate::sessions::list_sessions().await;
-        let Some(s) = sessions.into_iter().find(|s| s.id == session_id) else { return };
+        let Some(s) = sessions.into_iter().find(|s| s.id == session_id) else {
+            return;
+        };
         let root = PathBuf::from(&s.project_path);
-        app.state::<ChangeLedger>().inner.lock().unwrap().session_roots.insert(session_id, root.clone());
+        app.state::<ChangeLedger>()
+            .inner
+            .lock()
+            .unwrap()
+            .session_roots
+            .insert(session_id, root.clone());
         watch_root(&app, root);
     });
 }
@@ -281,7 +351,11 @@ pub fn track(app: &AppHandle, session_id: String) {
 /// A session's terminal just showed work. Called from the activity report.
 pub fn touch(app: &AppHandle, session_id: &str) {
     if let Some(l) = app.try_state::<ChangeLedger>() {
-        l.inner.lock().unwrap().recent.insert(session_id.to_string(), Instant::now());
+        l.inner
+            .lock()
+            .unwrap()
+            .recent
+            .insert(session_id.to_string(), Instant::now());
     }
 }
 
@@ -321,7 +395,9 @@ fn pump(app: AppHandle, rx: mpsc::Receiver<notify::Result<notify::Event>>) {
         // Settle, but not forever: a tree that is never quiet still gets
         // its changes recorded, two seconds at a time.
         let deadline = Instant::now() + Duration::from_secs(2);
-        while let Ok(ev) = rx.recv_timeout(SETTLE.min(deadline.saturating_duration_since(Instant::now()))) {
+        while let Ok(ev) =
+            rx.recv_timeout(SETTLE.min(deadline.saturating_duration_since(Instant::now())))
+        {
             note(ev);
             if Instant::now() >= deadline {
                 break;
@@ -356,16 +432,30 @@ fn record(app: &AppHandle, path: PathBuf, kind: &str) {
         }
     }
     let bytes = md.map(|m| m.len()).unwrap_or(0);
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let ledger = app.state::<ChangeLedger>();
     let sessions = {
         let inner = ledger.inner.lock().unwrap();
         attribute(&inner, &path, app)
     };
     let at = now();
-    let owners: Vec<Option<String>> = if sessions.is_empty() { vec![None] } else { sessions.into_iter().map(Some).collect() };
+    let owners: Vec<Option<String>> = if sessions.is_empty() {
+        vec![None]
+    } else {
+        sessions.into_iter().map(Some).collect()
+    };
     for session_id in owners {
-        let c = Change { path: path.to_string_lossy().into_owned(), name: name.clone(), kind: kind.into(), at, session_id: session_id.clone(), bytes };
+        let c = Change {
+            path: path.to_string_lossy().into_owned(),
+            name: name.clone(),
+            kind: kind.into(),
+            at,
+            session_id: session_id.clone(),
+            bytes,
+        };
         append(&c);
         {
             let mut inner = ledger.inner.lock().unwrap();
@@ -452,7 +542,9 @@ pub fn for_session(app: &AppHandle, session_id: &str) -> Vec<Change> {
     // ledger or no ledger — a file that landed while nothing was running
     // still belongs on the list. Read it live and fold in what's missing.
     for dir in harness_output_dirs(session_id) {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for f in rd.flatten() {
             let Ok(md) = f.metadata() else { continue };
             if !md.is_file() {
@@ -462,9 +554,21 @@ pub fn for_session(app: &AppHandle, session_id: &str) -> Vec<Change> {
             if !seen.insert(path.clone()) {
                 continue;
             }
-            let at = md.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            let at = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             let name = f.file_name().to_string_lossy().into_owned();
-            out.push(Change { path, name, kind: "created".into(), at, session_id: Some(session_id.to_string()), bytes: md.len() });
+            out.push(Change {
+                path,
+                name,
+                kind: "created".into(),
+                at,
+                session_id: Some(session_id.to_string()),
+                bytes: md.len(),
+            });
         }
     }
     // Backfilled entries append out of order; time, not file position, is
@@ -508,8 +612,14 @@ fn merge_artifacts(
     }
     for artifact in artifacts {
         let raw = PathBuf::from(&artifact.path);
-        let candidate = if raw.is_absolute() { raw } else { root.join(raw) };
-        let Ok(path) = candidate.canonicalize() else { continue };
+        let candidate = if raw.is_absolute() {
+            raw
+        } else {
+            root.join(raw)
+        };
+        let Ok(path) = candidate.canonicalize() else {
+            continue;
+        };
         if !path.starts_with(&root) && !shares_git_repository(&root, &path) {
             continue;
         }
@@ -517,7 +627,9 @@ fn merge_artifacts(
         if !seen.insert(path_text.clone()) {
             continue;
         }
-        let Ok(metadata) = path.metadata() else { continue };
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
         if !metadata.is_file() {
             continue;
         }
@@ -534,7 +646,12 @@ fn merge_artifacts(
         changes.push(Change {
             path: path_text,
             name,
-            kind: if artifact.tool == "Write" { "created" } else { "modified" }.into(),
+            kind: if artifact.tool == "Write" {
+                "created"
+            } else {
+                "modified"
+            }
+            .into(),
             at,
             session_id: Some(session_id.to_string()),
             bytes: metadata.len(),
@@ -549,11 +666,21 @@ fn merge_artifacts(
 /// than the checkout it started in. Git's common directory is the stable
 /// repository identity shared by the main checkout and every linked tree.
 fn shares_git_repository(root: &Path, path: &Path) -> bool {
-    let Some(parent) = path.parent() else { return false };
-    let Ok(root_repo) = git2::Repository::discover(root) else { return false };
-    let Ok(path_repo) = git2::Repository::discover(parent) else { return false };
-    let Ok(root_common) = root_repo.commondir().canonicalize() else { return false };
-    let Ok(path_common) = path_repo.commondir().canonicalize() else { return false };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(root_repo) = git2::Repository::discover(root) else {
+        return false;
+    };
+    let Ok(path_repo) = git2::Repository::discover(parent) else {
+        return false;
+    };
+    let Ok(root_common) = root_repo.commondir().canonicalize() else {
+        return false;
+    };
+    let Ok(path_common) = path_repo.commondir().canonicalize() else {
+        return false;
+    };
     root_common == path_common
 }
 
@@ -577,7 +704,10 @@ pub fn sessions_with_files(app: &AppHandle) -> HashSet<String> {
 pub fn harness_output_dirs(session_id: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        let codex = home.join(".codex").join("generated_images").join(session_id);
+        let codex = home
+            .join(".codex")
+            .join("generated_images")
+            .join(session_id);
         if codex.is_dir() {
             out.push(codex);
         }
@@ -617,7 +747,11 @@ pub async fn read_file_base64(path: String) -> Result<FilePreview, String> {
             return Err("too large to preview".into());
         }
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        let ext = Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
         let mime = match ext.as_str() {
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
@@ -628,7 +762,10 @@ pub async fn read_file_base64(path: String) -> Result<FilePreview, String> {
             "webm" => "video/webm",
             _ => "application/octet-stream",
         };
-        Ok(FilePreview { mime: mime.into(), data: base64_encode(&bytes) })
+        Ok(FilePreview {
+            mime: mime.into(),
+            data: base64_encode(&bytes),
+        })
     })
     .await
 }
@@ -637,12 +774,24 @@ fn base64_encode(bytes: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -670,10 +819,8 @@ mod tests {
 
     #[test]
     fn transcript_artifacts_fill_history_without_leaving_the_workspace() {
-        let temp = std::env::temp_dir().join(format!(
-            "aiterm-produced-files-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("aiterm-produced-files-{}", uuid::Uuid::new_v4()));
         let root = temp.join("workspace");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("kept.txt"), b"history").unwrap();
@@ -704,10 +851,8 @@ mod tests {
 
     #[test]
     fn live_ledger_entry_wins_over_the_same_transcript_artifact() {
-        let temp = std::env::temp_dir().join(format!(
-            "aiterm-produced-files-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp =
+            std::env::temp_dir().join(format!("aiterm-produced-files-{}", uuid::Uuid::new_v4()));
         let root = temp.join("workspace");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("same.txt");

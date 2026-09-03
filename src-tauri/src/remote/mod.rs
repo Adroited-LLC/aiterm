@@ -27,11 +27,19 @@ use tokio::sync::Mutex;
 pub const PAIRING_VERSION: u8 = 1;
 pub const RELAY_PAIRING_VERSION: u8 = 2;
 pub const RELAY_AUTH_PAIRING_VERSION: u8 = 3;
-const DEFAULT_RELAY_SERVER: &str = "https://control.34-23-107-73.sslip.io:8443";
+pub(crate) const DEFAULT_RELAY_SERVER: &str = "https://control.34-23-107-73.sslip.io:8443";
 const DEFAULT_RELAY_PUBLIC_DOMAIN: &str = "34-23-107-73.sslip.io";
 const STARTUP_CONFIG_FILE: &str = "startup.json";
 const DEFAULT_REMOTE_PORT: u16 = 8443;
 const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteNetworkStack {
+    #[default]
+    Aiterm,
+    Iroh,
+}
 
 // --- The pairing URI ---------------------------------------------------
 
@@ -334,7 +342,7 @@ fn desktop_name() -> String {
         .unwrap_or_else(|| "AITerm desktop".to_string())
 }
 
-fn state_root() -> Result<std::path::PathBuf, String> {
+pub(crate) fn state_root() -> Result<std::path::PathBuf, String> {
     dirs::data_dir()
         .map(|dir| dir.join("aiterm/remote"))
         .ok_or_else(|| "no data directory for remote access state".to_string())
@@ -349,6 +357,12 @@ struct RemoteStartupConfig {
     enabled: bool,
     address: String,
     port: u16,
+    #[serde(default)]
+    network_stack: RemoteNetworkStack,
+    #[serde(default)]
+    iroh_secret: String,
+    #[serde(default)]
+    iroh_relay_url: Option<String>,
 }
 
 impl Default for RemoteStartupConfig {
@@ -357,6 +371,9 @@ impl Default for RemoteStartupConfig {
             enabled: false,
             address: String::new(),
             port: DEFAULT_REMOTE_PORT,
+            network_stack: RemoteNetworkStack::Aiterm,
+            iroh_secret: String::new(),
+            iroh_relay_url: None,
         }
     }
 }
@@ -374,6 +391,10 @@ impl RemoteStartupConfig {
             if !is_shareable_address(address) {
                 return Err("remote access will not bind loopback or a link-local address".into());
             }
+        }
+        if let Some(url) = self.iroh_relay_url.as_deref() {
+            url.parse::<iroh::RelayUrl>()
+                .map_err(|error| format!("invalid Iroh relay URL: {error}"))?;
         }
         Ok(self)
     }
@@ -449,11 +470,15 @@ fn relay_certificate_dns(
 pub struct RemoteStatusView {
     pub enabled: bool,
     pub start_on_launch: bool,
+    pub network_stack: RemoteNetworkStack,
     pub address: Option<String>,
     pub port: Option<u16>,
     pub fingerprint: Option<String>,
     pub relay_server: String,
     pub relay: RelayStatusView,
+    pub iroh_node: Option<String>,
+    pub iroh_active: bool,
+    pub iroh_relay_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -486,6 +511,7 @@ struct Inner {
     relay_server: Option<RelayServerConfig>,
     relay_config_loaded: bool,
     relay: Option<RelayConnectorHandle>,
+    iroh: Option<crate::iroh_tunnel::Tunnel>,
     startup: RemoteStartupConfig,
     startup_loaded: bool,
     starting: bool,
@@ -546,6 +572,7 @@ impl Inner {
         RemoteStatusView {
             enabled: self.gateway.is_some(),
             start_on_launch: self.startup.enabled,
+            network_stack: self.startup.network_stack,
             address: self.bound.map(|addr| addr.ip().to_string()),
             port: self.bound.map(|addr| addr.port()),
             fingerprint: self.fingerprint.clone(),
@@ -575,6 +602,9 @@ impl Inner {
                     .map(RelayConnectorHandle::state)
                     .unwrap_or_default(),
             },
+            iroh_node: crate::iroh_tunnel::node_id_of(&self.startup.iroh_secret),
+            iroh_active: self.iroh.is_some(),
+            iroh_relay_url: self.startup.iroh_relay_url.clone(),
         }
     }
 
@@ -602,12 +632,15 @@ impl Inner {
         {
             return Err("remote listener advertisement state is inconsistent".into());
         }
-        let relay = self
-            .relay_config
-            .as_ref()
-            .map(|config| (config.public_host.as_str(), config.public_port))
-            .or_else(|| draft.map(RelayEnrollmentDraft::public_endpoint));
-        Ok(pairing_payload_with_relay_authorization(
+        let relay = (self.startup.network_stack == RemoteNetworkStack::Aiterm)
+            .then(|| {
+                self.relay_config
+                    .as_ref()
+                    .map(|config| (config.public_host.as_str(), config.public_port))
+                    .or_else(|| draft.map(RelayEnrollmentDraft::public_endpoint))
+            })
+            .flatten();
+        let mut payload = pairing_payload_with_relay_authorization(
             hosts,
             bound.port(),
             fingerprint,
@@ -615,7 +648,20 @@ impl Inner {
             name,
             relay,
             draft.map(RelayEnrollmentDraft::authorization_digest),
-        ))
+        );
+        if self.startup.network_stack == RemoteNetworkStack::Iroh {
+            let node = crate::iroh_tunnel::node_id_of(&self.startup.iroh_secret)
+                .ok_or_else(|| "the Iroh identity is unavailable".to_string())?;
+            payload.push_str("&m=iroh&i=");
+            payload.push_str(&percent_encode(&node));
+            if let Some(url) = self.startup.iroh_relay_url.as_deref() {
+                payload.push_str("&j=");
+                payload.push_str(&percent_encode(url));
+            }
+        } else {
+            payload.push_str("&m=aiterm");
+        }
+        Ok(payload)
     }
 }
 
@@ -696,7 +742,7 @@ pub async fn remote_relay_clear(
         if inner.gateway.is_some() || inner.starting {
             return Err("turn remote access off before removing relay settings".into());
         }
-        if inner.startup.enabled {
+        if inner.startup.enabled && inner.startup.network_stack == RemoteNetworkStack::Aiterm {
             inner.startup.enabled = false;
             inner.startup.save(&state_root()?)?;
         }
@@ -730,18 +776,67 @@ pub async fn remote_start_on_launch_set(
 ) -> Result<RemoteStatusView, String> {
     let mut inner = state.inner.lock().await;
     inner.load_relay_config()?;
-    if enabled && inner.relay_config.is_none() {
+    if enabled
+        && inner.startup.network_stack == RemoteNetworkStack::Aiterm
+        && inner.relay_config.is_none()
+    {
         return Err("set up a relay before enabling automatic startup".into());
     }
     let config = RemoteStartupConfig {
         enabled,
         address,
         port,
+        network_stack: inner.startup.network_stack,
+        iroh_secret: inner.startup.iroh_secret.clone(),
+        iroh_relay_url: inner.startup.iroh_relay_url.clone(),
     }
     .validated()?;
     config.save(&state_root()?)?;
     inner.startup = config;
     inner.startup_loaded = true;
+    Ok(inner.status())
+}
+
+#[tauri::command]
+pub async fn remote_network_stack_set(
+    state: tauri::State<'_, RemoteState>,
+    network_stack: RemoteNetworkStack,
+) -> Result<RemoteStatusView, String> {
+    let mut inner = state.inner.lock().await;
+    inner.load_relay_config()?;
+    if inner.gateway.is_some() || inner.starting {
+        return Err("turn remote access off before changing the network stack".into());
+    }
+    inner.startup.network_stack = network_stack;
+    if network_stack == RemoteNetworkStack::Iroh
+        && crate::iroh_tunnel::secret_from_hex(&inner.startup.iroh_secret).is_none()
+    {
+        inner.startup.iroh_secret = crate::iroh_tunnel::new_secret_hex();
+    }
+    inner.startup.save(&state_root()?)?;
+    Ok(inner.status())
+}
+
+#[tauri::command]
+pub async fn remote_iroh_relay_url_set(
+    state: tauri::State<'_, RemoteState>,
+    url: Option<String>,
+) -> Result<RemoteStatusView, String> {
+    let mut inner = state.inner.lock().await;
+    inner.load_relay_config()?;
+    if inner.gateway.is_some() || inner.starting {
+        return Err("turn remote access off before changing the Iroh relay".into());
+    }
+    let url = url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = url.as_deref() {
+        value
+            .parse::<iroh::RelayUrl>()
+            .map_err(|error| format!("invalid Iroh relay URL: {error}"))?;
+    }
+    inner.startup.iroh_relay_url = url;
+    inner.startup.save(&state_root()?)?;
     Ok(inner.status())
 }
 
@@ -778,6 +873,14 @@ async fn start_remote(
         if inner.starting {
             return Err("remote access is already starting".to_string());
         }
+        if inner.startup.network_stack == RemoteNetworkStack::Iroh
+            && crate::iroh_tunnel::secret_from_hex(&inner.startup.iroh_secret).is_none()
+        {
+            inner.startup.iroh_secret = crate::iroh_tunnel::new_secret_hex();
+            if let Err(error) = inner.startup.save(&state_root()?) {
+                return Err(error);
+            }
+        }
         inner.starting = true;
         match inner.devices() {
             Ok(devices) => devices,
@@ -787,9 +890,15 @@ async fn start_remote(
             }
         }
     };
-    let (relay_config, relay_server) = {
+    let (relay_config, relay_server, network_stack, iroh_secret, iroh_relay_url) = {
         let inner = state.inner.lock().await;
-        (inner.relay_config.clone(), inner.relay_server.clone())
+        (
+            inner.relay_config.clone(),
+            inner.relay_server.clone(),
+            inner.startup.network_stack,
+            inner.startup.iroh_secret.clone(),
+            inner.startup.iroh_relay_url.clone(),
+        )
     };
     let advertised_hosts = match advertised_hosts(ip, local_addresses()) {
         Ok(hosts) => hosts,
@@ -811,24 +920,36 @@ async fn start_remote(
     };
     // Bind the selected address family, not one interface. The selected IP
     // stays the preferred route while LAN/VPN transitions keep working.
-    let listen_ip = match ip {
-        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    let listen_ip = match network_stack {
+        RemoteNetworkStack::Iroh => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        RemoteNetworkStack::Aiterm => match ip {
+            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        },
     };
-    let relay_host = relay_config
-        .as_ref()
-        .map(|config| config.public_host.clone());
-    let relay_port = relay_config.as_ref().map(|config| config.public_port);
+    let relay_host = (network_stack == RemoteNetworkStack::Aiterm)
+        .then(|| {
+            relay_config
+                .as_ref()
+                .map(|config| config.public_host.clone())
+        })
+        .flatten();
+    let relay_port = (network_stack == RemoteNetworkStack::Aiterm)
+        .then(|| relay_config.as_ref().map(|config| config.public_port))
+        .flatten();
     let routes = advertised_hosts.iter().map(ToString::to_string).collect();
     let mut remote_services = RemoteServices::from_application_services(tabs, &services)
         .with_app_handle(app)
         .with_gateway_routes(routes, port, relay_host, relay_port);
-    if let Some(config) = relay_config.as_ref() {
-        remote_services = remote_services.with_direct_tunnel(Arc::new(DirectTunnelService::new(
-            config.clone(),
-            identity.clone(),
-            SocketAddr::new(ip, port),
-        )));
+    if network_stack == RemoteNetworkStack::Aiterm {
+        if let Some(config) = relay_config.as_ref() {
+            remote_services =
+                remote_services.with_direct_tunnel(Arc::new(DirectTunnelService::new(
+                    config.clone(),
+                    identity.clone(),
+                    SocketAddr::new(ip, port),
+                )));
+        }
     }
     let started = RemoteGateway::start(
         SocketAddr::new(listen_ip, port),
@@ -837,17 +958,49 @@ async fn start_remote(
         remote_services,
     )
     .await;
+    let gateway = match started {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            state.inner.lock().await.starting = false;
+            return Err(error.to_string());
+        }
+    };
+    let gateway_port = gateway.local_addr().port();
+    // `bound` is the advertised/connector address. In Iroh mode the actual
+    // socket is loopback-only, but the selected address remains in the
+    // certificate and pairing record for a future switch back to AITerm.
+    let local_target = SocketAddr::new(ip, gateway_port);
+    let iroh = if network_stack == RemoteNetworkStack::Iroh {
+        let secret = match crate::iroh_tunnel::secret_from_hex(&iroh_secret) {
+            Some(secret) => secret,
+            None => {
+                let _ = gateway.stop().await;
+                state.inner.lock().await.starting = false;
+                return Err("the Iroh identity is invalid".into());
+            }
+        };
+        match crate::iroh_tunnel::start(secret, gateway_port, iroh_relay_url).await {
+            Ok(tunnel) => Some(tunnel),
+            Err(error) => {
+                let _ = gateway.stop().await;
+                state.inner.lock().await.starting = false;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let mut inner = state.inner.lock().await;
     inner.starting = false;
-    let gateway = started.map_err(|error| error.to_string())?;
-    let gateway_port = gateway.local_addr().port();
-    let local_target = SocketAddr::new(ip, gateway_port);
     inner.bound = Some(local_target);
     inner.fingerprint = Some(gateway.spki_fingerprint().to_string());
     inner.advertised_hosts = Some(advertised_hosts);
-    if let Some(config) = relay_config {
-        inner.relay = Some(RelayConnectorHandle::start(config, local_target));
+    if network_stack == RemoteNetworkStack::Aiterm {
+        if let Some(config) = relay_config {
+            inner.relay = Some(RelayConnectorHandle::start(config, local_target));
+        }
     }
+    inner.iroh = iroh;
     inner.gateway = Some(gateway);
     Ok(inner.status())
 }
@@ -895,18 +1048,20 @@ pub fn start_on_launch(
             return;
         }
     };
-    match RelayConfig::load(&root) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            crate::diag!(
-                "remote",
-                "automatic startup skipped: no relay route is configured"
-            );
-            return;
-        }
-        Err(error) => {
-            crate::diag!("remote", "automatic startup skipped: {error}");
-            return;
+    if config.network_stack == RemoteNetworkStack::Aiterm {
+        match RelayConfig::load(&root) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                crate::diag!(
+                    "remote",
+                    "automatic startup skipped: no relay route is configured"
+                );
+                return;
+            }
+            Err(error) => {
+                crate::diag!("remote", "automatic startup skipped: {error}");
+                return;
+            }
         }
     }
     let (address, port) = match startup_listener(&config, local_addresses()) {
@@ -934,7 +1089,7 @@ pub fn start_on_launch(
 
 #[tauri::command]
 pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteStatusView, String> {
-    let (gateway, relay) = {
+    let (gateway, relay, iroh) = {
         let mut inner = state.inner.lock().await;
         if inner.starting {
             return Err("remote access is still starting".to_string());
@@ -942,12 +1097,15 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
         inner.bound = None;
         inner.fingerprint = None;
         inner.advertised_hosts = None;
-        (inner.gateway.take(), inner.relay.take())
+        (inner.gateway.take(), inner.relay.take(), inner.iroh.take())
     };
     // Closing the listener is not a statement about any phone: trusted
     // devices stay trusted, and revocation stays an explicit act.
     if let Some(relay) = relay {
         relay.stop().await;
+    }
+    if let Some(iroh) = iroh {
+        crate::iroh_tunnel::stop(iroh).await;
     }
     if let Some(gateway) = gateway {
         gateway.stop().await.map_err(|error| error.to_string())?;
@@ -971,7 +1129,8 @@ pub async fn remote_begin_pairing(
                 .fingerprint
                 .clone()
                 .ok_or("the remote identity is unavailable")?,
-            inner.relay_config.is_none(),
+            inner.startup.network_stack == RemoteNetworkStack::Aiterm
+                && inner.relay_config.is_none(),
             inner
                 .relay_server
                 .as_ref()
@@ -1035,7 +1194,8 @@ pub async fn remote_approve_device(
         let should_register = {
             let mut inner = state.inner.lock().await;
             inner.load_relay_config()?;
-            inner.relay_config.is_none()
+            inner.startup.network_stack == RemoteNetworkStack::Aiterm
+                && inner.relay_config.is_none()
         };
         if should_register {
             match enrollment
@@ -1050,9 +1210,11 @@ pub async fn remote_approve_device(
                         if let Some(gateway) = &inner.gateway {
                             gateway.set_relay_route(config.public_host.clone(), config.public_port);
                         }
-                        if let Some(local_target) = inner.bound {
-                            inner.relay =
-                                Some(RelayConnectorHandle::start(config.clone(), local_target));
+                        if inner.startup.network_stack == RemoteNetworkStack::Aiterm {
+                            if let Some(local_target) = inner.bound {
+                                inner.relay =
+                                    Some(RelayConnectorHandle::start(config.clone(), local_target));
+                            }
                         }
                         inner.relay_config = Some(config);
                         inner.relay_config_loaded = true;
@@ -1117,6 +1279,7 @@ mod listener_advertisement_tests {
             enabled: true,
             address: "10.0.0.151".into(),
             port: 9443,
+            ..Default::default()
         };
         selected.save(&root).unwrap();
         assert_eq!(RemoteStartupConfig::load(&root).unwrap(), selected);
@@ -1125,11 +1288,59 @@ mod listener_advertisement_tests {
     }
 
     #[test]
+    fn iroh_identity_is_absent_until_that_stack_is_selected() {
+        let config = RemoteStartupConfig::default();
+        assert_eq!(config.network_stack, RemoteNetworkStack::Aiterm);
+        assert!(config.iroh_secret.is_empty());
+        assert!(crate::iroh_tunnel::node_id_of(&config.iroh_secret).is_none());
+
+        let not_started_iroh = RemoteStartupConfig {
+            network_stack: RemoteNetworkStack::Iroh,
+            ..Default::default()
+        };
+        assert!(not_started_iroh.validated().unwrap().iroh_secret.is_empty());
+    }
+
+    #[test]
+    fn pairing_invite_advertises_only_the_selected_network_stack() {
+        let selected: IpAddr = "10.0.0.151".parse().unwrap();
+        let mut inner = Inner {
+            bound: Some(SocketAddr::new(selected, 8443)),
+            fingerprint: Some("stable-spki-pin".to_string()),
+            advertised_hosts: Some(vec![selected]),
+            relay_config: Some(RelayConfig {
+                connector_url: "wss://control.example.com/v1/connect".into(),
+                public_host: "desktop.relay.example.com".into(),
+                public_port: 443,
+                route_id: "desktop".into(),
+                token: "x".repeat(43),
+                managed: true,
+            }),
+            ..Inner::default()
+        };
+        inner.startup.network_stack = RemoteNetworkStack::Aiterm;
+        let native = inner.pairing_payload(b"secret", "desktop").unwrap();
+        assert!(native.contains("&m=aiterm"));
+        assert!(native.contains("&r=desktop.relay.example.com"));
+        assert!(!native.contains("&i="));
+
+        inner.startup.network_stack = RemoteNetworkStack::Iroh;
+        inner.startup.iroh_secret = crate::iroh_tunnel::new_secret_hex();
+        inner.startup.iroh_relay_url = Some("https://relay.example.com".into());
+        let iroh = inner.pairing_payload(b"secret", "desktop").unwrap();
+        assert!(iroh.contains("&m=iroh"));
+        assert!(iroh.contains("&i="));
+        assert!(iroh.contains("&j=https%3A%2F%2Frelay.example.com"));
+        assert!(!iroh.contains("&r="));
+    }
+
+    #[test]
     fn relay_startup_prefers_the_saved_address_then_survives_network_changes() {
         let config = RemoteStartupConfig {
             enabled: true,
             address: "10.8.0.2".into(),
             port: 8443,
+            ..Default::default()
         };
         assert_eq!(
             startup_listener(
@@ -1152,6 +1363,7 @@ mod listener_advertisement_tests {
             enabled: true,
             address: "127.0.0.1".into(),
             port: 8443,
+            ..Default::default()
         }
         .validated()
         .is_err());
@@ -1159,6 +1371,7 @@ mod listener_advertisement_tests {
             enabled: true,
             address: "10.0.0.151".into(),
             port: 443,
+            ..Default::default()
         }
         .validated()
         .is_err());

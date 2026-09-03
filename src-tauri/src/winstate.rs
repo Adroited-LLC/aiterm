@@ -83,10 +83,7 @@ fn drift_path() -> Option<std::path::PathBuf> {
 fn stored_drift() -> Option<(u32, u32)> {
     let raw = std::fs::read_to_string(drift_path()?).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    Some((
-        v.get("dw")?.as_u64()? as u32,
-        v.get("dh")?.as_u64()? as u32,
-    ))
+    Some((v.get("dw")?.as_u64()? as u32, v.get("dh")?.as_u64()? as u32))
 }
 
 fn store_drift(drift: (u32, u32)) {
@@ -176,7 +173,10 @@ mod tests {
         let saved = (2280u32, 1726u32);
         let asked = shrink(saved, drift);
         let landed = (asked.0 + drift.0, asked.1 + drift.1);
-        assert_eq!(landed, saved, "the size saved on exit must equal the size restored");
+        assert_eq!(
+            landed, saved,
+            "the size saved on exit must equal the size restored"
+        );
     }
 
     #[test]

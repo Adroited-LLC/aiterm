@@ -25,6 +25,8 @@ import {
   remoteDenyDevice,
   remoteDevices,
   remoteInterfaces,
+  remoteIrohRelayUrlSet,
+  remoteNetworkStackSet,
   remotePendingPairings,
   remoteRevokeDevice,
   remoteRelayClear,
@@ -84,6 +86,7 @@ export default function RemoteAccessSettings() {
   const [relayPublicPort, setRelayPublicPort] = useState(443);
   const [relayRouteId, setRelayRouteId] = useState("");
   const [relayToken, setRelayToken] = useState("");
+  const [irohRelayUrl, setIrohRelayUrl] = useState("");
   const [invite, setInvite] = useState<PairingInvite | null>(null);
   const [pending, setPending] = useState<PendingPairing[]>([]);
   const [devices, setDevices] = useState<TrustedDevice[]>([]);
@@ -118,6 +121,7 @@ export default function RemoteAccessSettings() {
         setRelayPublicHost(currentStatus.relay?.public_host ?? "");
         setRelayPublicPort(currentStatus.relay?.public_port ?? 443);
         setRelayRouteId(currentStatus.relay?.route_id ?? "");
+        setIrohRelayUrl(currentStatus.iroh_relay_url ?? "");
       })
       .catch(() => {
         setStatus(null);
@@ -164,12 +168,56 @@ export default function RemoteAccessSettings() {
     return <div className="sgroup-foot">Looking…</div>;
   }
   const relayServerChanged = relayServer.trim() !== status.relay_server;
+  const usesIroh = status.network_stack === "iroh";
+  const irohRelayChanged = irohRelayUrl.trim() !== (status.iroh_relay_url ?? "");
 
   return (
     <>
       <div className="sgroup">
         <div className="sgroup-title">Remote connection</div>
         <div className="sgroup-rows">
+          <Row
+            label="Network stack"
+            desc="Choose one complete transport stack. Switching is available while remote access is off; the other stack remains dormant. Re-pair phones after switching so they receive the selected route."
+          >
+            <select
+              className="set-select"
+              value={status.network_stack}
+              disabled={status.enabled}
+              onChange={(event) => run(remoteNetworkStackSet(event.target.value as "aiterm" | "iroh"))}
+            >
+              <option value="aiterm">AITerm network</option>
+              <option value="iroh">Iroh</option>
+            </select>
+          </Row>
+          {usesIroh ? (
+            <Row
+              label="Iroh relay"
+              desc="Optional. Leave blank for Iroh's default relays, or enter your own Iroh relay URL. Direct peer-to-peer is attempted automatically."
+              wide
+            >
+              <div className="remote-managed-relay">
+                <input
+                  className="set-input mono"
+                  value={irohRelayUrl}
+                  disabled={status.enabled}
+                  placeholder="Iroh default relays"
+                  spellCheck={false}
+                  onChange={(event) => setIrohRelayUrl(event.target.value)}
+                />
+                <div className="remote-relay-actions">
+                  <button
+                    className="set-recheck"
+                    disabled={status.enabled || !irohRelayChanged}
+                    onClick={() => run(remoteIrohRelayUrlSet(irohRelayUrl.trim() || null))}
+                  >Save Iroh relay</button>
+                </div>
+                <div className="sgroup-foot">
+                  Node {status.iroh_node ?? "is created when this setting is saved"}
+                </div>
+              </div>
+            </Row>
+          ) : (
           <Row
             label="Relay server"
             desc="The first approved phone authorizes this desktop. AITerm creates the private route automatically as part of pairing."
@@ -216,9 +264,12 @@ export default function RemoteAccessSettings() {
               </div>
             </div>
           </Row>
+          )}
           <Row
             label="Remote access"
-            desc="Automatically tries LAN, then VPN, then your AITerm Relay. One switch controls the same encrypted desktop gateway on every route."
+            desc={usesIroh
+              ? "Runs only the Iroh endpoint and a loopback gateway. The AITerm LAN, direct QUIC, and relay transports remain stopped."
+              : "Automatically tries LAN, then VPN, direct QUIC, then your AITerm Relay. Iroh remains stopped."}
           >
             <button
               className="set-recheck"
@@ -228,19 +279,19 @@ export default function RemoteAccessSettings() {
                   () => saveListenerPreference({ address, port }),
                 )
               }
-              disabled={!status.enabled && (!address || relayServerChanged)}
+              disabled={!status.enabled && (!address || (!usesIroh && relayServerChanged))}
             >
               {status.enabled ? "Turn off" : "Turn on"}
             </button>
           </Row>
           <Row
-            label="Start relay when AITerm opens"
-            desc="Restores remote access with this address and port, then reconnects the saved private relay route. Off by default."
+            label={`Start ${usesIroh ? "Iroh" : "AITerm network"} when AITerm opens`}
+            desc={`Restores the selected ${usesIroh ? "Iroh" : "AITerm"} stack automatically. Off by default.`}
           >
             <SettingsSwitch
               checked={status.start_on_launch}
-              disabled={!status.relay?.configured || !address || relayServerChanged}
-              label="Start relay when AITerm opens"
+              disabled={!address || (!usesIroh && (!status.relay?.configured || relayServerChanged))}
+              label="Start remote access when AITerm opens"
               onChange={(enabled) => run(
                 remoteStartOnLaunchSet(enabled, address, port),
                 () => saveListenerPreference({ address, port }),
@@ -326,13 +377,18 @@ export default function RemoteAccessSettings() {
           <Row label="Status">
             <span className="diag-val">{listenerLabel(status)}</span>
           </Row>
-          <Row
+          {!usesIroh && <Row
             label="AITerm Relay"
             desc="The relay only forwards opaque TLS bytes. It cannot read device keys, sessions, terminal data, or files."
           >
             <span className="diag-val">{relayLabel(status)}</span>
-          </Row>
-          {!status.relay?.configured && (
+          </Row>}
+          {usesIroh && <Row label="Iroh">
+            <span className="diag-val">
+              {status.iroh_active ? "connected and accepting peers" : status.enabled ? "starting" : "off"}
+            </span>
+          </Row>}
+          {!usesIroh && !status.relay?.configured && (
           <Row label="Advanced manual route" desc="For self-hosted relays that do not support phone-authorized setup." wide>
             <details className="remote-relay-advanced">
               <summary>Enter route details manually</summary>
@@ -419,7 +475,7 @@ export default function RemoteAccessSettings() {
           >
             <button
               className="set-recheck"
-              disabled={!status.enabled || relayServerChanged}
+              disabled={!status.enabled || (!usesIroh && relayServerChanged)}
               onClick={() => {
                 setError(null);
                 setNow(Date.now());

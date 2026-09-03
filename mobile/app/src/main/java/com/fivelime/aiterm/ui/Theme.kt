@@ -2,6 +2,12 @@ package com.fivelime.aiterm.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.compose.foundation.layout.ime
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -108,6 +114,7 @@ fun brandAsset(id: String): String? = when (id.lowercase()) {
     "grok" -> "grok.svg"
     "xai" -> "xai.svg"
     "opencode" -> "opencode.svg"
+    "antigravity" -> "gemini-color.svg"
     "gemini", "google" -> "gemini-color.svg"
     "anthropic" -> "claude-color.svg"
     "amazon" -> "aws-color.svg"
@@ -145,7 +152,10 @@ private fun isMono(asset: String) = !asset.contains("-color")
 @Composable
 fun AgentIcon(id: String, size: Dp = 28.dp) {
     val asset = brandAsset(id)
-    if (asset == null) {
+    // A mark that cannot be drawn — no asset for the id, or a load that
+    // failed — is a lettered avatar, never an empty gap in the row.
+    val failed = androidx.compose.runtime.remember(id) { androidx.compose.runtime.mutableStateOf(false) }
+    if (asset == null || failed.value) {
         Box(Modifier.size(size).background(agentColor(id).copy(alpha = 0.18f), CircleShape), contentAlignment = Alignment.Center) {
             Text(id.take(1).uppercase(), color = agentColor(id), fontWeight = FontWeight.Bold)
         }
@@ -157,6 +167,7 @@ fun AgentIcon(id: String, size: Dp = 28.dp) {
         contentDescription = id,
         modifier = Modifier.size(size),
         colorFilter = if (isMono(asset)) ColorFilter.tint(themeState.value.onSurface) else null,
+        onError = { failed.value = true },
     )
 }
 
@@ -189,6 +200,8 @@ fun agentColor(agent: String): Color = when (agent.lowercase()) {
     "codex" -> Color(0xFF8AB4F8)
     "grok" -> Color(0xFFB0BEC5)
     "opencode" -> Color(0xFFB39DDB)
+    // Google's: a blue, like the desktop's var(--blue) for the same mark.
+    "antigravity" -> Color(0xFF64B5F6)
     "chat" -> Color(0xFF80CBC4)
     else -> Muted
 }
@@ -223,6 +236,32 @@ fun Modifier.dismissKeyboardOnTap(): Modifier {
             detectTapGestures(onTap = { focus.clearFocus(); kb?.hide() })
         },
     )
+}
+
+/** A finger landing anywhere but `keep` (the composer, in root
+ *  coordinates) puts the keyboard away. Seen on the INITIAL pass — before
+ *  the message rows, tool cards and links, all of which take the tap for
+ *  themselves, so a tap-after-the-fact never arrived and the back button
+ *  was the only way down [John, 2026-09-03]. Nothing is consumed: the row
+ *  still gets its tap, the keyboard just goes first. */
+@Composable
+fun Modifier.dismissKeyboardOnTapOutside(keep: () -> androidx.compose.ui.geometry.Rect?): Modifier {
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
+    val kb = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val imeUp = androidx.compose.foundation.layout.WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
+    var coords by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
+    return this
+        .onGloballyPositioned { coords = it }
+        .pointerInput(imeUp) {
+            if (!imeUp) return@pointerInput
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                val at = coords?.localToRoot(down.position) ?: return@awaitEachGesture
+                if (keep()?.contains(at) == true) return@awaitEachGesture
+                focus.clearFocus()
+                kb?.hide()
+            }
+        }
 }
 
 /** The vendor logo a model id implies: "anthropic/claude-sonnet-5" wears

@@ -2,14 +2,14 @@
 //! for display. Read-only by design: these are files every session on the
 //! machine depends on, and Phase 1 shows them without touching them.
 
-pub mod settings;
 pub mod concern;
-pub mod instructions;
-pub mod mcp;
-pub mod skills;
-pub mod write;
 pub mod edit;
 pub mod hooks;
+pub mod instructions;
+pub mod mcp;
+pub mod settings;
+pub mod skills;
+pub mod write;
 
 use serde::Serialize;
 use settings::{Layer, LayerId, Setting};
@@ -26,7 +26,10 @@ fn layer_paths(home: &str, project: Option<&str>, injected: &str) -> Vec<(LayerI
     let mut out = vec![(LayerId::User, format!("{home}/.claude/settings.json"))];
     if let Some(p) = project {
         out.push((LayerId::Project, format!("{p}/.claude/settings.json")));
-        out.push((LayerId::ProjectLocal, format!("{p}/.claude/settings.local.json")));
+        out.push((
+            LayerId::ProjectLocal,
+            format!("{p}/.claude/settings.local.json"),
+        ));
     }
     out.push((LayerId::Injected, injected.to_string()));
     out
@@ -80,7 +83,13 @@ fn unreadable(id: LayerId, path: &str, e: &std::io::Error) -> Layer {
         std::io::ErrorKind::NotFound => None,
         _ => Some(e.to_string()),
     };
-    Layer { id, path: path.to_string(), present: false, error, text: String::new() }
+    Layer {
+        id,
+        path: path.to_string(),
+        present: false,
+        error,
+        text: String::new(),
+    }
 }
 
 /// Read every settings layer once: a row per file for display, plus the text of
@@ -103,7 +112,13 @@ fn read_layers(home: &str, project: Option<&str>) -> (Vec<Layer>, Vec<(LayerId, 
             Ok(t) => {
                 // Clone into the layer; avoid a second read by using the same text
                 // as the collision token.
-                layers.push(Layer { id, path, present: true, error: None, text: t.clone() });
+                layers.push(Layer {
+                    id,
+                    path,
+                    present: true,
+                    error: None,
+                    text: t.clone(),
+                });
                 texts.push((id, t));
             }
             Err(e) => layers.push(unreadable(id, &path, &e)),
@@ -147,8 +162,8 @@ pub fn claude_set_key(
     value: serde_json::Value,
     loaded_text: String,
 ) -> Result<(), write::SaveError> {
-    let next = edit::set_key(&loaded_text, &dotted_key, value)
-        .map_err(write::SaveError::Invalid)?;
+    let next =
+        edit::set_key(&loaded_text, &dotted_key, value).map_err(write::SaveError::Invalid)?;
     write::save_layer(&path, &next, &loaded_text)
 }
 
@@ -186,7 +201,11 @@ pub fn claude_mcp(project: Option<String>) -> McpView {
         mcp_json.as_deref(),
         project.as_deref().unwrap_or(""),
     );
-    McpView { servers, local_config_read, errors }
+    McpView {
+        servers,
+        local_config_read,
+        errors,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -239,10 +258,14 @@ pub fn claude_skills(project: Option<String>) -> SkillsView {
 
     let mut out = Vec::new();
     for (source, dir) in roots {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path().join("SKILL.md");
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let (name, description) = skills::frontmatter(&text);
             let dir_name = e.file_name().to_string_lossy().to_string();
             out.push(skills::Skill {
@@ -254,7 +277,11 @@ pub fn claude_skills(project: Option<String>) -> SkillsView {
         }
     }
     out.sort_by(|a, b| (a.source.clone(), a.name.clone()).cmp(&(b.source.clone(), b.name.clone())));
-    SkillsView { skills: out, disabled_plugins: plugins.disabled, errors }
+    SkillsView {
+        skills: out,
+        disabled_plugins: plugins.disabled,
+        errors,
+    }
 }
 
 #[tauri::command]
@@ -273,7 +300,11 @@ pub fn claude_hooks(project: Option<String>) -> HooksView {
                     let (layer_hooks, layer_errors) =
                         hooks::parse(id.label(), hooks_value, crate::hooklink::HOOK_REPORT_FLAG);
                     all_hooks.extend(layer_hooks);
-                    all_errors.extend(layer_errors.into_iter().map(|e| format!("{}: {}", id.label(), e)));
+                    all_errors.extend(
+                        layer_errors
+                            .into_iter()
+                            .map(|e| format!("{}: {}", id.label(), e)),
+                    );
                 }
             }
             Err(e) => {
@@ -282,7 +313,10 @@ pub fn claude_hooks(project: Option<String>) -> HooksView {
         }
     }
 
-    HooksView { hooks: all_hooks, errors: all_errors }
+    HooksView {
+        hooks: all_hooks,
+        errors: all_errors,
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +325,11 @@ mod tests {
 
     #[test]
     fn layer_paths_are_built_from_home_and_project() {
-        let l = layer_paths("/h", Some("/p"), "/h/.local/share/aiterm/claude-hook-settings.json");
+        let l = layer_paths(
+            "/h",
+            Some("/p"),
+            "/h/.local/share/aiterm/claude-hook-settings.json",
+        );
         assert_eq!(l[0].1, "/h/.claude/settings.json");
         assert_eq!(l[1].1, "/p/.claude/settings.json");
         assert_eq!(l[2].1, "/p/.claude/settings.local.json");
@@ -300,7 +338,11 @@ mod tests {
 
     #[test]
     fn with_no_project_open_only_the_user_and_injected_layers_are_looked_for() {
-        let l = layer_paths("/h", None, "/h/.local/share/aiterm/claude-hook-settings.json");
+        let l = layer_paths(
+            "/h",
+            None,
+            "/h/.local/share/aiterm/claude-hook-settings.json",
+        );
         assert!(l.iter().all(|(id, _)| *id != settings::LayerId::Project));
         assert_eq!(l.len(), 2);
     }
@@ -311,7 +353,10 @@ mod tests {
         // file as absent under a non-default XDG_DATA_HOME, while sessions
         // were still being launched with it.
         let l = layer_paths("/h", None, "/custom/aiterm/claude-hook-settings.json");
-        assert_eq!(l.last().unwrap().1, "/custom/aiterm/claude-hook-settings.json");
+        assert_eq!(
+            l.last().unwrap().1,
+            "/custom/aiterm/claude-hook-settings.json"
+        );
     }
 
     #[test]
@@ -341,12 +386,30 @@ mod tests {
     #[test]
     fn a_layer_that_failed_to_parse_wears_its_own_error() {
         let mut layers = vec![
-            Layer { id: LayerId::User, path: "/h/s.json".into(), present: true, error: None, text: String::new() },
-            Layer { id: LayerId::Project, path: "/p/s.json".into(), present: true, error: None, text: String::new() },
+            Layer {
+                id: LayerId::User,
+                path: "/h/s.json".into(),
+                present: true,
+                error: None,
+                text: String::new(),
+            },
+            Layer {
+                id: LayerId::Project,
+                path: "/p/s.json".into(),
+                present: true,
+                error: None,
+                text: String::new(),
+            },
         ];
-        attach_errors(&mut layers, &["project: expected value at line 1".to_string()]);
+        attach_errors(
+            &mut layers,
+            &["project: expected value at line 1".to_string()],
+        );
         assert_eq!(layers[1].error.as_deref(), Some("expected value at line 1"));
-        assert!(layers[0].error.is_none(), "a healthy layer must not inherit a sibling's error");
+        assert!(
+            layers[0].error.is_none(),
+            "a healthy layer must not inherit a sibling's error"
+        );
     }
 
     #[test]
@@ -354,7 +417,11 @@ mod tests {
         // "project local" contains a space; a split on the wrong separator, or a
         // match on the first word, would silently attach nothing.
         let mut layers = vec![Layer {
-            id: LayerId::ProjectLocal, path: "/p/l.json".into(), present: true, error: None, text: String::new(),
+            id: LayerId::ProjectLocal,
+            path: "/p/l.json".into(),
+            present: true,
+            error: None,
+            text: String::new(),
         }];
         attach_errors(&mut layers, &["project local: trailing comma".to_string()]);
         assert_eq!(layers[0].error.as_deref(), Some("trailing comma"));
@@ -365,10 +432,20 @@ mod tests {
         // split_once, not split — otherwise the message is truncated at its own
         // punctuation and the row explains less than it could.
         let mut layers = vec![Layer {
-            id: LayerId::User, path: "/h/s.json".into(), present: true, error: None, text: String::new(),
+            id: LayerId::User,
+            path: "/h/s.json".into(),
+            present: true,
+            error: None,
+            text: String::new(),
         }];
-        attach_errors(&mut layers, &["user: bad thing: at line 3 column 5".to_string()]);
-        assert_eq!(layers[0].error.as_deref(), Some("bad thing: at line 3 column 5"));
+        attach_errors(
+            &mut layers,
+            &["user: bad thing: at line 3 column 5".to_string()],
+        );
+        assert_eq!(
+            layers[0].error.as_deref(),
+            Some("bad thing: at line 3 column 5")
+        );
     }
 
     #[test]
@@ -407,7 +484,11 @@ mod tests {
             return;
         }
         let v = claude_settings(None);
-        let user = v.layers.iter().find(|l| l.id == settings::LayerId::User).unwrap();
+        let user = v
+            .layers
+            .iter()
+            .find(|l| l.id == settings::LayerId::User)
+            .unwrap();
         if user.present {
             assert!(!user.text.is_empty(), "a present layer must carry its text");
         } else {

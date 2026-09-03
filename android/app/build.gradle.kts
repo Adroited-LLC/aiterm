@@ -140,6 +140,13 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
 
+    // Optional network stack selected at pairing time. It carries the same
+    // pinned TLS/WebSocket protocol as the native AITerm stack.
+    implementation("computer.iroh:iroh-android:1.1.0") {
+        exclude(group = "net.java.dev.jna", module = "jna")
+    }
+    implementation("net.java.dev.jna:jna:5.15.0@aar")
+
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
 

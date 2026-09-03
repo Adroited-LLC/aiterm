@@ -74,6 +74,20 @@ class PairingRepositoryTest {
     }
 
     @Test
+    fun futureQrFields_areSkippedNotRejected() {
+        // A newer desktop may advertise transport metadata this build does
+        // not know. Trust-bearing fields remain strict; extensions are
+        // skipped so an otherwise compatible QR still works.
+        val combined = pairingUri() + "&tp=8877&tt=sometoken&tf=${"ab".repeat(32)}&z=${"cd".repeat(32)}"
+        val result = PairingPayload.parse(combined, scannedAt)
+        assertTrue(
+            "expected combined payload to parse, got $result",
+            result is PairingPayloadResult.Parsed,
+        )
+        assertEquals(8443, (result as PairingPayloadResult.Parsed).payload.port)
+    }
+
+    @Test
     fun malformedPayloads_areRejected() {
         val badPayloads = mapOf(
             "wrong scheme" to "https://example.com/pair?v=1",
@@ -90,7 +104,6 @@ class PairingRepositoryTest {
             "duplicate fingerprint" to pairingUri() + "&f=${ByteArray(32) { 9 }.toBase64Url()}",
             "duplicate secret" to pairingUri() + "&s=${ByteArray(32) { 9 }.toBase64Url()}",
             "duplicate name" to pairingUri() + "&n=Other",
-            "unknown field" to pairingUri() + "&token=surprise",
             "fingerprint padding" to pairingUri(fingerprint = ByteArray(32) { 7 }.toBase64Url() + "="),
             "malformed percent escape" to pairingUri(name = "Bad%ZZname"),
             "invalid UTF-8 escape" to pairingUri(name = "%FF"),
@@ -143,6 +156,42 @@ class PairingRepositoryTest {
         assertTrue(
             PairingPayload.parse(
                 pairingUri(version = "2", relayHost = "desk-1234.relay.example.com"),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
+    }
+
+    @Test
+    fun irohPayloadIsExclusiveWithAitermRelayMetadata() {
+        val node = "a".repeat(64)
+        val parsed = parsedPayload(
+            pairingUri(
+                networkStack = "iroh",
+                irohNodeId = node,
+                irohRelayUrl = "https%3A%2F%2Frelay.example.com",
+            ),
+            scannedAt,
+        )
+        assertEquals(RemoteNetworkStack.IROH, parsed.networkStack)
+        assertEquals(node, parsed.irohNodeId)
+        assertEquals("https://relay.example.com", parsed.irohRelayUrl)
+        assertEquals(null, parsed.relayEndpoint)
+
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(
+                    version = "2",
+                    relayHost = "desktop.relay.example.com",
+                    relayPort = 443,
+                    networkStack = "iroh",
+                    irohNodeId = node,
+                ),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(networkStack = "aiterm", irohNodeId = node),
                 scannedAt,
             ) is PairingPayloadResult.Rejected,
         )

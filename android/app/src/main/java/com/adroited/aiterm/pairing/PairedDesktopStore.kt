@@ -60,14 +60,21 @@ object PairedDesktopJson {
                 desktop.displayName.length > 128 ||
                 desktop.displayName.any(Char::isISOControl) ||
                 desktop.hosts.isEmpty() ||
-                desktop.hosts.size > 8 ||
+                desktop.hosts.size > 16 ||
                 desktop.hosts.any { !PairingPayload.isValidHost(it) } ||
                 desktop.port !in 1..65_535 ||
                 !PairingPayload.isValidFingerprint(desktop.serverSpkiFingerprint) ||
                 desktop.lastSeenEpochMillis?.let { it < 0 } == true ||
                 ((desktop.relayHost == null) != (desktop.relayPort == null)) ||
                 desktop.relayHost?.let { !PairingPayload.isValidHost(it) } == true ||
-                desktop.relayPort?.let { it !in 1..65_535 } == true
+                desktop.relayPort?.let { it !in 1..65_535 } == true ||
+                (desktop.networkStack == RemoteNetworkStack.IROH) != (desktop.irohNodeId != null) ||
+                (desktop.networkStack == RemoteNetworkStack.IROH && desktop.relayHost != null) ||
+                (desktop.networkStack == RemoteNetworkStack.AITERM && desktop.irohRelayUrl != null) ||
+                desktop.irohNodeId?.let {
+                    it.length !in 16..256 || it.any { char -> char.isWhitespace() || char.isISOControl() }
+                } == true ||
+                desktop.irohRelayUrl?.let { !PairingPayload.isValidIrohRelayUrl(it) } == true
             ) {
                 throw PairedDesktopStoreException("paired desktop storage contains invalid records")
             }

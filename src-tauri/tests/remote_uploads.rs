@@ -1469,10 +1469,7 @@ fn an_incomplete_member_resumes_at_the_acknowledged_chunk_on_a_new_attachment() 
 
     let replacement_attachment = AttachmentId::new();
     request.attachment_id = replacement_attachment.clone();
-    let resumed = fixture
-        .uploads
-        .begin(Some(&fixture.cwd), request)
-        .unwrap();
+    let resumed = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
 
     assert_eq!(resumed.upload_id, began.upload_id);
     assert_eq!(resumed.next_chunk, 1);

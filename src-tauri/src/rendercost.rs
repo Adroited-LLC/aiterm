@@ -60,7 +60,10 @@ fn parse_gfx(fdinfo: &str) -> Option<(u64, u64)> {
             // amdgpu spells it `drm-engine-gfx`; the value carries a "ns" unit
             // suffix on some drivers, so take the leading number only.
             "drm-engine-gfx" => {
-                gfx = value.split_whitespace().next().and_then(|n| n.parse::<u64>().ok())
+                gfx = value
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<u64>().ok())
             }
             _ => {}
         }
@@ -131,11 +134,11 @@ fn gpu_ms_for(pid: u32) -> Option<u64> {
             continue;
         }
         let name = fd.file_name();
-        let info = match fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", name.to_string_lossy()))
-        {
-            Ok(i) => i,
-            Err(_) => continue,
-        };
+        let info =
+            match fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", name.to_string_lossy())) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
         if let Some((client, gfx)) = parse_gfx(&info) {
             if !seen.iter().any(|(c, _)| *c == client) {
                 seen.push((client, gfx));
@@ -162,7 +165,11 @@ pub fn renderer_probe() -> Probe {
         .and_then(|s| parse_cpu_ticks(&s))
         .map(|ticks| ticks * 1000 / clock_hz())
         .unwrap_or(0);
-    Probe { cpu_ms, gpu_ms: gpu_ms_for(pid), ok: true }
+    Probe {
+        cpu_ms,
+        gpu_ms: gpu_ms_for(pid),
+        ok: true,
+    }
 }
 
 #[cfg(test)]

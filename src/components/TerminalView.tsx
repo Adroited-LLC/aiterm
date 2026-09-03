@@ -68,6 +68,10 @@ export interface TermTab {
    *  no engine — a plain shell — which is the same answer as an engine that is
    *  no longer registered: capable of nothing. */
   agentId?: string;
+  /** The tab this one was brought into — a second agent's tab nests under
+   *  its master in the strip's second row rather than standing in the first.
+   *  Renderer-local: the registry does not know parentage. */
+  parentKey?: TabId;
   /** Dedupe key linking this terminal to a sidebar item: a session id for
    *  resumes, "shell:<path>" for project shells. One terminal per slot. */
   slotId: string;

@@ -30,6 +30,8 @@ fun AitermApp(vm: AppViewModel) {
         if (!(vm.browsing && vm.browseUp())) vm.showFiles = false
     }
     BackHandler(enabled = vm.composingNew) { vm.composingNew = false }
+    // Back leaves the terminal screen; the shell keeps running on the desktop.
+    BackHandler(enabled = vm.terminalTab != null) { vm.terminalTab = null }
     BackHandler(enabled = vm.selected != null && !vm.composingNew && !vm.showFiles && vm.viewing == null) { vm.select(null) }
 
     Scaffold(
@@ -45,6 +47,7 @@ fun AitermApp(vm: AppViewModel) {
             vm.previewUrl != null -> PreviewScreen(vm, vm.previewUrl!!, padding)
             vm.showSettings -> SettingsScreen(vm, padding)
             vm.composingNew -> NewSessionScreen(vm, padding)
+            vm.terminalTab != null -> TerminalScreen(vm, vm.terminalTab!!, padding)
             vm.starting != null -> StartingScreen(vm, vm.starting!!, padding)
             vm.viewing != null -> FileViewer(vm, vm.viewing!!.first, vm.viewing!!.second, padding)
             vm.selected == null -> SessionsScreen(vm, padding)

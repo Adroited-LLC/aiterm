@@ -253,7 +253,8 @@ impl PtyManager {
                     // provider — the var is in no rc file on this machine, so a
                     // tab that does not get it handed over 401s against the local
                     // router. [observed: opencode.json + ~/.bashrc, 2026-08-31]
-                    if let Some((_, Some(env_name))) = crate::agents::opencode_provider_matching(p) {
+                    if let Some((_, Some(env_name))) = crate::agents::opencode_provider_matching(p)
+                    {
                         cmd.env(env_name, &p.api_key);
                     }
                 }

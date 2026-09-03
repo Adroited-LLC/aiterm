@@ -102,9 +102,7 @@ const ADDITIVE_ROOTS: &[&str] = &["permissions", "hooks"];
 /// after `flatten` means arrays.
 fn is_merged(key: &str, set_in: &[SetIn]) -> bool {
     let root = key.split('.').next().unwrap_or(key);
-    ADDITIVE_ROOTS.contains(&root)
-        && set_in.len() > 1
-        && set_in.iter().all(|s| s.value.is_array())
+    ADDITIVE_ROOTS.contains(&root) && set_in.len() > 1 && set_in.iter().all(|s| s.value.is_array())
 }
 
 /// Walk an object into dotted leaves. Arrays are leaves: `permissions.deny` is
@@ -116,9 +114,18 @@ fn is_merged(key: &str, set_in: &[SetIn]) -> bool {
 /// once it is folded into the joined `key` string there is no way to tell a
 /// key that legitimately contains a dot from a path that merely has several
 /// segments.
-fn flatten(prefix: &str, prefix_ambiguous: bool, map: &Map<String, Value>, out: &mut Vec<(String, Value, bool)>) {
+fn flatten(
+    prefix: &str,
+    prefix_ambiguous: bool,
+    map: &Map<String, Value>,
+    out: &mut Vec<(String, Value, bool)>,
+) {
     for (k, v) in map {
-        let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        let key = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
         let ambiguous = prefix_ambiguous || k.contains('.');
         match v {
             Value::Object(inner) if !inner.is_empty() => flatten(&key, ambiguous, inner, out),
@@ -156,7 +163,10 @@ pub fn resolve(layers: &[(LayerId, &str)]) -> (Vec<Setting>, Vec<String>) {
             if !found.contains_key(&key) {
                 order.push(key.clone());
             }
-            found.entry(key.clone()).or_default().push(SetIn { layer: *id, value });
+            found
+                .entry(key.clone())
+                .or_default()
+                .push(SetIn { layer: *id, value });
             ambiguous.insert(key, is_ambiguous);
         }
     }
@@ -213,7 +223,10 @@ mod tests {
         // "project overrides user" is the display this exists for.
         let (s, _) = resolve(&layered());
         let layers: Vec<_> = find(&s, "model").set_in.iter().map(|x| x.layer).collect();
-        assert_eq!(layers, vec![LayerId::User, LayerId::Project, LayerId::ProjectLocal]);
+        assert_eq!(
+            layers,
+            vec![LayerId::User, LayerId::Project, LayerId::ProjectLocal]
+        );
     }
 
     #[test]
@@ -249,8 +262,14 @@ mod tests {
         // permissions.deny is concatenated across sources, so both lists are in
         // force. aiterm relies on the same additivity for its SessionStart hook.
         let (s, _) = resolve(&[
-            (LayerId::User, r#"{"permissions": {"deny": ["Bash(rm:*)"]}}"#),
-            (LayerId::Project, r#"{"permissions": {"deny": ["Read(.env)"]}}"#),
+            (
+                LayerId::User,
+                r#"{"permissions": {"deny": ["Bash(rm:*)"]}}"#,
+            ),
+            (
+                LayerId::Project,
+                r#"{"permissions": {"deny": ["Read(.env)"]}}"#,
+            ),
         ]);
         assert!(find(&s, "permissions.deny").merged);
     }
@@ -274,7 +293,10 @@ mod tests {
         // the most local layer really does win, root membership notwithstanding.
         let (s, _) = resolve(&[
             (LayerId::User, r#"{"permissions": {"defaultMode": "ask"}}"#),
-            (LayerId::Project, r#"{"permissions": {"defaultMode": "auto"}}"#),
+            (
+                LayerId::Project,
+                r#"{"permissions": {"defaultMode": "auto"}}"#,
+            ),
         ]);
         assert!(!find(&s, "permissions.defaultMode").merged);
     }
@@ -282,7 +304,10 @@ mod tests {
     #[test]
     fn nested_objects_are_flattened_to_dotted_keys() {
         let (s, _) = resolve(&[(LayerId::User, r#"{"permissions": {"deny": ["Bash"]}}"#)]);
-        assert_eq!(find(&s, "permissions.deny").effective, serde_json::json!(["Bash"]));
+        assert_eq!(
+            find(&s, "permissions.deny").effective,
+            serde_json::json!(["Bash"])
+        );
     }
 
     #[test]
@@ -290,7 +315,11 @@ mod tests {
         // permissions.deny is a list of rules; walking into it would produce
         // permissions.deny.0 and lose the shape the user recognises.
         let (s, _) = resolve(&[(LayerId::User, r#"{"a": {"b": [1, 2]}}"#)]);
-        assert!(s.iter().all(|x| x.key != "a.b.0"), "{:?}", s.iter().map(|x| &x.key).collect::<Vec<_>>());
+        assert!(
+            s.iter().all(|x| x.key != "a.b.0"),
+            "{:?}",
+            s.iter().map(|x| &x.key).collect::<Vec<_>>()
+        );
     }
 
     #[test]

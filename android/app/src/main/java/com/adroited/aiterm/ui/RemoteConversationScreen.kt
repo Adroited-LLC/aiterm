@@ -1729,6 +1729,7 @@ private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aite
             com.adroited.aiterm.remote.RemotePath.RELAY -> "connected · relay"
             com.adroited.aiterm.remote.RemotePath.LAN -> "connected · LAN"
             com.adroited.aiterm.remote.RemotePath.VPN -> "connected · VPN"
+            com.adroited.aiterm.remote.RemotePath.IROH -> "connected · Iroh"
             else -> "connected"
         } to MaterialTheme.colorScheme.tertiary
         ConnectionState.Connecting -> "connecting" to MaterialTheme.colorScheme.primary

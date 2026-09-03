@@ -233,9 +233,18 @@ struct DetailSession {
 /// `state.input.filePath`). There is no OpenCode session on this machine
 /// to read one off, so the reader takes every field as optional and says
 /// nothing where a field is missing.
-pub(crate) fn parse_detail(id: &str, session_json: &str, rows_json: &str) -> crate::detail::SessionDetail {
-    use crate::detail::{iso_from_ms, note_message, push_unique, top_tools, touch_file, SessionDetail};
-    let mut d = SessionDetail { id: id.to_string(), ..Default::default() };
+pub(crate) fn parse_detail(
+    id: &str,
+    session_json: &str,
+    rows_json: &str,
+) -> crate::detail::SessionDetail {
+    use crate::detail::{
+        iso_from_ms, note_message, push_unique, top_tools, touch_file, SessionDetail,
+    };
+    let mut d = SessionDetail {
+        id: id.to_string(),
+        ..Default::default()
+    };
     if let Ok(rows) = serde_json::from_str::<Vec<DetailSession>>(session_json.trim()) {
         if let Some(s) = rows.into_iter().next() {
             d.cwd = s.directory.filter(|x| !x.is_empty());
@@ -262,12 +271,23 @@ pub(crate) fn parse_detail(id: &str, session_json: &str, rows_json: &str) -> cra
         }
     };
     for r in rows {
-        let Ok(part) = serde_json::from_str::<serde_json::Value>(&r.part_data) else { continue };
-        let new_message = current.as_ref().map(|c| c.0 != r.message_id).unwrap_or(true);
+        let Ok(part) = serde_json::from_str::<serde_json::Value>(&r.part_data) else {
+            continue;
+        };
+        let new_message = current
+            .as_ref()
+            .map(|c| c.0 != r.message_id)
+            .unwrap_or(true);
         if new_message {
             flush(&mut current, &mut d);
-            let Ok(m) = serde_json::from_str::<serde_json::Value>(&r.message_data) else { continue };
-            let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let Ok(m) = serde_json::from_str::<serde_json::Value>(&r.message_data) else {
+                continue;
+            };
+            let role = m
+                .get("role")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if let Some(ms) = m.pointer("/time/created").and_then(|x| x.as_u64()) {
                 let iso = iso_from_ms(ms);
                 if d.started.as_deref().is_none_or(|s| iso.as_str() < s) {
@@ -294,7 +314,9 @@ pub(crate) fn parse_detail(id: &str, session_json: &str, rows_json: &str) -> cra
         }
         match part.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
-                if let (Some(cur), Some(text)) = (current.as_mut(), part.get("text").and_then(|t| t.as_str())) {
+                if let (Some(cur), Some(text)) =
+                    (current.as_mut(), part.get("text").and_then(|t| t.as_str()))
+                {
                     if !cur.2.is_empty() {
                         cur.2.push('\n');
                     }
@@ -306,9 +328,13 @@ pub(crate) fn parse_detail(id: &str, session_json: &str, rows_json: &str) -> cra
                 let name = part.get("tool").and_then(|t| t.as_str()).unwrap_or("tool");
                 *tools.entry(name.to_string()).or_insert(0) += 1;
                 if matches!(name, "edit" | "write" | "patch" | "multiedit") {
-                    if let Some(fp) = ["/state/input/filePath", "/state/input/path", "/state/input/file_path"]
-                        .iter()
-                        .find_map(|p| part.pointer(p).and_then(|x| x.as_str()))
+                    if let Some(fp) = [
+                        "/state/input/filePath",
+                        "/state/input/path",
+                        "/state/input/file_path",
+                    ]
+                    .iter()
+                    .find_map(|p| part.pointer(p).and_then(|x| x.as_str()))
                     {
                         touch_file(&mut d.files, fp);
                     }
@@ -440,6 +466,47 @@ pub(crate) fn parse_session_model(json: &str) -> Option<(String, String)> {
 /// archived session is still OpenCode's even though it does not appear in the
 /// sidebar, and claiming otherwise would send it to whichever backend guessed
 /// next.
+/// Is the session's newest assistant message still an open turn?
+///
+/// OpenCode writes `time.completed` onto the assistant message when the turn
+/// ends; while the model is answering the field is NULL and the row updates as
+/// parts stream in. [observed: opencode 1.18.25, read off the db at 1s polling
+/// through a 40s turn]
+///
+/// The answer is `(turn_open, directory)` rather than a verdict, because the
+/// NULL alone must not be believed: a killed run leaves `time.completed` NULL
+/// forever, so the caller pairs it with process liveness — and the directory
+/// is what a fresh launch (whose argv names no session id yet) can be matched
+/// by.
+pub(crate) fn open_turn(session_id: &str) -> Option<(bool, Option<String>)> {
+    if !valid_id(session_id) {
+        return None;
+    }
+    let sql = format!(
+        "select (json_extract(m.data, '$.time.completed') is null) as open, \
+                s.directory as directory \
+         from message m join session s on s.id = m.session_id \
+         where m.session_id = '{session_id}' \
+           and json_extract(m.data, '$.role') = 'assistant' \
+         order by m.time_created desc limit 1"
+    );
+    query(&sql).and_then(|json| parse_open_turn(&json))
+}
+
+/// sqlite3's JSON for the query above → `(turn_open, directory)`. No assistant
+/// row yet — a session before its first reply — is no answer, not "idle": the
+/// caller falls through to whatever other signals it has.
+pub(crate) fn parse_open_turn(json: &str) -> Option<(bool, Option<String>)> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        open: Option<i64>,
+        directory: Option<String>,
+    }
+    let rows: Vec<Row> = serde_json::from_str(json.trim()).ok()?;
+    let r = rows.into_iter().next()?;
+    Some((r.open == Some(1), r.directory))
+}
+
 pub fn has_session(session_id: &str) -> bool {
     if !valid_id(session_id) {
         return false;
@@ -985,21 +1052,45 @@ mod detail_tests {
         assert_eq!(d.cwd.as_deref(), Some("/w"));
         assert_eq!(d.title.as_deref(), Some("Fix the thing"));
         assert_eq!(d.started.as_deref(), Some("2026-08-29T01:32:24.650Z"));
-        assert_eq!(d.last_active.as_deref(), Some("2026-08-29T01:40:00.000Z"), "the session row's update time outlasts the last message");
-        assert_eq!(d.models, vec!["claude-sonnet-4", "gpt-5"], "the transcript's models, in order of first use");
-        assert_eq!((d.user_messages, d.assistant_messages), (1, 1), "a tool-only message is not a reply");
+        assert_eq!(
+            d.last_active.as_deref(),
+            Some("2026-08-29T01:40:00.000Z"),
+            "the session row's update time outlasts the last message"
+        );
+        assert_eq!(
+            d.models,
+            vec!["claude-sonnet-4", "gpt-5"],
+            "the transcript's models, in order of first use"
+        );
+        assert_eq!(
+            (d.user_messages, d.assistant_messages),
+            (1, 1),
+            "a tool-only message is not a reply"
+        );
         assert_eq!(d.first_prompt.as_deref(), Some("fix the thing"));
-        assert_eq!(d.last_assistant.as_deref(), Some("On it\n— done."), "a reply split across parts is one turn");
+        assert_eq!(
+            d.last_assistant.as_deref(),
+            Some("On it\n— done."),
+            "a reply split across parts is one turn"
+        );
         assert_eq!(d.tool_calls, 2);
         assert_eq!(d.tools[0].name, "bash");
         assert_eq!(d.files, vec!["/w/a.rs"]);
-        assert_eq!(d.context_tokens, Some(1250), "last assistant turn's input side");
+        assert_eq!(
+            d.context_tokens,
+            Some(1250),
+            "last assistant turn's input side"
+        );
         assert_eq!(d.output_tokens, 50);
     }
 
     #[test]
     fn a_bare_session_row_falls_back_to_its_declared_model() {
-        let d = parse_detail("ses_x", r#"[{"directory":"/w","title":"t","time_created":1,"time_updated":2,"model":"openai/gpt-5","permission":"ask"}]"#, "");
+        let d = parse_detail(
+            "ses_x",
+            r#"[{"directory":"/w","title":"t","time_created":1,"time_updated":2,"model":"openai/gpt-5","permission":"ask"}]"#,
+            "",
+        );
         assert_eq!(d.models, vec!["openai/gpt-5"]);
         assert_eq!(d.permission_mode.as_deref(), Some("ask"));
         assert_eq!(d.user_messages, 0);
@@ -1405,10 +1496,7 @@ mod tests {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&database)
             .unwrap();
-        let held_path = std::path::PathBuf::from(format!(
-            "/proc/self/fd/{}",
-            held.as_raw_fd()
-        ));
+        let held_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
         let mut connection = rusqlite::Connection::open_with_flags(
             held_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -1442,10 +1530,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn opencode_delete_cannot_open_a_replacement_during_a_leaf_aba() {
-        let root = std::env::temp_dir().join(format!(
-            "aiterm-opencode-leaf-aba-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-opencode-leaf-aba-{}", uuid::Uuid::new_v4()));
         let database = root.join("store/opencode.db");
         let held_original = root.join("store/held-original.db");
         let replacement = root.join("store/replacement.db");

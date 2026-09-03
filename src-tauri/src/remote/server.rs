@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
+use tauri::Manager;
 
 const CERT_FILE: &str = "gateway-cert.der";
 const KEY_FILE: &str = "gateway-key.der";
@@ -1396,6 +1397,22 @@ struct SessionConversationRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SessionSpineRequest {
+    session_id: String,
+    #[serde(default)]
+    after: u64,
+}
+
+#[derive(Serialize)]
+struct SessionSpinePayload {
+    epoch: u64,
+    live: bool,
+    has_more: bool,
+    events: Vec<crate::spine::SpineEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionWebPreviewRequest {
     session_id: String,
     open: bool,
@@ -1419,6 +1436,27 @@ const MAX_CONVERSATION_MESSAGES: usize = 512;
 const MAX_CONVERSATION_MESSAGE_BYTES: usize = 64 * 1024;
 const CONVERSATION_OMISSION: &str = "[… earlier turns omitted for phone view …]";
 const CONVERSATION_TRUNCATION: &str = "\n[… message truncated for phone view …]";
+const MAX_SPINE_TEXT_BYTES: usize = 512 * 1024;
+
+fn bound_remote_spine_event(mut event: crate::spine::SpineEvent) -> crate::spine::SpineEvent {
+    let text = match &mut event.kind {
+        crate::spine::Kind::UserMessage { text, .. }
+        | crate::spine::Kind::AgentText { text, .. }
+        | crate::spine::Kind::AgentThought { text, .. } => Some(text),
+        _ => None,
+    };
+    if let Some(text) = text {
+        if text.len() > MAX_SPINE_TEXT_BYTES {
+            let mut end = MAX_SPINE_TEXT_BYTES - CONVERSATION_TRUNCATION.len();
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str(CONVERSATION_TRUNCATION);
+        }
+    }
+    event
+}
 
 /// Shape only the remote phone conversation response to the limits enforced
 /// by the Android decoder. The shared transcript parser and every desktop
@@ -2697,6 +2735,30 @@ impl RemoteServices {
                     request_id,
                     "session.conversation",
                     &SessionConversationPayload { messages },
+                )?]))
+            }
+            "session.spine" => {
+                let payload: SessionSpineRequest = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                let app = self.app.as_ref().ok_or("remote.unsupported")?;
+                crate::spine::ensure_tail_for(app, &payload.session_id);
+                let spine = app
+                    .try_state::<Arc<crate::spine::Spine>>()
+                    .ok_or("remote.unsupported")?;
+                let (has_more, events) =
+                    spine.page_after(&payload.session_id, payload.after, 700 * 1024);
+                let events = events.into_iter().map(bound_remote_spine_event).collect();
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.spine",
+                    &SessionSpinePayload {
+                        epoch: spine.epoch(),
+                        live: spine.is_live(&payload.session_id),
+                        has_more,
+                        events,
+                    },
                 )?]))
             }
             "session.changes" => {

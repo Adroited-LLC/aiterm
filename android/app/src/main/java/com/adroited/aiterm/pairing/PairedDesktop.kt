@@ -3,6 +3,12 @@ package com.adroited.aiterm.pairing
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
+@Serializable
+enum class RemoteNetworkStack {
+    @SerialName("aiterm") AITERM,
+    @SerialName("iroh") IROH,
+}
+
 /**
  * A desktop this phone has already enrolled with.
  *
@@ -26,4 +32,10 @@ data class PairedDesktop(
     val relayHost: String? = null,
     @SerialName("relay_port")
     val relayPort: Int? = null,
+    @SerialName("network_stack")
+    val networkStack: RemoteNetworkStack = RemoteNetworkStack.AITERM,
+    @SerialName("iroh_node_id")
+    val irohNodeId: String? = null,
+    @SerialName("iroh_relay_url")
+    val irohRelayUrl: String? = null,
 )

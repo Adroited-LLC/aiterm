@@ -1296,7 +1296,7 @@ fn js_string_after(s: &str, key: &str) -> Option<String> {
 
 /// A tool call's input, as a person would skim it: the command for Bash,
 /// the path for file tools, the pattern for searches, else the JSON.
-fn tool_input_summary(input: Option<&serde_json::Value>) -> String {
+pub(crate) fn tool_input_summary(input: Option<&serde_json::Value>) -> String {
     let Some(i) = input else { return String::new() };
     for key in [
         "command",
