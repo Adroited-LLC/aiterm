@@ -148,6 +148,7 @@ Three inputs:
   attention, with the reason `permission`), antigravity's step types,
   codex's open turn that has written nothing for 45 s (`approval`),
   opencode's store. Returns the verdict and a short reason, or nothing.
+  For agy it also reads `~/.gemini/antigravity-cli/cli.log` — see below.
 - **The spine's own turn bracket** — whether the adapter's last
   `turn_started` / `turn_ended` left a turn open. `Spine::push` records it
   wherever an event enters the log, so no path can route around it, and
@@ -207,6 +208,48 @@ verdict can no longer flip on its own, and before it, codex's 45 s
 staleness rule still can. Cadence and the turn bracket are re-read every
 tick regardless: a terminal falling quiet is the one change a cached
 transcript cannot see.
+
+### Antigravity's invisible permission prompt
+
+agy is the one engine whose "waiting on a person" state reaches none of its
+own records. It writes the `PLANNER_RESPONSE` carrying the tool call and
+then nothing at all while its TUI holds a confirmation dialog — no `ask_*`
+tool, no further step, no change to the transcript. Observed live: a
+`run_command` sat on its dialog for minutes while the spine read `working`
+[observed: agy 1.1.24, 2026-09-02].
+
+The only record is one line in agy's own log:
+
+```
+I0902 21:38:28.616360  492 tool_confirmation_manager.go:197] Surfacing tool confirmation: "RunCommand" at step 2
+```
+
+So the agy arm answers `("attention", "permission")` when both hold:
+
+1. the transcript ends on an open call — a `PLANNER_RESPONSE` with
+   `tool_calls` and no `GENERIC` result step after it, and
+2. `cli.log`'s last 64 KB carries a `Surfacing tool confirmation` line
+   stamped later than the transcript's mtime.
+
+Answering the prompt writes the result step, which moves the transcript's
+mtime past the log line, and the verdict falls back to `working` on its
+own. `cli.log` is a symlink into `log/cli-<stamp>.log` re-pointed on every
+run, and both the stat and the read follow it, so a confirmation from a
+previous run is never seen.
+
+Two things to know about this signal. glog writes no year and no zone, so
+the timestamp is parsed as local civil time through `mktime` (which is what
+knows this machine's zone and its DST rule) with the current year, minus
+one if that would put the line in the future. And **the log carries no
+conversation id**: with two agy TUIs open at once, one prompt would read as
+attention on both sessions that have an open call. One at a time is the
+normal case; a spurious "come and look" costs a glance, where the
+alternative is missing every real one.
+
+`cli.log` is registered in `phase_sources`, so the tick's mtime gate
+re-reads when the log moves. agy writes to it constantly, which in practice
+means an agy session's verdict is never skipped while one is running — its
+transcript is a few KB, so that read stays cheap.
 
 The tick is a second rather than two because idle has to land within about
 one. A tick that finds nothing changed is two `stat` calls and a compare —

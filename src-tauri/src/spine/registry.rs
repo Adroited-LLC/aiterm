@@ -518,6 +518,14 @@ fn phase_sources(session_id: &str) -> Vec<PathBuf> {
     if let Some(dir) = path.parent().filter(|d| d.file_name().is_some_and(|n| n == session_id)) {
         out.push(dir.join("events.jsonl"));
     }
+    // agy's permission dialogs never reach its transcript — the only record
+    // is a line in its own log, so the tick has to notice that moving too.
+    // agy writes to it constantly, which means an agy session's verdict is
+    // effectively never skipped while one is running. Its transcript is a
+    // few KB, so that read is cheap; see `antigravity_confirmation_after`.
+    if path.to_string_lossy().contains("/antigravity-cli/brain/") {
+        out.extend(crate::remote_api::antigravity_log_path());
+    }
     out.push(path);
     out
 }

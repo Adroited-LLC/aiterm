@@ -1240,6 +1240,7 @@ fn router(app: AppHandle) -> Router {
         .route("/v1/search", get(search))
         .route("/v1/files", get(file))
         .route("/v1/sessions", get(sessions).post(new_session))
+        .route("/v1/tabs", get(tabs))
         .route("/v1/sessions/{id}/artifacts", get(artifacts))
         .route("/v1/sessions/{id}/files", get(session_files))
         .route("/v1/sessions/{id}/changes", get(session_changes))
@@ -1914,6 +1915,139 @@ fn antigravity_transcript_state(text: &str) -> Option<Option<&'static str>> {
     verdict
 }
 
+/// Whether agy's transcript ends on a tool call whose result has not
+/// landed: the last step is a `PLANNER_RESPONSE` carrying `tool_calls`,
+/// with no `GENERIC` (the result) after it. That is the only shape a
+/// confirmation dialog can be sitting behind.
+fn antigravity_open_call(text: &str) -> bool {
+    let mut open = false;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("PLANNER_RESPONSE") => {
+                open = v
+                    .get("tool_calls")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|c| !c.is_empty());
+            }
+            // The result landing, or a new prompt, closes it.
+            Some("GENERIC") | Some("USER_INPUT") => open = false,
+            _ => {}
+        }
+    }
+    open
+}
+
+/// agy's own log. A symlink into `log/cli-<stamp>.log` re-pointed on each
+/// run; `metadata` and `File::open` both follow it, so this always reads
+/// the current run's file.
+pub(crate) fn antigravity_log_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".gemini/antigravity-cli/cli.log"))
+}
+
+/// The time in a glog header, as ms since the epoch.
+///
+/// `I0902 21:38:28.616360` is September 2nd at 21:38:28.616 LOCAL time —
+/// glog writes no year and no zone. The year is this one, minus one when
+/// that would place the line in the future (a December log read in
+/// January). The line may be prefixed by agy's
+/// `ERROR: logging before google.Init: `, so the header is found rather
+/// than assumed to be first.
+fn glog_time_ms(line: &str) -> Option<u64> {
+    let mut fields = line.split_whitespace();
+    let stamp = loop {
+        let field = fields.next()?;
+        // `I` + MMDD: the severity letter and the date, glued.
+        let (Some(sev), true) = (field.chars().next(), field.len() == 5) else { continue };
+        if !matches!(sev, 'I' | 'W' | 'E' | 'F') || !field[1..].bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        break field;
+    };
+    let month: i32 = stamp[1..3].parse().ok()?;
+    let day: i32 = stamp[3..5].parse().ok()?;
+    let clock = fields.next()?;
+    let mut parts = clock.split(':');
+    let hour: i32 = parts.next()?.parse().ok()?;
+    let minute: i32 = parts.next()?.parse().ok()?;
+    // `unwrap_or` evaluates its argument, so the field is taken once and
+    // then split — asking `parts` for it twice consumed the iterator.
+    let seconds = parts.next()?;
+    let (sec, frac) = seconds.split_once('.').unwrap_or((seconds, "0"));
+    let second: i32 = sec.parse().ok()?;
+    // glog writes microseconds; take whatever precision is actually there.
+    let millis: u64 = format!("{frac:0<3}")[..3].parse().ok()?;
+
+    // `mktime` is what turns a local civil time into an instant: it knows
+    // this machine's zone and its DST rule, which no amount of arithmetic
+    // here would. `tm_isdst = -1` asks it to work out which side of a
+    // transition the time falls on.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let year = unsafe {
+        let t = now as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return None;
+        }
+        tm.tm_year
+    };
+    let at = |year: i32| -> Option<u64> {
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            tm.tm_year = year;
+            tm.tm_mon = month - 1;
+            tm.tm_mday = day;
+            tm.tm_hour = hour;
+            tm.tm_min = minute;
+            tm.tm_sec = second;
+            tm.tm_isdst = -1;
+            let t = libc::mktime(&mut tm);
+            (t != -1).then(|| t as u64 * 1000 + millis)
+        }
+    };
+    let this_year = at(year)?;
+    // More than a day ahead means the log rolled over a new year under us.
+    if this_year > (now + 86_400) * 1000 {
+        return at(year - 1);
+    }
+    Some(this_year)
+}
+
+/// Is agy sitting on a tool confirmation right now?
+///
+/// A permission dialog is INVISIBLE to the transcript: agy writes the
+/// `PLANNER_RESPONSE` carrying the call and then nothing at all — no
+/// `ask_*` tool, no further step — while its TUI waits for a person. The
+/// only record anywhere is one line in agy's own log. Observed live: a
+/// `run_command` sat on its dialog for minutes while the spine read
+/// "working", with `tool_confirmation_manager.go:197] Surfacing tool
+/// confirmation: "RunCommand" at step 2` the sole evidence.
+/// [observed: agy 1.1.24, 2026-09-02]
+///
+/// `since_ms` is the transcript's mtime: a confirmation line NEWER than
+/// the last thing the transcript learned is one still unanswered, because
+/// answering it writes the result step and moves the transcript past it.
+///
+/// The log carries no conversation id, so this cannot say WHICH session
+/// was asked. One agy TUI at a time is the normal case and the signal is
+/// right for it; with two open, both sessions with an open call would read
+/// `attention` off one prompt. Accepted: a false "come and look" on a
+/// second session costs a glance, and the alternative is missing every
+/// real one.
+fn antigravity_confirmation_after(since_ms: u64) -> bool {
+    let Some(path) = antigravity_log_path() else { return false };
+    // 64 KB is many minutes of agy's chatter; the line we want is at the
+    // very end of the file when it matters at all.
+    let Some(text) = tail_of(&path, 64 * 1024) else { return false };
+    text.lines()
+        .filter(|l| l.contains("Surfacing tool confirmation"))
+        .filter_map(glog_time_ms)
+        .any(|at| at > since_ms)
+}
+
 /// When the transcript's verdict replaces what the terminal reported.
 /// Cadence may promote to working, but it must not HOLD working against a
 /// transcript that says a person is being waited on: codex's TUI keeps
@@ -2032,12 +2166,25 @@ pub(crate) fn transcript_verdict(session_id: &str) -> Option<(&'static str, &'st
     // knows none of them, so the verdict comes from the tail alone.
     // [observed: agy 1.1.24]
     if path.to_string_lossy().contains("/antigravity-cli/brain/") {
-        return tail_of(&path, 256 * 1024)
-            .and_then(|text| antigravity_transcript_state(&text))
-            .flatten()
-            // agy's only attention is an unanswered `ask_question` /
-            // `ask_permission` / `ask_custom_permission` call.
-            .map(|s| (s, if s == "attention" { "permission" } else { "" }));
+        let text = tail_of(&path, 256 * 1024)?;
+        let verdict = antigravity_transcript_state(&text).flatten();
+        // An open call plus a confirmation line newer than the transcript
+        // is a dialog still on screen — the one state agy's own records
+        // cannot express. See `antigravity_confirmation_after`.
+        if verdict == Some("working") && antigravity_open_call(&text) {
+            let written = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if antigravity_confirmation_after(written) {
+                return Some(("attention", "permission"));
+            }
+        }
+        // agy's other attention is an unanswered `ask_question` /
+        // `ask_permission` / `ask_custom_permission` call.
+        return verdict.map(|s| (s, if s == "attention" { "permission" } else { "" }));
     }
     let stale = std::fs::metadata(&path)
         .ok()
@@ -2434,6 +2581,43 @@ async fn terminal_open(State(ctx): State<Ctx>, Json(b): Json<TerminalOpenBody>) 
 /// The screen as text: scrollback tail plus the visible rows, one string
 /// per row, wide-cell continuations skipped. Colors and styles stay on the
 /// desktop — the phone gets what the terminal says, not how it looks.
+#[derive(Serialize)]
+struct TabRow {
+    tab: String,
+    slot: String,
+    title: String,
+    agent: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    running: bool,
+}
+
+/// Every tab the desktop holds, so a phone can name one.
+///
+/// `/v1/terminal/{tab}/screen` has always existed, but a tab id is minted
+/// on the desktop and appeared in no answer — so an engine stuck before it
+/// has written anything (codex asking whether to trust a directory, with no
+/// rollout yet for `/v1/sessions` to list) could be neither seen nor
+/// answered from the phone. Read-only: opening, writing and closing tabs
+/// already have their own routes.
+async fn tabs(State(ctx): State<Ctx>) -> Response {
+    let registry = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
+    let rows: Vec<TabRow> = registry
+        .list()
+        .into_iter()
+        .map(|t| TabRow {
+            tab: t.id().as_str().to_string(),
+            slot: t.slot_id().to_string(),
+            title: t.title().to_string(),
+            agent: t.agent_id().map(str::to_owned),
+            session_id: t.session_id().map(str::to_owned),
+            cwd: t.cwd().map(str::to_owned),
+            running: *t.state() == crate::tabs::TabState::Running,
+        })
+        .collect();
+    Json(rows).into_response()
+}
+
 async fn terminal_screen(State(ctx): State<Ctx>, Path(tab): Path<String>) -> Response {
     let tabs = ctx.app.state::<std::sync::Arc<crate::tabs::TabRegistry>>();
     let snap = match tabs.snapshot(&crate::tabs::TabId::from_raw(tab)) {
@@ -2943,6 +3127,50 @@ mod tests {
     /// The spine's turn bracket is the authority over cadence. A closed
     /// turn means a TUI's repaints no longer read as work; an open one, and
     /// a session no adapter reports turns for, leave the rule as it was.
+    /// A verbatim line from `~/.gemini/antigravity-cli/cli.log`, agy's
+    /// prefix and all. glog writes no year and no zone, so the assertion
+    /// is a round trip through this machine's own zone rather than a
+    /// constant that would only hold in one place.
+    #[test]
+    fn a_glog_header_parses_back_to_the_local_time_it_names() {
+        const LINE: &str = "ERROR: logging before google.Init: I0902 21:38:28.616360     492 tool_confirmation_manager.go:197] Surfacing tool confirmation: \"RunCommand\" at step 2";
+        let ms = glog_time_ms(LINE).expect("a glog header is in there");
+        assert_eq!(ms % 1000, 616, "microseconds land as milliseconds");
+        let (mon, day, h, mi, s) = unsafe {
+            let t = (ms / 1000) as libc::time_t;
+            let mut tm: libc::tm = std::mem::zeroed();
+            assert!(!libc::localtime_r(&t, &mut tm).is_null());
+            (tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+        };
+        assert_eq!((mon, day, h, mi, s), (9, 2, 21, 38, 28));
+
+        // The header is found, not assumed to be the first field.
+        assert_eq!(glog_time_ms("I0902 21:38:28.616360 492 x.go:1] hi"), Some(ms));
+        // Other severities, and a shorter fraction.
+        assert!(glog_time_ms("W1231 00:00:00.5 1 x.go:1] hi").is_some());
+        // Nothing that looks like a header.
+        assert_eq!(glog_time_ms("just a line of text"), None);
+        assert_eq!(glog_time_ms(""), None);
+        assert_eq!(glog_time_ms("I09022 21:38:28.616360 1 x.go:1] hi"), None);
+    }
+
+    /// The shape a confirmation dialog sits behind: a call issued with no
+    /// result after it. Anything that lands closes it.
+    #[test]
+    fn an_agy_call_is_open_only_until_its_result_lands() {
+        let call = r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command"}]}"#;
+        let result = r#"{"type":"GENERIC","content":"ok"}"#;
+        let answer = r#"{"type":"PLANNER_RESPONSE","content":"done"}"#;
+        let prompt = r#"{"type":"USER_INPUT","content":"go"}"#;
+        assert!(antigravity_open_call(&format!("{prompt}\n{call}\n")));
+        assert!(!antigravity_open_call(&format!("{prompt}\n{call}\n{result}\n")));
+        assert!(!antigravity_open_call(&format!("{prompt}\n{call}\n{answer}\n")));
+        assert!(!antigravity_open_call(prompt));
+        assert!(!antigravity_open_call(""));
+        // A second call after a landed result re-opens it.
+        assert!(antigravity_open_call(&format!("{call}\n{result}\n{call}\n")));
+    }
+
     #[test]
     fn a_closed_turn_stops_cadence_from_claiming_work() {
         // Some(false): the answer is finished, whatever the pty is doing.
@@ -3201,3 +3429,4 @@ mod tests {
         assert_eq!(grok_events_state(""), None);
     }
 }
+
