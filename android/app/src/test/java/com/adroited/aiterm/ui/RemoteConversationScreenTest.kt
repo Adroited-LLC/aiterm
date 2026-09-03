@@ -132,6 +132,8 @@ class RemoteConversationScreenTest {
     fun toolRowsUseReadableLabelsAndSingleLineSummaries() {
         assertEquals("Command", conversationActivityLabel("exec"))
         assertEquals("File edit", conversationActivityLabel("apply_patch"))
+        assertEquals("Output", conversationActivityLabel("tool_output"))
+        assertEquals("Agent message", conversationActivityLabel("agent_message"))
         assertEquals("Read file", conversationActivityLabel("read_file"))
         assertEquals("cargo test --all", conversationActivitySummary("cargo test\n  --all"))
         assertTrue(conversationActivitySummary("x".repeat(200)).endsWith("…"))

@@ -181,6 +181,7 @@ class RemoteClient(
     val scrollback: StateFlow<List<ScreenRow>> = mutableScrollback.asStateFlow()
     private val lifecycleLock = Any()
     private val selectionMutex = Mutex()
+    private val terminalSubmissionMutex = Mutex()
     private val transfers = linkedSetOf<String>()
     private val terminalAssembler = TerminalTransferAssembler()
     private val rosterAssembler = RosterTransferAssembler()
@@ -346,6 +347,50 @@ class RemoteClient(
             observeAcceptedResponse(batch.lifecycleGeneration, batch.transport, response)
         }
         return true
+    }
+
+    /**
+     * Sends a composed terminal submission one part at a time, waiting for the desktop to accept
+     * the pasted text before sending Enter. Interactive TUIs may process a paste asynchronously;
+     * pacing the submit key prevents it from being consumed before the paste becomes editable.
+     */
+    suspend fun submitInputs(tabId: String, texts: List<String>): Boolean {
+        if (tabId.isBlank() || texts.isEmpty()) return false
+        val encoded = texts.map { text ->
+            if (text.isEmpty()) return false
+            text.encodeToByteArray().also { if (it.size > MAX_INPUT_BYTES) return false }
+        }
+        return terminalSubmissionMutex.withLock {
+            encoded.forEachIndexed { index, data ->
+                val input = synchronized(lifecycleLock) {
+                    if (mutableState.value.focus != FocusOwner.Self) {
+                        mutableState.value = mutableState.value.copy(readOnly = true, showTakeFocus = true)
+                        return@withLock false
+                    }
+                    if (mutableState.value.activeTabId != tabId) return@withLock false
+                    val attachmentId = activeAttachmentId ?: return@withLock false
+                    if (activeAttachmentTabId != tabId) return@withLock false
+                    val active = transport ?: return@withLock false
+                    TerminalInputContext(lifecycleGeneration, active, attachmentId)
+                }
+                val response = input.transport.request(
+                    "terminal.input",
+                    RemoteCommands.input(tabId, input.attachmentId, data),
+                ).await()
+                val accepted = response is RemoteResponse.Success && response.kind == "terminal.input"
+                if (!accepted || synchronized(lifecycleLock) {
+                        !isCurrent(input.lifecycleGeneration, input.transport) ||
+                            mutableState.value.activeTabId != tabId ||
+                            activeAttachmentTabId != tabId ||
+                            activeAttachmentId != input.attachmentId
+                    }
+                ) {
+                    return@withLock false
+                }
+                if (index < encoded.lastIndex) delay(TERMINAL_SUBMIT_SETTLE_MILLIS)
+            }
+            true
+        }
     }
 
     /**
@@ -679,7 +724,11 @@ class RemoteClient(
                 if (mutableState.value.previewLoadingSessionId == sessionId) {
                     mutableState.value = mutableState.value.copy(
                         previewLoadingSessionId = null,
-                        previewError = "The desktop is disconnected.",
+                        previewError = if (mutableState.value.connection == ConnectionState.Connected) {
+                            "Conversation refresh is busy. Retrying…"
+                        } else {
+                            "The desktop is disconnected."
+                        },
                     )
                 }
             }
@@ -942,14 +991,13 @@ class RemoteClient(
             RequestContext(lifecycleGeneration, active)
         }
         val response = requestContext.transport.request(kind, payload)
-        observeAcceptedResponse(
+        return observeAcceptedResponse(
             generation = requestContext.lifecycleGeneration,
             active = requestContext.transport,
             response = response,
             onSuccess = onSuccess,
             onError = onError,
         )
-        return true
     }
 
     private suspend fun requestResource(kind: String, payload: ByteArray): ByteArray {
@@ -973,19 +1021,21 @@ class RemoteClient(
         response: Deferred<RemoteResponse>,
         onSuccess: (ByteArray) -> Unit = {},
         onError: ((String, String) -> Unit)? = null,
-    ) {
-        launchOwned(generation) {
+    ): Boolean {
+        val accepted = launchOwned(generation) {
             try {
                 when (val result = response.await()) {
                     is RemoteResponse.Error -> {
                         synchronized(lifecycleLock) {
                             if (isCurrent(generation, active)) onError?.invoke(result.code, result.message)
                         }
-                        accept(
-                            generation,
-                            RemoteServerEvent.Failure(result.code, result.message),
-                            active,
-                        )
+                        if (onError == null) {
+                            accept(
+                                generation,
+                                RemoteServerEvent.Failure(result.code, result.message),
+                                active,
+                            )
+                        }
                     }
                     is RemoteResponse.Success -> synchronized(lifecycleLock) {
                         if (isCurrent(generation, active)) {
@@ -1001,13 +1051,17 @@ class RemoteClient(
                         onError?.invoke("protocol.invalid_response", error.message ?: "Invalid desktop response")
                     }
                 }
-                acceptRequestFailure(
-                    generation,
-                    active,
-                    error,
-                )
+                if (onError == null || error is RemoteTransportTerminatedException) {
+                    acceptRequestFailure(
+                        generation,
+                        active,
+                        error,
+                    )
+                }
             }
         }
+        if (!accepted) active.abandonRequest(response)
+        return accepted
     }
 
     private fun acceptRequestFailure(
@@ -1385,6 +1439,11 @@ class RemoteClient(
     }
 
     private data class RequestContext(val lifecycleGeneration: Long, val transport: RemoteTransport)
+    private data class TerminalInputContext(
+        val lifecycleGeneration: Long,
+        val transport: RemoteTransport,
+        val attachmentId: String,
+    )
     private data class RequestBatchContext(
         val lifecycleGeneration: Long,
         val transport: RemoteTransport,
@@ -1420,6 +1479,7 @@ class RemoteClient(
         const val MAX_OWNED_JOBS = 64
         const val UPLOAD_CLEANUP_TIMEOUT_MILLIS = 2_000L
         const val UPLOAD_RESUME_TIMEOUT_MILLIS = 2 * 60_000L
+        const val TERMINAL_SUBMIT_SETTLE_MILLIS = 75L
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }

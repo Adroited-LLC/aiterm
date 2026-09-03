@@ -247,7 +247,7 @@ class RemoteTerminalViewModel(
                 paths = paths,
                 bracketedPaste = latestScreen.modes.bracketedPaste,
             )
-            if (!client.sendInputs(activeScreen.tabId, outbound)) {
+            if (!client.submitInputs(activeScreen.tabId, outbound)) {
                 return Result.failure(IllegalStateException("The terminal did not accept the message."))
             }
             delay(350)

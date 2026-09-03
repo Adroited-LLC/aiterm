@@ -163,10 +163,7 @@ fun RemoteDesktopScreen(
                 state = state,
                 session = selected,
                 onBack = { page = PAGE_SESSIONS },
-                onRefresh = {
-                    viewModel.previewSession(selected.id)
-                    viewModel.client.refreshSessions()
-                },
+                onRefresh = { viewModel.previewSession(selected.id) },
                 onSend = viewModel::sendConversationPrompt,
                 onBringIn = viewModel.client::bringInSession,
                 onLoadFiles = viewModel::sessionChanges,
@@ -1713,6 +1710,8 @@ internal fun conversationActivityLabel(role: String): String = when (role.lowerc
     "exec", "exec_command", "bash", "shell" -> "Command"
     "apply_patch", "edit", "write" -> "File edit"
     "image" -> "Image generation"
+    "tool_output" -> "Output"
+    "agent_message" -> "Agent message"
     else -> role.replace('_', ' ').trim().replaceFirstChar(Char::uppercase).ifBlank { "Tool" }
 }
 
