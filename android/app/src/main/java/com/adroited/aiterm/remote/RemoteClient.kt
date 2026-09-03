@@ -50,6 +50,10 @@ data class RemoteClientState(
     val sessionActivity: Map<String, String> = emptyMap(),
     val usage: List<RemoteUsageSource> = emptyList(),
     val previewSessionId: String? = null,
+    val previewItems: List<Item> = emptyList(),
+    val previewPhase: SpinePhase = SpinePhase.Idle,
+    val previewPhaseDetail: String = "",
+    val previewLive: Boolean = true,
     val previewMessages: List<RemotePreviewMessage> = emptyList(),
     val previewLoadingSessionId: String? = null,
     val previewError: String? = null,
@@ -718,19 +722,25 @@ class RemoteClient(
             },
             onSuccess = { payload ->
                 val page = RemoteCommands.spinePage(payload)
-                val messages = store.apply(page)
-                val activity = store.phase?.let { phase ->
+                val items = store.apply(page)
+                val activity = if (store.phaseSeen) {
                     mutableState.value.sessionActivity + (
-                        sessionId to when (phase) {
-                            "working" -> "output"
-                            "needs_you" -> "attention"
-                            else -> "idle"
+                        sessionId to when (store.phase) {
+                            SpinePhase.Working -> "output"
+                            SpinePhase.NeedsYou -> "attention"
+                            SpinePhase.Idle -> "idle"
                         }
                     )
-                } ?: mutableState.value.sessionActivity
+                } else {
+                    mutableState.value.sessionActivity
+                }
                 mutableState.value = mutableState.value.copy(
                     previewSessionId = sessionId,
-                    previewMessages = messages,
+                    previewItems = items,
+                    previewPhase = store.phase,
+                    previewPhaseDetail = store.phaseDetail,
+                    previewLive = store.live,
+                    previewMessages = store.asPreviewMessages(),
                     previewLoadingSessionId = null,
                     previewError = null,
                     sessionActivity = activity,
@@ -766,9 +776,16 @@ class RemoteClient(
                 )
             },
             onSuccess = { payload ->
+                val messages = RemoteCommands.sessionPreview(payload)
+                val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
+                store.legacy(messages)
                 mutableState.value = mutableState.value.copy(
                     previewSessionId = sessionId,
-                    previewMessages = RemoteCommands.sessionPreview(payload),
+                    previewItems = store.items,
+                    previewPhase = store.phase,
+                    previewPhaseDetail = store.phaseDetail,
+                    previewLive = store.live,
+                    previewMessages = messages,
                     previewLoadingSessionId = null,
                     previewError = null,
                 )

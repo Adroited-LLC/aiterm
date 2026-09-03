@@ -42,88 +42,243 @@ internal data class SpineConversationPage(
     val events: List<SpineEventWire>,
 )
 
-/** Incrementally projects spine events onto the conversation rows already used by Compose. */
+enum class ToolCategory(val wire: String) {
+    Read("read"), Edit("edit"), Execute("execute"), Search("search"), Fetch("fetch"), Think("think"), Other("other");
+
+    companion object {
+        /** A newer desktop category must degrade to a drawable generic tool. */
+        fun from(value: String?): ToolCategory = entries.firstOrNull { it.wire == value } ?: Other
+    }
+}
+
+enum class ToolStatus(val wire: String) {
+    Pending("pending"), Running("running"), Completed("completed"), Failed("failed"), Cancelled("cancelled");
+
+    val settled: Boolean get() = this == Completed || this == Failed || this == Cancelled
+
+    companion object {
+        fun from(value: String?): ToolStatus = entries.firstOrNull { it.wire == value } ?: Pending
+    }
+}
+
+enum class SpinePhase(val wire: String) {
+    Working("working"), NeedsYou("needs_you"), Idle("idle");
+
+    companion object {
+        fun from(value: String?): SpinePhase = entries.firstOrNull { it.wire == value } ?: Working
+    }
+}
+
+sealed interface SpineKind {
+    data class UserMessage(val id: String, val text: String) : SpineKind
+    data class AgentText(val id: String, val text: String, val done: Boolean) : SpineKind
+    data class AgentThought(val id: String, val text: String, val done: Boolean) : SpineKind
+    data class ToolCall(
+        val id: String, val tool: String, val title: String, val category: ToolCategory,
+        val input: String, val status: ToolStatus,
+    ) : SpineKind
+    data class ToolCallUpdate(val id: String, val status: ToolStatus, val output: String?) : SpineKind
+    data class TurnStarted(val turn: String) : SpineKind
+    data class TurnEnded(val turn: String, val reason: String) : SpineKind
+    data class PhaseChanged(val phase: SpinePhase, val detail: String) : SpineKind
+    data object Reset : SpineKind
+}
+
+data class SpineEvent(
+    val seq: Long,
+    val epoch: Long,
+    val sessionId: String,
+    val agent: String,
+    val ts: Long,
+    val kind: SpineKind,
+)
+
+/** One typed, stable-key row in the API conversation. */
+sealed interface Item {
+    val key: String
+
+    data class User(val id: String, val text: String, val ts: Long) : Item { override val key: String get() = id }
+    data class AgentText(val id: String, val text: String, val done: Boolean, val ts: Long) : Item { override val key: String get() = id }
+    data class Thought(val id: String, val text: String, val done: Boolean, val ts: Long) : Item { override val key: String get() = id }
+    data class Tool(
+        val id: String, val tool: String, val title: String, val category: ToolCategory,
+        val input: String, val status: ToolStatus, val output: String?, val ts: Long,
+    ) : Item { override val key: String get() = id }
+    data class TurnEnd(val turn: String, val reason: String) : Item { override val key: String get() = TURN_KEY_PREFIX + turn }
+
+    companion object { const val TURN_KEY_PREFIX = "\u0000turn:" }
+}
+
+enum class Offer { Applied, Gap, Stale, EpochChanged }
+
+/** Incrementally applies spine pages without rebuilding unchanged rows. */
 internal class SpineConversationStore {
-    private val rows = ArrayList<RemotePreviewMessage>()
-    private val rowIds = ArrayList<String>()
+    private val rows = ArrayList<Item>()
     private val rowIndex = HashMap<String, Int>()
+    private var snapshot: List<Item> = emptyList()
+    private var dirty = false
 
-    var epoch: Long = 0
-        private set
-    var lastSeq: Long = 0
-        private set
-    var live: Boolean = false
-        private set
-    var phase: String? = null
-        private set
+    var epoch: Long = 0L; private set
+    var lastSeq: Long = 0L; private set
+    var live: Boolean = true; private set
+    var phase: SpinePhase = SpinePhase.Idle; private set
+    var phaseDetail: String = ""; private set
+    var phaseSeen: Boolean = false; private set
+    var currentTurn: String? = null; private set
 
-    fun apply(page: SpineConversationPage): List<RemotePreviewMessage> {
-        if (epoch != 0L && page.epoch != 0L && page.epoch != epoch) clear()
-        if (page.epoch != 0L) epoch = page.epoch
-        live = page.live
-        page.events.sortedBy { it.seq }.forEach { event ->
-            if (event.seq <= lastSeq) return@forEach
-            if (event.kind == "reset") clearRows()
-            else applyEvent(event)
-            lastSeq = event.seq
+    val items: List<Item>
+        get() {
+            if (dirty) { snapshot = ArrayList(rows); dirty = false }
+            return snapshot
         }
-        return rows.toList()
+
+    fun apply(page: SpineConversationPage): List<Item> {
+        replay(page.epoch, page.live, page.events.mapNotNull(::parse))
+        return items
     }
 
     fun clear() {
-        clearRows()
-        epoch = 0
-        lastSeq = 0
-        live = false
-        phase = null
+        rows.clear(); rowIndex.clear(); dirty = true
+        epoch = 0L; lastSeq = 0L; live = true
+        phase = SpinePhase.Idle; phaseDetail = ""; phaseSeen = false
+        currentTurn = null
     }
 
-    private fun clearRows() {
-        rows.clear()
-        rowIds.clear()
-        rowIndex.clear()
+    fun tool(id: String): Item.Tool? = rowIndex[id]?.let { rows[it] as? Item.Tool }
+
+    fun offer(event: SpineEvent): Offer {
+        if (epoch != 0L && event.epoch != 0L && event.epoch != epoch) return Offer.EpochChanged
+        if (epoch == 0L) epoch = event.epoch
+        if (event.seq <= lastSeq) return Offer.Stale
+        if (event.seq > lastSeq + 1) return Offer.Gap
+        applyEvent(event); lastSeq = event.seq
+        return Offer.Applied
     }
 
-    private fun applyEvent(event: SpineEventWire) {
-        when (event.kind) {
-            "user_message" -> upsert(event, "user", event.text.orEmpty())
-            "agent_text" -> upsert(event, "assistant", event.text.orEmpty())
-            "agent_thought" -> upsert(event, "thinking", event.text.orEmpty())
-            "tool_call" -> {
-                val title = event.title?.takeIf(String::isNotBlank)
-                    ?: event.tool?.takeIf(String::isNotBlank)
-                    ?: "Tool"
-                val detail = event.input?.takeIf(String::isNotBlank)
-                upsert(event, "tool.${event.category ?: "other"}", listOfNotNull(title, detail).joinToString("\n"))
+    fun replay(epoch: Long, live: Boolean, events: List<SpineEvent>) {
+        if (this.epoch != 0L && epoch != 0L && epoch != this.epoch) clear()
+        if (epoch != 0L) this.epoch = epoch
+        this.live = live
+        replay(events)
+    }
+
+    fun replay(events: List<SpineEvent>) {
+        events.sortedBy { it.seq }.forEach { event ->
+            if (event.seq <= lastSeq) return@forEach
+            if (epoch == 0L) epoch = event.epoch
+            applyEvent(event); lastSeq = event.seq
+        }
+    }
+
+    /** Adds an immediate local bubble; the desktop's real event retires the oldest echo. */
+    fun echoUser(text: String, ts: Long) {
+        upsert(Item.User(ECHO_PREFIX + ts + "-" + rows.size, text, ts))
+    }
+
+    /** Maps an older desktop transcript onto the same typed rows. */
+    fun legacy(messages: List<RemotePreviewMessage>) {
+        rows.clear(); rowIndex.clear(); dirty = true; live = false
+        messages.forEachIndexed { index, message ->
+            val id = "legacy-$index"
+            val timestamp = message.at?.toLongOrNull() ?: 0L
+            val item = when (message.role) {
+                "user" -> Item.User(id, message.text, timestamp)
+                "assistant" -> Item.AgentText(id, message.text, true, timestamp)
+                "thinking" -> Item.Thought(id, message.text, true, timestamp)
+                else -> Item.Tool(
+                    id, message.role, message.role, categoryOf(message.role),
+                    message.text.lineSequence().firstOrNull { it.isNotBlank() }?.trim().orEmpty(),
+                    ToolStatus.Completed, message.text, timestamp,
+                )
             }
-            "tool_call_update" -> updateTool(event)
-            "phase" -> phase = event.phase
+            rowIndex[id] = rows.size; rows += item
         }
     }
 
-    private fun upsert(event: SpineEventWire, role: String, text: String) {
-        val id = event.id ?: return
-        val message = RemotePreviewMessage(role, text, event.ts.takeIf { it > 0 }?.toString())
-        val index = rowIndex[id]
+    fun asPreviewMessages(): List<RemotePreviewMessage> = items.mapNotNull { item ->
+        when (item) {
+            is Item.User -> RemotePreviewMessage("user", item.text, item.ts.takeIf { it > 0 }?.toString())
+            is Item.AgentText -> RemotePreviewMessage("assistant", item.text, item.ts.takeIf { it > 0 }?.toString())
+            is Item.Thought -> RemotePreviewMessage("thinking", item.text, item.ts.takeIf { it > 0 }?.toString())
+            is Item.Tool -> RemotePreviewMessage(
+                "tool.${item.category.wire}",
+                listOfNotNull(
+                    item.title.takeIf(String::isNotBlank), item.input.takeIf(String::isNotBlank),
+                    item.status.wire.replace('_', ' '), item.output?.takeIf(String::isNotBlank),
+                ).joinToString("\n"),
+                item.ts.takeIf { it > 0 }?.toString(),
+            )
+            is Item.TurnEnd -> null
+        }
+    }
+
+    private fun applyEvent(event: SpineEvent) {
+        when (val kind = event.kind) {
+            is SpineKind.UserMessage -> upsert(Item.User(kind.id, kind.text, event.ts)) { dropOldestEcho() }
+            is SpineKind.AgentText -> upsert(Item.AgentText(kind.id, kind.text, kind.done, event.ts))
+            is SpineKind.AgentThought -> upsert(Item.Thought(kind.id, kind.text, kind.done, event.ts))
+            is SpineKind.ToolCall -> upsert(Item.Tool(kind.id, kind.tool, kind.title, kind.category, kind.input, kind.status, tool(kind.id)?.output, event.ts))
+            is SpineKind.ToolCallUpdate -> {
+                val current = tool(kind.id) ?: return
+                upsert(current.copy(status = kind.status, output = kind.output ?: current.output))
+            }
+            is SpineKind.TurnStarted -> currentTurn = kind.turn
+            is SpineKind.TurnEnded -> { currentTurn = null; upsert(Item.TurnEnd(kind.turn, kind.reason)) }
+            is SpineKind.PhaseChanged -> { phase = kind.phase; phaseDetail = kind.detail; phaseSeen = true }
+            SpineKind.Reset -> { rows.clear(); rowIndex.clear(); dirty = true; currentTurn = null }
+        }
+    }
+
+    private fun upsert(item: Item, onInsert: () -> Unit = {}) {
+        dirty = true
+        val index = rowIndex[item.key]
         if (index == null) {
-            rowIndex[id] = rows.size
-            rowIds += id
-            rows += message
+            onInsert()
+            rowIndex[item.key] = rows.size
+            rows += item
         } else {
-            rows[index] = message
+            rows[index] = item
         }
     }
 
-    private fun updateTool(event: SpineEventWire) {
-        val id = event.id ?: return
-        val index = rowIndex[id] ?: return
-        val current = rows[index]
-        val status = event.status?.replace('_', ' ')?.takeIf(String::isNotBlank)
-        val output = event.output?.takeIf(String::isNotBlank)
-        val suffix = listOfNotNull(status, output).joinToString("\n")
-        if (suffix.isNotEmpty()) {
-            val base = current.text.substringBefore("\n$status")
-            rows[index] = current.copy(text = "$base\n$suffix")
+    private fun dropOldestEcho() {
+        val index = rows.indexOfFirst { it is Item.User && it.id.startsWith(ECHO_PREFIX) }
+        if (index < 0) return
+        rows.removeAt(index)
+        rowIndex.clear()
+        rows.forEachIndexed { row, item -> rowIndex[item.key] = row }
+    }
+
+    private fun parse(event: SpineEventWire): SpineEvent? {
+        val kind = when (event.kind) {
+            "user_message" -> SpineKind.UserMessage(event.id ?: return null, event.text.orEmpty())
+            "agent_text" -> SpineKind.AgentText(event.id ?: return null, event.text.orEmpty(), event.done ?: false)
+            "agent_thought" -> SpineKind.AgentThought(event.id ?: return null, event.text.orEmpty(), event.done ?: false)
+            "tool_call" -> SpineKind.ToolCall(event.id ?: return null, event.tool.orEmpty(), event.title.orEmpty(), ToolCategory.from(event.category), event.input.orEmpty(), ToolStatus.from(event.status))
+            "tool_call_update" -> SpineKind.ToolCallUpdate(event.id ?: return null, ToolStatus.from(event.status), event.output)
+            "turn_started" -> SpineKind.TurnStarted(event.turn.orEmpty())
+            "turn_ended" -> SpineKind.TurnEnded(event.turn.orEmpty(), event.reason ?: "unknown")
+            "phase" -> SpineKind.PhaseChanged(SpinePhase.from(event.phase), event.detail.orEmpty())
+            "reset" -> SpineKind.Reset
+            else -> return null
+        }
+        return SpineEvent(event.seq, event.epoch, event.sessionId, event.agent, event.ts, kind)
+    }
+
+    companion object {
+        private const val ECHO_PREFIX = "\u0000echo-"
+
+        fun categoryOf(tool: String): ToolCategory {
+            val value = tool.lowercase()
+            return when {
+                "read" in value || "notebook" in value || "cat" in value -> ToolCategory.Read
+                "edit" in value || "write" in value || "patch" in value || "apply" in value -> ToolCategory.Edit
+                "bash" in value || "shell" in value || "exec" in value || "terminal" in value || "command" in value -> ToolCategory.Execute
+                "grep" in value || "glob" in value || "search" in value || "find" in value -> ToolCategory.Search
+                "fetch" in value || "web" in value || "http" in value || "browser" in value -> ToolCategory.Fetch
+                "think" in value || "reason" in value || "plan" in value -> ToolCategory.Think
+                else -> ToolCategory.Other
+            }
         }
     }
 }

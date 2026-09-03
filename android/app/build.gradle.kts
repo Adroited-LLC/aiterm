@@ -50,8 +50,14 @@ android {
         applicationId = "com.adroited.aiterm"
         minSdk = 26
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
+
+        // Our native QUIC bridge is ARM64-only. Declaring the supported ABI
+        // also prevents dependency AARs from advertising unusable variants.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -119,6 +125,8 @@ dependencies {
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
     implementation(libs.compose.material.icons.extended)
+    implementation(libs.coil.compose)
+    implementation(libs.coil.svg)
 
     // Task 8: QR enrollment scans the aiterm://pair payload with CameraX + ML Kit.
     implementation(libs.androidx.camera.core)
@@ -142,9 +150,13 @@ dependencies {
 
     // Optional network stack selected at pairing time. It carries the same
     // pinned TLS/WebSocket protocol as the native AITerm stack.
-    implementation("computer.iroh:iroh-android:1.1.0") {
+    implementation("computer.iroh:iroh:1.1.0") {
         exclude(group = "net.java.dev.jna", module = "jna")
     }
+    // Maven's iroh-android 1.1.0 predates upstream's Android 16 KB page-size
+    // fix. This ARM64 AAR is rebuilt reproducibly from the same v1.1.0 tag;
+    // replace it with the first compatible upstream release when published.
+    implementation(files("libs/iroh-android-1.1.0-page16-arm64.aar"))
     implementation("net.java.dev.jna:jna:5.15.0@aar")
 
     debugImplementation(libs.compose.ui.tooling)
