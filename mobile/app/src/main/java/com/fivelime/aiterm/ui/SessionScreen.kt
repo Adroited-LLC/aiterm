@@ -98,6 +98,8 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import kotlinx.coroutines.flow.first
@@ -220,8 +222,10 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
         }
     }
 
+    // Where the composer sits, so a tap there keeps the keyboard.
+    var barBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
     Scaffold(
-        modifier = Modifier.padding(outer).imePadding().dismissKeyboardOnTap(),
+        modifier = Modifier.padding(outer).imePadding().dismissKeyboardOnTapOutside { barBounds },
         containerColor = Bg,
         topBar = {
             TopAppBar(
@@ -285,7 +289,7 @@ fun SessionScreen(vm: AppViewModel, s: Session, outer: PaddingValues) {
             )
         },
         bottomBar = {
-            Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
+            Column(Modifier.fillMaxWidth().navigationBarsPadding().onGloballyPositioned { barBounds = it.boundsInRoot() }) {
             vm.relays[s.id]?.let { r -> RelayBanner(vm, s, r) }
             // A brought-in agent parked on a prompt is invisible from here —
             // its dialog lives in its own terminal. Say so on the master's

@@ -2,6 +2,12 @@ package com.fivelime.aiterm.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.compose.foundation.layout.ime
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -230,6 +236,32 @@ fun Modifier.dismissKeyboardOnTap(): Modifier {
             detectTapGestures(onTap = { focus.clearFocus(); kb?.hide() })
         },
     )
+}
+
+/** A finger landing anywhere but `keep` (the composer, in root
+ *  coordinates) puts the keyboard away. Seen on the INITIAL pass — before
+ *  the message rows, tool cards and links, all of which take the tap for
+ *  themselves, so a tap-after-the-fact never arrived and the back button
+ *  was the only way down [John, 2026-09-03]. Nothing is consumed: the row
+ *  still gets its tap, the keyboard just goes first. */
+@Composable
+fun Modifier.dismissKeyboardOnTapOutside(keep: () -> androidx.compose.ui.geometry.Rect?): Modifier {
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
+    val kb = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val imeUp = androidx.compose.foundation.layout.WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
+    var coords by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<androidx.compose.ui.layout.LayoutCoordinates?>(null) }
+    return this
+        .onGloballyPositioned { coords = it }
+        .pointerInput(imeUp) {
+            if (!imeUp) return@pointerInput
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                val at = coords?.localToRoot(down.position) ?: return@awaitEachGesture
+                if (keep()?.contains(at) == true) return@awaitEachGesture
+                focus.clearFocus()
+                kb?.hide()
+            }
+        }
 }
 
 /** The vendor logo a model id implies: "anthropic/claude-sonnet-5" wears
