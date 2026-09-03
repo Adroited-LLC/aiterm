@@ -24,6 +24,8 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 
 interface RemoteBinarySocket {
+    val endpoint: RemoteEndpoint?
+        get() = null
     suspend fun receive(): ByteArray
     fun send(bytes: ByteArray): Boolean
     fun close()
@@ -32,6 +34,8 @@ interface RemoteBinarySocket {
 interface RemoteSocketDialer {
     suspend fun open(desktop: PairedDesktop): RemoteBinarySocket
 }
+
+data class RemoteEndpoint(val host: String, val port: Int)
 
 /** Authenticated, bounded, request-correlated remote protocol transport. */
 class AuthenticatedRemoteTransport(
@@ -43,6 +47,8 @@ class AuthenticatedRemoteTransport(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val beforeRequestEnqueue: () -> Unit = {},
 ) : RemoteTransport {
+    override val endpoint: RemoteEndpoint?
+        get() = synchronized(stateLock) { socket?.endpoint }
     private val eventChannel = Channel<RemoteServerEvent>(
         capacity = MAX_EVENTS,
         onBufferOverflow = BufferOverflow.SUSPEND,

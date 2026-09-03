@@ -514,6 +514,9 @@ pub trait PtyBackend: Send + Sync + 'static {
     fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<(), String>;
     fn kill(&self, id: u32);
     fn pty_for_descendant(&self, pid: u32) -> Option<u32>;
+    fn child_pid(&self, _id: u32) -> Option<u32> {
+        None
+    }
 }
 
 impl PtyBackend for PtyManager {
@@ -535,6 +538,10 @@ impl PtyBackend for PtyManager {
 
     fn pty_for_descendant(&self, pid: u32) -> Option<u32> {
         PtyManager::pty_for_descendant(self, pid)
+    }
+
+    fn child_pid(&self, id: u32) -> Option<u32> {
+        PtyManager::child_pid(self, id)
     }
 }
 
@@ -1499,6 +1506,30 @@ impl TabRegistry {
                 ))
             })
             .collect()
+    }
+
+    /// Root process for a live tab bound to this session. This is enough to
+    /// attribute a loopback listener without making the PTY manager aware of
+    /// sessions or remote-preview policy.
+    pub fn child_pid_for_session(&self, session_id: &str) -> Option<u32> {
+        let tabs = {
+            let maps = self.inner.maps.lock().ok()?;
+            maps.order
+                .iter()
+                .filter_map(|id| maps.by_id.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        tabs.into_iter().find_map(|tab| {
+            let live = tab.live.lock().ok()?;
+            let descriptor = &live.descriptor;
+            let matches = descriptor.state == TabState::Running
+                && (descriptor.session_id.as_deref() == Some(session_id)
+                    || descriptor.resumed_id.as_deref() == Some(session_id)
+                    || descriptor.slot_id == session_id);
+            let pty_id = matches.then(|| live.pty.id()).flatten()?;
+            drop(live);
+            self.inner.backend.child_pid(pty_id)
+        })
     }
 
     pub fn get(&self, id: &TabId) -> Result<TabDescriptor, TabError> {

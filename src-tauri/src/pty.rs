@@ -75,6 +75,10 @@ impl<T> PtyTable<T> {
             .unwrap_or_default()
     }
 
+    fn child_pid(&self, id: u32) -> Option<u32> {
+        self.entries.lock().ok()?.get(&id)?.child_pid
+    }
+
     fn with<R>(&self, id: u32, body: impl FnOnce(&mut T) -> R) -> Option<R> {
         let value = self.get(id)?;
         let mut value = value.lock().ok()?;
@@ -466,6 +470,12 @@ impl PtyManager {
             }
         }
         None
+    }
+
+    /// Direct child process for one PTY. Callers use it only as the root of
+    /// a bounded process-tree lookup; ownership remains here.
+    pub fn child_pid(&self, id: u32) -> Option<u32> {
+        self.ptys.child_pid(id)
     }
 }
 

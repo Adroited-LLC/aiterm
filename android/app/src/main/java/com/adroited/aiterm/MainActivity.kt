@@ -20,7 +20,8 @@ import com.adroited.aiterm.ui.AitermApp
 
 /**
  * The only Activity in the app. Every screen is a Compose destination inside
- * [AitermApp]; there is no WebView anywhere in this client.
+ * [AitermApp]. Terminal and conversation UI are native Compose; the only
+ * WebView is the explicit preview for a webpage built by a remote session.
  */
 class MainActivity : FragmentActivity() {
 

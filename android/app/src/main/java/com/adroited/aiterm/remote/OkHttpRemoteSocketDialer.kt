@@ -130,7 +130,11 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
             val listener = object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     reference.set(webSocket)
-                    val socket = OkHttpBinarySocket(reference, incoming)
+                    val socket = OkHttpBinarySocket(
+                        reference,
+                        incoming,
+                        RemoteEndpoint(url.host, url.port),
+                    )
                     if (opened.compareAndSet(null, socket) && continuation.isActive) {
                         continuation.resume(socket)
                     }
@@ -170,6 +174,7 @@ class OkHttpRemoteSocketDialer : RemoteSocketDialer {
     private class OkHttpBinarySocket(
         private val socket: AtomicReference<WebSocket?>,
         private val incoming: Channel<ByteArray>,
+        override val endpoint: RemoteEndpoint,
     ) : RemoteBinarySocket {
         override suspend fun receive(): ByteArray {
             val result = incoming.receiveCatching()

@@ -65,6 +65,7 @@ class RemoteClientTest {
 
         assertEquals(null, client.state.value.previewLoadingSessionId)
         assertEquals("Could not load it", client.state.value.previewError)
+        assertEquals(null, client.state.value.lastError)
         assertEquals(ConnectionState.Connected, client.state.value.connection)
         client.lock()
     }
@@ -114,6 +115,45 @@ class RemoteClientTest {
             RemoteCommands.input("tab-1", "attachment-1", "\r".encodeToByteArray()),
         )
         assertTrue(expected.zip(transport.requests.map { it.payload }).all { (a, b) -> a.contentEquals(b) })
+        client.lock()
+    }
+
+    @Test
+    fun terminalSubmissionWaitsForPasteAcceptanceAndSettleBeforeSendingEnter() = runTest {
+        val transport = FakeRemoteTransport()
+        val pasteAccepted = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            if (request.kind == "terminal.input" && transport.requests.count { it.kind == "terminal.input" } == 1) {
+                pasteAccepted
+            } else {
+                CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+            }
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val submission = async { client.submitInputs("tab-1", listOf("hello", "\r")) }
+        runCurrent()
+
+        assertEquals(1, transport.requests.size)
+        val paste = transport.requests.single()
+        pasteAccepted.complete(RemoteResponse.Success(paste.requestId, paste.kind, byteArrayOf()))
+        runCurrent()
+        assertEquals(1, transport.requests.size)
+
+        advanceTimeBy(75)
+        runCurrent()
+
+        assertTrue(submission.await())
+        assertEquals(listOf("terminal.input", "terminal.input"), transport.requests.map { it.kind })
+        assertArrayEquals(
+            RemoteCommands.input("tab-1", "attachment-1", "\r".encodeToByteArray()),
+            transport.requests.last().payload,
+        )
         client.lock()
     }
 

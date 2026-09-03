@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
+import okhttp3.HttpUrl
 
 class RemoteTerminalViewModel(
     initialDesktop: PairedDesktop,
@@ -136,6 +137,27 @@ class RemoteTerminalViewModel(
     suspend fun sessionChanges(id: String): Result<List<com.adroited.aiterm.remote.RemoteSessionChange>> =
         runCatching { client.sessionChanges(id) }
 
+    suspend fun hasWebPreview(id: String): Result<Boolean> =
+        runCatching { client.webPreview(id, open = false).available }
+
+    suspend fun openWebPreview(id: String): Result<String> = runCatching {
+        val preview = client.webPreview(id, open = true)
+        check(preview.available && preview.path != null) {
+            "This session does not have a webpage to preview yet."
+        }
+        val endpoint = client.state.value.connectedEndpoint
+            ?: error("The desktop is disconnected.")
+        HttpUrl.Builder()
+            .scheme("https")
+            .host(endpoint.host)
+            .port(endpoint.port)
+            .encodedPath(preview.path)
+            .build()
+            .toString()
+    }
+
+    fun desktopSpkiFingerprint(): String = desktop.serverSpkiFingerprint
+
     internal suspend fun sessionFilePreview(
         sessionId: String,
         path: String,
@@ -225,7 +247,7 @@ class RemoteTerminalViewModel(
                 paths = paths,
                 bracketedPaste = latestScreen.modes.bracketedPaste,
             )
-            if (!client.sendInputs(activeScreen.tabId, outbound)) {
+            if (!client.submitInputs(activeScreen.tabId, outbound)) {
                 return Result.failure(IllegalStateException("The terminal did not accept the message."))
             }
             delay(350)
