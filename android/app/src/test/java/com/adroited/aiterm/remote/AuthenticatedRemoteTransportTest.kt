@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.withTimeout
@@ -81,6 +82,163 @@ class AuthenticatedRemoteTransportTest {
         assertEquals(1, keys.signCount)
         assertEquals(1, socket.sent.size)
         assertTrue(socket.sent.single().isNotEmpty())
+        transport.close()
+    }
+
+    @Test
+    fun anAuthenticatedRelayConnectionUpgradesBeforePublishingTheTransport() = runTest {
+        val relayEndpoint = RemoteEndpoint("desktop.relay.example", 443)
+        val relay = FakeBinarySocket(relayEndpoint).apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+            incoming.trySend(
+                cborFixture(
+                    linkedMapOf(
+                        "version" to 1,
+                        "request_id" to 1,
+                        "kind" to "transport.direct",
+                        "payload" to cborFixture(
+                            linkedMapOf(
+                                "id" to "direct-id",
+                                "cookie" to "direct-cookie",
+                                "host" to "rendezvous.example",
+                                "port" to 443,
+                                "expires_in_millis" to 30_000,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
+        val direct = FakeBinarySocket(relayEndpoint).apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 4 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+        }
+        val keys = RecordingDeviceKeys()
+        val dialer = FakeDirectDialer(relay, direct)
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop().copy(relayHost = relayEndpoint.host, relayPort = relayEndpoint.port),
+            deviceKeys = keys,
+            appLock = unlockedAppLock(),
+            dialer = dialer,
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        transport.connect()
+
+        assertEquals(2, keys.signCount)
+        assertEquals("rendezvous.example", dialer.offer?.host)
+        assertEquals(2, relay.sent.size)
+        assertEquals(1, direct.sent.size)
+        assertTrue(relay.closed)
+        assertFalse(direct.closed)
+        transport.close()
+    }
+
+    @Test
+    fun failedQuicUpgradeKeepsTheAuthenticatedRelayAndAdvancesItsRequestId() = runTest {
+        val relayEndpoint = RemoteEndpoint("desktop.relay.example", 443)
+        val relay = FakeBinarySocket(relayEndpoint).apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+            incoming.trySend(
+                cborFixture(
+                    linkedMapOf(
+                        "version" to 1,
+                        "request_id" to 1,
+                        "kind" to "transport.direct",
+                        "payload" to cborFixture(
+                            linkedMapOf(
+                                "id" to "direct-id",
+                                "cookie" to "direct-cookie",
+                                "host" to "rendezvous.example",
+                                "port" to 443,
+                                "expires_in_millis" to 30_000,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop().copy(relayHost = relayEndpoint.host, relayPort = relayEndpoint.port),
+            deviceKeys = RecordingDeviceKeys(),
+            appLock = unlockedAppLock(),
+            dialer = FakeDirectDialer(relay, null),
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        transport.connect()
+        val response = transport.request("tab.list", byteArrayOf())
+        runCurrent()
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(2, "tab.list", byteArrayOf()))
+
+        assertEquals(2L, (response.await() as RemoteResponse.Success).requestId)
+        assertFalse(relay.closed)
+        assertEquals(3, relay.sent.size)
+        transport.close()
+    }
+
+    @Test
+    fun aSlowDirectAttemptDrainsRelayEventsBeforeFallingBack() = runTest {
+        val relayEndpoint = RemoteEndpoint("desktop.relay.example", 443, RemotePath.RELAY)
+        val relay = FakeBinarySocket(relayEndpoint).apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+            incoming.trySend(
+                cborFixture(
+                    linkedMapOf(
+                        "version" to 1,
+                        "request_id" to 1,
+                        "kind" to "transport.direct",
+                        "payload" to cborFixture(
+                            linkedMapOf(
+                                "id" to "direct-id",
+                                "cookie" to "direct-cookie",
+                                "host" to "rendezvous.example",
+                                "port" to 443,
+                                "expires_in_millis" to 30_000,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
+        val direct = CompletableDeferred<RemoteBinarySocket>()
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop().copy(relayHost = relayEndpoint.host, relayPort = relayEndpoint.port),
+            deviceKeys = RecordingDeviceKeys(),
+            appLock = unlockedAppLock(),
+            dialer = DeferredDirectDialer(relay, direct),
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        val connecting = async { transport.connect() }
+        runCurrent()
+        repeat(20) {
+            relay.incoming.trySend(
+                cborFixture(
+                    linkedMapOf(
+                        "version" to 1,
+                        "request_id" to 0,
+                        "kind" to "session.changed",
+                        "payload" to byteArrayOf(),
+                    ),
+                ),
+            )
+        }
+        runCurrent()
+        direct.completeExceptionally(RemoteProtocolException("direct path unavailable"))
+        advanceTimeBy(51)
+        runCurrent()
+        connecting.await()
+
+        val events = withTimeout(1_000) { transport.events.take(20).toList() }
+        assertEquals(20, events.size)
+        assertEquals(relayEndpoint, transport.endpoint)
+        assertFalse(relay.closed)
         transport.close()
     }
 
@@ -720,7 +878,7 @@ private class FakeDialer(private val socket: RemoteBinarySocket) : RemoteSocketD
     override suspend fun open(desktop: PairedDesktop): RemoteBinarySocket = socket
 }
 
-private class FakeBinarySocket : RemoteBinarySocket {
+private class FakeBinarySocket(override val endpoint: RemoteEndpoint? = null) : RemoteBinarySocket {
     val incoming = Channel<ByteArray>(Channel.UNLIMITED)
     val sent = mutableListOf<ByteArray>()
     var closed = false
@@ -734,6 +892,35 @@ private class FakeBinarySocket : RemoteBinarySocket {
         closed = true
         incoming.close()
     }
+}
+
+private class FakeDirectDialer(
+    private val relay: RemoteBinarySocket,
+    private val direct: RemoteBinarySocket?,
+) : DirectRemoteSocketDialer {
+    var offer: RemoteDirectOffer? = null
+
+    override suspend fun open(desktop: PairedDesktop): RemoteBinarySocket = relay
+
+    override suspend fun openDirect(
+        desktop: PairedDesktop,
+        offer: RemoteDirectOffer,
+    ): RemoteBinarySocket {
+        this.offer = offer
+        return direct ?: throw RemoteProtocolException("direct path unavailable")
+    }
+}
+
+private class DeferredDirectDialer(
+    private val relay: RemoteBinarySocket,
+    private val direct: CompletableDeferred<RemoteBinarySocket>,
+) : DirectRemoteSocketDialer {
+    override suspend fun open(desktop: PairedDesktop): RemoteBinarySocket = relay
+
+    override suspend fun openDirect(
+        desktop: PairedDesktop,
+        offer: RemoteDirectOffer,
+    ): RemoteBinarySocket = direct.await()
 }
 
 private class ReorderingBinarySocket : RemoteBinarySocket {

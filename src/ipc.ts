@@ -1162,6 +1162,13 @@ export const remoteStart = (address: string, port: number) =>
  *  turning remote access off is not the same statement as distrusting a phone. */
 export const remoteStop = () => invoke<RemoteStatus>("remote_stop");
 
+/** Persist whether the saved relay route should return when AITerm opens. */
+export const remoteStartOnLaunchSet = (
+  enabled: boolean,
+  address: string,
+  port: number,
+) => invoke<RemoteStatus>("remote_start_on_launch_set", { enabled, address, port });
+
 export const remoteRelayConfigure = (
   connectorUrl: string,
   publicHost: string,
@@ -1171,6 +1178,9 @@ export const remoteRelayConfigure = (
 ) => invoke<RemoteStatus>("remote_relay_configure", {
   connectorUrl, publicHost, publicPort, routeId, token,
 });
+
+export const remoteRelayServerSet = (server: string) =>
+  invoke<RemoteStatus>("remote_relay_server_set", { server });
 
 /** Asks a managed relay to mint one private route for this desktop. The
  * connector secret is returned directly to Rust and never enters JavaScript. */

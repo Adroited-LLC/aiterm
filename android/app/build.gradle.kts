@@ -1,7 +1,45 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+}
+
+val rustJniOutput = layout.buildDirectory.get().dir("generated/rustJniLibs/main").asFile
+val localProperties = Properties().apply {
+    val file = rootProject.layout.projectDirectory.file("local.properties").asFile
+    if (file.isFile) file.inputStream().use(::load)
+}
+val androidSdk = System.getenv("ANDROID_HOME")
+    ?: System.getenv("ANDROID_SDK_ROOT")
+    ?: localProperties.getProperty("sdk.dir")
+    ?: error("Android SDK path is required in ANDROID_HOME, ANDROID_SDK_ROOT, or local.properties")
+
+val buildRustQuic = tasks.register<Exec>("buildRustQuic") {
+    val bridge = rootProject.layout.projectDirectory.dir("quic-bridge")
+    workingDir(bridge)
+    environment(
+        "ANDROID_NDK_HOME",
+        System.getenv("ANDROID_NDK_HOME")
+            ?: "$androidSdk/ndk/27.0.12077973",
+    )
+    commandLine(
+        "cargo",
+        "ndk",
+        "-t",
+        "arm64-v8a",
+        "-o",
+        rustJniOutput.absolutePath,
+        "build",
+        "--release",
+    )
+    inputs.file(bridge.file("Cargo.toml"))
+    inputs.file(bridge.file("Cargo.lock"))
+    inputs.dir(bridge.dir("src"))
+    inputs.file(rootProject.layout.projectDirectory.file("../relay-protocol/Cargo.toml"))
+    inputs.dir(rootProject.layout.projectDirectory.dir("../relay-protocol/src"))
+    outputs.dir(rustJniOutput)
 }
 
 android {
@@ -12,10 +50,16 @@ android {
         applicationId = "com.adroited.aiterm"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    ndkVersion = "27.0.12077973"
+
+    sourceSets.named("main") {
+        jniLibs.srcDir(rustJniOutput)
     }
 
     buildTypes {
@@ -48,6 +92,10 @@ android {
     }
 }
 
+tasks.named("preBuild").configure {
+    dependsOn(buildRustQuic)
+}
+
 java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(21))
@@ -70,6 +118,7 @@ dependencies {
     implementation(libs.compose.ui.graphics)
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons.extended)
 
     // Task 8: QR enrollment scans the aiterm://pair payload with CameraX + ML Kit.
     implementation(libs.androidx.camera.core)

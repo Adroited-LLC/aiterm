@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod direct;
 pub mod model;
 pub mod relay;
 pub mod server;

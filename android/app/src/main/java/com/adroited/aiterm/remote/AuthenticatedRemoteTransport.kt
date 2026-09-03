@@ -1,5 +1,6 @@
 package com.adroited.aiterm.remote
 
+import android.util.Log
 import com.adroited.aiterm.pairing.AuthChallengeFrame
 import com.adroited.aiterm.pairing.PairedDesktop
 import com.adroited.aiterm.pairing.PairingFrames
@@ -13,6 +14,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel
@@ -22,8 +26,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 interface RemoteBinarySocket {
+    val endpoint: RemoteEndpoint?
+        get() = null
     suspend fun receive(): ByteArray
     fun send(bytes: ByteArray): Boolean
     fun close()
@@ -32,6 +39,18 @@ interface RemoteBinarySocket {
 interface RemoteSocketDialer {
     suspend fun open(desktop: PairedDesktop): RemoteBinarySocket
 }
+
+interface DirectRemoteSocketDialer : RemoteSocketDialer {
+    suspend fun openDirect(desktop: PairedDesktop, offer: RemoteDirectOffer): RemoteBinarySocket
+}
+
+enum class RemotePath { LAN, VPN, RELAY, DIRECT, UNKNOWN }
+
+data class RemoteEndpoint(
+    val host: String,
+    val port: Int,
+    val path: RemotePath = RemotePath.UNKNOWN,
+)
 
 /** Authenticated, bounded, request-correlated remote protocol transport. */
 class AuthenticatedRemoteTransport(
@@ -43,6 +62,8 @@ class AuthenticatedRemoteTransport(
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val beforeRequestEnqueue: () -> Unit = {},
 ) : RemoteTransport {
+    override val endpoint: RemoteEndpoint?
+        get() = synchronized(stateLock) { socket?.endpoint }
     private val eventChannel = Channel<RemoteServerEvent>(
         capacity = MAX_EVENTS,
         onBufferOverflow = BufferOverflow.SUSPEND,
@@ -70,7 +91,7 @@ class AuthenticatedRemoteTransport(
             if (started || closed) throw RemoteProtocolException("remote transport is closed")
             started = true
         }
-        val candidate = dialer.open(desktop)
+        var candidate = dialer.open(desktop)
         try {
             synchronized(stateLock) {
                 if (closed) {
@@ -79,27 +100,27 @@ class AuthenticatedRemoteTransport(
                 }
                 connectingSocket = candidate
             }
-            val challengeBytes = withTimeout(AUTH_TIMEOUT_MILLIS) { candidate.receive() }
-            val challenge = try {
-                PairingFrames.decode(challengeBytes) as? AuthChallengeFrame
-            } catch (_: PairingProtocolException) {
-                null
-            } ?: throw RemoteProtocolException("the desktop did not send an authentication challenge")
-            // This check is deliberately immediately before the Keystore call.
-            // A socket opening while locked must never cause a signature prompt.
-            val signature = appLock.signChallengeWhileUnlocked {
-                deviceKeys.signChallenge(challenge.nonce)
-            } ?: throw RemoteProtocolException("unlock is required before authentication")
-            ensureOpenAndUnlocked(candidate)
-            val proof = RemoteWireCodec.encodeAuthProof(desktop.deviceId, signature)
-            try {
-                if (!candidate.send(proof)) throw RemoteProtocolException("authentication proof send failed")
-            } finally {
-                proof.fill(0)
-                signature.fill(0)
-                challenge.nonce.fill(0)
+            authenticate(candidate)
+            val earlyEvents = mutableListOf<RemoteEventEnvelope>()
+            val directDialer = dialer as? DirectRemoteSocketDialer
+            if (directDialer != null && isRelayEndpoint(candidate.endpoint)) {
+                val offer = requestDirectOffer(candidate, earlyEvents)
+                nextRequestId = 2L
+                if (offer != null) {
+                    val direct = attemptDirectUpgrade(
+                        directDialer,
+                        candidate,
+                        offer,
+                        earlyEvents,
+                    )
+                    if (direct != null) {
+                        candidate.close()
+                        candidate = direct
+                        nextRequestId = 1L
+                        earlyEvents.clear()
+                    }
+                }
             }
-            RemoteWireCodec.decodeAuthOk(withTimeout(AUTH_TIMEOUT_MILLIS) { candidate.receive() })
             ensureOpenAndUnlocked(candidate)
             synchronized(stateLock) {
                 if (closed || connectingSocket !== candidate) {
@@ -108,15 +129,148 @@ class AuthenticatedRemoteTransport(
                 connectingSocket = null
                 socket = candidate
             }
+            logInfo("remote transport connected over ${candidate.endpoint?.path ?: RemotePath.UNKNOWN}")
             writerJob = scope.launch(dispatcher) { writeLoop() }
+            for (event in earlyEvents) accept(event)
             readerJob = scope.launch(dispatcher) { readLoop(candidate) }
         } catch (error: Exception) {
+            logWarning("remote transport connection failed", error)
             synchronized(stateLock) {
                 if (connectingSocket === candidate) connectingSocket = null
                 if (socket === candidate) socket = null
             }
             candidate.close()
             throw error
+        }
+    }
+
+    /**
+     * Keeps consuming the authenticated relay while the optional direct path is negotiated.
+     * OkHttp otherwise continues reading into its small socket queue; a busy desktop can fill
+     * that queue during a hard NAT timeout and accidentally destroy the healthy fallback.
+     */
+    private suspend fun attemptDirectUpgrade(
+        directDialer: DirectRemoteSocketDialer,
+        relay: RemoteBinarySocket,
+        offer: RemoteDirectOffer,
+        earlyEvents: MutableList<RemoteEventEnvelope>,
+    ): RemoteBinarySocket? = coroutineScope {
+        val upgrade = async {
+            var direct: RemoteBinarySocket? = null
+            try {
+                val opened = directDialer.openDirect(desktop, offer)
+                direct = opened
+                synchronized(stateLock) {
+                    if (closed || connectingSocket !== relay) {
+                        throw RemoteProtocolException("remote transport is closed")
+                    }
+                    connectingSocket = opened
+                }
+                authenticate(opened)
+                opened
+            } catch (cancelled: CancellationException) {
+                direct?.close()
+                throw cancelled
+            } catch (error: Exception) {
+                logInfo("direct QUIC unavailable; retaining relay: ${error.message}")
+                direct?.close()
+                null
+            }
+        }
+        var keepDirect = false
+        try {
+            var bufferedBytes = earlyEvents.sumOf { it.payload.size.toLong() }
+            while (!upgrade.isCompleted) {
+                val bytes = withTimeoutOrNull(DIRECT_RELAY_DRAIN_SLICE_MILLIS) {
+                    relay.receive()
+                } ?: continue
+                val event = RemoteWireCodec.decodeEvent(bytes)
+                if (event.requestId != 0L) {
+                    throw RemoteProtocolException("unexpected response during direct connection setup")
+                }
+                earlyEvents += event
+                bufferedBytes += event.payload.size
+                if (earlyEvents.size >= MAX_EARLY_UPGRADE_EVENTS ||
+                    bufferedBytes >= MAX_EARLY_UPGRADE_BYTES
+                ) {
+                    // Preserving the live relay outranks an optimization when the desktop is busy.
+                    upgrade.cancelAndJoin()
+                    return@coroutineScope null
+                }
+            }
+            upgrade.await().also { keepDirect = it != null }
+        } finally {
+            if (upgrade.isActive) upgrade.cancelAndJoin()
+            if (!keepDirect) {
+                synchronized(stateLock) {
+                    if (!closed) connectingSocket = relay
+                }
+            }
+        }
+    }
+
+    private suspend fun authenticate(candidate: RemoteBinarySocket) {
+        val challengeBytes = withTimeout(AUTH_TIMEOUT_MILLIS) { candidate.receive() }
+        val challenge = try {
+            PairingFrames.decode(challengeBytes) as? AuthChallengeFrame
+        } catch (_: PairingProtocolException) {
+            null
+        } ?: throw RemoteProtocolException("the desktop did not send an authentication challenge")
+        // This check is deliberately immediately before the Keystore call.
+        // A socket opening while locked must never cause a signature prompt.
+        val signature = appLock.signChallengeWhileUnlocked {
+            deviceKeys.signChallenge(challenge.nonce)
+        } ?: throw RemoteProtocolException("unlock is required before authentication")
+        ensureOpenAndUnlocked(candidate)
+        val proof = RemoteWireCodec.encodeAuthProof(desktop.deviceId, signature)
+        try {
+            if (!candidate.send(proof)) throw RemoteProtocolException("authentication proof send failed")
+        } finally {
+            proof.fill(0)
+            signature.fill(0)
+            challenge.nonce.fill(0)
+        }
+        RemoteWireCodec.decodeAuthOk(withTimeout(AUTH_TIMEOUT_MILLIS) { candidate.receive() })
+        ensureOpenAndUnlocked(candidate)
+    }
+
+    private fun isRelayEndpoint(endpoint: RemoteEndpoint?): Boolean {
+        val relayHost = desktop.relayHost ?: return false
+        val relayPort = desktop.relayPort ?: return false
+        return endpoint?.host?.equals(relayHost, ignoreCase = true) == true && endpoint.port == relayPort
+    }
+
+    private suspend fun requestDirectOffer(
+        candidate: RemoteBinarySocket,
+        earlyEvents: MutableList<RemoteEventEnvelope>,
+    ): RemoteDirectOffer? {
+        val encoded = RemoteWireCodec.encodeRequest(RemoteRequest(1L, "transport.direct", byteArrayOf()))
+        try {
+            if (!candidate.send(encoded)) {
+                throw RemoteProtocolException("direct connection setup send failed")
+            }
+        } finally {
+            encoded.fill(0)
+        }
+        return withTimeout(DIRECT_SETUP_TIMEOUT_MILLIS) {
+            var complete = false
+            var offer: RemoteDirectOffer? = null
+            while (!complete) {
+                val event = RemoteWireCodec.decodeEvent(candidate.receive())
+                if (event.requestId == 1L) {
+                    offer = when (event.kind) {
+                        "transport.direct" -> RemoteCommands.directOffer(event.payload)
+                        "error" -> null
+                        else -> throw RemoteProtocolException("invalid direct connection response")
+                    }
+                    complete = true
+                } else if (event.requestId != 0L || earlyEvents.size >= MAX_EARLY_EVENTS) {
+                    throw RemoteProtocolException("unexpected response during direct connection setup")
+                } else {
+                    earlyEvents += event
+                }
+            }
+            offer
         }
     }
 
@@ -321,6 +475,7 @@ class AuthenticatedRemoteTransport(
         } catch (_: CancellationException) {
             // Explicit close/lock owns teardown.
         } catch (error: Exception) {
+            logWarning("remote transport reader ended", error)
             closeWithOutcome(
                 RemoteTransportTerminalOutcome.Recoverable(error.message ?: "Connection ended"),
             )
@@ -488,6 +643,15 @@ class AuthenticatedRemoteTransport(
 
     private fun protocolFailure(): Nothing = throw RemoteProtocolException("uncorrelated remote response")
 
+    private fun logInfo(message: String) {
+        // android.util.Log is unavailable to the plain JVM unit-test runtime.
+        runCatching { Log.i(LOG_TAG, message) }
+    }
+
+    private fun logWarning(message: String, error: Throwable) {
+        runCatching { Log.w(LOG_TAG, message, error) }
+    }
+
     private data class PendingRequest(
         val kind: String,
         val deferred: CompletableDeferred<RemoteResponse>,
@@ -508,7 +672,10 @@ class AuthenticatedRemoteTransport(
     private enum class AttachmentDecision { Pending, Publish, Discard }
 
     private companion object {
+        const val LOG_TAG = "AITermRemote"
         const val AUTH_TIMEOUT_MILLIS = 10_000L
+        const val DIRECT_SETUP_TIMEOUT_MILLIS = 8_000L
+        const val DIRECT_RELAY_DRAIN_SLICE_MILLIS = 50L
         // The desktop bounds descriptor-safe session work at 120 seconds.
         // Keep a small transport grace period so its correlated result wins
         // rather than reconnecting while a protected delete is still active.
@@ -516,6 +683,9 @@ class AuthenticatedRemoteTransport(
         const val MAX_PENDING_REQUESTS = 64
         const val MAX_COMPLETED_CORRELATIONS = 64
         const val MAX_EVENTS = 64
+        const val MAX_EARLY_EVENTS = 16
+        const val MAX_EARLY_UPGRADE_EVENTS = 48
+        const val MAX_EARLY_UPGRADE_BYTES = 8L * 1_024 * 1_024
         const val MAX_HELD_ATTACH_FRAMES = 512
         const val MAX_HELD_ATTACH_BYTES = 8 * 1_024 * 1_024
     }

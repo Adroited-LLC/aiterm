@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import Row from "./SettingsRow";
+import SettingsSwitch from "./SettingsSwitch";
 import {
   fingerprintLabel,
   inviteCountdownSeconds,
@@ -28,7 +29,9 @@ import {
   remoteRevokeDevice,
   remoteRelayClear,
   remoteRelayConfigure,
+  remoteRelayServerSet,
   remoteStart,
+  remoteStartOnLaunchSet,
   remoteStatus,
   remoteStop,
 } from "../ipc";
@@ -75,6 +78,7 @@ export default function RemoteAccessSettings() {
   const [addresses, setAddresses] = useState<string[]>([]);
   const [address, setAddress] = useState<string>("");
   const [port, setPort] = useState(DEFAULT_PORT);
+  const [relayServer, setRelayServer] = useState(DEFAULT_RELAY_SERVER);
   const [relayConnectorUrl, setRelayConnectorUrl] = useState("");
   const [relayPublicHost, setRelayPublicHost] = useState("");
   const [relayPublicPort, setRelayPublicPort] = useState(443);
@@ -109,6 +113,7 @@ export default function RemoteAccessSettings() {
         );
         setAddress(initial.address);
         setPort(initial.port);
+        setRelayServer(currentStatus.relay_server || DEFAULT_RELAY_SERVER);
         setRelayConnectorUrl(currentStatus.relay?.connector_url ?? "");
         setRelayPublicHost(currentStatus.relay?.public_host ?? "");
         setRelayPublicPort(currentStatus.relay?.public_port ?? 443);
@@ -158,6 +163,7 @@ export default function RemoteAccessSettings() {
   if (!status) {
     return <div className="sgroup-foot">Looking…</div>;
   }
+  const relayServerChanged = relayServer.trim() !== status.relay_server;
 
   return (
     <>
@@ -170,10 +176,27 @@ export default function RemoteAccessSettings() {
             wide
           >
             <div className="remote-managed-relay">
-              <code className="diag-val">
-                {relayServerFromConnectorUrl(status.relay?.connector_url) ?? DEFAULT_RELAY_SERVER}
-              </code>
+              <input
+                className="set-input mono"
+                value={relayServer}
+                list="aiterm-relay-servers"
+                placeholder={DEFAULT_RELAY_SERVER}
+                aria-label="Relay server"
+                spellCheck={false}
+                onChange={(event) => setRelayServer(event.target.value)}
+              />
+              <datalist id="aiterm-relay-servers">
+                <option value={DEFAULT_RELAY_SERVER}>AITerm Relay</option>
+                {status.relay_server !== DEFAULT_RELAY_SERVER && (
+                  <option value={status.relay_server}>Saved relay server</option>
+                )}
+              </datalist>
               <div className="remote-relay-actions">
+                <button
+                  className="set-recheck"
+                  disabled={status.enabled || status.relay?.configured || !relayServer.trim() || !relayServerChanged}
+                  onClick={() => run(remoteRelayServerSet(relayServer))}
+                >Save server</button>
                 {status.relay?.configured && (
                   <button
                     className="set-recheck"
@@ -183,9 +206,13 @@ export default function RemoteAccessSettings() {
                 )}
               </div>
               <div className="sgroup-foot">
-                {status.relay?.configured
-                  ? relayLabel(status)
-                  : "Pair and approve a phone. LAN, VPN, and relay setup complete together."}
+                {status.relay?.configured && relayServerChanged
+                  ? `Current route remains on ${relayServerFromConnectorUrl(status.relay.connector_url) ?? "its existing server"}. Turn remote access off, remove it, then save this server.`
+                  : status.relay?.configured
+                    ? relayLabel(status)
+                    : relayServerChanged
+                      ? "Save this server before turning remote access on. AITerm verifies its control identity and public domain first."
+                      : "Pair and approve a phone. LAN, VPN, and relay setup complete together."}
               </div>
             </div>
           </Row>
@@ -201,10 +228,24 @@ export default function RemoteAccessSettings() {
                   () => saveListenerPreference({ address, port }),
                 )
               }
-              disabled={!status.enabled && !address}
+              disabled={!status.enabled && (!address || relayServerChanged)}
             >
               {status.enabled ? "Turn off" : "Turn on"}
             </button>
+          </Row>
+          <Row
+            label="Start relay when AITerm opens"
+            desc="Restores remote access with this address and port, then reconnects the saved private relay route. Off by default."
+          >
+            <SettingsSwitch
+              checked={status.start_on_launch}
+              disabled={!status.relay?.configured || !address || relayServerChanged}
+              label="Start relay when AITerm opens"
+              onChange={(enabled) => run(
+                remoteStartOnLaunchSet(enabled, address, port),
+                () => saveListenerPreference({ address, port }),
+              )}
+            />
           </Row>
           <Row
             label="Address"
@@ -217,7 +258,12 @@ export default function RemoteAccessSettings() {
                 onChange={(e) => {
                   const next = e.target.value;
                   setAddress(next);
-                  if (!status.enabled) saveListenerPreference({ address: next, port });
+                  if (!status.enabled) {
+                    saveListenerPreference({ address: next, port });
+                    if (status.start_on_launch) {
+                      run(remoteStartOnLaunchSet(true, next, port));
+                    }
+                  }
                 }}
               >
                 {addressOptions.length === 0 && <option value="">No LAN or VPN address</option>}
@@ -240,7 +286,12 @@ export default function RemoteAccessSettings() {
                         remoteStop,
                         (config) => remoteStart(config.address, config.port),
                       )
-                        .then(() => saveListenerPreference(target))
+                        .then(async () => {
+                          saveListenerPreference(target);
+                          if (status.start_on_launch) {
+                            await remoteStartOnLaunchSet(true, target.address, target.port);
+                          }
+                        })
                         .catch((cause) => {
                           setAddress(current.address);
                           setPort(current.port);
@@ -263,7 +314,12 @@ export default function RemoteAccessSettings() {
               onChange={(e) => {
                 const next = Number(e.target.value) || DEFAULT_PORT;
                 setPort(next);
-                if (!status.enabled) saveListenerPreference({ address, port: next });
+                if (!status.enabled) {
+                  saveListenerPreference({ address, port: next });
+                  if (status.start_on_launch) {
+                    run(remoteStartOnLaunchSet(true, address, next));
+                  }
+                }
               }}
             />
           </Row>
@@ -363,7 +419,7 @@ export default function RemoteAccessSettings() {
           >
             <button
               className="set-recheck"
-              disabled={!status.enabled}
+              disabled={!status.enabled || relayServerChanged}
               onClick={() => {
                 setError(null);
                 setNow(Date.now());

@@ -16,10 +16,14 @@ export const INVITE_LIFETIME_MS = 5 * 60 * 1000;
 export interface RemoteStatus {
   /** Whether the gateway is listening. False means no socket exists at all. */
   enabled: boolean;
+  /** Explicit opt-in to restore the listener and saved relay on app launch. */
+  start_on_launch: boolean;
   address: string | null;
   port: number | null;
   /** SHA-256 of the listener's SPKI, base64url. The phone pins this. */
   fingerprint: string | null;
+  /** Control origin used for the next phone-authorized relay enrollment. */
+  relay_server: string;
   relay?: RelayStatus;
 }
 

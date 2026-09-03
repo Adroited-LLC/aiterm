@@ -5,27 +5,30 @@ that connection is, what it deliberately is not, and how to verify it by hand.
 
 ## What the connection is
 
-The desktop is the host. It embeds a TLS gateway; the phone is a client. All
-of it runs over your own network:
+The desktop is the host. It embeds a TLS gateway; the phone is a client. The
+same pinned connection can use LAN, VPN, the AITerm relay, or an opportunistic
+direct QUIC tunnel:
 
 ```text
-Android AITerm  ──TLS 1.3, pinned──▶  AITerm desktop gateway
-   (phone)                              (this machine)
-                                             │
-                                     sessions, agents, PTYs
+Android AITerm  ── pinned TLS/WebSocket ──▶  AITerm desktop gateway
+   (phone)       over LAN/VPN/relay/QUIC          │
+                                              sessions, agents, PTYs
 ```
 
 The phone never reads a transcript file, never starts an agent process, and
 never owns a PTY. It asks the desktop, and the desktop answers.
 
-**Reachability is yours to arrange.** The gateway binds a LAN or VPN address
-you pick. There is no relay, no hosted account, no NAT traversal, and no
-port-forwarding advice here — forwarding this port to the internet is not a
-supported configuration. To reach your desktop from outside the house, put
-both devices on the same VPN (Tailscale and WireGuard both work) and bind the
-VPN address. Loopback and link-local addresses are not offered as bind
-candidates: a phone cannot reach either, so a listener on one starts cleanly
-and then fails in a way that is tedious to diagnose.
+The phone tries saved LAN and VPN routes before its route-specific relay
+hostname. If the relay wins, the already-authenticated connection requests a
+short-lived rendezvous. The relay reveals each peer's observed UDP address
+only after separate random desktop and phone cookies arrive, and the peers try
+to upgrade to QUIC. A failed hole punch leaves the relay connection in place;
+no port forwarding is required.
+
+QUIC is only a tunnel underneath the existing pinned TLS/WebSocket protocol.
+The relay and QUIC path do not implement a second session API, do not receive
+the phone's device key, and do not bypass desktop authorization. Loopback and
+link-local addresses are not offered as direct gateway candidates.
 
 The listener is **off by default** and starts nothing on disk until you turn
 it on. A desktop that never pairs a phone never grows a trusted-device file.
@@ -155,24 +158,43 @@ Requires a desktop and a phone on the same LAN or VPN.
    session must resume where it was, not blank and not duplicated.
 7. Leave it disconnected long enough to produce more than 1 MiB of output
    (`yes | head -c 2000000`), then reconnect. The phone must redraw from a
-   snapshot rather than appending a partial stream.
+snapshot rather than appending a partial stream.
+
+**Direct path and fallback**
+8. With the relay connected, move the phone to cellular data. The connection
+   label may change from `connected · relay` to `connected · direct`; both are
+   valid behind a restrictive carrier NAT.
+9. Temporarily block UDP 443 while leaving TCP 443 available. Reconnect and
+   confirm the app remains usable as `connected · relay`.
 
 **Focus**
-8. With the same terminal open on desktop and phone, type on the desktop.
-9. Type on the phone: it must be refused, with a visible way to take focus.
-10. Take focus on the phone. The desktop must show that it lost it.
+10. With the same terminal open on desktop and phone, type on the desktop.
+11. Type on the phone: it must be refused, with a visible way to take focus.
+12. Take focus on the phone. The desktop must show that it lost it.
 
 **Lock**
-11. Background the phone app for five minutes. Returning must require
+13. Background the phone app for five minutes. Returning must require
     biometric or PIN before any terminal content is shown.
 
 **Revocation**
-12. With the phone connected, revoke it on the desktop. Its connection must
+14. With the phone connected, revoke it on the desktop. Its connection must
     drop immediately, and reconnecting must fail without a new pairing.
 
 **Off is not revoked**
-13. Turn remote access off and on again. A trusted phone must reconnect with
+15. Turn remote access off and on again. A trusted phone must reconnect with
     no QR.
+
+## Android native transport build
+
+The Compose app packages a small Rust JNI library for QUIC only. A build host
+needs `cargo-ndk`, the `aarch64-linux-android` Rust target, and Android NDK
+27.0.12077973. Gradle builds and packages `libaiterm_quic.so` automatically:
+
+```sh
+rustup target add aarch64-linux-android
+cargo install cargo-ndk --locked
+cd android && ./gradlew testDebugUnitTest assembleDebug
+```
 
 ## Terminal image attachments
 

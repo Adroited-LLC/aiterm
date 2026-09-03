@@ -1,4 +1,5 @@
 use super::auth::{set_private_permissions, write_private_file, DeviceStore, PairingOutcome};
+use super::direct::DirectTunnelService;
 use super::model::{
     decode_exact, encode_terminal_frame, RemoteEvent, RemoteRequest, TerminalSize, PROTOCOL_VERSION,
 };
@@ -8,8 +9,7 @@ use super::terminal::{
     TransferChunk, TransferPlan,
 };
 use super::uploads::{
-    AttachmentStore, UploadBegin, UploadError, UploadErrorKind, UploadSet,
-    PARTIAL_ATTACHMENT_TTL,
+    AttachmentStore, UploadBegin, UploadError, UploadErrorKind, UploadSet, PARTIAL_ATTACHMENT_TTL,
 };
 use crate::launch::LaunchRequest;
 use crate::services::agents::AgentService;
@@ -20,7 +20,9 @@ use crate::tabs::{
 };
 use crate::terminal::model::{Revision, ScreenDiff, ScreenSnapshot};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path as AxumPath, RawQuery, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
@@ -66,6 +68,10 @@ const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const INBOUND_QUEUE: usize = 16;
 const CLOSED_ATTACHMENT_CACHE: usize = 16;
 const ATTACHMENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const WEB_PREVIEW_TTL: Duration = Duration::from_secs(60 * 60);
+const WEB_PREVIEW_TICKET_LIMIT: usize = 64;
+const WEB_PREVIEW_FILE_LIMIT: usize = 512;
+const WEB_PREVIEW_RESPONSE_LIMIT: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct TlsIdentity {
@@ -108,7 +114,12 @@ impl TlsIdentity {
                 if identity.covers(&subject_alt_ips, &subject_alt_dns)? {
                     Ok(identity)
                 } else {
-                    Self::reissue_certificate(&cert_path, identity, &subject_alt_ips, &subject_alt_dns)
+                    Self::reissue_certificate(
+                        &cert_path,
+                        identity,
+                        &subject_alt_ips,
+                        &subject_alt_dns,
+                    )
                 }
             }
             (false, false) => Self::generate(root, &subject_alt_ips, &subject_alt_dns),
@@ -119,7 +130,11 @@ impl TlsIdentity {
         }
     }
 
-    fn generate(root: &Path, subject_alt_ips: &[IpAddr], subject_alt_dns: &[String]) -> Result<Self, GatewayError> {
+    fn generate(
+        root: &Path,
+        subject_alt_ips: &[IpAddr],
+        subject_alt_dns: &[String],
+    ) -> Result<Self, GatewayError> {
         let signing_key = rcgen::KeyPair::generate().map_err(GatewayError::tls)?;
         let certificate_der = issue_certificate(&signing_key, subject_alt_ips, subject_alt_dns)?;
         let private_key_der = signing_key.serialize_der();
@@ -169,17 +184,26 @@ impl TlsIdentity {
         &self.certificate_der
     }
 
+    pub(crate) fn private_key_der(&self) -> &[u8] {
+        &self.private_key_der
+    }
+
     pub fn spki_fingerprint(&self) -> &str {
         &self.spki_fingerprint
     }
 
-    fn covers(&self, subject_alt_ips: &[IpAddr], subject_alt_dns: &[String]) -> Result<bool, GatewayError> {
+    fn covers(
+        &self,
+        subject_alt_ips: &[IpAddr],
+        subject_alt_dns: &[String],
+    ) -> Result<bool, GatewayError> {
         let certificate_der = CertificateDer::from(self.certificate_der.as_slice());
         let parsed = rustls::server::ParsedCertificate::try_from(&certificate_der)
             .map_err(GatewayError::tls)?;
         let localhost = ServerName::try_from("localhost").map_err(GatewayError::tls)?;
         let dns_names = subject_alt_dns.iter().map(|name| {
-            let probe = name.strip_prefix("*.")
+            let probe = name
+                .strip_prefix("*.")
                 .map(|suffix| format!("route-check.{suffix}"))
                 .unwrap_or_else(|| name.clone());
             ServerName::try_from(probe).expect("relay DNS names were validated before use")
@@ -235,7 +259,8 @@ fn bounded_subject_alt_dns(subject_alt_dns: &[String]) -> Result<Vec<String>, Ga
     let mut unique = Vec::with_capacity(subject_alt_dns.len().min(4));
     for name in subject_alt_dns {
         let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
-        let validation_name = normalized.strip_prefix("*.")
+        let validation_name = normalized
+            .strip_prefix("*.")
             .map(|suffix| format!("route-check.{suffix}"))
             .unwrap_or_else(|| normalized.clone());
         if normalized != *name || ServerName::try_from(validation_name).is_err() {
@@ -244,7 +269,9 @@ fn bounded_subject_alt_dns(subject_alt_dns: &[String]) -> Result<Vec<String>, Ga
                 "gateway relay host must be a normalized DNS name",
             ));
         }
-        if unique.contains(&normalized) { continue; }
+        if unique.contains(&normalized) {
+            continue;
+        }
         if unique.len() == 4 {
             return Err(GatewayError::new(
                 "gateway.too_many_advertised_dns",
@@ -350,7 +377,8 @@ mod relay_certificate_tests {
 
     #[test]
     fn wildcard_relay_certificate_covers_a_route_created_after_startup() {
-        let root = std::env::temp_dir().join(format!("aiterm-relay-wildcard-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-relay-wildcard-{}", uuid::Uuid::new_v4()));
         let ips = ["192.168.1.20".parse().unwrap()];
         let dns = vec!["*.relay.example.com".to_string()];
         let identity = TlsIdentity::load_or_create_with_dns(&root, &ips, &dns).unwrap();
@@ -365,6 +393,76 @@ struct GatewayState {
     services: RemoteServices,
     uploads: DeviceUploadRegistry,
     connections: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone, Default)]
+struct WebPreviewStore {
+    tickets: Arc<Mutex<HashMap<String, WebPreviewTicket>>>,
+}
+
+struct WebPreviewTicket {
+    target: WebPreviewTarget,
+    expires: Instant,
+}
+
+#[derive(Clone)]
+enum WebPreviewTarget {
+    Static(Arc<StaticWebPreview>),
+    Port(u16),
+}
+
+struct StaticWebPreview {
+    entry: String,
+    files: HashMap<String, PathBuf>,
+}
+
+impl WebPreviewStore {
+    fn mint(&self, target: WebPreviewTarget) -> String {
+        let mut raw = [0_u8; 32];
+        OsRng.fill_bytes(&mut raw);
+        let ticket = URL_SAFE_NO_PAD.encode(raw);
+        raw.fill(0);
+        let mut tickets = self
+            .tickets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        tickets.retain(|_, preview| preview.expires > now);
+        if tickets.len() >= WEB_PREVIEW_TICKET_LIMIT {
+            if let Some(oldest) = tickets
+                .iter()
+                .min_by_key(|(_, preview)| preview.expires)
+                .map(|(ticket, _)| ticket.clone())
+            {
+                tickets.remove(&oldest);
+            }
+        }
+        tickets.insert(
+            ticket.clone(),
+            WebPreviewTicket {
+                target,
+                expires: now + WEB_PREVIEW_TTL,
+            },
+        );
+        format!("/v1/preview/{ticket}/")
+    }
+
+    fn resolve(&self, ticket: &str) -> Option<WebPreviewTarget> {
+        if ticket.len() != 43
+            || !ticket
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return None;
+        }
+        let mut tickets = self
+            .tickets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        tickets.retain(|_, preview| preview.expires > now);
+        tickets.get(ticket).map(|preview| preview.target.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -424,11 +522,11 @@ impl DeviceUploadRegistry {
                 // same remembered phone while the first socket still exists.
                 Arc::strong_count(&lease.set) > 1
                     || now.saturating_duration_since(
-                    *lease
-                        .touched
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                ) <= PARTIAL_ATTACHMENT_TTL
+                        *lease
+                            .touched
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    ) <= PARTIAL_ATTACHMENT_TTL
             });
     }
 }
@@ -443,6 +541,8 @@ pub struct RemoteServices {
     session_open_locks: Arc<Vec<Mutex<()>>>,
     app: Option<tauri::AppHandle>,
     routes: Option<Arc<std::sync::RwLock<GatewayRoutesPayload>>>,
+    web_previews: WebPreviewStore,
+    direct_tunnel: Option<Arc<DirectTunnelService>>,
 }
 
 impl RemoteServices {
@@ -463,6 +563,8 @@ impl RemoteServices {
             ),
             app: None,
             routes: None,
+            web_previews: WebPreviewStore::default(),
+            direct_tunnel: None,
         }
     }
 
@@ -509,6 +611,11 @@ impl RemoteServices {
         self
     }
 
+    pub fn with_direct_tunnel(mut self, direct_tunnel: Arc<DirectTunnelService>) -> Self {
+        self.direct_tunnel = Some(direct_tunnel);
+        self
+    }
+
     pub fn registry(&self) -> &Arc<TabRegistry> {
         &self.registry
     }
@@ -545,6 +652,8 @@ impl RemoteGateway {
         };
         let router = Router::new()
             .route("/v1/ws", get(websocket_upgrade))
+            .route("/v1/preview/{ticket}/", get(web_preview_root))
+            .route("/v1/preview/{ticket}/{*rest}", get(web_preview_file))
             .with_state(state);
         let server_handle = axum_server::Handle::new();
         let run_handle = server_handle.clone();
@@ -598,7 +707,9 @@ impl GatewayHandle {
 
     pub fn set_relay_route(&self, host: String, port: u16) {
         if let Some(routes) = &self.routes {
-            let mut routes = routes.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut routes = routes
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             routes.relay_host = Some(host);
             routes.relay_port = Some(port);
         }
@@ -1251,10 +1362,43 @@ struct SessionIdPayload {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SessionStarPayload {
+    session_id: String,
+    on: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRenamePayload {
+    session_id: String,
+    title: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionBringInPayload {
+    session_id: String,
+    agent_id: String,
+    model: Option<String>,
+    effort: Option<String>,
+    focus: String,
+    rounds: u8,
+    auto: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionConversationRequest {
     session_id: String,
     #[serde(default = "default_conversation_chars")]
     max_chars: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionWebPreviewRequest {
+    session_id: String,
+    open: bool,
 }
 
 #[derive(Deserialize)]
@@ -1361,6 +1505,20 @@ struct SessionListPayload {
 }
 
 #[derive(Serialize)]
+struct SessionRosterPayload {
+    sessions: Vec<crate::sessions::Session>,
+    with_files: Vec<String>,
+    stars: Vec<String>,
+    brought_in: HashMap<String, String>,
+    activity: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct UsagePayload {
+    sources: Vec<crate::usage::UsageSource>,
+}
+
+#[derive(Serialize)]
 struct SessionPreviewPayload {
     messages: Vec<crate::sessions::PreviewMsg>,
 }
@@ -1373,6 +1531,12 @@ struct SessionConversationPayload {
 #[derive(Serialize)]
 struct SessionChangesPayload {
     changes: Vec<crate::changes::Change>,
+}
+
+#[derive(Serialize)]
+struct SessionWebPreviewPayload {
+    available: bool,
+    path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1810,9 +1974,10 @@ const MAX_FILE_READ_CHUNK_BYTES: u32 = 256 * 1024;
 
 fn read_authorized_file_chunk(
     app: &tauri::AppHandle,
+    session: &crate::sessions::Session,
     request: FileReadRequest,
 ) -> Result<FileReadPayload, &'static str> {
-    let changes = crate::changes::for_session(app, &request.session_id);
+    let changes = crate::changes::produced_files(app, session);
     read_file_chunk_from_ledger(request, &changes)
 }
 
@@ -1873,8 +2038,390 @@ fn file_mime(path: &Path) -> &'static str {
         "webp" => "image/webp",
         "gif" => "image/gif",
         "svg" => "image/svg+xml",
-        "txt" | "md" | "rs" | "kt" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml"
-        | "yaml" | "yml" | "css" | "html" => "text/plain",
+        "txt" | "md" | "rs" | "kt" | "ts" | "tsx" | "js" | "jsx" | "json" | "toml" | "yaml"
+        | "yml" | "css" | "html" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A preview target is derived on the desktop, never named by the phone. A
+/// paired client may ask whether one exists and may mint a ticket, but cannot
+/// turn the gateway into an arbitrary filesystem or loopback proxy.
+fn web_preview_target(
+    services: &RemoteServices,
+    app: &tauri::AppHandle,
+    session: &crate::sessions::Session,
+) -> Option<WebPreviewTarget> {
+    if let Some(root) = services.registry.child_pid_for_session(&session.id) {
+        if let Some(port) = ports_of_process_tree(root).into_iter().next() {
+            return Some(WebPreviewTarget::Port(port));
+        }
+    }
+    let changes = crate::changes::produced_files(app, session);
+    static_web_preview(&changes).map(|preview| WebPreviewTarget::Static(Arc::new(preview)))
+}
+
+fn static_web_preview(changes: &[crate::changes::Change]) -> Option<StaticWebPreview> {
+    let mut pages = changes
+        .iter()
+        .filter(|change| {
+            change.kind != "deleted"
+                && Path::new(&change.path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("html")
+                            || extension.eq_ignore_ascii_case("htm")
+                    })
+        })
+        .collect::<Vec<_>>();
+    pages.sort_by(|left, right| {
+        let left_index = !left.name.eq_ignore_ascii_case("index.html");
+        let right_index = !right.name.eq_ignore_ascii_case("index.html");
+        left_index
+            .cmp(&right_index)
+            .then_with(|| right.at.cmp(&left.at))
+    });
+
+    for page in pages {
+        let raw_page = PathBuf::from(&page.path);
+        let Ok(link_metadata) = std::fs::symlink_metadata(&raw_page) else {
+            continue;
+        };
+        if link_metadata.file_type().is_symlink()
+            || !link_metadata.is_file()
+            || link_metadata.len() > WEB_PREVIEW_RESPONSE_LIMIT
+        {
+            continue;
+        }
+        let Ok(page_path) = raw_page.canonicalize() else {
+            continue;
+        };
+        let Some(root) = page_path.parent() else {
+            continue;
+        };
+        let Some(entry) = preview_relative_path(root, &page_path) else {
+            continue;
+        };
+        let mut files = HashMap::new();
+        files.insert(entry.clone(), page_path.clone());
+        for change in changes {
+            if files.len() >= WEB_PREVIEW_FILE_LIMIT {
+                break;
+            }
+            if change.kind == "deleted" {
+                continue;
+            }
+            let raw = PathBuf::from(&change.path);
+            let Ok(metadata) = std::fs::symlink_metadata(&raw) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() > WEB_PREVIEW_RESPONSE_LIMIT
+            {
+                continue;
+            }
+            let Ok(path) = raw.canonicalize() else {
+                continue;
+            };
+            let Some(relative) = preview_relative_path(root, &path) else {
+                continue;
+            };
+            files.insert(relative, path);
+        }
+        return Some(StaticWebPreview { entry, files });
+    }
+    None
+}
+
+fn preview_relative_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(relative.to_string_lossy().replace('\\', "/"))
+}
+
+/// Listening TCP ports owned by the root process or one of its descendants.
+/// `ss` exposes the owning pid for this user's processes; `/proc` supplies the
+/// bounded parent tree. The operation runs inside the gateway's blocking
+/// dispatch pool and only while a selected session is being preview-probed.
+fn ports_of_process_tree(root: u32) -> Vec<u16> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, after_name)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let mut fields = after_name.split_whitespace();
+            let _state = fields.next();
+            if let Some(parent) = fields.next().and_then(|value| value.parse::<u32>().ok()) {
+                children.entry(parent).or_default().push(pid);
+            }
+        }
+    }
+    let mut tree = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if tree.insert(pid) {
+            if let Some(descendants) = children.get(&pid) {
+                stack.extend(descendants);
+            }
+        }
+    }
+
+    let Ok(output) = std::process::Command::new("ss").args(["-ltnpH"]).output() else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(pid) = line
+            .split("pid=")
+            .nth(1)
+            .and_then(|rest| rest.split(&[',', ')'][..]).next())
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !tree.contains(&pid) {
+            continue;
+        }
+        if let Some(port) = line
+            .split_whitespace()
+            .nth(3)
+            .and_then(|address| address.rsplit(':').next())
+            .and_then(|value| value.parse::<u16>().ok())
+        {
+            if !ports.contains(&port) {
+                ports.push(port);
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports
+}
+
+async fn web_preview_root(
+    State(state): State<GatewayState>,
+    AxumPath(ticket): AxumPath<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    serve_web_preview(state, ticket, String::new(), query).await
+}
+
+async fn web_preview_file(
+    State(state): State<GatewayState>,
+    AxumPath((ticket, rest)): AxumPath<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    serve_web_preview(state, ticket, rest, query).await
+}
+
+async fn serve_web_preview(
+    state: GatewayState,
+    ticket: String,
+    rest: String,
+    query: Option<String>,
+) -> Response {
+    let Some(target) = state.services.web_previews.resolve(&ticket) else {
+        return web_preview_error(
+            StatusCode::NOT_FOUND,
+            "Preview expired. Reopen it from AITerm.",
+        );
+    };
+    match target {
+        WebPreviewTarget::Static(preview) => serve_static_web_preview(preview, &rest).await,
+        WebPreviewTarget::Port(port) => proxy_web_preview(port, &rest, query.as_deref()).await,
+    }
+}
+
+async fn serve_static_web_preview(preview: Arc<StaticWebPreview>, rest: &str) -> Response {
+    let key = if rest.is_empty() {
+        preview.entry.as_str()
+    } else {
+        rest.trim_start_matches('/')
+    };
+    if key.is_empty()
+        || Path::new(key)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return web_preview_error(StatusCode::FORBIDDEN, "That preview path is not available.");
+    }
+    let Some(path) = preview.files.get(key).cloned() else {
+        return web_preview_error(
+            StatusCode::NOT_FOUND,
+            "That file was not produced by this session.",
+        );
+    };
+    let mime = web_preview_mime(&path);
+    let read = tokio::task::spawn_blocking(move || read_web_preview_file(&path)).await;
+    match read {
+        Ok(Ok(bytes)) => web_preview_response(StatusCode::OK, mime, bytes),
+        _ => web_preview_error(
+            StatusCode::NOT_FOUND,
+            "That preview file is no longer available.",
+        ),
+    }
+}
+
+fn read_web_preview_file(path: &Path) -> Result<Vec<u8>, ()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_file() || metadata.len() > WEB_PREVIEW_RESPONSE_LIMIT {
+        return Err(());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(WEB_PREVIEW_RESPONSE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > WEB_PREVIEW_RESPONSE_LIMIT {
+        return Err(());
+    }
+    Ok(bytes)
+}
+
+async fn proxy_web_preview(port: u16, rest: &str, query: Option<&str>) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Ok(mut url) = url::Url::parse(&format!("http://127.0.0.1:{port}/")) else {
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The preview server address is invalid.",
+        );
+    };
+    url.set_path(&format!("/{}", rest.trim_start_matches('/')));
+    url.set_query(query);
+    let target = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    let work = async {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        let request =
+            format!("GET {target} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        socket.write_all(request.as_bytes()).await.ok()?;
+        let mut bytes = Vec::new();
+        socket
+            .take(WEB_PREVIEW_RESPONSE_LIMIT + 64 * 1024)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        Some(bytes)
+    };
+    let Ok(Some(raw)) = tokio::time::timeout(Duration::from_secs(20), work).await else {
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The session's preview server did not answer.",
+        );
+    };
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The preview server returned an invalid response.",
+        );
+    };
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let body = raw[split + 4..].to_vec();
+    if body.len() as u64 > WEB_PREVIEW_RESPONSE_LIMIT {
+        return web_preview_error(
+            StatusCode::BAD_GATEWAY,
+            "The preview response is too large.",
+        );
+    }
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::OK);
+    let mime = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-type")
+                .then_some(value.trim())
+        })
+        .unwrap_or("application/octet-stream");
+    web_preview_response(status, mime, body)
+}
+
+fn web_preview_response(status: StatusCode, mime: &str, body: Vec<u8>) -> Response {
+    let mut response = (status, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(mime)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn web_preview_error(status: StatusCode, message: &'static str) -> Response {
+    web_preview_response(
+        status,
+        "text/plain; charset=utf-8",
+        message.as_bytes().to_vec(),
+    )
+}
+
+fn web_preview_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "mp4" => "video/mp4",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -1942,10 +2489,31 @@ impl RemoteServices {
         let request_id = request.request_id();
         match request.kind() {
             "gateway.routes" => {
-                if !request.payload().is_empty() { return Err("protocol.invalid_payload"); }
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
                 let routes = self.routes.as_ref().ok_or("remote.unsupported")?;
-                let routes = routes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-                Ok(DispatchOutcome::frames(vec![response(request_id, "gateway.routes", &routes)?]))
+                let routes = routes
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "gateway.routes",
+                    &routes,
+                )?]))
+            }
+            "usage.report" => {
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "usage.report",
+                    &UsagePayload {
+                        sources: crate::usage::usage_report(),
+                    },
+                )?]))
             }
             "session.list" => {
                 if !request.payload().is_empty() {
@@ -1956,6 +2524,137 @@ impl RemoteServices {
                     request_id,
                     "session.list",
                     &SessionListPayload { sessions },
+                )?]))
+            }
+            "session.roster" => {
+                if !request.payload().is_empty() {
+                    return Err("protocol.invalid_payload");
+                }
+                let sessions = self.sessions.list().map_err(|error| error.code())?;
+                let session_ids = sessions
+                    .iter()
+                    .map(|session| session.id.as_str())
+                    .collect::<std::collections::HashSet<_>>();
+                let mut with_files = self
+                    .app
+                    .as_ref()
+                    .map(crate::changes::sessions_with_files)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|id| session_ids.contains(id.as_str()))
+                    .collect::<Vec<_>>();
+                with_files.sort();
+                let stars = crate::sessions::session_stars()
+                    .into_iter()
+                    .filter(|id| session_ids.contains(id.as_str()))
+                    .collect();
+                let brought_in = crate::sessions::session_brought_in()
+                    .into_iter()
+                    .filter(|(child, parent)| {
+                        session_ids.contains(child.as_str())
+                            && session_ids.contains(parent.as_str())
+                    })
+                    .collect();
+                let activity = self
+                    .registry
+                    .session_activities()
+                    .into_iter()
+                    .filter(|(id, _)| session_ids.contains(id.as_str()))
+                    .collect();
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.roster",
+                    &SessionRosterPayload {
+                        sessions,
+                        with_files,
+                        stars,
+                        brought_in,
+                        activity,
+                    },
+                )?]))
+            }
+            "session.star" => {
+                let payload: SessionStarPayload = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                crate::sessions::set_star(&payload.session_id, payload.on)
+                    .map_err(|_| "session.metadata_failed")?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.star",
+                    &SuccessPayload { ok: true },
+                )?]))
+            }
+            "session.rename" => {
+                let payload: SessionRenamePayload = decode_payload(request)?;
+                if payload.title.len() > MAX_TITLE_BYTES {
+                    return Err("protocol.invalid_payload");
+                }
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                crate::sessions::rename_session(&payload.session_id, &payload.title)
+                    .map_err(|_| "session.metadata_failed")?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.rename",
+                    &SuccessPayload { ok: true },
+                )?]))
+            }
+            "session.bring_in" => {
+                let payload: SessionBringInPayload = decode_payload(request)?;
+                self.sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                bounded(&payload.agent_id, MAX_IDENTIFIER_BYTES)?;
+                bounded(&payload.focus, MAX_TITLE_BYTES)?;
+                if payload.agent_id.is_empty()
+                    || !(1..=3).contains(&payload.rounds)
+                    || payload
+                        .model
+                        .as_deref()
+                        .is_some_and(|value| bounded(value, MAX_IDENTIFIER_BYTES).is_err())
+                    || payload
+                        .effort
+                        .as_deref()
+                        .is_some_and(|value| bounded(value, MAX_IDENTIFIER_BYTES).is_err())
+                {
+                    return Err("protocol.invalid_payload");
+                }
+                let agent = self
+                    .agents
+                    .list()
+                    .into_iter()
+                    .find(|agent| agent.id == payload.agent_id)
+                    .ok_or("agent.unavailable")?;
+                if let Some(model) = payload.model.as_deref() {
+                    let model = agent
+                        .models
+                        .iter()
+                        .find(|candidate| candidate.id == model)
+                        .ok_or("agent.invalid_model")?;
+                    if payload.effort.as_deref().is_some_and(|effort| {
+                        !model.efforts.iter().any(|candidate| candidate == effort)
+                    }) {
+                        return Err("agent.invalid_effort");
+                    }
+                }
+                let is_open = self.registry.list().into_iter().any(|tab| {
+                    tab.state() == &TabState::Running
+                        && tab_matches_session(&tab, &payload.session_id)
+                });
+                if !is_open {
+                    return Err("session.tab_not_found");
+                }
+                let app = self.app.as_ref().ok_or("remote.unsupported")?;
+                use tauri::Emitter;
+                app.emit("remote://bring-in", &payload)
+                    .map_err(|_| "remote.operation_failed")?;
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.bring_in",
+                    &SuccessPayload { ok: true },
                 )?]))
             }
             "session.preview" => {
@@ -2002,25 +2701,47 @@ impl RemoteServices {
             }
             "session.changes" => {
                 let payload: SessionIdPayload = decode_payload(request)?;
-                self.sessions
+                let session = self
+                    .sessions
                     .find(&payload.session_id)
                     .map_err(|error| error.code())?;
                 let app = self.app.as_ref().ok_or("remote.unsupported")?;
-                let changes = crate::changes::for_session(app, &payload.session_id);
+                let changes = crate::changes::produced_files(app, &session);
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "session.changes",
                     &SessionChangesPayload { changes },
                 )?]))
             }
+            "session.web_preview" => {
+                let payload: SessionWebPreviewRequest = decode_payload(request)?;
+                let session = self
+                    .sessions
+                    .find(&payload.session_id)
+                    .map_err(|error| error.code())?;
+                let app = self.app.as_ref().ok_or("remote.unsupported")?;
+                let target = web_preview_target(self, app, &session);
+                let available = target.is_some();
+                let path = if payload.open {
+                    target.map(|target| self.web_previews.mint(target))
+                } else {
+                    None
+                };
+                Ok(DispatchOutcome::frames(vec![response(
+                    request_id,
+                    "session.web_preview",
+                    &SessionWebPreviewPayload { available, path },
+                )?]))
+            }
             "file.read" => {
                 let payload: FileReadRequest = decode_payload(request)?;
-                self.sessions
+                let session = self
+                    .sessions
                     .find(&payload.session_id)
                     .map_err(|error| error.code())?;
                 bounded(&payload.path, MAX_PATH_BYTES)?;
                 let app = self.app.as_ref().ok_or("remote.unsupported")?;
-                let chunk = read_authorized_file_chunk(app, payload)?;
+                let chunk = read_authorized_file_chunk(app, &session, payload)?;
                 Ok(DispatchOutcome::frames(vec![response(
                     request_id,
                     "file.read",
@@ -3933,6 +4654,39 @@ async fn run_authenticated_socket(
                     let _ = outbound.controls.try_send(EgressControl::Close);
                     break;
                 }
+                if request.kind() == "transport.direct" {
+                    let frame = if !request.payload().is_empty() {
+                        error_response(
+                            request.request_id(),
+                            "transport.invalid_direct_request",
+                            "direct connection setup does not accept a payload",
+                        )
+                    } else if let Some(service) = &services.direct_tunnel {
+                        match service.prepare().await {
+                            Ok(offer) => {
+                                match response(request.request_id(), "transport.direct", &offer) {
+                                    Ok(frame) => frame,
+                                    Err(_) => break,
+                                }
+                            }
+                            Err(error) => error_response(
+                                request.request_id(),
+                                "transport.direct_unavailable",
+                                &error,
+                            ),
+                        }
+                    } else {
+                        error_response(
+                            request.request_id(),
+                            "transport.direct_unavailable",
+                            "direct connections require an active relay route",
+                        )
+                    };
+                    if enqueue_event(&outbound, frame).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if request.kind() == "terminal.attach"
                     && attachments.len() >= MAX_ATTACHMENTS_PER_CONNECTION
                 {
@@ -4322,13 +5076,64 @@ mod request_guard_tests {
             kind: kind.into(),
             at: 1,
             session_id: Some("session-1".into()),
-            bytes: std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0),
+            bytes: std::fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
         }
     }
 
     #[test]
+    fn static_web_preview_prefers_index_and_exposes_only_recorded_siblings() {
+        let root =
+            std::env::temp_dir().join(format!("aiterm-web-preview-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let index = root.join("index.html");
+        let landing = root.join("landing.html");
+        let style = root.join("assets/site.css");
+        let secret = root.join("unrelated.env");
+        std::fs::write(&index, b"<link rel=stylesheet href=assets/site.css>").unwrap();
+        std::fs::write(&landing, b"newer page").unwrap();
+        std::fs::write(&style, b"body{}").unwrap();
+        std::fs::write(&secret, b"not for the preview").unwrap();
+        let mut landing_change = recorded_change(&landing, "created");
+        landing_change.at = 20;
+        let changes = vec![
+            landing_change,
+            recorded_change(&index, "created"),
+            recorded_change(&root.join("gone.js"), "deleted"),
+            recorded_change(&style, "modified"),
+        ];
+
+        let preview = static_web_preview(&changes).unwrap();
+
+        assert_eq!(preview.entry, "index.html");
+        assert!(preview.files.contains_key("index.html"));
+        assert!(preview.files.contains_key("assets/site.css"));
+        assert!(!preview.files.contains_key("unrelated.env"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn web_preview_tickets_are_bounded_unguessable_paths() {
+        let store = WebPreviewStore::default();
+        let path = store.mint(WebPreviewTarget::Port(5173));
+        let ticket = path
+            .strip_prefix("/v1/preview/")
+            .and_then(|value| value.strip_suffix('/'))
+            .unwrap();
+
+        assert_eq!(ticket.len(), 43);
+        assert!(matches!(
+            store.resolve(ticket),
+            Some(WebPreviewTarget::Port(5173))
+        ));
+        assert!(store.resolve("not-a-ticket").is_none());
+    }
+
+    #[test]
     fn upload_registry_keeps_one_set_for_an_idle_live_socket_and_expires_a_disconnected_one() {
-        let root = std::env::temp_dir().join(format!("aiterm-upload-lease-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("aiterm-upload-lease-{}", uuid::Uuid::new_v4()));
         let registry = DeviceUploadRegistry::new(AttachmentStore::new(root.clone()).unwrap());
         let live = registry.lease("phone-1");
         *live.touched.lock().unwrap() =
@@ -4366,8 +5171,9 @@ mod request_guard_tests {
             count,
         };
 
-        let first = read_file_chunk_from_ledger(request(&path, 0, 4), std::slice::from_ref(&change))
-            .unwrap();
+        let first =
+            read_file_chunk_from_ledger(request(&path, 0, 4), std::slice::from_ref(&change))
+                .unwrap();
         assert_eq!(first.data, b"abcd");
         assert_eq!(first.total, 6);
         assert!(!first.eof);
@@ -4870,8 +5676,7 @@ async fn handle_pairing(mut socket: WebSocket, state: GatewayState, peer_ip: IpA
         &request.public_key,
         (!request.relay_authority_public_key.is_empty())
             .then_some(request.relay_authority_public_key.as_slice()),
-        (!request.relay_signature_der.is_empty())
-            .then_some(request.relay_signature_der.as_slice()),
+        (!request.relay_signature_der.is_empty()).then_some(request.relay_signature_der.as_slice()),
         peer_ip,
         SystemTime::now(),
     ) {

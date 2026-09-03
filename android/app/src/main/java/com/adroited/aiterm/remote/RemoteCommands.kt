@@ -20,6 +20,45 @@ data class RemoteSession(
     @SerialName("last_active") val lastActive: Long,
 )
 
+data class RemoteSessionRoster(
+    val sessions: List<RemoteSession>,
+    val withFiles: Set<String>,
+    val stars: Set<String>,
+    val broughtIn: Map<String, String>,
+    val activity: Map<String, String>,
+)
+
+@Serializable
+data class RemoteUsageBar(
+    val kind: String,
+    val label: String,
+    val percent: Double,
+    val severity: String,
+    @SerialName("resets_at") val resetsAt: String,
+)
+
+@Serializable
+data class RemoteUsageAmount(
+    val label: String,
+    val amount: Double,
+    val of: Double? = null,
+    val currency: String,
+    val sense: String,
+)
+
+@Serializable
+data class RemoteUsageSource(
+    val id: String,
+    val name: String,
+    val state: String,
+    val detail: String,
+    val plan: String,
+    val account: String,
+    val bars: List<RemoteUsageBar>,
+    val amounts: List<RemoteUsageAmount>,
+    val notes: List<String>,
+)
+
 data class AttachedTerminal(
     val tabId: String,
     val attachmentId: String,
@@ -64,6 +103,11 @@ data class RemoteFileChunk(
     val data: ByteArray,
 )
 
+data class RemoteWebPreview(
+    val available: Boolean,
+    val path: String?,
+)
+
 @Serializable
 data class RemoteModelOption(
     val id: String,
@@ -98,6 +142,14 @@ data class RemoteAgentRoster(
     val caps: Map<String, RemoteAgentCaps>,
 )
 
+data class RemoteDirectOffer(
+    val id: String,
+    val cookie: String,
+    val host: String,
+    val port: Int,
+    val expiresInMillis: Long,
+)
+
 @OptIn(ExperimentalSerializationApi::class)
 object RemoteCommands {
     const val MAX_UPLOAD_BYTES = 12 * 1_024 * 1_024L
@@ -126,6 +178,21 @@ object RemoteCommands {
             ) malformed()
             RemoteGatewayRoutes(it.hosts, it.port, it.relayHost, it.relayPort)
         }
+    fun directOffer(payload: ByteArray): RemoteDirectOffer =
+        decode(DirectOfferReply.serializer(), payload).let {
+            if (
+                it.id.isBlank() || it.cookie.isBlank() || it.host.isBlank() ||
+                it.id.length > 128 || it.cookie.length > 128 || it.host.length > 253 ||
+                it.port !in 1..65_535 || it.expiresInMillis !in 1..60_000
+            ) malformed()
+            RemoteDirectOffer(
+                it.id,
+                it.cookie,
+                it.host,
+                it.port,
+                it.expiresInMillis,
+            )
+        }
     fun attachment(tabId: String, attachmentId: String): ByteArray =
         encode(AttachmentPayload.serializer(), AttachmentPayload(tabId, attachmentId))
     fun input(tabId: String, attachmentId: String, data: ByteArray): ByteArray =
@@ -139,6 +206,13 @@ object RemoteCommands {
     fun previewSession(sessionId: String): ByteArray = session(sessionId)
     fun conversation(sessionId: String, maxChars: Int = 512 * 1_024): ByteArray =
         encode(SessionConversationPayload.serializer(), SessionConversationPayload(sessionId, maxChars))
+    fun webPreview(sessionId: String, open: Boolean): ByteArray {
+        requireIdentifier(sessionId)
+        return encode(
+            SessionWebPreviewRequest.serializer(),
+            SessionWebPreviewRequest(sessionId, open),
+        )
+    }
     fun fileRead(sessionId: String, path: String, offset: Long, count: Int): ByteArray {
         requireIdentifier(sessionId)
         if (path.isBlank() || path.encodeToByteArray().size > MAX_PATH_BYTES || offset < 0 ||
@@ -229,10 +303,71 @@ object RemoteCommands {
         if (!decode(UploadSuccessReply.serializer(), payload).ok) malformed()
     }
 
-    fun sessions(payload: ByteArray): List<RemoteSession> =
-        decode(SessionListReply.serializer(), payload).sessions.also { sessions ->
-            if (sessions.size > 4_096 || sessions.any { it.id.length !in 1..512 }) malformed()
+    fun sessions(payload: ByteArray): List<RemoteSession> = sessionRoster(payload).sessions
+
+    fun sessionRoster(payload: ByteArray): RemoteSessionRoster =
+        decode(SessionListReply.serializer(), payload).let { reply ->
+            val ids = reply.sessions.mapTo(hashSetOf()) { it.id }
+            if (reply.sessions.size > 4_096 || reply.sessions.any { it.id.length !in 1..512 } ||
+                reply.withFiles.size > 4_096 || reply.stars.size > 4_096 ||
+                reply.broughtIn.size > 4_096 || reply.activity.size > 4_096 ||
+                reply.withFiles.any { it !in ids } || reply.stars.any { it !in ids } ||
+                reply.broughtIn.any { (child, parent) -> child !in ids || parent !in ids } ||
+                reply.activity.any { (id, activity) ->
+                    id !in ids || activity !in setOf("output", "idle", "attention")
+                }
+            ) malformed()
+            RemoteSessionRoster(
+                sessions = reply.sessions,
+                withFiles = reply.withFiles.toSet(),
+                stars = reply.stars.toSet(),
+                broughtIn = reply.broughtIn,
+                activity = reply.activity,
+            )
         }
+
+    fun usage(payload: ByteArray): List<RemoteUsageSource> =
+        decode(UsageReply.serializer(), payload).sources.also { sources ->
+            if (sources.size > 128 || sources.any { source ->
+                    source.id.length !in 1..512 || source.name.length !in 1..512 ||
+                        source.bars.size > 64 || source.amounts.size > 64 || source.notes.size > 64 ||
+                        source.bars.any { !it.percent.isFinite() || it.percent !in 0.0..100.0 } ||
+                        source.amounts.any { !it.amount.isFinite() || it.of?.isFinite() == false }
+                }
+            ) malformed()
+        }
+
+    fun starSession(sessionId: String, on: Boolean): ByteArray {
+        requireIdentifier(sessionId)
+        return encode(SessionStarPayload.serializer(), SessionStarPayload(sessionId, on))
+    }
+
+    fun renameSession(sessionId: String, title: String): ByteArray {
+        requireIdentifier(sessionId)
+        require(title.encodeToByteArray().size <= MAX_PATH_BYTES)
+        return encode(SessionRenamePayload.serializer(), SessionRenamePayload(sessionId, title))
+    }
+
+    fun bringInSession(
+        sessionId: String,
+        agentId: String,
+        model: String?,
+        effort: String?,
+        focus: String,
+        rounds: Int,
+        auto: Boolean,
+    ): ByteArray {
+        requireIdentifier(sessionId)
+        requireIdentifier(agentId)
+        model?.let(::requireIdentifier)
+        effort?.let(::requireIdentifier)
+        require(focus.encodeToByteArray().size <= MAX_PATH_BYTES)
+        require(rounds in 1..3)
+        return encode(
+            SessionBringInPayload.serializer(),
+            SessionBringInPayload(sessionId, agentId, model, effort, focus, rounds, auto),
+        )
+    }
 
     fun tabs(payload: ByteArray): List<RemoteTab> = decode(TabListReply.serializer(), payload).tabs.also {
         if (it.size > 128) malformed()
@@ -257,6 +392,14 @@ object RemoteCommands {
                         it.name.encodeToByteArray().size > MAX_PATH_BYTES
                 }
             ) malformed()
+        }
+
+    fun webPreview(payload: ByteArray): RemoteWebPreview =
+        decode(SessionWebPreviewReply.serializer(), payload).let { reply ->
+            if (
+                reply.path != null && (!reply.available || !WEB_PREVIEW_PATH.matches(reply.path))
+            ) malformed()
+            RemoteWebPreview(reply.available, reply.path)
         }
 
     fun fileChunk(payload: ByteArray): RemoteFileChunk =
@@ -332,6 +475,13 @@ object RemoteCommands {
         @SerialName("relay_host") val relayHost: String? = null,
         @SerialName("relay_port") val relayPort: Int? = null,
     )
+    @Serializable private data class DirectOfferReply(
+        val id: String,
+        val cookie: String,
+        val host: String,
+        val port: Int,
+        @SerialName("expires_in_millis") val expiresInMillis: Long,
+    )
     @Serializable private data class AttachmentPayload(
         @SerialName("tab_id") val tabId: String,
         @SerialName("attachment_id") val attachmentId: String,
@@ -356,6 +506,10 @@ object RemoteCommands {
     @Serializable private data class SessionConversationPayload(
         @SerialName("session_id") val sessionId: String,
         @SerialName("max_chars") val maxChars: Int,
+    )
+    @Serializable private data class SessionWebPreviewRequest(
+        @SerialName("session_id") val sessionId: String,
+        val open: Boolean,
     )
     @Serializable private data class FileReadRequest(
         @SerialName("session_id") val sessionId: String,
@@ -410,9 +564,37 @@ object RemoteCommands {
     )
     @Serializable private data class UploadFinishReply(val path: String)
     @Serializable private data class UploadSuccessReply(val ok: Boolean)
-    @Serializable private data class SessionListReply(val sessions: List<RemoteSession>)
+    @Serializable private data class SessionListReply(
+        val sessions: List<RemoteSession>,
+        @SerialName("with_files") val withFiles: List<String> = emptyList(),
+        val stars: List<String> = emptyList(),
+        @SerialName("brought_in") val broughtIn: Map<String, String> = emptyMap(),
+        val activity: Map<String, String> = emptyMap(),
+    )
+    @Serializable private data class UsageReply(val sources: List<RemoteUsageSource>)
+    @Serializable private data class SessionStarPayload(
+        @SerialName("session_id") val sessionId: String,
+        val on: Boolean,
+    )
+    @Serializable private data class SessionRenamePayload(
+        @SerialName("session_id") val sessionId: String,
+        val title: String,
+    )
+    @Serializable private data class SessionBringInPayload(
+        @SerialName("session_id") val sessionId: String,
+        @SerialName("agent_id") val agentId: String,
+        val model: String?,
+        val effort: String?,
+        val focus: String,
+        val rounds: Int,
+        val auto: Boolean,
+    )
     @Serializable private data class SessionPreviewReply(val messages: List<RemotePreviewMessage>)
     @Serializable private data class SessionChangesReply(val changes: List<RemoteSessionChange>)
+    @Serializable private data class SessionWebPreviewReply(
+        val available: Boolean,
+        val path: String? = null,
+    )
     @Serializable private data class FileReadReply(
         val path: String,
         val mime: String,
@@ -457,4 +639,6 @@ object RemoteCommands {
         @SerialName("attachment_id") val attachmentId: String,
         val exit: RemoteTabExit,
     )
+
+    private val WEB_PREVIEW_PATH = Regex("/v1/preview/[A-Za-z0-9_-]{43}/")
 }

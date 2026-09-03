@@ -1,6 +1,9 @@
 {
   "connector_listen": "127.0.0.1:8080",
   "ingress_listen": "0.0.0.0:443",
+  "direct_listen": "0.0.0.0:443",
+  "direct_public_host": "relay.example.com",
+  "direct_public_port": 443,
   "public_domain": "relay.example.com",
   "provisioning": {
     "state_file": "/var/lib/aiterm-relay/provisioning.json",

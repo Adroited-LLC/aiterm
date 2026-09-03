@@ -13,6 +13,7 @@ import androidx.navigation.compose.rememberNavController
 import com.adroited.aiterm.ui.theme.AitermTheme
 import com.adroited.aiterm.AitermApplication
 import com.adroited.aiterm.AppContainer
+import com.adroited.aiterm.pairing.PairedDesktop
 import kotlinx.serialization.Serializable
 import androidx.navigation.toRoute
 
@@ -26,11 +27,10 @@ object PairingRoute
 @Serializable
 data class TerminalRoute(val deviceId: String)
 
-/**
- * The navigation shell. The start destination is always the paired-desktop
- * list; pairing is reached from it, never the other way round, so a returning
- * user with a paired desktop never sees the camera.
- */
+internal fun initialDestination(desktops: List<PairedDesktop>): Any =
+    desktops.singleOrNull()?.let { TerminalRoute(it.deviceId) } ?: DesktopsRoute
+
+/** The navigation shell. Locked launches render the safe welcome surface above this graph. */
 @Composable
 fun AitermApp(
     navController: NavHostController = rememberNavController(),
@@ -46,7 +46,8 @@ fun AitermApp(
         if (locked) {
             LockedContent(onUnlock = onRequestUnlock, error = unlockError)
         } else {
-            NavHost(navController = navController, startDestination = DesktopsRoute) {
+            val desktops = runCatching { container.pairedDesktopStore.all() }.getOrDefault(emptyList())
+            NavHost(navController = navController, startDestination = initialDestination(desktops)) {
                 composable<DesktopsRoute> {
                     DesktopListScreen(
                         store = container.pairedDesktopStore,
@@ -67,7 +68,9 @@ fun AitermApp(
                         .getOrDefault(emptyList())
                         .firstOrNull { it.deviceId == route.deviceId }
                     if (desktop == null) {
-                        LaunchedEffect(route.deviceId) { navController.popBackStack() }
+                        LaunchedEffect(route.deviceId) {
+                            if (!navController.popBackStack()) navController.navigate(DesktopsRoute)
+                        }
                     } else {
                         val remoteViewModel: RemoteTerminalViewModel = viewModel(
                             key = "remote-${desktop.deviceId}",
@@ -81,8 +84,34 @@ fun AitermApp(
                         )
                         RemoteDesktopScreen(
                             viewModel = remoteViewModel,
-                            desktopName = desktop.displayName,
-                            onBack = { navController.popBackStack() },
+                            desktop = desktop,
+                            pairedDesktops = runCatching { container.pairedDesktopStore.all() }
+                                .getOrDefault(listOf(desktop)),
+                            onBack = {
+                                if (!navController.popBackStack()) navController.navigate(DesktopsRoute)
+                            },
+                            onOpenDesktop = { target ->
+                                navController.navigate(TerminalRoute(target.deviceId)) {
+                                    popUpTo(entry.destination.id) { inclusive = true }
+                                }
+                            },
+                            onPairDesktop = { navController.navigate(PairingRoute) },
+                            onForgetDesktop = {
+                                runCatching {
+                                    container.pairedDesktopStore.remove(desktop.deviceId)
+                                    val remaining = container.pairedDesktopStore.all()
+                                    val only = remaining.singleOrNull()
+                                    if (only == null) {
+                                        navController.navigate(DesktopsRoute) {
+                                            popUpTo(entry.destination.id) { inclusive = true }
+                                        }
+                                    } else {
+                                        navController.navigate(TerminalRoute(only.deviceId)) {
+                                            popUpTo(entry.destination.id) { inclusive = true }
+                                        }
+                                    }
+                                }.isSuccess
+                            },
                             keyBarPreference = container.terminalKeyBarPreference,
                         )
                     }

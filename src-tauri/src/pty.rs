@@ -75,6 +75,10 @@ impl<T> PtyTable<T> {
             .unwrap_or_default()
     }
 
+    fn child_pid(&self, id: u32) -> Option<u32> {
+        self.entries.lock().ok()?.get(&id)?.child_pid
+    }
+
     fn with<R>(&self, id: u32, body: impl FnOnce(&mut T) -> R) -> Option<R> {
         let value = self.get(id)?;
         let mut value = value.lock().ok()?;
@@ -396,16 +400,6 @@ fn parent_of(pid: u32) -> Option<u32> {
 }
 
 impl PtyManager {
-    /// Root pid of the PTY's child process, when it was known at spawn.
-    pub fn child_pid(&self, id: u32) -> Option<u32> {
-        self.ptys
-            .entries
-            .lock()
-            .ok()?
-            .get(&id)
-            .and_then(|entry| entry.child_pid)
-    }
-
     /// Write input to one live PTY.
     pub fn write(&self, id: u32, data: &[u8]) -> Result<(), String> {
         self.ptys
@@ -476,6 +470,12 @@ impl PtyManager {
             }
         }
         None
+    }
+
+    /// Direct child process for one PTY. Callers use it only as the root of
+    /// a bounded process-tree lookup; ownership remains here.
+    pub fn child_pid(&self, id: u32) -> Option<u32> {
+        self.ptys.child_pid(id)
     }
 }
 

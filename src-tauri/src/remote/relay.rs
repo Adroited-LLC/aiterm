@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::Message;
 
 const CONFIG_FILE: &str = "relay.json";
+const SERVER_CONFIG_FILE: &str = "relay-server.json";
 const MAX_STREAMS: usize = 128;
 const STREAM_QUEUE: usize = 32;
 const OUTGOING_QUEUE: usize = 256;
@@ -25,6 +26,71 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROVISION_RESPONSE_BYTES: u64 = 8 * 1024;
+
+/// The control plane selected for the next managed relay enrollment. Keeping
+/// its public domain beside the origin lets the gateway issue a matching TLS
+/// certificate before the relay route itself exists, without making LAN start
+/// depend on the relay being online every time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayServerConfig {
+    pub control_origin: String,
+    pub public_domain: String,
+}
+
+impl RelayServerConfig {
+    pub fn known(control_origin: &str, public_domain: &str) -> Result<Self, String> {
+        let origin = validated_server_origin(control_origin)?;
+        let public_domain = normalize_dns_name(public_domain)
+            .filter(|value| value == public_domain)
+            .ok_or_else(|| "relay public domain is invalid".to_string())?;
+        Ok(Self {
+            control_origin: origin.as_str().trim_end_matches('/').to_string(),
+            public_domain,
+        })
+    }
+
+    pub async fn discover(server: &str) -> Result<Self, String> {
+        let (control_origin, info) = fetch_relay_info(server).await?;
+        Self::known(&control_origin, &info.public_domain)
+    }
+
+    pub fn from_route(config: &RelayConfig) -> Option<Self> {
+        let mut origin = url::Url::parse(&config.connector_url).ok()?;
+        if !matches!(origin.path(), "/v1/connect" | "/v1/connect/") {
+            return None;
+        }
+        origin
+            .set_scheme(if origin.scheme() == "wss" { "https" } else { "http" })
+            .ok()?;
+        origin.set_path("/");
+        let public_domain = config
+            .public_host
+            .strip_prefix(&format!("{}.", config.route_id))?;
+        Self::known(origin.as_str(), public_domain).ok()
+    }
+
+    pub fn load(root: &Path) -> Result<Option<Self>, String> {
+        let path = root.join(SERVER_CONFIG_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("could not read relay server setting: {error}")),
+        };
+        let config: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("relay server setting is corrupt: {error}"))?;
+        Self::known(&config.control_origin, &config.public_domain).map(Some)
+    }
+
+    pub fn save(&self, root: &Path) -> Result<(), String> {
+        let validated = Self::known(&self.control_origin, &self.public_domain)?;
+        std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+        set_private_permissions(root, 0o700).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&validated).map_err(|error| error.to_string())?;
+        write_private_file(&root.join(SERVER_CONFIG_FILE), &bytes)
+            .map_err(|error| error.to_string())
+    }
+}
 
 #[derive(Clone)]
 pub struct RelayEnrollmentDraft {
@@ -191,23 +257,7 @@ impl RelayConfig {
         server: &str,
         desktop_spki_fingerprint: &str,
     ) -> Result<RelayEnrollmentDraft, String> {
-        let base = validated_server_origin(server)?;
-        let control_origin = base.as_str().trim_end_matches('/').to_string();
-        let mut info_url = base;
-        info_url.set_path("/v1/info");
-        let response = provisioning_client()?
-            .get(info_url)
-            .send()
-            .await
-            .map_err(|_| "the relay server could not be reached".to_string())?;
-        if !response.status().is_success() {
-            return Err("this relay server does not support automatic setup".into());
-        }
-        let info: RelayInfo = bounded_json(response).await?;
-        let returned_origin = validated_server_origin(&info.control_origin)?;
-        if returned_origin.as_str().trim_end_matches('/') != control_origin {
-            return Err("the relay server returned an unexpected control identity".into());
-        }
+        let (control_origin, info) = fetch_relay_info(server).await?;
         let public_domain = normalize_dns_name(&info.public_domain)
             .filter(|value| value == &info.public_domain)
             .ok_or_else(|| "the relay server returned an invalid public domain".to_string())?;
@@ -287,6 +337,27 @@ struct RelayInfo {
     connector_url: String,
     public_domain: String,
     public_port: u16,
+}
+
+async fn fetch_relay_info(server: &str) -> Result<(String, RelayInfo), String> {
+    let base = validated_server_origin(server)?;
+    let control_origin = base.as_str().trim_end_matches('/').to_string();
+    let mut info_url = base;
+    info_url.set_path("/v1/info");
+    let response = provisioning_client()?
+        .get(info_url)
+        .send()
+        .await
+        .map_err(|_| "the relay server could not be reached".to_string())?;
+    if !response.status().is_success() {
+        return Err("this relay server does not support automatic setup".into());
+    }
+    let info: RelayInfo = bounded_json(response).await?;
+    let returned_origin = validated_server_origin(&info.control_origin)?;
+    if returned_origin.as_str().trim_end_matches('/') != control_origin {
+        return Err("the relay server returned an unexpected control identity".into());
+    }
+    Ok((control_origin, info))
 }
 
 #[derive(Serialize)]
@@ -631,7 +702,45 @@ mod tests {
         let config = valid_config();
         config.save(&root).unwrap();
         assert_eq!(RelayConfig::load(&root).unwrap(), Some(config));
+        let server = RelayServerConfig::known(
+            "https://control.relay.example.com/",
+            "relay.example.com",
+        )
+        .unwrap();
+        server.save(&root).unwrap();
+        assert_eq!(RelayServerConfig::load(&root).unwrap(), Some(server));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_existing_route_recovers_its_server_for_upgrade() {
+        assert_eq!(
+            RelayServerConfig::from_route(&valid_config()),
+            Some(RelayServerConfig {
+                control_origin: "https://control.relay.example.com".into(),
+                public_domain: "relay.example.com".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn server_setting_accepts_only_a_secure_origin_and_plain_dns_domain() {
+        assert!(RelayServerConfig::known(
+            "https://control.relay.example.com:8443",
+            "relay.example.com",
+        ).is_ok());
+        assert!(RelayServerConfig::known(
+            "https://user@control.relay.example.com",
+            "relay.example.com",
+        ).is_err());
+        assert!(RelayServerConfig::known(
+            "https://control.relay.example.com/a/path",
+            "relay.example.com",
+        ).is_err());
+        assert!(RelayServerConfig::known(
+            "https://control.relay.example.com",
+            "*.relay.example.com",
+        ).is_err());
     }
 
     #[tokio::test]
@@ -677,6 +786,9 @@ mod tests {
                 .unwrap();
         });
 
+        let selected = RelayServerConfig::discover(&origin).await.unwrap();
+        assert_eq!(selected.control_origin, origin);
+        assert_eq!(selected.public_domain, "relay.example.com");
         let desktop_fingerprint = URL_SAFE_NO_PAD.encode([9u8; 32]);
         let draft = RelayConfig::prepare_enrollment(&origin, &desktop_fingerprint).await.unwrap();
         let authority = SigningKey::random(&mut OsRng);
