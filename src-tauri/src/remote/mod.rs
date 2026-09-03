@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod direct;
 pub mod model;
 pub mod relay;
 pub mod server;
@@ -8,15 +9,14 @@ pub mod uploads;
 use auth::{
     set_private_permissions, write_private_file, DeviceStore, PendingPairing, TrustedDevice,
 };
+use direct::DirectTunnelService;
 use qrcode::{EcLevel, QrCode};
 use relay::{
     RelayConfig, RelayConnectionState, RelayConnectorHandle, RelayEnrollmentDraft,
     RelayServerConfig,
 };
 use serde::{Deserialize, Serialize};
-use server::{
-    GatewayHandle, RemoteGateway, RemoteServices, TlsIdentity, MAX_ADVERTISED_HOSTS,
-};
+use server::{GatewayHandle, RemoteGateway, RemoteServices, TlsIdentity, MAX_ADVERTISED_HOSTS};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -95,7 +95,8 @@ impl PairingUri {
                     relay_authorization_digest = base64::Engine::decode(
                         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
                         value,
-                    ).ok()
+                    )
+                    .ok()
                 }
                 // An unknown key means a payload written by a build that knows
                 // something this one does not. Ignoring it is safe only
@@ -105,8 +106,10 @@ impl PairingUri {
         }
 
         let version = version?;
-        if !matches!(version, PAIRING_VERSION | RELAY_PAIRING_VERSION | RELAY_AUTH_PAIRING_VERSION)
-            || hosts.is_empty()
+        if !matches!(
+            version,
+            PAIRING_VERSION | RELAY_PAIRING_VERSION | RELAY_AUTH_PAIRING_VERSION
+        ) || hosts.is_empty()
         {
             return None;
         }
@@ -114,7 +117,9 @@ impl PairingUri {
         if (relay_host.is_some() != relay_port.is_some())
             || (matches!(version, RELAY_PAIRING_VERSION | RELAY_AUTH_PAIRING_VERSION) != has_relay)
             || ((version == RELAY_AUTH_PAIRING_VERSION)
-                != relay_authorization_digest.as_ref().is_some_and(|value| value.len() == 32))
+                != relay_authorization_digest
+                    .as_ref()
+                    .is_some_and(|value| value.len() == 32))
         {
             return None;
         }
@@ -377,7 +382,9 @@ impl RemoteStartupConfig {
         let path = root.join(STARTUP_CONFIG_FILE);
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
             Err(error) => return Err(format!("could not read remote startup setting: {error}")),
         };
         serde_json::from_slice::<Self>(&bytes)
@@ -432,10 +439,7 @@ fn relay_certificate_dns(
 ) -> Vec<String> {
     relay_config
         .map(|config| vec![config.public_host.clone()])
-        .or_else(|| {
-            relay_server
-                .map(|server| vec![format!("*.{}", server.public_domain)])
-        })
+        .or_else(|| relay_server.map(|server| vec![format!("*.{}", server.public_domain)]))
         .unwrap_or_else(|| vec![format!("*.{DEFAULT_RELAY_PUBLIC_DOMAIN}")])
 }
 
@@ -505,10 +509,9 @@ impl Inner {
                     .and_then(RelayServerConfig::from_route)
                 {
                     Some(server) => server,
-                    None => RelayServerConfig::known(
-                        DEFAULT_RELAY_SERVER,
-                        DEFAULT_RELAY_PUBLIC_DOMAIN,
-                    )?,
+                    None => {
+                        RelayServerConfig::known(DEFAULT_RELAY_SERVER, DEFAULT_RELAY_PUBLIC_DOMAIN)?
+                    }
                 },
             });
             self.relay_config_loaded = true;
@@ -553,11 +556,24 @@ impl Inner {
                 .unwrap_or_else(|| DEFAULT_RELAY_SERVER.to_string()),
             relay: RelayStatusView {
                 configured: self.relay_config.is_some(),
-                connector_url: self.relay_config.as_ref().map(|value| value.connector_url.clone()),
-                public_host: self.relay_config.as_ref().map(|value| value.public_host.clone()),
+                connector_url: self
+                    .relay_config
+                    .as_ref()
+                    .map(|value| value.connector_url.clone()),
+                public_host: self
+                    .relay_config
+                    .as_ref()
+                    .map(|value| value.public_host.clone()),
                 public_port: self.relay_config.as_ref().map(|value| value.public_port),
-                route_id: self.relay_config.as_ref().map(|value| value.route_id.clone()),
-                state: self.relay.as_ref().map(RelayConnectorHandle::state).unwrap_or_default(),
+                route_id: self
+                    .relay_config
+                    .as_ref()
+                    .map(|value| value.route_id.clone()),
+                state: self
+                    .relay
+                    .as_ref()
+                    .map(RelayConnectorHandle::state)
+                    .unwrap_or_default(),
             },
         }
     }
@@ -586,7 +602,9 @@ impl Inner {
         {
             return Err("remote listener advertisement state is inconsistent".into());
         }
-        let relay = self.relay_config.as_ref()
+        let relay = self
+            .relay_config
+            .as_ref()
             .map(|config| (config.public_host.as_str(), config.public_port))
             .or_else(|| draft.map(RelayEnrollmentDraft::public_endpoint));
         Ok(pairing_payload_with_relay_authorization(
@@ -624,7 +642,8 @@ pub async fn remote_relay_configure(
     if inner.gateway.is_some() || inner.starting {
         return Err("turn remote access off before changing relay settings".into());
     }
-    let token = token.filter(|value| !value.is_empty())
+    let token = token
+        .filter(|value| !value.is_empty())
         .or_else(|| inner.relay_config.as_ref().map(|value| value.token.clone()))
         .ok_or_else(|| "enter the relay connector token".to_string())?;
     let config = RelayConfig {
@@ -796,16 +815,26 @@ async fn start_remote(
         IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
     };
-    let relay_host = relay_config.as_ref().map(|config| config.public_host.clone());
+    let relay_host = relay_config
+        .as_ref()
+        .map(|config| config.public_host.clone());
     let relay_port = relay_config.as_ref().map(|config| config.public_port);
     let routes = advertised_hosts.iter().map(ToString::to_string).collect();
+    let mut remote_services = RemoteServices::from_application_services(tabs, &services)
+        .with_app_handle(app)
+        .with_gateway_routes(routes, port, relay_host, relay_port);
+    if let Some(config) = relay_config.as_ref() {
+        remote_services = remote_services.with_direct_tunnel(Arc::new(DirectTunnelService::new(
+            config.clone(),
+            identity.clone(),
+            SocketAddr::new(ip, port),
+        )));
+    }
     let started = RemoteGateway::start(
         SocketAddr::new(listen_ip, port),
         devices,
         identity,
-        RemoteServices::from_application_services(tabs, &services)
-            .with_app_handle(app)
-            .with_gateway_routes(routes, port, relay_host, relay_port),
+        remote_services,
     )
     .await;
     let mut inner = state.inner.lock().await;
@@ -839,7 +868,8 @@ pub async fn remote_start(
         services.inner().clone(),
         address,
         port,
-    ).await
+    )
+    .await
 }
 
 /// Restore remote access only after an explicit opt-in. Failure is diagnostic,
@@ -916,7 +946,9 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
     };
     // Closing the listener is not a statement about any phone: trusted
     // devices stay trusted, and revocation stays an explicit act.
-    if let Some(relay) = relay { relay.stop().await; }
+    if let Some(relay) = relay {
+        relay.stop().await;
+    }
     if let Some(gateway) = gateway {
         gateway.stop().await.map_err(|error| error.to_string())?;
     }
@@ -935,7 +967,10 @@ pub async fn remote_begin_pairing(
         }
         (
             inner.devices()?,
-            inner.fingerprint.clone().ok_or("the remote identity is unavailable")?,
+            inner
+                .fingerprint
+                .clone()
+                .ok_or("the remote identity is unavailable")?,
             inner.relay_config.is_none(),
             inner
                 .relay_server
@@ -1003,10 +1038,11 @@ pub async fn remote_approve_device(
             inner.relay_config.is_none()
         };
         if should_register {
-            match enrollment.draft.register(
-                &enrollment.authority_public_key,
-                &enrollment.signature_der,
-            ).await {
+            match enrollment
+                .draft
+                .register(&enrollment.authority_public_key, &enrollment.signature_der)
+                .await
+            {
                 Ok(config) => {
                     config.save(&state_root()?)?;
                     let mut inner = state.inner.lock().await;
@@ -1015,7 +1051,8 @@ pub async fn remote_approve_device(
                             gateway.set_relay_route(config.public_host.clone(), config.public_port);
                         }
                         if let Some(local_target) = inner.bound {
-                            inner.relay = Some(RelayConnectorHandle::start(config.clone(), local_target));
+                            inner.relay =
+                                Some(RelayConnectorHandle::start(config.clone(), local_target));
                         }
                         inner.relay_config = Some(config);
                         inner.relay_config_loaded = true;
@@ -1175,15 +1212,9 @@ mod listener_advertisement_tests {
 
         // This represents a later interface scan after the listener is live.
         // It must not change an invite produced from the listener's state.
-        let later_scan = advertised_hosts(
-            selected,
-            vec![selected, "172.16.40.7".parse().unwrap()],
-        )
-        .unwrap();
-        assert_eq!(
-            later_scan,
-            vec![selected, "172.16.40.7".parse().unwrap()]
-        );
+        let later_scan =
+            advertised_hosts(selected, vec![selected, "172.16.40.7".parse().unwrap()]).unwrap();
+        assert_eq!(later_scan, vec![selected, "172.16.40.7".parse().unwrap()]);
 
         let payload = inner
             .pairing_payload(b"enrollment-secret", "desktop")
@@ -1198,7 +1229,10 @@ mod listener_advertisement_tests {
 
     #[test]
     fn relay_invite_is_versioned_and_keeps_direct_routes() {
-        let hosts = vec!["192.168.1.20".parse().unwrap(), "100.90.1.2".parse().unwrap()];
+        let hosts = vec![
+            "192.168.1.20".parse().unwrap(),
+            "100.90.1.2".parse().unwrap(),
+        ];
         let payload = pairing_payload_with_relay(
             &hosts,
             8443,
@@ -1210,7 +1244,10 @@ mod listener_advertisement_tests {
         let parsed = PairingUri::parse(&payload).unwrap();
         assert_eq!(parsed.version, RELAY_PAIRING_VERSION);
         assert_eq!(parsed.hosts, vec!["192.168.1.20", "100.90.1.2"]);
-        assert_eq!(parsed.relay_host.as_deref(), Some("desk-1234.relay.example.com"));
+        assert_eq!(
+            parsed.relay_host.as_deref(),
+            Some("desk-1234.relay.example.com")
+        );
         assert_eq!(parsed.relay_port, Some(443));
     }
 
@@ -1229,6 +1266,9 @@ mod listener_advertisement_tests {
         );
         let parsed = PairingUri::parse(&payload).unwrap();
         assert_eq!(parsed.version, RELAY_AUTH_PAIRING_VERSION);
-        assert_eq!(parsed.relay_authorization_digest.as_deref(), Some(digest.as_slice()));
+        assert_eq!(
+            parsed.relay_authorization_digest.as_deref(),
+            Some(digest.as_slice())
+        );
     }
 }

@@ -359,7 +359,7 @@ private fun RemoteSessionDashboard(
                     title = {
                         Column {
                             Text(desktop.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            ConnectionLabel(state.connection)
+                            ConnectionLabel(state.connection, state.connectedEndpoint?.path)
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
@@ -492,7 +492,7 @@ private fun RemoteAppDrawer(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    ConnectionLabel(state.connection)
+                    ConnectionLabel(state.connection, state.connectedEndpoint?.path)
                 }
                 TextButton(onClick = onClose) { Text("Close") }
             }
@@ -1722,9 +1722,15 @@ internal fun conversationActivitySummary(text: String): String {
 }
 
 @Composable
-private fun ConnectionLabel(connection: ConnectionState) {
+private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aiterm.remote.RemotePath?) {
     val (label, color) = when (connection) {
-        ConnectionState.Connected -> "connected" to MaterialTheme.colorScheme.tertiary
+        ConnectionState.Connected -> when (path) {
+            com.adroited.aiterm.remote.RemotePath.DIRECT -> "connected · direct"
+            com.adroited.aiterm.remote.RemotePath.RELAY -> "connected · relay"
+            com.adroited.aiterm.remote.RemotePath.LAN -> "connected · LAN"
+            com.adroited.aiterm.remote.RemotePath.VPN -> "connected · VPN"
+            else -> "connected"
+        } to MaterialTheme.colorScheme.tertiary
         ConnectionState.Connecting -> "connecting" to MaterialTheme.colorScheme.primary
         ConnectionState.Reconnecting -> "reconnecting" to MaterialTheme.colorScheme.primary
         ConnectionState.Locked -> "locked" to MaterialTheme.colorScheme.error

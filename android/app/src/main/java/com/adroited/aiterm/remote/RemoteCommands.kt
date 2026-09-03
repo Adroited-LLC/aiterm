@@ -142,6 +142,14 @@ data class RemoteAgentRoster(
     val caps: Map<String, RemoteAgentCaps>,
 )
 
+data class RemoteDirectOffer(
+    val id: String,
+    val cookie: String,
+    val host: String,
+    val port: Int,
+    val expiresInMillis: Long,
+)
+
 @OptIn(ExperimentalSerializationApi::class)
 object RemoteCommands {
     const val MAX_UPLOAD_BYTES = 12 * 1_024 * 1_024L
@@ -169,6 +177,21 @@ object RemoteCommands {
                 it.relayPort?.let { port -> port !in 1..65_535 } == true
             ) malformed()
             RemoteGatewayRoutes(it.hosts, it.port, it.relayHost, it.relayPort)
+        }
+    fun directOffer(payload: ByteArray): RemoteDirectOffer =
+        decode(DirectOfferReply.serializer(), payload).let {
+            if (
+                it.id.isBlank() || it.cookie.isBlank() || it.host.isBlank() ||
+                it.id.length > 128 || it.cookie.length > 128 || it.host.length > 253 ||
+                it.port !in 1..65_535 || it.expiresInMillis !in 1..60_000
+            ) malformed()
+            RemoteDirectOffer(
+                it.id,
+                it.cookie,
+                it.host,
+                it.port,
+                it.expiresInMillis,
+            )
         }
     fun attachment(tabId: String, attachmentId: String): ByteArray =
         encode(AttachmentPayload.serializer(), AttachmentPayload(tabId, attachmentId))
@@ -451,6 +474,13 @@ object RemoteCommands {
         val port: Int,
         @SerialName("relay_host") val relayHost: String? = null,
         @SerialName("relay_port") val relayPort: Int? = null,
+    )
+    @Serializable private data class DirectOfferReply(
+        val id: String,
+        val cookie: String,
+        val host: String,
+        val port: Int,
+        @SerialName("expires_in_millis") val expiresInMillis: Long,
     )
     @Serializable private data class AttachmentPayload(
         @SerialName("tab_id") val tabId: String,

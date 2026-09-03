@@ -1,16 +1,23 @@
 # AITerm Relay
 
-AITerm Relay is a blind TCP relay for the existing AITerm remote gateway. It
+AITerm Relay is a blind transport relay for the existing AITerm remote gateway. It
 does not implement sessions, pairing, device trust, terminal rendering, or file
 transfer. The Android app still establishes pinned TLS directly with the
 desktop and still authenticates with its remembered device key. The relay only
 sees encrypted byte counts, timing, a random route id, and network addresses.
 
-Connection order is:
+Initial connection order is:
 
 1. local LAN address;
 2. VPN/overlay address;
 3. the route-specific relay hostname.
+
+After a relay connection authenticates, AITerm may use the relay's UDP
+rendezvous endpoint to discover the phone and desktop's observed addresses and
+upgrade to a direct QUIC tunnel. The established relay remains the fallback if
+hole punching or QUIC fails. QUIC carries the same opaque application TLS bytes
+as the relay, so this optimization does not introduce a second API or trust
+model.
 
 The desktop maintains one outbound WebSocket to the connector listener. A
 phone connects to the ingress listener with SNI
@@ -75,8 +82,6 @@ would additionally need an account or entitlement layer.
 The `routes` array remains available for administratively provisioned static
 routes. Generate a static token and its server-side hash with standard tools:
 
-Generate a token and its server-side hash with standard tools:
-
 ```sh
 route="desk-$(openssl rand -hex 12)"
 token="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
@@ -92,6 +97,7 @@ The intended single-VM layout uses two public ports:
 
 - TCP 80: ACME HTTP challenge for the connector certificate;
 - TCP 443: raw phone ingress owned by `aiterm-relay`;
+- UDP 443: bounded one-time direct-path rendezvous owned by `aiterm-relay`;
 - TCP 8443: ordinary TLS/WebSocket edge, proxied to the connector listener on
   `127.0.0.1:8080`.
 

@@ -10,6 +10,7 @@ pub const MAX_REQUEST_KIND_BYTES: usize = 64;
 
 const KNOWN_REQUESTS: &[&str] = &[
     "gateway.routes",
+    "transport.direct",
     "usage.report",
     "session.list",
     "session.roster",

@@ -54,6 +54,7 @@ CONVENTIONS.md
 # Gradle install.
 android/build/
 android/app/build/
+android/quic-bridge/target/
 android/.gradle/
 android/local.properties
 
