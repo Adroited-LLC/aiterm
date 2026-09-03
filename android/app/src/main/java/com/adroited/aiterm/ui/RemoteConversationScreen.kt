@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
@@ -35,22 +36,29 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -69,6 +77,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -77,6 +87,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.adroited.aiterm.remote.ConnectionState
+import com.adroited.aiterm.pairing.PairedDesktop
 import com.adroited.aiterm.remote.RemoteAgentChoice
 import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemotePreviewMessage
@@ -98,8 +109,12 @@ private const val PAGE_TERMINAL = "terminal"
 @Composable
 fun RemoteDesktopScreen(
     viewModel: RemoteTerminalViewModel,
-    desktopName: String,
+    desktop: PairedDesktop,
+    pairedDesktops: List<PairedDesktop>,
     onBack: () -> Unit,
+    onOpenDesktop: (PairedDesktop) -> Unit,
+    onPairDesktop: () -> Unit,
+    onForgetDesktop: () -> Boolean,
     keyBarPreference: TerminalKeyBarPreference,
 ) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
@@ -146,8 +161,12 @@ fun RemoteDesktopScreen(
 
         else -> RemoteSessionDashboard(
             state = state,
-            desktopName = desktopName,
-            onBack = onBack,
+            desktop = desktop,
+            pairedDesktops = pairedDesktops,
+            onOpenDesktop = onOpenDesktop,
+            onManageDesktops = onBack,
+            onPairDesktop = onPairDesktop,
+            onForgetDesktop = onForgetDesktop,
             onRefresh = { viewModel.client.refreshSessions() },
             onLoadUsage = viewModel.client::refreshUsage,
             onStarSession = viewModel.client::starSession,
@@ -169,8 +188,12 @@ fun RemoteDesktopScreen(
 @Composable
 private fun RemoteSessionDashboard(
     state: RemoteClientState,
-    desktopName: String,
-    onBack: () -> Unit,
+    desktop: PairedDesktop,
+    pairedDesktops: List<PairedDesktop>,
+    onOpenDesktop: (PairedDesktop) -> Unit,
+    onManageDesktops: () -> Unit,
+    onPairDesktop: () -> Unit,
+    onForgetDesktop: () -> Boolean,
     onRefresh: () -> Unit,
     onLoadUsage: () -> Unit,
     onStarSession: (String, Boolean) -> Unit,
@@ -185,6 +208,10 @@ private fun RemoteSessionDashboard(
     var foldedCrews by remember { mutableStateOf(emptySet<String>()) }
     var renameTarget by remember { mutableStateOf<RemoteSession?>(null) }
     var showUsage by remember { mutableStateOf(false) }
+    var forgetDesktop by remember { mutableStateOf(false) }
+    var forgetDesktopFailed by remember { mutableStateOf(false) }
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val drawerScope = rememberCoroutineScope()
     val agents = remember(state.sessions) { state.sessions.map { it.agent }.distinct().sorted() }
     val sessions = remember(
         state.sessions,
@@ -224,35 +251,108 @@ private fun RemoteSessionDashboard(
     if (showUsage) {
         UsageDialog(sources = state.usage, onDismiss = { showUsage = false })
     }
+    if (forgetDesktop) {
+        AlertDialog(
+            onDismissRequest = {
+                forgetDesktop = false
+                forgetDesktopFailed = false
+            },
+            title = { Text("Forget ${desktop.displayName}?") },
+            text = {
+                Text(
+                    if (forgetDesktopFailed) {
+                        "The saved desktop could not be removed. Nothing was changed."
+                    } else {
+                        "This removes the desktop key from this phone. You can pair it again later."
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { forgetDesktopFailed = !onForgetDesktop() }) {
+                    Text("Forget desktop")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    forgetDesktop = false
+                    forgetDesktopFailed = false
+                }) { Text("Keep desktop") }
+            },
+        )
+    }
     LaunchedEffect(state.connection) {
         while (state.connection == ConnectionState.Connected) {
             delay(3_000)
             onRefresh()
         }
     }
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                navigationIcon = { TextButton(onClick = onBack) { Text("Desktops") } },
-                title = {
-                    Column {
-                        Text(desktopName, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        ConnectionLabel(state.connection)
-                    }
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            RemoteAppDrawer(
+                state = state,
+                desktop = desktop,
+                pairedDesktops = pairedDesktops,
+                onClose = { drawerScope.launch { drawerState.close() } },
+                onOpenDesktop = { target ->
+                    drawerScope.launch { drawerState.close() }
+                    onOpenDesktop(target)
                 },
-                actions = {
-                    TextButton(onClick = {
-                        onLoadUsage()
-                        showUsage = true
-                    }) { Text("Usage") }
-                    TextButton(onClick = onOpenTerminal) { Text("Terminal") }
+                onShowUsage = {
+                    onLoadUsage()
+                    showUsage = true
+                    drawerScope.launch { drawerState.close() }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+                onRefresh = {
+                    onRefresh()
+                    onLoadUsage()
+                    drawerScope.launch { drawerState.close() }
+                },
+                onOpenTerminal = {
+                    drawerScope.launch { drawerState.close() }
+                    onOpenTerminal()
+                },
+                onManageDesktops = {
+                    drawerScope.launch { drawerState.close() }
+                    onManageDesktops()
+                },
+                onPairDesktop = {
+                    drawerScope.launch { drawerState.close() }
+                    onPairDesktop()
+                },
+                onForgetDesktop = {
+                    forgetDesktop = true
+                    drawerScope.launch { drawerState.close() }
+                },
             )
         },
-        containerColor = MaterialTheme.colorScheme.background,
-    ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding)) {
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(
+                            onClick = { drawerScope.launch { drawerState.open() } },
+                            modifier = Modifier.semantics { contentDescription = "Open menu" },
+                        ) {
+                            Text("☰", style = MaterialTheme.typography.titleLarge)
+                        }
+                    },
+                    title = {
+                        Column {
+                            Text(desktop.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            ConnectionLabel(state.connection)
+                        }
+                    },
+                    actions = {
+                        TextButton(onClick = onOpenTerminal) { Text("Terminal") }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+                )
+            },
+            containerColor = MaterialTheme.colorScheme.background,
+        ) { padding ->
+            Column(Modifier.fillMaxSize().padding(padding)) {
             OutlinedTextField(
                 value = query,
                 onValueChange = { query = it },
@@ -338,7 +438,123 @@ private fun RemoteSessionDashboard(
                     }
                 }
             }
+            }
         }
+    }
+}
+
+@Composable
+private fun RemoteAppDrawer(
+    state: RemoteClientState,
+    desktop: PairedDesktop,
+    pairedDesktops: List<PairedDesktop>,
+    onClose: () -> Unit,
+    onOpenDesktop: (PairedDesktop) -> Unit,
+    onShowUsage: () -> Unit,
+    onRefresh: () -> Unit,
+    onOpenTerminal: () -> Unit,
+    onManageDesktops: () -> Unit,
+    onPairDesktop: () -> Unit,
+    onForgetDesktop: () -> Unit,
+) {
+    ModalDrawerSheet(
+        modifier = Modifier.fillMaxHeight().widthIn(max = 340.dp),
+        drawerContainerColor = MaterialTheme.colorScheme.surface,
+    ) {
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 14.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ConnectionDot(state.connection)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        desktop.displayName,
+                        style = MaterialTheme.typography.titleLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    ConnectionLabel(state.connection)
+                }
+                TextButton(onClick = onClose) { Text("Close") }
+            }
+
+            if (pairedDesktops.size > 1) {
+                DrawerSectionLabel("Desktops")
+                pairedDesktops.forEach { candidate ->
+                    DrawerRow(
+                        title = candidate.displayName,
+                        detail = if (candidate.deviceId == desktop.deviceId) "Current desktop" else "Paired desktop",
+                        selected = candidate.deviceId == desktop.deviceId,
+                        onClick = { if (candidate.deviceId != desktop.deviceId) onOpenDesktop(candidate) },
+                    )
+                }
+            }
+
+            HorizontalDivider(Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.surfaceVariant)
+            DrawerRow("Usage", "Limits, balances, and account status", onClick = onShowUsage)
+            DrawerRow("Refresh", "Update sessions and usage", onClick = onRefresh)
+            DrawerRow("Open terminal", "View the raw desktop session", onClick = onOpenTerminal)
+
+            HorizontalDivider(Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.surfaceVariant)
+            DrawerRow("Manage desktops", "View and remove trusted computers", onClick = onManageDesktops)
+            DrawerRow("Add a desktop", "Scan another pairing code", onClick = onPairDesktop)
+            DrawerRow(
+                title = "Forget this desktop",
+                detail = "Remove its key from this phone",
+                titleColor = MaterialTheme.colorScheme.error,
+                onClick = onForgetDesktop,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ConnectionDot(connection: ConnectionState) {
+    val color = when (connection) {
+        ConnectionState.Connected -> MaterialTheme.colorScheme.tertiary
+        ConnectionState.Connecting, ConnectionState.Reconnecting -> MaterialTheme.colorScheme.primary
+        ConnectionState.Locked, ConnectionState.Revoked -> MaterialTheme.colorScheme.error
+        ConnectionState.Disconnected -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Box(Modifier.size(10.dp).background(color, CircleShape))
+}
+
+@Composable
+private fun DrawerSectionLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+    )
+}
+
+@Composable
+private fun DrawerRow(
+    title: String,
+    detail: String,
+    selected: Boolean = false,
+    titleColor: Color = MaterialTheme.colorScheme.onSurface,
+    onClick: () -> Unit,
+) {
+    val background = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent
+    Column(
+        Modifier.fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 2.dp)
+            .background(background, RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+    ) {
+        Text(title, style = MaterialTheme.typography.bodyLarge, color = titleColor)
+        Text(
+            detail,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
