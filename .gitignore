@@ -8,6 +8,12 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+dist-windows/
+windows/target/
+windows/gen/
+windows/resources/aiterm-wsl-backend
+wsl-backend/target/
+wsl-protocol/target/
 dist
 dist-ssr
 *.local
