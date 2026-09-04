@@ -242,7 +242,7 @@ private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
 
 /** A folded group must still say what happened; otherwise valid tool events look absent. */
 internal fun toolGroupHeadline(tools: List<Item.Tool>): String {
-    val latest = tools.lastOrNull() ?: return "Activity"
+    val latest = tools.asReversed().firstOrNull { toolHeadlineDetail(it) != null } ?: return "Activity"
     val verb = when (latest.category) {
         ToolCategory.Execute -> "Ran"
         ToolCategory.Edit -> "Edited"
@@ -252,11 +252,20 @@ internal fun toolGroupHeadline(tools: List<Item.Tool>): String {
         ToolCategory.Think -> "Reasoned"
         ToolCategory.Other -> "Used"
     }
-    val raw = latest.title.ifBlank { latest.tool.ifBlank { "tool" } }
-        .lineSequence().firstOrNull().orEmpty().trim().replace(Regex("\\s+"), " ")
+    val raw = toolHeadlineDetail(latest) ?: return "Activity"
     val detail = if (raw.startsWith("$verb ", ignoreCase = true)) raw.substring(verb.length + 1) else raw
     val clipped = if (detail.length > 72) detail.take(71).trimEnd() + "…" else detail
     return "$verb $clipped"
+}
+
+private fun toolHeadlineDetail(tool: Item.Tool): String? {
+    fun clean(value: String): String = value.lineSequence().firstOrNull().orEmpty()
+        .trim().replace(Regex("\\s+"), " ")
+    val title = clean(tool.title.ifBlank { tool.tool })
+    val protocolNames = setOf("exec", "tool", "tool_output", "custom_tool_call_output", "write_stdin")
+    if (title.lowercase() !in protocolNames && title.isNotBlank()) return title
+    val input = clean(tool.input)
+    return input.takeIf { it.isNotBlank() && it.lowercase() !in protocolNames }
 }
 
 @OptIn(ExperimentalFoundationApi::class)

@@ -220,8 +220,9 @@ class RemoteConversationScreenTest {
     fun foldedToolGroupNamesTheLatestRunInsteadOfHidingItAsActivity() {
         val read = Item.Tool("read", "view_image", "screenshot.jpg", ToolCategory.Read, "", ToolStatus.Completed, null, 1)
         val run = Item.Tool("run", "exec_command", "./gradlew :app:testDebugUnitTest", ToolCategory.Execute, "", ToolStatus.Completed, null, 2)
+        val protocolNoise = Item.Tool("result", "tool_output", "tool_output", ToolCategory.Other, "", ToolStatus.Completed, null, 3)
 
-        assertEquals("Ran ./gradlew :app:testDebugUnitTest", toolGroupHeadline(listOf(read, run)))
+        assertEquals("Ran ./gradlew :app:testDebugUnitTest", toolGroupHeadline(listOf(read, run, protocolNoise)))
     }
 
     @Test
