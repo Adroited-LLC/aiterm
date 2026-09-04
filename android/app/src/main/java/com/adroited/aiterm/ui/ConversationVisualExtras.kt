@@ -3,7 +3,6 @@ package com.adroited.aiterm.ui
 import android.content.ClipData
 import android.content.Intent
 import android.widget.Toast
-import android.graphics.BitmapFactory
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -19,7 +18,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,8 +29,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Share
@@ -48,14 +44,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
@@ -64,12 +56,10 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.adroited.aiterm.remote.Item
 import com.adroited.aiterm.remote.RemoteSession
-import com.adroited.aiterm.remote.RemoteSessionChange
 import com.adroited.aiterm.ui.theme.AgentIcon
 import kotlinx.coroutines.launch
 
@@ -243,62 +233,6 @@ internal fun ConversationCrewStrip(
                 }
             }
         }
-    }
-}
-
-@Composable
-internal fun GeneratedFilesRail(
-    files: List<RemoteSessionChange>,
-    onOpen: (RemoteSessionChange) -> Unit,
-    onShowAll: () -> Unit,
-    loadThumbnail: suspend (RemoteSessionChange) -> ByteArray?,
-) {
-    val visible = files.filter { it.kind != "deleted" }.take(8)
-    if (visible.isEmpty()) return
-    Column(Modifier.fillMaxWidth().padding(top = 2.dp)) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("MADE IN THIS SESSION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.weight(1f))
-            Text("All files", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.clickable(onClick = onShowAll).padding(6.dp))
-        }
-        Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(7.dp),
-        ) {
-            visible.forEach { file ->
-                GeneratedFileCard(file, onOpen, loadThumbnail)
-            }
-        }
-    }
-}
-
-@Composable
-private fun GeneratedFileCard(
-    file: RemoteSessionChange,
-    onOpen: (RemoteSessionChange) -> Unit,
-    loadThumbnail: suspend (RemoteSessionChange) -> ByteArray?,
-) {
-    val image = file.name.substringAfterLast('.', "").lowercase() in setOf("png", "jpg", "jpeg", "webp", "gif")
-    val thumbnail by produceState<ByteArray?>(initialValue = null, key1 = file.path, key2 = file.at) {
-        if (image && file.bytes <= 2 * 1024 * 1024) value = loadThumbnail(file)
-    }
-    val bitmap = remember(thumbnail) { thumbnail?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }?.asImageBitmap() }
-    Column(
-        Modifier.width(116.dp).background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .5f), RoundedCornerShape(12.dp))
-            .clickable { onOpen(file) }.padding(8.dp),
-    ) {
-        if (bitmap != null) {
-            Image(bitmap!!, file.name, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().height(64.dp).background(MaterialTheme.colorScheme.surface))
-        } else {
-            Icon(if (image) Icons.Filled.Image else Icons.Filled.InsertDriveFile, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(26.dp))
-        }
-        Spacer(Modifier.height(7.dp))
-        Text(file.name, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
-        Text(sessionFileSizeLabel(file.bytes), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

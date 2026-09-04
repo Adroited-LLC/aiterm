@@ -1480,17 +1480,6 @@ private fun RemoteConversationContent(
                             ConversationWorkingRow(session.agent, state.previewPhaseDetail)
                         }
                     }
-                    item(key = "generated-files") {
-                        GeneratedFilesRail(
-                            files = files,
-                            onOpen = ::openFile,
-                            onShowAll = { showFiles = true },
-                            loadThumbnail = { file ->
-                                onLoadFile(session.id, file.path, 2 * 1024 * 1024).getOrNull()
-                                    ?.takeUnless { it.truncated }?.data
-                            },
-                        )
-                    }
                 }
                 if (awayFromNewest) {
                     Text(
