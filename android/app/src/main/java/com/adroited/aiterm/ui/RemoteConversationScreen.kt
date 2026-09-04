@@ -45,6 +45,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.selection.DisableSelection
+import androidx.compose.foundation.text.selection.rememberSelectionState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -1007,6 +1009,7 @@ private fun RemoteConversationContent(
     val previewItems = if (state.previewSessionId == session.id) state.previewItems else emptyList()
     val timeline = remember(previewItems) { spineTimeline(previewItems) }
     val listState = rememberLazyListState()
+    val conversationSelection = rememberSelectionState()
     val working = isConversationWorking(
         phase = state.previewPhase,
         spineLive = state.previewLive,
@@ -1454,36 +1457,45 @@ private fun RemoteConversationContent(
                 contentAlignment = Alignment.Center,
             ) { Text("No conversation history yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
             else -> Box(Modifier.fillMaxSize().padding(padding)) {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize().then(conversationScrollIndicator(listState)).then(
-                        if (imeBottom > 0) Modifier.imeNestedScroll() else Modifier,
-                    ),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    item(key = "crew") {
-                        Column {
-                            ConversationCrewStrip(
-                                current = session,
-                                sessions = state.sessions,
-                                broughtIn = state.broughtInSessions,
-                                activity = state.sessionActivity,
-                                onSelect = onSelectSession,
-                            )
-                            if (needsYou) {
-                                state.tabs.firstOrNull { it.sessionId == session.id }?.let { tab ->
-                                    NeedsYouQuickKeys { key -> onQuickInput(tab.id, key) }
+                SelectionContainer(state = conversationSelection) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize().then(conversationScrollIndicator(listState)).then(
+                            if (imeBottom > 0) Modifier.imeNestedScroll() else Modifier,
+                        ),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        item(key = "crew") {
+                            DisableSelection {
+                                Column {
+                                    ConversationCrewStrip(
+                                        current = session,
+                                        sessions = state.sessions,
+                                        broughtIn = state.broughtInSessions,
+                                        activity = state.sessionActivity,
+                                        onSelect = onSelectSession,
+                                    )
+                                    if (needsYou) {
+                                        state.tabs.firstOrNull { it.sessionId == session.id }?.let { tab ->
+                                            NeedsYouQuickKeys { key -> onQuickInput(tab.id, key) }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    items(timeline, key = { it.key }) { item ->
-                        SpineTimelineRow(item, onLongPress = { messageActions = it })
-                    }
-                    if (working) {
-                        item(key = "working") {
-                            ConversationWorkingRow(session.agent, state.previewPhaseDetail)
+                        items(timeline, key = { it.key }) { item ->
+                            SpineTimelineRow(item, onLongPress = {
+                                conversationSelection.clear()
+                                messageActions = it
+                            })
+                        }
+                        if (working) {
+                            item(key = "working") {
+                                DisableSelection {
+                                    ConversationWorkingRow(session.agent, state.previewPhaseDetail)
+                                }
+                            }
                         }
                     }
                 }
