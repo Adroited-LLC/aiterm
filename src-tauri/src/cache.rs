@@ -24,7 +24,10 @@ pub struct TtlCache<T> {
 
 impl<T: Clone> TtlCache<T> {
     pub const fn new(ttl: Duration) -> Self {
-        Self { ttl, slot: Mutex::new(None) }
+        Self {
+            ttl,
+            slot: Mutex::new(None),
+        }
     }
 
     /// The cached value if it is younger than `ttl`, otherwise a fresh one.
@@ -77,8 +80,16 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let cache = TtlCache::new(Duration::from_secs(60));
         assert_eq!(cache.get(counting(&calls)), 1);
-        assert_eq!(cache.get(counting(&calls)), 1, "returned a newly produced value");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "produced twice inside the ttl");
+        assert_eq!(
+            cache.get(counting(&calls)),
+            1,
+            "returned a newly produced value"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "produced twice inside the ttl"
+        );
     }
 
     #[test]
@@ -111,8 +122,16 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let cache = TtlCache::new(Duration::from_secs(60));
         assert_eq!(cache.get(counting(&calls)), 1);
-        assert_eq!(cache.refresh(counting(&calls)), 2, "refresh served a cached value");
-        assert_eq!(cache.get(counting(&calls)), 2, "refresh did not reseed the cache");
+        assert_eq!(
+            cache.refresh(counting(&calls)),
+            2,
+            "refresh served a cached value"
+        );
+        assert_eq!(
+            cache.get(counting(&calls)),
+            2,
+            "refresh did not reseed the cache"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

@@ -133,14 +133,20 @@ pub fn agent_permissions() -> Vec<AgentPermissions> {
 /// Store the mode an engine starts in. Refused for an id the engine does not
 /// list — see the module note on why.
 #[tauri::command]
-pub fn agent_permission_set(agent_id: String, mode: String) -> Result<Vec<AgentPermissions>, String> {
+pub fn agent_permission_set(
+    agent_id: String,
+    mode: String,
+) -> Result<Vec<AgentPermissions>, String> {
     let list = crate::agents::backends();
     let backend = list
         .iter()
         .find(|b| b.id() == agent_id)
         .ok_or_else(|| format!("No engine called {agent_id}."))?;
     if !backend.permission_modes().iter().any(|m| m.id == mode) {
-        return Err(format!("{} has no permission mode called {mode}.", backend.display_name()));
+        return Err(format!(
+            "{} has no permission mode called {mode}.",
+            backend.display_name()
+        ));
     }
     let mut store = load();
     if !store.is_object() {
@@ -166,8 +172,8 @@ pub fn agent_permission_set(agent_id: String, mode: String) -> Result<Vec<AgentP
 mod tests {
     use super::*;
     use crate::agents::{ClaudeBackend, CodexBackend, OpenCodeBackend};
-    use crate::grok::GrokBackend;
     use crate::antigravity::AntigravityBackend;
+    use crate::grok::GrokBackend;
 
     #[test]
     fn nothing_stored_means_the_engines_first_mode() {
@@ -178,17 +184,33 @@ mod tests {
         // setting existed — nobody's sessions change until they choose.
         assert_eq!(
             m.flags,
-            &["--permission-mode auto", "--allow-dangerously-skip-permissions"]
+            &[
+                "--permission-mode auto",
+                "--allow-dangerously-skip-permissions"
+            ]
         );
-        assert_eq!(mode_for_in(&store, &CodexBackend).unwrap().flags, &[] as &[&str]);
-        assert_eq!(mode_for_in(&store, &GrokBackend).unwrap().flags, &[] as &[&str]);
-        assert_eq!(mode_for_in(&store, &OpenCodeBackend).unwrap().flags, &[] as &[&str]);
-        assert_eq!(mode_for_in(&store, &AntigravityBackend).unwrap().flags, &[] as &[&str]);
+        assert_eq!(
+            mode_for_in(&store, &CodexBackend).unwrap().flags,
+            &[] as &[&str]
+        );
+        assert_eq!(
+            mode_for_in(&store, &GrokBackend).unwrap().flags,
+            &[] as &[&str]
+        );
+        assert_eq!(
+            mode_for_in(&store, &OpenCodeBackend).unwrap().flags,
+            &[] as &[&str]
+        );
+        assert_eq!(
+            mode_for_in(&store, &AntigravityBackend).unwrap().flags,
+            &[] as &[&str]
+        );
     }
 
     #[test]
     fn a_stored_mode_wins_and_junk_falls_back() {
-        let store = serde_json::json!({"permission": {"claude": "bypassPermissions", "codex": "yolo"}});
+        let store =
+            serde_json::json!({"permission": {"claude": "bypassPermissions", "codex": "yolo"}});
         assert_eq!(
             mode_for_in(&store, &ClaudeBackend).unwrap().flags,
             &["--dangerously-skip-permissions"]
@@ -196,7 +218,12 @@ mod tests {
         // "yolo" is not a mode codex lists; the file may have been hand-edited.
         assert_eq!(mode_for_in(&store, &CodexBackend).unwrap().id, "default");
         // A file that is not even an object is "nothing stored".
-        assert_eq!(mode_for_in(&serde_json::json!([1, 2]), &ClaudeBackend).unwrap().id, "auto");
+        assert_eq!(
+            mode_for_in(&serde_json::json!([1, 2]), &ClaudeBackend)
+                .unwrap()
+                .id,
+            "auto"
+        );
     }
 
     #[test]
@@ -206,7 +233,10 @@ mod tests {
             "antigravity": "accept-edits"
         }});
         let flags = |b: &dyn AgentBackend| mode_for_in(&store, b).unwrap().flags.join(" ");
-        assert_eq!(flags(&ClaudeBackend), "--permission-mode acceptEdits --allow-dangerously-skip-permissions");
+        assert_eq!(
+            flags(&ClaudeBackend),
+            "--permission-mode acceptEdits --allow-dangerously-skip-permissions"
+        );
         assert_eq!(flags(&CodexBackend), "-a never -s workspace-write");
         assert_eq!(flags(&GrokBackend), "--always-approve");
         assert_eq!(flags(&OpenCodeBackend), "--auto");
@@ -218,7 +248,11 @@ mod tests {
         let store = serde_json::json!({"permission": {"grok": "auto"}});
         let view = view_in(&store, &crate::agents::backends());
         let ids: Vec<&str> = view.iter().map(|v| v.agent_id.as_str()).collect();
-        assert_eq!(ids, ["claude", "codex", "grok", "opencode", "antigravity"], "the API chat engine has no switch");
+        assert_eq!(
+            ids,
+            ["claude", "codex", "grok", "opencode", "antigravity"],
+            "the API chat engine has no switch"
+        );
         let grok = view.iter().find(|v| v.agent_id == "grok").unwrap();
         assert_eq!(grok.selected, "auto");
         assert!(grok.modes.iter().any(|m| m.id == "bypassPermissions"));

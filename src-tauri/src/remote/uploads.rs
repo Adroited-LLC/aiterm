@@ -273,10 +273,12 @@ impl UploadSet {
                     upload.next_chunk
                 }
                 None if member.published_path.is_some() => 0,
-                None => return Err(UploadError::new(
-                    UploadErrorKind::ClosedSubmission,
-                    "submission image is no longer resumable",
-                )),
+                None => {
+                    return Err(UploadError::new(
+                        UploadErrorKind::ClosedSubmission,
+                        "submission image is no longer resumable",
+                    ))
+                }
             };
             return Ok(UploadBegan {
                 upload_id: upload_id.clone(),

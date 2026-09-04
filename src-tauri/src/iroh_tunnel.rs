@@ -102,12 +102,18 @@ async fn pump(mut send: SendStream, mut recv: RecvStream, port: u16) {
 /// `relay_url` the endpoint uses that relay alone instead of n0's — for a
 /// person who runs their own iroh-relay and wants no third party even for
 /// the fallback path.
-pub async fn start(secret: SecretKey, port: u16, relay_url: Option<String>) -> Result<Tunnel, String> {
+pub async fn start(
+    secret: SecretKey,
+    port: u16,
+    relay_url: Option<String>,
+) -> Result<Tunnel, String> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()]);
     if let Some(url) = relay_url {
-        let url: RelayUrl = url.parse().map_err(|e| format!("iroh relay URL {url:?} is invalid: {e}"))?;
+        let url: RelayUrl = url
+            .parse()
+            .map_err(|e| format!("iroh relay URL {url:?} is invalid: {e}"))?;
         builder = builder.relay_mode(RelayMode::custom([url]));
     }
     let endpoint = builder
@@ -115,7 +121,9 @@ pub async fn start(secret: SecretKey, port: u16, relay_url: Option<String>) -> R
         .await
         .map_err(|e| format!("iroh bind failed: {e}"))?;
     let node_id = format!("{}", endpoint.id());
-    let router = Router::builder(endpoint).accept(ALPN, Forward { port }).spawn();
+    let router = Router::builder(endpoint)
+        .accept(ALPN, Forward { port })
+        .spawn();
     crate::diag!("remote", "iroh listening as {node_id}");
     Ok(Tunnel { router, node_id })
 }

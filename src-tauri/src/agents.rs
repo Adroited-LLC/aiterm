@@ -316,7 +316,10 @@ pub trait AgentBackend: Send + Sync {
 /// The prompt worth passing, if any: a blank one is no prompt, not an empty
 /// argument the engine would have to make sense of.
 pub(crate) fn prompt_of(spec: &LaunchSpec) -> Option<&str> {
-    spec.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    spec.prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 pub(crate) fn q(value: &str) -> String {
@@ -412,8 +415,12 @@ pub const OPENCODE_PERMISSION_MODES: &[PermissionMode] = &[
 /// this machine, 2026-08-31 — provider "local", baseURL
 /// "http://127.0.0.1:8099/v1", apiKey "{env:LOCAL_LLM_API_KEY}"]
 pub(crate) fn parse_opencode_providers(text: &str) -> Vec<(String, String, Option<String>)> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
-    let Some(map) = v.get("provider").and_then(|p| p.as_object()) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(map) = v.get("provider").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
     map.iter()
         .filter_map(|(id, cfg)| {
             let base = cfg.pointer("/options/baseURL")?.as_str()?.to_string();
@@ -432,7 +439,9 @@ pub(crate) fn parse_opencode_providers(text: &str) -> Vec<(String, String, Optio
 /// read on every ask, which is launch-time only, so a config edit between
 /// launches is always seen. Missing or unparseable file: no declarations.
 fn opencode_declared_providers() -> Vec<(String, String, Option<String>)> {
-    let Some(home) = dirs::home_dir() else { return Vec::new() };
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
     match std::fs::read_to_string(home.join(".config/opencode/opencode.json")) {
         Ok(text) => parse_opencode_providers(&text),
         Err(_) => Vec::new(),
@@ -477,7 +486,10 @@ impl AgentBackend for ClaudeBackend {
         "Claude Code"
     }
     fn detect(&self) -> Detection {
-        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "claude") }
+        Detection {
+            caps: self.caps(),
+            ..detect_cli(self.id(), self.display_name(), "claude")
+        }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &ClaudeProvider
@@ -538,15 +550,20 @@ impl AgentBackend for ClaudeBackend {
     /// nothing here is always safe.
     fn models(&self) -> Vec<ModelOption> {
         const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-        [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
-            .into_iter()
-            .map(|(id, name)| ModelOption {
-                id: id.to_string(),
-                display_name: name.to_string(),
-                efforts: EFFORTS.iter().map(|s| s.to_string()).collect(),
-                default_effort: None,
-            })
-            .collect()
+        [
+            ("fable", "Fable"),
+            ("opus", "Opus"),
+            ("sonnet", "Sonnet"),
+            ("haiku", "Haiku"),
+        ]
+        .into_iter()
+        .map(|(id, name)| ModelOption {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            efforts: EFFORTS.iter().map(|s| s.to_string()).collect(),
+            default_effort: None,
+        })
+        .collect()
     }
 
     fn permission_modes(&self) -> &'static [PermissionMode] {
@@ -745,7 +762,9 @@ fn scan_codex_dir_bounded(
 /// rest behind for the next scan to collapse back into a row, so the trash has
 /// to take the whole set.
 pub fn codex_session_files(session_id: &str) -> Vec<std::path::PathBuf> {
-    codex_root().map(|r| codex_session_files_in(&r, session_id)).unwrap_or_default()
+    codex_root()
+        .map(|r| codex_session_files_in(&r, session_id))
+        .unwrap_or_default()
 }
 
 /// The body of [`codex_session_files`], over an explicit root so it can be
@@ -996,7 +1015,9 @@ pub fn codex_tasks(session_id: &str) -> Vec<crate::sessions::SessionTask> {
     use std::io::BufRead;
     let mut last: Option<Vec<(String, String)>> = None;
     for path in codex_session_files(session_id) {
-        let Ok(file) = std::fs::File::open(&path) else { continue };
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
             if !line.contains("update_plan") {
                 continue;
@@ -1018,7 +1039,9 @@ pub fn codex_tasks(session_id: &str) -> Vec<crate::sessions::SessionTask> {
                     .as_ref()
                     .and_then(plan_json_steps)
             } else {
-                p.get("input").and_then(|i| i.as_str()).and_then(extract_js_plan)
+                p.get("input")
+                    .and_then(|i| i.as_str())
+                    .and_then(extract_js_plan)
             };
             if plan.is_some() {
                 last = plan;
@@ -1049,7 +1072,9 @@ pub fn codex_artifacts(session_id: &str) -> Vec<crate::sessions::Artifact> {
     use std::io::BufRead;
     let mut latest: std::collections::HashMap<String, (String, String)> = Default::default();
     for path in codex_session_files(session_id) {
-        let Ok(file) = std::fs::File::open(&path) else { continue };
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
             if !line.contains("apply_patch") && !line.contains("patch_apply_end") {
                 continue;
@@ -1148,7 +1173,10 @@ impl AgentBackend for CodexBackend {
         "Codex"
     }
     fn detect(&self) -> Detection {
-        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "codex") }
+        Detection {
+            caps: self.caps(),
+            ..detect_cli(self.id(), self.display_name(), "codex")
+        }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &CodexSessions
@@ -1172,7 +1200,12 @@ impl AgentBackend for CodexBackend {
     /// OpenCode out, whose one shared database a per-row delete would have handed
     /// away wholesale.)
     fn caps(&self) -> Caps {
-        Caps { resume: true, delete: true, tasks: true, ..Default::default() }
+        Caps {
+            resume: true,
+            delete: true,
+            tasks: true,
+            ..Default::default()
+        }
     }
 
     /// `codex resume <SESSION_ID>` — reopen a session by its UUID, confirmed on
@@ -1236,7 +1269,10 @@ impl AgentBackend for OpenCodeBackend {
         "OpenCode"
     }
     fn detect(&self) -> Detection {
-        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "opencode") }
+        Detection {
+            caps: self.caps(),
+            ..detect_cli(self.id(), self.display_name(), "opencode")
+        }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &crate::opencode::OpencodeSessions
@@ -1257,7 +1293,11 @@ impl AgentBackend for OpenCodeBackend {
     /// session's rows to the trash and deletes exactly those rows. The
     /// file-move path cannot reach this backend's path.
     fn caps(&self) -> Caps {
-        Caps { resume: true, delete: true, ..Default::default() }
+        Caps {
+            resume: true,
+            delete: true,
+            ..Default::default()
+        }
     }
 
     /// `opencode --help`: `-s, --session <id>` reopens a stored session. The id
@@ -1431,7 +1471,11 @@ impl AgentBackend for ChatBackend {
     /// written by this binary, one session per file. Trashing one takes exactly
     /// that conversation and nothing else.
     fn caps(&self) -> Caps {
-        Caps { resume: true, delete: true, ..Default::default() }
+        Caps {
+            resume: true,
+            delete: true,
+            ..Default::default()
+        }
     }
 
     /// The fallback, so it declines nothing. If it did, an API model on a
@@ -1650,8 +1694,11 @@ pub fn owner_in<'a>(
     list: &'a [Box<dyn AgentBackend>],
     session_id: &str,
 ) -> Option<(&'a dyn AgentBackend, std::path::PathBuf)> {
-    list.iter()
-        .find_map(|b| b.sessions().find_session_file(session_id).map(|p| (&**b, p)))
+    list.iter().find_map(|b| {
+        b.sessions()
+            .find_session_file(session_id)
+            .map(|p| (&**b, p))
+    })
 }
 
 /// The conversation `agent_id` holds for `session_id`, when that backend keeps
@@ -1739,9 +1786,7 @@ pub fn agent_choices(
 }
 
 #[doc(hidden)]
-pub fn agent_choices_from(
-    services: &crate::services::ApplicationServices,
-) -> Vec<AgentChoice> {
+pub fn agent_choices_from(services: &crate::services::ApplicationServices) -> Vec<AgentChoice> {
     services.agents.list()
 }
 
@@ -1955,8 +2000,15 @@ pub(crate) fn detect_cli(id: &str, display_name: &str, bin: &str) -> Detection {
 /// A tool that is installed but will not report a version is still usable, so
 /// this never affects `available`.
 fn read_version(bin: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
-    let text = if out.stdout.is_empty() { &out.stderr } else { &out.stdout };
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = if out.stdout.is_empty() {
+        &out.stderr
+    } else {
+        &out.stdout
+    };
     String::from_utf8_lossy(text)
         .lines()
         .next()
@@ -1980,13 +2032,19 @@ mod tests {
         assert_eq!(first.id, "auto");
         assert_eq!(
             first.flags,
-            &["--permission-mode auto", "--allow-dangerously-skip-permissions"],
+            &[
+                "--permission-mode auto",
+                "--allow-dangerously-skip-permissions"
+            ],
         );
     }
 
     #[test]
     fn only_an_engine_with_a_config_surface_offers_one() {
-        assert!(ClaudeBackend.caps().config, "claude has settings.json to show");
+        assert!(
+            ClaudeBackend.caps().config,
+            "claude has settings.json to show"
+        );
         assert!(!CodexBackend.caps().config, "nothing is read for codex yet");
     }
 
@@ -2004,7 +2062,10 @@ mod tests {
         // A directory named like the binary must not count as finding it.
         let dir = std::env::temp_dir().join("aiterm-which-test");
         let _ = std::fs::create_dir_all(dir.join("notabin"));
-        assert!(!is_executable_file(&dir.join("notabin")), "a directory passed as executable");
+        assert!(
+            !is_executable_file(&dir.join("notabin")),
+            "a directory passed as executable"
+        );
     }
 
     /// The case that actually happens: an agent the user has not installed.
@@ -2012,7 +2073,11 @@ mod tests {
     /// showing "Codex — not installed" is the whole point.
     #[test]
     fn a_missing_cli_detects_as_unavailable_without_failing() {
-        let d = detect_cli("ghost", "Ghost Agent", "definitely-not-a-real-binary-aiterm");
+        let d = detect_cli(
+            "ghost",
+            "Ghost Agent",
+            "definitely-not-a-real-binary-aiterm",
+        );
         assert!(!d.available);
         assert_eq!(d.version, None);
         assert_eq!(d.path, None);
@@ -2141,7 +2206,10 @@ mod tests {
     }
 
     fn fake(id: &'static str, rows: Vec<(&'static str, u64)>) -> Box<dyn AgentBackend> {
-        Box::new(FakeBackend { id, provider: FakeProvider { rows } })
+        Box::new(FakeBackend {
+            id,
+            provider: FakeProvider { rows },
+        })
     }
 
     #[test]
@@ -2152,8 +2220,18 @@ mod tests {
         ];
         let rows = scan_backends(&list);
         assert_eq!(rows.len(), crate::sessions::MAX_DISCOVERED_SESSION_FILES);
-        assert_eq!(rows.iter().filter(|(session, _)| session.agent == "first").count(), 3_000);
-        assert_eq!(rows.iter().filter(|(session, _)| session.agent == "second").count(), 1_096);
+        assert_eq!(
+            rows.iter()
+                .filter(|(session, _)| session.agent == "first")
+                .count(),
+            3_000
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(session, _)| session.agent == "second")
+                .count(),
+            1_096
+        );
     }
 
     /// The whole point of the registry: two agents, one list.
@@ -2214,8 +2292,13 @@ mod tests {
         let write = |name: &str, sid: &str, secs: u64| {
             let p = dir.join(name);
             let mut f = std::fs::File::create(&p).unwrap();
-            writeln!(f, "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/p\"}}}}").unwrap();
-            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+            writeln!(
+                f,
+                "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/p\"}}}}"
+            )
+            .unwrap();
+            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
             p
         };
         let first = write("rollout-a-1.jsonl", "sess-1", 100);
@@ -2246,8 +2329,13 @@ mod tests {
         let write = |name: &str, sid: &str, secs: u64| -> std::path::PathBuf {
             let p = dir.join(name);
             let mut f = std::fs::File::create(&p).unwrap();
-            writeln!(f, "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/proj\"}}}}").unwrap();
-            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+            writeln!(
+                f,
+                "{{\"payload\":{{\"session_id\":\"{sid}\",\"cwd\":\"/home/m/proj\"}}}}"
+            )
+            .unwrap();
+            f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
             p
         };
         // Three files of one conversation with ascending mtimes, plus a
@@ -2261,7 +2349,10 @@ mod tests {
         rows.sort_by(|a, b| a.0.id.cmp(&b.0.id));
         assert_eq!(rows.len(), 2, "two sessions, not four files");
         assert_eq!(rows[0].0.id, "sess-1");
-        assert_eq!(rows[0].1, newest, "the surviving file is the newest of the session");
+        assert_eq!(
+            rows[0].1, newest,
+            "the surviving file is the newest of the session"
+        );
         assert_eq!(rows[1].0.id, "sess-2");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2329,11 +2420,20 @@ mod tests {
             Some("new-nowhere".into())
         );
         // A row that names our folder still wins over one that names none.
-        let rows = vec![row("here", "/workspace/project", 450), row("nowhere", "", 500)];
-        assert_eq!(pick_adopted(&rows, "/workspace/project", 400, &[]), Some("here".into()));
+        let rows = vec![
+            row("here", "/workspace/project", 450),
+            row("nowhere", "", 500),
+        ];
+        assert_eq!(
+            pick_adopted(&rows, "/workspace/project", 400, &[]),
+            Some("here".into())
+        );
         // Known or stale folder-less rows are left alone, like any other.
         let rows = vec![row("busy", "", 9_999), row("stale", "", 100)];
-        assert_eq!(pick_adopted(&rows, "/workspace/project", 400, &["busy".into()]), None);
+        assert_eq!(
+            pick_adopted(&rows, "/workspace/project", 400, &["busy".into()]),
+            None
+        );
     }
 
     #[test]
@@ -2353,7 +2453,13 @@ mod tests {
             row("elsewhere", "/home/m/aiterm", 600),
         ];
         assert_eq!(
-            pick_clear_successor(&rows, "before", "/workspace/project", 400, &["before".into()]),
+            pick_clear_successor(
+                &rows,
+                "before",
+                "/workspace/project",
+                400,
+                &["before".into()]
+            ),
             Some("after".into()),
         );
     }
@@ -2368,15 +2474,27 @@ mod tests {
             row("second", "/workspace/project", 600),
         ];
         assert_eq!(
-            pick_clear_successor(&rows, "before", "/workspace/project", 400, &["before".into()]),
+            pick_clear_successor(
+                &rows,
+                "before",
+                "/workspace/project",
+                400,
+                &["before".into()]
+            ),
             None,
         );
     }
 
     #[test]
     fn sessions_from_every_backend_appear_in_one_list() {
-        let list = vec![fake("claude", vec![("c1", 10)]), fake("codex", vec![("x1", 20)])];
-        let ids: Vec<String> = scan_backends(&list).into_iter().map(|(s, _)| s.id).collect();
+        let list = vec![
+            fake("claude", vec![("c1", 10)]),
+            fake("codex", vec![("x1", 20)]),
+        ];
+        let ids: Vec<String> = scan_backends(&list)
+            .into_iter()
+            .map(|(s, _)| s.id)
+            .collect();
         assert_eq!(ids.len(), 2, "a backend's sessions went missing");
         assert!(ids.contains(&"c1".to_string()) && ids.contains(&"x1".to_string()));
     }
@@ -2386,7 +2504,10 @@ mod tests {
     /// output would be a second place for the name to live.
     #[test]
     fn every_row_is_tagged_with_the_backend_that_produced_it() {
-        let list = vec![fake("claude", vec![("c1", 10)]), fake("codex", vec![("x1", 20)])];
+        let list = vec![
+            fake("claude", vec![("c1", 10)]),
+            fake("codex", vec![("x1", 20)]),
+        ];
         for (s, _) in scan_backends(&list) {
             let expected = if s.id == "c1" { "claude" } else { "codex" };
             assert_eq!(s.agent, expected, "row {} carried the wrong agent", s.id);
@@ -2402,13 +2523,19 @@ mod tests {
             fake("claude", vec![("old", 10), ("newest", 40)]),
             fake("codex", vec![("newer", 30), ("oldest", 5)]),
         ];
-        let ids: Vec<String> = scan_backends(&list).into_iter().map(|(s, _)| s.id).collect();
+        let ids: Vec<String> = scan_backends(&list)
+            .into_iter()
+            .map(|(s, _)| s.id)
+            .collect();
         assert_eq!(ids, vec!["newest", "newer", "old", "oldest"]);
     }
 
     #[test]
     fn a_transcript_is_found_through_the_backend_that_owns_it() {
-        let list = vec![fake("claude", vec![("c1", 10)]), fake("codex", vec![("x1", 20)])];
+        let list = vec![
+            fake("claude", vec![("c1", 10)]),
+            fake("codex", vec![("x1", 20)]),
+        ];
         assert_eq!(
             find_session_file_in(&list, "x1"),
             Some(std::path::PathBuf::from("/fake/x1")),
@@ -2423,7 +2550,10 @@ mod tests {
     /// so the behaviour is a decision rather than an accident.
     #[test]
     fn colliding_ids_across_backends_stay_separate_rows() {
-        let list = vec![fake("claude", vec![("same", 10)]), fake("codex", vec![("same", 20)])];
+        let list = vec![
+            fake("claude", vec![("same", 10)]),
+            fake("codex", vec![("same", 20)]),
+        ];
         let rows = scan_backends(&list);
         assert_eq!(rows.len(), 2, "rows from different agents were merged");
         let agents: Vec<String> = rows.into_iter().map(|(s, _)| s.agent).collect();
@@ -2530,9 +2660,11 @@ mod tests {
     /// its door, so agent_choices must never offer it as a source.
     #[test]
     fn opencode_is_never_offered_as_a_source() {
-        assert!(agent_choices_from(&crate::services::ApplicationServices::desktop())
-            .iter()
-            .all(|c| c.id != "opencode"));
+        assert!(
+            agent_choices_from(&crate::services::ApplicationServices::desktop())
+                .iter()
+                .all(|c| c.id != "opencode")
+        );
     }
 
     /// OpenCode launches bare or with a model slug; a minted session id must
@@ -2545,7 +2677,10 @@ mod tests {
             session_id: Some("abc-123".into()),
             ..Default::default()
         });
-        assert_eq!(cmd, "opencode --model 'openrouter/anthropic/claude-sonnet-5'");
+        assert_eq!(
+            cmd,
+            "opencode --model 'openrouter/anthropic/claude-sonnet-5'"
+        );
     }
 
     /// The startup shortlist becomes OpenCode's model list — OpenRouter
@@ -2607,7 +2742,10 @@ mod tests {
         assert!(cmd.starts_with("codex "), "{cmd}");
         assert!(cmd.contains("--model 'gpt-5.6-sol'"), "{cmd}");
         assert!(cmd.contains("-c model_reasoning_effort='high'"), "{cmd}");
-        assert!(!cmd.contains("abc-123"), "session id leaked into a codex launch: {cmd}");
+        assert!(
+            !cmd.contains("abc-123"),
+            "session id leaked into a codex launch: {cmd}"
+        );
     }
 
     /// The home screen's first message rides on the command, in each engine's
@@ -2621,14 +2759,25 @@ mod tests {
             ..Default::default()
         };
         let claude = ClaudeBackend.launch(&spec);
-        assert!(claude.ends_with(" 'fix the thing, it'\\''s broken'"), "{claude}");
-        assert_eq!(CodexBackend.launch(&spec), "codex --model 'opus' 'fix the thing, it'\\''s broken'");
+        assert!(
+            claude.ends_with(" 'fix the thing, it'\\''s broken'"),
+            "{claude}"
+        );
+        assert_eq!(
+            CodexBackend.launch(&spec),
+            "codex --model 'opus' 'fix the thing, it'\\''s broken'"
+        );
         assert_eq!(
             OpenCodeBackend.launch(&spec),
             "opencode --model 'opus' --prompt 'fix the thing, it'\\''s broken'"
         );
-        assert!(ChatBackend.launch(&spec).ends_with("--prompt 'fix the thing, it'\\''s broken'"));
-        let blank = LaunchSpec { prompt: Some("   ".into()), ..Default::default() };
+        assert!(ChatBackend
+            .launch(&spec)
+            .ends_with("--prompt 'fix the thing, it'\\''s broken'"));
+        let blank = LaunchSpec {
+            prompt: Some("   ".into()),
+            ..Default::default()
+        };
         assert_eq!(CodexBackend.launch(&blank), "codex");
     }
 
@@ -2649,7 +2798,9 @@ mod tests {
     #[test]
     fn claude_resumes_with_the_flags_it_starts_with() {
         let start = ClaudeBackend.launch(&LaunchSpec::default());
-        let resumed = ClaudeBackend.resume("abc-123").expect("claude declined to resume");
+        let resumed = ClaudeBackend
+            .resume("abc-123")
+            .expect("claude declined to resume");
         assert_eq!(resumed, format!("{start} --resume 'abc-123'"));
     }
 
@@ -2657,7 +2808,9 @@ mod tests {
     /// it is exactly the launch command with that id in it.
     #[test]
     fn claude_clears_by_starting_fresh_under_the_given_id() {
-        let cleared = ClaudeBackend.clear("abc-123").expect("claude declined to clear");
+        let cleared = ClaudeBackend
+            .clear("abc-123")
+            .expect("claude declined to clear");
         assert_eq!(
             cleared,
             ClaudeBackend.launch(&LaunchSpec {
@@ -2745,9 +2898,14 @@ mod tests {
 
     #[test]
     fn a_chat_resume_names_only_the_session() {
-        let cmd = ChatBackend.resume("abc-123").expect("chat declined to resume");
+        let cmd = ChatBackend
+            .resume("abc-123")
+            .expect("chat declined to resume");
         assert!(cmd.contains(" chat --resume 'abc-123'"), "{cmd}");
-        assert!(!cmd.contains("--provider"), "provider guessed on a resume: {cmd}");
+        assert!(
+            !cmd.contains("--provider"),
+            "provider guessed on a resume: {cmd}"
+        );
     }
 
     /// It is this executable, so it is always here — and it is the fallback
@@ -2758,9 +2916,11 @@ mod tests {
         assert!(d.available);
         assert_eq!(d.id, "api");
         assert!(!ChatBackend.offered());
-        assert!(agent_choices_from(&crate::services::ApplicationServices::desktop())
-            .iter()
-            .all(|c| c.id != "api"));
+        assert!(
+            agent_choices_from(&crate::services::ApplicationServices::desktop())
+                .iter()
+                .all(|c| c.id != "api")
+        );
     }
 
     /// Chats reach the sidebar through the registry now. They used to be
@@ -2796,7 +2956,12 @@ mod tests {
     #[test]
     fn capabilities_ride_on_detection_and_match_the_backend() {
         for b in backends() {
-            assert_eq!(b.detect().caps, b.caps(), "{} detected different caps", b.id());
+            assert_eq!(
+                b.detect().caps,
+                b.caps(),
+                "{} detected different caps",
+                b.id()
+            );
         }
         assert_eq!(
             ClaudeBackend.caps(),
@@ -2814,15 +2979,28 @@ mod tests {
         );
         assert_eq!(
             CodexBackend.caps(),
-            Caps { resume: true, delete: true, tasks: true, ..Default::default() }
+            Caps {
+                resume: true,
+                delete: true,
+                tasks: true,
+                ..Default::default()
+            }
         );
         assert_eq!(
             OpenCodeBackend.caps(),
-            Caps { resume: true, delete: true, ..Default::default() },
+            Caps {
+                resume: true,
+                delete: true,
+                ..Default::default()
+            },
         );
         assert_eq!(
             ChatBackend.caps(),
-            Caps { resume: true, delete: true, ..Default::default() },
+            Caps {
+                resume: true,
+                delete: true,
+                ..Default::default()
+            },
         );
     }
 
@@ -2853,8 +3031,14 @@ mod tests {
     fn only_an_engine_with_a_single_session_delete_offers_one() {
         assert!(ClaudeBackend.caps().delete);
         assert!(ChatBackend.caps().delete);
-        assert!(CodexBackend.caps().delete, "a rollout is one session's file");
-        assert!(OpenCodeBackend.caps().delete, "row-level delete via opencode::delete_to_trash");
+        assert!(
+            CodexBackend.caps().delete,
+            "a rollout is one session's file"
+        );
+        assert!(
+            OpenCodeBackend.caps().delete,
+            "row-level delete via opencode::delete_to_trash"
+        );
     }
 
     /// The UI gates on this map, so a backend missing from it is an engine
@@ -2970,7 +3154,8 @@ mod tests {
         assert!(!same_base_url(base, "http://localhost:8098/v1"));
         assert_eq!(env.as_deref(), Some("LOCAL_LLM_API_KEY"));
         // A literal key is not an env spelling and names no variable.
-        let literal = r#"{"provider":{"x":{"options":{"baseURL":"http://h/v1","apiKey":"sk-abc"}}}}"#;
+        let literal =
+            r#"{"provider":{"x":{"options":{"baseURL":"http://h/v1","apiKey":"sk-abc"}}}}"#;
         assert_eq!(parse_opencode_providers(literal)[0].2, None);
     }
 
@@ -3055,7 +3240,11 @@ mod tests {
     fn agent_choices_only_offers_agents_that_are_here() {
         for c in agent_choices_from(&crate::services::ApplicationServices::desktop()) {
             let backend = backends().into_iter().find(|b| b.id() == c.id).unwrap();
-            assert!(backend.detect().available, "{} offered but not installed", c.id);
+            assert!(
+                backend.detect().available,
+                "{} offered but not installed",
+                c.id
+            );
         }
     }
 
@@ -3075,11 +3264,6 @@ mod tests {
     }
 }
 
-
-
-
-
-
 #[cfg(test)]
 mod codex_panel_tests {
     use super::*;
@@ -3089,8 +3273,14 @@ mod codex_panel_tests {
         let input = "const p = await tools.update_plan({plan:[\n  {step:\"Snapshot state\",status:\"in_progress\"},\n  {step:\"Implement [phase 2]\",status:\"pending\"}\n]}); text(p);\n";
         let plan = extract_js_plan(input).unwrap();
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0], ("Snapshot state".to_string(), "in_progress".to_string()));
-        assert_eq!(plan[1].0, "Implement [phase 2]", "brackets inside a step are not structure");
+        assert_eq!(
+            plan[0],
+            ("Snapshot state".to_string(), "in_progress".to_string())
+        );
+        assert_eq!(
+            plan[1].0, "Implement [phase 2]",
+            "brackets inside a step are not structure"
+        );
     }
 
     #[test]
@@ -3102,7 +3292,10 @@ mod codex_panel_tests {
         );
         let plan = extract_js_plan(input).unwrap();
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0], ("Copy new2 to new3".to_string(), "completed".to_string()));
+        assert_eq!(
+            plan[0],
+            ("Copy new2 to new3".to_string(), "completed".to_string())
+        );
         assert_eq!(plan[1].1, "in_progress");
     }
 

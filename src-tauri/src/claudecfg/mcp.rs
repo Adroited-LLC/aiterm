@@ -29,7 +29,11 @@ fn command_of(v: &Value) -> Option<String> {
 fn names(v: &Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -116,7 +120,8 @@ mod tests {
         }
     }"#;
 
-    const MCP_JSON: &str = r#"{"mcpServers": {"repo": {"command": "node server.js"}, "old": {"command": "x"}}}"#;
+    const MCP_JSON: &str =
+        r#"{"mcpServers": {"repo": {"command": "node server.js"}, "old": {"command": "x"}}}"#;
 
     #[test]
     fn a_user_scope_server_is_listed_with_its_command() {
@@ -146,7 +151,10 @@ mod tests {
         let (s, read, errors) = read(Some(r#"{"mcpServers": {}}"#), None, "/p");
         assert!(read);
         assert!(s.is_empty());
-        assert!(errors.is_empty(), "an empty list is not a failure: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "an empty list is not a failure: {errors:?}"
+        );
     }
 
     #[test]

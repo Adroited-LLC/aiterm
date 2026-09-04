@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -20,6 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import java.io.File
@@ -50,6 +52,11 @@ data class RemoteClientState(
     val sessionActivity: Map<String, String> = emptyMap(),
     val usage: List<RemoteUsageSource> = emptyList(),
     val previewSessionId: String? = null,
+    val previewItems: List<Item> = emptyList(),
+    val previewPhase: SpinePhase = SpinePhase.Idle,
+    val previewPhaseDetail: String = "",
+    val previewLive: Boolean = true,
+    val previewTurnOpen: Boolean? = null,
     val previewMessages: List<RemotePreviewMessage> = emptyList(),
     val previewLoadingSessionId: String? = null,
     val previewError: String? = null,
@@ -195,6 +202,7 @@ class RemoteClient(
     private var lifecycleGeneration = 0L
     private var selectionGeneration = 0L
     private val ownedJobs = linkedSetOf<Job>()
+    private val spineConversations = HashMap<String, SpineConversationStore>()
 
     suspend fun connect(): Boolean {
         synchronized(lifecycleLock) {
@@ -701,22 +709,53 @@ class RemoteClient(
                 previewError = null,
             )
         }
+        val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
         val started = launchRequest(
-            "session.conversation",
-            RemoteCommands.conversation(sessionId),
-            onError = { _, message ->
-                mutableState.value = mutableState.value.copy(
-                    previewLoadingSessionId = null,
-                    previewError = message,
-                )
+            "session.spine",
+            RemoteCommands.spine(sessionId, store.lastSeq),
+            timeoutMillis = PREVIEW_REFRESH_TIMEOUT_MILLIS,
+            onError = { code, message ->
+                if (code == "remote.unsupported" || code == "protocol.invalid_response") {
+                    previewSessionLegacy(sessionId)
+                } else {
+                    mutableState.value = mutableState.value.copy(
+                        previewLoadingSessionId = null,
+                        previewError = message,
+                    )
+                }
             },
             onSuccess = { payload ->
+                val page = RemoteCommands.spinePage(payload)
+                val items = store.apply(page)
+                val activity = if (store.phaseSeen) {
+                    mutableState.value.sessionActivity + (
+                        sessionId to when (store.phase) {
+                            SpinePhase.Working -> "output"
+                            SpinePhase.NeedsYou -> "attention"
+                            SpinePhase.Idle -> "idle"
+                        }
+                    )
+                } else {
+                    mutableState.value.sessionActivity
+                }
                 mutableState.value = mutableState.value.copy(
                     previewSessionId = sessionId,
-                    previewMessages = RemoteCommands.sessionPreview(payload),
+                    previewItems = items,
+                    previewPhase = store.phase,
+                    previewPhaseDetail = store.phaseDetail,
+                    previewLive = store.live,
+                    previewTurnOpen = store.turnOpen,
+                    previewMessages = store.asPreviewMessages(),
                     previewLoadingSessionId = null,
                     previewError = null,
+                    sessionActivity = activity,
                 )
+                // `latestSeq` is the desktop's atomic high-water mark. Drain
+                // until our applied cursor reaches it even if an older server
+                // accidentally under-reports `hasMore`.
+                if (page.hasMore || (page.latestSeq > 0L && store.lastSeq < page.latestSeq)) {
+                    previewSession(sessionId)
+                }
             },
         )
         if (!started) {
@@ -732,6 +771,42 @@ class RemoteClient(
                     )
                 }
             }
+        }
+    }
+
+    /** Compatibility with a desktop from before the spine joined our gateway. */
+    private fun previewSessionLegacy(sessionId: String) {
+        val started = launchRequest(
+            "session.conversation",
+            RemoteCommands.conversation(sessionId),
+            onError = { _, message ->
+                mutableState.value = mutableState.value.copy(
+                    previewLoadingSessionId = null,
+                    previewError = message,
+                )
+            },
+            onSuccess = { payload ->
+                val messages = RemoteCommands.sessionPreview(payload)
+                val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
+                store.legacy(messages)
+                mutableState.value = mutableState.value.copy(
+                    previewSessionId = sessionId,
+                    previewItems = store.items,
+                    previewPhase = store.phase,
+                    previewPhaseDetail = store.phaseDetail,
+                    previewLive = store.live,
+                    previewTurnOpen = null,
+                    previewMessages = messages,
+                    previewLoadingSessionId = null,
+                    previewError = null,
+                )
+            },
+        )
+        if (!started) {
+            mutableState.value = mutableState.value.copy(
+                previewLoadingSessionId = null,
+                previewError = "Conversation refresh is busy. Retrying…",
+            )
         }
     }
 
@@ -983,6 +1058,7 @@ class RemoteClient(
     private fun launchRequest(
         kind: String,
         payload: ByteArray,
+        timeoutMillis: Long? = null,
         onError: ((String, String) -> Unit)? = null,
         onSuccess: (ByteArray) -> Unit = {},
     ): Boolean {
@@ -995,6 +1071,7 @@ class RemoteClient(
             generation = requestContext.lifecycleGeneration,
             active = requestContext.transport,
             response = response,
+            timeoutMillis = timeoutMillis,
             onSuccess = onSuccess,
             onError = onError,
         )
@@ -1019,12 +1096,18 @@ class RemoteClient(
         generation: Long,
         active: RemoteTransport,
         response: Deferred<RemoteResponse>,
+        timeoutMillis: Long? = null,
         onSuccess: (ByteArray) -> Unit = {},
         onError: ((String, String) -> Unit)? = null,
     ): Boolean {
         val accepted = launchOwned(generation) {
             try {
-                when (val result = response.await()) {
+                val result = if (timeoutMillis == null) {
+                    response.await()
+                } else {
+                    withTimeout(timeoutMillis) { response.await() }
+                }
+                when (result) {
                     is RemoteResponse.Error -> {
                         synchronized(lifecycleLock) {
                             if (isCurrent(generation, active)) onError?.invoke(result.code, result.message)
@@ -1041,6 +1124,13 @@ class RemoteClient(
                         if (isCurrent(generation, active)) {
                             onSuccess(result.payload)
                         }
+                    }
+                }
+            } catch (_: TimeoutCancellationException) {
+                active.abandonRequest(response)
+                synchronized(lifecycleLock) {
+                    if (isCurrent(generation, active)) {
+                        onError?.invoke("request.timeout", "Conversation refresh timed out. Retrying…")
                     }
                 }
             } catch (_: kotlinx.coroutines.CancellationException) {
@@ -1480,6 +1570,7 @@ class RemoteClient(
         const val UPLOAD_CLEANUP_TIMEOUT_MILLIS = 2_000L
         const val UPLOAD_RESUME_TIMEOUT_MILLIS = 2 * 60_000L
         const val TERMINAL_SUBMIT_SETTLE_MILLIS = 75L
+        const val PREVIEW_REFRESH_TIMEOUT_MILLIS = 8_000L
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }

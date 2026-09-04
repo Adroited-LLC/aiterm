@@ -7,7 +7,7 @@ import { X } from "lucide-react";
 import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import Row from "./SettingsRow";
-import RemoteSettings from "./RemoteSettings";
+import RemoteAccessSettings from "./RemoteAccessSettings";
 import LibrarianPane from "./LibrarianPane";
 import BringInPane from "./BringInPane";
 import type { LibrarianCtl } from "../librarian";
@@ -568,7 +568,7 @@ export default function SettingsModal({
               </Group>
             </>}
 
-            {tab === "remote" && <RemoteSettings />}
+            {tab === "remote" && <RemoteAccessSettings />}
             {tab === "bringin" && (
               <BringInPane prompts={settings.bringIn} onChange={(next) => onChange({ ...settings, bringIn: next })} />
             )}

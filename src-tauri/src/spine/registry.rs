@@ -35,8 +35,7 @@ const TICK: Duration = Duration::from_secs(1);
 /// one poll per burst, not one per line.
 const COALESCE: Duration = Duration::from_millis(250);
 /// Deep enough that bootstrapping a long session cannot lag a phone that is
-/// keeping up. Its own channel on purpose: a burst here must not push the
-/// coarse `remote_api::Event`s out of theirs.
+/// keeping up.
 const BROADCAST_CAPACITY: usize = 1024;
 /// Retry cadence for a source that is not there yet, once the fast phase
 /// below has given up on it. `open_adapter` asks every backend in turn
@@ -200,9 +199,7 @@ impl Spine {
             }
             log.bytes += weight(&ev);
             log.events.push_back(ev.clone());
-            while log.events.len() > MAX_EVENTS
-                || (log.bytes > MAX_BYTES && log.events.len() > 1)
-            {
+            while log.events.len() > MAX_EVENTS || (log.bytes > MAX_BYTES && log.events.len() > 1) {
                 if let Some(old) = log.events.pop_front() {
                     log.bytes = log.bytes.saturating_sub(weight(&old));
                 }
@@ -222,8 +219,50 @@ impl Spine {
             .lock()
             .unwrap()
             .get(session_id)
-            .map(|log| log.events.iter().filter(|e| e.seq > after_seq).cloned().collect())
+            .map(|log| {
+                log.events
+                    .iter()
+                    .filter(|e| e.seq > after_seq)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    /// A forward, byte-bounded page for transports whose frame size is
+    /// smaller than the in-memory ring. Returning the oldest unseen events
+    /// first lets a client drain a long history without ever creating a seq
+    /// gap or rebuilding rows it already has.
+    pub fn page_after(
+        &self,
+        session_id: &str,
+        after_seq: u64,
+        max_bytes: usize,
+    ) -> (bool, u64, u64, Option<bool>, Vec<SpineEvent>) {
+        let sessions = self.sessions.lock().unwrap();
+        let Some(log) = sessions.get(session_id) else {
+            return (false, 0, 0, None, Vec::new());
+        };
+        // These bounds let a reconnecting consumer distinguish "nothing new"
+        // from "your cursor fell behind the bounded ring". Without them both
+        // cases are an empty/partial page and a phone can remain permanently
+        // stale while still looking connected.
+        let oldest_seq = log.events.front().map_or(0, |event| event.seq);
+        let latest_seq = log.events.back().map_or(0, |event| event.seq);
+        let turn_open = log.turn.map(|(open, _)| open);
+        let mut bytes = 0usize;
+        let mut events = Vec::new();
+        let mut has_more = false;
+        for event in log.events.iter().filter(|event| event.seq > after_seq) {
+            let event_bytes = weight(event);
+            if !events.is_empty() && bytes.saturating_add(event_bytes) > max_bytes {
+                has_more = true;
+                break;
+            }
+            bytes = bytes.saturating_add(event_bytes);
+            events.push(event.clone());
+        }
+        (has_more, oldest_seq, latest_seq, turn_open, events)
     }
 
     /// Every session with a log, folded to one row each — see
@@ -261,7 +300,9 @@ impl Spine {
                         Kind::ToolCallUpdate { id, status, .. } => {
                             updates.entry(id.as_str()).or_insert(*status);
                         }
-                        Kind::ToolCall { id, title, status, .. } if last_tool.is_none() => {
+                        Kind::ToolCall {
+                            id, title, status, ..
+                        } if last_tool.is_none() => {
                             let status = updates.get(id.as_str()).copied().unwrap_or(*status);
                             last_tool = Some(super::ipc::OverviewTool {
                                 title: super::clip(title, 80),
@@ -291,19 +332,32 @@ impl Spine {
     /// Whether this session's adapter reads the engine's own source, as
     /// opposed to the legacy re-derivation (or nothing at all).
     pub fn is_live(&self, session_id: &str) -> bool {
-        self.sessions.lock().unwrap().get(session_id).is_some_and(|l| l.live)
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|l| l.live)
     }
 
     /// Whether the tail has finished reading history.
     pub fn is_ready(&self, session_id: &str) -> bool {
-        self.sessions.lock().unwrap().get(session_id).is_some_and(|l| l.ready)
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|l| l.ready)
     }
 
     /// Whether a turn is open for this session, or `None` when no adapter
     /// has ever said. The phase rule treats `None` as "no opinion" and
     /// falls back to cadence alone.
     pub fn turn_open(&self, session_id: &str) -> Option<bool> {
-        self.sessions.lock().unwrap().get(session_id).and_then(|l| l.turn).map(|(open, _)| open)
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|l| l.turn)
+            .map(|(open, _)| open)
     }
 
     /// Remember what a hook last said about a session. Only for a session
@@ -330,7 +384,11 @@ impl Spine {
     }
 
     fn hook_phase(&self, session_id: &str) -> Option<(Phase, String)> {
-        self.sessions.lock().unwrap().get(session_id).and_then(|l| l.hook.clone())
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|l| l.hook.clone())
     }
 
     /// Whether a hook says this session is waiting on a person. Public
@@ -366,19 +424,33 @@ impl Spine {
     pub fn push_phase_if_tailed(&self, session_id: &str, phase: Phase, detail: &str) {
         let agent = {
             let mut sessions = self.sessions.lock().unwrap();
-            let Some(log) = sessions.get_mut(session_id) else { return };
+            let Some(log) = sessions.get_mut(session_id) else {
+                return;
+            };
             // Deliberately not started here: a phase with no content behind
             // it is not worth opening a transcript for.
             if !log.tailing() {
                 return;
             }
-            if log.last_phase.as_ref().is_some_and(|(p, d)| *p == phase && d == detail) {
+            if log
+                .last_phase
+                .as_ref()
+                .is_some_and(|(p, d)| *p == phase && d == detail)
+            {
                 return;
             }
             log.last_phase = Some((phase, detail.to_string()));
             log.agent.clone()
         };
-        self.push(session_id, &agent, now_ms(), Kind::Phase { phase, detail: detail.to_string() });
+        self.push(
+            session_id,
+            &agent,
+            now_ms(),
+            Kind::Phase {
+                phase,
+                detail: detail.to_string(),
+            },
+        );
     }
 
     /// A running tail is what gates a phase push, and a unit test has no
@@ -397,12 +469,17 @@ impl Spine {
     }
 
     fn remember_agent(&self, session_id: &str, agent: &str) {
-        self.agents.lock().unwrap().insert(session_id.to_string(), agent.to_string());
+        self.agents
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), agent.to_string());
     }
 
     fn set_flags(&self, session_id: &str, live: Option<bool>, ready: Option<bool>) {
         let mut sessions = self.sessions.lock().unwrap();
-        let Some(log) = sessions.get_mut(session_id) else { return };
+        let Some(log) = sessions.get_mut(session_id) else {
+            return;
+        };
         if let Some(v) = live {
             log.live = v;
         }
@@ -412,7 +489,11 @@ impl Spine {
     }
 
     fn has_events(&self, session_id: &str) -> bool {
-        self.sessions.lock().unwrap().get(session_id).is_some_and(|l| !l.events.is_empty())
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|l| !l.events.is_empty())
     }
 
     /// A tail is wanted while a tab is bound to the session, or while
@@ -482,9 +563,13 @@ fn weight(ev: &SpineEvent) -> usize {
         Kind::UserMessage { id, text }
         | Kind::AgentText { id, text, .. }
         | Kind::AgentThought { id, text, .. } => id.len() + text.len(),
-        Kind::ToolCall { id, tool, title, input, .. } => {
-            id.len() + tool.len() + title.len() + input.len()
-        }
+        Kind::ToolCall {
+            id,
+            tool,
+            title,
+            input,
+            ..
+        } => id.len() + tool.len() + title.len() + input.len(),
         Kind::ToolCallUpdate { id, output, .. } => {
             id.len() + output.as_ref().map_or(0, |o| o.len())
         }
@@ -516,7 +601,9 @@ pub async fn resolve_agent(spine: &Arc<Spine>, session_id: &str) -> Option<Strin
 /// Callable from a plain thread — the tabs registry bridge runs on one and
 /// has no async context of its own.
 pub fn ensure_tail_for(app: &AppHandle, session_id: &str) {
-    let Some(spine) = app.try_state::<Arc<Spine>>().map(|s| s.inner().clone()) else { return };
+    let Some(spine) = app.try_state::<Arc<Spine>>().map(|s| s.inner().clone()) else {
+        return;
+    };
     let app = app.clone();
     let sid = session_id.to_string();
     tauri::async_runtime::spawn(async move {
@@ -548,7 +635,9 @@ fn push_from_adapter(spine: &Spine, session_id: &str, agent: &str, ts: u64, kind
 /// stop. No transcript half: cadence knows no reason, and reading one here
 /// would put a 256 KB tail read on the pty's output path.
 pub fn push_phase(app: &AppHandle, session_id: &str, activity: &str) {
-    let Some(spine) = app.try_state::<Arc<Spine>>() else { return };
+    let Some(spine) = app.try_state::<Arc<Spine>>() else {
+        return;
+    };
     push_cadence(&spine, session_id, activity);
 }
 
@@ -556,7 +645,7 @@ pub fn push_phase(app: &AppHandle, session_id: &str, activity: &str) {
 /// against a bare registry.
 fn push_cadence(spine: &Spine, session_id: &str, activity: &str) {
     let hook = spine.hook_phase(session_id);
-    let (verdict, detail) = crate::remote_api::activity_verdict(
+    let (verdict, detail) = crate::spine::activity::activity_verdict(
         Some(activity),
         None,
         spine.turn_open(session_id),
@@ -597,7 +686,9 @@ pub enum HookPhase {
 /// `turn_duration` is the single source of turn events, and a second one
 /// from this side would unbalance the bracket `activity_verdict` reads.
 pub async fn push_hook_phase(app: &AppHandle, session_id: &str, hook: HookPhase) {
-    let Some(spine) = app.try_state::<Arc<Spine>>().map(|s| s.inner().clone()) else { return };
+    let Some(spine) = app.try_state::<Arc<Spine>>().map(|s| s.inner().clone()) else {
+        return;
+    };
     let (phase, detail) = match hook {
         // A permission dialog does not close a turn: the tool that asked
         // for it is part of an answer still being given.
@@ -620,8 +711,8 @@ pub async fn push_hook_phase(app: &AppHandle, session_id: &str, hook: HookPhase)
             spine.note_hook_turn(session_id, false);
             let sid = session_id.to_string();
             let transcript =
-                crate::run_blocking(move || crate::remote_api::transcript_verdict(&sid)).await;
-            let (activity, detail) = crate::remote_api::activity_verdict(
+                crate::run_blocking(move || crate::spine::activity::transcript_verdict(&sid)).await;
+            let (activity, detail) = crate::spine::activity::activity_verdict(
                 cadence_of(app, session_id).as_deref(),
                 transcript,
                 Some(false),
@@ -638,9 +729,13 @@ pub async fn push_hook_phase(app: &AppHandle, session_id: &str, hook: HookPhase)
 /// The tab registry's cadence for one session, or `None` when no tab of
 /// ours is running it.
 fn cadence_of(app: &AppHandle, session_id: &str) -> Option<String> {
-    app.try_state::<Arc<crate::tabs::TabRegistry>>().and_then(|tabs| {
-        tabs.session_activities().into_iter().find(|(id, _)| id == session_id).map(|(_, a)| a)
-    })
+    app.try_state::<Arc<crate::tabs::TabRegistry>>()
+        .and_then(|tabs| {
+            tabs.session_activities()
+                .into_iter()
+                .find(|(id, _)| id == session_id)
+                .map(|(_, a)| a)
+        })
 }
 
 /// The detail to push, given the verdict and what a hook last said.
@@ -676,7 +771,11 @@ pub async fn read_after(
     while !spine.is_ready(session_id) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Some((spine.epoch(), spine.is_live(session_id), spine.after(session_id, after_seq)))
+    Some((
+        spine.epoch(),
+        spine.is_live(session_id),
+        spine.after(session_id, after_seq),
+    ))
 }
 
 // -------------------------------------------------------------- the phase
@@ -684,8 +783,8 @@ pub async fn read_after(
 /// The driver's phase half: works out what the session is doing every tick
 /// and pushes it when it moved.
 ///
-/// The verdict itself comes from `remote_api::activity_verdict`, the same
-/// function the sessions list uses — the two cannot disagree about a
+/// The verdict itself comes from `spine::activity::activity_verdict`, the
+/// shared activity rule used by every spine projection, so consumers cannot disagree about a
 /// session. Only the transcript half is cached here: reading it is a tail
 /// read of up to 256 KB per tick, and it cannot have changed while none of
 /// the files it reads have.
@@ -704,7 +803,12 @@ impl PhaseGate {
     async fn new(session_id: &str) -> Self {
         let sid = session_id.to_string();
         let paths = crate::run_blocking(move || phase_sources(&sid)).await;
-        Self { paths, looked: Instant::now(), stamp: None, transcript: None }
+        Self {
+            paths,
+            looked: Instant::now(),
+            stamp: None,
+            transcript: None,
+        }
     }
 
     /// Work out what the session is doing and push it if it moved. `force`
@@ -727,7 +831,7 @@ impl PhaseGate {
             if !force && stamp.is_some() && stamp == last && quiet > VERDICT_SETTLES_AFTER {
                 return (stamp, None); // nothing it reads moved, and nothing will
             }
-            let verdict = crate::remote_api::transcript_verdict(&sid);
+            let verdict = crate::spine::activity::transcript_verdict(&sid);
             (stamp, Some(verdict))
         })
         .await;
@@ -740,7 +844,7 @@ impl PhaseGate {
         // transcript half cannot see.
         let cadence = cadence_of(app, session_id);
         let hook = spine.hook_phase(session_id);
-        let (activity, detail) = crate::remote_api::activity_verdict(
+        let (activity, detail) = crate::spine::activity::activity_verdict(
             cadence.as_deref(),
             self.transcript,
             spine.turn_open(session_id),
@@ -757,9 +861,14 @@ impl PhaseGate {
 /// inference it falls back to.
 fn phase_sources(session_id: &str) -> Vec<PathBuf> {
     let list = crate::agents::backends();
-    let Some((_, path)) = crate::agents::owner_in(&list, session_id) else { return Vec::new() };
+    let Some((_, path)) = crate::agents::owner_in(&list, session_id) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    if let Some(dir) = path.parent().filter(|d| d.file_name().is_some_and(|n| n == session_id)) {
+    if let Some(dir) = path
+        .parent()
+        .filter(|d| d.file_name().is_some_and(|n| n == session_id))
+    {
         out.push(dir.join("events.jsonl"));
     }
     // agy's permission dialogs never reach its transcript — the only record
@@ -768,7 +877,7 @@ fn phase_sources(session_id: &str) -> Vec<PathBuf> {
     // effectively never skipped while one is running. Its transcript is a
     // few KB, so that read is cheap; see `antigravity_confirmation_after`.
     if path.to_string_lossy().contains("/antigravity-cli/brain/") {
-        out.extend(crate::remote_api::antigravity_log_path());
+        out.extend(crate::spine::activity::antigravity_log_path());
     }
     out.push(path);
     out
@@ -780,7 +889,9 @@ fn stamp_of(paths: &[PathBuf]) -> (Option<Vec<(u64, u64)>>, Duration) {
     let mut out = Vec::new();
     let mut newest = Duration::MAX;
     for path in paths {
-        let Ok(meta) = std::fs::metadata(path) else { continue };
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
         let modified = meta.modified().ok();
         let secs = modified
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -844,7 +955,10 @@ async fn open_when_it_exists(
             return Some(adapter);
         }
         if tries == 0 {
-            crate::diag!("spine", "{agent} has no source for {short} yet; waiting for one");
+            crate::diag!(
+                "spine",
+                "{agent} has no source for {short} yet; waiting for one"
+            );
             // Not live, and nothing to hand back — but do not make a phone
             // wait out the grace period to be told so.
             spine.set_flags(session_id, Some(false), Some(true));
@@ -887,7 +1001,10 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
         push_from_adapter(&spine, &session_id, &agent, ts, kind);
     }
     spine.set_flags(&session_id, None, Some(true));
-    crate::diag!("spine", "tail up for {agent} {short}: {count} events from history");
+    crate::diag!(
+        "spine",
+        "tail up for {agent} {short}: {count} events from history"
+    );
 
     // Kept alive alongside the watcher so `fs.recv()` pends forever rather
     // than resolving immediately when there is nothing to watch.
@@ -897,8 +1014,8 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
 
     let mut tick = tokio::time::interval(TICK);
     tick.tick().await; // the first tick is immediate; skip it
-    // A slow poll (a big transcript, a busy blocking pool) must not be paid
-    // back with a burst of catch-up polls the moment it returns.
+                       // A slow poll (a big transcript, a busy blocking pool) must not be paid
+                       // back with a burst of catch-up polls the moment it returns.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut reap = tokio::time::interval(REAP_EVERY);
     reap.tick().await;
@@ -937,7 +1054,10 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
         // the text of it is in the log.
         phase.tick(&spine, &app, &session_id, boundary).await;
     }
-    crate::diag!("spine", "tail stopped for {short}: no tab bound and no interest");
+    crate::diag!(
+        "spine",
+        "tail stopped for {short}: no tab bound and no interest"
+    );
 }
 
 /// Run one adapter call on the blocking pool. Adapters are synchronous and
@@ -971,8 +1091,10 @@ fn spawn_watch(paths: &[PathBuf], tx: UnboundedSender<()>) -> Option<Recommended
         }
     })
     .ok()?;
-    let dirs: HashSet<PathBuf> =
-        paths.iter().filter_map(|p| p.parent().map(PathBuf::from)).collect();
+    let dirs: HashSet<PathBuf> = paths
+        .iter()
+        .filter_map(|p| p.parent().map(PathBuf::from))
+        .collect();
     let mut armed = false;
     for dir in dirs {
         if watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
@@ -994,7 +1116,11 @@ mod tests {
     use crate::spine::{ToolCategory, ToolStatus};
 
     fn text(id: &str, body: &str) -> Kind {
-        Kind::AgentText { id: id.into(), text: body.into(), done: true }
+        Kind::AgentText {
+            id: id.into(),
+            text: body.into(),
+            done: true,
+        }
     }
 
     #[test]
@@ -1005,7 +1131,10 @@ mod tests {
         }
         let all = spine.after("s1", 0);
         assert_eq!(all.len(), 5);
-        assert_eq!(all.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            all.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
         assert!(all.iter().all(|e| e.epoch == spine.epoch()));
         assert_eq!(all[0].ts, 100);
 
@@ -1015,6 +1144,58 @@ mod tests {
         // Sessions do not share a sequence.
         assert_eq!(spine.push("s2", "codex", 1, text("x", "y")).seq, 1);
         assert!(spine.after("nobody", 0).is_empty());
+    }
+
+    #[test]
+    fn remote_pages_are_forward_and_resume_without_a_sequence_gap() {
+        let spine = Spine::new();
+        for i in 0..5 {
+            spine.push("s", "codex", i, text(&format!("b{i}"), "12345"));
+        }
+        let one_event_budget = weight(&spine.after("s", 0)[0]);
+        let (more, oldest, latest, _, first) = spine.page_after("s", 0, one_event_budget);
+        assert!(more);
+        assert_eq!((oldest, latest), (1, 5));
+        assert_eq!(
+            first.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let (more, oldest, latest, _, second) =
+            spine.page_after("s", first.last().unwrap().seq, one_event_budget * 2);
+        assert!(more);
+        assert_eq!((oldest, latest), (1, 5));
+        assert_eq!(
+            second.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let (more, oldest, latest, _, tail) =
+            spine.page_after("s", second.last().unwrap().seq, usize::MAX);
+        assert!(!more);
+        assert_eq!((oldest, latest), (1, 5));
+        assert_eq!(
+            tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    #[test]
+    fn remote_page_carries_the_current_turn_gate_independent_of_event_history() {
+        let spine = Spine::new();
+        spine.push("s", "codex", 1, Kind::TurnStarted { turn: "t".into() });
+        let (_, _, _, open, _) = spine.page_after("s", u64::MAX, usize::MAX);
+        assert_eq!(open, Some(true));
+
+        spine.push(
+            "s",
+            "codex",
+            2,
+            Kind::TurnEnded { turn: "t".into(), reason: "completed".into() },
+        );
+        let (_, _, _, open, events) = spine.page_after("s", u64::MAX, usize::MAX);
+        assert!(events.is_empty());
+        assert_eq!(open, Some(false));
     }
 
     #[test]
@@ -1028,6 +1209,9 @@ mod tests {
         // Seq keeps counting; only the storage is bounded.
         assert_eq!(held.first().unwrap().seq, 21);
         assert_eq!(held.last().unwrap().seq, (MAX_EVENTS + 20) as u64);
+        let (_, oldest, latest, _, _) = spine.page_after("s", 1, usize::MAX);
+        assert_eq!(oldest, 21);
+        assert_eq!(latest, (MAX_EVENTS + 20) as u64);
     }
 
     #[test]
@@ -1038,7 +1222,11 @@ mod tests {
             spine.push("s", "claude", 0, text(&format!("b{i}"), &big));
         }
         let held = spine.after("s", 0);
-        assert!(held.len() < 12, "byte bound never fired: {} events held", held.len());
+        assert!(
+            held.len() < 12,
+            "byte bound never fired: {} events held",
+            held.len()
+        );
         assert!(held.iter().map(weight).sum::<usize>() <= MAX_BYTES + big.len());
         assert_eq!(held.last().unwrap().seq, 12);
     }
@@ -1065,10 +1253,22 @@ mod tests {
         let spine = Spine::new();
         assert_eq!(spine.turn_open("s"), None);
         spine.push("s", "claude", 1, text("a", "hi"));
-        assert_eq!(spine.turn_open("s"), None, "content says nothing about turns");
+        assert_eq!(
+            spine.turn_open("s"),
+            None,
+            "content says nothing about turns"
+        );
         spine.push("s", "claude", 2, Kind::TurnStarted { turn: "t1".into() });
         assert_eq!(spine.turn_open("s"), Some(true));
-        spine.push("s", "claude", 3, Kind::TurnEnded { turn: "t1".into(), reason: "completed".into() });
+        spine.push(
+            "s",
+            "claude",
+            3,
+            Kind::TurnEnded {
+                turn: "t1".into(),
+                reason: "completed".into(),
+            },
+        );
         assert_eq!(spine.turn_open("s"), Some(false));
         spine.push("s", "claude", 4, Kind::TurnStarted { turn: "t2".into() });
         assert_eq!(spine.turn_open("s"), Some(true));
@@ -1099,18 +1299,33 @@ mod tests {
 
         // The adapter sees the turn close. The very next cadence push — a
         // spinner clearing, half a second later — must not raise Working.
-        spine.push("s", "claude", 2, Kind::TurnEnded { turn: "t1".into(), reason: "completed".into() });
+        spine.push(
+            "s",
+            "claude",
+            2,
+            Kind::TurnEnded {
+                turn: "t1".into(),
+                reason: "completed".into(),
+            },
+        );
         push_cadence(&spine, "s", "output");
         assert_eq!(
             phases(&spine, "s"),
-            vec![(Phase::Working, String::new()), (Phase::Idle, String::new())]
+            vec![
+                (Phase::Working, String::new()),
+                (Phase::Idle, String::new())
+            ]
         );
 
         // And it stays put however many more repaints arrive.
         for _ in 0..5 {
             push_cadence(&spine, "s", "output");
         }
-        assert_eq!(phases(&spine, "s").len(), 2, "a repainting TUI must not flap the header");
+        assert_eq!(
+            phases(&spine, "s").len(),
+            2,
+            "a repainting TUI must not flap the header"
+        );
     }
 
     /// The gate is a gate, not a latch: the next turn opens it again, and
@@ -1119,13 +1334,24 @@ mod tests {
     fn a_new_turn_re_opens_working() {
         let spine = Spine::new();
         spine.pretend_tailing("s", "claude");
-        spine.push("s", "claude", 1, Kind::TurnEnded { turn: "t1".into(), reason: "completed".into() });
+        spine.push(
+            "s",
+            "claude",
+            1,
+            Kind::TurnEnded {
+                turn: "t1".into(),
+                reason: "completed".into(),
+            },
+        );
         push_cadence(&spine, "s", "output");
         spine.push("s", "claude", 2, Kind::TurnStarted { turn: "t2".into() });
         push_cadence(&spine, "s", "output");
         assert_eq!(
             phases(&spine, "s"),
-            vec![(Phase::Idle, String::new()), (Phase::Working, String::new())]
+            vec![
+                (Phase::Idle, String::new()),
+                (Phase::Working, String::new())
+            ]
         );
     }
 
@@ -1167,7 +1393,10 @@ mod tests {
 
         // Answered: the tool runs, the hook says so, and cadence is
         // believed again.
-        spine.set_hook_phase("s", Some((Phase::Working, "running Edit: src/main.rs".into())));
+        spine.set_hook_phase(
+            "s",
+            Some((Phase::Working, "running Edit: src/main.rs".into())),
+        );
         spine.push_phase_if_tailed("s", Phase::Working, "running Edit: src/main.rs");
         push_cadence(&spine, "s", "output");
         assert_eq!(
@@ -1182,10 +1411,16 @@ mod tests {
     #[test]
     fn a_hooks_detail_survives_a_tick_with_nothing_to_say() {
         let working = Some((Phase::Working, "running Bash: npm test".to_string()));
-        assert_eq!(with_hook_detail(Phase::Working, "", &working), "running Bash: npm test");
+        assert_eq!(
+            with_hook_detail(Phase::Working, "", &working),
+            "running Bash: npm test"
+        );
         // And it outranks the one flat word the other sources have for the
         // same phase: "permission: Edit" says more than "permission".
-        assert_eq!(with_hook_detail(Phase::Working, "busy", &working), "running Bash: npm test");
+        assert_eq!(
+            with_hook_detail(Phase::Working, "busy", &working),
+            "running Bash: npm test"
+        );
         // A different phase is a different state; the hook's words do not
         // follow it there.
         assert_eq!(with_hook_detail(Phase::Idle, "", &working), "");
@@ -1217,14 +1452,20 @@ mod tests {
         }
         assert_eq!(
             phases(&spine, "s"),
-            vec![(Phase::Working, String::new()), (Phase::Idle, String::new())]
+            vec![
+                (Phase::Working, String::new()),
+                (Phase::Idle, String::new())
+            ]
         );
 
         // And the next prompt re-opens it before the transcript's user line
         // has been written, so the phone does not wait a second to go busy.
         spine.note_hook_turn("s", true);
         push_cadence(&spine, "s", "output");
-        assert_eq!(phases(&spine, "s").last().unwrap(), &(Phase::Working, String::new()));
+        assert_eq!(
+            phases(&spine, "s").last().unwrap(),
+            &(Phase::Working, String::new())
+        );
     }
 
     /// A hook only ever speaks about a session the registry already knows:
@@ -1265,5 +1506,3 @@ mod tests {
         assert_eq!(second.agent, "grok");
     }
 }
-
-

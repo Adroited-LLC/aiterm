@@ -82,6 +82,9 @@ class PairingPayload private constructor(
     val relayHost: String?,
     val relayPort: Int?,
     val relayAuthorizationDigest: ByteArray?,
+    val networkStack: RemoteNetworkStack,
+    val irohNodeId: String?,
+    val irohRelayUrl: String?,
 ) {
 
     val relayEndpoint: PairingEndpoint?
@@ -110,7 +113,7 @@ class PairingPayload private constructor(
         private const val MAX_DISPLAY_NAME_CHARS = 128
         private val base64Url = Regex("^[A-Za-z0-9_-]+$")
         private val requiredSingletonFields = setOf("v", "p", "f", "s", "n")
-        private val optionalSingletonFields = setOf("r", "q", "a")
+        private val optionalSingletonFields = setOf("r", "q", "a", "m", "i", "j")
         private val knownFields = requiredSingletonFields + optionalSingletonFields + "h"
 
         fun parse(raw: String, scannedAtEpochMillis: Long): PairingPayloadResult {
@@ -209,6 +212,29 @@ class PairingPayload private constructor(
                 secretBytes.fill(0)
                 return malformed()
             }
+            val networkStack = when (fields["m"]?.singleOrNull() ?: "aiterm") {
+                "aiterm" -> RemoteNetworkStack.AITERM
+                "iroh" -> RemoteNetworkStack.IROH
+                else -> {
+                    secretBytes.fill(0)
+                    return malformed()
+                }
+            }
+            val irohNodeId = fields["i"]?.singleOrNull()
+            val irohRelayUrl = fields["j"]?.singleOrNull()
+            val validIrohNode = irohNodeId != null && irohNodeId.length in 16..256 &&
+                irohNodeId.none { it.isWhitespace() || it.isISOControl() }
+            val validIrohRelay = irohRelayUrl == null || isValidIrohRelayUrl(irohRelayUrl)
+            if (
+                (networkStack == RemoteNetworkStack.IROH) != validIrohNode ||
+                (networkStack == RemoteNetworkStack.AITERM && (irohNodeId != null || irohRelayUrl != null)) ||
+                (networkStack == RemoteNetworkStack.IROH && relayHost != null) ||
+                !validIrohRelay
+            ) {
+                secretBytes.fill(0)
+                relayAuthorizationDigest?.fill(0)
+                return malformed()
+            }
 
             return PairingPayloadResult.Parsed(
                 PairingPayload(
@@ -221,6 +247,9 @@ class PairingPayload private constructor(
                     relayHost = relayHost,
                     relayPort = relayPort,
                     relayAuthorizationDigest = relayAuthorizationDigest,
+                    networkStack = networkStack,
+                    irohNodeId = irohNodeId,
+                    irohRelayUrl = irohRelayUrl,
                 ),
             )
         }
@@ -244,6 +273,14 @@ class PairingPayload private constructor(
         }
 
         internal fun isValidFingerprint(value: String): Boolean = decodeBase64Url32(value) != null
+
+        internal fun isValidIrohRelayUrl(value: String): Boolean {
+            if (value.isEmpty() || value.length > 2_048 || value.any(Char::isISOControl)) return false
+            return runCatching { URI(value) }.getOrNull()?.let { uri ->
+                uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.rawUserInfo == null &&
+                    uri.rawFragment == null
+            } == true
+        }
 
         private fun decodeQueryValue(rawValue: String): String? {
             val bytes = ByteArrayOutputStream(rawValue.length)

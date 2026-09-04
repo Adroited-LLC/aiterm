@@ -143,7 +143,11 @@ impl Adapter for GrokAdapter {
     fn watch_paths(&self) -> Vec<PathBuf> {
         // The directory too: the first turn CREATES updates.jsonl, and a
         // watch on a path that does not exist yet never fires.
-        vec![self.updates.path.clone(), self.events.path.clone(), self.dir.clone()]
+        vec![
+            self.updates.path.clone(),
+            self.events.path.clone(),
+            self.dir.clone(),
+        ]
     }
 }
 
@@ -194,10 +198,14 @@ impl GrokAdapter {
         for line in lines {
             let ordinal = self.ordinal;
             self.ordinal += 1;
-            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
             let params = &v["params"];
             let update = &params["update"];
-            let Some(sort) = update["sessionUpdate"].as_str() else { continue };
+            let Some(sort) = update["sessionUpdate"].as_str() else {
+                continue;
+            };
             let ts = ts_ms(&v, params);
             match sort {
                 "user_message_chunk" => {
@@ -233,7 +241,13 @@ impl GrokAdapter {
                         Some("error") => "error",
                         _ => "unknown",
                     };
-                    out.push((ts, Kind::TurnEnded { turn: self.turn.clone(), reason: reason.into() }));
+                    out.push((
+                        ts,
+                        Kind::TurnEnded {
+                            turn: self.turn.clone(),
+                            reason: reason.into(),
+                        },
+                    ));
                 }
                 // The card grok just issued belongs to a process that
                 // outlives it; hold the card open and remember the task.
@@ -278,15 +292,37 @@ impl GrokAdapter {
     fn user_chunk(&mut self, ordinal: u64, ts: u64, text: String, out: &mut Vec<(u64, Kind)>) {
         if let Some(run) = self.run.as_mut().filter(|r| r.id.starts_with('u')) {
             run.text.push_str(&text);
-            out.push((ts, Kind::UserMessage { id: run.id.clone(), text: run.text.clone() }));
+            out.push((
+                ts,
+                Kind::UserMessage {
+                    id: run.id.clone(),
+                    text: run.text.clone(),
+                },
+            ));
             return;
         }
         self.close_run(out);
         self.turn = ordinal.to_string();
         let id = format!("u{ordinal}");
-        out.push((ts, Kind::TurnStarted { turn: self.turn.clone() }));
-        out.push((ts, Kind::UserMessage { id: id.clone(), text: text.clone() }));
-        self.run = Some(Run { thought: false, id, text, ts });
+        out.push((
+            ts,
+            Kind::TurnStarted {
+                turn: self.turn.clone(),
+            },
+        ));
+        out.push((
+            ts,
+            Kind::UserMessage {
+                id: id.clone(),
+                text: text.clone(),
+            },
+        ));
+        self.run = Some(Run {
+            thought: false,
+            id,
+            text,
+            ts,
+        });
     }
 
     fn agent_chunk(
@@ -304,7 +340,12 @@ impl GrokAdapter {
             }
             _ => {
                 self.close_run(out);
-                self.run = Some(Run { thought, id: format!("a{ordinal}"), text, ts });
+                self.run = Some(Run {
+                    thought,
+                    id: format!("a{ordinal}"),
+                    text,
+                    ts,
+                });
             }
         }
         let Some(run) = self.run.as_ref() else { return };
@@ -330,7 +371,9 @@ impl GrokAdapter {
     /// so it re-issues the card (upsert by id) with everything known. With a
     /// `status` it is the terminal result. [observed: grok 1.0.13]
     fn tool_update(&mut self, update: &Value, ts: u64, out: &mut Vec<(u64, Kind)>) {
-        let Some(id) = update["toolCallId"].as_str() else { return };
+        let Some(id) = update["toolCallId"].as_str() else {
+            return;
+        };
         let status = update["status"].as_str().map(tool_status);
         if status.is_none() {
             if let Some(k) = tool_card(update, ToolStatus::Running) {
@@ -353,7 +396,14 @@ impl GrokAdapter {
         // The start-of-run line only earns a second event when it brought
         // something to show (a diff, or a command's output so far).
         if status != ToolStatus::Running || output.is_some() {
-            out.push((ts, Kind::ToolCallUpdate { id: id.to_string(), status, output }));
+            out.push((
+                ts,
+                Kind::ToolCallUpdate {
+                    id: id.to_string(),
+                    status,
+                    output,
+                },
+            ));
         }
         if status == ToolStatus::Completed {
             self.completed[0].insert(id.to_string());
@@ -374,13 +424,19 @@ impl GrokAdapter {
     /// fresh uuid for the other 9, so the pairing has to be remembered here:
     /// it is the only line that ever carries both. [observed: grok 1.0.13]
     fn task_backgrounded(&mut self, update: &Value, ts: u64, out: &mut Vec<(u64, Kind)>) {
-        let Some(call) = update["tool_call_id"].as_str() else { return };
+        let Some(call) = update["tool_call_id"].as_str() else {
+            return;
+        };
         if let Some(task) = update["task_id"].as_str() {
             self.tasks.insert(task.to_string(), call.to_string());
         }
         self.background.insert(call.to_string());
         let what = one_line(&update["description"]);
-        let what = if what.is_empty() { one_line(&update["command"]) } else { what };
+        let what = if what.is_empty() {
+            one_line(&update["command"])
+        } else {
+            what
+        };
         let note = match what.is_empty() {
             true => "running in the background…".to_string(),
             false => format!("running in the background… {what}"),
@@ -404,7 +460,9 @@ impl GrokAdapter {
     /// breath rather than dropping the work on the floor.
     fn task_completed(&mut self, update: &Value, ts: u64, out: &mut Vec<(u64, Kind)>) {
         let snap = &update["task_snapshot"];
-        let Some(task) = snap["task_id"].as_str() else { return };
+        let Some(task) = snap["task_id"].as_str() else {
+            return;
+        };
         let id = match self.tasks.remove(task) {
             Some(call) => {
                 self.background.remove(&call);
@@ -419,7 +477,11 @@ impl GrokAdapter {
                     Kind::ToolCall {
                         id: id.clone(),
                         tool: snap["kind"].as_str().unwrap_or("task").to_string(),
-                        title: if title.is_empty() { command.clone() } else { title },
+                        title: if title.is_empty() {
+                            command.clone()
+                        } else {
+                            title
+                        },
                         category: ToolCategory::Execute,
                         input: clip(&command, INPUT_MAX),
                         status: ToolStatus::Running,
@@ -433,7 +495,11 @@ impl GrokAdapter {
             ts,
             Kind::ToolCallUpdate {
                 id,
-                status: if ok { ToolStatus::Completed } else { ToolStatus::Failed },
+                status: if ok {
+                    ToolStatus::Completed
+                } else {
+                    ToolStatus::Failed
+                },
                 output: Some(task_result(snap)),
             },
         ));
@@ -443,7 +509,9 @@ impl GrokAdapter {
     /// id is the ordinal of the FIRST plan line of the session, so the 2 or
     /// 3 revisions a session writes upsert one row instead of stacking.
     fn plan(&mut self, ordinal: u64, update: &Value, ts: u64, out: &mut Vec<(u64, Kind)>) {
-        let Some(entries) = update["entries"].as_array().filter(|e| !e.is_empty()) else { return };
+        let Some(entries) = update["entries"].as_array().filter(|e| !e.is_empty()) else {
+            return;
+        };
         let id = format!("p{}", *self.plan.get_or_insert(ordinal));
         let text = entries
             .iter()
@@ -459,7 +527,14 @@ impl GrokAdapter {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        out.push((ts, Kind::AgentThought { id, text: clip(&text, OUTPUT_MAX), done: true }));
+        out.push((
+            ts,
+            Kind::AgentThought {
+                id,
+                text: clip(&text, OUTPUT_MAX),
+                done: true,
+            },
+        ));
     }
 
     fn parse_events(&mut self, lines: &[String]) -> Vec<(u64, Kind)> {
@@ -471,8 +546,12 @@ impl GrokAdapter {
         let mut rows: Vec<Option<(u64, Kind)>> = Vec::new();
         let mut waiting: HashMap<String, usize> = HashMap::new();
         for line in lines {
-            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-            let Some(kind) = v["type"].as_str() else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(kind) = v["type"].as_str() else {
+                continue;
+            };
             let ts = v["ts"].as_str().and_then(iso_ms).unwrap_or_else(now_ms);
             let tool = v["tool_name"].as_str().unwrap_or("tool").to_string();
             match kind {
@@ -480,7 +559,10 @@ impl GrokAdapter {
                     waiting.insert(tool.clone(), rows.len());
                     rows.push(Some((
                         ts,
-                        Kind::Phase { phase: Phase::NeedsYou, detail: format!("permission: {tool}") },
+                        Kind::Phase {
+                            phase: Phase::NeedsYou,
+                            detail: format!("permission: {tool}"),
+                        },
                     )));
                 }
                 "permission_resolved" => match waiting.remove(&tool) {
@@ -489,23 +571,36 @@ impl GrokAdapter {
                     }
                     None => rows.push(Some((
                         ts,
-                        Kind::Phase { phase: Phase::Working, detail: String::new() },
+                        Kind::Phase {
+                            phase: Phase::Working,
+                            detail: String::new(),
+                        },
                     ))),
                 },
                 // The turn is already announced by updates.jsonl's user
                 // chunk; only the phase is worth repeating.
-                "turn_started" => {
-                    rows.push(Some((ts, Kind::Phase { phase: Phase::Working, detail: String::new() })))
-                }
-                "turn_ended" => {
-                    rows.push(Some((ts, Kind::Phase { phase: Phase::Idle, detail: String::new() })))
-                }
+                "turn_started" => rows.push(Some((
+                    ts,
+                    Kind::Phase {
+                        phase: Phase::Working,
+                        detail: String::new(),
+                    },
+                ))),
+                "turn_ended" => rows.push(Some((
+                    ts,
+                    Kind::Phase {
+                        phase: Phase::Idle,
+                        detail: String::new(),
+                    },
+                ))),
                 // The one thing events.jsonl knows that updates.jsonl does
                 // not: 17 of 36 failing tools were written to updates.jsonl
                 // as `completed`. Correct only a status we saw as completed,
                 // so a card whose result has not arrived is left alone.
                 "tool_completed" if v["outcome"].as_str() != Some("success") => {
-                    let Some(id) = v["tool_call_id"].as_str() else { continue };
+                    let Some(id) = v["tool_call_id"].as_str() else {
+                        continue;
+                    };
                     if self.completed[0].remove(id) || self.completed[1].remove(id) {
                         rows.push(Some((
                             ts,
@@ -557,7 +652,10 @@ fn chunk_text(content: &Value) -> String {
     match content["type"].as_str() {
         Some("text") => content["text"].as_str().unwrap_or_default().to_string(),
         Some("image") => {
-            format!("[image {}]", content["mimeType"].as_str().unwrap_or("attached"))
+            format!(
+                "[image {}]",
+                content["mimeType"].as_str().unwrap_or("attached")
+            )
         }
         _ => String::new(),
     }
@@ -576,7 +674,11 @@ fn tool_card(update: &Value, status: ToolStatus) -> Option<Kind> {
     Some(Kind::ToolCall {
         id: id.to_string(),
         tool: tool.to_string(),
-        title: if title.is_empty() { tool.to_string() } else { title.to_string() },
+        title: if title.is_empty() {
+            tool.to_string()
+        } else {
+            title.to_string()
+        },
         category: category(update["kind"].as_str(), xai["kind"].as_str()),
         input: summarize(&update["rawInput"]),
         status,
@@ -601,16 +703,23 @@ fn subagent_card(update: &Value) -> Option<Kind> {
     let id = update["subagent_id"].as_str()?;
     let kind = update["subagent_type"].as_str().unwrap_or("subagent");
     let title = one_line(&update["description"]);
-    let input = [("type", kind), ("model", update["model"].as_str().unwrap_or_default())]
-        .iter()
-        .filter(|(_, v)| !v.is_empty())
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let input = [
+        ("type", kind),
+        ("model", update["model"].as_str().unwrap_or_default()),
+    ]
+    .iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, v)| format!("{k}={v}"))
+    .collect::<Vec<_>>()
+    .join(" ");
     Some(Kind::ToolCall {
         id: format!("sub-{id}"),
         tool: "subagent".to_string(),
-        title: if title.is_empty() { kind.to_string() } else { title },
+        title: if title.is_empty() {
+            kind.to_string()
+        } else {
+            title
+        },
         category: ToolCategory::Think,
         input: clip(&input, INPUT_MAX),
         status: ToolStatus::Running,
@@ -636,8 +745,16 @@ fn subagent_result(update: &Value) -> Option<Kind> {
         head.push_str(&format!(" · {} s", ms / 1000));
     }
     let body = update["output"].as_str().unwrap_or_default();
-    let text = if body.is_empty() { head } else { format!("{head}\n{body}") };
-    Some(Kind::ToolCallUpdate { id: format!("sub-{id}"), status, output: Some(clip(&text, OUTPUT_MAX)) })
+    let text = if body.is_empty() {
+        head
+    } else {
+        format!("{head}\n{body}")
+    };
+    Some(Kind::ToolCallUpdate {
+        id: format!("sub-{id}"),
+        status,
+        output: Some(clip(&text, OUTPUT_MAX)),
+    })
 }
 
 /// What a finished background task showed: the reason it stopped when that
@@ -661,15 +778,22 @@ fn task_result(snap: &Value) -> String {
         marks.push("(no output)".to_string());
         return marks.join(" ");
     }
-    let text =
-        if marks.is_empty() { body.to_string() } else { format!("{} {body}", marks.join(" ")) };
+    let text = if marks.is_empty() {
+        body.to_string()
+    } else {
+        format!("{} {body}", marks.join(" "))
+    };
     clip(&text, OUTPUT_MAX)
 }
 
 /// A JSON string field as one line of card text: whitespace collapsed, so a
 /// heredoc of a command does not arrive as forty lines.
 fn one_line(v: &Value) -> String {
-    v.as_str().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ")
+    v.as_str()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The card's mark. The ACP `kind` is only on the fill-in line; the first
@@ -718,7 +842,10 @@ fn summarize(raw: &Value) -> String {
         None if raw.is_null() => String::new(),
         None => raw.to_string(),
     };
-    clip(&text.split_whitespace().collect::<Vec<_>>().join(" "), INPUT_MAX)
+    clip(
+        &text.split_whitespace().collect::<Vec<_>>().join(" "),
+        INPUT_MAX,
+    )
 }
 
 /// What a tool showed. `content` is an array of ACP tool-call content:
@@ -757,8 +884,8 @@ fn ts_ms(v: &Value, params: &Value) -> u64 {
 }
 
 /// "2026-08-28T22:30:22.790Z" → ms. events.jsonl stamps ISO where
-/// updates.jsonl stamps numbers; this is the same civil-days arithmetic as
-/// `remote_api::parse_iso_secs`, kept to the millisecond.
+/// updates.jsonl stamps numbers; keep the civil-days arithmetic to the
+/// millisecond.
 fn iso_ms(s: &str) -> Option<u64> {
     let (date, rest) = s.split_once('T')?;
     let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
@@ -766,10 +893,16 @@ fn iso_ms(s: &str) -> Option<u64> {
     let time = rest.trim_end_matches('Z');
     let time = time.split(['+', '-']).next().unwrap_or(time);
     let mut t = time.split(':');
-    let (h, mi) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+    let (h, mi) = (
+        t.next()?.parse::<i64>().ok()?,
+        t.next()?.parse::<i64>().ok()?,
+    );
     let secs_part = t.next()?;
     let (sec, frac) = match secs_part.split_once('.') {
-        Some((s, f)) => (s.parse::<i64>().ok()?, format!("{f:0<3}")[..3].parse::<i64>().ok()?),
+        Some((s, f)) => (
+            s.parse::<i64>().ok()?,
+            format!("{f:0<3}")[..3].parse::<i64>().ok()?,
+        ),
         None => (secs_part.parse::<i64>().ok()?, 0),
     };
     let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
@@ -795,7 +928,12 @@ struct Tail {
 
 impl Tail {
     fn new(path: PathBuf) -> Self {
-        Self { path, offset: 0, partial: String::new(), id: None }
+        Self {
+            path,
+            offset: 0,
+            partial: String::new(),
+            id: None,
+        }
     }
 
     fn rewind(&mut self) {
@@ -809,7 +947,9 @@ impl Tail {
     fn take(&mut self) -> Option<Vec<String>> {
         // A session that has not completed a turn has no updates.jsonl yet;
         // it appears under us, and until it does there is nothing to say.
-        let Ok(meta) = std::fs::metadata(&self.path) else { return Some(Vec::new()) };
+        let Ok(meta) = std::fs::metadata(&self.path) else {
+            return Some(Vec::new());
+        };
         let id = file_id(&meta);
         if meta.len() < self.offset || self.id.is_some_and(|was| was != id) {
             return None;
@@ -881,7 +1021,11 @@ mod tests {
 
     fn append(dir: &std::path::Path, file: &str, body: &str) {
         use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(file)).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(file))
+            .unwrap();
         f.write_all(body.as_bytes()).unwrap();
     }
 
@@ -926,7 +1070,8 @@ mod tests {
     const EV_PERM_REQ: &str = r#"{"ts":"2026-08-28T22:30:22.787Z","type":"permission_requested","tool_name":"read_file"}"#;
     const EV_PERM_OK: &str = r#"{"ts":"2026-08-28T22:30:22.788Z","type":"permission_resolved","tool_name":"read_file","decision":"allow","wait_ms":0}"#;
     const EV_TOOL_ERR: &str = r#"{"ts":"2026-08-28T22:30:22.790Z","type":"tool_completed","tool_name":"read_file","duration_ms":0,"outcome":"error","tool_call_id":"call-A-0"}"#;
-    const EV_PHASE: &str = r#"{"ts":"2026-08-28T22:30:20.714Z","type":"phase_changed","phase":"streaming_text"}"#;
+    const EV_PHASE: &str =
+        r#"{"ts":"2026-08-28T22:30:20.714Z","type":"phase_changed","phase":"streaming_text"}"#;
 
     fn kinds(evs: &[(u64, Kind)]) -> Vec<&Kind> {
         evs.iter().map(|(_, k)| k).collect()
@@ -941,7 +1086,10 @@ mod tests {
             kinds(&got),
             vec![
                 &Kind::TurnStarted { turn: "1".into() },
-                &Kind::UserMessage { id: "u1".into(), text: "build a weather page".into() },
+                &Kind::UserMessage {
+                    id: "u1".into(),
+                    text: "build a weather page".into()
+                },
             ]
         );
         // agentTimestampMs wins over the envelope's unix seconds.
@@ -951,7 +1099,11 @@ mod tests {
     #[test]
     fn a_run_of_agent_chunks_is_one_growing_block_closed_by_the_next_line() {
         let d = tmpdir("run");
-        write(&d, "updates.jsonl", &format!("{SAY}\n{SAY}\n{SAY}\n{CALL}\n"));
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{SAY}\n{SAY}\n{SAY}\n{CALL}\n"),
+        );
         let got = adapter(&d).bootstrap();
         let texts: Vec<_> = got
             .iter()
@@ -975,12 +1127,20 @@ mod tests {
     #[test]
     fn a_thought_run_is_its_own_block() {
         let d = tmpdir("thought");
-        write(&d, "updates.jsonl", &format!("{THOUGHT}\n{THOUGHT}\n{SAY}\n"));
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{THOUGHT}\n{THOUGHT}\n{SAY}\n"),
+        );
         let got = adapter(&d).bootstrap();
         assert_eq!(
             kinds(&got),
             vec![
-                &Kind::AgentThought { id: "a1".into(), text: "The user wants a page. ".into(), done: false },
+                &Kind::AgentThought {
+                    id: "a1".into(),
+                    text: "The user wants a page. ".into(),
+                    done: false
+                },
                 &Kind::AgentThought {
                     id: "a1".into(),
                     text: "The user wants a page. The user wants a page. ".into(),
@@ -991,7 +1151,11 @@ mod tests {
                     text: "The user wants a page. The user wants a page. ".into(),
                     done: true
                 },
-                &Kind::AgentText { id: "a3".into(), text: "I'll start ".into(), done: false },
+                &Kind::AgentText {
+                    id: "a3".into(),
+                    text: "I'll start ".into(),
+                    done: false
+                },
             ]
         );
     }
@@ -999,7 +1163,11 @@ mod tests {
     #[test]
     fn a_tool_call_is_issued_filled_in_then_finished() {
         let d = tmpdir("tool");
-        write(&d, "updates.jsonl", &format!("{CALL}\n{CALL_FILLED}\n{CALL_DONE}\n"));
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{CALL}\n{CALL_FILLED}\n{CALL_DONE}\n"),
+        );
         let got = adapter(&d).bootstrap();
         assert_eq!(
             kinds(&got),
@@ -1034,16 +1202,35 @@ mod tests {
     #[test]
     fn turn_completed_closes_an_open_block_and_ends_the_turn() {
         let d = tmpdir("turnend");
-        write(&d, "updates.jsonl", &format!("{USER}\n{SAY}\n{PLAN}\n{TURN_DONE}\n"));
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{USER}\n{SAY}\n{PLAN}\n{TURN_DONE}\n"),
+        );
         let got = adapter(&d).bootstrap();
         // `plan` ends the prose block, and speaks for itself.
         assert_eq!(
             kinds(&got)[2..],
             [
-                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: false },
-                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: true },
-                &Kind::AgentThought { id: "p3".into(), text: "[~] Load skills".into(), done: true },
-                &Kind::TurnEnded { turn: "1".into(), reason: "completed".into() },
+                &Kind::AgentText {
+                    id: "a2".into(),
+                    text: "I'll start ".into(),
+                    done: false
+                },
+                &Kind::AgentText {
+                    id: "a2".into(),
+                    text: "I'll start ".into(),
+                    done: true
+                },
+                &Kind::AgentThought {
+                    id: "p3".into(),
+                    text: "[~] Load skills".into(),
+                    done: true
+                },
+                &Kind::TurnEnded {
+                    turn: "1".into(),
+                    reason: "completed".into()
+                },
             ]
         );
     }
@@ -1051,16 +1238,32 @@ mod tests {
     #[test]
     fn a_plan_is_one_thought_row_that_is_rewritten_in_place() {
         let d = tmpdir("plan");
-        write(&d, "updates.jsonl", &format!("{PLAN}\n{SAY}\n{PLAN_GROWN}\n"));
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{PLAN}\n{SAY}\n{PLAN_GROWN}\n"),
+        );
         let got = adapter(&d).bootstrap();
         // Both revisions carry the FIRST plan line's ordinal, so the phone
         // upserts one checklist instead of stacking two.
         assert_eq!(
             kinds(&got),
             vec![
-                &Kind::AgentThought { id: "p1".into(), text: "[~] Load skills".into(), done: true },
-                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: false },
-                &Kind::AgentText { id: "a2".into(), text: "I'll start ".into(), done: true },
+                &Kind::AgentThought {
+                    id: "p1".into(),
+                    text: "[~] Load skills".into(),
+                    done: true
+                },
+                &Kind::AgentText {
+                    id: "a2".into(),
+                    text: "I'll start ".into(),
+                    done: false
+                },
+                &Kind::AgentText {
+                    id: "a2".into(),
+                    text: "I'll start ".into(),
+                    done: true
+                },
                 &Kind::AgentThought {
                     id: "p1".into(),
                     text: "[x] Load skills\n[ ] Serve, verify, commit".into(),
@@ -1125,7 +1328,11 @@ mod tests {
         let d = tmpdir("bg-alias");
         // task_id is a uuid, tool_call_id is the card: only the
         // `task_backgrounded` line knows they are the same thing.
-        write(&d, "updates.jsonl", &format!("{BG_CALL}\n{BG_ALIAS}\n{TASK_FAILED}\n"));
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{BG_CALL}\n{BG_ALIAS}\n{TASK_FAILED}\n"),
+        );
         let got = adapter(&d).bootstrap();
         assert_eq!(got.len(), 3);
         assert_eq!(
@@ -1174,7 +1381,11 @@ mod tests {
     #[test]
     fn a_subagent_is_a_card_of_its_own_from_spawn_to_report() {
         let d = tmpdir("subagent");
-        write(&d, "updates.jsonl", &format!("{SUB_SPAWNED}\n{SAY}\n{SUB_FINISHED}\n"));
+        write(
+            &d,
+            "updates.jsonl",
+            &format!("{SUB_SPAWNED}\n{SAY}\n{SUB_FINISHED}\n"),
+        );
         let got = adapter(&d).bootstrap();
         let id = "sub-01a03137-0bb1-74a0-9a4f-cf1b27783f4c";
         assert_eq!(
@@ -1205,11 +1416,18 @@ mod tests {
     #[test]
     fn a_permission_answered_before_we_looked_never_needed_anyone() {
         let d = tmpdir("perm-fast");
-        write(&d, "events.jsonl", &format!("{EV_TURN_STARTED}\n{EV_PERM_REQ}\n{EV_PERM_OK}\n{EV_PHASE}\n"));
+        write(
+            &d,
+            "events.jsonl",
+            &format!("{EV_TURN_STARTED}\n{EV_PERM_REQ}\n{EV_PERM_OK}\n{EV_PHASE}\n"),
+        );
         let got = adapter(&d).bootstrap();
         assert_eq!(
             kinds(&got),
-            vec![&Kind::Phase { phase: Phase::Working, detail: String::new() }]
+            vec![&Kind::Phase {
+                phase: Phase::Working,
+                detail: String::new()
+            }]
         );
     }
 
@@ -1220,12 +1438,18 @@ mod tests {
         let mut a = adapter(&d);
         assert_eq!(
             kinds(&a.bootstrap()),
-            vec![&Kind::Phase { phase: Phase::NeedsYou, detail: "permission: read_file".into() }]
+            vec![&Kind::Phase {
+                phase: Phase::NeedsYou,
+                detail: "permission: read_file".into()
+            }]
         );
         append(&d, "events.jsonl", &format!("{EV_PERM_OK}\n"));
         assert_eq!(
             kinds(&a.poll()),
-            vec![&Kind::Phase { phase: Phase::Working, detail: String::new() }]
+            vec![&Kind::Phase {
+                phase: Phase::Working,
+                detail: String::new()
+            }]
         );
     }
 
@@ -1254,7 +1478,11 @@ mod tests {
         // The user line is stamped 1787956219612; the events line is
         // 2026-08-28T22:30:19.612Z, which is the same instant.
         write(&d, "updates.jsonl", &format!("{USER}\n{SAY}\n"));
-        write(&d, "events.jsonl", &format!("{EV_TURN_STARTED}\n{EV_PHASE}\n"));
+        write(
+            &d,
+            "events.jsonl",
+            &format!("{EV_TURN_STARTED}\n{EV_PHASE}\n"),
+        );
         let got = adapter(&d).bootstrap();
         assert_eq!(iso_ms("2026-08-28T22:30:19.612Z"), Some(1787956219612));
         let stamps: Vec<u64> = got.iter().map(|(ts, _)| *ts).collect();
@@ -1262,7 +1490,13 @@ mod tests {
         // updates first on a tie, then the events phase, then the prose.
         assert!(matches!(got[0].1, Kind::TurnStarted { .. }));
         assert!(matches!(got[1].1, Kind::UserMessage { .. }));
-        assert_eq!(got[2].1, Kind::Phase { phase: Phase::Working, detail: String::new() });
+        assert_eq!(
+            got[2].1,
+            Kind::Phase {
+                phase: Phase::Working,
+                detail: String::new()
+            }
+        );
         assert!(matches!(got[3].1, Kind::AgentText { .. }));
     }
 
@@ -1278,7 +1512,10 @@ mod tests {
             kinds(&a.poll()),
             vec![
                 &Kind::TurnStarted { turn: "1".into() },
-                &Kind::UserMessage { id: "u1".into(), text: "build a weather page".into() },
+                &Kind::UserMessage {
+                    id: "u1".into(),
+                    text: "build a weather page".into()
+                },
             ]
         );
     }
@@ -1296,7 +1533,10 @@ mod tests {
             vec![
                 &Kind::Reset,
                 &Kind::TurnStarted { turn: "1".into() },
-                &Kind::UserMessage { id: "u1".into(), text: "build a weather page".into() },
+                &Kind::UserMessage {
+                    id: "u1".into(),
+                    text: "build a weather page".into()
+                },
             ]
         );
     }
@@ -1319,14 +1559,21 @@ mod tests {
             .unwrap()
             .flatten()
             .filter(|c| c.path().is_dir())
-            .flat_map(|c| std::fs::read_dir(c.path()).unwrap().flatten().map(|s| s.path()))
+            .flat_map(|c| {
+                std::fs::read_dir(c.path())
+                    .unwrap()
+                    .flatten()
+                    .map(|s| s.path())
+            })
             .filter(|s| s.join("updates.jsonl").is_file())
             .collect();
         sessions.sort();
         let mut histogram: std::collections::BTreeMap<String, usize> = Default::default();
         for dir in sessions {
             let lines = |f: &str| {
-                std::fs::read_to_string(dir.join(f)).map(|s| s.lines().count()).unwrap_or(0)
+                std::fs::read_to_string(dir.join(f))
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0)
             };
             let (u, e) = (lines("updates.jsonl"), lines("events.jsonl"));
             let start = std::time::Instant::now();
@@ -1338,7 +1585,10 @@ mod tests {
                 start.elapsed().as_secs_f64() * 1000.0
             );
             for (_, k) in &out {
-                let tag = serde_json::to_value(k).unwrap()["kind"].as_str().unwrap().to_string();
+                let tag = serde_json::to_value(k).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
                 *histogram.entry(tag).or_default() += 1;
             }
             // At most one block may still be open — the one the file ends
@@ -1347,8 +1597,12 @@ mod tests {
             let open: std::collections::BTreeSet<&String> = out
                 .iter()
                 .filter_map(|(_, k)| match k {
-                    Kind::AgentText { id, done: false, .. }
-                    | Kind::AgentThought { id, done: false, .. } => Some(id),
+                    Kind::AgentText {
+                        id, done: false, ..
+                    }
+                    | Kind::AgentThought {
+                        id, done: false, ..
+                    } => Some(id),
                     _ => None,
                 })
                 .filter(|id| {

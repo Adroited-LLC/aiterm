@@ -93,13 +93,17 @@ pub fn parse_id(out: &str) -> Option<u32> {
 /// so it can be taken down again when the session stops waiting — a popup still
 /// on screen for a prompt already answered is worse than none.
 #[tauri::command]
-pub fn desktop_notify(app: tauri::AppHandle, summary: String, body: String, replaces: u32) -> Option<u32> {
-    // A phone should hear about a waiting session the same moment the desktop does.
-    crate::remote_api::notify(
-        &app,
-        crate::remote_api::Event::Attention { title: summary.clone(), body: body.clone() },
-    );
-    let out = Command::new("gdbus").args(notify_args(&summary, &body, replaces)).output().ok()?;
+pub fn desktop_notify(
+    app: tauri::AppHandle,
+    summary: String,
+    body: String,
+    replaces: u32,
+) -> Option<u32> {
+    let _ = app;
+    let out = Command::new("gdbus")
+        .args(notify_args(&summary, &body, replaces))
+        .output()
+        .ok()?;
     parse_id(&String::from_utf8_lossy(&out.stdout))
 }
 
@@ -155,7 +159,11 @@ mod tests {
         let long = "x".repeat(500);
         let args = notify_args("t", &long, 0);
         let body = &args[12];
-        assert!(body.chars().count() < MAX_BODY + 4, "{}", body.chars().count());
+        assert!(
+            body.chars().count() < MAX_BODY + 4,
+            "{}",
+            body.chars().count()
+        );
         assert!(body.ends_with("…\""));
     }
 

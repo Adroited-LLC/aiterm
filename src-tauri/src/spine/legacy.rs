@@ -42,9 +42,16 @@ pub fn open(agent: &str, session_id: &str) -> Option<LegacyAdapter> {
         .into_iter()
         .collect::<Vec<_>>();
     if paths.is_empty() {
-        crate::diag!("spine", "legacy adapter for {agent} has no file to watch; polling only");
+        crate::diag!(
+            "spine",
+            "legacy adapter for {agent} has no file to watch; polling only"
+        );
     }
-    Some(LegacyAdapter { session_id: session_id.to_string(), paths, seen: Vec::new() })
+    Some(LegacyAdapter {
+        session_id: session_id.to_string(),
+        paths,
+        seen: Vec::new(),
+    })
 }
 
 impl Adapter for LegacyAdapter {
@@ -100,7 +107,12 @@ fn diff(seen: &mut Vec<(String, String)>, turns: Vec<(String, String)>) -> Vec<(
 }
 
 fn map_turns(turns: &[(String, String)], from: usize) -> Vec<(u64, Kind)> {
-    turns.iter().enumerate().skip(from).map(|(i, t)| map_turn(i, t)).collect()
+    turns
+        .iter()
+        .enumerate()
+        .skip(from)
+        .map(|(i, t)| map_turn(i, t))
+        .collect()
 }
 
 /// One turn → one event. There are no timestamps on this path, so `ts` is
@@ -108,13 +120,28 @@ fn map_turns(turns: &[(String, String)], from: usize) -> Vec<(u64, Kind)> {
 fn map_turn(index: usize, (role, text): &(String, String)) -> (u64, Kind) {
     let id = format!("legacy:{index}");
     let kind = match role.as_str() {
-        "user" => Kind::UserMessage { id, text: text.clone() },
-        "assistant" => Kind::AgentText { id, text: text.clone(), done: true },
-        "thinking" => Kind::AgentThought { id, text: text.clone(), done: true },
+        "user" => Kind::UserMessage {
+            id,
+            text: text.clone(),
+        },
+        "assistant" => Kind::AgentText {
+            id,
+            text: text.clone(),
+            done: true,
+        },
+        "thinking" => Kind::AgentThought {
+            id,
+            text: text.clone(),
+            done: true,
+        },
         // The only "system" turn this path produces is the elision marker
         // `conversation_rich` inserts when a conversation is over budget.
         // It is prose about the conversation, not a tool that ran.
-        "system" => Kind::AgentText { id, text: text.clone(), done: true },
+        "system" => Kind::AgentText {
+            id,
+            text: text.clone(),
+            done: true,
+        },
         // Anything else IS the tool's name — that is how `line_events`
         // encodes a tool call. The result is not in this stream, so the
         // call is reported already finished.
@@ -157,7 +184,10 @@ mod tests {
     use super::*;
 
     fn turns(items: &[(&str, &str)]) -> Vec<(String, String)> {
-        items.iter().map(|(r, t)| (r.to_string(), t.to_string())).collect()
+        items
+            .iter()
+            .map(|(r, t)| (r.to_string(), t.to_string()))
+            .collect()
     }
 
     fn kinds(evs: Vec<(u64, Kind)>) -> Vec<Kind> {
@@ -175,10 +205,20 @@ mod tests {
             ]),
             0,
         ));
-        assert_eq!(got[0], Kind::UserMessage { id: "legacy:0".into(), text: "fix the build".into() });
+        assert_eq!(
+            got[0],
+            Kind::UserMessage {
+                id: "legacy:0".into(),
+                text: "fix the build".into()
+            }
+        );
         assert_eq!(
             got[1],
-            Kind::AgentThought { id: "legacy:1".into(), text: "cargo first".into(), done: true }
+            Kind::AgentThought {
+                id: "legacy:1".into(),
+                text: "cargo first".into(),
+                done: true
+            }
         );
         assert_eq!(
             got[2],
@@ -193,7 +233,11 @@ mod tests {
         );
         assert_eq!(
             got[3],
-            Kind::AgentText { id: "legacy:3".into(), text: "done".into(), done: true }
+            Kind::AgentText {
+                id: "legacy:3".into(),
+                text: "done".into(),
+                done: true
+            }
         );
     }
 
@@ -216,7 +260,10 @@ mod tests {
     #[test]
     fn a_diff_emits_only_what_is_new() {
         let mut seen = turns(&[("user", "hi"), ("assistant", "hel")]);
-        let got = kinds(diff(&mut seen, turns(&[("user", "hi"), ("assistant", "hello there")])));
+        let got = kinds(diff(
+            &mut seen,
+            turns(&[("user", "hi"), ("assistant", "hello there")]),
+        ));
         // The tail block grew: re-emitted under the same id, nothing else.
         assert_eq!(
             got,
@@ -228,12 +275,20 @@ mod tests {
         );
 
         // Nothing moved at all.
-        assert!(diff(&mut seen, turns(&[("user", "hi"), ("assistant", "hello there")])).is_empty());
+        assert!(diff(
+            &mut seen,
+            turns(&[("user", "hi"), ("assistant", "hello there")])
+        )
+        .is_empty());
 
         // A new turn arrives; the settled ones are not repeated.
         let got = kinds(diff(
             &mut seen,
-            turns(&[("user", "hi"), ("assistant", "hello there"), ("Read", "src/lib.rs")]),
+            turns(&[
+                ("user", "hi"),
+                ("assistant", "hello there"),
+                ("Read", "src/lib.rs"),
+            ]),
         ));
         assert_eq!(got.len(), 1);
         assert!(matches!(&got[0], Kind::ToolCall { id, .. } if id == "legacy:2"));
@@ -246,7 +301,10 @@ mod tests {
         assert_eq!(got[0], Kind::Reset);
         assert_eq!(
             got[1],
-            Kind::UserMessage { id: "legacy:0".into(), text: "fresh start".into() }
+            Kind::UserMessage {
+                id: "legacy:0".into(),
+                text: "fresh start".into()
+            }
         );
         assert_eq!(got.len(), 2);
         assert_eq!(seen.len(), 1);
@@ -259,7 +317,11 @@ mod tests {
         let mut seen = turns(&[("user", "hi"), ("assistant", "a"), ("assistant", "b")]);
         let got = kinds(diff(
             &mut seen,
-            turns(&[("user", "hi"), ("system", "[… earlier turns omitted …]"), ("assistant", "b")]),
+            turns(&[
+                ("user", "hi"),
+                ("system", "[… earlier turns omitted …]"),
+                ("assistant", "b"),
+            ]),
         ));
         assert_eq!(got[0], Kind::Reset);
         assert_eq!(got.len(), 4);

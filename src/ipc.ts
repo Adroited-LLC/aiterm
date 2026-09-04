@@ -1169,6 +1169,12 @@ export const remoteStartOnLaunchSet = (
   port: number,
 ) => invoke<RemoteStatus>("remote_start_on_launch_set", { enabled, address, port });
 
+export const remoteNetworkStackSet = (networkStack: "aiterm" | "iroh") =>
+  invoke<RemoteStatus>("remote_network_stack_set", { networkStack });
+
+export const remoteIrohRelayUrlSet = (url: string | null) =>
+  invoke<RemoteStatus>("remote_iroh_relay_url_set", { url });
+
 export const remoteRelayConfigure = (
   connectorUrl: string,
   publicHost: string,
@@ -1205,114 +1211,3 @@ export const remoteDevices = () => invoke<TrustedDevice[]>("remote_devices");
 /** Forgets the device's key and drops its live connections. */
 export const remoteRevokeDevice = (deviceId: string) =>
   invoke<boolean>("remote_revoke_device", { deviceId });
-
-// ------------------------------------------------- phone listener (remote_api)
-// The phone-protocol listener with its iroh tunnel — separate from the
-// remote gateway above, and off unless enabled in Settings → Phone remote.
-// Wire names keep their remote_* spelling except `remote_api_status`, which
-// the gateway's own `remote_status` forced to move.
-
-export interface PhoneRemoteStatus {
-  enabled: boolean;
-  running: boolean;
-  port: number;
-  name: string;
-  /** Addresses a phone might reach this machine on, best first. */
-  addresses: string[];
-  /** What the router said: "off" | "searching" | "mapped" | "no_router" | "refused". */
-  upnp: string;
-  /** The address the internet sees, when the router told us. */
-  public_address: string | null;
-  /** SHA-256 of the listener certificate — what a paired phone pins. */
-  fingerprint: string | null;
-  /** Phones holding the event socket open right now. */
-  clients: PhoneRemoteClient[];
-  error: string | null;
-  /** Whether the iroh tunnel is configured to ride alongside the listener. */
-  iroh_enabled: boolean;
-  /** The reach-from-anywhere address: this desktop's iroh node id. */
-  iroh_node: string | null;
-  /** Which roads are on — see docs/remote-roads.md. */
-  roads: PhoneRemoteRoads;
-  /** What the VPN road sees on this machine right now. */
-  vpn: PhoneRemoteVpn;
-  /** The relay road: enrolled route, connector state, pending draft. */
-  relay: PhoneRemoteRelay;
-  /** Custom iroh relay URL; null = iroh's default relays. */
-  iroh_relay_url: string | null;
-  /** The order phones try the roads, most preferred first — published in
-   *  /v1/status; a phone that has not set its own order adopts it. */
-  road_order: PhoneRemoteRoad[];
-}
-export type PhoneRemoteRoad = "lan" | "vpn" | "relay" | "iroh";
-export interface PhoneRemoteRoads {
-  lan: boolean;
-  vpn: boolean;
-  relay: boolean;
-  iroh: boolean;
-}
-export interface PhoneRemoteVpn {
-  detected: boolean;
-  kind: "tailscale" | "wireguard" | "other" | null;
-  interface: string | null;
-  address: string | null;
-  /** Tailscale's MagicDNS name for this machine, when the CLI answers. */
-  magic_dns: string | null;
-}
-export interface PhoneRemoteRelay {
-  configured: boolean;
-  state: "off" | "connecting" | "connected" | "retrying";
-  host: string | null;
-  port: number | null;
-  /** The relay control server routes are enrolled with. */
-  server: string;
-  /** An enrollment draft is waiting: any paired phone signs it from
-   *  /v1/status (no new pairing), and a QR carries it as `ta`. */
-  pending_enrollment: boolean;
-  /** The relay server could not be reached when a draft was wanted; no
-   *  draft is waiting until the next try. */
-  error: string | null;
-}
-export interface PhoneRemoteClient {
-  id: number;
-  device: string;
-  os: string;
-  app: string;
-  address: string;
-  /** Unix seconds. */
-  since: number;
-}
-export interface PhonePairPayload {
-  uri: string;
-  /** The QR, as SVG markup from the backend — the token never becomes a string here. */
-  svg: string;
-}
-export const phoneRemoteStatus = () => invoke<PhoneRemoteStatus>("remote_api_status");
-export const phoneRemoteSetEnabled = (on: boolean) =>
-  invoke<PhoneRemoteStatus>("remote_set_enabled", { on });
-/** Forget every paired phone: a new token, so each must scan again. */
-export const phoneRemoteRotateToken = () => invoke<PhoneRemoteStatus>("remote_rotate_token");
-export const phoneRemoteSetName = (name: string) =>
-  invoke<PhoneRemoteStatus>("remote_set_name", { name });
-export const phoneRemoteSetPort = (port: number) =>
-  invoke<PhoneRemoteStatus>("remote_set_port", { port });
-export const phoneRemotePairPayload = () => invoke<PhonePairPayload>("remote_pair_payload");
-/** iroh on/off, live — the LAN route is untouched either way. */
-export const phoneRemoteSetIroh = (on: boolean) =>
-  invoke<PhoneRemoteStatus>("remote_set_iroh", { on });
-/** One road on or off, live. Relay on with no route prepares an enrollment
- *  draft that a paired phone signs by itself. */
-export const phoneRemoteSetRoad = (road: PhoneRemoteRoad, on: boolean) =>
-  invoke<PhoneRemoteStatus>("remote_set_road", { road, on });
-/** The order phones try the roads: all four, each once. Phones that have
- *  not set their own order pick it up on their next status read. */
-export const phoneRemoteSetRoadOrder = (order: PhoneRemoteRoad[]) =>
-  invoke<PhoneRemoteStatus>("remote_set_road_order", { order });
-/** A custom iroh relay (null = default). Restarts a running tunnel. */
-export const phoneRemoteSetIrohRelayUrl = (url: string | null) =>
-  invoke<PhoneRemoteStatus>("remote_set_iroh_relay_url", { url });
-/** Forget the phone relay route: release it at the relay, delete the file, stop the connector. */
-export const phoneRemoteRelayClear = () => invoke<PhoneRemoteStatus>("remote_phone_relay_clear");
-/** One QR that pairs either phone app: the gateway invite with the phone
- *  listener's fields riding behind under their own names. */
-export const remoteBeginPairingCombined = () => invoke<PairingInvite>("remote_begin_pairing_combined");

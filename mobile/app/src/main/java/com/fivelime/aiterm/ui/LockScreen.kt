@@ -45,7 +45,7 @@ fun LockScreen(vm: AppViewModel, outer: PaddingValues) {
                 android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_WEAK or
                     android.hardware.biometrics.BiometricManager.Authenticators.DEVICE_CREDENTIAL,
             )
-        } else if (Build.VERSION.SDK_INT >= 29) {
+        } else {
             @Suppress("DEPRECATION")
             b.setDeviceCredentialAllowed(true)
         }

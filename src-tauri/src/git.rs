@@ -54,7 +54,10 @@ fn git_repo_state_sync(path: String) -> RepoState {
         };
     };
     let head = repo.head().ok();
-    let branch = head.as_ref().and_then(|h| h.shorthand().ok()).map(String::from);
+    let branch = head
+        .as_ref()
+        .and_then(|h| h.shorthand().ok())
+        .map(String::from);
     let (ahead, behind) = head
         .as_ref()
         .and_then(|h| {
@@ -303,7 +306,9 @@ pub async fn git_diff_file(path: String, file: String) -> Result<String, String>
 fn git_diff_file_sync(path: String, file: String) -> Result<String, String> {
     let repo = open(&path)?;
     let mut opts = DiffOptions::new();
-    opts.pathspec(&file).include_untracked(true).show_untracked_content(true);
+    opts.pathspec(&file)
+        .include_untracked(true)
+        .show_untracked_content(true);
     let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let diff = repo
         .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts))

@@ -206,6 +206,11 @@ object RemoteCommands {
     fun previewSession(sessionId: String): ByteArray = session(sessionId)
     fun conversation(sessionId: String, maxChars: Int = 512 * 1_024): ByteArray =
         encode(SessionConversationPayload.serializer(), SessionConversationPayload(sessionId, maxChars))
+    fun spine(sessionId: String, after: Long): ByteArray {
+        requireIdentifier(sessionId)
+        if (after < 0) malformed()
+        return encode(SessionSpinePayload.serializer(), SessionSpinePayload(sessionId, after))
+    }
     fun webPreview(sessionId: String, open: Boolean): ByteArray {
         requireIdentifier(sessionId)
         return encode(
@@ -385,6 +390,27 @@ object RemoteCommands {
             ) malformed()
         }
 
+    internal fun spinePage(payload: ByteArray): SpineConversationPage =
+        decode(SpineSnapshotWire.serializer(), payload).let { page ->
+            if (page.events.size > 5_000 || page.events.any { event ->
+                    event.seq <= 0 || event.sessionId.isBlank() || event.kind.isBlank() ||
+                        event.id?.encodeToByteArray()?.size?.let { it > MAX_IDENTIFIER_BYTES } == true ||
+                        event.text?.encodeToByteArray()?.size?.let { it > 512 * 1_024 } == true ||
+                        event.input?.encodeToByteArray()?.size?.let { it > 64 * 1_024 } == true ||
+                        event.output?.encodeToByteArray()?.size?.let { it > 64 * 1_024 } == true
+                }
+            ) malformed()
+            SpineConversationPage(
+                page.epoch,
+                page.live,
+                page.hasMore,
+                page.oldestSeq,
+                page.latestSeq,
+                page.turnOpen,
+                page.events,
+            )
+        }
+
     fun sessionChanges(payload: ByteArray): List<RemoteSessionChange> =
         decode(SessionChangesReply.serializer(), payload).changes.also { changes ->
             if (changes.size > 5_000 || changes.any {
@@ -506,6 +532,10 @@ object RemoteCommands {
     @Serializable private data class SessionConversationPayload(
         @SerialName("session_id") val sessionId: String,
         @SerialName("max_chars") val maxChars: Int,
+    )
+    @Serializable private data class SessionSpinePayload(
+        @SerialName("session_id") val sessionId: String,
+        val after: Long,
     )
     @Serializable private data class SessionWebPreviewRequest(
         @SerialName("session_id") val sessionId: String,

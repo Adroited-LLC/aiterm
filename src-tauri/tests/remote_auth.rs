@@ -257,7 +257,12 @@ fn a_successful_proof_records_when_the_device_was_last_seen() {
     let connected_at = paired_at + Duration::from_secs(60);
     let signature: Signature = key.sign(b"nonce");
     store
-        .verify_proof_at(&device.id, b"nonce", signature.to_der().as_bytes(), connected_at)
+        .verify_proof_at(
+            &device.id,
+            b"nonce",
+            signature.to_der().as_bytes(),
+            connected_at,
+        )
         .expect("the paired key should prove identity");
 
     let listed = store

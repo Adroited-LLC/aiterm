@@ -1,3 +1,4 @@
+use super::relay::RelayEnrollmentDraft;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};
@@ -11,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use super::relay::RelayEnrollmentDraft;
 
 const STORE_VERSION: u8 = 1;
 const ENROLLMENT_LIFETIME: Duration = Duration::from_secs(300);
@@ -146,9 +146,11 @@ impl DeviceStore {
             .ok_or_else(|| AuthError::new("pairing.invalid_time", "pairing time overflow"))?;
         let mut state = self.state.lock().map_err(|_| AuthError::poisoned())?;
         state.enrollments.retain(|item| item.expires_at >= now);
-        state
-            .enrollments
-            .push(PendingEnrollment { secret, expires_at, relay: relay.clone() });
+        state.enrollments.push(PendingEnrollment {
+            secret,
+            expires_at,
+            relay: relay.clone(),
+        });
         Ok(EnrollmentQr { secret, relay })
     }
 
@@ -260,9 +262,13 @@ impl DeviceStore {
         let relay = match (pending.relay, authority_public_key, signature_der) {
             (None, None, None) => None,
             (Some(draft), Some(authority_public_key), Some(signature_der)) => {
-                let authority = VerifyingKey::from_sec1_bytes(authority_public_key).map_err(|_| {
-                    AuthError::new("pairing.invalid_relay_authority", "invalid relay authority key")
-                })?;
+                let authority =
+                    VerifyingKey::from_sec1_bytes(authority_public_key).map_err(|_| {
+                        AuthError::new(
+                            "pairing.invalid_relay_authority",
+                            "invalid relay authority key",
+                        )
+                    })?;
                 let canonical_authority = authority.to_encoded_point(true);
                 if canonical_authority.as_bytes() != authority_public_key {
                     return Err(AuthError::new(
@@ -271,21 +277,31 @@ impl DeviceStore {
                     ));
                 }
                 let signature = Signature::from_der(signature_der).map_err(|_| {
-                    AuthError::new("pairing.invalid_relay_signature", "invalid relay authorization signature")
+                    AuthError::new(
+                        "pairing.invalid_relay_signature",
+                        "invalid relay authorization signature",
+                    )
                 })?;
-                authority.verify(draft.authorization_digest(), &signature).map_err(|_| {
-                    AuthError::new("pairing.invalid_relay_signature", "relay authorization signature did not verify")
-                })?;
+                authority
+                    .verify(draft.authorization_digest(), &signature)
+                    .map_err(|_| {
+                        AuthError::new(
+                            "pairing.invalid_relay_signature",
+                            "relay authorization signature did not verify",
+                        )
+                    })?;
                 Some(PendingRelayEnrollment {
                     draft,
                     authority_public_key: authority_public_key.to_vec(),
                     signature_der: signature_der.to_vec(),
                 })
             }
-            _ => return Err(AuthError::new(
-                "pairing.invalid_relay_authorization",
-                "relay authorization is incomplete or unexpected",
-            )),
+            _ => {
+                return Err(AuthError::new(
+                    "pairing.invalid_relay_authorization",
+                    "relay authorization is incomplete or unexpected",
+                ))
+            }
         };
         let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(canonical_bytes));
         let view = PendingPairing {
@@ -341,7 +357,10 @@ impl DeviceStore {
         state.devices = devices;
         state.pairing_outcomes.insert(
             request_id.to_string(),
-            (PairingOutcome::Approved(view.clone()), now + PAIRING_RETENTION),
+            (
+                PairingOutcome::Approved(view.clone()),
+                now + PAIRING_RETENTION,
+            ),
         );
         Ok(view)
     }
@@ -375,9 +394,13 @@ impl DeviceStore {
         request_id: &str,
     ) -> Result<Option<PendingRelayEnrollment>, AuthError> {
         let state = self.state.lock().map_err(|_| AuthError::poisoned())?;
-        let pending = state.pending_pairings.iter()
+        let pending = state
+            .pending_pairings
+            .iter()
             .find(|pairing| pairing.view.id == request_id)
-            .ok_or_else(|| AuthError::new("pairing.unknown_request", "pairing request does not exist"))?;
+            .ok_or_else(|| {
+                AuthError::new("pairing.unknown_request", "pairing request does not exist")
+            })?;
         Ok(pending.relay.clone())
     }
 
@@ -405,7 +428,9 @@ impl DeviceStore {
         self.state
             .lock()
             .map(|state| {
-                state.enrollments.len() + state.pending_pairings.len() + state.pairing_outcomes.len()
+                state.enrollments.len()
+                    + state.pending_pairings.len()
+                    + state.pairing_outcomes.len()
             })
             .unwrap_or(0)
     }
@@ -423,9 +448,10 @@ impl DeviceStore {
         if state.pending_pairings.len() == original_len {
             return Ok(false);
         }
-        state
-            .pairing_outcomes
-            .insert(request_id.to_string(), (PairingOutcome::Denied, now + PAIRING_RETENTION));
+        state.pairing_outcomes.insert(
+            request_id.to_string(),
+            (PairingOutcome::Denied, now + PAIRING_RETENTION),
+        );
         Ok(true)
     }
 
@@ -540,7 +566,12 @@ impl DeviceStore {
     pub(crate) fn is_trusted(&self, device_id: &str) -> bool {
         self.state
             .lock()
-            .map(|state| state.devices.iter().any(|device| device.view.id == device_id))
+            .map(|state| {
+                state
+                    .devices
+                    .iter()
+                    .any(|device| device.view.id == device_id)
+            })
             .unwrap_or(false)
     }
 }

@@ -18,6 +18,8 @@ export interface RemoteStatus {
   enabled: boolean;
   /** Explicit opt-in to restore the listener and saved relay on app launch. */
   start_on_launch: boolean;
+  /** Exactly one stack is active. Iroh and the AITerm routes never overlap. */
+  network_stack: "aiterm" | "iroh";
   address: string | null;
   port: number | null;
   /** SHA-256 of the listener's SPKI, base64url. The phone pins this. */
@@ -25,6 +27,9 @@ export interface RemoteStatus {
   /** Control origin used for the next phone-authorized relay enrollment. */
   relay_server: string;
   relay?: RelayStatus;
+  iroh_node: string | null;
+  iroh_active: boolean;
+  iroh_relay_url: string | null;
 }
 
 export interface RelayStatus {

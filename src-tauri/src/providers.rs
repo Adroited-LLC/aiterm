@@ -204,7 +204,10 @@ pub fn set_startup_models(
         .find(|p| p.id == id)
         .ok_or("No such provider.")?;
     let mut seen = std::collections::HashSet::new();
-    p.startup_models = models.into_iter().filter(|m| seen.insert(m.clone())).collect();
+    p.startup_models = models
+        .into_iter()
+        .filter(|m| seen.insert(m.clone()))
+        .collect();
     Ok(())
 }
 
@@ -312,7 +315,10 @@ pub fn slug(name: &str) -> String {
 /// about rather than the base.
 pub fn normalise_base(url: &str) -> String {
     let u = url.trim().trim_end_matches('/');
-    u.strip_suffix("/models").unwrap_or(u).trim_end_matches('/').to_string()
+    u.strip_suffix("/models")
+        .unwrap_or(u)
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -500,7 +506,10 @@ fn provider_startup_set_sync(id: String, models: Vec<String>) -> Result<Vec<Prov
 /// One `GET {base}/models` as curl sees it: body, newline, HTTP status.
 fn fetch_models_response(id: &str) -> Result<String, String> {
     let list = load();
-    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    let p = list
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
     if p.api_key.is_empty() {
         return Err("No API key saved for this provider.".into());
     }
@@ -656,7 +665,10 @@ pub fn parse_model_cards(response: &str) -> Result<Vec<ModelCard>, String> {
     let cards: Vec<ModelCard> = items
         .iter()
         .filter_map(|m| {
-            let id = m.get("id").and_then(|i| i.as_str()).or_else(|| m.as_str())?;
+            let id = m
+                .get("id")
+                .and_then(|i| i.as_str())
+                .or_else(|| m.as_str())?;
             Some(ModelCard {
                 id: id.to_string(),
                 name: m.get("name").and_then(|v| v.as_str()).map(String::from),
@@ -778,7 +790,10 @@ pub fn parse_endpoints(
 #[tauri::command(async)]
 pub fn provider_model_endpoints(id: String, model: String) -> Result<Vec<EndpointCard>, String> {
     let list = load();
-    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    let p = list
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
     if !p.is_openrouter() {
         return Err("Provider routing is an OpenRouter feature.".into());
     }
@@ -829,7 +844,11 @@ pub fn parse_directory(response: &str) -> Result<Vec<DirectoryEntry>, String> {
                 datacenters: e
                     .get("datacenters")
                     .and_then(|d| d.as_array())
-                    .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             })
         })
@@ -883,7 +902,10 @@ pub fn resolve_ignore(
 #[tauri::command(async)]
 pub fn provider_directory(id: String) -> Result<Vec<DirectoryEntry>, String> {
     let list = load();
-    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    let p = list
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
     if !p.is_openrouter() {
         return Err("Provider routing is an OpenRouter feature.".into());
     }
@@ -1103,7 +1125,10 @@ fn provider_management_key_set_sync(id: String, key: String) -> Result<Vec<Provi
 #[tauri::command(async)]
 pub fn provider_activity(id: String) -> Result<Vec<ActivityRow>, String> {
     let list = load();
-    let p = list.iter().find(|p| p.id == id).ok_or("No such provider.")?;
+    let p = list
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or("No such provider.")?;
     if !p.is_openrouter() {
         return Err("Activity is an OpenRouter feature.".into());
     }
@@ -1166,7 +1191,9 @@ mod tests {
     fn a_policy_alone_sends_only_the_ignore_list() {
         let mut p = provider("openrouter");
         p.policy.resolved_ignore.insert("baidu".into(), "CN".into());
-        p.policy.resolved_ignore.insert("streamlake".into(), "CN".into());
+        p.policy
+            .resolved_ignore
+            .insert("streamlake".into(), "CN".into());
         assert_eq!(
             routing_block(&p, "z-ai/glm-5.2").unwrap(),
             serde_json::json!({"ignore": ["baidu", "streamlake"]}),
@@ -1179,9 +1206,14 @@ mod tests {
     #[test]
     fn a_pin_means_only_that_host() {
         let mut p = provider("openrouter");
-        p.routes.insert("z-ai/glm-5.2".into(), Route {
-            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
-        });
+        p.routes.insert(
+            "z-ai/glm-5.2".into(),
+            Route {
+                order: vec!["novita".into()],
+                allow_fallbacks: false,
+                ..Default::default()
+            },
+        );
         let b = routing_block(&p, "z-ai/glm-5.2").unwrap();
         assert_eq!(b["order"], serde_json::json!(["novita"]));
         assert_eq!(b["allow_fallbacks"], serde_json::json!(false));
@@ -1205,16 +1237,28 @@ mod tests {
     #[test]
     fn a_models_ceiling_replaces_the_policy_ceiling_rather_than_merging() {
         let mut p = provider("openrouter");
-        p.policy.max_price = MaxPrice { prompt: Some(1.0), completion: Some(2.5) };
-        p.routes.insert("z-ai/glm-5.2".into(), Route {
-            max_price: MaxPrice { prompt: None, completion: Some(1.8) },
-            ..Default::default()
-        });
+        p.policy.max_price = MaxPrice {
+            prompt: Some(1.0),
+            completion: Some(2.5),
+        };
+        p.routes.insert(
+            "z-ai/glm-5.2".into(),
+            Route {
+                max_price: MaxPrice {
+                    prompt: None,
+                    completion: Some(1.8),
+                },
+                ..Default::default()
+            },
+        );
         let b = routing_block(&p, "z-ai/glm-5.2").unwrap();
         assert_eq!(b["max_price"], serde_json::json!({"completion": 1.8}));
         // The other model still gets the account default.
         let b2 = routing_block(&p, "z-ai/glm-5.1").unwrap();
-        assert_eq!(b2["max_price"], serde_json::json!({"prompt": 1.0, "completion": 2.5}));
+        assert_eq!(
+            b2["max_price"],
+            serde_json::json!({"prompt": 1.0, "completion": 2.5})
+        );
     }
 
     /// Routes are keyed by model and stay that way — pinning one model must
@@ -1222,9 +1266,14 @@ mod tests {
     #[test]
     fn a_route_for_another_model_does_not_leak_into_this_one() {
         let mut p = provider("openrouter");
-        p.routes.insert("z-ai/glm-5.1".into(), Route {
-            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
-        });
+        p.routes.insert(
+            "z-ai/glm-5.1".into(),
+            Route {
+                order: vec!["novita".into()],
+                allow_fallbacks: false,
+                ..Default::default()
+            },
+        );
         assert_eq!(routing_block(&p, "z-ai/glm-5.2"), None);
     }
 
@@ -1236,14 +1285,22 @@ mod tests {
     fn opencode_gets_the_routing_block_under_the_models_options() {
         let mut p = provider("openrouter");
         p.policy.resolved_ignore.insert("baidu".into(), "CN".into());
-        p.routes.insert("z-ai/glm-5.2".into(), Route {
-            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
-        });
+        p.routes.insert(
+            "z-ai/glm-5.2".into(),
+            Route {
+                order: vec!["novita".into()],
+                allow_fallbacks: false,
+                ..Default::default()
+            },
+        );
         let text = opencode_config_content(&p, "z-ai/glm-5.2").unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let opts = &v["provider"]["openrouter"]["models"]["z-ai/glm-5.2"]["options"];
         assert_eq!(opts["provider"]["order"], serde_json::json!(["novita"]));
-        assert_eq!(opts["provider"]["allow_fallbacks"], serde_json::json!(false));
+        assert_eq!(
+            opts["provider"]["allow_fallbacks"],
+            serde_json::json!(false)
+        );
         // Verified 2026-08-10: OpenCode passes `options` straight onto the body,
         // and does NOT unwrap `extraBody`. An extraBody key here would be silently
         // ignored by OpenRouter.
@@ -1263,9 +1320,14 @@ mod tests {
     #[test]
     fn a_model_id_with_awkward_characters_stays_valid_json() {
         let mut p = provider("openrouter");
-        p.routes.insert("weird/\"quote\"".into(), Route {
-            order: vec!["novita".into()], allow_fallbacks: false, ..Default::default()
-        });
+        p.routes.insert(
+            "weird/\"quote\"".into(),
+            Route {
+                order: vec!["novita".into()],
+                allow_fallbacks: false,
+                ..Default::default()
+            },
+        );
         let text = opencode_config_content(&p, "weird/\"quote\"").unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).expect("must be valid JSON");
         assert!(v["provider"]["openrouter"]["models"]["weird/\"quote\""].is_object());
@@ -1477,14 +1539,20 @@ mod tests {
     fn a_models_own_ceiling_decides_which_rows_are_over_cap() {
         let mut p = provider("openrouter");
         p.policy.max_price.completion = Some(5.0);
-        p.routes.insert("z-ai/glm-5.2".into(), Route {
-            max_price: MaxPrice { prompt: None, completion: Some(1.6) },
-            ..Default::default()
-        });
+        p.routes.insert(
+            "z-ai/glm-5.2".into(),
+            Route {
+                max_price: MaxPrice {
+                    prompt: None,
+                    completion: Some(1.6),
+                },
+                ..Default::default()
+            },
+        );
         let rows = parse_endpoints(ENDPOINTS, &p, "z-ai/glm-5.2").unwrap();
-        assert_eq!(rows[0].excluded.as_deref(), Some("over cap"));  // $3.15/M
-        assert_eq!(rows[1].excluded, None);                         // $1.58/M
-        assert_eq!(rows[2].excluded, None);                         // $1.584/M... under 1.6
+        assert_eq!(rows[0].excluded.as_deref(), Some("over cap")); // $3.15/M
+        assert_eq!(rows[1].excluded, None); // $1.58/M
+        assert_eq!(rows[2].excluded, None); // $1.584/M... under 1.6
     }
 
     fn directory() -> Vec<DirectoryEntry> {
@@ -1528,7 +1596,10 @@ mod tests {
         assert_eq!(out.get("baidu").map(String::as_str), Some("CN"));
         assert_eq!(out.get("alibaba").map(String::as_str), Some("CN"));
         assert!(!out.contains_key("novita"));
-        assert!(!out.contains_key("mystery"), "unknown is not blocked unless asked");
+        assert!(
+            !out.contains_key("mystery"),
+            "unknown is not blocked unless asked"
+        );
     }
 
     #[test]
@@ -1551,8 +1622,14 @@ mod tests {
             ..Default::default()
         };
         let out = resolve_ignore(&policy, &directory());
-        assert_eq!(out.get("novita").map(String::as_str), Some("blocked by hand"));
-        assert_eq!(out.get("baidu").map(String::as_str), Some("blocked by hand"));
+        assert_eq!(
+            out.get("novita").map(String::as_str),
+            Some("blocked by hand")
+        );
+        assert_eq!(
+            out.get("baidu").map(String::as_str),
+            Some("blocked by hand")
+        );
     }
 
     #[test]
@@ -1657,8 +1734,14 @@ mod tests {
             ..provider("openrouter")
         };
         let shown = format!("{p:?}");
-        assert!(!shown.contains("mgmt-do-not-print-me"), "key leaked: {shown}");
-        assert!(shown.contains("<26 chars>"), "not redacted as a length: {shown}");
+        assert!(
+            !shown.contains("mgmt-do-not-print-me"),
+            "key leaked: {shown}"
+        );
+        assert!(
+            shown.contains("<26 chars>"),
+            "not redacted as a length: {shown}"
+        );
     }
 
     #[test]
@@ -1673,9 +1756,15 @@ mod tests {
 
     #[test]
     fn base_urls_are_normalised() {
-        assert_eq!(normalise_base("https://openrouter.ai/api/v1/"), "https://openrouter.ai/api/v1");
+        assert_eq!(
+            normalise_base("https://openrouter.ai/api/v1/"),
+            "https://openrouter.ai/api/v1"
+        );
         // The endpoint people actually have in front of them when copying.
-        assert_eq!(normalise_base("https://openrouter.ai/api/v1/models"), "https://openrouter.ai/api/v1");
+        assert_eq!(
+            normalise_base("https://openrouter.ai/api/v1/models"),
+            "https://openrouter.ai/api/v1"
+        );
         assert_eq!(normalise_base("  https://x.dev/v1  "), "https://x.dev/v1");
     }
 
@@ -1694,8 +1783,14 @@ mod tests {
         };
         let v = p.view();
         let json = serde_json::to_string(&v).unwrap();
-        assert!(!json.contains("sk-or-v1-abcdefghijklmnop"), "the key reached the frontend");
-        assert!(!json.contains("abcdefghijkl"), "too much of the key reached the frontend");
+        assert!(
+            !json.contains("sk-or-v1-abcdefghijklmnop"),
+            "the key reached the frontend"
+        );
+        assert!(
+            !json.contains("abcdefghijkl"),
+            "too much of the key reached the frontend"
+        );
         assert!(v.has_key);
         assert_eq!(v.key_hint, "mnop");
     }
@@ -1711,8 +1806,14 @@ mod tests {
         };
         let v = p.view();
         let json = serde_json::to_string(&v).unwrap();
-        assert!(!json.contains("sk-or-mgmt-abcdefghijklwxyz"), "the key reached the frontend");
-        assert!(!json.contains("abcdefghijkl"), "too much of the key reached the frontend");
+        assert!(
+            !json.contains("sk-or-mgmt-abcdefghijklwxyz"),
+            "the key reached the frontend"
+        );
+        assert!(
+            !json.contains("abcdefghijkl"),
+            "too much of the key reached the frontend"
+        );
         assert!(v.has_management_key);
         assert_eq!(v.management_key_hint, "wxyz");
         // A provider with no management key says so, rather than looking like
@@ -1765,8 +1866,12 @@ mod tests {
         let bad_key = parse_models("{\"error\":{\"message\":\"no\"}}\n401").unwrap_err();
         assert!(bad_key.contains("rejected"), "got: {bad_key}");
 
-        let server = parse_models("{\"error\":{\"message\":\"upstream is down\"}}\n502").unwrap_err();
-        assert!(server.contains("502") && server.contains("upstream is down"), "got: {server}");
+        let server =
+            parse_models("{\"error\":{\"message\":\"upstream is down\"}}\n502").unwrap_err();
+        assert!(
+            server.contains("502") && server.contains("upstream is down"),
+            "got: {server}"
+        );
 
         let html = parse_models("<html>not json</html>\n200").unwrap_err();
         assert!(html.contains("did not return JSON"), "got: {html}");

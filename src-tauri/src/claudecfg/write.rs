@@ -46,8 +46,8 @@ pub fn save_layer(path: &str, new_text: &str, loaded_text: &str) -> Result<(), S
         return Err(SaveError::Collision);
     }
 
-    let parsed: Value = serde_json::from_str(new_text)
-        .map_err(|e| SaveError::Invalid(e.to_string()))?;
+    let parsed: Value =
+        serde_json::from_str(new_text).map_err(|e| SaveError::Invalid(e.to_string()))?;
     if !parsed.is_object() {
         return Err(SaveError::NotAnObject);
     }
@@ -90,7 +90,10 @@ mod tests {
         let p = scratch("clean");
         std::fs::write(&p, r#"{"model":"opus"}"#).unwrap();
         save_layer(&p, r#"{"model":"sonnet"}"#, r#"{"model":"opus"}"#).unwrap();
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), r#"{"model":"sonnet"}"#);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            r#"{"model":"sonnet"}"#
+        );
     }
 
     #[test]
@@ -98,7 +101,10 @@ mod tests {
         let p = scratch("backup");
         std::fs::write(&p, r#"{"model":"opus"}"#).unwrap();
         save_layer(&p, r#"{"model":"sonnet"}"#, r#"{"model":"opus"}"#).unwrap();
-        assert_eq!(std::fs::read_to_string(backup_path(&p)).unwrap(), r#"{"model":"opus"}"#);
+        assert_eq!(
+            std::fs::read_to_string(backup_path(&p)).unwrap(),
+            r#"{"model":"opus"}"#
+        );
     }
 
     #[test]
@@ -156,7 +162,10 @@ mod tests {
 
     #[test]
     fn the_backup_name_sits_beside_the_file_it_copies() {
-        assert_eq!(backup_path("/h/.claude/settings.json"), "/h/.claude/settings.json.bak-aiterm");
+        assert_eq!(
+            backup_path("/h/.claude/settings.json"),
+            "/h/.claude/settings.json.bak-aiterm"
+        );
     }
 
     #[test]

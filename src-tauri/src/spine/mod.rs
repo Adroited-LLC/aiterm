@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod activity;
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
@@ -56,9 +57,20 @@ pub enum Phase {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Kind {
-    UserMessage { id: String, text: String },
-    AgentText { id: String, text: String, done: bool },
-    AgentThought { id: String, text: String, done: bool },
+    UserMessage {
+        id: String,
+        text: String,
+    },
+    AgentText {
+        id: String,
+        text: String,
+        done: bool,
+    },
+    AgentThought {
+        id: String,
+        text: String,
+        done: bool,
+    },
     ToolCall {
         id: String,
         tool: String,
@@ -73,9 +85,17 @@ pub enum Kind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
-    TurnStarted { turn: String },
-    TurnEnded { turn: String, reason: String },
-    Phase { phase: Phase, detail: String },
+    TurnStarted {
+        turn: String,
+    },
+    TurnEnded {
+        turn: String,
+        reason: String,
+    },
+    Phase {
+        phase: Phase,
+        detail: String,
+    },
     Reset,
 }
 
@@ -151,7 +171,11 @@ mod tests {
             session_id: "s".into(),
             agent: "claude".into(),
             ts: 2,
-            kind: Kind::ToolCallUpdate { id: "t1".into(), status: ToolStatus::Completed, output: None },
+            kind: Kind::ToolCallUpdate {
+                id: "t1".into(),
+                status: ToolStatus::Completed,
+                output: None,
+            },
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["kind"], "tool_call_update");

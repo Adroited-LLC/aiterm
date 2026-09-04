@@ -21,7 +21,10 @@ use std::process::Command;
 /// `/usr/share/applications/<name>.desktop`.
 const DESKTOP_ID: &str = concat!("application://", env!("CARGO_PKG_NAME"), ".desktop");
 
-const OBJECT_PATH: &str = concat!("/com/canonical/unity/launcherentry/", env!("CARGO_PKG_NAME"));
+const OBJECT_PATH: &str = concat!(
+    "/com/canonical/unity/launcherentry/",
+    env!("CARGO_PKG_NAME")
+);
 
 /// The GVariant dictionary Plasma reads. Zero hides the badge rather than
 /// drawing a "0", which would be a worse lie than showing nothing.
@@ -83,7 +86,10 @@ mod tests {
         // Why this can be a shell-out with no quoting worries: the sole
         // substitution is a u32, so no input can reach the argument.
         for n in [1u32, 42, u32::MAX] {
-            assert_eq!(payload(n), format!("{{'count': <int64 {n}>, 'count-visible': <true>}}"));
+            assert_eq!(
+                payload(n),
+                format!("{{'count': <int64 {n}>, 'count-visible': <true>}}")
+            );
         }
     }
 }
