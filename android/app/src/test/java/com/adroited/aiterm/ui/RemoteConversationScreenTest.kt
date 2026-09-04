@@ -93,6 +93,17 @@ class RemoteConversationScreenTest {
     }
 
     @Test
+    fun fileMetadataUsesReadableLabels() {
+        assertEquals("Created", sessionFileChangeLabel("created"))
+        assertEquals("Modified", sessionFileChangeLabel("modified"))
+        assertEquals("Deleted", sessionFileChangeLabel("deleted"))
+        assertEquals("Future state", sessionFileChangeLabel("future_state"))
+        assertEquals("900 B", sessionFileSizeLabel(900))
+        assertEquals("2 KB", sessionFileSizeLabel(2_048))
+        assertEquals("1.5 MB", sessionFileSizeLabel(1_572_864))
+    }
+
+    @Test
     fun dashboardFiltersComposeAndStarsStayFirst() {
         val sessions = listOf(
             session("claude", "Claude", agent = "claude", lastActive = 30),

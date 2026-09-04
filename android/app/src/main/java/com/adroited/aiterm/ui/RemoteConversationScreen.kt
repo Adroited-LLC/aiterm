@@ -52,6 +52,8 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
@@ -65,9 +67,14 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Image as ImageIcon
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
@@ -944,7 +951,18 @@ private fun RemoteConversationContent(
     }
     val latestAttachments by rememberUpdatedState(attachments)
 
-    BackHandler(enabled = !sending && !attachments.preparing, onBack = onBack)
+    BackHandler(enabled = !sending && !attachments.preparing) {
+        when {
+            filePreviewTarget != null -> {
+                filePreviewTarget = null
+                filePreview = null
+                filePreviewError = null
+                showFiles = true
+            }
+            showFiles -> showFiles = false
+            else -> onBack()
+        }
+    }
     DisposableEffect(session.id) {
         onDispose { latestAttachments.items.forEach { it.image.file.delete() } }
     }
@@ -1072,9 +1090,29 @@ private fun RemoteConversationContent(
             TopAppBar(
                 navigationIcon = {
                     IconButton(
-                        onClick = onBack,
+                        onClick = {
+                            when {
+                                filePreviewTarget != null -> {
+                                    filePreviewTarget = null
+                                    filePreview = null
+                                    filePreviewError = null
+                                    showFiles = true
+                                }
+                                showFiles -> showFiles = false
+                                else -> onBack()
+                            }
+                        },
                         enabled = !sending && !attachments.preparing,
-                    ) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to sessions") }
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = when {
+                                filePreviewTarget != null -> "Back to files"
+                                showFiles -> "Back to conversation"
+                                else -> "Back to sessions"
+                            },
+                        )
+                    }
                 },
                 title = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1119,9 +1157,20 @@ private fun RemoteConversationContent(
                 },
                 actions = {
                     IconButton(onClick = {
+                        if (filePreviewTarget != null) {
+                            filePreviewTarget = null
+                            filePreview = null
+                            filePreviewError = null
                             showFiles = true
-                            filesLoading = true
-                            filesError = null
+                            return@IconButton
+                        }
+                        if (showFiles) {
+                            showFiles = false
+                            return@IconButton
+                        }
+                        showFiles = true
+                        filesLoading = true
+                        filesError = null
                             scope.launch {
                                 onLoadFiles(session.id).fold(
                                     onSuccess = { files = it },
@@ -1133,7 +1182,11 @@ private fun RemoteConversationContent(
                         Icon(
                             Icons.Filled.Folder,
                             contentDescription = "Files",
-                            tint = if (showFiles) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            tint = if (showFiles || filePreviewTarget != null) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
                         )
                     }
                     if (webPreviewAvailable) {
@@ -1195,6 +1248,7 @@ private fun RemoteConversationContent(
             )
         },
         bottomBar = {
+            if (!showFiles && filePreviewTarget == null) {
             Column(
                 Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)
                     .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
@@ -1241,10 +1295,52 @@ private fun RemoteConversationContent(
                     )
                 }
             }
+            }
         },
         containerColor = MaterialTheme.colorScheme.background,
     ) { padding ->
         when {
+            filePreviewTarget != null -> SessionFilePreviewPane(
+                target = filePreviewTarget!!,
+                loading = filePreviewLoading,
+                preview = filePreview,
+                error = filePreviewError,
+                modifier = Modifier.fillMaxSize().padding(padding),
+            )
+            showFiles -> SessionFilesPane(
+                loading = filesLoading,
+                files = files,
+                error = filesError,
+                modifier = Modifier.fillMaxSize().padding(padding),
+                onRetry = {
+                    filesLoading = true
+                    filesError = null
+                    scope.launch {
+                        onLoadFiles(session.id).fold(
+                            onSuccess = { files = it },
+                            onFailure = { filesError = it.message ?: "Could not load files." },
+                        )
+                        filesLoading = false
+                    }
+                },
+                onOpen = { target ->
+                    if (target.kind != "deleted") {
+                        filePreviewTarget = target
+                        filePreview = null
+                        filePreviewError = null
+                        filePreviewLoading = true
+                        scope.launch {
+                            onLoadFile(session.id, target.path, 8 * 1024 * 1024).fold(
+                                onSuccess = { filePreview = it },
+                                onFailure = {
+                                    filePreviewError = it.message ?: "Could not read this file."
+                                },
+                            )
+                            filePreviewLoading = false
+                        }
+                    }
+                },
+            )
             state.previewSessionId != session.id && state.previewLoadingSessionId == session.id -> Box(
                 Modifier.fillMaxSize().padding(padding),
                 contentAlignment = Alignment.Center,
@@ -1342,78 +1438,185 @@ private fun RemoteConversationContent(
             onDismiss = { showBringIn = false },
         )
     }
-    if (showFiles) {
-        AlertDialog(
-            onDismissRequest = { showFiles = false },
-            title = { Text("Session files") },
-            text = {
-                when {
-                    filesLoading -> Box(
-                        Modifier.fillMaxWidth().height(120.dp),
-                        contentAlignment = Alignment.Center,
-                    ) { CircularProgressIndicator() }
-                    filesError != null -> Text(filesError!!, color = MaterialTheme.colorScheme.error)
-                    files.isEmpty() -> Text("No files recorded for this session yet.")
-                    else -> LazyColumn(Modifier.fillMaxWidth().heightIn(max = 440.dp)) {
-                        items(files, key = { "${it.path}:${it.at}:${it.kind}" }) { file ->
-                            Column(
-                                Modifier.fillMaxWidth()
-                                    .clickable(enabled = file.kind != "deleted") {
-                                        showFiles = false
-                                        filePreviewTarget = file
-                                        filePreview = null
-                                        filePreviewError = null
-                                        filePreviewLoading = true
-                                        scope.launch {
-                                            onLoadFile(session.id, file.path, 8 * 1024 * 1024).fold(
-                                                onSuccess = { filePreview = it },
-                                                onFailure = {
-                                                    filePreviewError = it.message ?: "Could not read this file."
-                                                },
-                                            )
-                                            filePreviewLoading = false
-                                        }
-                                    }
-                                    .padding(vertical = 7.dp),
-                            ) {
-                                Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(
-                                    "${file.kind} · ${file.bytes} bytes\n${file.path}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                        }
-                    }
+}
+
+@Composable
+private fun SessionFilesPane(
+    loading: Boolean,
+    files: List<RemoteSessionChange>,
+    error: String?,
+    modifier: Modifier = Modifier,
+    onRetry: () -> Unit,
+    onOpen: (RemoteSessionChange) -> Unit,
+) {
+    when {
+        loading && files.isEmpty() -> Box(modifier, contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+        error != null && files.isEmpty() -> Column(
+            modifier.padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text(error, color = MaterialTheme.colorScheme.error)
+            Spacer(Modifier.height(10.dp))
+            TextButton(onClick = onRetry) { Text("Retry") }
+        }
+        files.isEmpty() -> Box(modifier.padding(32.dp), contentAlignment = Alignment.Center) {
+            Text(
+                "Nothing produced yet. Files this session writes will appear here.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        else -> LazyColumn(modifier) {
+            item(key = "files-heading") {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                    Text("Files from this session", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Newest changes first. Tap a file to open it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
-            },
-            confirmButton = { TextButton(onClick = { showFiles = false }) { Text("Done") } },
-        )
+            }
+            items(files, key = { it.path }) { file ->
+                val deleted = file.kind == "deleted"
+                ListItem(
+                    modifier = Modifier.clickable(enabled = !deleted) { onOpen(file) },
+                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                    leadingContent = {
+                        Icon(
+                            imageVector = sessionFileIcon(file),
+                            contentDescription = null,
+                            tint = when {
+                                deleted -> MaterialTheme.colorScheme.error
+                                sessionFileType(file) == "image" -> MaterialTheme.colorScheme.primary
+                                else -> MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    },
+                    headlineContent = {
+                        Text(
+                            file.name,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            color = if (deleted) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.onSurface
+                            },
+                        )
+                    },
+                    supportingContent = {
+                        Text(
+                            buildString {
+                                append(sessionFileChangeLabel(file.kind))
+                                append(" · ")
+                                append(sessionFileSizeLabel(file.bytes))
+                                append(" · ")
+                                append(relativeSessionTime(file.at).lowercase())
+                                append('\n')
+                                append(file.path)
+                            },
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    },
+                )
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f),
+                    modifier = Modifier.padding(start = 56.dp),
+                )
+            }
+            if (error != null) {
+                item(key = "files-stale-error") {
+                    Text(
+                        "Could not refresh: $error",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                }
+            }
+        }
     }
-    filePreviewTarget?.let { target ->
-        AlertDialog(
-            onDismissRequest = {
-                filePreviewTarget = null
-                filePreview = null
-            },
-            title = { Text(target.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            text = {
-                SessionFilePreviewBody(
-                    loading = filePreviewLoading,
-                    preview = filePreview,
-                    error = filePreviewError,
+}
+
+@Composable
+private fun SessionFilePreviewPane(
+    target: RemoteSessionChange,
+    loading: Boolean,
+    preview: RemoteSessionFilePreview?,
+    error: String?,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier) {
+        ListItem(
+            colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            leadingContent = {
+                Icon(
+                    sessionFileIcon(target),
+                    contentDescription = null,
+                    tint = if (sessionFileType(target) == "image") {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                 )
             },
-            confirmButton = {
-                TextButton(onClick = {
-                    filePreviewTarget = null
-                    filePreview = null
-                }) { Text("Done") }
+            headlineContent = {
+                Text(target.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            },
+            supportingContent = {
+                Text(
+                    "${sessionFileSizeLabel(target.bytes)} · ${target.path}",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontFamily = FontFamily.Monospace,
+                )
             },
         )
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        SessionFilePreviewBody(
+            loading = loading,
+            preview = preview,
+            error = error,
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 14.dp, vertical = 10.dp),
+        )
     }
+}
+
+private fun sessionFileType(file: RemoteSessionChange): String = when (
+    file.name.substringAfterLast('.', "").lowercase()
+) {
+    "png", "jpg", "jpeg", "webp", "gif", "svg" -> "image"
+    "kt", "kts", "java", "rs", "go", "py", "js", "jsx", "ts", "tsx", "html", "css", "scss",
+    "json", "toml", "yaml", "yml", "xml", "sh", "zsh", "bash", "sql" -> "code"
+    "txt", "md", "markdown", "log", "csv" -> "text"
+    else -> "file"
+}
+
+private fun sessionFileIcon(file: RemoteSessionChange) = when {
+    file.kind == "deleted" -> Icons.Filled.Delete
+    sessionFileType(file) == "image" -> Icons.Filled.ImageIcon
+    sessionFileType(file) == "code" -> Icons.Filled.Code
+    sessionFileType(file) == "text" -> Icons.Filled.Description
+    else -> Icons.AutoMirrored.Filled.InsertDriveFile
+}
+
+internal fun sessionFileChangeLabel(kind: String): String = when (kind) {
+    "created" -> "Created"
+    "modified" -> "Modified"
+    "deleted" -> "Deleted"
+    else -> kind.replace('_', ' ').replaceFirstChar(Char::uppercase)
+}
+
+internal fun sessionFileSizeLabel(bytes: Long): String = when {
+    bytes < 1_024 -> "$bytes B"
+    bytes < 1_048_576 -> "${bytes / 1_024} KB"
+    else -> "%.1f MB".format(bytes / 1_048_576.0)
 }
 
 @Composable
@@ -1566,17 +1769,23 @@ private fun SessionFilePreviewBody(
     loading: Boolean,
     preview: RemoteSessionFilePreview?,
     error: String?,
+    modifier: Modifier = Modifier,
 ) {
     when {
         loading -> Box(
-            Modifier.fillMaxWidth().height(180.dp),
+            modifier,
             contentAlignment = Alignment.Center,
         ) { CircularProgressIndicator() }
-        error != null -> Text(error, color = MaterialTheme.colorScheme.error)
-        preview == null -> Text("No preview available.")
+        error != null -> Box(modifier, contentAlignment = Alignment.Center) {
+            Text(error, color = MaterialTheme.colorScheme.error)
+        }
+        preview == null -> Box(modifier, contentAlignment = Alignment.Center) {
+            Text("No preview available.")
+        }
         preview.mime.startsWith("image/") && preview.truncated -> Text(
             "This image is larger than the 8 MB phone preview limit (${preview.total} bytes).",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = modifier,
         )
         preview.mime.startsWith("image/") -> {
             val bitmap = remember(preview.data) { decodeBoundedPreviewBitmap(preview.data) }
@@ -1586,25 +1795,28 @@ private fun SessionFilePreviewBody(
                 Image(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = preview.path.substringAfterLast('/'),
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 480.dp),
+                    modifier = modifier,
                     contentScale = ContentScale.Fit,
                 )
             }
         }
         preview.mime.startsWith("text/") -> LazyColumn(
-            Modifier.fillMaxWidth().heightIn(max = 480.dp),
+            modifier,
         ) {
             item {
-                Text(
-                    preview.data.decodeToString() + if (preview.truncated) "\n\n…preview truncated…" else "",
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                SelectionContainer {
+                    Text(
+                        preview.data.decodeToString() + if (preview.truncated) "\n\n…preview truncated…" else "",
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
         }
         else -> Text(
             "No inline preview for ${preview.mime}. The file is ${preview.total} bytes.",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = modifier,
         )
     }
 }
