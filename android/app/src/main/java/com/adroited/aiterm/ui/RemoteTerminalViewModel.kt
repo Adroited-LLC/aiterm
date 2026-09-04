@@ -15,6 +15,7 @@ import com.adroited.aiterm.remote.OkHttpRemoteSocketDialer
 import com.adroited.aiterm.remote.RemoteClient
 import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.remote.RemoteUploadSource
+import com.adroited.aiterm.remote.RemoteUploadException
 import com.adroited.aiterm.remote.TerminalSize
 import com.adroited.aiterm.security.AppLock
 import com.adroited.aiterm.security.DeviceKeys
@@ -194,6 +195,32 @@ class RemoteTerminalViewModel(
             truncated = !eof,
         )
     }
+
+    internal suspend fun parseMarkdown(source: String): Result<com.adroited.aiterm.remote.RemoteMarkdownDocument> =
+        runCatching { client.parseMarkdown(source) }
+
+    internal suspend fun saveMarkdown(
+        sessionId: String,
+        path: String,
+        content: String,
+        expectedSha256: ByteArray,
+    ): Result<ByteArray> = runCatching {
+        val saved = try {
+            client.writeMarkdown(sessionId, path, content, expectedSha256)
+        } catch (error: RemoteUploadException) {
+            if (error.code == "file.changed_on_disk") {
+                throw IllegalStateException("file.changed_on_disk", error)
+            }
+            throw error
+        }
+        check(saved.path == path) { "The desktop saved a different file." }
+        saved.sha256
+    }
+
+    internal suspend fun renderSvg(
+        sessionId: String,
+        path: String,
+    ): Result<ByteArray> = runCatching { client.renderSvg(sessionId, path).data }
 
     /**
      * Sends from the conversation view without introducing a second protocol. Opening the

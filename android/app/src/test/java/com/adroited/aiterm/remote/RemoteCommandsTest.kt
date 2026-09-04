@@ -7,6 +7,7 @@ import kotlinx.serialization.cbor.Cbor
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemoteCommandsTest {
@@ -157,6 +158,53 @@ class RemoteCommandsTest {
         assertEquals(mapOf(session.id to "output"), roster.activity)
     }
 
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun markdownDocumentDecodesRustNativeBlocksAndRejectsUnknownKinds() {
+        val cbor = Cbor { encodeDefaults = false; useDefiniteLengthEncoding = true }
+        val document = RemoteMarkdownDocument(
+            listOf(
+                RemoteMarkdownBlock(
+                    kind = "heading",
+                    level = 2,
+                    spans = listOf(RemoteMarkdownSpan("Native "), RemoteMarkdownSpan("Markdown", bold = true)),
+                ),
+                RemoteMarkdownBlock(
+                    kind = "list_item",
+                    checked = true,
+                    spans = listOf(RemoteMarkdownSpan("done")),
+                ),
+            ),
+        )
+        val decoded = RemoteCommands.markdownDocument(cbor.encodeToByteArray(RemoteMarkdownDocument.serializer(), document))
+        assertEquals(2, decoded.blocks.size)
+        assertTrue(decoded.blocks.first().spans.last().bold)
+        assertEquals(true, decoded.blocks.last().checked)
+
+        val invalid = RemoteMarkdownDocument(listOf(RemoteMarkdownBlock(kind = "script")))
+        assertThrows(RemoteProtocolException::class.java) {
+            RemoteCommands.markdownDocument(cbor.encodeToByteArray(RemoteMarkdownDocument.serializer(), invalid))
+        }
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun renderedSvgAndMarkdownSaveRepliesStayBounded() {
+        val cbor = Cbor { encodeDefaults = true; useDefiniteLengthEncoding = true }
+        val hash = ByteArray(32) { it.toByte() }
+        val saved = RemoteCommands.markdownSaved(
+            cbor.encodeToByteArray(MarkdownSavedWire.serializer(), MarkdownSavedWire("/work/notes.md", hash)),
+        )
+        assertEquals("/work/notes.md", saved.path)
+        assertArrayEquals(hash, saved.sha256)
+
+        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47)
+        val rendered = RemoteCommands.renderedFile(
+            cbor.encodeToByteArray(RenderedFileWire.serializer(), RenderedFileWire("image/png", png)),
+        )
+        assertArrayEquals(png, rendered.data)
+    }
+
     @Serializable
     private data class SessionRosterWire(
         val sessions: List<RemoteSession>,
@@ -170,6 +218,18 @@ class RemoteCommandsTest {
     private data class WebPreviewWire(
         val available: Boolean,
         val path: String?,
+    )
+
+    @Serializable
+    private data class MarkdownSavedWire(
+        val path: String,
+        @kotlinx.serialization.cbor.ByteString val sha256: ByteArray,
+    )
+
+    @Serializable
+    private data class RenderedFileWire(
+        val mime: String,
+        @kotlinx.serialization.cbor.ByteString val data: ByteArray,
     )
 
     private fun hex(value: String): ByteArray =

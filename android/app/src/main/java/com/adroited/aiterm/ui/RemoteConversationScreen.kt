@@ -138,6 +138,7 @@ import com.adroited.aiterm.remote.RemoteClientState
 import com.adroited.aiterm.remote.RemotePreviewMessage
 import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.remote.RemoteSessionChange
+import com.adroited.aiterm.remote.RemoteMarkdownDocument
 import com.adroited.aiterm.remote.RemoteTab
 import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.remote.RemoteUsageSource
@@ -215,6 +216,9 @@ fun RemoteDesktopScreen(
                 onStop = viewModel::stopSession,
                 onLoadFiles = viewModel::sessionChanges,
                 onLoadFile = viewModel::sessionFilePreview,
+                onParseMarkdown = viewModel::parseMarkdown,
+                onSaveMarkdown = viewModel::saveMarkdown,
+                onRenderSvg = viewModel::renderSvg,
                 onProbeWebPreview = viewModel::hasWebPreview,
                 onOpenWebPreview = viewModel::openWebPreview,
                 onShowWebPreview = { url ->
@@ -976,6 +980,9 @@ private fun RemoteConversationContent(
     onStop: (String) -> Unit,
     onLoadFiles: suspend (String) -> Result<List<RemoteSessionChange>>,
     onLoadFile: suspend (String, String, Int) -> Result<RemoteSessionFilePreview>,
+    onParseMarkdown: suspend (String) -> Result<RemoteMarkdownDocument>,
+    onSaveMarkdown: suspend (String, String, String, ByteArray) -> Result<ByteArray>,
+    onRenderSvg: suspend (String, String) -> Result<ByteArray>,
     onProbeWebPreview: suspend (String) -> Result<Boolean>,
     onOpenWebPreview: suspend (String) -> Result<String>,
     onShowWebPreview: (String) -> Unit,
@@ -1188,7 +1195,13 @@ private fun RemoteConversationContent(
         filePreviewError = null
         filePreviewLoading = true
         scope.launch {
-            onLoadFile(session.id, target.path, 8 * 1024 * 1024).fold(
+            val extension = target.name.substringAfterLast('.', "").lowercase()
+            val limit = when (extension) {
+                "md", "markdown", "mdx" -> 512 * 1024
+                "svg" -> 2 * 1024 * 1024
+                else -> 8 * 1024 * 1024
+            }
+            onLoadFile(session.id, target.path, limit).fold(
                 onSuccess = { filePreview = it },
                 onFailure = { filePreviewError = it.message ?: "Could not read this file." },
             )
@@ -1412,10 +1425,14 @@ private fun RemoteConversationContent(
     ) { padding ->
         when {
             filePreviewTarget != null -> SessionFilePreviewPane(
+                sessionId = session.id,
                 target = filePreviewTarget!!,
                 loading = filePreviewLoading,
                 preview = filePreview,
                 error = filePreviewError,
+                onParseMarkdown = onParseMarkdown,
+                onSaveMarkdown = onSaveMarkdown,
+                onRenderSvg = onRenderSvg,
                 modifier = Modifier.fillMaxSize().padding(padding),
             )
             showFiles -> SessionFilesPane(
@@ -1723,10 +1740,14 @@ private fun SessionFilesPane(
 
 @Composable
 private fun SessionFilePreviewPane(
+    sessionId: String,
     target: RemoteSessionChange,
     loading: Boolean,
     preview: RemoteSessionFilePreview?,
     error: String?,
+    onParseMarkdown: suspend (String) -> Result<RemoteMarkdownDocument>,
+    onSaveMarkdown: suspend (String, String, String, ByteArray) -> Result<ByteArray>,
+    onRenderSvg: suspend (String, String) -> Result<ByteArray>,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier) {
@@ -1757,10 +1778,14 @@ private fun SessionFilePreviewPane(
         )
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         RichSessionFilePreviewBody(
+            sessionId = sessionId,
             target = target,
             loading = loading,
             preview = preview,
             error = error,
+            onParseMarkdown = onParseMarkdown,
+            onSaveMarkdown = onSaveMarkdown,
+            onRenderSvg = onRenderSvg,
             modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 14.dp, vertical = 10.dp),
         )
     }

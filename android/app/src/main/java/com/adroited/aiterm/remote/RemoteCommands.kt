@@ -109,6 +109,43 @@ data class RemoteWebPreview(
 )
 
 @Serializable
+data class RemoteMarkdownDocument(val blocks: List<RemoteMarkdownBlock>)
+
+@Serializable
+data class RemoteMarkdownBlock(
+    val kind: String,
+    val level: Int? = null,
+    val language: String? = null,
+    val ordered: Boolean = false,
+    val number: Long? = null,
+    val checked: Boolean? = null,
+    val depth: Int = 0,
+    val spans: List<RemoteMarkdownSpan> = emptyList(),
+    val rows: List<RemoteMarkdownRow> = emptyList(),
+    val align: List<String> = emptyList(),
+)
+
+@Serializable
+data class RemoteMarkdownRow(
+    val header: Boolean,
+    val cells: List<List<RemoteMarkdownSpan>>,
+)
+
+@Serializable
+data class RemoteMarkdownSpan(
+    val text: String,
+    val bold: Boolean = false,
+    val italic: Boolean = false,
+    val strike: Boolean = false,
+    val code: Boolean = false,
+    val href: String? = null,
+    val image: String? = null,
+)
+
+data class RemoteMarkdownSave(val path: String, val sha256: ByteArray)
+data class RemoteRenderedFile(val mime: String, val data: ByteArray)
+
+@Serializable
 data class RemoteModelOption(
     val id: String,
     @SerialName("display_name") val displayName: String,
@@ -159,6 +196,7 @@ object RemoteCommands {
     const val MAX_SUBMISSION_ID_BYTES = 128
     const val MAX_IDENTIFIER_BYTES = 4 * 1_024
     const val MAX_PATH_BYTES = 4 * 1_024
+    const val MAX_MARKDOWN_BYTES = 512 * 1_024
 
     private val cbor = Cbor {
         encodeDefaults = true
@@ -224,6 +262,25 @@ object RemoteCommands {
             count !in 1..MAX_UPLOAD_CHUNK_BYTES
         ) malformed()
         return encode(FileReadRequest.serializer(), FileReadRequest(sessionId, path, offset, count))
+    }
+    fun parseMarkdown(source: String): ByteArray {
+        if (source.encodeToByteArray().size > MAX_MARKDOWN_BYTES) malformed()
+        return encode(MarkdownParseRequest.serializer(), MarkdownParseRequest(source))
+    }
+    fun writeMarkdown(sessionId: String, path: String, content: String, expectedSha256: ByteArray): ByteArray {
+        requireIdentifier(sessionId)
+        if (path.isBlank() || path.encodeToByteArray().size > MAX_PATH_BYTES ||
+            content.encodeToByteArray().size > MAX_MARKDOWN_BYTES || expectedSha256.size != 32
+        ) malformed()
+        return encode(
+            MarkdownWriteRequest.serializer(),
+            MarkdownWriteRequest(sessionId, path, content, expectedSha256.copyOf()),
+        )
+    }
+    fun renderSvg(sessionId: String, path: String, maxEdge: Int = 1_200): ByteArray {
+        requireIdentifier(sessionId)
+        if (path.isBlank() || path.encodeToByteArray().size > MAX_PATH_BYTES || maxEdge !in 1..1_600) malformed()
+        return encode(SvgRenderRequest.serializer(), SvgRenderRequest(sessionId, path, maxEdge))
     }
     fun openSession(sessionId: String, size: TerminalSize): ByteArray =
         encode(SessionOpenPayload.serializer(), SessionOpenPayload(sessionId, size))
@@ -438,6 +495,41 @@ object RemoteCommands {
             RemoteFileChunk(it.path, it.mime, it.offset, it.total, it.eof, it.data.copyOf())
         }
 
+    fun markdownDocument(payload: ByteArray): RemoteMarkdownDocument =
+        decode(RemoteMarkdownDocument.serializer(), payload).also(::validateMarkdownDocument)
+
+    fun markdownSaved(payload: ByteArray): RemoteMarkdownSave =
+        decode(MarkdownWriteReply.serializer(), payload).let {
+            if (it.path.isBlank() || it.path.encodeToByteArray().size > MAX_PATH_BYTES || it.sha256.size != 32) malformed()
+            RemoteMarkdownSave(it.path, it.sha256.copyOf())
+        }
+
+    fun renderedFile(payload: ByteArray): RemoteRenderedFile =
+        decode(RenderedFileReply.serializer(), payload).let {
+            if (it.mime !in setOf("image/png") || it.data.isEmpty() || it.data.size > 900 * 1_024) malformed()
+            RemoteRenderedFile(it.mime, it.data.copyOf())
+        }
+
+    private fun validateMarkdownDocument(document: RemoteMarkdownDocument) {
+        if (document.blocks.size > 4_096) malformed()
+        var spans = 0
+        document.blocks.forEach { block ->
+            if (block.kind !in setOf("paragraph", "heading", "quote", "code", "rule", "list_item", "table") ||
+                block.level?.let { it !in 1..6 } == true || block.depth !in 0..12 ||
+                block.language?.length?.let { it > 128 } == true || block.rows.size > 2_048 ||
+                block.align.any { it !in setOf("left", "center", "right") }
+            ) malformed()
+            val allSpans = block.spans + block.rows.flatMap { it.cells.flatten() }
+            spans += allSpans.size
+            if (spans > 32_768 || allSpans.any {
+                    it.text.encodeToByteArray().size > MAX_MARKDOWN_BYTES ||
+                        it.href?.encodeToByteArray()?.size?.let { size -> size > MAX_PATH_BYTES } == true ||
+                        it.image?.encodeToByteArray()?.size?.let { size -> size > MAX_PATH_BYTES } == true
+                }
+            ) malformed()
+        }
+    }
+
     fun attached(payload: ByteArray): AttachedTerminal = decode(AttachedReply.serializer(), payload).let {
         if (it.tabId.isBlank() || it.attachmentId.isBlank() || it.title.length > 4_096) malformed()
         AttachedTerminal(it.tabId, it.attachmentId, it.hasFocus, it.title)
@@ -631,6 +723,26 @@ object RemoteCommands {
         val offset: Long,
         val total: Long,
         val eof: Boolean,
+        @ByteString val data: ByteArray,
+    )
+    @Serializable private data class MarkdownParseRequest(val source: String)
+    @Serializable private data class MarkdownWriteRequest(
+        @SerialName("session_id") val sessionId: String,
+        val path: String,
+        val content: String,
+        @SerialName("expected_sha256") @ByteString val expectedSha256: ByteArray,
+    )
+    @Serializable private data class MarkdownWriteReply(
+        val path: String,
+        @ByteString val sha256: ByteArray,
+    )
+    @Serializable private data class SvgRenderRequest(
+        @SerialName("session_id") val sessionId: String,
+        val path: String,
+        @SerialName("max_edge") val maxEdge: Int,
+    )
+    @Serializable private data class RenderedFileReply(
+        val mime: String,
         @ByteString val data: ByteArray,
     )
     @Serializable private data class TabListReply(val tabs: List<RemoteTab>)

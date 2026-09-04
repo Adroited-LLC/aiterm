@@ -32,20 +32,23 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,19 +69,28 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import com.adroited.aiterm.remote.RemoteSessionChange
+import com.adroited.aiterm.remote.RemoteMarkdownDocument
 import java.io.File
+import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
 internal fun RichSessionFilePreviewBody(
+    sessionId: String,
     target: RemoteSessionChange,
     loading: Boolean,
     preview: RemoteSessionFilePreview?,
     error: String?,
+    onParseMarkdown: suspend (String) -> Result<RemoteMarkdownDocument>,
+    onSaveMarkdown: suspend (String, String, String, ByteArray) -> Result<ByteArray>,
+    onRenderSvg: suspend (String, String) -> Result<ByteArray>,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val cached = remember(preview) {
         preview?.let {
             val extension = target.name.substringAfterLast('.', "bin").replace(Regex("[^a-zA-Z0-9]"), "")
@@ -90,6 +102,40 @@ internal fun RichSessionFilePreviewBody(
     val mime = preview?.mime?.takeIf { it.isNotBlank() }
         ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(target.name.substringAfterLast('.', ""))
         ?: "application/octet-stream"
+    val extension = target.name.substringAfterLast('.', "").lowercase()
+    val isMarkdown = extension in setOf("md", "markdown", "mdx")
+    val isSvg = extension == "svg" || mime == "image/svg+xml"
+    var editing by remember(target.path) { mutableStateOf(false) }
+    var source by remember(target.path) { mutableStateOf("") }
+    var baseHash by remember(target.path) { mutableStateOf(ByteArray(0)) }
+    var markdown by remember(target.path) { mutableStateOf<RemoteMarkdownDocument?>(null) }
+    var markdownError by remember(target.path) { mutableStateOf<String?>(null) }
+    var saving by remember(target.path) { mutableStateOf(false) }
+    var renderedSvg by remember(target.path) { mutableStateOf<ByteArray?>(null) }
+    var svgError by remember(target.path) { mutableStateOf<String?>(null) }
+    val sourceHash = remember(source) { MessageDigest.getInstance("SHA-256").digest(source.encodeToByteArray()) }
+    val dirty = baseHash.size == 32 && !sourceHash.contentEquals(baseHash)
+
+    LaunchedEffect(preview, isMarkdown) {
+        if (!isMarkdown || preview == null || preview.truncated) return@LaunchedEffect
+        source = preview.data.toString(Charsets.UTF_8)
+        baseHash = MessageDigest.getInstance("SHA-256").digest(preview.data)
+    }
+    LaunchedEffect(source, isMarkdown) {
+        if (!isMarkdown || preview == null || preview.truncated) return@LaunchedEffect
+        delay(180)
+        onParseMarkdown(source).fold(
+            onSuccess = { markdown = it; markdownError = null },
+            onFailure = { markdownError = it.message ?: "Could not render Markdown." },
+        )
+    }
+    LaunchedEffect(preview, isSvg) {
+        if (!isSvg || preview == null || preview.truncated) return@LaunchedEffect
+        onRenderSvg(sessionId, target.path).fold(
+            onSuccess = { renderedSvg = it; svgError = null },
+            onFailure = { svgError = it.message ?: "Could not render SVG." },
+        )
+    }
 
     fun uri() = cached?.let { FileProvider.getUriForFile(context, "${context.packageName}.terminal-images", it) }
     fun open() = uri()?.let {
@@ -108,10 +154,31 @@ internal fun RichSessionFilePreviewBody(
 
     Column(modifier) {
         if (preview != null && cached != null && !preview.truncated) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                if (isMarkdown) {
+                    TextButton(onClick = { editing = false }, enabled = editing) { Text("Preview") }
+                    TextButton(onClick = { editing = true }, enabled = !editing) { Text("Edit") }
+                    TextButton(
+                        enabled = dirty && !saving && source.encodeToByteArray().size <= 512 * 1024,
+                        onClick = {
+                            saving = true
+                            markdownError = null
+                            scope.launch {
+                                onSaveMarkdown(sessionId, target.path, source, baseHash).fold(
+                                    onSuccess = { baseHash = it; editing = false },
+                                    onFailure = { markdownError = when {
+                                        it.message?.contains("changed_on_disk") == true -> "The agent changed this file. Reopen it before saving your version."
+                                        else -> it.message ?: "Could not save Markdown."
+                                    } },
+                                )
+                                saving = false
+                            }
+                        },
+                    ) { Text(if (saving) "Saving…" else if (dirty) "Save ●" else "Saved") }
+                }
                 IconButton(onClick = ::copy) { Icon(Icons.Filled.ContentCopy, "Copy file") }
                 IconButton(onClick = ::share) { Icon(Icons.Filled.Share, "Share") }
-                IconButton(onClick = ::open) { Icon(Icons.Filled.OpenInNew, "Open with") }
+                IconButton(onClick = ::open) { Icon(Icons.AutoMirrored.Filled.OpenInNew, "Open with") }
             }
         }
         Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
@@ -119,7 +186,31 @@ internal fun RichSessionFilePreviewBody(
                 loading -> CircularProgressIndicator()
                 error != null -> Text(error, color = MaterialTheme.colorScheme.error)
                 preview == null -> Text("No preview available", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                preview.truncated -> Text("This file is larger than the 8 MB phone preview limit. Open it from the desktop for the complete file.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                preview.truncated -> Text(
+                    when {
+                        isMarkdown -> "This Markdown file is larger than the 512 KB safe editing limit. Open it from the desktop for the complete file."
+                        isSvg -> "This SVG is larger than the 2 MB safe rendering limit. Open it from the desktop for the complete file."
+                        else -> "This file is larger than the 8 MB phone preview limit. Open it from the desktop for the complete file."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                isMarkdown && editing -> OutlinedTextField(
+                    value = source,
+                    onValueChange = { source = it },
+                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    modifier = Modifier.fillMaxSize(),
+                    label = { Text("Markdown source") },
+                    supportingText = markdownError?.let { message -> { Text(message, color = MaterialTheme.colorScheme.error) } },
+                )
+                isMarkdown && markdown != null -> NativeMarkdownDocument(
+                    document = markdown!!,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                isMarkdown && markdownError != null -> Text(markdownError!!, color = MaterialTheme.colorScheme.error)
+                isMarkdown -> CircularProgressIndicator()
+                isSvg && renderedSvg != null -> ZoomableImage(renderedSvg!!, target.name)
+                isSvg && svgError != null -> Text(svgError!!, color = MaterialTheme.colorScheme.error)
+                isSvg -> CircularProgressIndicator()
                 mime.startsWith("image/") -> ZoomableImage(preview.data, target.name)
                 mime == "application/pdf" || target.name.endsWith(".pdf", true) -> PdfPreview(cached!!)
                 mime.startsWith("video/") || mime.startsWith("audio/") -> MediaPreview(cached!!)

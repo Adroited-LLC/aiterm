@@ -827,6 +827,27 @@ class RemoteClient(
         requestResource("file.read", RemoteCommands.fileRead(sessionId, path, offset, count)),
     )
 
+    suspend fun parseMarkdown(source: String): RemoteMarkdownDocument = RemoteCommands.markdownDocument(
+        requestResource("markdown.parse", RemoteCommands.parseMarkdown(source)),
+    )
+
+    suspend fun writeMarkdown(
+        sessionId: String,
+        path: String,
+        content: String,
+        expectedSha256: ByteArray,
+    ): RemoteMarkdownSave = RemoteCommands.markdownSaved(
+        requestResource(
+            "file.write_markdown",
+            RemoteCommands.writeMarkdown(sessionId, path, content, expectedSha256),
+        ),
+    )
+
+    suspend fun renderSvg(sessionId: String, path: String, maxEdge: Int = 1_200): RemoteRenderedFile =
+        RemoteCommands.renderedFile(
+            requestResource("file.render_svg", RemoteCommands.renderSvg(sessionId, path, maxEdge)),
+        )
+
     fun closeSession(sessionId: String) {
         val tabId = synchronized(lifecycleLock) {
             mutableState.value.tabs.singleOrNull { it.sessionId == sessionId }?.id

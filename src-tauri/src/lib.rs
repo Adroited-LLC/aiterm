@@ -15,6 +15,7 @@ pub mod indexer;
 pub mod iroh_tunnel;
 pub mod launch;
 pub mod librarian;
+pub mod markdown;
 pub mod mcp;
 pub mod notify;
 pub mod opencode;
@@ -27,6 +28,7 @@ pub mod rendercost;
 pub mod services;
 pub mod sessions;
 pub mod spine;
+pub mod svg;
 pub mod tabs;
 pub mod taskbar;
 pub mod terminal;
@@ -91,6 +93,7 @@ pub fn run() {
             detail::session_transcript_path,
             changes::session_changes,
             changes::read_file_base64,
+            markdown::render_markdown,
             agents::detect_agents,
             agents::agent_caps,
             rendercost::renderer_probe,
