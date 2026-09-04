@@ -3,6 +3,7 @@ package com.adroited.aiterm.ui
 import com.adroited.aiterm.remote.RemotePreviewMessage
 import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.remote.RemoteTab
+import com.adroited.aiterm.remote.SpinePhase
 import com.adroited.aiterm.remote.TerminalSize
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -47,6 +48,48 @@ class RemoteConversationScreenTest {
     fun liveStateComesOnlyFromARealTabForThatSession() {
         assertTrue(isConversationSessionLive(session("live", "Live"), listOf(liveTab)))
         assertFalse(isConversationSessionLive(session("other", "Other"), listOf(liveTab)))
+    }
+
+    @Test
+    fun dashboardLiveCountIgnoresShellAndOrphanTabs() {
+        val shell = RemoteTab(
+            id = "shell",
+            title = "Shell",
+            sessionId = null,
+            size = TerminalSize(80, 24),
+        )
+        val orphan = RemoteTab(
+            id = "orphan",
+            title = "Old session",
+            sessionId = "missing",
+            size = TerminalSize(80, 24),
+        )
+
+        assertEquals(
+            1,
+            liveConversationCount(
+                sessions = listOf(session("live", "Live"), session("other", "Other")),
+                tabs = listOf(liveTab, shell, orphan),
+            ),
+        )
+    }
+
+    @Test
+    fun nativeSpineIdleOutranksStaleRosterActivity() {
+        assertFalse(isConversationWorking(SpinePhase.Idle, spineLive = true, turnOpen = false, rosterActivity = "output"))
+        assertTrue(isConversationWorking(SpinePhase.Working, spineLive = true, turnOpen = true, rosterActivity = "idle"))
+        assertFalse(isConversationWorking(SpinePhase.NeedsYou, spineLive = true, turnOpen = true, rosterActivity = "output"))
+    }
+
+    @Test
+    fun completedNativeTurnOutranksAStaleWorkingPhase() {
+        assertFalse(isConversationWorking(SpinePhase.Working, spineLive = true, turnOpen = false, rosterActivity = "output"))
+    }
+
+    @Test
+    fun legacyConversationStillFallsBackToRosterActivity() {
+        assertTrue(isConversationWorking(SpinePhase.Idle, spineLive = false, turnOpen = null, rosterActivity = "output"))
+        assertFalse(isConversationWorking(SpinePhase.Idle, spineLive = false, turnOpen = null, rosterActivity = "idle"))
     }
 
     @Test

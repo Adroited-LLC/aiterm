@@ -125,6 +125,7 @@ internal class SpineConversationStore {
     var phaseDetail: String = ""; private set
     var phaseSeen: Boolean = false; private set
     var currentTurn: String? = null; private set
+    var turnOpen: Boolean? = null; private set
 
     val items: List<Item>
         get() {
@@ -141,7 +142,7 @@ internal class SpineConversationStore {
         rows.clear(); rowIndex.clear(); dirty = true
         epoch = 0L; lastSeq = 0L; live = true
         phase = SpinePhase.Idle; phaseDetail = ""; phaseSeen = false
-        currentTurn = null
+        currentTurn = null; turnOpen = null
     }
 
     fun tool(id: String): Item.Tool? = rowIndex[id]?.let { rows[it] as? Item.Tool }
@@ -178,6 +179,8 @@ internal class SpineConversationStore {
     /** Maps an older desktop transcript onto the same typed rows. */
     fun legacy(messages: List<RemotePreviewMessage>) {
         rows.clear(); rowIndex.clear(); dirty = true; live = false
+        phase = SpinePhase.Idle; phaseDetail = ""; phaseSeen = false
+        currentTurn = null; turnOpen = null
         messages.forEachIndexed { index, message ->
             val id = "legacy-$index"
             val timestamp = message.at?.toLongOrNull() ?: 0L
@@ -222,10 +225,18 @@ internal class SpineConversationStore {
                 val current = tool(kind.id) ?: return
                 upsert(current.copy(status = kind.status, output = kind.output ?: current.output))
             }
-            is SpineKind.TurnStarted -> currentTurn = kind.turn
-            is SpineKind.TurnEnded -> { currentTurn = null; upsert(Item.TurnEnd(kind.turn, kind.reason)) }
+            is SpineKind.TurnStarted -> { currentTurn = kind.turn; turnOpen = true }
+            is SpineKind.TurnEnded -> {
+                currentTurn = null
+                turnOpen = false
+                upsert(Item.TurnEnd(kind.turn, kind.reason))
+            }
             is SpineKind.PhaseChanged -> { phase = kind.phase; phaseDetail = kind.detail; phaseSeen = true }
-            SpineKind.Reset -> { rows.clear(); rowIndex.clear(); dirty = true; currentTurn = null }
+            SpineKind.Reset -> {
+                rows.clear(); rowIndex.clear(); dirty = true
+                phase = SpinePhase.Idle; phaseDetail = ""; phaseSeen = false
+                currentTurn = null; turnOpen = null
+            }
         }
     }
 

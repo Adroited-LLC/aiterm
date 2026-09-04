@@ -29,6 +29,7 @@ class SpineConversationTest {
         assertEquals(ToolCategory.Other, (store.items[3] as Item.Tool).category)
         assertEquals(ToolStatus.Pending, (store.items[3] as Item.Tool).status)
         assertEquals("turn-1", store.currentTurn)
+        assertEquals(true, store.turnOpen)
         assertEquals(SpinePhase.NeedsYou, store.phase)
         assertEquals("approve Edit", store.phaseDetail)
         assertTrue(store.phaseSeen)
@@ -107,6 +108,7 @@ class SpineConversationTest {
         assertEquals(listOf("a1"), store.items.map(Item::key))
         assertEquals(4, store.lastSeq)
         assertNull(store.currentTurn)
+        assertNull(store.turnOpen)
     }
 
     @Test
@@ -132,6 +134,7 @@ class SpineConversationTest {
             ),
         )
         assertNull(store.currentTurn)
+        assertEquals(false, store.turnOpen)
         assertEquals(SpinePhase.Idle, store.phase)
         assertEquals(Item.TurnEnd("turn-1", "completed"), store.items.last())
     }
@@ -177,6 +180,7 @@ class SpineConversationTest {
         assertTrue(store.live)
         assertFalse(store.phaseSeen)
         assertSame(SpinePhase.Idle, store.phase)
+        assertNull(store.turnOpen)
     }
 
     private fun userEvent(seq: Long, epoch: Long, text: String) = SpineEvent(

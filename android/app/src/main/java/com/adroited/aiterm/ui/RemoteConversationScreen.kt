@@ -43,6 +43,8 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
@@ -54,6 +56,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -61,7 +64,17 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -100,6 +113,7 @@ import com.adroited.aiterm.remote.RemoteTab
 import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.remote.RemoteUsageSource
 import com.adroited.aiterm.remote.SpinePhase
+import com.adroited.aiterm.ui.theme.AgentIcon
 import java.io.File
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.delay
@@ -167,6 +181,9 @@ fun RemoteDesktopScreen(
                 onRefresh = { viewModel.previewSession(selected.id) },
                 onSend = viewModel::sendConversationPrompt,
                 onBringIn = viewModel.client::bringInSession,
+                onStar = viewModel.client::starSession,
+                onOpen = { viewModel.openSession(it, 80, 24) },
+                onStop = viewModel::stopSession,
                 onLoadFiles = viewModel::sessionChanges,
                 onLoadFile = viewModel::sessionFilePreview,
                 onProbeWebPreview = viewModel::hasWebPreview,
@@ -354,13 +371,33 @@ private fun RemoteSessionDashboard(
                             onClick = { drawerScope.launch { drawerState.open() } },
                             modifier = Modifier.semantics { contentDescription = "Open menu" },
                         ) {
-                            Text("☰", style = MaterialTheme.typography.titleLarge)
+                            Icon(Icons.Filled.Menu, contentDescription = "Open menu")
                         }
                     },
                     title = {
-                        Column {
-                            Text(desktop.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            ConnectionLabel(state.connection, state.connectedEndpoint?.path)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            ConnectionDot(state.connection)
+                            Spacer(Modifier.width(10.dp))
+                            Column {
+                                Text(desktop.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                ConnectionLabel(state.connection, state.connectedEndpoint?.path)
+                            }
+                        }
+                    },
+                    actions = {
+                        IconButton(
+                            onClick = onOpenTerminal,
+                            enabled = state.connection == ConnectionState.Connected,
+                        ) {
+                            Icon(
+                                Icons.Filled.Terminal,
+                                contentDescription = "Open terminal",
+                                tint = if (state.connection == ConnectionState.Connected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
@@ -373,9 +410,22 @@ private fun RemoteSessionDashboard(
                 value = query,
                 onValueChange = { query = it },
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                placeholder = { Text("Search sessions") },
+                placeholder = { Text("Search sessions…") },
+                leadingIcon = {
+                    Icon(
+                        Icons.Filled.Search,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
                 singleLine = true,
-                shape = RoundedCornerShape(14.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                ),
             )
             LazyRow(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
@@ -387,6 +437,7 @@ private fun RemoteSessionDashboard(
                         selected = agentFilter == agent,
                         onClick = { agentFilter = agent.takeUnless { it == agentFilter } },
                         label = { Text(agent.replaceFirstChar(Char::uppercase), maxLines = 1) },
+                        leadingIcon = { AgentIcon(agent, size = 16.dp) },
                     )
                 }
                 item(key = "files") {
@@ -411,7 +462,7 @@ private fun RemoteSessionDashboard(
                 Text("SESSIONS", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.weight(1f))
                 Text(
-                    "${state.tabs.count { it.sessionId != null }} live · ${state.sessions.size} total",
+                    "${liveConversationCount(state.sessions, state.tabs)} live · ${state.sessions.size} total",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -495,7 +546,9 @@ private fun RemoteAppDrawer(
                     )
                     ConnectionLabel(state.connection, state.connectedEndpoint?.path)
                 }
-                TextButton(onClick = onClose) { Text("Close") }
+                IconButton(onClick = onClose) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close menu")
+                }
             }
 
             if (pairedDesktops.size > 1) {
@@ -537,6 +590,21 @@ private fun ConnectionDot(connection: ConnectionState) {
         ConnectionState.Disconnected -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     Box(Modifier.size(10.dp).background(color, CircleShape))
+}
+
+/** John’s compact operational badge: state stays beside identity instead of
+ * competing with the conversation as a full-width banner. */
+@Composable
+private fun SessionStateChip(label: String, color: Color) {
+    Row(
+        modifier = Modifier.background(color.copy(alpha = 0.14f), RoundedCornerShape(50))
+            .padding(horizontal = 7.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(6.dp).background(color, CircleShape))
+        Spacer(Modifier.width(5.dp))
+        Text(label, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1)
+    }
 }
 
 @Composable
@@ -696,17 +764,7 @@ private fun SessionDashboardRow(
             Text("↳", color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.width(6.dp))
         }
-        Box(
-            Modifier.size(if (satellite) 30.dp else 38.dp)
-                .background(agentColor(session.agent).copy(alpha = 0.16f), CircleShape),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                session.agent.take(1).uppercase(),
-                color = agentColor(session.agent),
-                fontWeight = FontWeight.Bold,
-            )
-        }
+        AgentIcon(session.agent, size = if (satellite) 30.dp else 38.dp)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -834,6 +892,9 @@ private fun RemoteConversationContent(
         (RemoteUploadProgress) -> Unit,
     ) -> Result<Unit>,
     onBringIn: (String, String, String?, String?, String, Int, Boolean) -> Unit,
+    onStar: (String, Boolean) -> Unit,
+    onOpen: (String) -> Unit,
+    onStop: (String) -> Unit,
     onLoadFiles: suspend (String) -> Result<List<RemoteSessionChange>>,
     onLoadFile: suspend (String, String, Int) -> Result<RemoteSessionFilePreview>,
     onProbeWebPreview: suspend (String) -> Result<Boolean>,
@@ -847,6 +908,7 @@ private fun RemoteConversationContent(
     var showImageSources by remember(session.id) { mutableStateOf(false) }
     var showFiles by remember(session.id) { mutableStateOf(false) }
     var showBringIn by remember(session.id) { mutableStateOf(false) }
+    var showActions by remember(session.id) { mutableStateOf(false) }
     var filesLoading by remember(session.id) { mutableStateOf(false) }
     var files by remember(session.id) { mutableStateOf<List<RemoteSessionChange>>(emptyList()) }
     var filesError by remember(session.id) { mutableStateOf<String?>(null) }
@@ -862,11 +924,15 @@ private fun RemoteConversationContent(
     val previewItems = if (state.previewSessionId == session.id) state.previewItems else emptyList()
     val timeline = remember(previewItems) { spineTimeline(previewItems) }
     val listState = rememberLazyListState()
-    val working = when (state.previewPhase) {
-        SpinePhase.Working -> true
-        SpinePhase.NeedsYou -> false
-        SpinePhase.Idle -> state.sessionActivity[session.id] == "output"
-    }
+    val working = isConversationWorking(
+        phase = state.previewPhase,
+        spineLive = state.previewLive,
+        turnOpen = state.previewTurnOpen,
+        rosterActivity = state.sessionActivity[session.id],
+    )
+    val live = isConversationSessionLive(session, state.tabs)
+    val needsYou = state.previewPhase == SpinePhase.NeedsYou
+    val starred = session.id in state.starredSessions
     val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
     var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
     val awayFromNewest by remember(session.id) {
@@ -1005,34 +1071,71 @@ private fun RemoteConversationContent(
         topBar = {
             TopAppBar(
                 navigationIcon = {
-                    TextButton(
+                    IconButton(
                         onClick = onBack,
                         enabled = !sending && !attachments.preparing,
-                    ) { Text("Sessions") }
+                    ) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to sessions") }
                 },
                 title = {
-                    Column {
-                        Text(session.title.ifBlank { "Untitled session" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(
-                            "${session.agent} · ${if (isConversationSessionLive(session, state.tabs)) "live" else "history"}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        AgentIcon(session.agent, size = 26.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                session.title.ifBlank { "Untitled session" },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    session.groupPath.trimEnd('/').substringAfterLast('/').ifBlank {
+                                        session.projectPath.trimEnd('/').substringAfterLast('/')
+                                    },
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.widthIn(max = 120.dp),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                SessionStateChip(
+                                    label = when {
+                                        needsYou -> "needs you"
+                                        working -> "working"
+                                        live -> "on desktop"
+                                        else -> "history"
+                                    },
+                                    color = when {
+                                        needsYou -> MaterialTheme.colorScheme.error
+                                        working -> Color(0xFFF6C453)
+                                        live -> MaterialTheme.colorScheme.tertiary
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                )
+                            }
+                        }
                     }
                 },
                 actions = {
-                    TextButton(onClick = {
-                        showFiles = true
-                        filesLoading = true
-                        filesError = null
-                        scope.launch {
-                            onLoadFiles(session.id).fold(
-                                onSuccess = { files = it },
-                                onFailure = { filesError = it.message ?: "Could not load files." },
-                            )
-                            filesLoading = false
-                        }
-                    }) { Text("Files") }
+                    IconButton(onClick = {
+                            showFiles = true
+                            filesLoading = true
+                            filesError = null
+                            scope.launch {
+                                onLoadFiles(session.id).fold(
+                                    onSuccess = { files = it },
+                                    onFailure = { filesError = it.message ?: "Could not load files." },
+                                )
+                                filesLoading = false
+                            }
+                        }) {
+                        Icon(
+                            Icons.Filled.Folder,
+                            contentDescription = "Files",
+                            tint = if (showFiles) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     if (webPreviewAvailable) {
                         IconButton(
                             onClick = {
@@ -1057,7 +1160,36 @@ private fun RemoteConversationContent(
                             }
                         }
                     }
-                    TextButton(onClick = { showBringIn = true }) { Text("Bring in") }
+                    IconButton(onClick = { showActions = true }) {
+                        Icon(Icons.Filled.MoreVert, contentDescription = "Session actions")
+                    }
+                    DropdownMenu(expanded = showActions, onDismissRequest = { showActions = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Bring in a second agent") },
+                            onClick = { showActions = false; showBringIn = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (starred) "Unstar" else "Star — keep on top") },
+                            onClick = { showActions = false; onStar(session.id, !starred) },
+                        )
+                        if (!live) {
+                            DropdownMenuItem(
+                                text = { Text("Open on desktop") },
+                                leadingIcon = { Icon(Icons.Filled.PlayArrow, contentDescription = null) },
+                                onClick = { showActions = false; onOpen(session.id) },
+                            )
+                        } else {
+                            DropdownMenuItem(
+                                text = { Text("Stop session") },
+                                leadingIcon = { Icon(Icons.Filled.Stop, contentDescription = null) },
+                                onClick = { showActions = false; onStop(session.id) },
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text("Refresh") },
+                            onClick = { showActions = false; onRefresh() },
+                        )
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
             )
@@ -1080,11 +1212,17 @@ private fun RemoteConversationContent(
                     },
                 )
                 Row(verticalAlignment = Alignment.Bottom) {
-                    TextButton(
+                    IconButton(
                         onClick = { showImageSources = true },
                         enabled = !sending && !attachments.preparing &&
                             attachments.items.size < TerminalAttachmentDraft.MAX_IMAGES,
-                    ) { Text("＋") }
+                    ) {
+                        Icon(
+                            Icons.Filled.Add,
+                            contentDescription = "Attach an image",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     OutlinedTextField(
                         value = draft,
                         onValueChange = { draft = it },
@@ -1758,6 +1896,33 @@ private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aite
 
 internal fun isConversationSessionLive(session: RemoteSession, tabs: List<RemoteTab>): Boolean =
     tabs.any { it.sessionId == session.id }
+
+/** Shell tabs are useful in the raw terminal, but are not conversation rows. */
+internal fun liveConversationCount(sessions: List<RemoteSession>, tabs: List<RemoteTab>): Int =
+    sessions.count { isConversationSessionLive(it, tabs) }
+
+/**
+ * A native spine reads the agent's own turn boundaries and therefore owns
+ * the verdict. The roster is a coarse terminal-cadence fallback for older
+ * desktops; allowing it to override a native Idle makes a completed turn
+ * keep spinning whenever the two refreshes race.
+ */
+internal fun isConversationWorking(
+    phase: SpinePhase,
+    spineLive: Boolean,
+    turnOpen: Boolean?,
+    rosterActivity: String?,
+): Boolean {
+    // A completed native turn is stronger evidence than the last phase
+    // packet. It also makes the UI robust if an idle phase is delayed or
+    // lost while the conversation is paging through a large history.
+    if (spineLive && turnOpen == false) return false
+    return when (phase) {
+        SpinePhase.Working -> true
+        SpinePhase.NeedsYou -> false
+        SpinePhase.Idle -> !spineLive && rosterActivity == "output"
+    }
+}
 
 internal fun conversationSessions(
     sessions: List<RemoteSession>,
