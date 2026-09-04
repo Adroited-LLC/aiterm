@@ -5,6 +5,9 @@ import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.remote.RemoteTab
 import com.adroited.aiterm.remote.SpinePhase
 import com.adroited.aiterm.remote.TerminalSize
+import com.adroited.aiterm.remote.Item
+import com.adroited.aiterm.remote.ToolCategory
+import com.adroited.aiterm.remote.ToolStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -211,6 +214,14 @@ class RemoteConversationScreenTest {
             timeline[1],
         )
         assertEquals(ConversationTimelineItem.Turn(assistant), timeline[2])
+    }
+
+    @Test
+    fun foldedToolGroupNamesTheLatestRunInsteadOfHidingItAsActivity() {
+        val read = Item.Tool("read", "view_image", "screenshot.jpg", ToolCategory.Read, "", ToolStatus.Completed, null, 1)
+        val run = Item.Tool("run", "exec_command", "./gradlew :app:testDebugUnitTest", ToolCategory.Execute, "", ToolStatus.Completed, null, 2)
+
+        assertEquals("Ran ./gradlew :app:testDebugUnitTest", toolGroupHeadline(listOf(read, run)))
     }
 
     @Test

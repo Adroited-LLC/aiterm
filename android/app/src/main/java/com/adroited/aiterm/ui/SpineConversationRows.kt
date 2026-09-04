@@ -209,17 +209,19 @@ private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
             Icon(Icons.Filled.Build, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
             Spacer(Modifier.width(7.dp))
             Text(
-                "Activity",
+                toolGroupHeadline(tools),
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
                 style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
             )
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(7.dp))
             Text(
                 if (active > 0) "${tools.size} steps · $active running" else "${tools.size} steps",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall,
-                modifier = Modifier.weight(1f),
             )
             Text(
                 if (expanded) "⌃" else "⌄",
@@ -236,6 +238,25 @@ private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
             }
         }
     }
+}
+
+/** A folded group must still say what happened; otherwise valid tool events look absent. */
+internal fun toolGroupHeadline(tools: List<Item.Tool>): String {
+    val latest = tools.lastOrNull() ?: return "Activity"
+    val verb = when (latest.category) {
+        ToolCategory.Execute -> "Ran"
+        ToolCategory.Edit -> "Edited"
+        ToolCategory.Read -> "Read"
+        ToolCategory.Search -> "Searched"
+        ToolCategory.Fetch -> "Fetched"
+        ToolCategory.Think -> "Reasoned"
+        ToolCategory.Other -> "Used"
+    }
+    val raw = latest.title.ifBlank { latest.tool.ifBlank { "tool" } }
+        .lineSequence().firstOrNull().orEmpty().trim().replace(Regex("\\s+"), " ")
+    val detail = if (raw.startsWith("$verb ", ignoreCase = true)) raw.substring(verb.length + 1) else raw
+    val clipped = if (detail.length > 72) detail.take(71).trimEnd() + "…" else detail
+    return "$verb $clipped"
 }
 
 @OptIn(ExperimentalFoundationApi::class)

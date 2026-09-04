@@ -74,11 +74,12 @@ class RemoteCommandsTest {
         val current = RemoteCommands.spinePage(
             cbor.encodeToByteArray(
                 SpineSnapshotWire.serializer(),
-                SpineSnapshotWire(3, true, false, 4, 7, listOf(event)),
+                SpineSnapshotWire(3, true, false, 4, 7, turnOpen = false, events = listOf(event)),
             ),
         )
         assertEquals(4, current.oldestSeq)
         assertEquals(7, current.latestSeq)
+        assertEquals(false, current.turnOpen)
 
         val legacy = RemoteCommands.spinePage(
             cbor.encodeToByteArray(
@@ -88,6 +89,7 @@ class RemoteCommandsTest {
         )
         assertEquals(0, legacy.oldestSeq)
         assertEquals(0, legacy.latestSeq)
+        assertEquals(null, legacy.turnOpen)
     }
 
     @OptIn(ExperimentalSerializationApi::class)

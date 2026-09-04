@@ -406,6 +406,7 @@ object RemoteCommands {
                 page.hasMore,
                 page.oldestSeq,
                 page.latestSeq,
+                page.turnOpen,
                 page.events,
             )
         }

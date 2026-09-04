@@ -34,6 +34,7 @@ internal data class SpineSnapshotWire(
     @SerialName("has_more") val hasMore: Boolean,
     @SerialName("oldest_seq") val oldestSeq: Long = 0L,
     @SerialName("latest_seq") val latestSeq: Long = 0L,
+    @SerialName("turn_open") val turnOpen: Boolean? = null,
     val events: List<SpineEventWire>,
 )
 
@@ -43,6 +44,7 @@ internal data class SpineConversationPage(
     val hasMore: Boolean,
     val oldestSeq: Long = 0L,
     val latestSeq: Long = 0L,
+    val turnOpen: Boolean? = null,
     val events: List<SpineEventWire>,
 )
 
@@ -159,6 +161,12 @@ internal class SpineConversationStore {
             }
             parse(wire)?.let(::applyEvent)
             lastSeq = wire.seq
+        }
+        // The current gate is returned atomically with the ring bounds. A
+        // long turn may evict a boundary event, but cannot evict this state.
+        page.turnOpen?.let { authoritative ->
+            turnOpen = authoritative
+            if (!authoritative) currentTurn = null
         }
         return items
     }

@@ -198,6 +198,18 @@ class SpineConversationTest {
         assertNull(store.turnOpen)
     }
 
+    @Test
+    fun authoritativeTurnGateClosesAStaleOrEvictedBoundary() {
+        val store = SpineConversationStore()
+        store.apply(page(event(1, "turn_started", turn = "turn-1"), turnOpen = true))
+        assertEquals(true, store.turnOpen)
+
+        store.apply(page(oldestSeq = 1, latestSeq = 1, turnOpen = false))
+
+        assertEquals(false, store.turnOpen)
+        assertNull(store.currentTurn)
+    }
+
     private fun userEvent(seq: Long, epoch: Long, text: String) = SpineEvent(
         seq, epoch, "session-1", "codex", seq,
         SpineKind.UserMessage("u$seq", text),
@@ -214,12 +226,14 @@ class SpineConversationTest {
         live: Boolean = true,
         oldestSeq: Long = events.firstOrNull()?.seq ?: 0L,
         latestSeq: Long = events.lastOrNull()?.seq ?: 0L,
+        turnOpen: Boolean? = null,
     ) = SpineConversationPage(
         epoch,
         live,
         hasMore = false,
         oldestSeq = oldestSeq,
         latestSeq = latestSeq,
+        turnOpen = turnOpen,
         events = events.toList(),
     )
 
