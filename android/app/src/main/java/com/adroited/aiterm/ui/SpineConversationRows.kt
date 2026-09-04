@@ -8,6 +8,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -43,6 +46,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -51,6 +56,31 @@ import androidx.compose.ui.unit.dp
 import com.adroited.aiterm.remote.Item
 import com.adroited.aiterm.remote.ToolCategory
 import com.adroited.aiterm.remote.ToolStatus
+import kotlinx.coroutines.withTimeoutOrNull
+
+internal const val MESSAGE_ACTION_HOLD_MILLIS = 800L
+
+/**
+ * Observes a deliberate stationary hold without consuming the pointer stream.
+ * Native text selection and list scrolling therefore keep their normal Android gestures.
+ */
+internal fun Modifier.stationaryMessageHold(onHold: () -> Unit): Modifier = pointerInput(onHold) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+        val origin = down.position
+        val cancelledBeforeTimeout = withTimeoutOrNull(MESSAGE_ACTION_HOLD_MILLIS) {
+            while (true) {
+                val change = awaitPointerEvent(PointerEventPass.Initial)
+                    .changes.firstOrNull { it.id == down.id }
+                    ?: return@withTimeoutOrNull true
+                if (!change.pressed || (change.position - origin).getDistance() > viewConfiguration.touchSlop) {
+                    return@withTimeoutOrNull true
+                }
+            }
+        }
+        if (cancelledBeforeTimeout == null) onHold()
+    }
+}
 
 internal sealed interface SpineTimelineItem {
     val key: String
@@ -115,7 +145,7 @@ private fun SpineUserBubble(item: Item.User, onLongPress: () -> Unit) {
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Column(
             Modifier.widthIn(max = 330.dp)
-                .combinedClickable(onClick = {}, onLongClick = onLongPress)
+                .stationaryMessageHold(onLongPress)
                 .background(
                     MaterialTheme.colorScheme.primaryContainer,
                     RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp),
@@ -144,7 +174,7 @@ private fun SpineUserBubble(item: Item.User, onLongPress: () -> Unit) {
 @OptIn(ExperimentalFoundationApi::class)
 private fun SpineAgentBlock(item: Item.AgentText, onLongPress: () -> Unit) {
     Column(
-        Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClick = onLongPress).padding(end = 14.dp),
+        Modifier.fillMaxWidth().stationaryMessageHold(onLongPress).padding(end = 14.dp),
     ) {
         ConversationMarkdown(item.text)
         if (!item.done) SpineCaret()
@@ -171,7 +201,8 @@ private fun SpineCaret() {
 private fun SpineThoughtBlock(item: Item.Thought, onLongPress: () -> Unit) {
     var expanded by rememberSaveable(item.id) { mutableStateOf(false) }
     val modifier = Modifier.fillMaxWidth()
-        .combinedClickable(onClick = { expanded = !expanded }, onLongClick = onLongPress)
+        .stationaryMessageHold(onLongPress)
+        .clickable { expanded = !expanded }
         .padding(horizontal = 4.dp, vertical = 2.dp)
     if (expanded) {
         Box(modifier) {
@@ -200,10 +231,10 @@ private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f), RoundedCornerShape(10.dp)),
     ) {
         Row(
-            Modifier.fillMaxWidth().combinedClickable(
-                onClick = { expanded = !expanded },
-                onLongClick = onLongPress,
-            ).padding(horizontal = 11.dp, vertical = 9.dp),
+            Modifier.fillMaxWidth()
+                .stationaryMessageHold(onLongPress)
+                .clickable { expanded = !expanded }
+                .padding(horizontal = 11.dp, vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(Icons.Filled.Build, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
