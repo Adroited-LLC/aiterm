@@ -84,19 +84,19 @@ internal fun spineTimeline(items: List<Item>): List<SpineTimelineItem> {
 }
 
 @Composable
-internal fun SpineTimelineRow(row: SpineTimelineItem) {
+internal fun SpineTimelineRow(row: SpineTimelineItem, onLongPress: (SpineTimelineItem) -> Unit = {}) {
     when (row) {
-        is SpineTimelineItem.Row -> SpineItemRow(row.item)
-        is SpineTimelineItem.Tools -> SpineToolGroup(row.tools)
+        is SpineTimelineItem.Row -> SpineItemRow(row.item, onLongPress = { onLongPress(row) })
+        is SpineTimelineItem.Tools -> SpineToolGroup(row.tools, onLongPress = { onLongPress(row) })
     }
 }
 
 @Composable
-private fun SpineItemRow(item: Item) {
+private fun SpineItemRow(item: Item, onLongPress: () -> Unit) {
     when (item) {
-        is Item.User -> SpineUserBubble(item)
-        is Item.AgentText -> SpineAgentBlock(item)
-        is Item.Thought -> SpineThoughtBlock(item)
+        is Item.User -> SpineUserBubble(item, onLongPress)
+        is Item.AgentText -> SpineAgentBlock(item, onLongPress)
+        is Item.Thought -> SpineThoughtBlock(item, onLongPress)
         is Item.Tool -> SpineToolCard(item)
         is Item.TurnEnd -> HorizontalDivider(
             Modifier.padding(vertical = 4.dp),
@@ -108,12 +108,14 @@ private fun SpineItemRow(item: Item) {
 }
 
 @Composable
-private fun SpineUserBubble(item: Item.User) {
+@OptIn(ExperimentalFoundationApi::class)
+private fun SpineUserBubble(item: Item.User, onLongPress: () -> Unit) {
     val content = remember(item.text) { splitConversationAttachments(item.text) }
     if (content.text.isBlank() && content.imagePaths.isEmpty()) return
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Column(
             Modifier.widthIn(max = 330.dp)
+                .combinedClickable(onClick = {}, onLongClick = onLongPress)
                 .background(
                     MaterialTheme.colorScheme.primaryContainer,
                     RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp),
@@ -139,8 +141,11 @@ private fun SpineUserBubble(item: Item.User) {
 }
 
 @Composable
-private fun SpineAgentBlock(item: Item.AgentText) {
-    Column(Modifier.fillMaxWidth().padding(end = 14.dp)) {
+@OptIn(ExperimentalFoundationApi::class)
+private fun SpineAgentBlock(item: Item.AgentText, onLongPress: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().combinedClickable(onClick = {}, onLongClick = onLongPress).padding(end = 14.dp),
+    ) {
         ConversationMarkdown(item.text)
         if (!item.done) SpineCaret()
     }
@@ -163,10 +168,10 @@ private fun SpineCaret() {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SpineThoughtBlock(item: Item.Thought) {
+private fun SpineThoughtBlock(item: Item.Thought, onLongPress: () -> Unit) {
     var expanded by rememberSaveable(item.id) { mutableStateOf(false) }
     val modifier = Modifier.fillMaxWidth()
-        .combinedClickable(onClick = { expanded = !expanded }, onLongClick = { expanded = true })
+        .combinedClickable(onClick = { expanded = !expanded }, onLongClick = onLongPress)
         .padding(horizontal = 4.dp, vertical = 2.dp)
     if (expanded) {
         Box(modifier) {
@@ -186,7 +191,8 @@ private fun SpineThoughtBlock(item: Item.Thought) {
 }
 
 @Composable
-private fun SpineToolGroup(tools: List<Item.Tool>) {
+@OptIn(ExperimentalFoundationApi::class)
+private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
     var expanded by rememberSaveable(tools.first().id) { mutableStateOf(false) }
     val active = tools.count { !it.status.settled }
     Column(
@@ -196,7 +202,7 @@ private fun SpineToolGroup(tools: List<Item.Tool>) {
         Row(
             Modifier.fillMaxWidth().combinedClickable(
                 onClick = { expanded = !expanded },
-                onLongClick = { expanded = true },
+                onLongClick = onLongPress,
             ).padding(horizontal = 11.dp, vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {

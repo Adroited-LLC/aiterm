@@ -2,6 +2,11 @@ package com.adroited.aiterm.ui
 
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -75,11 +80,18 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image as ImageIcon
+import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
@@ -100,6 +112,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -199,6 +214,11 @@ fun RemoteDesktopScreen(
                     webPreviewUrl = url
                     page = PAGE_WEB_PREVIEW
                 },
+                onSelectSession = { target ->
+                    selectedSessionId = target.id
+                    viewModel.previewSession(target.id)
+                },
+                onQuickInput = { tabId, key -> viewModel.sendInputs(tabId, listOf(key)) },
             )
         }
 
@@ -250,7 +270,6 @@ private fun RemoteSessionDashboard(
     var activeOnly by rememberSaveable { mutableStateOf(false) }
     var foldedCrews by remember { mutableStateOf(emptySet<String>()) }
     var renameTarget by remember { mutableStateOf<RemoteSession?>(null) }
-    var showUsage by remember { mutableStateOf(false) }
     var forgetDesktop by remember { mutableStateOf(false) }
     var forgetDesktopFailed by remember { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -290,9 +309,6 @@ private fun RemoteSessionDashboard(
             },
             onDismiss = { renameTarget = null },
         )
-    }
-    if (showUsage) {
-        UsageDialog(sources = state.usage, onDismiss = { showUsage = false })
     }
     if (forgetDesktop) {
         AlertDialog(
@@ -341,11 +357,7 @@ private fun RemoteSessionDashboard(
                     drawerScope.launch { drawerState.close() }
                     onOpenDesktop(target)
                 },
-                onShowUsage = {
-                    onLoadUsage()
-                    showUsage = true
-                    drawerScope.launch { drawerState.close() }
-                },
+                onLoadUsage = onLoadUsage,
                 onRefresh = {
                     onRefresh()
                     onLoadUsage()
@@ -524,13 +536,14 @@ private fun RemoteAppDrawer(
     pairedDesktops: List<PairedDesktop>,
     onClose: () -> Unit,
     onOpenDesktop: (PairedDesktop) -> Unit,
-    onShowUsage: () -> Unit,
+    onLoadUsage: () -> Unit,
     onRefresh: () -> Unit,
     onOpenTerminal: () -> Unit,
     onManageDesktops: () -> Unit,
     onPairDesktop: () -> Unit,
     onForgetDesktop: () -> Unit,
 ) {
+    LaunchedEffect(Unit) { onLoadUsage() }
     ModalDrawerSheet(
         modifier = Modifier.fillMaxHeight().widthIn(max = 340.dp),
         drawerContainerColor = MaterialTheme.colorScheme.surface,
@@ -564,6 +577,7 @@ private fun RemoteAppDrawer(
                     DrawerRow(
                         title = candidate.displayName,
                         detail = if (candidate.deviceId == desktop.deviceId) "Current desktop" else "Paired desktop",
+                        icon = Icons.Filled.Devices,
                         selected = candidate.deviceId == desktop.deviceId,
                         onClick = { if (candidate.deviceId != desktop.deviceId) onOpenDesktop(candidate) },
                     )
@@ -571,16 +585,17 @@ private fun RemoteAppDrawer(
             }
 
             HorizontalDivider(Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.surfaceVariant)
-            DrawerRow("Usage", "Limits, balances, and account status", onClick = onShowUsage)
-            DrawerRow("Refresh", "Update sessions and usage", onClick = onRefresh)
-            DrawerRow("Open terminal", "View the raw desktop session", onClick = onOpenTerminal)
+            DrawerUsage(state.usage)
+            DrawerRow("Refresh", "Update sessions and usage", Icons.Filled.Refresh, onClick = onRefresh)
+            DrawerRow("Open terminal", "View the raw desktop session", Icons.Filled.Terminal, onClick = onOpenTerminal)
 
             HorizontalDivider(Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.surfaceVariant)
-            DrawerRow("Manage desktops", "View and remove trusted computers", onClick = onManageDesktops)
-            DrawerRow("Add a desktop", "Scan another pairing code", onClick = onPairDesktop)
+            DrawerRow("Manage desktops", "View and remove trusted computers", Icons.Filled.Devices, onClick = onManageDesktops)
+            DrawerRow("Add a desktop", "Scan another pairing code", Icons.Filled.Add, onClick = onPairDesktop)
             DrawerRow(
                 title = "Forget this desktop",
                 detail = "Remove its key from this phone",
+                icon = Icons.Filled.LinkOff,
                 titleColor = MaterialTheme.colorScheme.error,
                 onClick = onForgetDesktop,
             )
@@ -596,19 +611,33 @@ private fun ConnectionDot(connection: ConnectionState) {
         ConnectionState.Locked, ConnectionState.Revoked -> MaterialTheme.colorScheme.error
         ConnectionState.Disconnected -> MaterialTheme.colorScheme.onSurfaceVariant
     }
-    Box(Modifier.size(10.dp).background(color, CircleShape))
+    val transition = rememberInfiniteTransition(label = "connection-pulse")
+    val alpha by transition.animateFloat(
+        initialValue = if (connection == ConnectionState.Connecting || connection == ConnectionState.Reconnecting) .28f else 1f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(720), RepeatMode.Reverse),
+        label = "connection-alpha",
+    )
+    Box(Modifier.size(10.dp).background(color.copy(alpha = alpha), CircleShape))
 }
 
 /** John’s compact operational badge: state stays beside identity instead of
  * competing with the conversation as a full-width banner. */
 @Composable
 private fun SessionStateChip(label: String, color: Color) {
+    val transition = rememberInfiniteTransition(label = "session-state")
+    val alpha by transition.animateFloat(
+        initialValue = if (label == "working") .35f else 1f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(760), RepeatMode.Reverse),
+        label = "session-state-alpha",
+    )
     Row(
         modifier = Modifier.background(color.copy(alpha = 0.14f), RoundedCornerShape(50))
             .padding(horizontal = 7.dp, vertical = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(Modifier.size(6.dp).background(color, CircleShape))
+        Box(Modifier.size(6.dp).background(color.copy(alpha = alpha), CircleShape))
         Spacer(Modifier.width(5.dp))
         Text(label, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1)
     }
@@ -628,24 +657,60 @@ private fun DrawerSectionLabel(text: String) {
 private fun DrawerRow(
     title: String,
     detail: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
     selected: Boolean = false,
     titleColor: Color = MaterialTheme.colorScheme.onSurface,
     onClick: () -> Unit,
 ) {
     val background = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent
-    Column(
+    Row(
         Modifier.fillMaxWidth()
             .padding(horizontal = 10.dp, vertical = 2.dp)
             .background(background, RoundedCornerShape(12.dp))
             .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(title, style = MaterialTheme.typography.bodyLarge, color = titleColor)
-        Text(
-            detail,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        if (icon != null) {
+            Icon(icon, null, tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.width(14.dp))
+        }
+        Column {
+            Text(title, style = MaterialTheme.typography.bodyLarge, color = titleColor)
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun DrawerUsage(sources: List<RemoteUsageSource>) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Speed, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            Text("Usage", style = MaterialTheme.typography.titleSmall)
+        }
+        if (sources.isEmpty()) {
+            Text("Reading account limits…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 30.dp, top = 5.dp))
+        } else {
+            sources.forEach { source ->
+                Column(Modifier.padding(start = 30.dp, top = 8.dp)) {
+                    Row {
+                        Text(source.name, style = MaterialTheme.typography.labelMedium, modifier = Modifier.weight(1f))
+                        source.plan.takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
+                    }
+                    source.bars.forEach { bar ->
+                        Row { Text(bar.label, style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f)); Text("${bar.percent.toInt()}%", style = MaterialTheme.typography.labelSmall) }
+                        LinearProgressIndicator(
+                            progress = { (bar.percent / 100.0).toFloat() },
+                            modifier = Modifier.fillMaxWidth().height(3.dp),
+                            color = if (bar.severity == "critical") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -907,6 +972,8 @@ private fun RemoteConversationContent(
     onProbeWebPreview: suspend (String) -> Result<Boolean>,
     onOpenWebPreview: suspend (String) -> Result<String>,
     onShowWebPreview: (String) -> Unit,
+    onSelectSession: (RemoteSession) -> Unit,
+    onQuickInput: (String, String) -> Unit,
 ) {
     var draft by rememberSaveable(session.id) { mutableStateOf("") }
     var sending by remember(session.id) { mutableStateOf(false) }
@@ -925,8 +992,11 @@ private fun RemoteConversationContent(
     var filePreviewError by remember(session.id) { mutableStateOf<String?>(null) }
     var webPreviewAvailable by remember(session.id) { mutableStateOf(false) }
     var webPreviewOpening by remember(session.id) { mutableStateOf(false) }
+    var messageActions by remember(session.id) { mutableStateOf<SpineTimelineItem?>(null) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    val composerFocus = remember { FocusRequester() }
     val normalizer = remember(context) { TerminalImageNormalizer(context) }
     val previewItems = if (state.previewSessionId == session.id) state.previewItems else emptyList()
     val timeline = remember(previewItems) { spineTimeline(previewItems) }
@@ -968,6 +1038,11 @@ private fun RemoteConversationContent(
     }
 
     LaunchedEffect(session.id) { onRefresh() }
+    LaunchedEffect(session.id, state.connection) {
+        if (state.connection == ConnectionState.Connected) {
+            onLoadFiles(session.id).onSuccess { files = it }
+        }
+    }
     LaunchedEffect(session.id, isConversationSessionLive(session, state.tabs)) {
         if (isConversationSessionLive(session, state.tabs)) {
             while (true) {
@@ -1082,6 +1157,33 @@ private fun RemoteConversationContent(
                 },
             )
             sending = false
+        }
+    }
+
+    fun sendAgain(text: String) {
+        if (text.isBlank() || sending) return
+        sending = true
+        sendError = null
+        scope.launch {
+            onSend(session.id, text, emptyList()) {}.onFailure {
+                sendError = it.message ?: "The desktop did not accept the message."
+            }
+            sending = false
+        }
+    }
+
+    fun openFile(target: RemoteSessionChange) {
+        if (target.kind == "deleted") return
+        filePreviewTarget = target
+        filePreview = null
+        filePreviewError = null
+        filePreviewLoading = true
+        scope.launch {
+            onLoadFile(session.id, target.path, 8 * 1024 * 1024).fold(
+                onSuccess = { filePreview = it },
+                onFailure = { filePreviewError = it.message ?: "Could not read this file." },
+            )
+            filePreviewLoading = false
         }
     }
 
@@ -1280,7 +1382,7 @@ private fun RemoteConversationContent(
                     OutlinedTextField(
                         value = draft,
                         onValueChange = { draft = it },
-                        modifier = Modifier.weight(1f),
+                        modifier = Modifier.weight(1f).focusRequester(composerFocus),
                         placeholder = { Text("Message ${session.agent}") },
                         maxLines = 5,
                         shape = RoundedCornerShape(18.dp),
@@ -1323,23 +1425,7 @@ private fun RemoteConversationContent(
                         filesLoading = false
                     }
                 },
-                onOpen = { target ->
-                    if (target.kind != "deleted") {
-                        filePreviewTarget = target
-                        filePreview = null
-                        filePreviewError = null
-                        filePreviewLoading = true
-                        scope.launch {
-                            onLoadFile(session.id, target.path, 8 * 1024 * 1024).fold(
-                                onSuccess = { filePreview = it },
-                                onFailure = {
-                                    filePreviewError = it.message ?: "Could not read this file."
-                                },
-                            )
-                            filePreviewLoading = false
-                        }
-                    }
-                },
+                onOpen = ::openFile,
             )
             state.previewSessionId != session.id && state.previewLoadingSessionId == session.id -> Box(
                 Modifier.fillMaxSize().padding(padding),
@@ -1364,19 +1450,46 @@ private fun RemoteConversationContent(
             else -> Box(Modifier.fillMaxSize().padding(padding)) {
                 LazyColumn(
                     state = listState,
-                    modifier = Modifier.fillMaxSize().then(
+                    modifier = Modifier.fillMaxSize().then(conversationScrollIndicator(listState)).then(
                         if (imeBottom > 0) Modifier.imeNestedScroll() else Modifier,
                     ),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
+                    item(key = "crew") {
+                        Column {
+                            ConversationCrewStrip(
+                                current = session,
+                                sessions = state.sessions,
+                                broughtIn = state.broughtInSessions,
+                                activity = state.sessionActivity,
+                                onSelect = onSelectSession,
+                            )
+                            if (needsYou) {
+                                state.tabs.firstOrNull { it.sessionId == session.id }?.let { tab ->
+                                    NeedsYouQuickKeys { key -> onQuickInput(tab.id, key) }
+                                }
+                            }
+                        }
+                    }
                     items(timeline, key = { it.key }) { item ->
-                        SpineTimelineRow(item)
+                        SpineTimelineRow(item, onLongPress = { messageActions = it })
                     }
                     if (working) {
                         item(key = "working") {
                             ConversationWorkingRow(session.agent, state.previewPhaseDetail)
                         }
+                    }
+                    item(key = "generated-files") {
+                        GeneratedFilesRail(
+                            files = files,
+                            onOpen = ::openFile,
+                            onShowAll = { showFiles = true },
+                            loadThumbnail = { file ->
+                                onLoadFile(session.id, file.path, 2 * 1024 * 1024).getOrNull()
+                                    ?.takeUnless { it.truncated }?.data
+                            },
+                        )
                     }
                 }
                 if (awayFromNewest) {
@@ -1436,6 +1549,27 @@ private fun RemoteConversationContent(
                 showBringIn = false
             },
             onDismiss = { showBringIn = false },
+        )
+    }
+    messageActions?.let { held ->
+        val rowItem = (held as? SpineTimelineItem.Row)?.item
+        val promptAbove = if (rowItem is com.adroited.aiterm.remote.Item.AgentText) {
+            val index = previewItems.indexOfFirst { it.key == rowItem.key }
+            previewItems.take(index.coerceAtLeast(0)).lastOrNull { it is com.adroited.aiterm.remote.Item.User }
+                ?.let { (it as com.adroited.aiterm.remote.Item.User).text }
+        } else null
+        ConversationMessageSheet(
+            row = held,
+            promptAbove = promptAbove,
+            onDismiss = { messageActions = null },
+            onEdit = { text ->
+                draft = text
+                scope.launch {
+                    composerFocus.requestFocus()
+                    keyboard?.show()
+                }
+            },
+            onSendAgain = ::sendAgain,
         )
     }
 }
@@ -1579,7 +1713,8 @@ private fun SessionFilePreviewPane(
             },
         )
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        SessionFilePreviewBody(
+        RichSessionFilePreviewBody(
+            target = target,
             loading = loading,
             preview = preview,
             error = error,
@@ -1592,6 +1727,9 @@ private fun sessionFileType(file: RemoteSessionChange): String = when (
     file.name.substringAfterLast('.', "").lowercase()
 ) {
     "png", "jpg", "jpeg", "webp", "gif", "svg" -> "image"
+    "pdf" -> "pdf"
+    "mp4", "webm", "mkv", "mov", "avi" -> "video"
+    "mp3", "m4a", "wav", "ogg", "flac" -> "audio"
     "kt", "kts", "java", "rs", "go", "py", "js", "jsx", "ts", "tsx", "html", "css", "scss",
     "json", "toml", "yaml", "yml", "xml", "sh", "zsh", "bash", "sql" -> "code"
     "txt", "md", "markdown", "log", "csv" -> "text"
@@ -1601,6 +1739,9 @@ private fun sessionFileType(file: RemoteSessionChange): String = when (
 private fun sessionFileIcon(file: RemoteSessionChange) = when {
     file.kind == "deleted" -> Icons.Filled.Delete
     sessionFileType(file) == "image" -> Icons.Filled.ImageIcon
+    sessionFileType(file) == "pdf" -> Icons.Filled.PictureAsPdf
+    sessionFileType(file) == "video" -> Icons.Filled.Videocam
+    sessionFileType(file) == "audio" -> Icons.Filled.Audiotrack
     sessionFileType(file) == "code" -> Icons.Filled.Code
     sessionFileType(file) == "text" -> Icons.Filled.Description
     else -> Icons.AutoMirrored.Filled.InsertDriveFile

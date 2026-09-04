@@ -3,4 +3,7 @@
     <cache-path
         name="terminal-image-captures"
         path="terminal-image-captures/" />
+    <cache-path
+        name="session-previews"
+        path="session-previews/" />
 </paths>
