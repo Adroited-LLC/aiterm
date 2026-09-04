@@ -9,10 +9,25 @@ pub const OUTPUT_WINDOW: usize = 256 * 1024;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    Start { version: u32, cols: u16, rows: u16 },
-    Input { data: String },
-    Resize { cols: u16, rows: u16 },
-    Ack { sequence: u64 },
+    Start {
+        version: u32,
+        cols: u16,
+        rows: u16,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
+    },
+    Input {
+        data: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Ack {
+        sequence: u64,
+    },
     Close,
 }
 

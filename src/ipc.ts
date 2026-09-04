@@ -1,5 +1,6 @@
 import { makeWriteQueue } from "./writeQueue";
-import { invoke, Channel } from "@tauri-apps/api/core";
+import { Channel } from "@tauri-apps/api/core";
+import { invoke } from "./platform";
 
 export interface Session {
   id: string;

@@ -2,5 +2,5 @@
   "identifier": "default",
   "description": "Local desktop window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-destroy"]
 }

@@ -10,20 +10,22 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
+from pathlib import Path
 import unittest
 
 BINARY = os.path.abspath(sys.argv.pop(1))
 
 
 class Companion:
-    def __init__(self, version=1):
+    def __init__(self, version=1, **launch):
         self.proc = subprocess.Popen([BINARY], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      env={**os.environ, "SHELL": "/bin/bash"})
         self.events = queue.Queue()
         self.output = bytearray()
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
-        self.send(type="start", version=version, cols=91, rows=27)
+        self.send(type="start", version=version, cols=91, rows=27, **launch)
 
     def read(self):
         for line in self.proc.stdout:
@@ -72,6 +74,18 @@ class Companion:
 
 
 class BackendTests(unittest.TestCase):
+    def test_tabs_keep_separate_directories_and_processes(self):
+        with tempfile.TemporaryDirectory(prefix="aiterm spaces 世界 ") as directory:
+            first = Companion(cwd=directory, command="printf 'FIRST:%s\\n' \"$PWD\"; sleep 300")
+            second = Companion(cwd="/tmp", command="printf 'SECOND:%s\\n' \"$PWD\"; sleep 300")
+            self.addCleanup(first.close)
+            self.addCleanup(second.close)
+            first.until(lambda _: b"FIRST:" in first.output)
+            second.until(lambda _: b"SECOND:/tmp" in second.output)
+            self.assertIn(directory.encode(), first.output)
+            first.close()
+            self.assertIsNone(second.proc.poll())
+
     def start(self):
         p = Companion()
         self.addCleanup(p.close)
@@ -143,7 +157,7 @@ class BackendTests(unittest.TestCase):
                     state = f.read().split(") ", 1)[1].split()[0]
                 if state == "Z":
                     return
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 return
             time.sleep(.05)
         self.fail("Foreground job survived desktop disconnect")
@@ -153,6 +167,54 @@ class BackendTests(unittest.TestCase):
         self.addCleanup(p.close)
         self.assertEqual(p.event()["type"], "error")
         self.assertNotEqual(p.proc.wait(timeout=5), 0)
+
+
+class RpcTests(unittest.TestCase):
+    def rpc(self, command, **args):
+        response = subprocess.run([BINARY, "--rpc"],
+            input=json.dumps({"command": command, "args": args}) + "\n",
+            text=True, capture_output=True, timeout=15, check=True)
+        return json.loads(response.stdout)
+
+    def test_unicode_files_and_conflicting_save(self):
+        with tempfile.TemporaryDirectory(prefix="aiterm 世界 ") as directory:
+            path = Path(directory) / "notes 'quoted'.txt"
+            path.write_text("original 世界", encoding="utf-8")
+            listing = self.rpc("list_dir", path=directory)["value"]
+            self.assertEqual(listing[0]["path"], str(path))
+            original = self.rpc("read_text_file", path=str(path))["value"]
+            self.assertEqual(original["content"], "original 世界")
+            result = self.rpc("write_text_file", path=str(path), content="saved ✓",
+                              expectedMtimeMs=original["mtime_ms"])
+            self.assertIn("value", result)
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            stale = self.rpc("write_text_file", path=str(path), content="clobber",
+                             expectedMtimeMs=result["value"])
+            self.assertIn("changed-on-disk", stale["error"])
+            self.assertEqual(path.read_text(), "saved ✓")
+
+    def test_git_panels_and_markdown_use_linux_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            path = Path(directory) / "file.txt"
+            path.write_text("before\n")
+            for args in [["add", "file.txt"], ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                         "commit", "-qm", "Initial"]]:
+                subprocess.run(["git", "-C", directory, *args], check=True)
+            path.write_text("after\n")
+            state = self.rpc("git_repo_state", path=directory)["value"]
+            self.assertTrue(state["is_repo"])
+            self.assertEqual(self.rpc("git_status", path=directory)["value"][0]["path"], "file.txt")
+            diff = self.rpc("git_diff_file", path=directory, file="file.txt")["value"]
+            self.assertIn("+after", diff)
+            log = self.rpc("git_log", path=directory, limit=10)["value"]
+            self.assertEqual(log[0]["summary"], "Initial")
+            branches = self.rpc("git_branches", path=directory)["value"]
+            self.assertTrue(any(b["is_head"] for b in branches))
+        rendered = self.rpc("render_markdown", source="# Hello\n<script>alert(1)</script>")["value"]
+        self.assertIn("<h1>Hello</h1>", rendered)
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("error", self.rpc("not_a_command"))
 
 
 if __name__ == "__main__":

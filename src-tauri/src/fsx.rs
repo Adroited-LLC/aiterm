@@ -18,7 +18,7 @@ pub struct ProjectInfo {
 
 /// All project directories under ~/Projects, whether or not they still have
 /// Claude sessions (transcripts get purged after cleanupPeriodDays).
-#[tauri::command]
+#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
 pub async fn list_projects() -> Vec<ProjectInfo> {
     crate::run_blocking(list_projects_sync).await
 }
@@ -62,7 +62,7 @@ fn list_projects_sync() -> Vec<ProjectInfo> {
 }
 
 /// Open a file with the desktop's default application.
-#[tauri::command]
+#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
 pub async fn open_path(path: String) -> Result<(), String> {
     crate::run_blocking(move || open_path_sync(path)).await
 }
@@ -75,7 +75,7 @@ fn open_path_sync(path: String) -> Result<(), String> {
         .map_err(|e| format!("xdg-open {path}: {e}"))
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
 pub async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     crate::run_blocking(move || list_dir_sync(path)).await
 }
@@ -128,7 +128,7 @@ fn file_mtime_ms(path: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
 pub async fn read_text_file(path: String) -> Result<TextFile, String> {
     crate::run_blocking(move || read_text_file_sync(&path)).await
 }
@@ -167,7 +167,7 @@ pub const CHANGED_ON_DISK: &str = "changed-on-disk";
 /// someone else — an agent, most likely — wrote in between, and silently
 /// clobbering their edit is the one wrong answer. Pass `None` to overwrite
 /// deliberately. Returns the new mtime so the next save has its baseline.
-#[tauri::command]
+#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
 pub async fn write_text_file(
     path: String,
     content: String,

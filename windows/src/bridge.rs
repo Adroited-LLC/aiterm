@@ -40,7 +40,7 @@ fn text(bytes: &[u8]) -> String {
     }
 }
 
-fn capture(mut command: Command, input: &'static [u8]) -> Result<String, String> {
+fn capture(mut command: Command, input: Vec<u8>) -> Result<String, String> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -50,11 +50,13 @@ fn capture(mut command: Command, input: &'static [u8]) -> Result<String, String>
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let sender = std::thread::spawn(move || stdin.write_all(input));
+    let sender = std::thread::spawn(move || stdin.write_all(&input));
     let read = |pipe: Box<dyn Read + Send>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = pipe.take(256 * 1024).read_to_end(&mut buf);
+            let _ = pipe
+                .take((aiterm_wsl_protocol::MAX_FRAME + 1) as u64)
+                .read_to_end(&mut buf);
             buf
         })
     };
@@ -120,34 +122,14 @@ impl Drop for Session {
 pub fn start(
     cols: u16,
     rows: u16,
+    cwd: Option<String>,
+    command: Option<String>,
     events: impl Fn(Event) -> bool + Send + 'static,
 ) -> Result<(Session, Workspace), String> {
     if !(2..=1000).contains(&cols) || !(1..=1000).contains(&rows) {
         return Err("Invalid terminal dimensions".into());
     }
-    // Ask the default distribution itself, rather than parsing localized list
-    // output or accidentally choosing Docker's internal distribution.
-    let mut probe = wsl();
-    probe.args(["--exec", "sh", "-c", "printf '%s\\n' \"$WSL_DISTRO_NAME\""]);
-    let distribution = capture(probe, &[])?.trim().to_owned();
-    if distribution.is_empty() || distribution.starts_with("docker-desktop") {
-        return Err(
-            "Choose a Linux distribution such as Ubuntu as your WSL default, then retry.".into(),
-        );
-    }
-    let digest = format!("{:x}", Sha256::digest(BACKEND));
-    // The only interpolated component is our hex digest, never a user path.
-    let install_script = format!("set -eu; umask 077; d=\"$HOME/.local/share/aiterm/backends\"; mkdir -p \"$d\"; if [ -x \"$d/{digest}\" ]; then cat >/dev/null; else t=$(mktemp \"$d/.install.XXXXXX\"); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; chmod 700 \"$t\"; mv \"$t\" \"$d/{digest}\"; fi");
-    let mut install = wsl();
-    install.args([
-        "--distribution",
-        &distribution,
-        "--exec",
-        "sh",
-        "-c",
-        &install_script,
-    ]);
-    capture(install, BACKEND)?;
+    let (distribution, digest) = prepare()?;
     let launch = format!("exec \"$HOME/.local/share/aiterm/backends/{digest}\"");
     let mut child = wsl()
         .args([
@@ -219,6 +201,8 @@ pub fn start(
         version: VERSION,
         cols,
         rows,
+        cwd,
+        command,
     })?;
     let (home, shell) = ready_rx.recv_timeout(Duration::from_secs(30)).map_err(|_| "Linux terminal did not become ready. Open your distribution and check that its shell starts.")??;
     Ok((
@@ -229,4 +213,83 @@ pub fn start(
             shell,
         },
     ))
+}
+
+fn prepare() -> Result<(String, String), String> {
+    // Cache a successful installation, while retaining an explicit reconnect.
+    static READY: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+    let mut cached = READY.lock().map_err(|e| e.to_string())?;
+    if let Some(value) = &*cached {
+        return Ok(value.clone());
+    }
+    // Ask the default distribution itself, rather than parsing localized list
+    // output or accidentally choosing Docker's internal distribution.
+    let mut probe = wsl();
+    probe.args(["--exec", "sh", "-c", "printf '%s\\n' \"$WSL_DISTRO_NAME\""]);
+    let distribution = capture(probe, Vec::new())?.trim().to_owned();
+    if distribution.is_empty() || distribution.starts_with("docker-desktop") {
+        return Err(
+            "Choose a Linux distribution such as Ubuntu as your WSL default, then retry.".into(),
+        );
+    }
+    let digest = format!("{:x}", Sha256::digest(BACKEND));
+    // The only interpolated component is our hex digest, never a user path.
+    let install_script = format!("set -eu; umask 077; d=\"$HOME/.local/share/aiterm/backends\"; mkdir -p \"$d\"; if [ -x \"$d/{digest}\" ]; then cat >/dev/null; else t=$(mktemp \"$d/.install.XXXXXX\"); trap 'rm -f \"$t\"' EXIT; cat >\"$t\"; chmod 700 \"$t\"; mv \"$t\" \"$d/{digest}\"; fi");
+    let mut install = wsl();
+    install.args([
+        "--distribution",
+        &distribution,
+        "--exec",
+        "sh",
+        "-c",
+        &install_script,
+    ]);
+    capture(install, BACKEND.to_vec())?;
+
+    let value = (distribution, digest);
+    *cached = Some(value.clone());
+    Ok(value)
+}
+
+pub fn rpc(command: String, args: serde_json::Value) -> Result<serde_json::Value, String> {
+    let (distribution, digest) = prepare()?;
+    if command == "open_path" {
+        let path = args["path"].as_str().ok_or("Missing path")?;
+        if !path.starts_with('/') || path.contains('\\') || path.contains('\0') {
+            return Err("Expected an absolute Linux path".into());
+        }
+        let unc = format!(
+            "\\\\wsl.localhost\\{}{}",
+            distribution,
+            path.replace('/', "\\")
+        );
+        Command::new("explorer.exe")
+            .arg(unc)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(serde_json::Value::Null);
+    }
+    let launch = format!("exec \"$HOME/.local/share/aiterm/backends/{digest}\" --rpc");
+    let mut cmd = wsl();
+    cmd.args([
+        "--distribution",
+        &distribution,
+        "--exec",
+        "sh",
+        "-c",
+        &launch,
+    ]);
+    let mut input = Vec::new();
+    write_frame(
+        &mut input,
+        &serde_json::json!({"command":command,"args":args}),
+    )
+    .map_err(|e| e.to_string())?;
+    let output = capture(cmd, input)?;
+    let reply: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Invalid workspace response: {e}"))?;
+    if let Some(error) = reply["error"].as_str() {
+        return Err(error.into());
+    }
+    Ok(reply["value"].clone())
 }

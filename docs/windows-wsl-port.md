@@ -1,8 +1,9 @@
 # Windows application powered by WSL
 
-Status: first terminal milestone built, installed, and exercised in the Windows
-11 / Ubuntu 24.04 WSL 2 VM. Full agent/session functionality and first-run WSL
-installation are not yet implemented.
+Status: Linux-style Windows workbench built and exercised in the Windows 11 /
+Ubuntu 24.04 WSL 2 VM: sidebar, tabs, agent launching, recent Claude/Codex history,
+Linux folder selection, shared file editing/Markdown, and Git panels. Full
+agent/session parity and first-run WSL installation are not yet implemented.
 
 ## Product contract
 
@@ -16,6 +17,10 @@ should feel like installing one application. Users should not need prior WSL
 knowledge, terminal commands, or an understanding of the backend architecture.
 Explain Linux and administrator actions where they help the user make a decision.
 Do not conceal required system changes.
+
+The visual direction is the same GUI style as Linux aiterm: preserve its
+sidebar, toolbar, tabs, colors and panel layout. Windows-specific behavior and
+fewer settings do not imply a separate minimalist terminal design.
 
 All implementation work belongs on `feature/windows-wsl`, based initially on
 `728bda5`. Keep changes in focused commits suitable for review and incremental

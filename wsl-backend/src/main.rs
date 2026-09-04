@@ -5,6 +5,18 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
+#[allow(dead_code)]
+#[path = "../../src-tauri/src/fsx.rs"]
+mod fsx;
+#[allow(dead_code)]
+#[path = "../../src-tauri/src/git.rs"]
+mod git;
+mod rpc;
+
+// RPCs already run in a separate companion process; no GUI thread to block.
+async fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
+    work()
+}
 
 #[derive(Default)]
 struct Credits {
@@ -80,6 +92,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         version,
         cols,
         rows,
+        cwd,
+        command: launch,
     }) = read_frame(&mut input)?
     else {
         return Err("Expected startup handshake".into());
@@ -92,7 +106,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pair = native_pty_system().openpty(size(cols, rows)?)?;
     let mut command = CommandBuilder::new(&shell);
     command.arg("-l");
-    command.cwd(&home);
+    if let Some(launch) = launch {
+        command.arg("-c");
+        command.arg(launch);
+    }
+    command.cwd(cwd.as_deref().unwrap_or(&home));
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     // Match desktop PTY isolation: keep user configuration, drop parent markers.
@@ -196,6 +214,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--rpc") {
+        rpc::serve();
+        return;
+    }
     if let Err(error) = run() {
         let _ = emit(&Event::Error {
             message: error.to_string(),
