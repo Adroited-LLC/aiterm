@@ -1408,6 +1408,8 @@ struct SessionSpinePayload {
     epoch: u64,
     live: bool,
     has_more: bool,
+    oldest_seq: u64,
+    latest_seq: u64,
     events: Vec<crate::spine::SpineEvent>,
 }
 
@@ -2747,7 +2749,7 @@ impl RemoteServices {
                 let spine = app
                     .try_state::<Arc<crate::spine::Spine>>()
                     .ok_or("remote.unsupported")?;
-                let (has_more, events) =
+                let (has_more, oldest_seq, latest_seq, events) =
                     spine.page_after(&payload.session_id, payload.after, 700 * 1024);
                 let events = events.into_iter().map(bound_remote_spine_event).collect();
                 Ok(DispatchOutcome::frames(vec![response(
@@ -2757,6 +2759,8 @@ impl RemoteServices {
                         epoch: spine.epoch(),
                         live: spine.is_live(&payload.session_id),
                         has_more,
+                        oldest_seq,
+                        latest_seq,
                         events,
                     },
                 )?]))

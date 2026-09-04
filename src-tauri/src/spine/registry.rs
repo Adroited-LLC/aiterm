@@ -238,11 +238,17 @@ impl Spine {
         session_id: &str,
         after_seq: u64,
         max_bytes: usize,
-    ) -> (bool, Vec<SpineEvent>) {
+    ) -> (bool, u64, u64, Vec<SpineEvent>) {
         let sessions = self.sessions.lock().unwrap();
         let Some(log) = sessions.get(session_id) else {
-            return (false, Vec::new());
+            return (false, 0, 0, Vec::new());
         };
+        // These bounds let a reconnecting consumer distinguish "nothing new"
+        // from "your cursor fell behind the bounded ring". Without them both
+        // cases are an empty/partial page and a phone can remain permanently
+        // stale while still looking connected.
+        let oldest_seq = log.events.front().map_or(0, |event| event.seq);
+        let latest_seq = log.events.back().map_or(0, |event| event.seq);
         let mut bytes = 0usize;
         let mut events = Vec::new();
         let mut has_more = false;
@@ -255,7 +261,7 @@ impl Spine {
             bytes = bytes.saturating_add(event_bytes);
             events.push(event.clone());
         }
-        (has_more, events)
+        (has_more, oldest_seq, latest_seq, events)
     }
 
     /// Every session with a log, folded to one row each — see
@@ -1146,22 +1152,27 @@ mod tests {
             spine.push("s", "codex", i, text(&format!("b{i}"), "12345"));
         }
         let one_event_budget = weight(&spine.after("s", 0)[0]);
-        let (more, first) = spine.page_after("s", 0, one_event_budget);
+        let (more, oldest, latest, first) = spine.page_after("s", 0, one_event_budget);
         assert!(more);
+        assert_eq!((oldest, latest), (1, 5));
         assert_eq!(
             first.iter().map(|event| event.seq).collect::<Vec<_>>(),
             vec![1]
         );
 
-        let (more, second) = spine.page_after("s", first.last().unwrap().seq, one_event_budget * 2);
+        let (more, oldest, latest, second) =
+            spine.page_after("s", first.last().unwrap().seq, one_event_budget * 2);
         assert!(more);
+        assert_eq!((oldest, latest), (1, 5));
         assert_eq!(
             second.iter().map(|event| event.seq).collect::<Vec<_>>(),
             vec![2, 3]
         );
 
-        let (more, tail) = spine.page_after("s", second.last().unwrap().seq, usize::MAX);
+        let (more, oldest, latest, tail) =
+            spine.page_after("s", second.last().unwrap().seq, usize::MAX);
         assert!(!more);
+        assert_eq!((oldest, latest), (1, 5));
         assert_eq!(
             tail.iter().map(|event| event.seq).collect::<Vec<_>>(),
             vec![4, 5]
@@ -1179,6 +1190,9 @@ mod tests {
         // Seq keeps counting; only the storage is bounded.
         assert_eq!(held.first().unwrap().seq, 21);
         assert_eq!(held.last().unwrap().seq, (MAX_EVENTS + 20) as u64);
+        let (_, oldest, latest, _) = spine.page_after("s", 1, usize::MAX);
+        assert_eq!(oldest, 21);
+        assert_eq!(latest, (MAX_EVENTS + 20) as u64);
     }
 
     #[test]

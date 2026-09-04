@@ -400,7 +400,14 @@ object RemoteCommands {
                         event.output?.encodeToByteArray()?.size?.let { it > 64 * 1_024 } == true
                 }
             ) malformed()
-            SpineConversationPage(page.epoch, page.live, page.hasMore, page.events)
+            SpineConversationPage(
+                page.epoch,
+                page.live,
+                page.hasMore,
+                page.oldestSeq,
+                page.latestSeq,
+                page.events,
+            )
         }
 
     fun sessionChanges(payload: ByteArray): List<RemoteSessionChange> =

@@ -43,6 +43,32 @@ import kotlin.concurrent.thread
 class RemoteClientTest {
 
     @Test
+    fun stalledSpineRefreshIsAbandonedAndDoesNotPinLaterRefreshes() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request ->
+            if (request.kind == "session.spine") CompletableDeferred()
+            else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+
+        client.previewSession("session-1")
+        runCurrent()
+        assertEquals("session-1", client.state.value.previewLoadingSessionId)
+
+        advanceTimeBy(8_001)
+        runCurrent()
+        assertEquals(null, client.state.value.previewLoadingSessionId)
+        assertEquals("Conversation refresh timed out. Retrying…", client.state.value.previewError)
+        assertEquals(1, transport.abandonedRequests.size)
+
+        client.previewSession("session-1")
+        runCurrent()
+        assertEquals(2, transport.requests.count { it.kind == "session.spine" })
+        client.lock()
+    }
+
+    @Test
     fun conversationFailureStopsLoadingAndSuppressesDuplicateRequests() = runTest {
         val transport = FakeRemoteTransport()
         val pending = CompletableDeferred<RemoteResponse>()

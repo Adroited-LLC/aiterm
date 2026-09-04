@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -20,6 +21,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import java.io.File
@@ -711,6 +713,7 @@ class RemoteClient(
         val started = launchRequest(
             "session.spine",
             RemoteCommands.spine(sessionId, store.lastSeq),
+            timeoutMillis = PREVIEW_REFRESH_TIMEOUT_MILLIS,
             onError = { code, message ->
                 if (code == "remote.unsupported" || code == "protocol.invalid_response") {
                     previewSessionLegacy(sessionId)
@@ -747,7 +750,12 @@ class RemoteClient(
                     previewError = null,
                     sessionActivity = activity,
                 )
-                if (page.hasMore) previewSession(sessionId)
+                // `latestSeq` is the desktop's atomic high-water mark. Drain
+                // until our applied cursor reaches it even if an older server
+                // accidentally under-reports `hasMore`.
+                if (page.hasMore || (page.latestSeq > 0L && store.lastSeq < page.latestSeq)) {
+                    previewSession(sessionId)
+                }
             },
         )
         if (!started) {
@@ -1050,6 +1058,7 @@ class RemoteClient(
     private fun launchRequest(
         kind: String,
         payload: ByteArray,
+        timeoutMillis: Long? = null,
         onError: ((String, String) -> Unit)? = null,
         onSuccess: (ByteArray) -> Unit = {},
     ): Boolean {
@@ -1062,6 +1071,7 @@ class RemoteClient(
             generation = requestContext.lifecycleGeneration,
             active = requestContext.transport,
             response = response,
+            timeoutMillis = timeoutMillis,
             onSuccess = onSuccess,
             onError = onError,
         )
@@ -1086,12 +1096,18 @@ class RemoteClient(
         generation: Long,
         active: RemoteTransport,
         response: Deferred<RemoteResponse>,
+        timeoutMillis: Long? = null,
         onSuccess: (ByteArray) -> Unit = {},
         onError: ((String, String) -> Unit)? = null,
     ): Boolean {
         val accepted = launchOwned(generation) {
             try {
-                when (val result = response.await()) {
+                val result = if (timeoutMillis == null) {
+                    response.await()
+                } else {
+                    withTimeout(timeoutMillis) { response.await() }
+                }
+                when (result) {
                     is RemoteResponse.Error -> {
                         synchronized(lifecycleLock) {
                             if (isCurrent(generation, active)) onError?.invoke(result.code, result.message)
@@ -1108,6 +1124,13 @@ class RemoteClient(
                         if (isCurrent(generation, active)) {
                             onSuccess(result.payload)
                         }
+                    }
+                }
+            } catch (_: TimeoutCancellationException) {
+                active.abandonRequest(response)
+                synchronized(lifecycleLock) {
+                    if (isCurrent(generation, active)) {
+                        onError?.invoke("request.timeout", "Conversation refresh timed out. Retrying…")
                     }
                 }
             } catch (_: kotlinx.coroutines.CancellationException) {
@@ -1547,6 +1570,7 @@ class RemoteClient(
         const val UPLOAD_CLEANUP_TIMEOUT_MILLIS = 2_000L
         const val UPLOAD_RESUME_TIMEOUT_MILLIS = 2 * 60_000L
         const val TERMINAL_SUBMIT_SETTLE_MILLIS = 75L
+        const val PREVIEW_REFRESH_TIMEOUT_MILLIS = 8_000L
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }
 }

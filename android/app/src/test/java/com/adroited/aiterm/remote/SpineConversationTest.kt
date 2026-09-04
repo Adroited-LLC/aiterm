@@ -142,14 +142,29 @@ class SpineConversationTest {
     @Test
     fun unknownKindsAreIgnoredWithoutStoppingKnownEvents() {
         val store = SpineConversationStore()
-        store.apply(
-            page(
-                event(1, "future_telemetry"),
-                event(2, "user_message", id = "u1", text = "still here"),
-            ),
-        )
+        store.apply(page(event(1, "future_telemetry")))
+        assertEquals(1, store.lastSeq)
+
+        store.apply(page(event(2, "user_message", id = "u1", text = "still here")))
         assertEquals(listOf("u1"), store.items.map(Item::key))
         assertEquals(2, store.lastSeq)
+    }
+
+    @Test
+    fun ringGapDropsUnverifiableRowsAndResumesAtDesktopOldestSequence() {
+        val store = SpineConversationStore()
+        store.apply(page(event(1, "user_message", id = "old", text = "too old")))
+
+        store.apply(
+            page(
+                event(50, "agent_text", id = "kept", text = "available", done = true),
+                oldestSeq = 50,
+                latestSeq = 50,
+            ),
+        )
+
+        assertEquals(50, store.lastSeq)
+        assertEquals(listOf("kept"), store.items.map(Item::key))
     }
 
     @Test
@@ -197,7 +212,16 @@ class SpineConversationTest {
         vararg events: SpineEventWire,
         epoch: Long = 1,
         live: Boolean = true,
-    ) = SpineConversationPage(epoch, live, hasMore = false, events = events.toList())
+        oldestSeq: Long = events.firstOrNull()?.seq ?: 0L,
+        latestSeq: Long = events.lastOrNull()?.seq ?: 0L,
+    ) = SpineConversationPage(
+        epoch,
+        live,
+        hasMore = false,
+        oldestSeq = oldestSeq,
+        latestSeq = latestSeq,
+        events = events.toList(),
+    )
 
     private fun event(
         seq: Long,

@@ -32,6 +32,8 @@ internal data class SpineSnapshotWire(
     val epoch: Long,
     val live: Boolean,
     @SerialName("has_more") val hasMore: Boolean,
+    @SerialName("oldest_seq") val oldestSeq: Long = 0L,
+    @SerialName("latest_seq") val latestSeq: Long = 0L,
     val events: List<SpineEventWire>,
 )
 
@@ -39,6 +41,8 @@ internal data class SpineConversationPage(
     val epoch: Long,
     val live: Boolean,
     val hasMore: Boolean,
+    val oldestSeq: Long = 0L,
+    val latestSeq: Long = 0L,
     val events: List<SpineEventWire>,
 )
 
@@ -134,7 +138,28 @@ internal class SpineConversationStore {
         }
 
     fun apply(page: SpineConversationPage): List<Item> {
-        replay(page.epoch, page.live, page.events.mapNotNull(::parse))
+        if (epoch != 0L && page.epoch != 0L && page.epoch != epoch) clear()
+        // A bounded desktop ring may have advanced past a phone that slept.
+        // Keeping the phone's older rows while applying a discontinuous tail
+        // looks plausible but is not truthful, so rebuild from the oldest
+        // page the desktop can still supply.
+        if (lastSeq > 0L && page.oldestSeq > 0L && lastSeq + 1L < page.oldestSeq) clear()
+        if (page.epoch != 0L) epoch = page.epoch
+        live = page.live
+
+        // Advance across every wire event, including a future event kind this
+        // version cannot draw. Otherwise one unknown event at the head of the
+        // next page pins the cursor and every poll downloads it forever.
+        page.events.sortedBy { it.seq }.forEach { wire ->
+            if (wire.seq <= lastSeq) return@forEach
+            if (lastSeq > 0L && wire.seq > lastSeq + 1L) {
+                rows.clear(); rowIndex.clear(); dirty = true
+                phase = SpinePhase.Idle; phaseDetail = ""; phaseSeen = false
+                currentTurn = null; turnOpen = null
+            }
+            parse(wire)?.let(::applyEvent)
+            lastSeq = wire.seq
+        }
         return items
     }
 

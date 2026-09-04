@@ -10,6 +10,14 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RemoteCommandsTest {
+    @Serializable
+    private data class LegacySpineSnapshot(
+        val epoch: Long,
+        val live: Boolean,
+        @SerialName("has_more") val hasMore: Boolean,
+        val events: List<SpineEventWire>,
+    )
+
     @Test
     fun terminalInputUsesTheExactStrictRustPayloadShape() {
         assertArrayEquals(
@@ -53,6 +61,33 @@ class RemoteCommandsTest {
         )
 
         assertEquals("2026-08-29T23:42:00Z", messages.single().at)
+    }
+
+    @OptIn(ExperimentalSerializationApi::class)
+    @Test
+    fun spineSnapshotCarriesBoundsAndAcceptsAnOlderDesktopWithoutThem() {
+        val cbor = Cbor {
+            encodeDefaults = true
+            useDefiniteLengthEncoding = true
+        }
+        val event = SpineEventWire(7, 3, "session-1", "codex", 9, "future_event")
+        val current = RemoteCommands.spinePage(
+            cbor.encodeToByteArray(
+                SpineSnapshotWire.serializer(),
+                SpineSnapshotWire(3, true, false, 4, 7, listOf(event)),
+            ),
+        )
+        assertEquals(4, current.oldestSeq)
+        assertEquals(7, current.latestSeq)
+
+        val legacy = RemoteCommands.spinePage(
+            cbor.encodeToByteArray(
+                LegacySpineSnapshot.serializer(),
+                LegacySpineSnapshot(3, true, false, listOf(event)),
+            ),
+        )
+        assertEquals(0, legacy.oldestSeq)
+        assertEquals(0, legacy.latestSeq)
     }
 
     @OptIn(ExperimentalSerializationApi::class)
