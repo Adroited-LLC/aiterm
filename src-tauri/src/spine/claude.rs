@@ -53,7 +53,13 @@ pub fn open(session_id: &str) -> Option<ClaudeAdapter> {
     if backend.id() != "claude" {
         return None;
     }
-    Some(ClaudeAdapter { path, offset: 0, pending: Vec::new(), ident: None, turn: None })
+    Some(ClaudeAdapter {
+        path,
+        offset: 0,
+        pending: Vec::new(),
+        ident: None,
+        turn: None,
+    })
 }
 
 impl Adapter for ClaudeAdapter {
@@ -93,7 +99,9 @@ impl Adapter for ClaudeAdapter {
             return out;
         }
 
-        let Ok(mut file) = std::fs::File::open(&self.path) else { return out };
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return out;
+        };
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return out;
         }
@@ -133,7 +141,9 @@ impl Adapter for ClaudeAdapter {
 
 impl ClaudeAdapter {
     fn read_line(&mut self, raw: &[u8], out: &mut Vec<(u64, Kind)>) {
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else { return };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else {
+            return;
+        };
         // Subagent chatter (`isSidechain`) is a conversation of its own and
         // harness-injected text (`isMeta`: a loaded skill's body, an image's
         // dimensions) was never said by the person. `conversation_rich` skips
@@ -156,11 +166,19 @@ impl ClaudeAdapter {
             // The one system line that says something: the turn is over.
             // `away_summary`, `informational` and the rest are the harness
             // talking about itself. [observed: Claude Code 2.1.258]
-            Some("system") if v.get("subtype").and_then(|s| s.as_str()) == Some("turn_duration") => {
+            Some("system")
+                if v.get("subtype").and_then(|s| s.as_str()) == Some("turn_duration") =>
+            {
                 // A tail that started mid-file has not seen the turn open;
                 // the line's own uuid at least names it stably.
                 let turn = self.turn.take().unwrap_or_else(|| uuid.to_string());
-                out.push((ts, Kind::TurnEnded { turn, reason: "completed".into() }));
+                out.push((
+                    ts,
+                    Kind::TurnEnded {
+                        turn,
+                        reason: "completed".into(),
+                    },
+                ));
             }
             // `attachment`, `summary`, `mode`, `permission-mode`, `ai-title`,
             // `last-prompt`, `bridge-session`, `file-history-*`, `cost-state`,
@@ -178,21 +196,36 @@ impl ClaudeAdapter {
     ) {
         match v.pointer("/message/content") {
             Some(serde_json::Value::String(s)) => {
-                if let Some(stdout) = between(s, "<local-command-stdout>", "</local-command-stdout>")
+                if let Some(stdout) =
+                    between(s, "<local-command-stdout>", "</local-command-stdout>")
                 {
                     // The second half of a slash command: what the command
                     // printed, on its own `user` line. It answers the command
                     // rather than opening a turn.
                     out.push((
                         ts,
-                        Kind::UserMessage { id: uuid.to_string(), text: stdout.to_string() },
+                        Kind::UserMessage {
+                            id: uuid.to_string(),
+                            text: stdout.to_string(),
+                        },
                     ));
                     return;
                 }
                 let text = slash_command(s).unwrap_or_else(|| s.clone());
                 self.turn = Some(uuid.to_string());
-                out.push((ts, Kind::TurnStarted { turn: uuid.to_string() }));
-                out.push((ts, Kind::UserMessage { id: uuid.to_string(), text }));
+                out.push((
+                    ts,
+                    Kind::TurnStarted {
+                        turn: uuid.to_string(),
+                    },
+                ));
+                out.push((
+                    ts,
+                    Kind::UserMessage {
+                        id: uuid.to_string(),
+                        text,
+                    },
+                ));
             }
             Some(serde_json::Value::Array(blocks)) => {
                 for (i, b) in blocks.iter().enumerate() {
@@ -201,8 +234,7 @@ impl ClaudeAdapter {
                             let Some(id) = b.get("tool_use_id").and_then(|t| t.as_str()) else {
                                 continue;
                             };
-                            let failed =
-                                b.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+                            let failed = b.get("is_error").and_then(|e| e.as_bool()) == Some(true);
                             out.push((
                                 ts,
                                 Kind::ToolCallUpdate {
@@ -222,7 +254,9 @@ impl ClaudeAdapter {
                         // interrupted by user]". Said on the person's behalf,
                         // so it shows — but it opens no turn.
                         Some("text") => {
-                            let Some(t) = b.get("text").and_then(|t| t.as_str()) else { continue };
+                            let Some(t) = b.get("text").and_then(|t| t.as_str()) else {
+                                continue;
+                            };
                             out.push((
                                 ts,
                                 Kind::UserMessage {
@@ -244,7 +278,9 @@ impl ClaudeAdapter {
 /// Claude Code appends the record after the block closes, so `done` is always
 /// true and a consumer never has to stitch deltas.
 fn assistant_line(v: &serde_json::Value, uuid: &str, ts: u64, out: &mut Vec<(u64, Kind)>) {
-    let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else { return };
+    let Some(blocks) = v.pointer("/message/content").and_then(|c| c.as_array()) else {
+        return;
+    };
     // `<message.id>:<apiBlockIndex>` is the API's own name for the block and
     // survives a re-read. Before 2.1.252 the line carried no `apiBlockIndex`
     // and every block of one message still wrote `content` of length 1, so
@@ -259,27 +295,50 @@ fn assistant_line(v: &serde_json::Value, uuid: &str, ts: u64, out: &mut Vec<(u64
         _ => uuid.to_string(),
     };
     for (i, b) in blocks.iter().enumerate() {
-        let id = if blocks.len() > 1 { format!("{base}.{i}") } else { base.clone() };
+        let id = if blocks.len() > 1 {
+            format!("{base}.{i}")
+        } else {
+            base.clone()
+        };
         match b.get("type").and_then(|t| t.as_str()) {
             Some("thinking") => {
-                let text = b.get("thinking").and_then(|t| t.as_str()).unwrap_or_default();
+                let text = b
+                    .get("thinking")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default();
                 if text.is_empty() {
                     // A redacted or signature-only thinking block: nothing to show.
                     continue;
                 }
-                out.push((ts, Kind::AgentThought { id, text: text.to_string(), done: true }));
+                out.push((
+                    ts,
+                    Kind::AgentThought {
+                        id,
+                        text: text.to_string(),
+                        done: true,
+                    },
+                ));
             }
             Some("text") => {
                 let text = b.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                 if text.is_empty() {
                     continue;
                 }
-                out.push((ts, Kind::AgentText { id, text: text.to_string(), done: true }));
+                out.push((
+                    ts,
+                    Kind::AgentText {
+                        id,
+                        text: text.to_string(),
+                        done: true,
+                    },
+                ));
             }
             Some("tool_use") => {
                 // The tool's own id, so the `tool_result` that lands later
                 // updates this card instead of adding one.
-                let Some(call_id) = b.get("id").and_then(|i| i.as_str()) else { continue };
+                let Some(call_id) = b.get("id").and_then(|i| i.as_str()) else {
+                    continue;
+                };
                 let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                 let input = b.get("input");
                 out.push((
@@ -326,9 +385,9 @@ fn title(name: &str, input: Option<&serde_json::Value>) -> String {
     let picked = match name {
         // Multi-line commands are common; the first line is the verb.
         "Bash" | "Monitor" => field("command").and_then(|c| c.lines().next()),
-        "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
-            field("file_path").or_else(|| field("notebook_path")).or_else(|| field("path"))
-        }
+        "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => field("file_path")
+            .or_else(|| field("notebook_path"))
+            .or_else(|| field("path")),
         "Grep" | "Glob" => field("pattern"),
         "WebSearch" | "ToolSearch" => field("query"),
         "WebFetch" => field("url"),
@@ -371,8 +430,14 @@ fn result_text(content: Option<&serde_json::Value>) -> Option<String> {
 /// [observed: Claude Code 2.1.226 – 2.1.259]
 fn slash_command(s: &str) -> Option<String> {
     let name = between(s, "<command-name>", "</command-name>")?.trim();
-    let args = between(s, "<command-args>", "</command-args>").unwrap_or("").trim();
-    Some(if args.is_empty() { name.to_string() } else { format!("{name} {args}") })
+    let args = between(s, "<command-args>", "</command-args>")
+        .unwrap_or("")
+        .trim();
+    Some(if args.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {args}")
+    })
 }
 
 fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -396,8 +461,8 @@ fn identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
 
 /// "2026-09-02T20:39:29.099Z" → millis. Enough of ISO 8601 for the timestamps
 /// the transcripts write; anything else gets `None` and the caller stamps now.
-/// (`remote_api` keeps a seconds-only sibling of this; the spine needs the
-/// millis, because two blocks of one message land in the same second.)
+/// The spine needs millis because two blocks of one message can land in the
+/// same second.
 fn iso_to_ms(s: &str) -> Option<u64> {
     let (date, rest) = s.split_once('T')?;
     let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
@@ -405,7 +470,10 @@ fn iso_to_ms(s: &str) -> Option<u64> {
     let time = rest.trim_end_matches('Z');
     let time = time.split(['+', '-']).next().unwrap_or(time);
     let mut t = time.split(':');
-    let (h, mi) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+    let (h, mi) = (
+        t.next()?.parse::<i64>().ok()?,
+        t.next()?.parse::<i64>().ok()?,
+    );
     let secs_part = t.next()?;
     let (sec, frac) = match secs_part.split_once('.') {
         Some((s, f)) => (s.parse::<i64>().ok()?, f),
@@ -429,13 +497,17 @@ fn busiest_transcript() -> Option<PathBuf> {
     let root = dirs::home_dir()?.join(".claude/projects");
     let mut best: Option<(u64, PathBuf)> = None;
     for project in std::fs::read_dir(root).ok()?.flatten() {
-        let Ok(files) = std::fs::read_dir(project.path()) else { continue };
+        let Ok(files) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
         for f in files.flatten() {
             let p = f.path();
             if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Ok(len) = f.metadata().map(|m| m.len()) else { continue };
+            let Ok(len) = f.metadata().map(|m| m.len()) else {
+                continue;
+            };
             if best.as_ref().is_none_or(|(b, _)| len > *b) {
                 best = Some((len, p));
             }
@@ -506,8 +578,11 @@ mod tests {
     }
 
     fn write(path: &Path, bytes: &str) {
-        let mut f =
-            std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         f.write_all(bytes.as_bytes()).unwrap();
     }
 
@@ -527,7 +602,9 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                Kind::TurnStarted { turn: "2d2da9bc-e53a-44ce-8c35-abda6dba6de3".into() },
+                Kind::TurnStarted {
+                    turn: "2d2da9bc-e53a-44ce-8c35-abda6dba6de3".into()
+                },
                 Kind::UserMessage {
                     id: "2d2da9bc-e53a-44ce-8c35-abda6dba6de3".into(),
                     text: "plugged back in. install it and take the screenshot".into(),
@@ -611,7 +688,9 @@ mod tests {
         assert_eq!(
             kinds(&[SLASH, SLASH_STDOUT]),
             vec![
-                Kind::TurnStarted { turn: "9a796962-55c5-47cc-a818-96e426b9980e".into() },
+                Kind::TurnStarted {
+                    turn: "9a796962-55c5-47cc-a818-96e426b9980e".into()
+                },
                 Kind::UserMessage {
                     id: "9a796962-55c5-47cc-a818-96e426b9980e".into(),
                     text: "/login".into(),
@@ -630,14 +709,18 @@ mod tests {
         assert_eq!(
             kinds(&[USER, TEXT, TURN_DURATION]),
             vec![
-                Kind::TurnStarted { turn: "2d2da9bc-e53a-44ce-8c35-abda6dba6de3".into() },
+                Kind::TurnStarted {
+                    turn: "2d2da9bc-e53a-44ce-8c35-abda6dba6de3".into()
+                },
                 Kind::UserMessage {
                     id: "2d2da9bc-e53a-44ce-8c35-abda6dba6de3".into(),
                     text: "plugged back in. install it and take the screenshot".into(),
                 },
                 Kind::AgentText {
                     id: "msg_011CefFwY5xDrhoxhgvJhGs3:1".into(),
-                    text: "I'll check my notes on the aiterm repo setup first, then pull and launch.".into(),
+                    text:
+                        "I'll check my notes on the aiterm repo setup first, then pull and launch."
+                            .into(),
                     done: true,
                 },
                 Kind::TurnEnded {
@@ -659,12 +742,22 @@ mod tests {
         let (head, tail) = USER.split_at(120);
         write(&path, head);
         let mut a = adapter_over(&path);
-        assert!(a.poll().is_empty(), "an unterminated line is not a line yet");
+        assert!(
+            a.poll().is_empty(),
+            "an unterminated line is not a line yet"
+        );
         write(&path, tail);
         assert!(a.poll().is_empty(), "still no newline");
         write(&path, "\n");
-        assert_eq!(a.poll().len(), 2, "turn_started + user_message once the line closes");
-        assert!(a.poll().is_empty(), "and nothing on a poll with nothing new");
+        assert_eq!(
+            a.poll().len(),
+            2,
+            "turn_started + user_message once the line closes"
+        );
+        assert!(
+            a.poll().is_empty(),
+            "and nothing on a poll with nothing new"
+        );
     }
 
     #[test]
@@ -697,7 +790,11 @@ mod tests {
         let path = scratch("late");
         let mut a = adapter_over(&path);
         assert!(a.bootstrap().is_empty());
-        assert_eq!(a.watch_paths().len(), 2, "the file and the folder it will appear in");
+        assert_eq!(
+            a.watch_paths().len(),
+            2,
+            "the file and the folder it will appear in"
+        );
         write(&path, &format!("{USER}\n"));
         assert_eq!(a.poll().len(), 2);
     }
@@ -713,8 +810,14 @@ mod tests {
         assert_eq!(title("Agent", Some(&input)), "Survey the adapters");
         assert_eq!(category("Agent"), ToolCategory::Think);
         // An MCP tool has no field we can guess at: it wears its own name.
-        assert_eq!(title("mcp__claude-in-chrome__computer", None), "mcp__claude-in-chrome__computer");
-        assert_eq!(category("mcp__claude-in-chrome__computer"), ToolCategory::Other);
+        assert_eq!(
+            title("mcp__claude-in-chrome__computer", None),
+            "mcp__claude-in-chrome__computer"
+        );
+        assert_eq!(
+            category("mcp__claude-in-chrome__computer"),
+            ToolCategory::Other
+        );
     }
 
     /// The real thing: resolve the busiest transcript on this machine through
@@ -753,7 +856,10 @@ mod tests {
             took.as_millis()
         );
         assert!(!events.is_empty());
-        assert!(a.poll().is_empty(), "a second poll on a file nobody wrote to is empty");
+        assert!(
+            a.poll().is_empty(),
+            "a second poll on a file nobody wrote to is empty"
+        );
     }
 
     fn kind_name(k: &Kind) -> &'static str {

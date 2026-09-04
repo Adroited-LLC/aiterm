@@ -7,9 +7,7 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{
-    self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError,
-};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -1335,9 +1333,7 @@ impl TabRegistry {
         let desktop_open = launch.desktop_pending;
         {
             let mut maps = self.inner.maps.lock().unwrap();
-            if maps.by_id.len().saturating_add(maps.pending_slots.len())
-                >= MAX_TAB_ROSTER_ENTRIES
-            {
+            if maps.by_id.len().saturating_add(maps.pending_slots.len()) >= MAX_TAB_ROSTER_ENTRIES {
                 return Err(TabError::new(
                     "tab.too_many_tabs",
                     "the recoverable tab roster limit was reached",
@@ -1832,12 +1828,8 @@ impl TabRegistry {
         self.inner.maps.lock().ok()?.by_pty.get(&pty_id).cloned()
     }
 
-    // Session-keyed views for the phone listener (`remote_api`). That
-    // protocol authorizes the phone at the listener (token + pinned TLS),
-    // then addresses tabs by the session they run — not by tab id, and not
-    // through an input-owner attachment. These helpers answer by session id
-    // and write through the backend directly, leaving desktop input
-    // ownership untouched.
+    // Session-keyed views shared by the authenticated remote gateway and the
+    // spine. They address tabs by the session they run rather than by tab id.
 
     fn cells(&self) -> Vec<Arc<TabCell>> {
         let maps = self.inner.maps.lock().unwrap();
@@ -1851,7 +1843,9 @@ impl TabRegistry {
         self.cells().into_iter().find(|tab| {
             let live = tab.live.lock().unwrap();
             live.descriptor.state == TabState::Running
-                && live.descriptor.session_id.as_deref() == Some(session_id)
+                && (live.descriptor.session_id.as_deref() == Some(session_id)
+                    || live.descriptor.resumed_id.as_deref() == Some(session_id)
+                    || live.descriptor.slot_id == session_id)
         })
     }
 
@@ -1862,7 +1856,10 @@ impl TabRegistry {
             .filter_map(|tab| {
                 let live = tab.live.lock().unwrap();
                 if live.descriptor.state == TabState::Running {
-                    live.descriptor.session_id.clone()
+                    live.descriptor
+                        .session_id
+                        .clone()
+                        .or_else(|| live.descriptor.resumed_id.clone())
                 } else {
                     None
                 }
@@ -1877,8 +1874,8 @@ impl TabRegistry {
 
     /// What each bound session's terminal is doing, as cadence evidence:
     /// "output" while bytes flowed recently, "idle" otherwise. Weak on its
-    /// own — the transcript outranks it, and `remote_api` upgrades verdicts
-    /// with `transcript_state` before a phone sees them.
+    /// own — the spine's transcript evidence outranks it before a phone sees
+    /// the resulting phase.
     pub fn session_activities(&self) -> Vec<(String, String)> {
         self.cells()
             .iter()
@@ -1887,11 +1884,17 @@ impl TabRegistry {
                 if live.descriptor.state != TabState::Running {
                     return None;
                 }
-                let session_id = live.descriptor.session_id.clone()?;
+                let session_id = live
+                    .descriptor
+                    .session_id
+                    .clone()
+                    .or_else(|| live.descriptor.resumed_id.clone())?;
                 drop(live);
-                let recent =
-                    tab.last_activity.lock().unwrap().elapsed() < Duration::from_secs(10);
-                Some((session_id, if recent { "output" } else { "idle" }.to_string()))
+                let recent = tab.last_activity.lock().unwrap().elapsed() < Duration::from_secs(10);
+                Some((
+                    session_id,
+                    if recent { "output" } else { "idle" }.to_string(),
+                ))
             })
             .collect()
     }
@@ -2030,44 +2033,9 @@ fn emit_desktop_exit(app: &AppHandle, tab_id: &TabId, exit: &TabExit) {
     );
 }
 
-/// Project one registry event into the phone listener's session-keyed
-/// stream (`remote_api`): a tab binding or losing a session moves the
-/// phone's list, and a Running→Exited transition is that session's exit.
-/// `known` remembers each tab's last-seen (session, state) so both are
-/// announced exactly once.
-fn note_tab_for_phone(
-    app: &AppHandle,
-    known: &mut HashMap<TabId, (Option<String>, TabState)>,
-    tab: &TabDescriptor,
-    list_moved: &mut bool,
-) {
-    let session = tab.session_id().map(str::to_owned);
-    let state = tab.state().clone();
-    match known.get(tab.id()) {
-        Some((prev_session, prev_state)) => {
-            if *prev_session != session {
-                *list_moved = true;
-            }
-            if *prev_state == TabState::Running && state == TabState::Exited {
-                crate::remote_api::notify(
-                    app,
-                    crate::remote_api::Event::SessionExit {
-                        session_id: session.clone(),
-                        code: tab.exit().and_then(|exit| exit.code()),
-                    },
-                );
-                *list_moved = true;
-            }
-        }
-        None => {
-            if session.is_some() {
-                *list_moved = true;
-            }
-        }
-    }
-    known.insert(tab.id().clone(), (session, state));
-}
-
+/// Project one registry event into unexpected desktop exits. A tab binding or
+/// losing a session moves the session list, and a Running→Exited transition
+/// is that session's exit.
 fn unexpected_desktop_exits(change: &TabRegistryEvent) -> Vec<(TabId, TabExit)> {
     fn unexpected(tab: &TabDescriptor) -> Option<(TabId, TabExit)> {
         tab.exit()
@@ -2097,33 +2065,9 @@ pub fn start_desktop_registry_bridge(
     std::thread::Builder::new()
         .name("desktop-tab-registry".to_string())
         .spawn(move || {
-            let mut known: HashMap<TabId, (Option<String>, TabState)> = HashMap::new();
             loop {
                 match changes.recv_timeout(Duration::from_millis(250)) {
                     Ok(change) => {
-                        let mut list_moved = false;
-                        match &change {
-                            TabRegistryEvent::Snapshot { tabs, .. } => {
-                                for tab in tabs {
-                                    note_tab_for_phone(&app, &mut known, tab, &mut list_moved);
-                                }
-                            }
-                            TabRegistryEvent::Opened { tab, .. }
-                            | TabRegistryEvent::Changed { tab, .. } => {
-                                note_tab_for_phone(&app, &mut known, tab, &mut list_moved);
-                            }
-                            TabRegistryEvent::Removed { tab_id, .. } => {
-                                if known.remove(tab_id).is_some() {
-                                    list_moved = true;
-                                }
-                            }
-                        }
-                        if list_moved {
-                            crate::remote_api::notify(
-                                &app,
-                                crate::remote_api::Event::SessionsChanged,
-                            );
-                        }
                         let sessions: Vec<String> = match &change {
                             TabRegistryEvent::Snapshot { tabs, .. } => tabs
                                 .iter()
@@ -2160,16 +2104,6 @@ pub fn start_desktop_registry_bridge(
                     // tailed, and only when the phase actually changed — this
                     // fires four times a second while output flows.
                     crate::spine::push_phase(&app, &session_id, "output");
-                    // A phone shows "working" off terminal cadence the moment
-                    // bytes flow; the transcript upgrades or overrides this on
-                    // the next sessions poll.
-                    crate::remote_api::notify(
-                        &app,
-                        crate::remote_api::Event::Activity {
-                            session_id,
-                            activity: "output".into(),
-                        },
-                    );
                 }
             }
         })
@@ -3017,11 +2951,12 @@ impl PtySink for TabSink {
                     live.enqueue_remote_diff(&live.descriptor.id.clone(), diff);
                 }
                 let changed = if let Some(title) = damage.title {
-                    let other = live.descriptor.text_bytes().saturating_sub(live.descriptor.title.len());
-                    let title = truncate_utf8(
-                        &title,
-                        MAX_TAB_DESCRIPTOR_TEXT_BYTES.saturating_sub(other),
-                    );
+                    let other = live
+                        .descriptor
+                        .text_bytes()
+                        .saturating_sub(live.descriptor.title.len());
+                    let title =
+                        truncate_utf8(&title, MAX_TAB_DESCRIPTOR_TEXT_BYTES.saturating_sub(other));
                     live.descriptor.title = title.clone();
                     live.enqueue_control_all(TabEvent::Title(title));
                     Some(live.descriptor.clone())

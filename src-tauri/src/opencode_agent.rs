@@ -93,7 +93,9 @@ pub fn opencode_default_target() -> AgentTarget {
 fn apply_agent_env(cmd: &mut std::process::Command, provider: Option<&str>, model: Option<&str>) {
     let Some(pid) = provider else { return };
     let providers = crate::providers::load_providers();
-    let Some(p) = providers.iter().find(|p| p.id == pid) else { return };
+    let Some(p) = providers.iter().find(|p| p.id == pid) else {
+        return;
+    };
     if p.is_openrouter() && !p.api_key.is_empty() {
         cmd.env("OPENROUTER_API_KEY", &p.api_key);
     }
@@ -134,9 +136,15 @@ fn session_id_from_events(stdout: &str) -> Option<String> {
 fn text_from_events(stdout: &str) -> String {
     let mut out = String::new();
     for line in stdout.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if v.get("type").and_then(|t| t.as_str()) == Some("text") {
-            if let Some(t) = v.get("part").and_then(|p| p.get("text")).and_then(|t| t.as_str()) {
+            if let Some(t) = v
+                .get("part")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+            {
                 out.push_str(t);
             }
         }
@@ -171,7 +179,9 @@ fn run_bounded_output(mut child: std::process::Child, ceiling: Duration) -> Resu
         }
     }
     let _ = child.wait();
-    reader.join().map_err(|_| "stdout reader panicked".to_string())
+    reader
+        .join()
+        .map_err(|_| "stdout reader panicked".to_string())
 }
 
 /// Dispatch one task and return the agent's final answer.
@@ -238,7 +248,9 @@ pub fn dispatch(
     // forever (and would corrupt the protocol). Headless runs read no input.
     cmd.stdin(std::process::Stdio::null());
 
-    let child = cmd.spawn().map_err(|e| format!("could not start opencode run: {e}"))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start opencode run: {e}"))?;
     let stdout = run_bounded_output(child, RUN_CEILING)?;
 
     let session_id = session_id_from_events(&stdout)
@@ -269,10 +281,8 @@ pub async fn opencode_dispatch(
     provider: Option<String>,
     model: Option<String>,
 ) -> Result<Report, String> {
-    crate::run_blocking(move || {
-        dispatch(&prompt, &cwd, provider.as_deref(), model.as_deref())
-    })
-    .await
+    crate::run_blocking(move || dispatch(&prompt, &cwd, provider.as_deref(), model.as_deref()))
+        .await
 }
 
 #[cfg(test)]
@@ -285,10 +295,14 @@ mod tests {
     #[test]
     fn parses_session_id_and_text_from_the_event_stream() {
         let stream = concat!(
-            r#"{"type":"step_start","sessionID":"ses_abc","part":{"type":"step-start"}}"#, "\n",
-            r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"PO"}}"#, "\n",
-            r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"NG"}}"#, "\n",
-            r#"{"type":"step_finish","sessionID":"ses_abc","part":{"type":"step-finish"}}"#, "\n",
+            r#"{"type":"step_start","sessionID":"ses_abc","part":{"type":"step-start"}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"PO"}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"NG"}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_abc","part":{"type":"step-finish"}}"#,
+            "\n",
         );
         assert_eq!(session_id_from_events(stream).as_deref(), Some("ses_abc"));
         assert_eq!(text_from_events(stream), "PONG");
@@ -331,7 +345,11 @@ mod tests {
         .expect("dispatch should return a report");
         eprintln!("session: {}", report.session_id);
         eprintln!("report : {:?}", report.text);
-        assert!(report.text.to_uppercase().contains("PONG"), "expected PONG, got {:?}", report.text);
+        assert!(
+            report.text.to_uppercase().contains("PONG"),
+            "expected PONG, got {:?}",
+            report.text
+        );
         // Don't litter the real db: dump+delete the probe session, then remove
         // the dump the trash step wrote into the temp dir.
         let _ = crate::opencode::delete_to_trash(&report.session_id, &cwd);

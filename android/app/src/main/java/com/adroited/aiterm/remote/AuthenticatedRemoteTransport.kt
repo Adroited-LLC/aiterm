@@ -44,7 +44,7 @@ interface DirectRemoteSocketDialer : RemoteSocketDialer {
     suspend fun openDirect(desktop: PairedDesktop, offer: RemoteDirectOffer): RemoteBinarySocket
 }
 
-enum class RemotePath { LAN, VPN, RELAY, DIRECT, UNKNOWN }
+enum class RemotePath { LAN, VPN, RELAY, DIRECT, IROH, UNKNOWN }
 
 data class RemoteEndpoint(
     val host: String,

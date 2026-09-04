@@ -1,13 +1,11 @@
 package com.adroited.aiterm.remote
 
+import android.content.Context
 import com.adroited.aiterm.pairing.PairedDesktop
+import com.adroited.aiterm.pairing.RemoteNetworkStack
 import com.adroited.aiterm.pairing.tls13Context
 import com.adroited.aiterm.security.PinnedSpkiTrustManager
 import java.security.SecureRandom
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Socket
-import java.net.SocketAddress
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -36,9 +34,29 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 /** Opens only TLS 1.3 WebSockets whose SPKI and hostname both match pairing. */
-class OkHttpRemoteSocketDialer : DirectRemoteSocketDialer {
+class OkHttpRemoteSocketDialer(private val context: Context? = null) : DirectRemoteSocketDialer {
     override suspend fun open(desktop: PairedDesktop): RemoteBinarySocket = coroutineScope {
         require(desktop.hosts.isNotEmpty())
+        if (desktop.networkStack == RemoteNetworkStack.IROH) {
+            val appContext = context
+                ?: throw RemoteProtocolException("Iroh is unavailable without an Android context")
+            val nodeId = desktop.irohNodeId
+                ?: throw RemoteProtocolException("the paired desktop has no Iroh node id")
+            val localPort = try {
+                IrohBridge.localPortFor(appContext, nodeId, desktop.irohRelayUrl)
+            } catch (error: Exception) {
+                throw RemoteProtocolException("Iroh could not reach the desktop", error)
+            }
+            val client = pinnedClient(
+                desktop.serverSpkiFingerprint,
+                LoopbackRedirectingSocketFactory(localPort),
+            )
+            return@coroutineScope openEndpoint(
+                client,
+                endpoint(desktop.hosts.first(), desktop.port),
+                RemotePath.IROH,
+            )
+        }
         val client = pinnedClient(desktop.serverSpkiFingerprint)
         val endpoints = orderedEndpoints(desktop)
         val winner = CompletableDeferred<RemoteBinarySocket>()
@@ -94,7 +112,7 @@ class OkHttpRemoteSocketDialer : DirectRemoteSocketDialer {
         try {
             val client = pinnedClient(
                 desktop.serverSpkiFingerprint,
-                RedirectingSocketFactory(tunnel.localPort),
+                LoopbackRedirectingSocketFactory(tunnel.localPort),
             )
             val socket = openEndpoint(client, endpoint(relayHost, relayPort), RemotePath.DIRECT)
             TunnelOwnedSocket(socket, tunnel)
@@ -169,41 +187,6 @@ class OkHttpRemoteSocketDialer : DirectRemoteSocketDialer {
         override fun close() {
             delegate.close()
             tunnel.close()
-        }
-    }
-
-    private class RedirectingSocketFactory(private val localPort: Int) : SocketFactory() {
-        override fun createSocket(): Socket = RedirectingSocket(localPort)
-
-        override fun createSocket(host: String, port: Int): Socket =
-            createSocket().apply { connect(InetSocketAddress(host, port)) }
-
-        override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
-            createSocket().apply {
-                bind(InetSocketAddress(localHost, localPort))
-                connect(InetSocketAddress(host, port))
-            }
-
-        override fun createSocket(host: InetAddress, port: Int): Socket =
-            createSocket().apply { connect(InetSocketAddress(host, port)) }
-
-        override fun createSocket(
-            address: InetAddress,
-            port: Int,
-            localAddress: InetAddress,
-            localPort: Int,
-        ): Socket = createSocket().apply {
-            bind(InetSocketAddress(localAddress, localPort))
-            connect(InetSocketAddress(address, port))
-        }
-    }
-
-    private class RedirectingSocket(private val localPort: Int) : Socket() {
-        override fun connect(endpoint: SocketAddress?) = connect(endpoint, 0)
-
-        override fun connect(endpoint: SocketAddress?, timeout: Int) {
-            val ipv4Loopback = InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
-            super.connect(InetSocketAddress(ipv4Loopback, localPort), timeout)
         }
     }
 

@@ -454,15 +454,18 @@ pub fn start_hook_drain(app: tauri::AppHandle) {
         }
     })
     .ok()
-    .and_then(|mut w| {
-        match w.watch(&dir, notify::RecursiveMode::NonRecursive) {
+    .and_then(
+        |mut w| match w.watch(&dir, notify::RecursiveMode::NonRecursive) {
             Ok(()) => Some(w),
             Err(e) => {
-                crate::diag!("hook", "phase spool watch failed, falling back to poll: {e}");
+                crate::diag!(
+                    "hook",
+                    "phase spool watch failed, falling back to poll: {e}"
+                );
                 None
             }
-        }
-    });
+        },
+    );
     tauri::async_runtime::spawn(async move {
         let _watcher = watcher;
         let _keepalive = keepalive;
@@ -511,7 +514,9 @@ async fn drain_hook_events(app: &tauri::AppHandle) {
             "hook",
             "{} {} → {phase:?}",
             &session_id[..8.min(session_id.len())],
-            v.get("hook_event_name").and_then(|x| x.as_str()).unwrap_or("?")
+            v.get("hook_event_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?")
         );
         crate::spine::registry::push_hook_phase(app, &session_id, phase).await;
     }
@@ -666,7 +671,10 @@ mod tests {
             "Stop",
         ];
         for event in understood {
-            assert!(HOOK_EVENTS.contains(&event), "{event} is mapped but never installed");
+            assert!(
+                HOOK_EVENTS.contains(&event),
+                "{event} is mapped but never installed"
+            );
             let payload = serde_json::json!({
                 "session_id": "s1",
                 "hook_event_name": event,
@@ -748,7 +756,10 @@ mod tests {
             "background_tasks": [],
             "session_crons": []
         });
-        assert_eq!(hook_verdict(&stop), Some(("s1".to_string(), HookPhase::Stopped)));
+        assert_eq!(
+            hook_verdict(&stop),
+            Some(("s1".to_string(), HookPhase::Stopped))
+        );
 
         // Notification, from the shape the binary builds:
         // {hook_event_name, message, title, notification_type}.
@@ -761,7 +772,10 @@ mod tests {
         });
         assert_eq!(
             hook_verdict(&ask),
-            Some(("s1".to_string(), HookPhase::NeedsYou("permission: Bash".to_string()))),
+            Some((
+                "s1".to_string(),
+                HookPhase::NeedsYou("permission: Bash".to_string())
+            )),
             "the tool is dug out of the harness's own sentence"
         );
 
@@ -771,10 +785,18 @@ mod tests {
             "notification_type": "idle_prompt",
             "message": "Claude is waiting for your input"
         });
-        assert_eq!(hook_verdict(&idle), Some(("s1".to_string(), HookPhase::Idle)));
+        assert_eq!(
+            hook_verdict(&idle),
+            Some(("s1".to_string(), HookPhase::Idle))
+        );
 
         // Every other notification type says nothing about this session.
-        for kind in ["auth_success", "elicitation_dialog", "push_notification", ""] {
+        for kind in [
+            "auth_success",
+            "elicitation_dialog",
+            "push_notification",
+            "",
+        ] {
             let other = serde_json::json!({
                 "session_id": "s1",
                 "hook_event_name": "Notification",
@@ -793,7 +815,10 @@ mod tests {
         });
         assert_eq!(
             hook_verdict(&perm),
-            Some(("s1".to_string(), HookPhase::NeedsYou("permission: Edit".to_string())))
+            Some((
+                "s1".to_string(),
+                HookPhase::NeedsYou("permission: Edit".to_string())
+            ))
         );
 
         // No session id, no session to speak about.
@@ -816,9 +841,15 @@ mod tests {
     #[test]
     fn a_tool_detail_names_its_subject_in_one_short_line() {
         let bash = serde_json::json!({ "command": "npm test\n  --watch" });
-        assert_eq!(tool_detail("Bash", Some(&bash)), "running Bash: npm test --watch");
+        assert_eq!(
+            tool_detail("Bash", Some(&bash)),
+            "running Bash: npm test --watch"
+        );
         let edit = serde_json::json!({ "file_path": "src/main.rs", "old_string": "a" });
-        assert_eq!(tool_detail("Edit", Some(&edit)), "running Edit: src/main.rs");
+        assert_eq!(
+            tool_detail("Edit", Some(&edit)),
+            "running Edit: src/main.rs"
+        );
         // Nothing recognisable to name it by: the tool alone.
         let mcp = serde_json::json!({ "query": "x" });
         assert_eq!(tool_detail("mcp__x__y", Some(&mcp)), "running mcp__x__y");
@@ -841,7 +872,10 @@ mod tests {
             "permission: Bash"
         );
         assert_eq!(
-            permission_detail("Claude needs your permission to read files outside the workspace.", ""),
+            permission_detail(
+                "Claude needs your permission to read files outside the workspace.",
+                ""
+            ),
             "permission: read files outside the workspace"
         );
         assert_eq!(permission_detail("", ""), "permission");
@@ -861,7 +895,13 @@ mod tests {
             "tool_use_id": "toolu_1"
         });
         let mut trimmed = serde_json::Map::new();
-        for key in ["hook_event_name", "session_id", "cwd", "tool_name", "tool_use_id"] {
+        for key in [
+            "hook_event_name",
+            "session_id",
+            "cwd",
+            "tool_name",
+            "tool_use_id",
+        ] {
             trimmed.insert(key.into(), payload[key].clone());
         }
         trimmed.insert("tool_input".into(), trim_tool_input(&payload["tool_input"]));

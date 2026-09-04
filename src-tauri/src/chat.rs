@@ -68,7 +68,11 @@ pub fn parse_transcript(lines: impl Iterator<Item = String>) -> Option<Loaded> {
                 model = model.or_else(|| v.get("model").and_then(|m| m.as_str()).map(String::from));
             }
             Some("aiterm-chat-model") => {
-                model = v.get("model").and_then(|m| m.as_str()).map(String::from).or(model);
+                model = v
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+                    .or(model);
             }
             Some("aiterm-chat-clear") => {
                 cleared += messages.len();
@@ -158,7 +162,11 @@ pub(crate) fn scan_chats_bounded(
             }
             let id = v.get("id")?.as_str()?.to_string();
             let model = v.get("model")?.as_str()?.to_string();
-            let cwd = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let cwd = v
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
             let last_active = std::fs::metadata(&path)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -303,14 +311,21 @@ pub enum Start {
         /// as if it had been typed.
         prompt: Option<String>,
     },
-    Resume { session_id: String },
+    Resume {
+        session_id: String,
+    },
 }
 
 /// Entry point for the `chat` argv mode. Never returns to Tauri.
 pub fn run(start: Start) -> i32 {
     let mut pending = None;
     let (provider_id, mut model, session_id, mut messages, cleared) = match start {
-        Start::Fresh { provider_id, model, session_id, prompt } => {
+        Start::Fresh {
+            provider_id,
+            model,
+            session_id,
+            prompt,
+        } => {
             pending = prompt.filter(|p| !p.trim().is_empty());
             (provider_id, model, session_id, Vec::new(), 0)
         }
@@ -351,7 +366,9 @@ pub fn run(start: Start) -> i32 {
 
     // The transcript, where there is an id to keep one under. Opened for
     // append: a resume continues the same file it loaded.
-    let mut log = session_id.as_deref().and_then(|id| open_transcript(id, &p.id, &model));
+    let mut log = session_id
+        .as_deref()
+        .and_then(|id| open_transcript(id, &p.id, &model));
 
     // Dim banner, plain prompt. The terminal's own line editing does the rest.
     println!("\x1b[2m── {model} · via {} · aiterm chat\x1b[0m", p.name);
@@ -376,29 +393,31 @@ pub fn run(start: Start) -> i32 {
         if let Some(first) = pending.take() {
             println!("{first}");
             buf = first;
-        } else { loop {
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    ended = true; // Ctrl+D or a closed pty
-                    break;
+        } else {
+            loop {
+                let mut line = String::new();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        ended = true; // Ctrl+D or a closed pty
+                        break;
+                    }
+                    Ok(_) => {}
                 }
-                Ok(_) => {}
+                let piece = line.trim_end_matches(['\r', '\n']);
+                match continuation(piece) {
+                    Some(kept) => {
+                        buf.push_str(kept);
+                        buf.push('\n');
+                        print!("\x1b[2m…\x1b[0m ");
+                        let _ = std::io::stdout().flush();
+                    }
+                    None => {
+                        buf.push_str(piece);
+                        break;
+                    }
+                }
             }
-            let piece = line.trim_end_matches(['\r', '\n']);
-            match continuation(piece) {
-                Some(kept) => {
-                    buf.push_str(kept);
-                    buf.push('\n');
-                    print!("\x1b[2m…\x1b[0m ");
-                    let _ = std::io::stdout().flush();
-                }
-                None => {
-                    buf.push_str(piece);
-                    break;
-                }
-            }
-        } }
+        }
         if ended && buf.trim().is_empty() {
             break;
         }
@@ -410,7 +429,10 @@ pub fn run(start: Start) -> i32 {
             "/quit" | "/exit" => break,
             "/clear" => {
                 messages.clear();
-                append(&mut log, &serde_json::json!({"type":"aiterm-chat-clear"}).to_string());
+                append(
+                    &mut log,
+                    &serde_json::json!({"type":"aiterm-chat-clear"}).to_string(),
+                );
                 println!("\x1b[2mFresh conversation — the model remembers nothing above.\x1b[0m");
                 continue;
             }
@@ -429,7 +451,10 @@ pub fn run(start: Start) -> i32 {
             println!("\x1b[2mNow talking to {model} — it sees the whole conversation.\x1b[0m");
             continue;
         }
-        messages.push(Msg { role: "user", content: text.to_string() });
+        messages.push(Msg {
+            role: "user",
+            content: text.to_string(),
+        });
         // Rebuilt per send: `/model` swaps the model mid-chat, and the route
         // has to swap with it.
         let routing = crate::providers::routing_block(p, &model);
@@ -449,14 +474,21 @@ pub fn run(start: Start) -> i32 {
                 }
                 append(&mut log, &msg_line("user", text, now_ms()));
                 append(&mut log, &msg_line("assistant", &reply.text, now_ms()));
-                messages.push(Msg { role: "assistant", content: reply.text });
+                messages.push(Msg {
+                    role: "assistant",
+                    content: reply.text,
+                });
             }
             Err(e) => {
                 eprintln!("\x1b[31m{}\x1b[0m", e.message());
                 // A pin is "only that host": say so when a host actually
                 // refused, or a refusal from a constraint the user set reads
                 // as a broken session. A dead network gets no such note.
-                let order = p.routes.get(&model).map(|r| r.order.as_slice()).unwrap_or(&[]);
+                let order = p
+                    .routes
+                    .get(&model)
+                    .map(|r| r.order.as_slice())
+                    .unwrap_or(&[]);
                 if let Some(note) = pinned_note(&model, order, e.provider_answered()) {
                     eprintln!("\x1b[2m  {note}\x1b[0m");
                 }
@@ -473,12 +505,18 @@ pub fn run(start: Start) -> i32 {
 fn open_transcript(id: &str, provider_id: &str, model: &str) -> Option<std::fs::File> {
     let dir = chats_dir()?;
     if std::fs::create_dir_all(&dir).is_err() {
-        eprintln!("\x1b[2m(transcript off — could not create {})\x1b[0m", dir.display());
+        eprintln!(
+            "\x1b[2m(transcript off — could not create {})\x1b[0m",
+            dir.display()
+        );
         return None;
     }
     let path = dir.join(format!("{id}.jsonl"));
     let fresh = !path.is_file();
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path);
     match file {
         Ok(mut f) => {
             if fresh {
@@ -645,13 +683,23 @@ fn stream_reply(
         return Err(Failed::Provider(format!("The provider refused: {e}")));
     }
     match status {
-        Ok(s) if s.success() => Ok(Reply { text: reply, host, cost }),
+        Ok(s) if s.success() => Ok(Reply {
+            text: reply,
+            host,
+            cost,
+        }),
         _ => {
             if reply.is_empty() {
-                Err(Failed::Transport("curl could not reach the provider.".into()))
+                Err(Failed::Transport(
+                    "curl could not reach the provider.".into(),
+                ))
             } else {
                 // The stream broke mid-reply; what printed is what there is.
-                Ok(Reply { text: reply, host, cost })
+                Ok(Reply {
+                    text: reply,
+                    host,
+                    cost,
+                })
             }
         }
     }
@@ -726,7 +774,10 @@ mod tests {
         assert_eq!(v["provider"]["order"], serde_json::json!(["novita"]));
         assert_eq!(v["stream"], serde_json::json!(true));
         // Cost per reply, which is why include_usage goes on unconditionally.
-        assert_eq!(v["stream_options"]["include_usage"], serde_json::json!(true));
+        assert_eq!(
+            v["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]
@@ -742,7 +793,10 @@ mod tests {
     fn the_attribution_names_only_the_parts_that_arrived() {
         let both = attribution(Some("Novita"), Some(0.0021));
         assert_eq!(both.as_deref(), Some("via Novita · $0.0021"));
-        assert_eq!(attribution(Some("Novita"), None).as_deref(), Some("via Novita"));
+        assert_eq!(
+            attribution(Some("Novita"), None).as_deref(),
+            Some("via Novita")
+        );
         assert_eq!(attribution(None, Some(0.0021)).as_deref(), Some("$0.0021"));
         assert_eq!(attribution(None, None), None);
     }
@@ -757,8 +811,16 @@ mod tests {
         let note = pinned_note("z-ai/glm-5.2", &order, true).unwrap();
         assert!(note.contains("z-ai/glm-5.2"), "{note}");
         assert!(note.contains("novita, deepinfra"), "{note}");
-        assert_eq!(pinned_note("z-ai/glm-5.2", &order, false), None, "the network died");
-        assert_eq!(pinned_note("z-ai/glm-5.2", &[], true), None, "no pin to name");
+        assert_eq!(
+            pinned_note("z-ai/glm-5.2", &order, false),
+            None,
+            "the network died"
+        );
+        assert_eq!(
+            pinned_note("z-ai/glm-5.2", &[], true),
+            None,
+            "no pin to name"
+        );
     }
 
     /// The two ways a send fails are told apart at the source, so the pin note
@@ -783,7 +845,10 @@ mod tests {
     }
 
     fn lines(v: &[&str]) -> impl Iterator<Item = String> {
-        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+        v.iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// A transcript loads back to exactly the context the model should see:
@@ -814,14 +879,23 @@ mod tests {
     /// not an empty conversation pretending to be one.
     #[test]
     fn a_foreign_jsonl_is_not_a_chat() {
-        assert!(parse_transcript(lines(&[r#"{"type":"user","message":{"role":"user","content":"hi"}}"#])).is_none());
+        assert!(parse_transcript(lines(&[
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#
+        ]))
+        .is_none());
     }
 
     #[test]
     fn the_body_carries_model_history_and_streaming() {
         let msgs = vec![
-            Msg { role: "user", content: "hi".into() },
-            Msg { role: "assistant", content: "hello".into() },
+            Msg {
+                role: "user",
+                content: "hi".into(),
+            },
+            Msg {
+                role: "assistant",
+                content: "hello".into(),
+            },
         ];
         let v: serde_json::Value = serde_json::from_str(&chat_body("a/b", &msgs, None)).unwrap();
         assert_eq!(v["model"], "a/b");

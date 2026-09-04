@@ -169,7 +169,9 @@ impl Adapter for AntigravityAdapter {
             return out;
         }
 
-        let Ok(mut file) = std::fs::File::open(&self.path) else { return out };
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return out;
+        };
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return out;
         }
@@ -235,8 +237,12 @@ impl AntigravityAdapter {
     }
 
     fn read_step(&mut self, raw: &[u8], out: &mut Vec<(u64, Kind)>) {
-        let Ok(v) = serde_json::from_slice::<Value>(raw) else { return };
-        let Some(index) = v.get("step_index").and_then(Value::as_u64) else { return };
+        let Ok(v) = serde_json::from_slice::<Value>(raw) else {
+            return;
+        };
+        let Some(index) = v.get("step_index").and_then(Value::as_u64) else {
+            return;
+        };
         let ts = v
             .get("created_at")
             .and_then(|c| c.as_str())
@@ -259,7 +265,10 @@ impl AntigravityAdapter {
     }
 
     fn user_input(&mut self, v: &Value, index: u64, ts: u64, out: &mut Vec<(u64, Kind)>) {
-        let content = v.get("content").and_then(|c| c.as_str()).unwrap_or_default();
+        let content = v
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
         let text = crate::antigravity::user_request(content);
         let text = text.trim();
         // A `USER_INPUT` carrying only `<USER_SETTINGS_CHANGE>` and the local
@@ -273,12 +282,24 @@ impl AntigravityAdapter {
         // answer — interrupted, or a run killed mid-flight. Close it honestly
         // rather than leaving the phone a turn that never ends.
         if let Some(turn) = self.turn.take() {
-            out.push((ts, Kind::TurnEnded { turn, reason: "unknown".into() }));
+            out.push((
+                ts,
+                Kind::TurnEnded {
+                    turn,
+                    reason: "unknown".into(),
+                },
+            ));
         }
         let turn = index.to_string();
         self.turn = Some(turn.clone());
         out.push((ts, Kind::TurnStarted { turn }));
-        out.push((ts, Kind::UserMessage { id: self.step_id(index), text: text.to_string() }));
+        out.push((
+            ts,
+            Kind::UserMessage {
+                id: self.step_id(index),
+                text: text.to_string(),
+            },
+        ));
     }
 
     fn planner(&mut self, v: &Value, index: u64, ts: u64, out: &mut Vec<(u64, Kind)>) {
@@ -287,7 +308,11 @@ impl AntigravityAdapter {
 
         // agy appends the record once the step is finished, so every block is
         // whole the moment it is read: `done` is never false here.
-        let thinking = v.get("thinking").and_then(|t| t.as_str()).unwrap_or_default().trim();
+        let thinking = v
+            .get("thinking")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .trim();
         if !thinking.is_empty() {
             out.push((
                 ts,
@@ -299,17 +324,29 @@ impl AntigravityAdapter {
             ));
         }
         // A long answer is logged with its middle cut out; the db has it whole.
-        let logged = v.get("content").and_then(|c| c.as_str()).unwrap_or_default().trim();
+        let logged = v
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .trim();
         let content = crate::antigravity::recover_truncated(&self.root, &self.id, index, logged);
         let content = content.trim();
         if !content.is_empty() {
             out.push((
                 ts,
-                Kind::AgentText { id: step.clone(), text: content.to_string(), done: true },
+                Kind::AgentText {
+                    id: step.clone(),
+                    text: content.to_string(),
+                    done: true,
+                },
             ));
         }
 
-        let calls = v.get("tool_calls").and_then(|c| c.as_array()).map(Vec::as_slice).unwrap_or(&[]);
+        let calls = v
+            .get("tool_calls")
+            .and_then(|c| c.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         for (i, call) in calls.iter().enumerate() {
             let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
             let id = format!("{step}:{i}");
@@ -330,10 +367,17 @@ impl AntigravityAdapter {
             ));
             let ask = is_ask(name);
             // The i-th call is answered by the step i places after this one.
-            self.awaiting.insert(index + 1 + i as u64, Awaited { call: id, ask });
+            self.awaiting
+                .insert(index + 1 + i as u64, Awaited { call: id, ask });
             if ask && !self.asking {
                 self.asking = true;
-                out.push((ts, Kind::Phase { phase: Phase::NeedsYou, detail: "question".into() }));
+                out.push((
+                    ts,
+                    Kind::Phase {
+                        phase: Phase::NeedsYou,
+                        detail: "question".into(),
+                    },
+                ));
             }
         }
         // An output that arrived before the call that owns it now has one.
@@ -343,12 +387,21 @@ impl AntigravityAdapter {
         // prose and nothing else. See the module doc for what that misses.
         if calls.is_empty() && !content.is_empty() {
             let turn = self.turn.take().unwrap_or_else(|| index.to_string());
-            out.push((ts, Kind::TurnEnded { turn, reason: "completed".into() }));
+            out.push((
+                ts,
+                Kind::TurnEnded {
+                    turn,
+                    reason: "completed".into(),
+                },
+            ));
         }
     }
 
     fn tool_output(&mut self, v: &Value, index: u64, ts: u64, out: &mut Vec<(u64, Kind)>) {
-        let body = v.get("content").and_then(|c| c.as_str()).unwrap_or_default();
+        let body = v
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
         match self.awaiting.remove(&index) {
             Some(waiting) => self.finish(waiting, ts, body, out),
             // The call is further down the file than its own output — the
@@ -356,7 +409,9 @@ impl AntigravityAdapter {
             None => {
                 self.orphans.insert(index, (ts, body.to_string()));
                 while self.orphans.len() > ORPHANS_MAX {
-                    let Some(oldest) = self.orphans.keys().next().copied() else { break };
+                    let Some(oldest) = self.orphans.keys().next().copied() else {
+                        break;
+                    };
                     self.orphans.remove(&oldest);
                 }
             }
@@ -366,7 +421,14 @@ impl AntigravityAdapter {
     /// Close a call with the output that answers it.
     fn finish(&mut self, waiting: Awaited, ts: u64, body: &str, out: &mut Vec<(u64, Kind)>) {
         let (status, output) = result_of(body);
-        out.push((ts, Kind::ToolCallUpdate { id: waiting.call, status, output }));
+        out.push((
+            ts,
+            Kind::ToolCallUpdate {
+                id: waiting.call,
+                status,
+                output,
+            },
+        ));
         if waiting.ask {
             self.answered(ts, out);
         }
@@ -374,11 +436,19 @@ impl AntigravityAdapter {
 
     /// Hand every held output to the call that has since claimed its index.
     fn claim_orphans(&mut self, out: &mut Vec<(u64, Kind)>) {
-        let ready: Vec<u64> =
-            self.orphans.keys().copied().filter(|i| self.awaiting.contains_key(i)).collect();
+        let ready: Vec<u64> = self
+            .orphans
+            .keys()
+            .copied()
+            .filter(|i| self.awaiting.contains_key(i))
+            .collect();
         for index in ready {
-            let Some((ts, body)) = self.orphans.remove(&index) else { continue };
-            let Some(waiting) = self.awaiting.remove(&index) else { continue };
+            let Some((ts, body)) = self.orphans.remove(&index) else {
+                continue;
+            };
+            let Some(waiting) = self.awaiting.remove(&index) else {
+                continue;
+            };
             self.finish(waiting, ts, &body, out);
         }
     }
@@ -395,7 +465,9 @@ impl AntigravityAdapter {
     fn settle(&mut self, index: u64, ts: u64, out: &mut Vec<(u64, Kind)>) {
         let stale: Vec<u64> = self.awaiting.range(..index).map(|(i, _)| *i).collect();
         for i in stale {
-            let Some(waiting) = self.awaiting.remove(&i) else { continue };
+            let Some(waiting) = self.awaiting.remove(&i) else {
+                continue;
+            };
             out.push((
                 ts,
                 Kind::ToolCallUpdate {
@@ -414,14 +486,19 @@ impl AntigravityAdapter {
     fn answered(&mut self, ts: u64, out: &mut Vec<(u64, Kind)>) {
         if self.asking {
             self.asking = false;
-            out.push((ts, Kind::Phase { phase: Phase::Working, detail: String::new() }));
+            out.push((
+                ts,
+                Kind::Phase {
+                    phase: Phase::Working,
+                    detail: String::new(),
+                },
+            ));
         }
     }
 }
 
-/// agy's tools for putting a question to the person. `remote_api`'s
-/// needs-you verdict names three of them; the binary also carries
-/// `ask_for_user_feedback`, so the prefix is what is matched.
+/// agy's tools for putting a question to the person. The binary carries
+/// several variants, so the `ask_` prefix is what is matched.
 fn is_ask(name: &str) -> bool {
     name.starts_with("ask_")
 }
@@ -452,15 +529,13 @@ fn category(name: &str) -> ToolCategory {
 /// for a tool whose arguments we do not know, and `tool_summary` falls back
 /// again to the tool's name.
 fn title(call: &Value, name: &str) -> String {
-    let arg = |key: &str| {
-        crate::antigravity::arg_str(call, key).filter(|s| !s.trim().is_empty())
-    };
+    let arg = |key: &str| crate::antigravity::arg_str(call, key).filter(|s| !s.trim().is_empty());
     let picked = match name {
         // Multi-line commands are common; the first line is the verb.
         "run_command" => arg("CommandLine").map(|c| first_line(&c)),
-        "read_file" | "view_file" | "view_code_item" | "view_file_outline" => {
-            arg("AbsolutePath").or_else(|| arg("TargetFile")).or_else(|| arg("File"))
-        }
+        "read_file" | "view_file" | "view_code_item" | "view_file_outline" => arg("AbsolutePath")
+            .or_else(|| arg("TargetFile"))
+            .or_else(|| arg("File")),
         "write_to_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" => {
             arg("TargetFile")
         }
@@ -479,13 +554,20 @@ fn title(call: &Value, name: &str) -> String {
 /// are dropped; each value is clipped on its own so a file's whole body
 /// cannot crowd out the path it is being written to.
 fn input_summary(call: &Value) -> String {
-    let Some(args) = call.get("args").and_then(|a| a.as_object()) else { return String::new() };
+    let Some(args) = call.get("args").and_then(|a| a.as_object()) else {
+        return String::new();
+    };
     let mut parts: Vec<String> = Vec::new();
     for key in args.keys() {
-        if matches!(key.as_str(), "toolAction" | "toolSummary" | "ArtifactMetadata") {
+        if matches!(
+            key.as_str(),
+            "toolAction" | "toolSummary" | "ArtifactMetadata"
+        ) {
             continue;
         }
-        let Some(value) = crate::antigravity::arg_str(call, key) else { continue };
+        let Some(value) = crate::antigravity::arg_str(call, key) else {
+            continue;
+        };
         let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
         if value.is_empty() {
             continue;
@@ -574,7 +656,10 @@ fn iso_to_ms(s: &str) -> Option<u64> {
     let time = rest.trim_end_matches('Z');
     let time = time.split(['+', '-']).next().unwrap_or(time);
     let mut t = time.split(':');
-    let (h, mi) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+    let (h, mi) = (
+        t.next()?.parse::<i64>().ok()?,
+        t.next()?.parse::<i64>().ok()?,
+    );
     let secs_part = t.next()?;
     let (sec, frac) = match secs_part.split_once('.') {
         Some((s, f)) => (s.parse::<i64>().ok()?, f),
@@ -594,13 +679,19 @@ fn iso_to_ms(s: &str) -> Option<u64> {
 /// Every conversation with a transcript on this machine, for the live test.
 #[cfg(test)]
 fn real_conversations() -> Vec<String> {
-    let Some(root) = crate::antigravity::store_root() else { return Vec::new() };
-    let Ok(dir) = std::fs::read_dir(root.join("brain")) else { return Vec::new() };
+    let Some(root) = crate::antigravity::store_root() else {
+        return Vec::new();
+    };
+    let Ok(dir) = std::fs::read_dir(root.join("brain")) else {
+        return Vec::new();
+    };
     let mut ids: Vec<String> = dir
         .flatten()
         .filter_map(|e| {
             let id = e.file_name().to_string_lossy().into_owned();
-            crate::antigravity::transcript_path(&root, &id).is_file().then_some(id)
+            crate::antigravity::transcript_path(&root, &id)
+                .is_file()
+                .then_some(id)
         })
         .collect();
     ids.sort();
@@ -703,7 +794,11 @@ mod tests {
     }
 
     fn write(path: &Path, bytes: &str) {
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         f.write_all(bytes.as_bytes()).unwrap();
     }
 
@@ -855,7 +950,10 @@ mod tests {
             Kind::ToolCall { id, title, .. } if id.ends_with(":1:0") => Some(title.clone()),
             _ => None,
         });
-        assert!(a.unwrap().ends_with("/a.txt"), "the first call is the first path");
+        assert!(
+            a.unwrap().ends_with("/a.txt"),
+            "the first call is the first path"
+        );
         assert!(matches!(
             out.last(),
             Some(Kind::ToolCallUpdate { status: ToolStatus::Completed, output: Some(o), .. })
@@ -868,8 +966,10 @@ mod tests {
     #[test]
     fn a_call_whose_output_never_lands_is_a_failure() {
         let out = kinds(&[LOST_CALL, NEXT_CALL]);
-        let updates: Vec<&Kind> =
-            out.iter().filter(|k| matches!(k, Kind::ToolCallUpdate { .. })).collect();
+        let updates: Vec<&Kind> = out
+            .iter()
+            .filter(|k| matches!(k, Kind::ToolCallUpdate { .. }))
+            .collect();
         assert_eq!(
             updates,
             vec![&Kind::ToolCallUpdate {
@@ -881,7 +981,8 @@ mod tests {
             }]
         );
         assert!(
-            out.iter().any(|k| matches!(k, Kind::ToolCall { id, .. } if id.ends_with(":3:0"))),
+            out.iter()
+                .any(|k| matches!(k, Kind::ToolCall { id, .. } if id.ends_with(":3:0"))),
             "and the step that condemned it still shows its own call",
         );
     }
@@ -901,7 +1002,13 @@ mod tests {
                 status: ToolStatus::Running,
             }
         );
-        assert_eq!(out[3], Kind::Phase { phase: Phase::NeedsYou, detail: "question".into() });
+        assert_eq!(
+            out[3],
+            Kind::Phase {
+                phase: Phase::NeedsYou,
+                detail: "question".into()
+            }
+        );
         assert_eq!(
             out[4],
             Kind::ToolCallUpdate {
@@ -910,7 +1017,13 @@ mod tests {
                 output: Some("A1: User Skipped".into()),
             }
         );
-        assert_eq!(out[5], Kind::Phase { phase: Phase::Working, detail: String::new() });
+        assert_eq!(
+            out[5],
+            Kind::Phase {
+                phase: Phase::Working,
+                detail: String::new()
+            }
+        );
     }
 
     #[test]
@@ -918,10 +1031,15 @@ mod tests {
         let out = kinds(&[INPUT_0, RUN_OK_CALL, RUN_OK_OUT, FINAL]);
         assert_eq!(
             out.last(),
-            Some(&Kind::TurnEnded { turn: "0".into(), reason: "completed".into() })
+            Some(&Kind::TurnEnded {
+                turn: "0".into(),
+                reason: "completed".into()
+            })
         );
         assert_eq!(
-            out.iter().filter(|k| matches!(k, Kind::TurnEnded { .. })).count(),
+            out.iter()
+                .filter(|k| matches!(k, Kind::TurnEnded { .. }))
+                .count(),
             1,
             "a response carrying tool calls is not the end of anything",
         );
@@ -944,7 +1062,10 @@ mod tests {
         );
         assert_eq!(
             out[out.len() - 3],
-            Kind::TurnEnded { turn: "0".into(), reason: "unknown".into() },
+            Kind::TurnEnded {
+                turn: "0".into(),
+                reason: "unknown".into()
+            },
             "and the turn it belonged to has no answer to end on",
         );
         assert_eq!(out[out.len() - 2], Kind::TurnStarted { turn: "25".into() });
@@ -956,12 +1077,22 @@ mod tests {
         let (head, tail) = INPUT_0.split_at(120);
         write(&path, head);
         let mut a = adapter_over(&path);
-        assert!(a.poll().is_empty(), "an unterminated line is not a line yet");
+        assert!(
+            a.poll().is_empty(),
+            "an unterminated line is not a line yet"
+        );
         write(&path, tail);
         assert!(a.poll().is_empty(), "still no newline");
         write(&path, "\n");
-        assert_eq!(a.poll().len(), 2, "turn_started + user_message once the record closes");
-        assert!(a.poll().is_empty(), "and nothing on a poll with nothing new");
+        assert_eq!(
+            a.poll().len(),
+            2,
+            "turn_started + user_message once the record closes"
+        );
+        assert!(
+            a.poll().is_empty(),
+            "and nothing on a poll with nothing new"
+        );
     }
 
     #[test]
@@ -1017,7 +1148,11 @@ mod tests {
         let mut a = adapter_over(&path);
         assert!(a.bootstrap().is_empty());
         assert!(a.poll().is_empty());
-        assert_eq!(a.watch_paths().len(), 2, "the file and a directory that exists");
+        assert_eq!(
+            a.watch_paths().len(),
+            2,
+            "the file and a directory that exists"
+        );
         write(&path, &format!("{INPUT_0}\n"));
         assert_eq!(a.poll().len(), 2);
     }
@@ -1034,7 +1169,9 @@ mod tests {
 
     #[test]
     fn a_conversation_whose_directories_do_not_exist_still_arms_a_watch() {
-        let Some(root) = crate::antigravity::store_root() else { return };
+        let Some(root) = crate::antigravity::store_root() else {
+            return;
+        };
         let a = open("00000000-0000-0000-0000-000000000000").unwrap();
         let paths = a.watch_paths();
         assert_eq!(paths[0], crate::antigravity::transcript_path(&root, &a.id));
@@ -1066,7 +1203,10 @@ mod tests {
     #[ignore]
     fn real_conversations_bootstrap_once_and_then_say_nothing() {
         let ids = super::real_conversations();
-        assert!(!ids.is_empty(), "a transcript under ~/.gemini/antigravity-cli/brain");
+        assert!(
+            !ids.is_empty(),
+            "a transcript under ~/.gemini/antigravity-cli/brain"
+        );
         for id in ids {
             let mut a = open(&id).expect("the store opens a conversation by its id");
             let lines = std::fs::read_to_string(&a.path).unwrap().lines().count();
@@ -1084,7 +1224,10 @@ mod tests {
                 took.as_millis()
             );
             assert!(!events.is_empty());
-            assert!(a.poll().is_empty(), "a second poll on a file nobody wrote to is empty");
+            assert!(
+                a.poll().is_empty(),
+                "a second poll on a file nobody wrote to is empty"
+            );
         }
     }
 

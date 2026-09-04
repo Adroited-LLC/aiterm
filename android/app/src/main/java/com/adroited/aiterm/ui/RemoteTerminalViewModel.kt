@@ -43,7 +43,7 @@ class RemoteTerminalViewModel(
     /** Survives terminal tab changes and configuration changes for this ViewModel's lifetime. */
     internal val terminalDrafts = TerminalDraftStore()
     private val screenStore = DefaultTerminalScreenStore()
-    private val dialer = OkHttpRemoteSocketDialer()
+    private val dialer = OkHttpRemoteSocketDialer(context.applicationContext)
     private val networkMonitor = AndroidNetworkMonitor(context)
     private var connectJob: Job? = null
     val client = RemoteClient(

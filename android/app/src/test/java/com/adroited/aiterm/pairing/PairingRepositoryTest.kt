@@ -74,10 +74,10 @@ class PairingRepositoryTest {
     }
 
     @Test
-    fun combinedQrFields_areSkippedNotRejected() {
-        // A combined QR carries a second listener's payload under its own
-        // names (tp/tt/tf/z). This app reads only its own fields; the rest
-        // must be skipped, not treated as malformed.
+    fun futureQrFields_areSkippedNotRejected() {
+        // A newer desktop may advertise transport metadata this build does
+        // not know. Trust-bearing fields remain strict; extensions are
+        // skipped so an otherwise compatible QR still works.
         val combined = pairingUri() + "&tp=8877&tt=sometoken&tf=${"ab".repeat(32)}&z=${"cd".repeat(32)}"
         val result = PairingPayload.parse(combined, scannedAt)
         assertTrue(
@@ -156,6 +156,42 @@ class PairingRepositoryTest {
         assertTrue(
             PairingPayload.parse(
                 pairingUri(version = "2", relayHost = "desk-1234.relay.example.com"),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
+    }
+
+    @Test
+    fun irohPayloadIsExclusiveWithAitermRelayMetadata() {
+        val node = "a".repeat(64)
+        val parsed = parsedPayload(
+            pairingUri(
+                networkStack = "iroh",
+                irohNodeId = node,
+                irohRelayUrl = "https%3A%2F%2Frelay.example.com",
+            ),
+            scannedAt,
+        )
+        assertEquals(RemoteNetworkStack.IROH, parsed.networkStack)
+        assertEquals(node, parsed.irohNodeId)
+        assertEquals("https://relay.example.com", parsed.irohRelayUrl)
+        assertEquals(null, parsed.relayEndpoint)
+
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(
+                    version = "2",
+                    relayHost = "desktop.relay.example.com",
+                    relayPort = 443,
+                    networkStack = "iroh",
+                    irohNodeId = node,
+                ),
+                scannedAt,
+            ) is PairingPayloadResult.Rejected,
+        )
+        assertTrue(
+            PairingPayload.parse(
+                pairingUri(networkStack = "aiterm", irohNodeId = node),
                 scannedAt,
             ) is PairingPayloadResult.Rejected,
         )

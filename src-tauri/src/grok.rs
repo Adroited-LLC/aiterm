@@ -20,7 +20,10 @@
 //! trash is a separate piece of work, so the button is withheld rather than
 //! wired to something that half-works.
 
-use crate::agents::{prompt_of, q, detect_cli, AgentBackend, Caps, Detection, LaunchSpec, ModelOption, PermissionMode};
+use crate::agents::{
+    detect_cli, prompt_of, q, AgentBackend, Caps, Detection, LaunchSpec, ModelOption,
+    PermissionMode,
+};
 use crate::sessions::{Session, SessionProvider};
 use std::path::{Path, PathBuf};
 
@@ -121,7 +124,11 @@ fn mtime_ms(p: &Path) -> u64 {
 /// summary — a session that has not been spoken to yet still exists.
 fn session_file(dir: &Path) -> PathBuf {
     let chat = dir.join("chat_history.jsonl");
-    if chat.is_file() { chat } else { dir.join("summary.json") }
+    if chat.is_file() {
+        chat
+    } else {
+        dir.join("summary.json")
+    }
 }
 
 /// One session directory → its row. `None` for anything that is not one.
@@ -179,7 +186,9 @@ pub(crate) fn scan_dir_bounded(
             break;
         }
         // `session_search.sqlite` sits beside the cwd directories.
-        let Ok(cwd_type) = cwd.file_type() else { continue };
+        let Ok(cwd_type) = cwd.file_type() else {
+            continue;
+        };
         if cwd_type.is_symlink() || !cwd_type.is_dir() {
             continue;
         }
@@ -190,7 +199,9 @@ pub(crate) fn scan_dir_bounded(
             if budget.remaining() == 0 {
                 break;
             }
-            let Ok(file_type) = e.file_type() else { continue };
+            let Ok(file_type) = e.file_type() else {
+                continue;
+            };
             if !file_type.is_symlink() && file_type.is_dir() && budget.claim_file() {
                 if let Some(row) = read_row(&e.path()) {
                     out.push(row);
@@ -243,7 +254,11 @@ pub fn parse_messages(text: &str) -> Vec<(String, String)> {
                     .join("\n"),
                 _ => return None,
             };
-            let body = if role == "user" { user_query(&body) } else { body };
+            let body = if role == "user" {
+                user_query(&body)
+            } else {
+                body
+            };
             // The opening `<user_info>`/`<rules>` line has no query in it;
             // stripped of its tags it is nothing, and nothing is what it
             // should count as. [observed: grok 1.0.13]
@@ -285,8 +300,12 @@ pub fn parse_tasks(text: &str) -> Vec<crate::sessions::SessionTask> {
         if !line.contains("todo_write") {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else {
+            continue;
+        };
         for call in calls {
             if call.get("name").and_then(|n| n.as_str()) != Some("todo_write") {
                 continue;
@@ -299,7 +318,9 @@ pub fn parse_tasks(text: &str) -> Vec<crate::sessions::SessionTask> {
             else {
                 continue;
             };
-            let Some(todos) = args.get("todos").and_then(|t| t.as_array()) else { continue };
+            let Some(todos) = args.get("todos").and_then(|t| t.as_array()) else {
+                continue;
+            };
             if !args.get("merge").and_then(|m| m.as_bool()).unwrap_or(false) {
                 tasks.clear();
             }
@@ -344,8 +365,12 @@ pub fn parse_artifacts(text: &str) -> Vec<crate::sessions::Artifact> {
         if !line.contains("file_path") {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else {
+            continue;
+        };
         for call in calls {
             let tool = match call.get("name").and_then(|n| n.as_str()) {
                 Some("write") | Some("create_file") => "Write",
@@ -356,7 +381,11 @@ pub fn parse_artifacts(text: &str) -> Vec<crate::sessions::Artifact> {
                 .get("arguments")
                 .and_then(|a| a.as_str())
                 .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
-                .and_then(|args| args.get("file_path").and_then(|f| f.as_str()).map(String::from))
+                .and_then(|args| {
+                    args.get("file_path")
+                        .and_then(|f| f.as_str())
+                        .map(String::from)
+                })
             else {
                 continue;
             };
@@ -388,13 +417,24 @@ pub fn parse_artifacts(text: &str) -> Vec<crate::sessions::Artifact> {
 /// context stays unknown rather than invented.
 pub fn parse_detail(id: &str, summary: &str, chat: &str) -> crate::detail::SessionDetail {
     use crate::detail::{note_message, push_unique, top_tools, touch_file, SessionDetail};
-    let mut d = SessionDetail { id: id.to_string(), ..Default::default() };
+    let mut d = SessionDetail {
+        id: id.to_string(),
+        ..Default::default()
+    };
     let mut summary_model = None;
     if let Ok(s) = serde_json::from_str::<serde_json::Value>(summary) {
-        let str_of = |k: &str| s.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty()).map(String::from);
+        let str_of = |k: &str| {
+            s.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(String::from)
+        };
         d.started = str_of("created_at");
         d.last_active = str_of("updated_at");
-        d.cwd = s.pointer("/info/cwd").and_then(|v| v.as_str()).map(String::from);
+        d.cwd = s
+            .pointer("/info/cwd")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         d.branch = str_of("head_branch");
         d.title = str_of("session_summary");
         d.effort = str_of("reasoning_effort");
@@ -403,8 +443,12 @@ pub fn parse_detail(id: &str, summary: &str, chat: &str) -> crate::detail::Sessi
     }
     let mut tools: std::collections::HashMap<String, u32> = Default::default();
     for line in chat.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let Some(kind) = v.get("type").and_then(|t| t.as_str()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(kind) = v.get("type").and_then(|t| t.as_str()) else {
+            continue;
+        };
         if kind != "user" && kind != "assistant" {
             continue;
         }
@@ -415,16 +459,28 @@ pub fn parse_detail(id: &str, summary: &str, chat: &str) -> crate::detail::Sessi
             if let Some(e) = v.get("reasoning_effort").and_then(|e| e.as_str()) {
                 d.effort = Some(e.to_string());
             }
-            for call in v.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten() {
+            for call in v
+                .get("tool_calls")
+                .and_then(|t| t.as_array())
+                .into_iter()
+                .flatten()
+            {
                 d.tool_calls += 1;
                 let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                 *tools.entry(name.to_string()).or_insert(0) += 1;
-                if matches!(name, "write" | "create_file" | "search_replace" | "edit_file" | "apply_patch") {
+                if matches!(
+                    name,
+                    "write" | "create_file" | "search_replace" | "edit_file" | "apply_patch"
+                ) {
                     if let Some(fp) = call
                         .get("arguments")
                         .and_then(|a| a.as_str())
                         .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok())
-                        .and_then(|a| a.get("file_path").and_then(|f| f.as_str()).map(String::from))
+                        .and_then(|a| {
+                            a.get("file_path")
+                                .and_then(|f| f.as_str())
+                                .map(String::from)
+                        })
                     {
                         touch_file(&mut d.files, &fp);
                     }
@@ -522,7 +578,11 @@ pub fn parse_models(text: &str) -> Option<Vec<ModelOption>> {
         .iter()
         .filter_map(|(slug, entry)| {
             let info = entry.get("info")?;
-            if info.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false) {
+            if info
+                .get("hidden")
+                .and_then(|h| h.as_bool())
+                .unwrap_or(false)
+            {
                 return None;
             }
             let display_name = info
@@ -554,7 +614,12 @@ pub fn parse_models(text: &str) -> Option<Vec<ModelOption>> {
                 .or_else(|| info.get("reasoning_effort").and_then(|x| x.as_str()))
                 .filter(|_| !efforts.is_empty())
                 .map(String::from);
-            Some(ModelOption { id: slug.clone(), display_name, efforts, default_effort })
+            Some(ModelOption {
+                id: slug.clone(),
+                display_name,
+                efforts,
+                default_effort,
+            })
         })
         .collect();
     (!out.is_empty()).then_some(out)
@@ -573,7 +638,10 @@ impl AgentBackend for GrokBackend {
         "Grok"
     }
     fn detect(&self) -> Detection {
-        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "grok") }
+        Detection {
+            caps: self.caps(),
+            ..detect_cli(self.id(), self.display_name(), "grok")
+        }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &GrokSessions
@@ -591,7 +659,12 @@ impl AgentBackend for GrokBackend {
     /// TUI driving, no transcript panels: both read claude's shapes. No
     /// delete — see the module doc.
     fn caps(&self) -> Caps {
-        Caps { resume: true, clear: true, tasks: true, ..Default::default() }
+        Caps {
+            resume: true,
+            clear: true,
+            tasks: true,
+            ..Default::default()
+        }
     }
 
     fn permission_modes(&self) -> &'static [PermissionMode] {
@@ -662,21 +735,42 @@ mod detail_tests {
         ].join("\n");
         let d = parse_detail("89fc", summary, &chat);
         assert_eq!(d.started.as_deref(), Some("2026-08-29T01:32:24.650674083Z"));
-        assert_eq!(d.last_active.as_deref(), Some("2026-08-29T01:40:00.000000000Z"));
+        assert_eq!(
+            d.last_active.as_deref(),
+            Some("2026-08-29T01:40:00.000000000Z")
+        );
         assert_eq!(d.cwd.as_deref(), Some("/home/admin/AI-OS"));
         assert_eq!(d.branch.as_deref(), Some("master"));
         assert_eq!(d.title.as_deref(), Some("Closing House research"));
-        assert_eq!(d.models, vec!["grok-4.6-build"], "the transcript's model, not the summary's");
+        assert_eq!(
+            d.models,
+            vec!["grok-4.6-build"],
+            "the transcript's model, not the summary's"
+        );
         assert_eq!(d.effort.as_deref(), Some("high"));
         assert_eq!(d.permission_mode.as_deref(), Some("sandbox off"));
-        assert_eq!((d.user_messages, d.assistant_messages), (1, 2), "the preamble, synthetic user turns and empty assistant turns are not the conversation");
+        assert_eq!(
+            (d.user_messages, d.assistant_messages),
+            (1, 2),
+            "the preamble, synthetic user turns and empty assistant turns are not the conversation"
+        );
         assert_eq!(d.tool_calls, 4);
         assert_eq!(d.tools[0].name, "write");
         assert_eq!(d.tools[0].count, 2);
-        assert_eq!(d.files, vec!["/home/admin/AI-OS/a.md", "/home/admin/AI-OS/b.md"], "most recent touch first, once each");
+        assert_eq!(
+            d.files,
+            vec!["/home/admin/AI-OS/a.md", "/home/admin/AI-OS/b.md"],
+            "most recent touch first, once each"
+        );
         assert_eq!(d.first_prompt.as_deref(), Some("look at closing.house"));
-        assert_eq!(d.last_assistant.as_deref(), Some("Here is what I took from closing.house."));
-        assert_eq!(d.context_tokens, None, "grok records no usage; nothing is invented");
+        assert_eq!(
+            d.last_assistant.as_deref(),
+            Some("Here is what I took from closing.house.")
+        );
+        assert_eq!(
+            d.context_tokens, None,
+            "grok records no usage; nothing is invented"
+        );
     }
 
     #[test]
@@ -714,14 +808,18 @@ mod tests {
     #[test]
     fn a_session_directory_lists_under_its_cwd_and_titles_itself() {
         let root = std::env::temp_dir().join(format!("aiterm-grok-{}", uuid::Uuid::new_v4()));
-        let dir = root.join("%2Fhome%2Fx%2FAI-OS").join("01a03132-548d-7422-b3b1-f966d5acd37a");
+        let dir = root
+            .join("%2Fhome%2Fx%2FAI-OS")
+            .join("01a03132-548d-7422-b3b1-f966d5acd37a");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("summary.json"), SUMMARY).unwrap();
         std::fs::write(dir.join("chat_history.jsonl"), "").unwrap();
         // The search index sits beside the cwd directories and is not one.
         std::fs::write(root.join("session_search.sqlite"), "").unwrap();
         // An untitled session reads as its directory.
-        let bare = root.join("%2Ftmp%2Fprobe").join("e63b0f22-7d69-4084-aaf3-733816255e8e");
+        let bare = root
+            .join("%2Ftmp%2Fprobe")
+            .join("e63b0f22-7d69-4084-aaf3-733816255e8e");
         std::fs::create_dir_all(&bare).unwrap();
         std::fs::write(
             bare.join("summary.json"),
@@ -736,7 +834,10 @@ mod tests {
         assert_eq!(rows[0].0.project_path, "/home/x/AI-OS");
         assert!(rows[0].1.ends_with("chat_history.jsonl"));
         assert_eq!(rows[1].0.title, "probe");
-        assert!(rows[1].1.ends_with("summary.json"), "no transcript yet: the summary stands in");
+        assert!(
+            rows[1].1.ends_with("summary.json"),
+            "no transcript yet: the summary stands in"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -746,13 +847,20 @@ mod tests {
     #[test]
     fn the_preview_is_the_conversation_and_not_the_machinery() {
         let log = concat!(
-            r#"{"type":"system","content":"You are Grok."}"#, "\n",
-            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS: linux\n</user_info>\n\n<user_query>\nfix the bug\n</user_query>"}]}"#, "\n",
-            r#"{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]}"#, "\n",
-            r#"{"type":"assistant","content":"","tool_calls":[{"name":"read_file"}]}"#, "\n",
-            r#"{"type":"tool_result","content":"file contents"}"#, "\n",
-            r#"{"type":"assistant","content":"Fixed it."}"#, "\n",
-            r#"{"type":"user","content":"thanks"}"#, "\n",
+            r#"{"type":"system","content":"You are Grok."}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS: linux\n</user_info>\n\n<user_query>\nfix the bug\n</user_query>"}]}"#,
+            "\n",
+            r#"{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"read_file"}]}"#,
+            "\n",
+            r#"{"type":"tool_result","content":"file contents"}"#,
+            "\n",
+            r#"{"type":"assistant","content":"Fixed it."}"#,
+            "\n",
+            r#"{"type":"user","content":"thanks"}"#,
+            "\n",
         );
         let msgs = parse_messages(log);
         assert_eq!(
@@ -773,12 +881,18 @@ mod tests {
     #[test]
     fn the_preview_drops_the_four_line_preamble() {
         let log = concat!(
-            r#"{"type":"system","content":"You are Grok 4.6 released by xAI."}"#, "\n",
-            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: linux\nWorkspace Path: /tmp/grok-specimen\n</user_info>\n\n<rules>\n<user_rule>be brief</user_rule>\n</rules>"}]}"#, "\n",
-            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>\nThe following skills are available for use:\n\n- ai-seo: …\n</system-reminder>"}],"synthetic_reason":"system_reminder"}"#, "\n",
-            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>\nMCP servers connected:\n- memory-index (1 tool)\n</system-reminder>"}],"synthetic_reason":"system_reminder"}"#, "\n",
-            r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nSay hi briefly then wait\n</user_query>"}],"prompt_index":0}"#, "\n",
-            r#"{"type":"assistant","content":"Hi."}"#, "\n",
+            r#"{"type":"system","content":"You are Grok 4.6 released by xAI."}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: linux\nWorkspace Path: /tmp/grok-specimen\n</user_info>\n\n<rules>\n<user_rule>be brief</user_rule>\n</rules>"}]}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>\nThe following skills are available for use:\n\n- ai-seo: …\n</system-reminder>"}],"synthetic_reason":"system_reminder"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>\nMCP servers connected:\n- memory-index (1 tool)\n</system-reminder>"}],"synthetic_reason":"system_reminder"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nSay hi briefly then wait\n</user_query>"}],"prompt_index":0}"#,
+            "\n",
+            r#"{"type":"assistant","content":"Hi."}"#,
+            "\n",
         );
         let msgs = parse_messages(log);
         assert_eq!(
@@ -840,7 +954,9 @@ mod tests {
             "grok --model 'grok-4.6' --session-id 'e63b0f22-7d69-4084-aaf3-733816255e8e' 'you'\\''ve been brought in'"
         );
         assert_eq!(
-            GrokBackend.resume("e63b0f22-7d69-4084-aaf3-733816255e8e").unwrap(),
+            GrokBackend
+                .resume("e63b0f22-7d69-4084-aaf3-733816255e8e")
+                .unwrap(),
             "grok --resume 'e63b0f22-7d69-4084-aaf3-733816255e8e'"
         );
         assert_eq!(GrokBackend.clear("abc").unwrap(), "grok --session-id 'abc'");
@@ -854,12 +970,19 @@ mod panel_tests {
     #[test]
     fn todo_write_replays_replace_and_merge() {
         let log = concat!(
-            r#"{"type":"assistant","content":"","tool_calls":[{"name":"todo_write","arguments":"{\"todos\":[{\"id\":\"1\",\"content\":\"Load context\",\"status\":\"in_progress\"},{\"id\":\"2\",\"content\":\"Pull data\",\"status\":\"pending\"}],\"merge\":false}"}]}"#, "\n",
-            r#"{"type":"tool_result","content":"ok"}"#, "\n",
-            r#"{"type":"assistant","content":"","tool_calls":[{"name":"todo_write","arguments":"{\"todos\":[{\"id\":\"1\",\"content\":\"Load context\",\"status\":\"completed\"}],\"merge\":true}"}]}"#, "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"todo_write","arguments":"{\"todos\":[{\"id\":\"1\",\"content\":\"Load context\",\"status\":\"in_progress\"},{\"id\":\"2\",\"content\":\"Pull data\",\"status\":\"pending\"}],\"merge\":false}"}]}"#,
+            "\n",
+            r#"{"type":"tool_result","content":"ok"}"#,
+            "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"todo_write","arguments":"{\"todos\":[{\"id\":\"1\",\"content\":\"Load context\",\"status\":\"completed\"}],\"merge\":true}"}]}"#,
+            "\n",
         );
         let tasks = parse_tasks(log);
-        assert_eq!(tasks.len(), 2, "merge:true updates in place, it does not truncate");
+        assert_eq!(
+            tasks.len(),
+            2,
+            "merge:true updates in place, it does not truncate"
+        );
         assert_eq!(tasks[0].status, "completed");
         assert_eq!(tasks[1].subject, "Pull data");
     }
@@ -867,15 +990,21 @@ mod panel_tests {
     #[test]
     fn artifacts_read_newest_first_with_the_last_tool_kept() {
         let log = concat!(
-            r#"{"type":"assistant","content":"","tool_calls":[{"name":"write","arguments":"{\"file_path\":\"/tmp/a.py\",\"content\":\"x\"}"}]}"#, "\n",
-            r#"{"type":"assistant","content":"","tool_calls":[{"name":"write","arguments":"{\"file_path\":\"/tmp/b.md\",\"content\":\"y\"}"}]}"#, "\n",
-            r#"{"type":"assistant","content":"","tool_calls":[{"name":"search_replace","arguments":"{\"file_path\":\"/tmp/a.py\",\"new_string\":\"z\"}"}]}"#, "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"write","arguments":"{\"file_path\":\"/tmp/a.py\",\"content\":\"x\"}"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"write","arguments":"{\"file_path\":\"/tmp/b.md\",\"content\":\"y\"}"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"","tool_calls":[{"name":"search_replace","arguments":"{\"file_path\":\"/tmp/a.py\",\"new_string\":\"z\"}"}]}"#,
+            "\n",
         );
         let arts = parse_artifacts(log);
         assert_eq!(arts.len(), 2);
         assert_eq!(arts[0].path, "/tmp/a.py", "last touched leads");
         assert_eq!(arts[0].tool, "Edit", "the write was later edited");
         assert_eq!(arts[1].tool, "Write");
-        assert_eq!(arts[0].at, "", "grok records carry no timestamps — none is invented");
+        assert_eq!(
+            arts[0].at, "",
+            "grok records carry no timestamps — none is invented"
+        );
     }
 }

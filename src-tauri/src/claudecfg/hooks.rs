@@ -3,7 +3,7 @@
 //! its source to explain whether editing is safe: aiterm's own hook lives in
 //! aiterm's own file and must never be edited through this panel.
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +27,11 @@ pub struct Hook {
 /// `is_aiterm` is set when the command contains `aiterm_marker`. The marker
 /// is what identifies aiterm's own hook, which aiterm injects through
 /// `--settings` with the command `"aiterm --hook-report"`.
-pub fn parse(layer_label: &str, hooks_value: &Value, aiterm_marker: &str) -> (Vec<Hook>, Vec<String>) {
+pub fn parse(
+    layer_label: &str,
+    hooks_value: &Value,
+    aiterm_marker: &str,
+) -> (Vec<Hook>, Vec<String>) {
     let mut hooks = Vec::new();
     let mut errors = Vec::new();
 
@@ -48,7 +52,10 @@ pub fn parse(layer_label: &str, hooks_value: &Value, aiterm_marker: &str) -> (Ve
                 continue;
             };
 
-            let matcher = entry_obj.get("matcher").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let matcher = entry_obj
+                .get("matcher")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let Some(hooks_arr) = entry_obj.get("hooks").and_then(|v| v.as_array()) else {
                 errors.push(format!("{event}: missing or non-array 'hooks' field"));

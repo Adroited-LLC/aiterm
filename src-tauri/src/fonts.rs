@@ -32,14 +32,46 @@ pub struct FontPackage {
 /// buggy frontend cannot turn the install button into arbitrary package
 /// installation.
 const PACKAGES: &[(&str, &str, &str)] = &[
-    ("Hack", "source-foundry-hack-fonts", "Legible at small sizes, wide language coverage"),
-    ("JetBrains Mono", "jetbrains-mono-fonts", "Tall x-height, coding ligatures"),
-    ("Fira Code", "fira-code-fonts", "The original programming-ligature font"),
-    ("Cascadia Mono", "cascadia-mono-fonts", "Microsoft's terminal font, no ligatures"),
-    ("Cascadia Code", "cascadia-code-fonts", "Cascadia with ligatures"),
-    ("IBM Plex Mono", "ibm-plex-mono-fonts", "Humanist, slightly warmer than most"),
-    ("Intel One Mono", "intel-one-mono-fonts", "Designed for low-vision developers"),
-    ("Source Code Pro", "adobe-source-code-pro-fonts", "Adobe's, a common default"),
+    (
+        "Hack",
+        "source-foundry-hack-fonts",
+        "Legible at small sizes, wide language coverage",
+    ),
+    (
+        "JetBrains Mono",
+        "jetbrains-mono-fonts",
+        "Tall x-height, coding ligatures",
+    ),
+    (
+        "Fira Code",
+        "fira-code-fonts",
+        "The original programming-ligature font",
+    ),
+    (
+        "Cascadia Mono",
+        "cascadia-mono-fonts",
+        "Microsoft's terminal font, no ligatures",
+    ),
+    (
+        "Cascadia Code",
+        "cascadia-code-fonts",
+        "Cascadia with ligatures",
+    ),
+    (
+        "IBM Plex Mono",
+        "ibm-plex-mono-fonts",
+        "Humanist, slightly warmer than most",
+    ),
+    (
+        "Intel One Mono",
+        "intel-one-mono-fonts",
+        "Designed for low-vision developers",
+    ),
+    (
+        "Source Code Pro",
+        "adobe-source-code-pro-fonts",
+        "Adobe's, a common default",
+    ),
 ];
 
 /// Extensions fontconfig can actually consume from a user font directory.
@@ -260,7 +292,10 @@ mod tests {
             all.len() > 1,
             "expected many families, got {all:?} — check the --format escape"
         );
-        assert!(all.iter().all(|f| f.len() < 100), "family names ran together");
+        assert!(
+            all.iter().all(|f| f.len() < 100),
+            "family names ran together"
+        );
         assert!(fc_families(&[":mono"]).len() <= all.len());
     }
 

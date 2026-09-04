@@ -18,7 +18,11 @@ use crate::providers::Provider;
 
 /// What the user asked for, in the terms the UI actually has.
 #[derive(Deserialize, Debug, Clone)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum LaunchRequest {
     /// A named engine from the ＋ menu, with whatever the picker chose.
     Agent {
@@ -112,7 +116,8 @@ fn resolve_result_with(
         } => Some(flags.clone()),
         _ => None,
     };
-    let plan = resolve_in(list, providers, request.clone()).ok_or_else(|| explain(list, &request))?;
+    let plan =
+        resolve_in(list, providers, request.clone()).ok_or_else(|| explain(list, &request))?;
     let flags = permission_override.unwrap_or_else(|| {
         list.iter()
             .find(|backend| backend.id() == plan.agent_id)
@@ -170,7 +175,11 @@ pub fn resolve_in(
             })
         }
 
-        LaunchRequest::ApiModel { provider_id, model_id, prompt } => {
+        LaunchRequest::ApiModel {
+            provider_id,
+            model_id,
+            prompt,
+        } => {
             let provider = providers.iter().find(|p| p.id == provider_id)?;
             // First willing engine in registry order. `ChatBackend` is last and
             // accepts everything, so this only fails if the registry is empty.
@@ -329,7 +338,10 @@ fn explain(list: &[Box<dyn AgentBackend>], request: &LaunchRequest) -> String {
         }
         LaunchRequest::Resume { session_id } | LaunchRequest::Restart { session_id } => {
             match owner(list, session_id) {
-                Some(b) => format!("{} sessions can't be reopened from aiterm yet.", b.display_name()),
+                Some(b) => format!(
+                    "{} sessions can't be reopened from aiterm yet.",
+                    b.display_name()
+                ),
                 None => gone.into(),
             }
         }
@@ -383,7 +395,10 @@ mod tests {
             caps: Caps::default(),
         };
         let stamped = with_permission(plan.clone(), "--dangerously-skip-permissions");
-        assert_eq!(stamped.command, "claude --resume 'abc' --dangerously-skip-permissions");
+        assert_eq!(
+            stamped.command,
+            "claude --resume 'abc' --dangerously-skip-permissions"
+        );
         // The re-key guard watches for the quoted resume form; appending must
         // not disturb it.
         assert!(stamped.command.contains("--resume 'abc'"));
@@ -503,7 +518,10 @@ mod tests {
             self.mints
         }
         fn caps(&self) -> Caps {
-            Caps { resume: self.can_resume, ..Default::default() }
+            Caps {
+                resume: self.can_resume,
+                ..Default::default()
+            }
         }
         fn launch(&self, spec: &LaunchSpec) -> String {
             let mut cmd = self.id.to_string();
@@ -602,7 +620,10 @@ mod tests {
     }
 
     fn undeclared() -> Provider {
-        provider("unit-test-undeclared", "https://unit-test-undeclared.invalid/v1")
+        provider(
+            "unit-test-undeclared",
+            "https://unit-test-undeclared.invalid/v1",
+        )
     }
 
     /* ---- routing -------------------------------------------------------- */
@@ -623,8 +644,16 @@ mod tests {
         )
         .expect("no plan");
         assert_eq!(plan.agent_id, "claude");
-        assert!(plan.command.starts_with("claude --model opus --effort high"), "{}", plan.command);
-        assert_eq!(plan.env_provider, None, "a plain agent must never be handed a key");
+        assert!(
+            plan.command
+                .starts_with("claude --model opus --effort high"),
+            "{}",
+            plan.command
+        );
+        assert_eq!(
+            plan.env_provider, None,
+            "a plain agent must never be handed a key"
+        );
         assert_eq!(plan.env_model, None);
     }
 
@@ -634,7 +663,13 @@ mod tests {
         assert!(resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "ghost".into(), model: None, effort: None, prompt: None, permission_flags: None },
+            LaunchRequest::Agent {
+                agent_id: "ghost".into(),
+                model: None,
+                effort: None,
+                prompt: None,
+                permission_flags: None
+            },
         )
         .is_none());
     }
@@ -656,7 +691,8 @@ mod tests {
         assert_eq!(plan.agent_id, "opencode");
         // The catalog prefix is the engine's spelling, applied by the engine.
         assert!(
-            plan.command.contains("--model openrouter/anthropic/claude-sonnet-5"),
+            plan.command
+                .contains("--model openrouter/anthropic/claude-sonnet-5"),
             "{}",
             plan.command
         );
@@ -677,7 +713,11 @@ mod tests {
         .expect("no plan");
         assert_eq!(plan.agent_id, "api");
         // No prefix: that spelling belongs to OpenCode's catalog, not to ours.
-        assert!(plan.command.contains("--model anthropic/claude-sonnet-5"), "{}", plan.command);
+        assert!(
+            plan.command.contains("--model anthropic/claude-sonnet-5"),
+            "{}",
+            plan.command
+        );
     }
 
     /// A custom OpenAI-compatible endpoint is not in OpenCode's catalog, so it
@@ -788,11 +828,20 @@ mod tests {
         let minting = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None, permission_flags: None },
+            LaunchRequest::Agent {
+                agent_id: "claude".into(),
+                model: None,
+                effort: None,
+                prompt: None,
+                permission_flags: None,
+            },
         )
         .unwrap();
         let id = minting.session_id.expect("claude mints an id");
-        assert!(minting.command.contains(&id), "the minted id never reached the command line");
+        assert!(
+            minting.command.contains(&id),
+            "the minted id never reached the command line"
+        );
 
         let not_minting = resolve_in(
             &list,
@@ -805,7 +854,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(not_minting.agent_id, "opencode");
-        assert_eq!(not_minting.session_id, None, "an id was minted for an engine that drops it");
+        assert_eq!(
+            not_minting.session_id, None,
+            "an id was minted for an engine that drops it"
+        );
     }
 
     #[test]
@@ -831,7 +883,9 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[],
-            LaunchRequest::Resume { session_id: "chat-1".into() },
+            LaunchRequest::Resume {
+                session_id: "chat-1".into(),
+            },
         )
         .expect("no plan");
         assert_eq!(plan.agent_id, "api");
@@ -859,7 +913,9 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[openrouter()],
-            LaunchRequest::Resume { session_id: "ses_1".into() },
+            LaunchRequest::Resume {
+                session_id: "ses_1".into(),
+            },
         )
         .expect("no plan");
         assert_eq!(plan.env_provider.as_deref(), Some("openrouter"));
@@ -882,7 +938,9 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[provider("other", "https://api.example.com/v1")],
-            LaunchRequest::Resume { session_id: "ses_1".into() },
+            LaunchRequest::Resume {
+                session_id: "ses_1".into(),
+            },
         )
         .expect("no plan");
         assert_eq!(plan.env_provider, None);
@@ -897,7 +955,9 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[openrouter()],
-            LaunchRequest::Resume { session_id: "chat-1".into() },
+            LaunchRequest::Resume {
+                session_id: "chat-1".into(),
+            },
         )
         .expect("no plan");
         assert_eq!(plan.env_provider, None);
@@ -908,7 +968,9 @@ mod tests {
     /// command `aiterm chat` actually parses.
     #[test]
     fn resuming_a_chat_produces_the_chat_harness_command() {
-        let cmd = crate::agents::ChatBackend.resume("chat-1").expect("no resume command");
+        let cmd = crate::agents::ChatBackend
+            .resume("chat-1")
+            .expect("no resume command");
         assert!(cmd.contains(" chat --resume 'chat-1'"), "{cmd}");
     }
 
@@ -918,12 +980,16 @@ mod tests {
         let resumed = resolve_in(
             &list,
             &[],
-            LaunchRequest::Resume { session_id: "chat-1".into() },
+            LaunchRequest::Resume {
+                session_id: "chat-1".into(),
+            },
         );
         let restarted = resolve_in(
             &list,
             &[],
-            LaunchRequest::Restart { session_id: "chat-1".into() },
+            LaunchRequest::Restart {
+                session_id: "chat-1".into(),
+            },
         );
         assert_eq!(resumed, restarted);
     }
@@ -941,7 +1007,9 @@ mod tests {
         assert!(resolve_in(
             &list,
             &[],
-            LaunchRequest::Resume { session_id: "x1".into() },
+            LaunchRequest::Resume {
+                session_id: "x1".into()
+            },
         )
         .is_none());
     }
@@ -952,7 +1020,9 @@ mod tests {
         assert!(resolve_in(
             &list,
             &[],
-            LaunchRequest::Resume { session_id: "nobody".into() },
+            LaunchRequest::Resume {
+                session_id: "nobody".into()
+            },
         )
         .is_none());
     }
@@ -965,13 +1035,17 @@ mod tests {
         assert!(resolve_in(
             &list,
             &[],
-            LaunchRequest::Clear { session_id: "chat-1".into() },
+            LaunchRequest::Clear {
+                session_id: "chat-1".into()
+            },
         )
         .is_none());
 
         // The real backend: `/clear` re-keys onto an id aiterm chose, which is
         // the same command as a fresh start.
-        let cmd = crate::agents::ClaudeBackend.clear("abc-123").expect("no clear command");
+        let cmd = crate::agents::ClaudeBackend
+            .clear("abc-123")
+            .expect("no clear command");
         assert!(cmd.contains("--session-id 'abc-123'"), "{cmd}");
     }
 
@@ -989,8 +1063,14 @@ mod tests {
             ..Default::default()
         })];
 
-        let plan = resolve_in(&list, &[], LaunchRequest::Clear { session_id: "old-1".into() })
-            .expect("no plan");
+        let plan = resolve_in(
+            &list,
+            &[],
+            LaunchRequest::Clear {
+                session_id: "old-1".into(),
+            },
+        )
+        .expect("no plan");
 
         let fresh = plan.session_id.expect("a clear names its new conversation");
         assert_ne!(fresh, "old-1");
@@ -1010,12 +1090,25 @@ mod tests {
             ..Default::default()
         })];
 
-        let refused = explain(&list, &LaunchRequest::Resume { session_id: "c-1".into() });
+        let refused = explain(
+            &list,
+            &LaunchRequest::Resume {
+                session_id: "c-1".into(),
+            },
+        );
         assert!(refused.contains("codex-like"), "{refused}");
-        assert!(!refused.contains("c-1"), "the id is not news to whoever clicked it: {refused}");
+        assert!(
+            !refused.contains("c-1"),
+            "the id is not news to whoever clicked it: {refused}"
+        );
 
         // Nobody owns it: a different fact, and it reads differently.
-        let gone = explain(&list, &LaunchRequest::Resume { session_id: "never".into() });
+        let gone = explain(
+            &list,
+            &LaunchRequest::Resume {
+                session_id: "never".into(),
+            },
+        );
         assert!(gone.contains("isn't on disk"), "{gone}");
     }
 
@@ -1031,9 +1124,14 @@ mod tests {
             ..Default::default()
         })];
 
-        assert!(
-            resolve_in(&list, &[], LaunchRequest::Clear { session_id: "old-1".into() }).is_none()
-        );
+        assert!(resolve_in(
+            &list,
+            &[],
+            LaunchRequest::Clear {
+                session_id: "old-1".into()
+            }
+        )
+        .is_none());
     }
 
     /* ---- the wire ------------------------------------------------------- */
@@ -1057,8 +1155,10 @@ mod tests {
             r#"{"kind":"apiModel","providerId":"openrouter","modelId":"a/b"}"#,
         )
         .expect("apiModel");
-        assert!(matches!(api, LaunchRequest::ApiModel { provider_id, model_id, .. }
-            if provider_id == "openrouter" && model_id == "a/b"));
+        assert!(
+            matches!(api, LaunchRequest::ApiModel { provider_id, model_id, .. }
+            if provider_id == "openrouter" && model_id == "a/b")
+        );
 
         for (json, ok) in [
             (r#"{"kind":"resume","sessionId":"s1"}"#, "resume"),
@@ -1082,7 +1182,14 @@ mod tests {
     fn an_agent_request_may_name_no_model_at_all() {
         let parsed: LaunchRequest =
             serde_json::from_str(r#"{"kind":"agent","agentId":"claude"}"#).expect("agent");
-        assert!(matches!(parsed, LaunchRequest::Agent { model: None, effort: None, .. }));
+        assert!(matches!(
+            parsed,
+            LaunchRequest::Agent {
+                model: None,
+                effort: None,
+                ..
+            }
+        ));
     }
 
     /// `caps` is what the UI gates on, so it has to survive serialization in
@@ -1093,14 +1200,26 @@ mod tests {
         let plan = resolve_in(
             &list,
             &[],
-            LaunchRequest::Agent { agent_id: "claude".into(), model: None, effort: None, prompt: None, permission_flags: None },
+            LaunchRequest::Agent {
+                agent_id: "claude".into(),
+                model: None,
+                effort: None,
+                prompt: None,
+                permission_flags: None,
+            },
         )
         .unwrap();
         let v: serde_json::Value = serde_json::to_value(&plan).unwrap();
         assert!(v.get("command").is_some() && v.get("env_provider").is_some());
         assert!(v.get("env_model").is_some());
-        assert_eq!(v.pointer("/caps/tui_drive"), Some(&serde_json::Value::Bool(false)));
-        assert_eq!(v.pointer("/caps/resume"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            v.pointer("/caps/tui_drive"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            v.pointer("/caps/resume"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     /* ---- the real registry ---------------------------------------------- */
@@ -1112,7 +1231,11 @@ mod tests {
     fn the_all_accepting_fallback_is_last_in_the_registry() {
         let list = crate::agents::backends();
         let fallback = list.iter().position(|b| b.id() == "api");
-        assert_eq!(fallback, Some(list.len() - 1), "a backend sits behind the fallback");
+        assert_eq!(
+            fallback,
+            Some(list.len() - 1),
+            "a backend sits behind the fallback"
+        );
     }
 
     /// The chat harness is always available, so an API model resolves on a
@@ -1122,12 +1245,19 @@ mod tests {
         let plan = resolve_in(
             &crate::agents::backends(),
             &[undeclared()],
-            LaunchRequest::ApiModel { provider_id: "unit-test-undeclared".into(), model_id: "m".into(), prompt: None },
+            LaunchRequest::ApiModel {
+                provider_id: "unit-test-undeclared".into(),
+                model_id: "m".into(),
+                prompt: None,
+            },
         )
         .expect("no engine would run an API model");
         assert_eq!(plan.agent_id, "api");
         assert_eq!(plan.env_provider, None);
         assert_eq!(plan.env_model, None);
-        assert!(plan.session_id.is_some(), "a chat's id is real from the first frame");
+        assert!(
+            plan.session_id.is_some(),
+            "a chat's id is real from the first frame"
+        );
     }
 }

@@ -16,7 +16,7 @@ class AppContainer(context: Context) {
     val deviceKeys = AndroidDeviceKeyStore()
     val relayAuthorityKeys = AndroidDeviceKeyStore("aiterm-relay-authority-p256-v1")
     val pairingRepository = PairingRepository(
-        transport = OkHttpPairingTransport(),
+        transport = OkHttpPairingTransport(context.applicationContext),
         deviceKeys = deviceKeys,
         relayAuthorityKeys = relayAuthorityKeys,
         store = pairedDesktopStore,

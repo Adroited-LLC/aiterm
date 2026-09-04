@@ -27,6 +27,9 @@ internal fun pairingUri(
     relayHost: String? = null,
     relayPort: Int? = null,
     relayAuthorizationDigest: ByteArray? = null,
+    networkStack: String? = null,
+    irohNodeId: String? = null,
+    irohRelayUrl: String? = null,
 ): String = buildString {
     append("aiterm://pair?v=").append(version)
     hosts.forEach { append("&h=").append(it) }
@@ -37,6 +40,9 @@ internal fun pairingUri(
     relayHost?.let { append("&r=").append(it) }
     relayPort?.let { append("&q=").append(it) }
     relayAuthorizationDigest?.let { append("&a=").append(it.toBase64Url()) }
+    networkStack?.let { append("&m=").append(it) }
+    irohNodeId?.let { append("&i=").append(it) }
+    irohRelayUrl?.let { append("&j=").append(it) }
 }
 
 internal fun parsedPayload(

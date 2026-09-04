@@ -58,8 +58,12 @@ const TITLE_CAP: usize = 200;
 /// decide whether a message is ENTIRELY scaffolding, never to edit the text
 /// that goes on the wire. `recommended_plugins` is codex's alone and the
 /// phone does not know it yet.
-const HARNESS_TAGS: [&str; 4] =
-    ["INSTRUCTIONS", "environment_context", "user_instructions", "recommended_plugins"];
+const HARNESS_TAGS: [&str; 4] = [
+    "INSTRUCTIONS",
+    "environment_context",
+    "user_instructions",
+    "recommended_plugins",
+];
 
 /// The heading codex puts above an AGENTS.md it has loaded.
 const HARNESS_HEADING: &str = "# AGENTS.md instructions for ";
@@ -165,7 +169,9 @@ impl Adapter for CodexAdapter {
             return out;
         }
 
-        let Ok(mut file) = std::fs::File::open(&self.path) else { return out };
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return out;
+        };
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return out;
         }
@@ -206,7 +212,9 @@ impl Adapter for CodexAdapter {
 
 impl CodexAdapter {
     fn read_line(&mut self, raw: &[u8], out: &mut Vec<(u64, Kind)>) {
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else { return };
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw) else {
+            return;
+        };
         self.line += 1;
         let ts = v
             .get("timestamp")
@@ -243,7 +251,10 @@ impl CodexAdapter {
                     return;
                 }
                 let from = p.get("author").and_then(|a| a.as_str()).unwrap_or("agent");
-                let to = p.get("recipient").and_then(|a| a.as_str()).unwrap_or("agent");
+                let to = p
+                    .get("recipient")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("agent");
                 out.push((
                     ts,
                     Kind::AgentText {
@@ -263,7 +274,14 @@ impl CodexAdapter {
                 if text.trim().is_empty() {
                     return;
                 }
-                out.push((ts, Kind::AgentThought { id: self.id_of(p), text, done: true }));
+                out.push((
+                    ts,
+                    Kind::AgentThought {
+                        id: self.id_of(p),
+                        text,
+                        done: true,
+                    },
+                ));
             }
             Some("function_call" | "custom_tool_call" | "local_shell_call") => {
                 self.tool_call(p, ts, out)
@@ -282,7 +300,14 @@ impl CodexAdapter {
                 if text.trim().is_empty() {
                     return;
                 }
-                out.push((ts, Kind::AgentText { id: self.id_of(p), text, done: true }));
+                out.push((
+                    ts,
+                    Kind::AgentText {
+                        id: self.id_of(p),
+                        text,
+                        done: true,
+                    },
+                ));
             }
             Some("user") => {
                 // The first `user` record of every session is codex's own
@@ -326,7 +351,11 @@ impl CodexAdapter {
             None => String::new(),
         };
         let (tool, detail, category) = shape(name, &input);
-        self.open = Some(OpenCall { id: id.clone(), status: None, output: None });
+        self.open = Some(OpenCall {
+            id: id.clone(),
+            status: None,
+            output: None,
+        });
         out.push((
             ts,
             Kind::ToolCall {
@@ -409,18 +438,33 @@ impl CodexAdapter {
             // Older builds' spelling of `item_completed`/`FileChange`: the
             // patch's own output is `{}`, so this is where the file list is.
             Some("patch_apply_end") => {
-                let Some(open) = self.open.as_mut() else { return };
+                let Some(open) = self.open.as_mut() else {
+                    return;
+                };
                 let ok = p.get("success").and_then(|s| s.as_bool()).unwrap_or(true);
-                open.status = Some(if ok { ToolStatus::Completed } else { ToolStatus::Failed });
+                open.status = Some(if ok {
+                    ToolStatus::Completed
+                } else {
+                    ToolStatus::Failed
+                });
                 open.output = first_nonempty(&[p.get("stdout"), p.get("stderr")]);
             }
             // Not written by 0.151 — it narrates a command with
             // `item_completed`/`CommandExecution` — but it is the older
             // spelling and it is one line to honour.
             Some("exec_command_end") => {
-                let Some(open) = self.open.as_mut() else { return };
-                let bad = p.get("exit_code").and_then(|c| c.as_i64()).is_some_and(|c| c != 0);
-                open.status = Some(if bad { ToolStatus::Failed } else { ToolStatus::Completed });
+                let Some(open) = self.open.as_mut() else {
+                    return;
+                };
+                let bad = p
+                    .get("exit_code")
+                    .and_then(|c| c.as_i64())
+                    .is_some_and(|c| c != 0);
+                open.status = Some(if bad {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Completed
+                });
             }
             // `token_count`, `thread_settings_applied`, `web_search_end`,
             // `agent_message`, `user_message`, `agent_reasoning`,
@@ -456,7 +500,13 @@ impl CodexAdapter {
             .or_else(|| self.turn.take())
             .unwrap_or_else(|| self.fallback_id());
         self.turn = None;
-        out.push((ts, Kind::TurnEnded { turn, reason: reason.into() }));
+        out.push((
+            ts,
+            Kind::TurnEnded {
+                turn,
+                reason: reason.into(),
+            },
+        ));
     }
 
     /// What an `item_completed` says about the call now open. The item ids do
@@ -464,7 +514,9 @@ impl CodexAdapter {
     /// `call_<…>` — so the pairing is positional, which the rollouts' strict
     /// one-call-at-a-time ordering makes safe.
     fn outcome(&mut self, item: Option<&serde_json::Value>) {
-        let (Some(open), Some(item)) = (self.open.as_mut(), item) else { return };
+        let (Some(open), Some(item)) = (self.open.as_mut(), item) else {
+            return;
+        };
         match item.get("type").and_then(|t| t.as_str()) {
             Some("CommandExecution") => open.status = Some(item_status(item)),
             // A patch: the call answers `{}`, the item lists the files.
@@ -599,7 +651,10 @@ fn patch_files(input: &str) -> String {
     let mut rest = input;
     while let Some(at) = rest.find("*** ") {
         let after = &rest[at + "*** ".len()..];
-        let end = after.find("\\n").or_else(|| after.find('\n')).unwrap_or(after.len());
+        let end = after
+            .find("\\n")
+            .or_else(|| after.find('\n'))
+            .unwrap_or(after.len());
         let line = &after[..end];
         for (verb, tag) in VERBS {
             if let Some(path) = line.strip_prefix(verb) {
@@ -628,7 +683,10 @@ fn item_status(item: &serde_json::Value) -> ToolStatus {
         Some("failed" | "error") => ToolStatus::Failed,
         Some("cancelled" | "aborted") => ToolStatus::Cancelled,
         _ => {
-            let bad = item.get("exit_code").and_then(|c| c.as_i64()).is_some_and(|c| c != 0);
+            let bad = item
+                .get("exit_code")
+                .and_then(|c| c.as_i64())
+                .is_some_and(|c| c != 0);
             if bad {
                 ToolStatus::Failed
             } else {
@@ -659,7 +717,9 @@ fn content_text(v: Option<&serde_json::Value>) -> String {
         Some(serde_json::Value::Array(parts)) => {
             let mut out = String::new();
             for part in parts {
-                let Some(t) = part.get("text").and_then(|t| t.as_str()) else { continue };
+                let Some(t) = part.get("text").and_then(|t| t.as_str()) else {
+                    continue;
+                };
                 if !out.is_empty() {
                     out.push('\n');
                 }
@@ -683,7 +743,9 @@ fn harness_only(text: &str) -> bool {
         // tag with words between them must not swallow the words.
         while let Some(a) = rest.find(&open) {
             let after = a + open.len();
-            let Some(rel) = rest[after..].find(&close) else { break };
+            let Some(rel) = rest[after..].find(&close) else {
+                break;
+            };
             rest.replace_range(a..after + rel + close.len(), "");
         }
     }
@@ -735,8 +797,8 @@ fn identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
 
 /// "2026-09-02T22:24:08.034Z" → millis. Enough of ISO 8601 for the timestamps
 /// a rollout writes; anything else gets `None` and the caller stamps now.
-/// (`remote_api` keeps a seconds-only sibling for the sessions list; the
-/// spine needs millis, because a call and its result land in the same second.)
+/// The spine needs millis because a call and its result can land in the same
+/// second.
 fn iso_to_ms(s: &str) -> Option<u64> {
     let (date, rest) = s.split_once('T')?;
     let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
@@ -744,7 +806,10 @@ fn iso_to_ms(s: &str) -> Option<u64> {
     let time = rest.trim_end_matches('Z');
     let time = time.split(['+', '-']).next().unwrap_or(time);
     let mut t = time.split(':');
-    let (h, mi) = (t.next()?.parse::<i64>().ok()?, t.next()?.parse::<i64>().ok()?);
+    let (h, mi) = (
+        t.next()?.parse::<i64>().ok()?,
+        t.next()?.parse::<i64>().ok()?,
+    );
     let secs_part = t.next()?;
     let (sec, frac) = match secs_part.split_once('.') {
         Some((s, f)) => (s.parse::<i64>().ok()?, f),
@@ -864,7 +929,11 @@ mod tests {
     }
 
     fn write(path: &Path, bytes: &str) {
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
         f.write_all(bytes.as_bytes()).unwrap();
     }
 
@@ -888,7 +957,9 @@ mod tests {
         assert_eq!(
             kinds(&[TASK_STARTED, USER]),
             vec![
-                Kind::TurnStarted { turn: "01a06438-ef47-7d91-a661-d26a0b396c26".into() },
+                Kind::TurnStarted {
+                    turn: "01a06438-ef47-7d91-a661-d26a0b396c26".into()
+                },
                 Kind::UserMessage {
                     id: "msg_01a06439-a83a-7461-8dff-56245740268c".into(),
                     text: "viewthe conversation and tell meif they improved".into(),
@@ -900,7 +971,9 @@ mod tests {
     #[test]
     fn a_turn_closes_naming_the_turn_it_opened() {
         assert_eq!(
-            kinds(&[TASK_STARTED, USER, ASSISTANT, TASK_COMPLETE]).last().unwrap(),
+            kinds(&[TASK_STARTED, USER, ASSISTANT, TASK_COMPLETE])
+                .last()
+                .unwrap(),
             &Kind::TurnEnded {
                 turn: "01a06438-ef47-7d91-a661-d26a0b396c26".into(),
                 reason: "completed".into(),
@@ -913,17 +986,26 @@ mod tests {
         // No `task_started` in front of it: the message names its own turn.
         assert_eq!(
             kinds(&[USER])[0],
-            Kind::TurnStarted { turn: "msg_01a06439-a83a-7461-8dff-56245740268c".into() }
+            Kind::TurnStarted {
+                turn: "msg_01a06439-a83a-7461-8dff-56245740268c".into()
+            }
         );
     }
 
     #[test]
     fn codexs_own_preamble_is_not_something_a_person_said() {
-        assert!(kinds(&[USER_SCAFFOLD]).is_empty(), "AGENTS.md and the environment block");
+        assert!(
+            kinds(&[USER_SCAFFOLD]).is_empty(),
+            "AGENTS.md and the environment block"
+        );
         assert!(kinds(&[USER_PLUGINS]).is_empty(), "the plugin catalogue");
         // Words BETWEEN two blocks of one tag are words, not scaffolding.
-        assert!(!harness_only("<INSTRUCTIONS>a</INSTRUCTIONS> ship it <INSTRUCTIONS>b</INSTRUCTIONS>"));
-        assert!(harness_only("<INSTRUCTIONS>a</INSTRUCTIONS>\n<INSTRUCTIONS>b</INSTRUCTIONS>"));
+        assert!(!harness_only(
+            "<INSTRUCTIONS>a</INSTRUCTIONS> ship it <INSTRUCTIONS>b</INSTRUCTIONS>"
+        ));
+        assert!(harness_only(
+            "<INSTRUCTIONS>a</INSTRUCTIONS>\n<INSTRUCTIONS>b</INSTRUCTIONS>"
+        ));
         // An envelope that never closes is text, not a block to swallow.
         assert!(!harness_only("<INSTRUCTIONS>truncated"));
     }
@@ -931,10 +1013,8 @@ mod tests {
     #[test]
     fn a_message_that_carries_a_harness_block_and_words_keeps_both() {
         // The text goes over the wire whole; the phone is what strips it.
-        let both = USER_SCAFFOLD.replace(
-            "</INSTRUCTIONS>",
-            "</INSTRUCTIONS>\\n\\nnow fix the build",
-        );
+        let both =
+            USER_SCAFFOLD.replace("</INSTRUCTIONS>", "</INSTRUCTIONS>\\n\\nnow fix the build");
         assert_eq!(
             kinds(&[&both]).last().unwrap(),
             &Kind::UserMessage {
@@ -1020,13 +1100,19 @@ mod tests {
         let out = kinds(&[FAIL_CALL, FAIL_ITEM, FAIL_OUTPUT]);
         assert!(matches!(
             &out[1],
-            Kind::ToolCallUpdate { status: ToolStatus::Failed, .. }
+            Kind::ToolCallUpdate {
+                status: ToolStatus::Failed,
+                ..
+            }
         ));
         // Without the item there is nothing to go on, so it reads as fine.
         let blind = kinds(&[FAIL_CALL, FAIL_OUTPUT]);
         assert!(matches!(
             &blind[1],
-            Kind::ToolCallUpdate { status: ToolStatus::Completed, .. }
+            Kind::ToolCallUpdate {
+                status: ToolStatus::Completed,
+                ..
+            }
         ));
     }
 
@@ -1089,7 +1175,9 @@ mod tests {
         assert_eq!(
             kinds(&[TASK_STARTED, EXEC_CALL, TURN_ABORTED]),
             vec![
-                Kind::TurnStarted { turn: "01a06438-ef47-7d91-a661-d26a0b396c26".into() },
+                Kind::TurnStarted {
+                    turn: "01a06438-ef47-7d91-a661-d26a0b396c26".into()
+                },
                 Kind::ToolCall {
                     id: "call_YH30YPzrngNxj7cJGNWJTyYo".into(),
                     tool: "exec_command".into(),
@@ -1122,13 +1210,27 @@ mod tests {
 
     #[test]
     fn what_a_call_is_comes_out_of_the_javascript_it_was_written_in() {
-        let (tool, detail, cat) = shape("exec", "const r = await tools.web__run({search_query:[\n {q:\"codex rollout format\"}]});");
-        assert_eq!((tool.as_str(), detail.as_str(), cat), ("web_search", "codex rollout format", ToolCategory::Search));
-        let (tool, detail, cat) =
-            shape("exec", "await tools.image_gen__imagegen({prompt:\"a dog on a bicycle\"});");
-        assert_eq!((tool.as_str(), detail.as_str(), cat), ("image_gen", "a dog on a bicycle", ToolCategory::Other));
+        let (tool, detail, cat) = shape(
+            "exec",
+            "const r = await tools.web__run({search_query:[\n {q:\"codex rollout format\"}]});",
+        );
+        assert_eq!(
+            (tool.as_str(), detail.as_str(), cat),
+            ("web_search", "codex rollout format", ToolCategory::Search)
+        );
+        let (tool, detail, cat) = shape(
+            "exec",
+            "await tools.image_gen__imagegen({prompt:\"a dog on a bicycle\"});",
+        );
+        assert_eq!(
+            (tool.as_str(), detail.as_str(), cat),
+            ("image_gen", "a dog on a bicycle", ToolCategory::Other)
+        );
         let (tool, detail, cat) = shape("exec", "tools.view_image({path:\"/tmp/shot.png\"})");
-        assert_eq!((tool.as_str(), detail.as_str(), cat), ("view_image", "/tmp/shot.png", ToolCategory::Read));
+        assert_eq!(
+            (tool.as_str(), detail.as_str(), cat),
+            ("view_image", "/tmp/shot.png", ToolCategory::Read)
+        );
         // A subagent being spawned: a plain function call with JSON arguments.
         let (tool, _, cat) = shape("spawn_agent", "{\"task_name\":\"weather_review\"}");
         assert_eq!((tool.as_str(), cat), ("spawn_agent", ToolCategory::Think));
@@ -1145,7 +1247,11 @@ mod tests {
         let anonymous = r##"{"timestamp":"2026-08-29T23:29:03.197Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"replayed"}]}}"##;
         assert_eq!(
             kinds(&[HEADER, anonymous]),
-            vec![Kind::AgentText { id: "codex:2".into(), text: "replayed".into(), done: true }],
+            vec![Kind::AgentText {
+                id: "codex:2".into(),
+                text: "replayed".into(),
+                done: true
+            }],
             "stable because bootstrap always counts from the first line"
         );
     }
@@ -1169,7 +1275,10 @@ mod tests {
     fn a_replaced_rollout_is_a_reset_and_a_replay() {
         let path = scratch("replaced");
         let mut a = adapter_over(&path);
-        write(&path, &format!("{HEADER}\n{TASK_STARTED}\n{USER}\n{ASSISTANT}\n"));
+        write(
+            &path,
+            &format!("{HEADER}\n{TASK_STARTED}\n{USER}\n{ASSISTANT}\n"),
+        );
         assert_eq!(a.bootstrap().len(), 3);
         // A shorter file under the same name.
         std::fs::write(&path, format!("{HEADER}\n{TASK_STARTED}\n")).unwrap();
@@ -1184,7 +1293,11 @@ mod tests {
         let path = scratch("late");
         let mut a = adapter_over(&path);
         assert!(a.bootstrap().is_empty());
-        assert_eq!(a.watch_paths().len(), 2, "the file and the day folder it lands in");
+        assert_eq!(
+            a.watch_paths().len(),
+            2,
+            "the file and the day folder it lands in"
+        );
         write(&path, &format!("{HEADER}\n{TASK_STARTED}\n{USER}\n"));
         assert_eq!(a.poll().len(), 2);
     }
@@ -1207,7 +1320,9 @@ mod tests {
         let mut totals: std::collections::BTreeMap<&str, usize> = Default::default();
         for path in &files {
             let mut a = adapter_over(path);
-            let lines = std::fs::read_to_string(path).map(|s| s.lines().count()).unwrap_or(0);
+            let lines = std::fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
             let started = std::time::Instant::now();
             let events = a.bootstrap();
             let took = started.elapsed();
@@ -1222,7 +1337,10 @@ mod tests {
                 events.len(),
                 took.as_millis()
             );
-            assert!(a.poll().is_empty(), "a second poll on a finished rollout is empty");
+            assert!(
+                a.poll().is_empty(),
+                "a second poll on a finished rollout is empty"
+            );
             all_lines += lines;
             all_events += events.len();
             all_ms += took.as_millis();
@@ -1246,7 +1364,9 @@ mod tests {
 
     #[cfg(test)]
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {

@@ -91,9 +91,7 @@ pub(crate) fn store_root() -> Option<PathBuf> {
 
 /// Ids are uuids in file names; anything else must not reach a path join.
 pub(crate) fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 pub(crate) fn transcript_path(root: &Path, id: &str) -> PathBuf {
@@ -177,7 +175,9 @@ pub(crate) fn arg_str(call: &serde_json::Value, key: &str) -> Option<String> {
     match raw {
         serde_json::Value::String(s) => {
             if s.starts_with('"') {
-                serde_json::from_str::<String>(s).ok().or_else(|| Some(s.clone()))
+                serde_json::from_str::<String>(s)
+                    .ok()
+                    .or_else(|| Some(s.clone()))
             } else {
                 Some(s.clone())
             }
@@ -233,7 +233,10 @@ pub fn parse_messages(text: &str) -> Vec<(String, String)> {
 /// [`parse_messages`] with a hand that can put back what agy cut: `recover`
 /// gets each `PLANNER_RESPONSE`'s `step_index` and its `content` as logged,
 /// and returns the content to show. See [`recover_truncated`].
-pub fn parse_messages_with(text: &str, recover: &dyn Fn(u64, &str) -> String) -> Vec<(String, String)> {
+pub fn parse_messages_with(
+    text: &str,
+    recover: &dyn Fn(u64, &str) -> String,
+) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| {
             let v: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -247,9 +250,17 @@ pub fn parse_messages_with(text: &str, recover: &dyn Fn(u64, &str) -> String) ->
                     (!body.is_empty()).then(|| ("user".to_string(), body.to_string()))
                 }
                 "PLANNER_RESPONSE" => {
-                    let logged = v.get("content").and_then(|c| c.as_str()).unwrap_or("").trim();
+                    let logged = v
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .trim();
                     let index = v.get("step_index").and_then(|i| i.as_u64()).unwrap_or(0);
-                    let content = if logged.is_empty() { String::new() } else { recover(index, logged) };
+                    let content = if logged.is_empty() {
+                        String::new()
+                    } else {
+                        recover(index, logged)
+                    };
                     let content = content.trim();
                     if !content.is_empty() {
                         return Some(("assistant".to_string(), content.to_string()));
@@ -318,7 +329,9 @@ pub fn splice_truncated(content: &str, payload: &[u8]) -> Option<String> {
     // agy puts the marker on a line of its own; those two newlines are the
     // marker's, not the text's.
     let head = content[..at].strip_suffix('\n').unwrap_or(&content[..at]);
-    let tail = content[mark_end..].strip_prefix('\n').unwrap_or(&content[mark_end..]);
+    let tail = content[mark_end..]
+        .strip_prefix('\n')
+        .unwrap_or(&content[mark_end..]);
     if head.is_empty() && tail.is_empty() {
         return None;
     }
@@ -336,7 +349,10 @@ fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from);
     }
-    hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
+    hay.get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
 }
 
 /// [`splice_truncated`] against the conversation's own db: the content as
@@ -355,7 +371,11 @@ pub(crate) fn recover_truncated(root: &Path, id: &str, step_index: u64, content:
         )
         .ok()?;
         let payload: Vec<u8> = conn
-            .query_row("SELECT step_payload FROM steps WHERE idx = ?1", [step_index as i64], |r| r.get(0))
+            .query_row(
+                "SELECT step_payload FROM steps WHERE idx = ?1",
+                [step_index as i64],
+                |r| r.get(0),
+            )
             .ok()?;
         splice_truncated(content, &payload)
     })();
@@ -401,12 +421,19 @@ pub fn file_uris_in(bytes: &[u8]) -> Vec<String> {
 fn cwd_from_db(root: &Path, id: &str) -> Option<String> {
     const CAP: u64 = 16 * 1024 * 1024;
     let base = root.join("conversations").join(format!("{id}.db"));
-    for path in [base.clone(), PathBuf::from(format!("{}-wal", base.display()))] {
-        let Ok(meta) = std::fs::metadata(&path) else { continue };
+    for path in [
+        base.clone(),
+        PathBuf::from(format!("{}-wal", base.display())),
+    ] {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
         if meta.len() > CAP {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let brain = root.join("brain");
         // A protobuf tag byte that happens to be printable rides on the
         // end of the real path (`…/harness-auditj`, seen live 09-02), so a
@@ -428,7 +455,9 @@ fn cwd_from_db(root: &Path, id: &str) -> Option<String> {
 /// an empty or absent transcript; those are not sessions.
 fn has_a_step(transcript: &Path) -> bool {
     use std::io::{BufRead, BufReader};
-    let Ok(f) = std::fs::File::open(transcript) else { return false };
+    let Ok(f) = std::fs::File::open(transcript) else {
+        return false;
+    };
     BufReader::new(f)
         .lines()
         .next()
@@ -504,14 +533,18 @@ pub(crate) fn scan_dir_bounded(
         if budget.remaining() == 0 {
             break;
         }
-        let Ok(file_type) = e.file_type() else { continue };
+        let Ok(file_type) = e.file_type() else {
+            continue;
+        };
         if file_type.is_symlink() || !file_type.is_file() {
             continue;
         }
         let name = e.file_name();
         let name = name.to_string_lossy();
         // `<id>.db` only — the `-wal`/`-shm` siblings belong to the same id.
-        let Some(id) = name.strip_suffix(".db") else { continue };
+        let Some(id) = name.strip_suffix(".db") else {
+            continue;
+        };
         if !valid_id(id) || !budget.claim_file() {
             continue;
         }
@@ -542,14 +575,28 @@ pub fn parse_artifacts(text: &str) -> Vec<crate::sessions::Artifact> {
         if !line.contains("TargetFile") {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let at = v.get("created_at").and_then(|c| c.as_str()).unwrap_or("").to_string();
-        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let at = v
+            .get("created_at")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(calls) = v.get("tool_calls").and_then(|t| t.as_array()) else {
+            continue;
+        };
         for call in calls {
-            let Some(tool) = call.get("name").and_then(|n| n.as_str()).and_then(write_tool_of) else {
+            let Some(tool) = call
+                .get("name")
+                .and_then(|n| n.as_str())
+                .and_then(write_tool_of)
+            else {
                 continue;
             };
-            let Some(fp) = arg_str(call, "TargetFile").filter(|f| !f.is_empty()) else { continue };
+            let Some(fp) = arg_str(call, "TargetFile").filter(|f| !f.is_empty()) else {
+                continue;
+            };
             if let Some(pos) = order.iter().position(|p| p == &fp) {
                 order.remove(pos);
             }
@@ -562,7 +609,11 @@ pub fn parse_artifacts(text: &str) -> Vec<crate::sessions::Artifact> {
         .rev()
         .map(|path| {
             let (tool, at) = info.remove(&path).unwrap_or(("Write", String::new()));
-            crate::sessions::Artifact { tool: tool.to_string(), path, at }
+            crate::sessions::Artifact {
+                tool: tool.to_string(),
+                path,
+                at,
+            }
         })
         .collect()
 }
@@ -576,7 +627,10 @@ fn model_from_settings_change(content: &str) -> Option<String> {
     let rest = &content[i..];
     let j = rest.find(" to ")? + " to ".len();
     let label = &rest[j..];
-    let end = label.find(". ").or_else(|| label.find('\n')).unwrap_or(label.len());
+    let end = label
+        .find(". ")
+        .or_else(|| label.find('\n'))
+        .unwrap_or(label.len());
     let label = label[..end].trim();
     (!label.is_empty()).then(|| label.to_string())
 }
@@ -586,14 +640,24 @@ fn model_from_settings_change(content: &str) -> Option<String> {
 /// started/last-active are real; the model is the label the first turn's
 /// settings-change names. Token counts are only in print-mode output, never
 /// on disk, so context stays unknown. [observed: agy 1.1.24]
-pub fn parse_detail(id: &str, transcript: &str, title: Option<&str>, cwd: Option<&str>) -> crate::detail::SessionDetail {
+pub fn parse_detail(
+    id: &str,
+    transcript: &str,
+    title: Option<&str>,
+    cwd: Option<&str>,
+) -> crate::detail::SessionDetail {
     use crate::detail::{note_message, push_unique, top_tools, touch_file, SessionDetail};
-    let mut d = SessionDetail { id: id.to_string(), ..Default::default() };
+    let mut d = SessionDetail {
+        id: id.to_string(),
+        ..Default::default()
+    };
     d.title = title.map(String::from);
     d.cwd = cwd.filter(|c| !c.is_empty()).map(String::from);
     let mut tools: std::collections::HashMap<String, u32> = Default::default();
     for line in transcript.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if let Some(at) = v.get("created_at").and_then(|c| c.as_str()) {
             if d.started.is_none() {
                 d.started = Some(at.to_string());
@@ -602,7 +666,9 @@ pub fn parse_detail(id: &str, transcript: &str, title: Option<&str>, cwd: Option
         }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("USER_INPUT") => {
-                let Some(content) = v.get("content").and_then(|c| c.as_str()) else { continue };
+                let Some(content) = v.get("content").and_then(|c| c.as_str()) else {
+                    continue;
+                };
                 if let Some(m) = model_from_settings_change(content) {
                     push_unique(&mut d.models, &m);
                 }
@@ -612,7 +678,12 @@ pub fn parse_detail(id: &str, transcript: &str, title: Option<&str>, cwd: Option
                 }
             }
             Some("PLANNER_RESPONSE") => {
-                for call in v.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten() {
+                for call in v
+                    .get("tool_calls")
+                    .and_then(|t| t.as_array())
+                    .into_iter()
+                    .flatten()
+                {
                     d.tool_calls += 1;
                     let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
                     *tools.entry(name.to_string()).or_insert(0) += 1;
@@ -658,15 +729,18 @@ impl SessionProvider for AntigravitySessions {
     fn messages(&self, session_id: &str) -> Option<Vec<(String, String)>> {
         let text = std::fs::read_to_string(transcript_of(session_id)?).ok()?;
         let root = store_root()?;
-        Some(parse_messages_with(&text, &|index, content| recover_truncated(&root, session_id, index, content)))
+        Some(parse_messages_with(&text, &|index, content| {
+            recover_truncated(&root, session_id, index, content)
+        }))
     }
 
     fn detail(&self, session_id: &str) -> Option<crate::detail::SessionDetail> {
         let root = store_root()?;
         let text = std::fs::read_to_string(transcript_of(session_id)?).ok()?;
-        let title = std::fs::read_to_string(root.join("annotations").join(format!("{session_id}.pbtxt")))
-            .ok()
-            .and_then(|t| parse_title(&t));
+        let title =
+            std::fs::read_to_string(root.join("annotations").join(format!("{session_id}.pbtxt")))
+                .ok()
+                .and_then(|t| parse_title(&t));
         let last = std::fs::read_to_string(root.join("cache").join("last_conversations.json"))
             .map(|t| parse_last_conversations(&t))
             .unwrap_or_default();
@@ -675,7 +749,12 @@ impl SessionProvider for AntigravitySessions {
             .cloned()
             .or_else(|| first_run_command_cwd(&text))
             .or_else(|| cwd_from_db(&root, session_id));
-        Some(parse_detail(session_id, &text, title.as_deref(), cwd.as_deref()))
+        Some(parse_detail(
+            session_id,
+            &text,
+            title.as_deref(),
+            cwd.as_deref(),
+        ))
     }
 
     fn artifacts(&self, session_id: &str) -> Option<Vec<crate::sessions::Artifact>> {
@@ -714,7 +793,10 @@ pub(crate) fn run_capped(
         match child.try_wait() {
             Ok(Some(status)) => {
                 let out = reader.join().unwrap_or_default();
-                return Ok((status.code().unwrap_or(-1), String::from_utf8_lossy(&out).into_owned()));
+                return Ok((
+                    status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out).into_owned(),
+                ));
             }
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -800,7 +882,10 @@ impl AgentBackend for AntigravityBackend {
         "Antigravity"
     }
     fn detect(&self) -> Detection {
-        Detection { caps: self.caps(), ..detect_cli(self.id(), self.display_name(), "agy") }
+        Detection {
+            caps: self.caps(),
+            ..detect_cli(self.id(), self.display_name(), "agy")
+        }
     }
     fn sessions(&self) -> &dyn SessionProvider {
         &AntigravitySessions
@@ -818,7 +903,10 @@ impl AgentBackend for AntigravityBackend {
     /// the Tasks tab would be a guess. No TUI driving, no transcript panels:
     /// both read claude's shapes.
     fn caps(&self) -> Caps {
-        Caps { resume: true, ..Default::default() }
+        Caps {
+            resume: true,
+            ..Default::default()
+        }
     }
 
     fn permission_modes(&self) -> &'static [PermissionMode] {
@@ -911,26 +999,45 @@ mod tests {
 
     #[test]
     fn the_title_is_read_off_the_annotation() {
-        assert_eq!(parse_title(r#"title:"Google Ads Performance Review""#).as_deref(), Some("Google Ads Performance Review"));
-        assert_eq!(parse_title(r#"title:"Say \"hi\" \\ twice""#).as_deref(), Some(r#"Say "hi" \ twice"#));
+        assert_eq!(
+            parse_title(r#"title:"Google Ads Performance Review""#).as_deref(),
+            Some("Google Ads Performance Review")
+        );
+        assert_eq!(
+            parse_title(r#"title:"Say \"hi\" \\ twice""#).as_deref(),
+            Some(r#"Say "hi" \ twice"#)
+        );
         assert_eq!(parse_title(r#"title:"""#), None);
         assert_eq!(parse_title("other:1"), None);
     }
 
     #[test]
     fn last_conversations_is_inverted() {
-        let m = parse_last_conversations(r#"{
+        let m = parse_last_conversations(
+            r#"{
   "/home/john/nanoclaw": "4e27641c-e5e2-47c7-9086-2c1f75ccd490",
   "/tmp/probe": "5ad73b75-8047-4a40-8f58-0a770f114c1a"
-}"#);
-        assert_eq!(m["4e27641c-e5e2-47c7-9086-2c1f75ccd490"], "/home/john/nanoclaw");
+}"#,
+        );
+        assert_eq!(
+            m["4e27641c-e5e2-47c7-9086-2c1f75ccd490"],
+            "/home/john/nanoclaw"
+        );
         assert_eq!(m.len(), 2);
         assert!(parse_last_conversations("nope").is_empty());
     }
 
     #[test]
     fn the_preview_is_the_person_and_the_prose() {
-        let log = [FIRST_INPUT, TOOL_STEP, RESULT_STEP, SECOND_INPUT, SYSTEM_STEP, ANSWER_STEP].join("\n");
+        let log = [
+            FIRST_INPUT,
+            TOOL_STEP,
+            RESULT_STEP,
+            SECOND_INPUT,
+            SYSTEM_STEP,
+            ANSWER_STEP,
+        ]
+        .join("\n");
         let msgs = parse_messages(&log);
         assert_eq!(
             msgs,
@@ -947,7 +1054,10 @@ mod tests {
     #[test]
     fn a_tool_only_response_falls_back_to_the_tool_name() {
         let line = r#"{"step_index":9,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-09-02T16:01:40Z","tool_calls":[{"name":"list_dir","args":{"DirectoryPath":"\"/tmp\""}},{"name":"view_file","args":{"AbsolutePath":"\"/tmp/a\"","toolSummary":"\"View a\""}}]}"#;
-        assert_eq!(parse_messages(line), vec![("assistant".to_string(), "list_dir\nView a".to_string())]);
+        assert_eq!(
+            parse_messages(line),
+            vec![("assistant".to_string(), "list_dir\nView a".to_string())]
+        );
     }
 
     #[test]
@@ -960,7 +1070,10 @@ mod tests {
     fn the_first_request_and_the_first_cwd_are_found() {
         let log = [FIRST_INPUT, TOOL_STEP].join("\n");
         assert_eq!(first_request_line(&log).as_deref(), Some("take a look at the acc medlink google ads account so far this week. i wnt to make sure everything is running smoothly"));
-        assert_eq!(first_run_command_cwd(&log).as_deref(), Some("/home/john/nanoclaw"));
+        assert_eq!(
+            first_run_command_cwd(&log).as_deref(),
+            Some("/home/john/nanoclaw")
+        );
         assert_eq!(first_run_command_cwd(FIRST_INPUT), None);
     }
 
@@ -971,7 +1084,12 @@ mod tests {
         let bytes = b"\x0a\x1cfile:///home/john/nanoclaw\x12\x05x file:///home/john/nanoclawj\"\x00file:///path/to/bar.py#L10 (file:///absolute/path/to/file)";
         assert_eq!(
             file_uris_in(bytes),
-            vec!["/home/john/nanoclaw", "/home/john/nanoclawj", "/path/to/bar.py", "/absolute/path/to/file"]
+            vec![
+                "/home/john/nanoclaw",
+                "/home/john/nanoclawj",
+                "/path/to/bar.py",
+                "/absolute/path/to/file"
+            ]
         );
         assert!(file_uris_in(b"file:///").is_empty());
     }
@@ -985,7 +1103,11 @@ mod tests {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         let write = |id: &str, transcript: Option<&str>, title: Option<&str>| {
-            std::fs::write(root.join("conversations").join(format!("{id}.db")), b"SQLite format 3\0").unwrap();
+            std::fs::write(
+                root.join("conversations").join(format!("{id}.db")),
+                b"SQLite format 3\0",
+            )
+            .unwrap();
             std::fs::write(root.join("conversations").join(format!("{id}.db-wal")), b"").unwrap();
             if let Some(t) = transcript {
                 let p = transcript_path(&root, id);
@@ -993,18 +1115,39 @@ mod tests {
                 std::fs::write(p, t).unwrap();
             }
             if let Some(t) = title {
-                std::fs::write(root.join("annotations").join(format!("{id}.pbtxt")), format!("title:\"{t}\"")).unwrap();
+                std::fs::write(
+                    root.join("annotations").join(format!("{id}.pbtxt")),
+                    format!("title:\"{t}\""),
+                )
+                .unwrap();
             }
         };
         // Titled, cwd from the cache.
-        write("4e27641c-e5e2-47c7-9086-2c1f75ccd490", Some(&[FIRST_INPUT, TOOL_STEP].join("\n")), Some("Google Ads Performance Review"));
+        write(
+            "4e27641c-e5e2-47c7-9086-2c1f75ccd490",
+            Some(&[FIRST_INPUT, TOOL_STEP].join("\n")),
+            Some("Google Ads Performance Review"),
+        );
         // Untitled, cwd from its first run_command.
-        write("8733080f-ff82-4f52-a73a-094777650e1c", Some(&[FIRST_INPUT, TOOL_STEP].join("\n")), None);
+        write(
+            "8733080f-ff82-4f52-a73a-094777650e1c",
+            Some(&[FIRST_INPUT, TOOL_STEP].join("\n")),
+            None,
+        );
         // Untitled, no tool call: cwd from the DB's file:// URI, title from the prompt.
-        write("58cd57d4-e8e3-4c76-9eed-f2359e2d018d", Some(&[SECOND_INPUT, ANSWER_STEP].join("\n")), None);
+        write(
+            "58cd57d4-e8e3-4c76-9eed-f2359e2d018d",
+            Some(&[SECOND_INPUT, ANSWER_STEP].join("\n")),
+            None,
+        );
         std::fs::write(
-            root.join("conversations").join("58cd57d4-e8e3-4c76-9eed-f2359e2d018d.db"),
-            format!("\x0a\x20file:///path/to/bar.py\x00\x0a\x20file://{}\x12", cwd.display()).as_bytes(),
+            root.join("conversations")
+                .join("58cd57d4-e8e3-4c76-9eed-f2359e2d018d.db"),
+            format!(
+                "\x0a\x20file:///path/to/bar.py\x00\x0a\x20file://{}\x12",
+                cwd.display()
+            )
+            .as_bytes(),
         )
         .unwrap();
         // A failed probe: conversation on disk, transcript empty.
@@ -1013,7 +1156,10 @@ mod tests {
         write("36fd0982-4254-4045-81c2-32124c0ae32e", None, None);
         std::fs::write(
             root.join("cache").join("last_conversations.json"),
-            format!(r#"{{"{}": "4e27641c-e5e2-47c7-9086-2c1f75ccd490"}}"#, cwd.display()),
+            format!(
+                r#"{{"{}": "4e27641c-e5e2-47c7-9086-2c1f75ccd490"}}"#,
+                cwd.display()
+            ),
         )
         .unwrap();
 
@@ -1023,10 +1169,16 @@ mod tests {
         assert_eq!(rows[0].0.id, "4e27641c-e5e2-47c7-9086-2c1f75ccd490");
         assert_eq!(rows[0].0.title, "Google Ads Performance Review");
         assert_eq!(rows[0].0.project_path, cwd.to_string_lossy());
-        assert!(rows[0].1.ends_with(".system_generated/logs/transcript.jsonl"));
+        assert!(rows[0]
+            .1
+            .ends_with(".system_generated/logs/transcript.jsonl"));
         assert_eq!(rows[1].0.id, "58cd57d4-e8e3-4c76-9eed-f2359e2d018d");
         assert_eq!(rows[1].0.title, "Reply with exactly: pong3");
-        assert_eq!(rows[1].0.project_path, cwd.to_string_lossy(), "the first file:// that is a real directory");
+        assert_eq!(
+            rows[1].0.project_path,
+            cwd.to_string_lossy(),
+            "the first file:// that is a real directory"
+        );
         assert_eq!(rows[2].0.title, "take a look at the acc medlink google ads account so far this week. i wnt to make sure everything is running smoothly");
         assert_eq!(rows[2].0.project_path, "/home/john/nanoclaw");
         assert!(rows[2].0.last_active > 0);
@@ -1041,26 +1193,57 @@ mod tests {
         assert_eq!(arts[0].path, "/home/john/.gemini/antigravity-cli/brain/1e6213a2-6da8-46d3-a2e6-624bc72ff061/scratch/pull_data.py");
         assert_eq!(arts[0].tool, "Edit");
         assert_eq!(arts[0].at, "2026-09-02T16:02:57Z");
-        assert_eq!(arts[1].path, "/home/john/nanoclaw/projects/google_ads/montue_compare_20260902/pull_data.py");
+        assert_eq!(
+            arts[1].path,
+            "/home/john/nanoclaw/projects/google_ads/montue_compare_20260902/pull_data.py"
+        );
         assert_eq!(arts[1].tool, "Write");
     }
 
     #[test]
     fn the_flyout_gets_the_lot() {
-        let log = [FIRST_INPUT, TOOL_STEP, RESULT_STEP, WRITE_STEP, SECOND_INPUT, SYSTEM_STEP, ANSWER_STEP].join("\n");
-        let d = parse_detail("4e27", &log, Some("Google Ads Performance Review"), Some("/home/john/nanoclaw"));
+        let log = [
+            FIRST_INPUT,
+            TOOL_STEP,
+            RESULT_STEP,
+            WRITE_STEP,
+            SECOND_INPUT,
+            SYSTEM_STEP,
+            ANSWER_STEP,
+        ]
+        .join("\n");
+        let d = parse_detail(
+            "4e27",
+            &log,
+            Some("Google Ads Performance Review"),
+            Some("/home/john/nanoclaw"),
+        );
         assert_eq!(d.started.as_deref(), Some("2026-09-02T15:55:55Z"));
         assert_eq!(d.last_active.as_deref(), Some("2026-09-02T16:06:37Z"));
         assert_eq!(d.title.as_deref(), Some("Google Ads Performance Review"));
         assert_eq!(d.cwd.as_deref(), Some("/home/john/nanoclaw"));
-        assert_eq!(d.models, vec!["Gemini 3.8 Flash (High)"], "the label the settings-change names");
+        assert_eq!(
+            d.models,
+            vec!["Gemini 3.8 Flash (High)"],
+            "the label the settings-change names"
+        );
         assert_eq!((d.user_messages, d.assistant_messages), (2, 1));
         assert_eq!(d.tool_calls, 2);
         assert_eq!(d.tools[0].name, "run_command");
-        assert_eq!(d.files, vec!["/home/john/nanoclaw/projects/google_ads/montue_compare_20260902/pull_data.py"]);
-        assert!(d.first_prompt.as_deref().unwrap().starts_with("take a look at the acc medlink"));
+        assert_eq!(
+            d.files,
+            vec!["/home/john/nanoclaw/projects/google_ads/montue_compare_20260902/pull_data.py"]
+        );
+        assert!(d
+            .first_prompt
+            .as_deref()
+            .unwrap()
+            .starts_with("take a look at the acc medlink"));
         assert_eq!(d.last_assistant.as_deref(), Some("pong3"));
-        assert_eq!(d.context_tokens, None, "tokens are only in print-mode output; nothing is invented");
+        assert_eq!(
+            d.context_tokens, None,
+            "tokens are only in print-mode output; nothing is invented"
+        );
     }
 
     /// `agy models` 1.1.24, verbatim.
@@ -1078,7 +1261,10 @@ mod tests {
 
     #[test]
     fn launch_spells_the_flags_agy_documents() {
-        assert_eq!(AntigravityBackend.launch(&LaunchSpec::default()), "agy --add-dir \"$PWD\"");
+        assert_eq!(
+            AntigravityBackend.launch(&LaunchSpec::default()),
+            "agy --add-dir \"$PWD\""
+        );
         let cmd = AntigravityBackend.launch(&LaunchSpec {
             model: Some("gemini-3.1-pro-high".into()),
             effort: Some("low".into()),
@@ -1088,7 +1274,9 @@ mod tests {
         });
         assert_eq!(cmd, "agy --add-dir \"$PWD\" -i 'say it'\\''s done' --model 'gemini-3.1-pro-high' --effort 'low'");
         assert_eq!(
-            AntigravityBackend.resume("8733080f-ff82-4f52-a73a-094777650e1c").unwrap(),
+            AntigravityBackend
+                .resume("8733080f-ff82-4f52-a73a-094777650e1c")
+                .unwrap(),
             "agy --conversation '8733080f-ff82-4f52-a73a-094777650e1c'"
         );
         assert_eq!(AntigravityBackend.clear("x"), None);
@@ -1101,9 +1289,20 @@ mod tests {
     #[test]
     fn permission_ids_are_agys_own_words() {
         let ids: Vec<&str> = ANTIGRAVITY_PERMISSION_MODES.iter().map(|m| m.id).collect();
-        assert_eq!(ids, ["default", "plan", "accept-edits", "dangerously-skip-permissions"]);
+        assert_eq!(
+            ids,
+            [
+                "default",
+                "plan",
+                "accept-edits",
+                "dangerously-skip-permissions"
+            ]
+        );
         assert_eq!(ANTIGRAVITY_PERMISSION_MODES[0].flags, &[] as &[&str]);
-        assert_eq!(ANTIGRAVITY_PERMISSION_MODES[3].flags, &["--dangerously-skip-permissions"]);
+        assert_eq!(
+            ANTIGRAVITY_PERMISSION_MODES[3].flags,
+            &["--dangerously-skip-permissions"]
+        );
     }
 
     /// Reads the real store on this machine and prints what it finds; it
@@ -1113,9 +1312,21 @@ mod tests {
     #[test]
     #[ignore]
     fn live_cwd_of_every_row() {
-        let Some(root) = store_root() else { println!("agy store absent"); return };
+        let Some(root) = store_root() else {
+            println!("agy store absent");
+            return;
+        };
         for (s, _) in AntigravitySessions.scan_with_paths() {
-            println!("{}  {:40}  {}", &s.id[..8], s.title, if s.project_path.is_empty() { "<none>" } else { &s.project_path });
+            println!(
+                "{}  {:40}  {}",
+                &s.id[..8],
+                s.title,
+                if s.project_path.is_empty() {
+                    "<none>"
+                } else {
+                    &s.project_path
+                }
+            );
         }
         let _ = root;
     }

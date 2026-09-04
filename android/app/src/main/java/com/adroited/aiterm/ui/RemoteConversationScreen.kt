@@ -99,6 +99,7 @@ import com.adroited.aiterm.remote.RemoteSessionChange
 import com.adroited.aiterm.remote.RemoteTab
 import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.remote.RemoteUsageSource
+import com.adroited.aiterm.remote.SpinePhase
 import java.io.File
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.delay
@@ -858,10 +859,14 @@ private fun RemoteConversationContent(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val normalizer = remember(context) { TerminalImageNormalizer(context) }
-    val messages = if (state.previewSessionId == session.id) state.previewMessages else emptyList()
-    val timeline = remember(messages) { conversationTimeline(messages) }
+    val previewItems = if (state.previewSessionId == session.id) state.previewItems else emptyList()
+    val timeline = remember(previewItems) { spineTimeline(previewItems) }
     val listState = rememberLazyListState()
-    val working = state.sessionActivity[session.id] == "output"
+    val working = when (state.previewPhase) {
+        SpinePhase.Working -> true
+        SpinePhase.NeedsYou -> false
+        SpinePhase.Idle -> state.sessionActivity[session.id] == "output"
+    }
     val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
     var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
     val awayFromNewest by remember(session.id) {
@@ -897,7 +902,7 @@ private fun RemoteConversationContent(
             delay(5_000)
         }
     }
-    LaunchedEffect(messages.size, timeline.size, working) {
+    LaunchedEffect(previewItems.size, timeline.size, working) {
         val itemCount = timeline.size + if (working) 1 else 0
         if (itemCount == 0) return@LaunchedEffect
         if (!positionedAtNewest) {
@@ -1118,7 +1123,7 @@ private fun RemoteConversationContent(
                 Spacer(Modifier.height(8.dp))
                 TextButton(onClick = onRefresh) { Text("Retry") }
             }
-            messages.isEmpty() && !working -> Box(
+            previewItems.isEmpty() && !working -> Box(
                 Modifier.fillMaxSize().padding(padding),
                 contentAlignment = Alignment.Center,
             ) { Text("No conversation history yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -1131,14 +1136,13 @@ private fun RemoteConversationContent(
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    itemsIndexed(timeline) { _, item ->
-                        when (item) {
-                            is ConversationTimelineItem.Turn -> ConversationTurn(item.message)
-                            is ConversationTimelineItem.ActivityGroup -> ConversationActivityGroup(item.messages)
-                        }
+                    items(timeline, key = { it.key }) { item ->
+                        SpineTimelineRow(item)
                     }
                     if (working) {
-                        item(key = "working") { ConversationWorkingRow(session.agent) }
+                        item(key = "working") {
+                            ConversationWorkingRow(session.agent, state.previewPhaseDetail)
+                        }
                     }
                 }
                 if (awayFromNewest) {
@@ -1393,18 +1397,29 @@ private fun BringInDialog(
 }
 
 @Composable
-private fun ConversationWorkingRow(agent: String) {
+private fun ConversationWorkingRow(agent: String, detail: String = "") {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp)
         Spacer(Modifier.width(9.dp))
-        Text(
-            "${agent.replaceFirstChar(Char::uppercase)} is working…",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Column {
+            Text(
+                "${agent.replaceFirstChar(Char::uppercase)} is working…",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (detail.isNotBlank()) {
+                Text(
+                    detail,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.78f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }
 
@@ -1729,6 +1744,7 @@ private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aite
             com.adroited.aiterm.remote.RemotePath.RELAY -> "connected · relay"
             com.adroited.aiterm.remote.RemotePath.LAN -> "connected · LAN"
             com.adroited.aiterm.remote.RemotePath.VPN -> "connected · VPN"
+            com.adroited.aiterm.remote.RemotePath.IROH -> "connected · Iroh"
             else -> "connected"
         } to MaterialTheme.colorScheme.tertiary
         ConnectionState.Connecting -> "connecting" to MaterialTheme.colorScheme.primary

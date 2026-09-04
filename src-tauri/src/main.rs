@@ -32,9 +32,12 @@ fn main() {
         }
         let start = match (resume, provider, model) {
             (Some(session_id), _, _) => aiterm_lib::chat::Start::Resume { session_id },
-            (None, Some(provider_id), Some(model)) => {
-                aiterm_lib::chat::Start::Fresh { provider_id, model, session_id, prompt }
-            }
+            (None, Some(provider_id), Some(model)) => aiterm_lib::chat::Start::Fresh {
+                provider_id,
+                model,
+                session_id,
+                prompt,
+            },
             _ => {
                 eprintln!(
                     "usage: aiterm chat --provider <id> --model <model-id> [--session-id <uuid>] [--prompt <text>]\n       aiterm chat --resume <uuid>"

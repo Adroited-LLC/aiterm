@@ -590,10 +590,7 @@ async fn tauri_agent_adapters_and_remote_gateway_share_one_managed_agent_graph()
 
     socket.send(empty_request(70, "agent.list")).await.unwrap();
     let remote: AgentListReply = decode(&receive(&mut socket).await.payload);
-    assert_eq!(
-        remote.agents[0].display_name,
-        "Fixture Agent generation 7"
-    );
+    assert_eq!(remote.agents[0].display_name, "Fixture Agent generation 7");
 
     socket
         .send(request(
@@ -1267,7 +1264,10 @@ async fn remote_session_roster_adds_mobile_metadata_without_changing_session_lis
     );
     let (gateway, mut socket) = start(&fixture).await;
 
-    socket.send(empty_request(71, "session.roster")).await.unwrap();
+    socket
+        .send(empty_request(71, "session.roster"))
+        .await
+        .unwrap();
     let envelope = receive(&mut socket).await;
     let roster: SessionRosterReply = decode(&envelope.payload);
 

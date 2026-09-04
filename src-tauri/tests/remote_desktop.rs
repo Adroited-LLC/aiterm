@@ -124,9 +124,19 @@ fn the_qr_is_an_svg_that_encodes_the_payload_and_nothing_larger() {
     );
     let svg = pairing_qr_svg(&payload).expect("a payload this size must render");
 
-    assert!(svg.starts_with("<svg"), "the renderer must emit a bare SVG element: {}", &svg[..40.min(svg.len())]);
-    assert!(!svg.contains("<?xml"), "an XML prolog cannot be injected into a DOM node");
+    assert!(
+        svg.starts_with("<svg"),
+        "the renderer must emit a bare SVG element: {}",
+        &svg[..40.min(svg.len())]
+    );
+    assert!(
+        !svg.contains("<?xml"),
+        "an XML prolog cannot be injected into a DOM node"
+    );
     // The secret must survive as drawn geometry only — never as text a
     // screenshot tool, an accessibility tree, or a log could lift out.
-    assert!(!svg.contains("aiterm://"), "the payload must not appear as text in the SVG");
+    assert!(
+        !svg.contains("aiterm://"),
+        "the payload must not appear as text in the SVG"
+    );
 }

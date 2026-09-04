@@ -76,13 +76,20 @@ mod tests {
         // serde_json's preserve_order feature; a save that reshuffled a user's
         // file would make every diff unreadable.
         let out = set_key(r#"{"z":1,"a":2}"#, "a", json!(3)).unwrap();
-        assert!(out.find("\"z\"").unwrap() < out.find("\"a\"").unwrap(), "{out}");
+        assert!(
+            out.find("\"z\"").unwrap() < out.find("\"a\"").unwrap(),
+            "{out}"
+        );
     }
 
     #[test]
     fn a_nested_key_is_reached_through_its_path() {
-        let out = set_key(r#"{"permissions":{"deny":["a"]}}"#, "permissions.deny", json!(["b"]))
-            .unwrap();
+        let out = set_key(
+            r#"{"permissions":{"deny":["a"]}}"#,
+            "permissions.deny",
+            json!(["b"]),
+        )
+        .unwrap();
         assert!(out.contains("\"b\""), "{out}");
         assert!(!out.contains("\"a\""), "{out}");
     }

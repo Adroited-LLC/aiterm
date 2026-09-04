@@ -145,7 +145,10 @@ fn tools_call(id: Value, request: &Value) -> Value {
     let task = args.and_then(|a| a.get("task")).and_then(|t| t.as_str());
     let cwd = args.and_then(|a| a.get("cwd")).and_then(|c| c.as_str());
     let (Some(task), Some(cwd)) = (task, cwd) else {
-        return result(id, tool_error("opencode_delegate needs both `task` and `cwd`"));
+        return result(
+            id,
+            tool_error("opencode_delegate needs both `task` and `cwd`"),
+        );
     };
 
     let (default_provider, default_model) = crate::opencode_agent::default_target();

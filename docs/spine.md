@@ -5,8 +5,9 @@ else that wants to watch a session) as it happens. Every engine feeds it
 through an adapter; every consumer reads one vocabulary. Adding a harness
 means writing one adapter. Nothing above it changes.
 
-This replaces the phone's poll of `GET /v1/sessions/{id}/conversation`
-every 3 s, which re-parsed the whole transcript and swapped the whole list.
+The authenticated remote gateway exposes this independently of its network
+transport. A phone gets the same spine whether the selected stack is AITerm
+networking or Iroh; neither parser nor UI knows which road carried the frame.
 
 ## Vocabulary
 
@@ -64,46 +65,43 @@ it is how a card gets filled in. Grok writes the call first and the human
 better text. Merge it like any other upsert, and keep any `output` already
 held for that id — a re-issued call never carries one.
 
-## Endpoints
+## Remote gateway
 
-- `GET /v1/sessions/{id}/spine?after=N` →
-  `{ "epoch": u64, "live": bool, "events": [ SpineEvent… ] }`
+- CBOR request `session.spine { session_id, after }` →
+  `{ epoch, live, has_more, events: [ SpineEvent… ] }`
   Everything after `seq` N (N=0 for all). Calling it registers interest:
   the registry starts (or keeps) the adapter tail for that session.
   `live` is false when the session is served by the legacy adapter
   (an engine with no native adapter yet: the conversation is re-derived
   from `conversation_rich` on a slow poll and diffed into events).
-  When the call is what STARTS the tail it waits up to 2 s for the
-  adapter's `bootstrap()` to land before answering, so a phone opening a
-  session gets its history in that one request rather than a blank screen
-  and a wait for the next event. A tail that is already running answers
-  immediately; an agent with no adapter at all answers at once with
-  `live:false` and no events.
-- The existing WebSocket `/v1/events` now also carries
-  `{"type":"spine", …SpineEvent fields flattened…}` for every session with
-  a running tail. The phone ignores sessions it is not looking at.
+  Starting a tail is asynchronous so it never blocks the gateway dispatcher.
+  An initial empty page is valid; the next refresh receives the bootstrap.
+  Responses are forward-paged below the gateway's frame ceiling. A client
+  follows `has_more` immediately and otherwise uses its normal refresh
+  cadence, applying only events after its saved sequence.
 
 ## Client rule (the phone)
 
-1. On opening a session: `GET …/spine?after=0`, apply all, remember `epoch`
+1. On opening a session: request `session.spine` with `after=0`, apply all, remember `epoch`
    and `lastSeq`.
-2. On a `spine` WS event for that session: if `epoch` differs → go to 1.
-   If `seq == lastSeq + 1` → apply. Otherwise → `GET …/spine?after=lastSeq`
-   and apply what comes back (dedupe by `seq`).
+2. Request again with `after=lastSeq`; while `has_more`, do so immediately.
+   Otherwise use the active-session refresh cadence. If `epoch` differs,
+   clear and return to step 1.
 3. Apply = upsert by `id` for every kind that carries one, `user_message`
    included — Grok folds a pasted image and its caption into one message
    across two chunks, so the same id arrives twice with more text the
    second time. Append only when the id is new. `reset` → clear and go to 1.
 4. Never rebuild the list from scratch on a normal event. Rows are keyed by
    id so a growing block re-renders in place.
-5. On WS reconnect: `GET …/spine?after=lastSeq`.
+5. On transport reconnect: request from `lastSeq`; an epoch change heals a
+   desktop restart, while retained rows survive an ordinary network change.
 
 ## Registry lifecycle (desktop)
 
 - `Spine` lives in Tauri managed state. One `SessionLog` per session:
   bounded ring (last 5 000 events or 4 MB), `next_seq`, adapter handle,
   `last_interest`.
-- A tail starts when: a phone asks (`GET …/spine`), or a tab binds the
+- A tail starts when: a phone requests `session.spine`, or a tab binds the
   session (`TabRegistry`), or a relay starts on it.
 - A tail stops when: no tab is bound AND no interest for 15 minutes.
 - Adapter driver: `bootstrap()` once (history → events, seq assigned in
@@ -132,7 +130,7 @@ held for that id — a re-issued call never carries one.
 ## Phase — where the verdict comes from
 
 `phase` is not the adapter's. Adapters read content; what a session is
-DOING is decided by one function, `remote_api::activity_verdict`, which the
+DOING is decided by one function, `spine::activity::activity_verdict`, which the
 sessions list (`GET /v1/sessions`) and the spine's driver both call. There
 is one rule, so the phone's list and the session it opens can never
 disagree about a session.
@@ -143,7 +141,7 @@ Four inputs:
   (`TabRegistry::session_activities`, which spells it `output`). Immediate,
   and blind: it cannot tell working from waiting-on-a-person, and it cannot
   tell an agent thinking from a TUI repainting.
-- **The transcript** — `remote_api::transcript_verdict`, a tail read of the
+- **The transcript** — `spine::activity::transcript_verdict`, a tail read of the
   session's own files: grok's `events.jsonl` (`permission_requested` →
   attention, with the reason `permission`), antigravity's step types,
   codex's open turn that has written nothing for 45 s (`approval`),
@@ -421,13 +419,14 @@ turn that changed, is a `Reset` and a full replay.
 
 ## Ownership while it is being built
 
-- spine core, registry, endpoints, WS, legacy adapter, phase bridge:
-  `src-tauri/src/spine/mod.rs`, `spine/legacy.rs`, `remote_api.rs`, `lib.rs`, `tabs.rs`.
+- spine core, registry, authenticated gateway endpoint, legacy adapter, phase bridge:
+  `src-tauri/src/spine/mod.rs`, `spine/legacy.rs`, `spine/registry.rs`,
+  `remote/server.rs`, `lib.rs`, `tabs.rs`.
 - claude adapter: `src-tauri/src/spine/claude.rs` (+ visibility tweaks in `detail.rs`).
 - Claude Code hooks → phase: `src-tauri/src/hooklink.rs`, the `--hook-report`
   argv mode in `main.rs`, `push_hook_phase` in `spine/registry.rs`.
 - grok adapter: `src-tauri/src/spine/grok.rs` (+ visibility tweaks in `grok.rs`).
-- phone: `mobile/**`.
+- phone: `android/**`.
 
 The types and trait in `spine/mod.rs` are the contract. Change them only by
 agreement; everything else is yours.

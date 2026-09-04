@@ -50,6 +50,10 @@ data class RemoteClientState(
     val sessionActivity: Map<String, String> = emptyMap(),
     val usage: List<RemoteUsageSource> = emptyList(),
     val previewSessionId: String? = null,
+    val previewItems: List<Item> = emptyList(),
+    val previewPhase: SpinePhase = SpinePhase.Idle,
+    val previewPhaseDetail: String = "",
+    val previewLive: Boolean = true,
     val previewMessages: List<RemotePreviewMessage> = emptyList(),
     val previewLoadingSessionId: String? = null,
     val previewError: String? = null,
@@ -195,6 +199,7 @@ class RemoteClient(
     private var lifecycleGeneration = 0L
     private var selectionGeneration = 0L
     private val ownedJobs = linkedSetOf<Job>()
+    private val spineConversations = HashMap<String, SpineConversationStore>()
 
     suspend fun connect(): Boolean {
         synchronized(lifecycleLock) {
@@ -701,22 +706,46 @@ class RemoteClient(
                 previewError = null,
             )
         }
+        val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
         val started = launchRequest(
-            "session.conversation",
-            RemoteCommands.conversation(sessionId),
-            onError = { _, message ->
-                mutableState.value = mutableState.value.copy(
-                    previewLoadingSessionId = null,
-                    previewError = message,
-                )
+            "session.spine",
+            RemoteCommands.spine(sessionId, store.lastSeq),
+            onError = { code, message ->
+                if (code == "remote.unsupported" || code == "protocol.invalid_response") {
+                    previewSessionLegacy(sessionId)
+                } else {
+                    mutableState.value = mutableState.value.copy(
+                        previewLoadingSessionId = null,
+                        previewError = message,
+                    )
+                }
             },
             onSuccess = { payload ->
+                val page = RemoteCommands.spinePage(payload)
+                val items = store.apply(page)
+                val activity = if (store.phaseSeen) {
+                    mutableState.value.sessionActivity + (
+                        sessionId to when (store.phase) {
+                            SpinePhase.Working -> "output"
+                            SpinePhase.NeedsYou -> "attention"
+                            SpinePhase.Idle -> "idle"
+                        }
+                    )
+                } else {
+                    mutableState.value.sessionActivity
+                }
                 mutableState.value = mutableState.value.copy(
                     previewSessionId = sessionId,
-                    previewMessages = RemoteCommands.sessionPreview(payload),
+                    previewItems = items,
+                    previewPhase = store.phase,
+                    previewPhaseDetail = store.phaseDetail,
+                    previewLive = store.live,
+                    previewMessages = store.asPreviewMessages(),
                     previewLoadingSessionId = null,
                     previewError = null,
+                    sessionActivity = activity,
                 )
+                if (page.hasMore) previewSession(sessionId)
             },
         )
         if (!started) {
@@ -732,6 +761,41 @@ class RemoteClient(
                     )
                 }
             }
+        }
+    }
+
+    /** Compatibility with a desktop from before the spine joined our gateway. */
+    private fun previewSessionLegacy(sessionId: String) {
+        val started = launchRequest(
+            "session.conversation",
+            RemoteCommands.conversation(sessionId),
+            onError = { _, message ->
+                mutableState.value = mutableState.value.copy(
+                    previewLoadingSessionId = null,
+                    previewError = message,
+                )
+            },
+            onSuccess = { payload ->
+                val messages = RemoteCommands.sessionPreview(payload)
+                val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
+                store.legacy(messages)
+                mutableState.value = mutableState.value.copy(
+                    previewSessionId = sessionId,
+                    previewItems = store.items,
+                    previewPhase = store.phase,
+                    previewPhaseDetail = store.phaseDetail,
+                    previewLive = store.live,
+                    previewMessages = messages,
+                    previewLoadingSessionId = null,
+                    previewError = null,
+                )
+            },
+        )
+        if (!started) {
+            mutableState.value = mutableState.value.copy(
+                previewLoadingSessionId = null,
+                previewError = "Conversation refresh is busy. Retrying…",
+            )
         }
     }
 

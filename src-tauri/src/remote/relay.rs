@@ -61,7 +61,11 @@ impl RelayServerConfig {
             return None;
         }
         origin
-            .set_scheme(if origin.scheme() == "wss" { "https" } else { "http" })
+            .set_scheme(if origin.scheme() == "wss" {
+                "https"
+            } else {
+                "http"
+            })
             .ok()?;
         origin.set_path("/");
         let public_domain = config
@@ -103,7 +107,8 @@ pub struct RelayEnrollmentDraft {
 
 impl std::fmt::Debug for RelayEnrollmentDraft {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("RelayEnrollmentDraft")
+        formatter
+            .debug_struct("RelayEnrollmentDraft")
             .field("control_origin", &self.control_origin)
             .field("public_host", &self.config.public_host)
             .field("route_id", &self.config.route_id)
@@ -148,7 +153,10 @@ impl RelayEnrollmentDraft {
                 404 => "this relay server does not support automatic setup".into(),
                 409 => "the relay route was already claimed".into(),
                 429 => "this phone or network has reached the relay route limit".into(),
-                _ => format!("relay setup failed with status {}", response.status().as_u16()),
+                _ => format!(
+                    "relay setup failed with status {}",
+                    response.status().as_u16()
+                ),
             });
         }
         let provisioned: ProvisionedRelay = bounded_json(response).await?;
@@ -157,7 +165,9 @@ impl RelayEnrollmentDraft {
             || provisioned.public_port != self.config.public_port
             || provisioned.route_id != self.config.route_id
         {
-            return Err("the relay server returned a different route than the phone authorized".into());
+            return Err(
+                "the relay server returned a different route than the phone authorized".into(),
+            );
         }
         self.config.validate()?;
         Ok(self.config.clone())
@@ -207,7 +217,10 @@ impl RelayConfig {
             return Err("relay public host must begin with the route id".into());
         }
         if !(43..=128).contains(&self.token.len())
-            || !self.token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            || !self
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         {
             return Err("relay connector token is invalid".into());
         }
@@ -226,8 +239,7 @@ impl RelayConfig {
         Self::load_named(root, CONFIG_FILE)
     }
 
-    /// The same file shape under another name — the phone listener keeps its
-    /// own route beside the gateway's `relay.json`.
+    /// Load the same file shape under an explicitly supplied name.
     pub fn load_named(root: &Path, file: &str) -> Result<Option<Self>, String> {
         let path = root.join(file);
         let bytes = match std::fs::read(&path) {
@@ -261,9 +273,11 @@ impl RelayConfig {
         let public_domain = normalize_dns_name(&info.public_domain)
             .filter(|value| value == &info.public_domain)
             .ok_or_else(|| "the relay server returned an invalid public domain".to_string())?;
-        let decoded_spki = URL_SAFE_NO_PAD.decode(desktop_spki_fingerprint.as_bytes())
+        let decoded_spki = URL_SAFE_NO_PAD
+            .decode(desktop_spki_fingerprint.as_bytes())
             .map_err(|_| "the desktop identity fingerprint is invalid".to_string())?;
-        let desktop_spki_sha256: [u8; 32] = decoded_spki.try_into()
+        let desktop_spki_sha256: [u8; 32] = decoded_spki
+            .try_into()
             .map_err(|_| "the desktop identity fingerprint is invalid".to_string())?;
         let mut route_bytes = [0u8; 12];
         let mut token_bytes = [0u8; 32];
@@ -302,8 +316,12 @@ impl RelayConfig {
         }
         let mut url = url::Url::parse(&self.connector_url)
             .map_err(|_| "stored relay connector URL is invalid".to_string())?;
-        url.set_scheme(if url.scheme() == "wss" { "https" } else { "http" })
-            .map_err(|_| "stored relay connector URL is invalid".to_string())?;
+        url.set_scheme(if url.scheme() == "wss" {
+            "https"
+        } else {
+            "http"
+        })
+        .map_err(|_| "stored relay connector URL is invalid".to_string())?;
         url.set_path(&format!("/v1/routes/{}", self.route_id));
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
@@ -311,12 +329,19 @@ impl RelayConfig {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| "could not initialize relay removal".to_string())?;
-        let response = client.delete(url).bearer_auth(&self.token).send().await
+        let response = client
+            .delete(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
             .map_err(|_| "the relay server could not be reached".to_string())?;
         if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
             Ok(())
         } else {
-            Err(format!("relay removal failed with status {}", response.status().as_u16()))
+            Err(format!(
+                "relay removal failed with status {}",
+                response.status().as_u16()
+            ))
         }
     }
 }
@@ -395,11 +420,18 @@ fn provisioning_client() -> Result<reqwest::Client, String> {
         .map_err(|_| "could not initialize relay provisioning".to_string())
 }
 
-async fn bounded_json<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
-    if response.content_length().is_some_and(|length| length > MAX_PROVISION_RESPONSE_BYTES) {
+async fn bounded_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROVISION_RESPONSE_BYTES)
+    {
         return Err("the relay server returned an oversized setup response".into());
     }
-    let bytes = response.bytes().await
+    let bytes = response
+        .bytes()
+        .await
         .map_err(|_| "the relay setup response could not be read".to_string())?;
     if bytes.len() as u64 > MAX_PROVISION_RESPONSE_BYTES {
         return Err("the relay server returned an oversized setup response".into());
@@ -702,11 +734,9 @@ mod tests {
         let config = valid_config();
         config.save(&root).unwrap();
         assert_eq!(RelayConfig::load(&root).unwrap(), Some(config));
-        let server = RelayServerConfig::known(
-            "https://control.relay.example.com/",
-            "relay.example.com",
-        )
-        .unwrap();
+        let server =
+            RelayServerConfig::known("https://control.relay.example.com/", "relay.example.com")
+                .unwrap();
         server.save(&root).unwrap();
         assert_eq!(RelayServerConfig::load(&root).unwrap(), Some(server));
         fs::remove_dir_all(root).unwrap();
@@ -728,19 +758,23 @@ mod tests {
         assert!(RelayServerConfig::known(
             "https://control.relay.example.com:8443",
             "relay.example.com",
-        ).is_ok());
+        )
+        .is_ok());
         assert!(RelayServerConfig::known(
             "https://user@control.relay.example.com",
             "relay.example.com",
-        ).is_err());
+        )
+        .is_err());
         assert!(RelayServerConfig::known(
             "https://control.relay.example.com/a/path",
             "relay.example.com",
-        ).is_err());
+        )
+        .is_err());
         assert!(RelayServerConfig::known(
             "https://control.relay.example.com",
             "*.relay.example.com",
-        ).is_err());
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -778,25 +812,33 @@ mod tests {
             connector_url: format!("ws://{address}/v1/connect"),
         };
         let server = tokio::spawn(async move {
-            axum::serve(listener, Router::new()
-                .route("/v1/info", get(info))
-                .route("/v1/provision", post(provision))
-                .with_state(test_state))
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/info", get(info))
+                    .route("/v1/provision", post(provision))
+                    .with_state(test_state),
+            )
+            .await
+            .unwrap();
         });
 
         let selected = RelayServerConfig::discover(&origin).await.unwrap();
         assert_eq!(selected.control_origin, origin);
         assert_eq!(selected.public_domain, "relay.example.com");
         let desktop_fingerprint = URL_SAFE_NO_PAD.encode([9u8; 32]);
-        let draft = RelayConfig::prepare_enrollment(&origin, &desktop_fingerprint).await.unwrap();
+        let draft = RelayConfig::prepare_enrollment(&origin, &desktop_fingerprint)
+            .await
+            .unwrap();
         let authority = SigningKey::random(&mut OsRng);
         let signature: Signature = authority.sign(draft.authorization_digest());
-        let config = draft.register(
-            authority.verifying_key().to_encoded_point(true).as_bytes(),
-            signature.to_der().as_bytes(),
-        ).await.unwrap();
+        let config = draft
+            .register(
+                authority.verifying_key().to_encoded_point(true).as_bytes(),
+                signature.to_der().as_bytes(),
+            )
+            .await
+            .unwrap();
         assert_eq!(config.token.len(), 43);
         assert!(config.validate().is_ok());
         server.abort();
