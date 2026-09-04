@@ -255,6 +255,13 @@ pub fn rpc(command: String, args: serde_json::Value) -> Result<serde_json::Value
     let (distribution, digest) = prepare()?;
     if command == "open_path" {
         let path = args["path"].as_str().ok_or("Missing path")?;
+        if path.starts_with("https://") || path.starts_with("http://") {
+            Command::new("explorer.exe")
+                .arg(path)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            return Ok(serde_json::Value::Null);
+        }
         if !path.starts_with('/') || path.contains('\\') || path.contains('\0') {
             return Err("Expected an absolute Linux path".into());
         }
