@@ -1,6 +1,8 @@
 # Windows application powered by WSL
 
-Status: agreed product direction; implementation has not started.
+Status: first terminal milestone built, installed, and exercised in the Windows
+11 / Ubuntu 24.04 WSL 2 VM. Full agent/session functionality and first-run WSL
+installation are not yet implemented.
 
 ## Product contract
 
@@ -79,8 +81,10 @@ Provide actions such as Open in Explorer and import/clone project so users do no
 have to translate paths. File dialogs, drag-and-drop, uploads, previews, and open
 links must consistently cross the Windows/Linux boundary.
 
-Add Windows-specific controls under **Settings → Windows**, visible only in the
-Windows app. Keep this panel small:
+The Windows UI may differ from Linux and should have fewer settings. Start with
+no settings panel; use the default Linux distribution automatically. When a real
+configuration need emerges, place Windows-specific controls under
+**Settings → Windows**. Candidate controls, not requirements to add now:
 
 - Linux workspace/distribution and connection status.
 - Repair or retry setup, preserving projects and user configuration.
@@ -141,6 +145,9 @@ The initial test VM was shown at `10.0.0.196`; confirm its current address befor
 connecting. Use Windows OpenSSH for command execution and the graphical console
 for UI testing. The host serial PTY does not establish a Windows shell.
 
-The Linux host reported AMD KVM nested virtualization enabled. Exposure inside
-the Windows VM and a successful WSL 2 launch remain unverified. Native Windows
-build tools, SSH availability, and guest credentials also remain unverified.
+The VM now uses the libvirt default network at `192.168.122.20`. Windows OpenSSH
+is running with key authentication from the Linux host. Ubuntu 24.04 starts
+successfully as WSL 2 under the Windows user's account. Windows MSVC, Node.js,
+Rust, WebView2, and the Linux companion toolchain are available. The native
+executable passed its WSL smoke test; the installed GUI displayed a shell and
+ran commands through keyboard input. The NSIS installer completed successfully.
