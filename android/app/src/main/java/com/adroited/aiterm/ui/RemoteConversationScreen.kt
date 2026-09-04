@@ -74,6 +74,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
@@ -81,6 +82,8 @@ import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image as ImageIcon
 import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.Screenshot
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Language
@@ -105,6 +108,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -113,6 +117,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.semantics.contentDescription
@@ -995,6 +1000,7 @@ private fun RemoteConversationContent(
     var messageActions by remember(session.id) { mutableStateOf<SpineTimelineItem?>(null) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val captureView = LocalView.current.rootView
     val keyboard = LocalSoftwareKeyboardController.current
     val composerFocus = remember { FocusRequester() }
     val normalizer = remember(context) { TerminalImageNormalizer(context) }
@@ -1506,27 +1512,63 @@ private fun RemoteConversationContent(
         AlertDialog(
             onDismissRequest = { showImageSources = false },
             title = { Text("Attach image") },
-            text = { Text("Choose a source") },
-            confirmButton = {
-                TextButton(onClick = {
-                    showImageSources = false
-                    picker.launch(
-                        TerminalImageSource.Gallery,
-                        TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
-                        session.id,
-                    ) { handlePickerResult(it) }
-                }) { Text("Gallery") }
+            text = {
+                Column {
+                    Text(
+                        "Choose a source",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                    ListItem(
+                        headlineContent = { Text("Camera") },
+                        leadingContent = {
+                            Icon(Icons.Filled.CameraAlt, contentDescription = null)
+                        },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                        modifier = Modifier.clickable {
+                            showImageSources = false
+                            picker.launch(
+                                TerminalImageSource.Camera,
+                                TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
+                                session.id,
+                            ) { handlePickerResult(it) }
+                        },
+                    )
+                    ListItem(
+                        headlineContent = { Text("Screenshot") },
+                        supportingContent = { Text("Capture this AITerm screen") },
+                        leadingContent = {
+                            Icon(Icons.Filled.Screenshot, contentDescription = null)
+                        },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                        modifier = Modifier.clickable {
+                            showImageSources = false
+                            scope.launch {
+                                // Let Compose remove the dialog before drawing the app window.
+                                withFrameNanos { }
+                                withFrameNanos { }
+                                handlePickerResult(captureTerminalScreenshot(context, captureView))
+                            }
+                        },
+                    )
+                    ListItem(
+                        headlineContent = { Text("Gallery") },
+                        leadingContent = {
+                            Icon(Icons.Filled.PhotoLibrary, contentDescription = null)
+                        },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                        modifier = Modifier.clickable {
+                            showImageSources = false
+                            picker.launch(
+                                TerminalImageSource.Gallery,
+                                TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
+                                session.id,
+                            ) { handlePickerResult(it) }
+                        },
+                    )
+                }
             },
-            dismissButton = {
-                TextButton(onClick = {
-                    showImageSources = false
-                    picker.launch(
-                        TerminalImageSource.Camera,
-                        TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
-                        session.id,
-                    ) { handlePickerResult(it) }
-                }) { Text("Camera") }
-            },
+            confirmButton = { },
         )
     }
     if (showBringIn) {
