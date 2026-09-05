@@ -9,6 +9,7 @@ pub fn dispatch(
     app: &tauri::AppHandle,
 ) -> Option<Result<Value, String>> {
     Some(match command {
+        "setup_wsl" => setup_wsl(app),
         "open_path" => crate::bridge::rpc(command.into(), args.clone()),
         "list_fonts" => {
             let mut db = fontdb::Database::new();
@@ -40,6 +41,33 @@ pub fn dispatch(
         "desktop_notify_close" => close_toast(args).map(|_| Value::Null),
         _ => return None,
     })
+}
+
+fn setup_wsl(app: &tauri::AppHandle) -> Result<Value, String> {
+    use std::os::windows::process::CommandExt;
+    // A visible console lets the distribution own account creation and passwords.
+    // The frontend cannot supply executable paths, arguments, or elevation flags.
+    let script = app
+        .path()
+        .resolve("setup/setup-wsl.ps1", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| e.to_string())?;
+    let system_root = std::env::var_os("SystemRoot").ok_or("Windows directory unavailable")?;
+    let powershell = std::path::PathBuf::from(system_root)
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let status = std::process::Command::new(powershell)
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(script)
+        .creation_flags(0x00000010) // CREATE_NEW_CONSOLE, never elevate account setup.
+        .status()
+        .map_err(|e| format!("Could not open WSL setup: {e}"))?;
+    match status.code() {
+        Some(0) => Ok(json!("ready")),
+        Some(3010) => Ok(json!("restart_required")),
+        Some(2) => Ok(json!("cancelled")),
+        _ => Err(
+            "WSL setup did not finish. Follow the setup window's guidance, then try again.".into(),
+        ),
+    }
 }
 
 fn badge(app: &tauri::AppHandle, count: u64) -> Result<(), String> {

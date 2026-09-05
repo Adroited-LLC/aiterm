@@ -6,6 +6,12 @@
 .wsl-folder-row.on { background: var(--bg-active); color: var(--text); }
 .workspace-overlay { position: absolute; inset: 0; background: var(--bg); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; text-align: center; }
 .workspace-overlay p { max-width: 520px; overflow-wrap: anywhere; color: var(--text-dim); }
+.workspace-overlay { overflow-y: auto; }
+.workspace-overlay h2 { font-size: 20px; font-weight: 500; }
+.wsl-setup-actions { display: flex; gap: 10px; margin: 12px 0; }
+.wsl-setup-actions button:disabled { opacity: .55; cursor: wait; }
+.wsl-setup-details { margin-top: 12px; max-width: 520px; color: var(--text-dim); text-align: left; }
+.wsl-setup-details summary { cursor: pointer; }
 .wsl-dialog { width: min(650px, 90vw); background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 20px 80px #0008; overflow: hidden; }
 .wsl-dialog h2 { font-size: 17px; font-weight: 500; margin-top: 0; }
 .wsl-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 12px; }

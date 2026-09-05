@@ -207,3 +207,34 @@ Validation: the Windows installer built successfully. A temporary NSIS harness
 verified real mirrored-mode detection plus simulated NAT and unavailable-probe
 responses, including noninteractive completion in silent mode. Existing Linux
 and Android application code is unchanged by this installer-only update.
+
+## Guided WSL setup (Windows 0.1.5)
+
+The installer checks whether the default distribution can run as a non-root
+user. If it cannot, installation finishes with an offer to open WSL setup.
+Silent installs skip the offer and never launch prerequisite installation.
+The first-launch recovery screen also provides **Set up WSL** and **Try again**.
+
+Both entry points use the bundled `windows/setup/setup-wsl.ps1` helper in a
+visible PowerShell console. Setup installs Windows WSL components with explicit
+UAC approval, using `--no-distribution` so an alternate administrator account
+cannot accidentally own the user's distribution. It asks the user to save and
+restart Windows, then reopen AITerm to continue. It does not restart the machine
+or persist an automatic elevated startup task.
+
+After WSL is available, setup offers Ubuntu when no usable distribution exists,
+or lets the user select an existing distribution (excluding Docker internals).
+Ubuntu installation and interactive account creation run as the original Windows
+user. The distribution handles the Linux password directly. Setup verifies a
+non-root default account and asks before changing WSL's default distribution.
+It recommends mirrored networking after account setup. It does not unregister
+distributions, reset accounts, edit firewall rules, or change networking modes.
+A per-session mutex prevents duplicate setup windows from making concurrent changes.
+
+Validation: Windows release and NSIS packaging build; frontend typecheck/build;
+PowerShell workflow tests in `windows/tests/setup-wsl.tests.ps1`. Installer tests
+in `windows/tests/installer-setup.tests.ps1` use the existing non-root default
+distribution for the `actual` case and simulate missing/root-only workspaces.
+The missing-WSL installation, UAC, reboot, and first-account creation paths are
+mocked in the workflow tests; a full fresh-Windows acceptance run is still needed.
+Existing developer WSL distributions are preserved during validation.
