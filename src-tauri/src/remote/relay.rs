@@ -117,6 +117,19 @@ impl std::fmt::Debug for RelayEnrollmentDraft {
 }
 
 impl RelayEnrollmentDraft {
+    pub fn config(&self) -> &RelayConfig {
+        &self.config
+    }
+
+    /// Public commitment only; the connector token never enters the QR.
+    pub fn bootstrap_query(&self) -> String {
+        format!(
+            "&c={}&t={}",
+            super::percent_encode(&self.control_origin),
+            hex_bytes(&self.token_sha256)
+        )
+    }
+
     pub fn authorization_digest(&self) -> &[u8; 32] {
         &self.authorization_digest
     }
@@ -184,6 +197,8 @@ pub struct RelayConfig {
     pub token: String,
     #[serde(default)]
     pub managed: bool,
+    #[serde(default)]
+    pub enrollment_pending: bool,
 }
 
 impl RelayConfig {
@@ -293,6 +308,7 @@ impl RelayConfig {
             route_id,
             token,
             managed: true,
+            enrollment_pending: true,
         };
         config.validate()?;
         let authorization_digest = enrollment_digest(
@@ -304,6 +320,30 @@ impl RelayConfig {
         Ok(RelayEnrollmentDraft {
             control_origin,
             config,
+            token_sha256,
+            desktop_spki_sha256,
+            authorization_digest,
+        })
+    }
+
+    pub fn pending_enrollment(&self, fingerprint: &str) -> Result<RelayEnrollmentDraft, String> {
+        let server =
+            RelayServerConfig::from_route(self).ok_or("relay enrollment origin is unavailable")?;
+        let desktop_spki_sha256: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(fingerprint)
+            .map_err(|_| "invalid desktop fingerprint")?
+            .try_into()
+            .map_err(|_| "invalid desktop fingerprint")?;
+        let token_sha256 = Sha256::digest(self.token.as_bytes()).into();
+        let authorization_digest = enrollment_digest(
+            &server.control_origin,
+            &self.route_id,
+            &token_sha256,
+            &desktop_spki_sha256,
+        );
+        Ok(RelayEnrollmentDraft {
+            control_origin: server.control_origin,
+            config: self.clone(),
             token_sha256,
             desktop_spki_sha256,
             authorization_digest,
@@ -513,7 +553,11 @@ async fn run(
         backoff = if was_connected {
             Duration::from_secs(1)
         } else {
-            (backoff * 2).min(Duration::from_secs(30))
+            (backoff * 2).min(Duration::from_secs(if config.enrollment_pending {
+                1
+            } else {
+                30
+            }))
         };
     }
     let _ = state.send(RelayConnectionState::Off);
@@ -696,6 +740,38 @@ mod tests {
     use p256::elliptic_curve::rand_core::OsRng;
     use std::fs;
 
+    #[test]
+    fn pending_enrollment_preserves_route_and_keeps_connector_secret_out_of_qr() {
+        let mut config = valid_config();
+        config.managed = true;
+        config.enrollment_pending = true;
+        config.connector_url = "wss://control.example.com/v1/connect".into();
+        config.public_host = format!("{}.relay.example.com", config.route_id);
+        let fingerprint = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let draft = config.pending_enrollment(&fingerprint).unwrap();
+        assert_eq!(draft.config(), &config);
+        assert!(!draft.bootstrap_query().contains(&config.token));
+        assert_eq!(
+            draft.authorization_digest(),
+            &enrollment_digest(
+                "https://control.example.com",
+                &config.route_id,
+                &Sha256::digest(config.token.as_bytes()).into(),
+                &[7u8; 32]
+            )
+        );
+        let reloaded: RelayConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(reloaded.enrollment_pending);
+        assert_eq!(
+            reloaded
+                .pending_enrollment(&fingerprint)
+                .unwrap()
+                .bootstrap_query(),
+            draft.bootstrap_query()
+        );
+    }
+
     fn valid_config() -> RelayConfig {
         RelayConfig {
             connector_url: "wss://control.relay.example.com/v1/connect".into(),
@@ -704,6 +780,7 @@ mod tests {
             route_id: "desk-1234".into(),
             token: "x".repeat(43),
             managed: false,
+            enrollment_pending: false,
         }
     }
 

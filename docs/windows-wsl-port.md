@@ -156,3 +156,25 @@ successfully as WSL 2 under the Windows user's account. Windows MSVC, Node.js,
 Rust, WebView2, and the Linux companion toolchain are available. The native
 executable passed its WSL smoke test; the installed GUI displayed a shell and
 ran commands through keyboard input. The NSIS installer completed successfully.
+
+## Relay pairing from a private VM (Windows 0.1.3 / Android 0.3.6)
+
+The first phone could not pair to a NAT-only VM: the old flow registered the
+relay only after a direct pairing succeeded. A fresh WSL pairing code now uses
+version 4 and includes the relay control origin and connector-token hash, bound
+to the same phone-signed enrollment digest as the route and desktop TLS pin.
+The connector token remains on the desktop.
+
+The WSL app persists one pending route and starts its outbound connector when
+preparing the code. Retries and restarts reuse that route. Android still tries
+direct endpoints first; if those are unreachable, it registers the signed route
+through the existing relay provisioning API before trying the pinned desktop
+connection through the relay. Only normal desktop approval grants device access.
+Repeated registration conflicts never replace a route; successful pairing still
+requires the exact desktop TLS identity. Approval preserves an already connected
+relay so it does not interrupt its own pairing response.
+
+No relay-server deployment or VM network change is required. Android continues
+to support pairing versions 1–3 used by the installed Linux desktop. The Linux
+installation is unchanged. Pending routes can be removed with the existing relay
+removal control; a scan may authorize transport before desktop approval.

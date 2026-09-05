@@ -522,6 +522,7 @@ struct Inner {
 #[derive(Default)]
 pub struct RemoteState {
     inner: Mutex<Inner>,
+    pairing_setup: Mutex<()>,
 }
 
 impl Inner {
@@ -651,6 +652,10 @@ impl Inner {
             relay,
             draft.map(RelayEnrollmentDraft::authorization_digest),
         );
+        if let Some(draft) = draft {
+            payload = payload.replacen("?v=3", "?v=4", 1);
+            payload.push_str(&draft.bootstrap_query());
+        }
         if self.startup.network_stack == RemoteNetworkStack::Iroh {
             let node = crate::iroh_tunnel::node_id_of(&self.startup.iroh_secret)
                 .ok_or_else(|| "the Iroh identity is unavailable".to_string())?;
@@ -701,6 +706,7 @@ pub async fn remote_relay_configure(
         route_id,
         token,
         managed: false,
+        enrollment_pending: false,
     };
     config.save(&state_root()?)?;
     inner.relay_config = Some(config);
@@ -1119,7 +1125,8 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
 pub async fn remote_begin_pairing(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
-    let (devices, fingerprint, needs_relay, relay_server) = {
+    let _setup = state.pairing_setup.lock().await;
+    let (devices, fingerprint, needs_relay, relay_server, pending_config) = {
         let mut inner = state.inner.lock().await;
         inner.load_relay_config()?;
         if inner.gateway.is_none() {
@@ -1132,25 +1139,58 @@ pub async fn remote_begin_pairing(
                 .clone()
                 .ok_or("the remote identity is unavailable")?,
             inner.startup.network_stack == RemoteNetworkStack::Aiterm
-                && inner.relay_config.is_none(),
+                && inner
+                    .relay_config
+                    .as_ref()
+                    .is_none_or(|config| config.enrollment_pending),
             inner
                 .relay_server
                 .as_ref()
                 .map(|value| value.control_origin.clone())
                 .unwrap_or_else(|| DEFAULT_RELAY_SERVER.to_string()),
+            inner.relay_config.clone(),
         )
     };
     let draft = if needs_relay {
-        match RelayConfig::prepare_enrollment(&relay_server, &fingerprint).await {
-            Ok(draft) => Some(draft),
-            Err(error) => {
-                tracing::warn!(error = %error, "relay setup was unavailable during pairing");
-                None
+        if let Some(config) = pending_config {
+            Some(config.pending_enrollment(&fingerprint)?)
+        } else {
+            match RelayConfig::prepare_enrollment(&relay_server, &fingerprint).await {
+                Ok(draft) => Some(draft),
+                Err(error) => {
+                    tracing::warn!(error = %error, "relay setup was unavailable during pairing");
+                    None
+                }
             }
         }
     } else {
         None
     };
+    if let Some(draft) = &draft {
+        let mut inner = state.inner.lock().await;
+        if inner.gateway.is_none()
+            || inner.fingerprint.as_deref() != Some(&fingerprint)
+            || inner.startup.network_stack != RemoteNetworkStack::Aiterm
+            || inner
+                .relay_config
+                .as_ref()
+                .is_some_and(|config| config != draft.config())
+        {
+            return Err("remote access changed while preparing pairing".into());
+        }
+        if inner.relay_config.is_none() {
+            let config = draft.config().clone();
+            config.save(&state_root()?)?;
+            if let Some(gateway) = &inner.gateway {
+                gateway.set_relay_route(config.public_host.clone(), config.public_port);
+            }
+            inner.relay = Some(RelayConnectorHandle::start(
+                config.clone(),
+                inner.bound.ok_or("listener unavailable")?,
+            ));
+            inner.relay_config = Some(config);
+        }
+    }
     let now = SystemTime::now();
     let enrollment = devices
         .begin_enrollment_with_relay_at(now, draft)
@@ -1197,25 +1237,45 @@ pub async fn remote_approve_device(
             let mut inner = state.inner.lock().await;
             inner.load_relay_config()?;
             inner.startup.network_stack == RemoteNetworkStack::Aiterm
-                && inner.relay_config.is_none()
+                && inner
+                    .relay_config
+                    .as_ref()
+                    .is_none_or(|config| config.enrollment_pending)
         };
         if should_register {
-            match enrollment
-                .draft
-                .register(&enrollment.authority_public_key, &enrollment.signature_der)
-                .await
-            {
-                Ok(config) => {
-                    config.save(&state_root()?)?;
+            let connected = {
+                let inner = state.inner.lock().await;
+                inner.relay_config.as_ref() == Some(enrollment.draft.config())
+                    && inner
+                        .relay
+                        .as_ref()
+                        .is_some_and(|relay| relay.state() == RelayConnectionState::Connected)
+            };
+            let registration = if connected {
+                Ok(enrollment.draft.config().clone())
+            } else {
+                enrollment
+                    .draft
+                    .register(&enrollment.authority_public_key, &enrollment.signature_der)
+                    .await
+            };
+            match registration {
+                Ok(mut config) => {
+                    config.enrollment_pending = false;
                     let mut inner = state.inner.lock().await;
-                    if inner.relay_config.is_none() {
+                    if inner.relay_config.as_ref() == Some(enrollment.draft.config()) {
+                        config.save(&state_root()?)?;
                         if let Some(gateway) = &inner.gateway {
                             gateway.set_relay_route(config.public_host.clone(), config.public_port);
                         }
                         if inner.startup.network_stack == RemoteNetworkStack::Aiterm {
                             if let Some(local_target) = inner.bound {
-                                inner.relay =
-                                    Some(RelayConnectorHandle::start(config.clone(), local_target));
+                                if inner.relay.is_none() {
+                                    inner.relay = Some(RelayConnectorHandle::start(
+                                        config.clone(),
+                                        local_target,
+                                    ));
+                                }
                             }
                         }
                         inner.relay_config = Some(config);
@@ -1317,6 +1377,7 @@ mod listener_advertisement_tests {
                 route_id: "desktop".into(),
                 token: "x".repeat(43),
                 managed: true,
+                enrollment_pending: false,
             }),
             ..Inner::default()
         };
@@ -1398,6 +1459,7 @@ mod listener_advertisement_tests {
             route_id: "desktop-1234".into(),
             token: "x".repeat(43),
             managed: true,
+            enrollment_pending: false,
         };
         assert_eq!(
             relay_certificate_dns(Some(&route), Some(&server)),
