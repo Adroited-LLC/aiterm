@@ -82,6 +82,7 @@ class PairingPayload private constructor(
     val relayHost: String?,
     val relayPort: Int?,
     val relayAuthorizationDigest: ByteArray?,
+    val relayBootstrap: RelayBootstrap?,
     val networkStack: RemoteNetworkStack,
     val irohNodeId: String?,
     val irohRelayUrl: String?,
@@ -113,7 +114,7 @@ class PairingPayload private constructor(
         private const val MAX_DISPLAY_NAME_CHARS = 128
         private val base64Url = Regex("^[A-Za-z0-9_-]+$")
         private val requiredSingletonFields = setOf("v", "p", "f", "s", "n")
-        private val optionalSingletonFields = setOf("r", "q", "a", "m", "i", "j")
+        private val optionalSingletonFields = setOf("r", "q", "a", "m", "i", "j", "c", "t")
         private val knownFields = requiredSingletonFields + optionalSingletonFields + "h"
 
         fun parse(raw: String, scannedAtEpochMillis: Long): PairingPayloadResult {
@@ -162,7 +163,7 @@ class PairingPayload private constructor(
                 optionalSingletonFields.any { fields[it]?.size?.let { count -> count > 1 } == true }
             ) return malformed()
             val version = fields.getValue("v").single()
-            if (version !in setOf("1", "2", "3")) {
+            if (version !in setOf("1", "2", "3", "4")) {
                 return PairingPayloadResult.Rejected(PairingFailure.UNSUPPORTED_VERSION)
             }
 
@@ -192,14 +193,25 @@ class PairingPayload private constructor(
                 secretBytes.fill(0)
                 return malformed()
             }
-            if ((version in setOf("2", "3")) != (relayHost != null)) {
+            if ((version in setOf("2", "3", "4")) != (relayHost != null)) {
                 secretBytes.fill(0)
                 return malformed()
             }
             val relayAuthorizationDigest = fields["a"]?.singleOrNull()?.let(::decodeBase64Url32)
-            if ((version == "3") != (relayAuthorizationDigest != null)) {
+            if ((version in setOf("3", "4")) != (relayAuthorizationDigest != null)) {
                 secretBytes.fill(0)
                 relayAuthorizationDigest?.fill(0)
+                return malformed()
+            }
+            val bootstrapOrigin = fields["c"]?.singleOrNull()
+            val bootstrapHash = fields["t"]?.singleOrNull()
+            val bootstrap = if (version == "4" && bootstrapOrigin != null && bootstrapHash != null && relayHost != null) {
+                RelayBootstrap.parse(bootstrapOrigin, bootstrapHash, relayHost)
+            } else null
+            if ((version == "4" && (bootstrap == null ||
+                    !java.security.MessageDigest.isEqual(bootstrap.digest(fingerprint), relayAuthorizationDigest))) ||
+                (version != "4" && (bootstrapOrigin != null || bootstrapHash != null))) {
+                secretBytes.fill(0)
                 return malformed()
             }
             val relayPort = relayPortText?.let { text ->
@@ -247,6 +259,7 @@ class PairingPayload private constructor(
                     relayHost = relayHost,
                     relayPort = relayPort,
                     relayAuthorizationDigest = relayAuthorizationDigest,
+                    relayBootstrap = bootstrap,
                     networkStack = networkStack,
                     irohNodeId = irohNodeId,
                     irohRelayUrl = irohRelayUrl,

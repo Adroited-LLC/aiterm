@@ -97,3 +97,20 @@ reproduced newline classification at 75 ms and submission eligibility at 250 ms.
 This is a timing regression check, not an end-to-end guarantee under arbitrary
 receiver stalls. Phone prompt submission still needs user confirmation.
 Source: https://raw.githubusercontent.com/openai/codex/main/codex-rs/tui/src/bottom_pane/paste_burst.rs
+
+## Android 0.3.6: first pairing to a private WSL VM
+
+Adds support for version-4 WSL pairing codes containing public relay enrollment
+commitments. The phone validates the digest binding the control origin, route,
+connector-token hash, and desktop TLS identity before signing. Existing version
+1–3 codes and direct-first pairing behavior remain supported. Only after direct
+endpoints fail does the phone provision the route, then attempt the pinned relay
+connection. Provisioning never sends the connector token or pairing secret to
+the relay and never substitutes for desktop approval.
+
+Validation: 243 Android unit tests passed and APK built. New tests cover QR
+binding/tampering, HTTPS provisioning payloads, route-limit rejection, repeated
+registration, direct-path preservation, and required desktop approval. An
+isolated WSL service completed a real relay enrollment and approval exchange;
+its temporary relay route was deleted afterward (HTTP 204). The installed Linux
+desktop and Linux Rust sources were not changed for this fix.

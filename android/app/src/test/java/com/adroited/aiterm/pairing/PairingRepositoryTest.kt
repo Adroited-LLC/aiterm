@@ -65,7 +65,7 @@ class PairingRepositoryTest {
 
     @Test
     fun unknownPayloadVersion_isRejectedOutright() {
-        val result = PairingPayload.parse(pairingUri(version = "4"), scannedAt)
+        val result = PairingPayload.parse(pairingUri(version = "5"), scannedAt)
 
         assertEquals(
             PairingPayloadResult.Rejected(PairingFailure.UNSUPPORTED_VERSION),

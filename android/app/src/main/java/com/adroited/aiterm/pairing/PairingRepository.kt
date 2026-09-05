@@ -81,6 +81,7 @@ class PairingRepository(
     private val deviceKeys: DeviceKeys,
     private val store: PairedDesktopStore,
     private val relayAuthorityKeys: DeviceKeys = deviceKeys,
+    private val relayProvisioner: RelayProvisioner = HttpRelayProvisioner(),
 ) {
 
     suspend fun pair(
@@ -158,7 +159,27 @@ class PairingRepository(
         } else {
             payload.hosts.map { PairingEndpoint(it, payload.port) }
         }
-        for (endpoint in directEndpoints + listOfNotNull(payload.relayEndpoint)) {
+        var bootstrapAttempted = false
+        val relayAttempts = payload.relayEndpoint?.let { endpoint ->
+            List(if (payload.relayBootstrap != null) 3 else 1) { endpoint }
+        }.orEmpty()
+        for (endpoint in directEndpoints + relayAttempts) {
+            if (endpoint == payload.relayEndpoint && payload.relayBootstrap != null && !bootstrapAttempted) {
+                bootstrapAttempted = true
+                try {
+                    if (relayAuthorityPublicKey == null || relaySignatureDer == null ||
+                        !relayProvisioner.provision(payload.relayBootstrap, payload.serverSpkiFingerprint,
+                            relayAuthorityPublicKey, relaySignatureDer)) {
+                        return PairingResult.Rejected(PairingFailure.UNREACHABLE)
+                    }
+                    // The outbound desktop connector retries pending enrollment every second.
+                    kotlinx.coroutines.delay(1_500)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    return PairingResult.Rejected(PairingFailure.UNREACHABLE)
+                }
+            }
             val outcome = try {
                 transport.enroll(
                     endpoint = endpoint,
@@ -223,7 +244,11 @@ class PairingRepository(
                     return PairingResult.Rejected(PairingFailure.ENROLLMENT_STATE_UNKNOWN)
                 is EnrollmentOutcome.ProtocolFailure ->
                     return PairingResult.Rejected(PairingFailure.PROTOCOL_ERROR)
-                is EnrollmentOutcome.Unreachable -> Unit
+                is EnrollmentOutcome.Unreachable -> {
+                    if (endpoint == payload.relayEndpoint && payload.relayBootstrap != null) {
+                        kotlinx.coroutines.delay(1_000)
+                    }
+                }
             }
         }
         return PairingResult.Rejected(PairingFailure.UNREACHABLE)
