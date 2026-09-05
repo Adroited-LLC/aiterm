@@ -498,6 +498,10 @@ class AuthenticatedRemoteTransport(
                 closeWithOutcome(RemoteTransportTerminalOutcome.Revoked)
             }
             "error" -> acceptError(event)
+            "session.spine.changed" -> {
+                if (event.requestId != 0L) protocolFailure()
+                emit(RemoteServerEvent.Raw(event.kind, event.payload))
+            }
             "session.changed", "agent.changed", "tab.changed", "terminal.exited",
             "terminal.title", "terminal.focus_changed" -> {
                 requireKnownCorrelation(event.requestId)

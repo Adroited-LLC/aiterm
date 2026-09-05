@@ -64,6 +64,9 @@ fn accepts_the_live_conversation_cursor_through_the_wire_decoder() {
     assert_eq!(request.request_id(), 42);
     assert_eq!(request.kind(), "session.spine");
     assert_eq!(request.payload(), encoded);
+    let subscription = RemoteRequest::decode(&cbor_request(1, "session.spine.subscribe", &encoded))
+        .expect("subscription must pass the same authenticated gateway decoder");
+    assert_eq!(subscription.kind(), "session.spine.subscribe");
 }
 
 #[test]

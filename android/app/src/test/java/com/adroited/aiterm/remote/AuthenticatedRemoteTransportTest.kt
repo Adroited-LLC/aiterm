@@ -34,6 +34,30 @@ import kotlin.concurrent.thread
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class AuthenticatedRemoteTransportTest {
+    @Test
+    fun authenticatedConnectionDeliversUnsolicitedSpineNotifications() = runTest {
+        val socket = FakeBinarySocket().apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+        }
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(), deviceKeys = RecordingDeviceKeys(), appLock = unlockedAppLock(),
+            dialer = FakeDialer(socket), scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        transport.connect()
+        val event = async { transport.events.first() }
+        socket.incoming.trySend(cborFixture(linkedMapOf(
+            "version" to 1, "request_id" to 0, "kind" to "session.spine.changed",
+            "payload" to cborFixture(linkedMapOf("session_id" to "s", "epoch" to 1, "latest_seq" to 42)),
+        )))
+        runCurrent()
+        val raw = event.await() as RemoteServerEvent.Raw
+        assertEquals("session.spine.changed", raw.kind)
+        assertEquals(42L, RemoteCommands.spineChanged(raw.payload).latestSeq)
+        transport.close()
+    }
+
 
     @Test
     fun aLockedAppNeverSignsTheOpeningChallenge() = runTest {

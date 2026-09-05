@@ -38,6 +38,13 @@ internal data class SpineSnapshotWire(
     val events: List<SpineEventWire>,
 )
 
+@Serializable
+internal data class SpineChangedWire(
+    @SerialName("session_id") val sessionId: String,
+    val epoch: Long,
+    @SerialName("latest_seq") val latestSeq: Long,
+)
+
 internal data class SpineConversationPage(
     val epoch: Long,
     val live: Boolean,

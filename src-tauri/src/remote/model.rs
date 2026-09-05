@@ -20,6 +20,7 @@ const KNOWN_REQUESTS: &[&str] = &[
     "session.preview",
     "session.conversation",
     "session.spine",
+    "session.spine.subscribe",
     "session.changes",
     "session.web_preview",
     "file.read",

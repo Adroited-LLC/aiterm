@@ -468,6 +468,12 @@ object RemoteCommands {
             )
         }
 
+    internal fun spineChanged(payload: ByteArray): SpineChangedWire =
+        decode(SpineChangedWire.serializer(), payload).also {
+            requireIdentifier(it.sessionId)
+            if (it.epoch < 0L || it.latestSeq < 0L) malformed()
+        }
+
     fun sessionChanges(payload: ByteArray): List<RemoteSessionChange> =
         decode(SessionChangesReply.serializer(), payload).changes.also { changes ->
             if (changes.size > 5_000 || changes.any {

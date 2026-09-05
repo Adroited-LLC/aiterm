@@ -1062,7 +1062,9 @@ private fun RemoteConversationContent(
         if (state.connection == ConnectionState.Connected) {
             while (true) {
                 refreshConversation()
-                delay(1_500)
+                // Push notifications drive updates; this heals missed signals
+                // and remains compatible with older polling-only desktops.
+                delay(5_000)
             }
         }
     }
@@ -1274,12 +1276,15 @@ private fun RemoteConversationContent(
                                 Spacer(Modifier.width(8.dp))
                                 SessionStateChip(
                                     label = when {
+                                        state.connection != ConnectionState.Connected -> "disconnected"
+                                        state.previewError != null -> "sync interrupted"
                                         needsYou -> "needs you"
                                         working -> "working"
                                         live -> "on desktop"
                                         else -> "history"
                                     },
                                     color = when {
+                                        state.connection != ConnectionState.Connected || state.previewError != null -> MaterialTheme.colorScheme.error
                                         needsYou -> MaterialTheme.colorScheme.error
                                         working -> Color(0xFFF6C453)
                                         live -> MaterialTheme.colorScheme.tertiary
@@ -1504,6 +1509,9 @@ private fun RemoteConversationContent(
                                         activity = state.sessionActivity,
                                         onSelect = onSelectSession,
                                     )
+                                    state.previewError?.let { error ->
+                                        Text("Conversation updates interrupted: $error", color = MaterialTheme.colorScheme.error)
+                                    }
                                     if (needsYou) {
                                         state.tabs.firstOrNull { it.sessionId == session.id }?.let { tab ->
                                             NeedsYouQuickKeys { key -> onQuickInput(tab.id, key) }

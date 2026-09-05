@@ -164,6 +164,15 @@ impl Spine {
         self.tx.subscribe()
     }
 
+    /// Cheap high-water mark for coalesced remote change notifications.
+    pub fn latest_seq(&self, session_id: &str) -> u64 {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map_or(0, |log| log.next_seq.saturating_sub(1))
+    }
+
     /// Stamp, store and broadcast one event. The only way anything enters
     /// the spine.
     pub fn push(&self, session_id: &str, agent: &str, ts: u64, kind: Kind) -> SpineEvent {
@@ -1026,7 +1035,7 @@ async fn drive(spine: Arc<Spine>, app: AppHandle, session_id: String, agent: Str
         tokio::select! {
             _ = fs.recv() => {
                 // Fold the rest of the burst into this one poll.
-                while tokio::time::timeout(COALESCE, fs.recv()).await.is_ok() {}
+                coalesce_changes(&mut fs).await;
             }
             _ = tick.tick() => {}
             _ = reap.tick() => {
@@ -1078,6 +1087,18 @@ where
 /// files moves. Directories rather than the files themselves because a
 /// transcript is often replaced rather than appended (a `/clear` writes a
 /// new file), and an inotify watch on the old inode would go quiet.
+async fn coalesce_changes(fs: &mut mpsc::UnboundedReceiver<()>) {
+    // One deadline for the entire burst. Restarting a timeout after every
+    // notification can starve transcript reads indefinitely under load.
+    let deadline = tokio::time::Instant::now() + COALESCE;
+    while tokio::time::Instant::now() < deadline
+        && matches!(
+            tokio::time::timeout_at(deadline, fs.recv()).await,
+            Ok(Some(()))
+        )
+    {}
+}
+
 fn spawn_watch(paths: &[PathBuf], tx: UnboundedSender<()>) -> Option<RecommendedWatcher> {
     if paths.is_empty() {
         return None;
@@ -1085,6 +1106,10 @@ fn spawn_watch(paths: &[PathBuf], tx: UnboundedSender<()>) -> Option<Recommended
     let wanted: HashSet<PathBuf> = paths.iter().cloned().collect();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
+            // Reading the transcript must not wake its own watcher.
+            if !(ev.kind.is_modify() || ev.kind.is_create() || ev.kind.is_remove()) {
+                return;
+            }
             if ev.paths.iter().any(|p| wanted.contains(p)) {
                 let _ = tx.send(());
             }
@@ -1114,6 +1139,25 @@ fn short(session_id: &str) -> &str {
 mod tests {
     use super::*;
     use crate::spine::{ToolCategory, ToolStatus};
+
+    #[tokio::test]
+    async fn continuous_notifications_cannot_starve_transcript_reads() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(async move {
+            loop {
+                if tx.send(()).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let result = tokio::time::timeout(Duration::from_secs(2), coalesce_changes(&mut rx)).await;
+        writer.abort();
+        assert!(
+            result.is_ok(),
+            "continuous writes must not postpone reading indefinitely"
+        );
+    }
 
     fn text(id: &str, body: &str) -> Kind {
         Kind::AgentText {
@@ -1191,7 +1235,10 @@ mod tests {
             "s",
             "codex",
             2,
-            Kind::TurnEnded { turn: "t".into(), reason: "completed".into() },
+            Kind::TurnEnded {
+                turn: "t".into(),
+                reason: "completed".into(),
+            },
         );
         let (_, _, _, open, events) = spine.page_after("s", u64::MAX, usize::MAX);
         assert!(events.is_empty());

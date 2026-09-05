@@ -203,6 +203,7 @@ class RemoteClient(
     private var selectionGeneration = 0L
     private val ownedJobs = linkedSetOf<Job>()
     private val spineConversations = HashMap<String, SpineConversationStore>()
+    private val spineRefreshPending = HashSet<String>()
 
     suspend fun connect(): Boolean {
         synchronized(lifecycleLock) {
@@ -701,9 +702,15 @@ class RemoteClient(
         }
     }
 
-    fun previewSession(sessionId: String) {
+    fun previewSession(sessionId: String) = previewSession(sessionId, subscribe = true)
+
+    private fun previewSession(sessionId: String, subscribe: Boolean) {
         synchronized(lifecycleLock) {
-            if (mutableState.value.previewLoadingSessionId == sessionId) return
+            if (mutableState.value.previewLoadingSessionId == sessionId) {
+                spineRefreshPending.add(sessionId)
+                return
+            }
+            spineRefreshPending.remove(sessionId)
             mutableState.value = mutableState.value.copy(
                 previewLoadingSessionId = sessionId,
                 previewError = null,
@@ -712,11 +719,14 @@ class RemoteClient(
         val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
         val requestedAfter = store.lastSeq
         val started = launchRequest(
-            "session.spine",
+            if (subscribe) "session.spine.subscribe" else "session.spine",
             RemoteCommands.spine(sessionId, requestedAfter),
             timeoutMillis = PREVIEW_REFRESH_TIMEOUT_MILLIS,
             onError = { code, message ->
-                if (code == "remote.unsupported" || code == "protocol.invalid_response") {
+                if (subscribe && code == "remote.unsupported") {
+                    mutableState.value = mutableState.value.copy(previewLoadingSessionId = null)
+                    previewSession(sessionId, subscribe = false)
+                } else if (code == "remote.unsupported") {
                     previewSessionLegacy(sessionId)
                 } else {
                     mutableState.value = mutableState.value.copy(
@@ -735,7 +745,7 @@ class RemoteClient(
                 ) {
                     store.clear()
                     mutableState.value = mutableState.value.copy(previewLoadingSessionId = null)
-                    previewSession(sessionId)
+                    previewSession(sessionId, subscribe)
                     return@launchRequest
                 }
                 val items = store.apply(page)
@@ -765,10 +775,10 @@ class RemoteClient(
                 // `latestSeq` is the desktop's atomic high-water mark. Drain
                 // until our applied cursor reaches it even if an older server
                 // accidentally under-reports `hasMore`.
-                if (store.lastSeq > requestedAfter &&
+                if (spineRefreshPending.remove(sessionId) || (store.lastSeq > requestedAfter &&
                     (page.hasMore || (page.latestSeq > 0L && store.lastSeq < page.latestSeq))
-                ) {
-                    previewSession(sessionId)
+                )) {
+                    previewSession(sessionId, subscribe)
                 }
             },
         )
@@ -1050,6 +1060,16 @@ class RemoteClient(
 
     private fun acceptRaw(event: RemoteServerEvent.Raw) {
         when (event.kind) {
+            "session.spine.changed" -> {
+                val changed = RemoteCommands.spineChanged(event.payload)
+                val state = mutableState.value
+                if (changed.sessionId == state.previewSessionId || changed.sessionId == state.previewLoadingSessionId) {
+                    val store = spineConversations[changed.sessionId]
+                    if (store == null || store.epoch != changed.epoch || store.lastSeq < changed.latestSeq) {
+                        previewSession(changed.sessionId)
+                    }
+                }
+            }
             "terminal.focus_changed" -> {
                 val focus = RemoteCommands.focus(event.payload)
                 if (focus.attachmentId == activeAttachmentId && focus.tabId == mutableState.value.activeTabId) {

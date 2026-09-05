@@ -41,6 +41,62 @@ import kotlin.concurrent.thread
 
 @OptIn(ExperimentalCoroutinesApi::class, ExperimentalSerializationApi::class)
 class RemoteClientTest {
+    @Test
+    fun pushedChangesCatchUpEvenWhenAnotherNotificationArrivesDuringFetch() = runTest {
+        val transport = FakeRemoteTransport()
+        val delayed = CompletableDeferred<RemoteResponse>()
+        var reads = 0
+        fun reply(seq: Long) = uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(),
+            SpineSnapshotWire(1, true, false, 1, seq, turnOpen = seq != 3L,
+                events = listOf(SpineEventWire(seq, 1, "session-1", "codex", seq,
+                    "agent_text", id = "a$seq", text = "message $seq", done = true))))
+        transport.responseFor = { request ->
+            if (request.kind == "session.spine.subscribe") {
+                reads++
+                if (reads == 2) delayed else CompletableDeferred(
+                    RemoteResponse.Success(request.requestId, request.kind, reply(reads.toLong())))
+            } else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("session-1")
+        runCurrent()
+        fun notify(seq: Long, session: String = "session-1") {
+            client.acceptForTest(RemoteServerEvent.Raw("session.spine.changed",
+                uploadCbor.encodeToByteArray(SpineChangedWire.serializer(), SpineChangedWire(session, 1, seq))))
+        }
+        notify(2)
+        runCurrent()
+        assertEquals(2, reads)
+        notify(3)
+        val request = transport.requests.last { it.kind == "session.spine.subscribe" }
+        delayed.complete(RemoteResponse.Success(request.requestId, request.kind, reply(2)))
+        runCurrent()
+        assertEquals(3, reads)
+        assertEquals(listOf("message 1", "message 2", "message 3"), client.state.value.previewMessages.map { it.text })
+        assertEquals(false, client.state.value.previewTurnOpen)
+        notify(3)
+        notify(100, "another-session")
+        runCurrent()
+        assertEquals(3, reads)
+        assertEquals(0, testScheduler.currentTime) // no periodic poll needed
+        client.lock()
+    }
+
+    @Test
+    fun malformedLiveFeedDoesNotSilentlyBecomeLegacyHistory() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request -> CompletableDeferred(
+            RemoteResponse.Success(request.requestId, request.kind, byteArrayOf())) }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("session-1")
+        advanceUntilIdle()
+        assertTrue(client.state.value.previewError != null)
+        assertTrue(transport.requests.none { it.kind == "session.conversation" })
+        client.lock()
+    }
+
 
     @Test
     fun spineDrainsEveryPageAndRefetchesHistoryAfterDesktopRestart() = runTest {
@@ -56,7 +112,7 @@ class RemoteClientTest {
         replies.add(page(1, 1, "first", latest = 2))
         replies.add(page(1, 2, "second"))
         transport.responseFor = { request ->
-            val payload = if (request.kind == "session.spine") {
+            val payload = if (request.kind == "session.spine.subscribe") {
                 uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), replies.removeFirst())
             } else byteArrayOf()
             CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
@@ -75,7 +131,7 @@ class RemoteClientTest {
         advanceUntilIdle()
         assertEquals(listOf("new first", "new second", "new last"),
             client.state.value.previewMessages.map { it.text })
-        val requests = transport.requests.filter { it.kind == "session.spine" }
+        val requests = transport.requests.filter { it.kind == "session.spine.subscribe" }
         listOf(0L, 1L, 2L, 0L, 1L, 2L).zip(requests).forEach { (after, request) ->
             assertArrayEquals(RemoteCommands.spine("session-1", after), request.payload)
         }
@@ -88,7 +144,7 @@ class RemoteClientTest {
     fun emptySpinePageWithHighWatermarkDoesNotStartAnEndlessRequestLoop() = runTest {
         val transport = FakeRemoteTransport()
         transport.responseFor = { request ->
-            val payload = if (request.kind == "session.spine") uploadCbor.encodeToByteArray(
+            val payload = if (request.kind == "session.spine.subscribe") uploadCbor.encodeToByteArray(
                 SpineSnapshotWire.serializer(),
                 SpineSnapshotWire(epoch = 1, live = true, hasMore = true, latestSeq = 10, events = emptyList()),
             ) else byteArrayOf()
@@ -98,7 +154,7 @@ class RemoteClientTest {
         client.connect()
         client.previewSession("session-1")
         advanceUntilIdle()
-        assertEquals(1, transport.requests.count { it.kind == "session.spine" })
+        assertEquals(1, transport.requests.count { it.kind == "session.spine.subscribe" })
         assertEquals(null, client.state.value.previewLoadingSessionId)
         client.lock()
     }
@@ -107,7 +163,7 @@ class RemoteClientTest {
     fun stalledSpineRefreshIsAbandonedAndDoesNotPinLaterRefreshes() = runTest {
         val transport = FakeRemoteTransport()
         transport.responseFor = { request ->
-            if (request.kind == "session.spine") CompletableDeferred()
+            if (request.kind == "session.spine.subscribe") CompletableDeferred()
             else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
         }
         val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
@@ -125,7 +181,7 @@ class RemoteClientTest {
 
         client.previewSession("session-1")
         runCurrent()
-        assertEquals(2, transport.requests.count { it.kind == "session.spine" })
+        assertEquals(2, transport.requests.count { it.kind == "session.spine.subscribe" })
         client.lock()
     }
 
@@ -134,6 +190,8 @@ class RemoteClientTest {
         val transport = FakeRemoteTransport()
         val pending = CompletableDeferred<RemoteResponse>()
         transport.responseFor = { request ->
+            if (request.kind.startsWith("session.spine")) CompletableDeferred(RemoteResponse.Error(request.requestId, "remote.unsupported", "old desktop"))
+            else
             if (request.kind == "session.conversation") pending
             else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
         }
@@ -161,6 +219,8 @@ class RemoteClientTest {
     fun conversationSuccessPublishesMessagesAndStopsLoading() = runTest {
         val transport = FakeRemoteTransport()
         transport.responseFor = { request ->
+            if (request.kind.startsWith("session.spine")) CompletableDeferred(RemoteResponse.Error(request.requestId, "remote.unsupported", "old desktop"))
+            else
             CompletableDeferred(
                 RemoteResponse.Success(
                     request.requestId,

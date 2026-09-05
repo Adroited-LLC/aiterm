@@ -49,3 +49,34 @@ so the target includes the working indicator instead of stopping one row short.
 Verified on the connected Pixel after installing 0.3.3: the visible API view
 shows “Codex is working…”, the header says “working”, and native tool rows show
 running status. Desktop 0.10.79 remained running throughout this verification.
+
+## Desktop 0.10.80 / Android 0.3.4: push and bounded source reads
+
+`session.spine.subscribe` returns the same cursor page as `session.spine` and
+subscribes the authenticated socket to that conversation. The gateway checks
+the in-memory sequence every 100 ms and pushes a coalesced
+`session.spine.changed {session_id, epoch, latest_seq}` notification with
+request ID zero when it advances. No transcript is read for this check. There
+is one subscription per connection, replaced when another conversation is
+selected. Old phones receive no unsolicited new event unless they opt in.
+
+Android immediately fetches after its last applied sequence. Notifications
+arriving during a fetch queue another catch-up, and duplicates already applied
+are ignored. A five-second refresh is a recovery check and compatibility path;
+desktop restarts still refetch from zero. An unsupported subscription falls
+back to ordinary spine polling. Malformed replies now surface a sync error
+instead of silently switching to legacy snapshots.
+
+The transcript watcher ignores read/access notifications and has a single
+250 ms deadline for an entire burst. The former sliding timeout could wait
+indefinitely when notifications continued arriving, preventing both new
+content and completion status from being produced.
+
+Validation includes continuous-notification starvation, coalesced/isolated
+subscriptions, authenticated unsolicited notification delivery, notifications
+racing in-flight fetches, duplicate suppression, and completed-turn delivery
+without advancing the polling clock. All 236 Android tests and the Linux
+635-test library plus 17 protocol tests passed with four Rust test threads.
+Three unrelated session filesystem tests failed in an initial unrestricted
+parallel run and passed on the limited-parallelism rerun. Windows/WSL includes
+the same backend changes in preview 0.1.2.
