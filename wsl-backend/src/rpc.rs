@@ -218,7 +218,8 @@ pub fn serve() {
         let request: Value = aiterm_wsl_protocol::read_frame(&mut std::io::stdin().lock())
             .map_err(|e| e.to_string())?
             .ok_or("Missing RPC request")?;
-        pollster::block_on(dispatch(&arg(&request, "command")?, &request["args"]))
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string())?
+            .block_on(dispatch(&arg(&request, "command")?, &request["args"]))
     })();
     let response = match result {
         Ok(value) => json!({"value":value}),

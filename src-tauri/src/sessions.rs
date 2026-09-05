@@ -1,3 +1,5 @@
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use serde::Serialize;
 #[cfg(unix)]
 use std::ffi::CString;
@@ -66,7 +68,7 @@ pub fn rename_session(session_id: &str, title: &str) -> Result<(), String> {
     save_metadata("titles.json", &titles)
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn session_titles() -> std::collections::HashMap<String, String> {
     load_metadata("titles.json")
 }
@@ -87,7 +89,7 @@ pub fn set_star(session_id: &str, on: bool) -> Result<(), String> {
     save_metadata("stars.json", &stars)
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn session_stars() -> Vec<String> {
     load_stars()
 }
@@ -112,7 +114,7 @@ pub(crate) fn apply_session_names(sessions: &mut [Session]) {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn session_brought_in() -> std::collections::HashMap<String, String> {
     load_brought_in()
 }
@@ -143,7 +145,7 @@ pub fn record_brought_in(second_session: &str, master_session: &str) -> Result<(
 /// Record a desktop-owned second-agent exchange for every session-list UI.
 /// The exchange itself stays in the renderer because it owns the two terminal
 /// handles; this command only publishes durable lineage.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn relay_report(
     app: tauri::AppHandle,
     session_id: String,
@@ -167,7 +169,7 @@ pub fn relay_report(
     let _ = app.emit("sessions://changed", ());
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn session_star(app: tauri::AppHandle, session_id: String, on: bool) -> Result<(), String> {
     set_star(&session_id, on)?;
     use tauri::Emitter;
@@ -175,7 +177,7 @@ pub fn session_star(app: tauri::AppHandle, session_id: String, on: bool) -> Resu
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn session_rename(
     app: tauri::AppHandle,
     session_id: String,
@@ -1082,7 +1084,7 @@ pub struct SessionStatus {
 
 /// Read the current mode lines from a Claude session jsonl. Mode changes are
 /// appended over time, so the last occurrence in the file wins.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_status(session_id: String) -> SessionStatus {
     crate::run_blocking(move || session_status_sync(session_id)).await
 }
@@ -1182,7 +1184,7 @@ fn deletable<'a>(
 /// purged lazily on later deletes). An OpenCode session has no file of its
 /// own to move; its rows are dumped to the trash and deleted from
 /// `opencode.db` instead.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_delete(session_id: String) -> Result<(), String> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {
@@ -1799,16 +1801,7 @@ impl HeldWriteLease {
     }
 
     fn publish(&self, directory: &File, name: &CString) -> Result<(), String> {
-        let empty = CString::new("").unwrap();
-        if unsafe {
-            libc::linkat(
-                self.file.as_raw_fd(),
-                empty.as_ptr(),
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        } == 0
+        if link_held_noreplace(&self.file, directory, name) == 0
         {
             Ok(())
         } else {
@@ -2635,6 +2628,20 @@ fn prepare_generated_archive(
 }
 
 #[cfg(target_os = "linux")]
+fn link_held_noreplace(held: &File, directory: &File, name: &CString) -> i32 {
+    let result = unsafe { libc::linkat(held.as_raw_fd(), c"".as_ptr(), directory.as_raw_fd(), name.as_ptr(), libc::AT_EMPTY_PATH) };
+    if result == 0 { return result; }
+    // Unprivileged WSL users may not have AT_EMPTY_PATH. /proc/self/fd keeps
+    // the same held inode and destination-dir fd, with no overwrite and no
+    // return to the mutable original pathname (also used by remote uploads).
+    if matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM | libc::EINVAL | libc::ENOENT)) {
+        let source = CString::new(format!("/proc/self/fd/{}", held.as_raw_fd())).unwrap();
+        return unsafe { libc::linkat(libc::AT_FDCWD, source.as_ptr(), directory.as_raw_fd(), name.as_ptr(), libc::AT_SYMLINK_FOLLOW) };
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
 fn preserve_prepared_source(
     source: &VerifiedSessionFile,
 ) -> Result<Option<ArchiveRecoveryLink>, String> {
@@ -2643,15 +2650,7 @@ fn preserve_prepared_source(
     }
     let recovery_name = format!(".aiterm-source-recovery-{}", uuid::Uuid::new_v4());
     let name = CString::new(recovery_name.as_bytes()).unwrap();
-    if unsafe {
-        libc::linkat(
-            source.object.as_raw_fd(),
-            c"".as_ptr(),
-            source.parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        )
-    } != 0
+    if link_held_noreplace(&source.object, &source.parent, &name) != 0
     {
         return Err(format!(
             "could not preserve exact source before quarantine: {}",
@@ -2675,15 +2674,7 @@ fn preserve_prepared_archive(
 ) -> Result<ArchiveRecoveryLink, String> {
     let recovery_name = format!(".aiterm-archive-recovery-{}", uuid::Uuid::new_v4());
     let name = CString::new(recovery_name.as_bytes()).unwrap();
-    if unsafe {
-        libc::linkat(
-            archive.archive.file.as_raw_fd(),
-            c"".as_ptr(),
-            destination.file.as_raw_fd(),
-            name.as_ptr(),
-            libc::AT_EMPTY_PATH,
-        )
-    } != 0
+    if link_held_noreplace(&archive.archive.file, &destination.file, &name) != 0
     {
         return Err(format!(
             "could not preserve exact archive before retirement: {}",
@@ -3460,15 +3451,7 @@ impl StrictArchiveEntry {
     fn publish_recovery_link(&self) -> Result<ArchiveRecoveryLink, String> {
         let recovery_name = format!(".aiterm-restore-recovery-{}", uuid::Uuid::new_v4());
         let recovery = CString::new(recovery_name.as_bytes()).unwrap();
-        if unsafe {
-            libc::linkat(
-                self.archive.file.as_raw_fd(),
-                c"".as_ptr(),
-                self.parent.as_raw_fd(),
-                recovery.as_ptr(),
-                libc::AT_EMPTY_PATH,
-            )
-        } != 0
+        if link_held_noreplace(&self.archive.file, &self.parent, &recovery) != 0
         {
             return Err(format!(
                 "could not preserve held restore archive: {}",
@@ -4637,7 +4620,7 @@ fn valid_id(session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn trash_list() -> Vec<TrashedSession> {
     crate::run_blocking(trash_list_sync).await
 }
@@ -4693,7 +4676,7 @@ fn flatten_project_dir(cwd: &str) -> String {
         .collect()
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn trash_restore(session_id: String) -> Result<(), String> {
     crate::run_blocking(move || trash_restore_sync(session_id)).await
 }
@@ -4928,7 +4911,7 @@ fn restore_claude_sidecars(trash: &Path, session_id: &str) -> Result<(), String>
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn trash_delete(session_id: String) -> Result<(), String> {
     crate::run_blocking(move || trash_delete_sync(session_id)).await
 }
@@ -5039,7 +5022,7 @@ fn trash_delete_in_directory_with_hook(
     main.remove_exact()
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn trash_empty() -> Result<(), String> {
     crate::run_blocking(trash_empty_sync).await
 }
@@ -5192,7 +5175,7 @@ pub(crate) fn line_message(v: &serde_json::Value) -> Option<(String, String)> {
     (!text.trim().is_empty()).then_some((role, text))
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_preview(session_id: String) -> Vec<PreviewMsg> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || sessions.preview(&session_id).unwrap_or_default()).await
@@ -5320,7 +5303,7 @@ pub struct SessionTask {
 /// task systems: the newer TaskCreate/TaskUpdate tools (sequential ids) and
 /// the older TodoWrite snapshots (last write wins). Whichever wrote later in
 /// the file is the live one; the legacy per-task json dir is a last resort.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_tasks(session_id: String) -> Vec<SessionTask> {
     crate::run_blocking(move || session_tasks_sync(session_id)).await
 }
@@ -5538,7 +5521,7 @@ fn snippet(text: &str, max: usize) -> String {
 /// a sync agent is done when its tool_result lands; a background agent's
 /// tool_result is just "Async agent launched…" and completion arrives later
 /// as a <task-notification> carrying the original tool-use-id.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_agents(session_id: String) -> Vec<AgentRun> {
     crate::run_blocking(move || session_agents_sync(session_id)).await
 }
@@ -5789,7 +5772,7 @@ fn resolve_live_session_file(session_id: &str) -> Option<std::path::PathBuf> {
 /// nothing resumable is left — so the UI can say so instead of launching a
 /// doomed resume. A live `<id>.jsonl` resolves to itself — forking never
 /// retires the original, so a forked parent stays resumable at its own point.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn resolve_resumable_id(session_id: String) -> Option<String> {
     crate::run_blocking(move || resolve_resumable_id_sync(session_id)).await
 }
@@ -5819,7 +5802,7 @@ fn resolve_resumable_id_sync(session_id: String) -> Option<String> {
 /// release build; errors the UI swallows (a failed invoke, a rejected promise)
 /// were invisible, which is how a dead code path survives testing. Low volume:
 /// callers log outcomes and errors, not chatter.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn ui_log(msg: String) {
     crate::diag!("ui", "{msg}");
 }
@@ -5880,7 +5863,7 @@ pub struct SessionMove {
 /// claude opens on it. Detected instead from the child's own head, which carries
 /// Claude Code's echo of the command that made it (see [`CLEAR_ECHO`]), paired
 /// with being the first transcript written after the parent stopped.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_moved_to(session_id: String) -> Option<SessionMove> {
     crate::run_blocking(move || session_moved_to_sync(session_id)).await
 }
@@ -6208,7 +6191,7 @@ fn daemon_live_session_shortids() -> Vec<String> {
     out
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn running_session_ids() -> Vec<String> {
     crate::run_blocking(running_session_ids_sync).await
 }
@@ -6287,7 +6270,7 @@ fn extract_session_id(val: &str) -> Option<String> {
 /// Cost note: the scan is mtime-gated, so for a healthy interactive session
 /// (its own transcript newest in the dir) it rejects every candidate without
 /// reading them.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn live_session_ids() -> Vec<String> {
     crate::run_blocking(live_session_ids_sync).await
 }
@@ -6467,7 +6450,7 @@ fn roster_from_cli() -> Vec<RosterEntry> {
 /// and the error return rather than a fire-and-forget signal.
 /// Off the main thread: this signals, then polls the roster for up to five
 /// seconds. Run inline it would freeze the window for that whole time.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn stop_session(session_id: String) -> Result<(), String> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     tauri::async_runtime::spawn_blocking(move || {
@@ -6531,7 +6514,7 @@ fn stop_session_blocking(session_id: String) -> Result<(), String> {
 /// is held by the daemon with no tab of ours, so `--resume` on it exits with
 /// "…add --fork-session to branch off a copy" — resume says so rather than
 /// launching a doomed one.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn bg_agent_session_ids() -> Vec<String> {
     crate::run_blocking(bg_agent_session_ids_sync).await
 }
@@ -6562,7 +6545,7 @@ fn bg_agent_session_ids_sync() -> Vec<String> {
 /// Filtering on either one alone was tried and is wrong: a roster observed on
 /// 2026-07-26 reported *every* entry with a live pid, including a background
 /// one, so a `pid.is_none()` test matched nothing at all.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn unstoppable_session_ids() -> Vec<String> {
     crate::run_blocking(unstoppable_session_ids_sync).await
 }
@@ -6577,7 +6560,7 @@ fn unstoppable_session_ids_sync() -> Vec<String> {
 
 /// Files this session created or modified, newest first — parsed from
 /// Write/Edit/NotebookEdit tool calls in the transcript.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_artifacts(session_id: String) -> Vec<Artifact> {
     crate::run_blocking(move || session_artifacts_sync(session_id)).await
 }
@@ -6664,7 +6647,7 @@ pub struct ModelChoice {
 /// terminal, or a flag on launch. Nothing to keep in sync.
 ///
 /// Only the tail is read; these files reach several MB.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_model(session_id: String) -> ModelChoice {
     crate::run_blocking(move || session_model_sync(session_id)).await
 }
@@ -6784,7 +6767,7 @@ pub struct Refusal {
 /// today, but a future variant should still raise the banner rather than slip
 /// through silently. Returns the last such record; `uuid` lets the caller tell a
 /// fresh refusal from one it has already handled.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_refusal(session_id: String) -> Option<Refusal> {
     crate::run_blocking(move || session_refusal_sync(session_id)).await
 }
@@ -6991,7 +6974,7 @@ mod refusal_tests {
 /// Returns `None` when nothing is configured, or when the configured value
 /// isn't one the CLI accepts — passing an unknown mode makes `claude` exit, and
 /// a terminal that dies on open is worse than a permission prompt.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn claude_permission_mode(project_path: String) -> Option<String> {
     crate::run_blocking(move || claude_permission_mode_sync(project_path)).await
 }
@@ -7038,7 +7021,7 @@ fn user_settings_path() -> Option<std::path::PathBuf> {
 
 /// The `model` key in ~/.claude/settings.json — Claude Code's global default
 /// for new sessions. None when unset.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn claude_model_default() -> Option<String> {
     crate::run_blocking(claude_model_default_sync).await
 }
@@ -7068,7 +7051,7 @@ fn claude_model_default_sync() -> Option<String> {
 /// the whole window while it polled — worst case the full timeout, which is
 /// exactly what happens when you pick the model that is already your default
 /// and the file therefore never changes.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn restore_claude_model_default(previous: Option<String>) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || restore_model_default_blocking(previous))
         .await
@@ -7166,7 +7149,7 @@ fn rewrite_session_ids(text: &str, old: &str, new: &str) -> (String, usize) {
 /// copy is a dead file — verified: it fails with "No conversation found with
 /// session ID". (opcode's fork does exactly that, which is why its forks are
 /// unresumable.)
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_fork(session_id: String) -> Result<String, String> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {
@@ -7278,7 +7261,7 @@ fn history_up_to<'a>(text: &'a str, boundary: &str) -> Vec<&'a str> {
 /// branch — instead of a row that can only ever fail. It is the same copy and
 /// id-rewrite as `session_fork`, with a cut at the boundary timestamp, and it
 /// refuses to touch a stub that already has content.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn materialize_fork(session_id: String) -> Result<(), String> {
     crate::run_blocking(move || materialize_fork_sync(session_id)).await
 }
@@ -9752,7 +9735,7 @@ mod tests {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn list_sessions() -> Vec<Session> {
     let sessions = crate::services::ApplicationServices::desktop().sessions;
     crate::run_blocking(move || {

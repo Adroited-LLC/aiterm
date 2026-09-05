@@ -11,6 +11,8 @@
 //! id is real, and what the resulting tab supports. The caller never learns
 //! which backend answered.
 
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use serde::{Deserialize, Serialize};
 
 use crate::agents::{AgentBackend, Caps, LaunchSpec};
@@ -355,7 +357,7 @@ fn explain(list: &[Box<dyn AgentBackend>], request: &LaunchRequest) -> String {
 /// `async` and off the main thread: resolution scans every backend's session
 /// store and probes PATH for the API case, and a plain `#[tauri::command]`
 /// would do all of that on the GTK main loop.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn resolve_launch(
     services: tauri::State<'_, crate::services::ApplicationServices>,
     request: LaunchRequest,

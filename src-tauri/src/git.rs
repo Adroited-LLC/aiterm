@@ -39,7 +39,7 @@ fn open(path: &str) -> Result<Repository, String> {
     Repository::discover(path).map_err(|e| e.message().to_string())
 }
 
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_repo_state(path: String) -> RepoState {
     crate::run_blocking(move || git_repo_state_sync(path)).await
 }
@@ -76,7 +76,7 @@ fn git_repo_state_sync(path: String) -> RepoState {
     }
 }
 
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_status(path: String) -> Result<Vec<FileStatus>, String> {
     crate::run_blocking(move || git_status_sync(path)).await
 }
@@ -125,7 +125,7 @@ fn git_status_sync(path: String) -> Result<Vec<FileStatus>, String> {
     Ok(out)
 }
 
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
     crate::run_blocking(move || git_branches_sync(path)).await
 }
@@ -156,7 +156,7 @@ fn git_branches_sync(path: String) -> Result<Vec<BranchInfo>, String> {
     Ok(out)
 }
 
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_log(path: String, limit: usize) -> Result<Vec<CommitInfo>, String> {
     crate::run_blocking(move || git_log_sync(path, limit)).await
 }
@@ -213,7 +213,7 @@ pub struct TreeEntry {
 }
 
 /// Structure (not content) of a branch tip's tree at `subpath` ("" = root).
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_branch_files(
     path: String,
     branch: String,
@@ -259,7 +259,7 @@ fn git_branch_files_sync(
 }
 
 /// Recent commits reachable from one branch tip.
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_branch_log(
     path: String,
     branch: String,
@@ -298,7 +298,7 @@ fn git_branch_log_sync(
     Ok(out)
 }
 
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_diff_file(path: String, file: String) -> Result<String, String> {
     crate::run_blocking(move || git_diff_file_sync(path, file)).await
 }
@@ -326,7 +326,7 @@ fn git_diff_file_sync(path: String, file: String) -> Result<String, String> {
     Ok(text)
 }
 
-#[cfg_attr(not(feature = "wsl-headless"), tauri::command)]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn git_commit_diff(path: String, commit_id: String) -> Result<String, String> {
     crate::run_blocking(move || git_commit_diff_sync(path, commit_id)).await
 }

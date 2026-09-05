@@ -16,7 +16,7 @@ pub struct Workspace {
     pub shell: String,
 }
 
-fn wsl() -> Command {
+pub(crate) fn wsl() -> Command {
     let mut cmd = Command::new("wsl.exe");
     cmd.env("WSL_UTF8", "1");
     #[cfg(windows)]
@@ -215,7 +215,7 @@ pub fn start(
     ))
 }
 
-fn prepare() -> Result<(String, String), String> {
+pub(crate) fn prepare() -> Result<(String, String), String> {
     // Cache a successful installation, while retaining an explicit reconnect.
     static READY: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
     let mut cached = READY.lock().map_err(|e| e.to_string())?;

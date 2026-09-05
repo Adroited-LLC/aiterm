@@ -1,114 +1,111 @@
-# Windows / WSL workbench preview
+# Windows / WSL app
 
-The Windows preview now uses Linux aiterm's stylesheet, icons, toolbar and tab
-layout, shared file explorer/editor, and shared Git panel. The Windows workbench
-has a sessions/projects sidebar, independent WSL terminal tabs, a home launcher,
-and a small Settings → Windows panel. It replaces the single-terminal demo.
-See [the product plan](windows-wsl-port.md).
+The Windows build mounts the same `src/App.tsx` as Linux. Its new-session menu,
+session sidebar, terminal tabs, file editor, repository panels, home dashboard,
+and full settings panel are shared components. Settings adds a Windows page
+showing the connected distribution and its home folder.
 
-It discovers installed Claude Code, Codex, OpenCode and Gemini CLIs in the Linux
-login environment. Recent Claude Code and Codex transcripts can be resumed;
-agent credentials and defaults remain inside Linux. The folder picker browses
-Linux directly, and project discovery covers both ~/Projects and ~/projects.
-Ctrl+Shift+T opens another terminal; Ctrl+S saves in the shared editor.
+Sessions, agent discovery/configuration, provider models, usage, tasks,
+Librarian, transcript indexing, file watching, and session lifecycle commands
+use the actual Linux backend modules running inside WSL. There is no separate
+Windows session implementation to maintain. Windows owns its window, fonts,
+tray menu, waiting indicator, notifications, and native font-file chooser.
+The project folder chooser browses Linux.
 
-## Runtime requirements
+## Running
 
-- Windows 11 with WebView2 and a working WSL 2 distribution.
-- Ubuntu 24.04 x86-64 is the initial build/test baseline. Other distributions and
-  architectures have not been validated; the companion currently uses the build
-  distribution's glibc rather than a portable static runtime.
-- A normal Linux user and working login shell in the default distribution.
+The preview requires Windows 11, WebView2, and a configured WSL 2 distribution
+with a normal Linux user and working login shell. Ubuntu 24.04 x86-64 is the
+build/test baseline; the companion uses Ubuntu's glibc. Other distributions and
+architectures have not been validated.
 
-No Rust, Node.js, compiler, network port, SSH service, or manually installed
-companion is required to **run** the packaged preview. The desktop embeds the
-Linux companion, installs it under `~/.local/share/aiterm/backends/<sha256>`, and
-starts it with `wsl.exe`. Existing distribution defaults are not changed.
+The installer embeds the companion. Users do not need Rust, Node.js, SSH,
+an open network port, or a separately installed companion to run aiterm.
+Windows copies the executable into
+`~/.local/share/aiterm/backends/<sha256>` and starts it through `wsl.exe`.
+The app uses the default distribution for its lifetime; restart aiterm after
+changing that default. Agents and their credentials live in Linux.
 
-Each terminal tab owns a Linux session. Closing a tab releases its processes;
-other tabs stay running. Closing the window releases all its terminal sessions.
-After a process exits, Restart terminal creates a fresh connection. Dirty file
-tabs prompt before discarding edits, and saves retain the Linux editor's mtime
-conflict check. Other applications and WSL itself remain running.
+Closing the window closes the service and its terminal sessions. It does not
+stop WSL or other applications in the distribution. A disconnected service is
+reported in the window; reopen aiterm to reconnect.
 
-## Preview limits
+## Remaining platform differences
 
-This is the Linux **style** and a working core workbench, not complete feature
-parity. Task/usage panels, provider setup, full session lifecycle operations,
-detached terminals, automatic tab restoration, and guided WSL installation
-remain future work. Agent installation and sign-in still happen in the terminal.
-The distribution is pinned for the life of the app; restart after changing the
-WSL default. Changes are refreshed every 15 seconds or with the refresh button.
+- Guided installation of WSL/distributions is still planned. The current
+  startup screen requires an existing, working distribution.
+- Fonts come from Windows. Downloaded font files install for the current
+  Windows account; Fedora font packages do not apply.
+- Renderer selection and its live sample work, but Linux WebKit CPU/GPU process
+  counters are unavailable for WebView2. The measurement reports unavailable.
+- The taskbar uses a waiting indicator; the shared tray menu contains the
+  waiting sessions.
+- Remote access runs inside WSL. LAN reachability still depends on Windows/WSL
+  networking and firewall configuration.
+- Feature availability inside the shared panels follows the installed Linux
+  agents, credentials, and tools. Sharing an implementation is not a claim
+  that every provider/network workflow has been exercised on Windows.
 
-History is a bounded recent-transcript scan (up to 300 files per supported
-engine); it does not yet share the full Linux session indexer. OpenCode/Gemini
-can launch, but their history is not included yet. HTML opens as source; Markdown
-has the shared rendered preview. Media/HTML asset routing is not ported.
-Requests and replies are bounded to 1 MiB serialized JSON; larger files or diffs
-currently report an error. Build/test baseline remains Ubuntu x86-64.
+## Building
 
-## Build on Windows
-
-Use a Windows-local checkout. Install Node.js LTS, Rust with the MSVC toolchain,
-Visual Studio C++ Build Tools (Desktop development with C++), and WebView2.
-Inside Ubuntu, install Rust and `build-essential`, `curl`, `ca-certificates`, and
-`python3`. WSL builds stay in the Linux filesystem; Windows builds stay in NTFS.
-
-From PowerShell at the repository root:
+Use a Windows-local checkout with Node.js, Rust MSVC, Visual Studio C++ Build
+Tools, and WebView2. Inside Ubuntu install Rust, `build-essential`, `curl`,
+`ca-certificates`, and `python3`.
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-windows-wsl.ps1 -Bundle
 ```
 
-The script builds/tests the Linux companion, builds the Windows UI and native
-executable, optionally creates an NSIS installer, and runs a real Windows-to-WSL
-terminal smoke test. The default build distribution is Ubuntu; override with
-`-Distribution <name>`. At runtime the application uses the user's WSL default.
+The script copies Linux sources into a Linux filesystem build cache, tests and
+builds the companion, builds the shared frontend and native executable, creates
+an NSIS installer, and runs the native transport smoke test. Override the build
+distribution with `-Distribution <name>`; runtime uses the user's WSL default.
 
-Outputs:
+Outputs are `windows/target/release/aiterm-windows.exe`,
+`windows/target/release/bundle/nsis/`, and `windows/target/smoke-test.txt`.
+Linux retains its existing `npm run tauri build` entry point.
 
-- `windows/target/release/aiterm-windows.exe`
-- `windows/target/release/bundle/nsis/` (with `-Bundle`)
-- `windows/target/smoke-test.txt`
+## Implementation
 
-The existing Linux app continues to use `npm run tauri build`. Its Rust package
-and entry point remain the Linux build. Shared file/Git command attributes are
-conditionally omitted when those modules compile into the headless companion.
+- `src/windows/main.tsx`: workspace startup and Linux folder dialog around the
+  shared application.
+- `src/platform.ts`: command routing, file URLs, and terminal acknowledgments.
+- `windows/src/workspace.rs`: persistent process supervision, command replies,
+  native Tauri event/channel delivery.
+- `windows/src/native.rs`: Windows desktop operations.
+- `wsl-backend/src/core_modules.rs`: imports the production Linux modules.
+- `wsl-backend/build.rs`: derives the dispatcher from their command signatures.
+- `wsl-backend/src/runtime.rs`: state, events, channels, and async execution
+  without a Linux GUI runtime.
+- `wsl-backend/src/service.rs`: application state/startup and framed requests.
 
-## Boundary and validation
+The `aiterm_headless` compiler configuration omits Tauri command wrappers only
+in the companion build. It does not change the Linux desktop build. Hook-report,
+chat, and MCP subprocess modes are retained for agents that launch aiterm itself.
 
-- `windows/`: native Tauri host, companion installation and process supervision.
-- `src/windows/`, `windows-ui/`: Windows workbench composed with shared Linux UI.
-- `src/platform.ts`: sends shared panel operations through the WSL bridge in
-  Windows builds; Linux retains its original Tauri commands.
-- `wsl-backend/`: Linux PTYs and short-lived RPC mode. Compiles the existing
-  `src-tauri/src/git.rs` and `fsx.rs` directly, with no GUI dependencies.
-- `wsl-protocol/`: versioned, size-limited JSON frames over stdin/stdout. Terminal
-  bytes use base64 so partial UTF-8 and control sequences arrive unchanged.
+The persistent service allows up to 64 concurrent commands and bounds each JSON
+frame to 16 MiB. Terminal output is chunked and limited to 256 KiB
+unacknowledged per attachment; xterm acknowledges bytes after consuming them.
+Terminal traffic, events, and command replies share stdio without a TCP server.
+The original single-PTY protocol remains for its native smoke test.
 
-The renderer acknowledges output after xterm consumes it. The companion limits
-unacknowledged output to 256 KiB and applies backpressure instead of accumulating
-an unbounded queue. Protocol errors close the session. Startup has timeouts and
-visible retry/error states.
-
-Run the terminal checks on Linux:
+## Validation
 
 ```sh
 cargo test --locked --manifest-path wsl-protocol/Cargo.toml
-cargo test --locked --manifest-path wsl-backend/Cargo.toml
+cargo test --locked --manifest-path wsl-backend/Cargo.toml -- --test-threads=4
 cargo build --locked --manifest-path wsl-backend/Cargo.toml
 python3 scripts/test-wsl-backend.py wsl-backend/target/debug/aiterm-wsl-backend
+python3 scripts/test-wsl-service.py wsl-backend/target/debug/aiterm-wsl-backend
 npm run test:ui
 npm run build:windows-ui
+cargo check --locked --manifest-path src-tauri/Cargo.toml
 ```
 
-Tests exercise protocol framing/version mismatch, Unicode, actual terminal
-dimensions, Ctrl+C, output-before-exit ordering, output backpressure/resumption,
-and session cleanup including a foreground job that ignores hangup. They also
-cover separate tab directories/lifetimes, Unicode/quoted filenames, conflicting
-saves, Git status/log/branches/diffs, safe Markdown, and transcript discovery.
-
-The Windows executable also accepts `--smoke-test`, with `AITERM_SMOKE_REPORT`
-pointing to the result file. This exercises companion provisioning, WSL launch,
-workspace metadata, file listing, the handshake, terminal output, dimensions, and exit status through the same
-bridge code as the UI. It does not substitute for visual/interactive GUI testing.
+The shared tests cover session archive integrity and lifecycle, agents,
+providers, terminal ownership, configuration, and remote services. Transport
+tests exercise live PTYs, independent tabs, byte fidelity, resize, cleanup,
+large file replies, structured save errors, registry events, and slow consumers.
+Use four test threads because archive stress tests hold hundreds of file
+descriptors each. Native builds and interactive Windows GUI checks remain
+necessary in addition to these Linux tests.

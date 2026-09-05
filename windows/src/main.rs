@@ -1,5 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod bridge;
+mod native;
+#[path = "../../src-tauri/src/tray.rs"]
+mod tray;
+mod workspace;
 use aiterm_wsl_protocol::{Event, Request};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -86,10 +90,37 @@ async fn terminal_request(
 async fn workspace_rpc(
     command: String,
     args: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || bridge::rpc(command, args))
-        .await
-        .map_err(|e| e.to_string())?
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(result) = native::dispatch(&command, &args, &app) {
+            return result.map_err(serde_json::Value::String);
+        }
+        let service = app
+            .state::<workspace::Workspace>()
+            .get(app.clone())
+            .map_err(serde_json::Value::String)?;
+        if command == "workspace" {
+            return bridge::rpc(command, args).map_err(serde_json::Value::String);
+        }
+        service.call(command, args)
+    })
+    .await
+    .map_err(|e| serde_json::json!(e.to_string()))?
+}
+
+#[tauri::command]
+async fn workspace_control(frame: serde_json::Value, app: tauri::AppHandle) -> Result<(), String> {
+    if frame["type"] != "ack" && frame["type"] != "channel_close" {
+        return Err("Invalid terminal control".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<workspace::Workspace>()
+            .get(app.clone())?
+            .send(frame)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn main() {
@@ -109,15 +140,29 @@ fn main() {
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .manage(workspace::Workspace::default())
+        .setup(|app| {
+            tray::init(app.handle())?;
+            Ok(())
+        })
         .manage(Terminal::default())
         .invoke_handler(tauri::generate_handler![
             start_terminal,
             terminal_request,
-            workspace_rpc
+            workspace_rpc,
+            workspace_control
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
                 window.state::<Terminal>().0.lock().unwrap().clear();
+                window
+                    .state::<workspace::Workspace>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take();
             }
         })
         .run(tauri::generate_context!())

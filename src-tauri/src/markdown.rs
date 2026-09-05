@@ -114,7 +114,7 @@ pub fn to_safe_html(source: &str) -> Result<String, String> {
     Ok(comrak::markdown_to_html(source, &markdown_options()))
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn render_markdown(source: String) -> Result<String, String> {
     crate::run_blocking(move || to_safe_html(&source)).await
 }

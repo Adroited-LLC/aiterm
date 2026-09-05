@@ -14,6 +14,8 @@
 //! the frontend asks: which model, which provider, and which sessions are
 //! the caller's decisions, and a provider's key never leaves this process.
 
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -628,12 +630,12 @@ fn run_sync(
 
 /* ---- commands ---------------------------------------------------------- */
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn librarian_state() -> Store {
     crate::run_blocking(load_store).await
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn librarian_run(
     app: tauri::AppHandle,
     engine: Engine,
@@ -644,13 +646,13 @@ pub async fn librarian_run(
 }
 
 /// How many of these sessions a run would look at, without running.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn librarian_pending(sessions: Vec<Candidate>) -> usize {
     crate::run_blocking(move || pending(&load_store(), &sessions).len()).await
 }
 
 /// Forget every name and start over — a different model, or a bad first pass.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn librarian_forget(app: tauri::AppHandle) -> Result<(), String> {
     crate::run_blocking(move || {
         save_store(&Store::default())?;

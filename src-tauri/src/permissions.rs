@@ -125,14 +125,14 @@ fn view_in(store: &serde_json::Value, list: &[Box<dyn AgentBackend>]) -> Vec<Age
 }
 
 /// Every engine with a permission switch, its modes, and the one in force.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn agent_permissions() -> Vec<AgentPermissions> {
     view_in(&load(), &crate::agents::backends())
 }
 
 /// Store the mode an engine starts in. Refused for an id the engine does not
 /// list — see the module note on why.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn agent_permission_set(
     agent_id: String,
     mode: String,

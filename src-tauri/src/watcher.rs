@@ -1,3 +1,5 @@
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::Mutex;
@@ -27,7 +29,7 @@ const SKIP: &[&str] = &[
     "/.mypy_cache/",
 ];
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn watch_project(
     app: AppHandle,
     state: State<'_, WatchState>,

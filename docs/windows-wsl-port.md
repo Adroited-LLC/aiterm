@@ -1,9 +1,9 @@
 # Windows application powered by WSL
 
-Status: Linux-style Windows workbench built and exercised in the Windows 11 /
-Ubuntu 24.04 WSL 2 VM: sidebar, tabs, agent launching, recent Claude/Codex history,
-Linux folder selection, shared file editing/Markdown, and Git panels. Full
-agent/session parity and first-run WSL installation are not yet implemented.
+Status: Windows mounts the shared Linux application and full settings panel,
+with its backend running as a persistent WSL service. See
+[implementation and current limits](windows-wsl-preview.md). Guided first-run
+WSL installation remains planned.
 
 ## Product contract
 
@@ -86,10 +86,10 @@ Provide actions such as Open in Explorer and import/clone project so users do no
 have to translate paths. File dialogs, drag-and-drop, uploads, previews, and open
 links must consistently cross the Windows/Linux boundary.
 
-The Windows UI may differ from Linux and should have fewer settings. Start with
-no settings panel; use the default Linux distribution automatically. When a real
-configuration need emerges, place Windows-specific controls under
-**Settings → Windows**. Candidate controls, not requirements to add now:
+The Windows UI should preserve the Linux interface and settings as closely as
+possible. Use the default Linux distribution automatically. Put platform-specific
+configuration under **Settings → Windows**. Candidate controls, not requirements
+to add now:
 
 - Linux workspace/distribution and connection status.
 - Repair or retry setup, preserving projects and user configuration.

@@ -5,6 +5,7 @@ use std::io::{self, BufRead, Read, Write};
 pub const VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const OUTPUT_WINDOW: usize = 256 * 1024;
+pub const MAX_SERVICE_FRAME: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -56,15 +57,28 @@ pub enum Event {
 pub fn read_frame<T: serde::de::DeserializeOwned>(
     reader: &mut impl BufRead,
 ) -> io::Result<Option<T>> {
+    read_bounded(reader, MAX_FRAME)
+}
+
+pub fn read_service_frame<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+) -> io::Result<Option<T>> {
+    read_bounded(reader, MAX_SERVICE_FRAME)
+}
+
+fn read_bounded<T: serde::de::DeserializeOwned>(
+    reader: &mut impl BufRead,
+    limit: usize,
+) -> io::Result<Option<T>> {
     // Limit before allocation, including frames without a terminating newline.
     let mut bytes = Vec::new();
     let n = reader
-        .take((MAX_FRAME + 1) as u64)
+        .take((limit + 1) as u64)
         .read_until(b'\n', &mut bytes)?;
     if n == 0 {
         return Ok(None);
     }
-    if n > MAX_FRAME || bytes.last() != Some(&b'\n') {
+    if n > limit || bytes.last() != Some(&b'\n') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Invalid or oversized protocol frame",
@@ -76,9 +90,15 @@ pub fn read_frame<T: serde::de::DeserializeOwned>(
 }
 
 pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+    write_bounded(writer, value, MAX_FRAME)
+}
+pub fn write_service_frame(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+    write_bounded(writer, value, MAX_SERVICE_FRAME)
+}
+fn write_bounded(writer: &mut impl Write, value: &impl Serialize, limit: usize) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
-    if bytes.len() > MAX_FRAME {
+    if bytes.len() > limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Protocol frame too large",

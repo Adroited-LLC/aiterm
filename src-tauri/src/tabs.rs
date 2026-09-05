@@ -1,3 +1,5 @@
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use crate::pty::{PtyManager, PtySink, PtySpawnSpec};
 use crate::remote::model::TerminalSize;
 use crate::terminal::model::{Revision, ScreenDiff, ScreenRow, ScreenSnapshot};
@@ -2111,7 +2113,7 @@ pub fn start_desktop_registry_bridge(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn tab_open(
     state: State<'_, Arc<TabRegistry>>,
     launch: TabLaunch,
@@ -2124,17 +2126,17 @@ pub async fn tab_open(
     .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn tab_list(state: State<'_, Arc<TabRegistry>>) -> Vec<TabDescriptor> {
     state.list()
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn tab_registry_snapshot(state: State<'_, Arc<TabRegistry>>) -> TabRegistrySnapshot {
     state.roster_snapshot()
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn tab_update(
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
@@ -2161,7 +2163,7 @@ fn forward_desktop_events(events: TabEventReceiver, mut send_raw: impl FnMut(Vec
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn tab_attach_desktop(
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
@@ -2184,7 +2186,7 @@ pub fn tab_attach_desktop(
     Ok(attachment_id)
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn tab_detach(
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
@@ -2199,7 +2201,7 @@ pub async fn tab_detach(
     .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn tab_write(
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
@@ -2219,7 +2221,7 @@ fn terminal_size(cols: u16, rows: u16) -> Result<TerminalSize, String> {
     TerminalSize::try_new(cols, rows).map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn tab_resize(
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
@@ -2237,7 +2239,7 @@ pub async fn tab_resize(
     .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn tab_take_focus(
     state: State<'_, Arc<TabRegistry>>,
     tab_id: TabId,
@@ -2255,7 +2257,7 @@ pub async fn tab_take_focus(
     .await
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn tab_close(state: State<'_, Arc<TabRegistry>>, tab_id: TabId) -> Result<(), String> {
     let registry = (*state).clone();
     crate::run_blocking(move || registry.close(&tab_id).map_err(command_error)).await

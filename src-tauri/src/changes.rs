@@ -13,6 +13,8 @@
 //! config, so what a session produced last night is still listed today.
 //! Both UIs read it: the desktop's agent panel and the phone's Files view.
 
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -723,7 +725,7 @@ pub fn harness_output_dirs(session_id: &str) -> Vec<PathBuf> {
     out
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn session_changes(app: AppHandle, session_id: String) -> Vec<Change> {
     for_session(&app, &session_id)
 }
@@ -739,7 +741,7 @@ const PREVIEW_LIMIT: u64 = 12 * 1024 * 1024;
 
 /// An image (or any small file) as base64 for the renderer's preview — the
 /// asset protocol is not enabled here, and this is one read, on demand.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn read_file_base64(path: String) -> Result<FilePreview, String> {
     crate::run_blocking(move || {
         let md = std::fs::metadata(&path).map_err(|e| e.to_string())?;

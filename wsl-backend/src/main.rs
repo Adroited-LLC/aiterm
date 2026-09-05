@@ -5,17 +5,17 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Condvar, Mutex};
-#[allow(dead_code)]
-#[path = "../../src-tauri/src/fsx.rs"]
-mod fsx;
-#[allow(dead_code)]
-#[path = "../../src-tauri/src/git.rs"]
-mod git;
+mod core_modules;
+pub use core_modules::*;
 mod rpc;
+pub mod runtime;
+mod service;
 
 // RPCs already run in a separate companion process; no GUI thread to block.
-async fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
-    work()
+async fn run_blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(work)
+        .await
+        .expect("workspace operation panicked")
 }
 
 #[derive(Default)]
@@ -214,6 +214,64 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
+    // `aiterm --hook-report` is not the app: it is the one-shot helper a
+    // Claude Code SessionStart hook runs to tell the running aiterm which
+    // session just started in which process. Dispatch before Tauri exists —
+    // it must cost milliseconds and never touch a display.
+    if std::env::args().nth(1).as_deref() == Some(crate::hooklink::HOOK_REPORT_FLAG) {
+        crate::hooklink::hook_report();
+        return;
+    }
+    // `aiterm chat --provider X --model Y` is the console harness an
+    // API-model tab runs — its own process inside the tab's PTY, exactly the
+    // way `claude` is. Same rule: dispatch before Tauri exists.
+    if std::env::args().nth(1).as_deref() == Some("chat") {
+        let mut provider = None;
+        let mut model = None;
+        let mut session_id = None;
+        let mut resume = None;
+        let mut prompt = None;
+        let mut args = std::env::args().skip(2);
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "--provider" => provider = args.next(),
+                "--model" => model = args.next(),
+                "--session-id" => session_id = args.next(),
+                "--resume" => resume = args.next(),
+                "--prompt" => prompt = args.next(),
+                _ => {}
+            }
+        }
+        let start = match (resume, provider, model) {
+            (Some(session_id), _, _) => crate::chat::Start::Resume { session_id },
+            (None, Some(provider_id), Some(model)) => crate::chat::Start::Fresh {
+                provider_id,
+                model,
+                session_id,
+                prompt,
+            },
+            _ => {
+                eprintln!(
+                    "usage: aiterm chat --provider <id> --model <model-id> [--session-id <uuid>] [--prompt <text>]\n       aiterm chat --resume <uuid>"
+                );
+                std::process::exit(2);
+            }
+        };
+        std::process::exit(crate::chat::run(start));
+    }
+    // `aiterm mcp` is the stdio MCP server that exposes OpenCode delegation as a
+    // tool to any Claude Code session that adds it. Like `chat`, it is its own
+    // one-shot process that never touches a display — dispatch before Tauri.
+    if std::env::args().nth(1).as_deref() == Some("mcp") {
+        std::process::exit(crate::mcp::run());
+    }
+
+    if std::env::args().any(|arg| arg == "--service") {
+        if let Err(error) = service::run() {
+            eprintln!("Workspace service: {error}");
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--rpc") {
         rpc::serve();
         return;

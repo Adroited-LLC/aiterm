@@ -5,8 +5,8 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
-[features]
-wsl-headless = []
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aiterm_headless)'] }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

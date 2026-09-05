@@ -7,10 +7,9 @@ import { LanguageDescription, syntaxHighlighting } from "@codemirror/language";
 import { classHighlighter } from "@lezer/highlight";
 import { languages } from "@codemirror/language-data";
 import { homeAbbrev, openPath, readTextFile, renderMarkdown, writeTextFile } from "../ipc";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc } from "../platform";
 import Icon from "./Icon";
 import { Code, Eye } from "lucide-react";
-import { windowsWsl } from "../platform";
 
 /** Files that have a rendered form worth looking at. */
 export function isMarkdown(path: string): boolean {
@@ -106,7 +105,7 @@ export default function FileView({
   // always code. The editor stays mounted underneath, hidden, so flipping
   // back costs nothing and loses nothing.
   const md = isMarkdown(path);
-  const html = isHtml(path) && !windowsWsl;
+  const html = isHtml(path);
   const [mode, setModeState] = useState<FileMode>(() => (md ? loadMarkdownMode() : html ? loadHtmlMode() : "code"));
   const modeRef = useRef(mode);
   const [previewHtml, setPreviewHtml] = useState("");

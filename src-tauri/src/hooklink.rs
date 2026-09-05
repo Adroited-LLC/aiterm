@@ -41,6 +41,8 @@
 //! The heuristics stay, demoted to fallback: a claude typed into a shell tab,
 //! or a session already running when aiterm restarts, has no hook wired in.
 
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -541,7 +543,7 @@ pub struct SessionEvent {
 /// at which point it is somebody else's claude (or a previous aiterm's) and is
 /// discarded. Polled by the frontend; reading an empty directory is the whole
 /// cost of the quiet case.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn drain_session_events(
     state: tauri::State<'_, std::sync::Arc<crate::tabs::TabRegistry>>,
 ) -> Vec<SessionEvent> {

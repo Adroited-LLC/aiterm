@@ -1,3 +1,5 @@
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 pub mod auth;
 pub mod direct;
 pub mod model;
@@ -665,7 +667,7 @@ impl Inner {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_status(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<RemoteStatusView, String> {
@@ -674,7 +676,7 @@ pub async fn remote_status(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_relay_configure(
     state: tauri::State<'_, RemoteState>,
     connector_url: String,
@@ -706,7 +708,7 @@ pub async fn remote_relay_configure(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_relay_server_set(
     state: tauri::State<'_, RemoteState>,
     server: String,
@@ -732,7 +734,7 @@ pub async fn remote_relay_server_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_relay_clear(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<RemoteStatusView, String> {
@@ -767,7 +769,7 @@ pub async fn remote_relay_clear(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_start_on_launch_set(
     state: tauri::State<'_, RemoteState>,
     enabled: bool,
@@ -797,7 +799,7 @@ pub async fn remote_start_on_launch_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_network_stack_set(
     state: tauri::State<'_, RemoteState>,
     network_stack: RemoteNetworkStack,
@@ -817,7 +819,7 @@ pub async fn remote_network_stack_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_iroh_relay_url_set(
     state: tauri::State<'_, RemoteState>,
     url: Option<String>,
@@ -840,7 +842,7 @@ pub async fn remote_iroh_relay_url_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_interfaces(
     _state: tauri::State<'_, RemoteState>,
 ) -> Result<Vec<String>, String> {
@@ -1005,7 +1007,7 @@ async fn start_remote(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, RemoteState>,
@@ -1087,7 +1089,7 @@ pub fn start_on_launch(
     });
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteStatusView, String> {
     let (gateway, relay, iroh) = {
         let mut inner = state.inner.lock().await;
@@ -1113,7 +1115,7 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
     Ok(state.inner.lock().await.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_begin_pairing(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
@@ -1169,7 +1171,7 @@ pub async fn remote_begin_pairing(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_pending_pairings(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<Vec<PendingPairing>, String> {
@@ -1178,7 +1180,7 @@ pub async fn remote_pending_pairings(
     Ok(devices.list_pending_pairings())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_approve_device(
     state: tauri::State<'_, RemoteState>,
     request_id: String,
@@ -1229,7 +1231,7 @@ pub async fn remote_approve_device(
     Ok(device)
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_deny_device(
     state: tauri::State<'_, RemoteState>,
     request_id: String,
@@ -1240,7 +1242,7 @@ pub async fn remote_deny_device(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_devices(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<Vec<TrustedDevice>, String> {
@@ -1248,7 +1250,7 @@ pub async fn remote_devices(
     Ok(devices.list_devices())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_revoke_device(
     state: tauri::State<'_, RemoteState>,
     device_id: String,

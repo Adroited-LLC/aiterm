@@ -6,7 +6,10 @@
   "build": { "frontendDist": "../dist-windows" },
   "app": {
     "windows": [{ "label": "main", "title": "aiterm", "width": 1100, "height": 760, "minWidth": 600, "minHeight": 400, "theme": "Dark", "backgroundColor": "#121317" }],
-    "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:" }
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://asset.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://asset.localhost; media-src 'self' blob: http://asset.localhost; frame-src 'self' http://asset.localhost; worker-src 'self' blob:",
+      "assetProtocol": { "enable": true, "scope": [] }
+    }
   },
   "bundle": { "active": true, "targets": ["nsis"], "icon": ["../src-tauri/icons/icon.ico"] }
 }

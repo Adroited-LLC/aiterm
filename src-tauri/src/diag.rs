@@ -79,7 +79,7 @@ macro_rules! diag {
 }
 
 /// Where the log is, for the UI to offer to open it.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn diag_log_path() -> Option<String> {
     log_dir().map(|d| d.join("aiterm.log").to_string_lossy().to_string())
 }
@@ -89,7 +89,7 @@ pub fn diag_log_path() -> Option<String> {
 /// Bounded because the point is to hand somebody the last thing that happened,
 /// and a log that has to be truncated before it can be read is one nobody
 /// sends.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn diag_log_tail(lines: usize) -> String {
     let Some(path) = log_dir().map(|d| d.join("aiterm.log")) else {
         return String::new();
@@ -105,7 +105,7 @@ pub fn diag_log_tail(lines: usize) -> String {
 ///
 /// The first three questions of any "it is behaving oddly" conversation,
 /// answered in one place so nobody has to be talked through finding them.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn diag_environment() -> Vec<(String, String)> {
     let mut out = vec![
         ("version".into(), env!("CARGO_PKG_VERSION").to_string()),

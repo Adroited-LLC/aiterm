@@ -127,7 +127,7 @@ fn read_layers(home: &str, project: Option<&str>) -> (Vec<Layer>, Vec<(LayerId, 
     (layers, texts)
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn claude_settings(project: Option<String>) -> SettingsView {
     let (mut layers, texts) = read_layers(&home(), project.as_deref());
     let borrowed: Vec<(LayerId, &str)> = texts.iter().map(|(i, t)| (*i, t.as_str())).collect();
@@ -144,7 +144,7 @@ pub fn claude_settings(project: Option<String>) -> SettingsView {
 
 /// Replace one settings layer's contents. `loaded_text` must be the bytes the
 /// panel last read, or the save is refused — see `write::save_layer`.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn claude_save_layer(
     path: String,
     new_text: String,
@@ -155,7 +155,7 @@ pub fn claude_save_layer(
 
 /// Change one key in one layer. The panel's inline row editors use this; the
 /// raw editor sends whole files through `claude_save_layer` instead.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn claude_set_key(
     path: String,
     dotted_key: String,
@@ -167,7 +167,7 @@ pub fn claude_set_key(
     write::save_layer(&path, &next, &loaded_text)
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn claude_instructions(project: Option<String>) -> Vec<instructions::Doc> {
     let h = home();
     let mut roots = vec![("user".to_string(), format!("{h}/.claude/CLAUDE.md"))];
@@ -189,7 +189,7 @@ pub struct McpView {
     pub errors: Vec<String>,
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn claude_mcp(project: Option<String>) -> McpView {
     let h = home();
     let claude_json = std::fs::read_to_string(format!("{h}/.claude.json")).ok();
@@ -229,7 +229,7 @@ pub struct HooksView {
     pub errors: Vec<String>,
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn claude_skills(project: Option<String>) -> SkillsView {
     let h = home();
     let mut roots = vec![("user".to_string(), format!("{h}/.claude/skills"))];
@@ -284,7 +284,7 @@ pub fn claude_skills(project: Option<String>) -> SkillsView {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn claude_hooks(project: Option<String>) -> HooksView {
     let h = home();
     let (_layers, texts) = read_layers(&h, project.as_deref());
