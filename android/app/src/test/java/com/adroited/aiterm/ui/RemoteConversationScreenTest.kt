@@ -14,6 +14,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RemoteConversationScreenTest {
+    @Test
+    fun catchingUpFollowsTheOldTailButPreservesReadingOlderMessages() {
+        // A reader at row 19 stays following even if the next page adds 50
+        // rows. Neither the new count nor a text-only upsert changes this.
+        assertTrue(shouldFollowConversationUpdate(previousCount = 20, lastVisible = 19, scrolling = false))
+        assertFalse(shouldFollowConversationUpdate(previousCount = 20, lastVisible = 8, scrolling = false))
+        assertFalse(shouldFollowConversationUpdate(previousCount = 20, lastVisible = 19, scrolling = true))
+    }
+
     private val liveTab = RemoteTab(
         id = "tab-live",
         title = "Live terminal",

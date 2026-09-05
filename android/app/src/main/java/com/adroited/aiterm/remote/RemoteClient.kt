@@ -710,9 +710,10 @@ class RemoteClient(
             )
         }
         val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
+        val requestedAfter = store.lastSeq
         val started = launchRequest(
             "session.spine",
-            RemoteCommands.spine(sessionId, store.lastSeq),
+            RemoteCommands.spine(sessionId, requestedAfter),
             timeoutMillis = PREVIEW_REFRESH_TIMEOUT_MILLIS,
             onError = { code, message ->
                 if (code == "remote.unsupported" || code == "protocol.invalid_response") {
@@ -726,6 +727,17 @@ class RemoteClient(
             },
             onSuccess = { payload ->
                 val page = RemoteCommands.spinePage(payload)
+                // The server filtered this page using the old desktop's cursor.
+                // After a restart it may be empty, or omit the beginning of the
+                // new history. Refetch from zero before applying any of it.
+                if (requestedAfter > 0L && store.epoch != 0L && page.epoch != 0L &&
+                    store.epoch != page.epoch
+                ) {
+                    store.clear()
+                    mutableState.value = mutableState.value.copy(previewLoadingSessionId = null)
+                    previewSession(sessionId)
+                    return@launchRequest
+                }
                 val items = store.apply(page)
                 val activity = if (store.phaseSeen) {
                     mutableState.value.sessionActivity + (
@@ -753,7 +765,9 @@ class RemoteClient(
                 // `latestSeq` is the desktop's atomic high-water mark. Drain
                 // until our applied cursor reaches it even if an older server
                 // accidentally under-reports `hasMore`.
-                if (page.hasMore || (page.latestSeq > 0L && store.lastSeq < page.latestSeq)) {
+                if (store.lastSeq > requestedAfter &&
+                    (page.hasMore || (page.latestSeq > 0L && store.lastSeq < page.latestSeq))
+                ) {
                     previewSession(sessionId)
                 }
             },

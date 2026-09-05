@@ -43,6 +43,67 @@ import kotlin.concurrent.thread
 class RemoteClientTest {
 
     @Test
+    fun spineDrainsEveryPageAndRefetchesHistoryAfterDesktopRestart() = runTest {
+        val transport = FakeRemoteTransport()
+        val replies = ArrayDeque<SpineSnapshotWire>()
+        fun page(epoch: Long, seq: Long, text: String, latest: Long = seq) = SpineSnapshotWire(
+            epoch = epoch, live = true, hasMore = false, oldestSeq = 1, latestSeq = latest,
+            events = listOf(SpineEventWire(seq, epoch, "session-1", "codex", seq,
+                "agent_text", id = "message-$seq", text = text, done = true)),
+        )
+        // Exercise a desktop under-reporting has_more as well as a restart
+        // whose new log is already longer than the phone's old cursor.
+        replies.add(page(1, 1, "first", latest = 2))
+        replies.add(page(1, 2, "second"))
+        transport.responseFor = { request ->
+            val payload = if (request.kind == "session.spine") {
+                uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), replies.removeFirst())
+            } else byteArrayOf()
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("session-1")
+        advanceUntilIdle()
+        assertEquals(listOf("first", "second"), client.state.value.previewMessages.map { it.text })
+
+        replies.add(page(2, 3, "new last")) // filtered with the obsolete after=2
+        replies.add(page(2, 1, "new first", latest = 3))
+        replies.add(page(2, 2, "new second", latest = 3))
+        replies.add(page(2, 3, "new last"))
+        client.previewSession("session-1")
+        advanceUntilIdle()
+        assertEquals(listOf("new first", "new second", "new last"),
+            client.state.value.previewMessages.map { it.text })
+        val requests = transport.requests.filter { it.kind == "session.spine" }
+        listOf(0L, 1L, 2L, 0L, 1L, 2L).zip(requests).forEach { (after, request) ->
+            assertArrayEquals(RemoteCommands.spine("session-1", after), request.payload)
+        }
+        assertEquals(6, requests.size)
+        assertTrue(transport.requests.none { it.kind == "session.conversation" })
+        client.lock()
+    }
+
+    @Test
+    fun emptySpinePageWithHighWatermarkDoesNotStartAnEndlessRequestLoop() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request ->
+            val payload = if (request.kind == "session.spine") uploadCbor.encodeToByteArray(
+                SpineSnapshotWire.serializer(),
+                SpineSnapshotWire(epoch = 1, live = true, hasMore = true, latestSeq = 10, events = emptyList()),
+            ) else byteArrayOf()
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("session-1")
+        advanceUntilIdle()
+        assertEquals(1, transport.requests.count { it.kind == "session.spine" })
+        assertEquals(null, client.state.value.previewLoadingSessionId)
+        client.lock()
+    }
+
+    @Test
     fun stalledSpineRefreshIsAbandonedAndDoesNotPinLaterRefreshes() = runTest {
         val transport = FakeRemoteTransport()
         transport.responseFor = { request ->

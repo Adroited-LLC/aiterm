@@ -1028,6 +1028,7 @@ private fun RemoteConversationContent(
     val starred = session.id in state.starredSessions
     val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
     var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
+    var previousTimelineCount by remember(session.id) { mutableStateOf(0) }
     val awayFromNewest by remember(session.id) {
         derivedStateOf {
             val layout = listState.layoutInfo
@@ -1053,18 +1054,21 @@ private fun RemoteConversationContent(
         onDispose { latestAttachments.items.forEach { it.image.file.delete() } }
     }
 
-    LaunchedEffect(session.id) { onRefresh() }
+    val refreshConversation by rememberUpdatedState(onRefresh)
+    // Tab membership is discovery metadata, not a subscription lifetime.
+    // Keep reading the visible conversation even when that metadata is stale,
+    // and refresh immediately when the transport reconnects.
+    LaunchedEffect(session.id, state.connection) {
+        if (state.connection == ConnectionState.Connected) {
+            while (true) {
+                refreshConversation()
+                delay(1_500)
+            }
+        }
+    }
     LaunchedEffect(session.id, state.connection) {
         if (state.connection == ConnectionState.Connected) {
             onLoadFiles(session.id).onSuccess { files = it }
-        }
-    }
-    LaunchedEffect(session.id, isConversationSessionLive(session, state.tabs)) {
-        if (isConversationSessionLive(session, state.tabs)) {
-            while (true) {
-                delay(1_500)
-                onRefresh()
-            }
         }
     }
     LaunchedEffect(session.id, state.connection) {
@@ -1077,15 +1081,22 @@ private fun RemoteConversationContent(
             delay(5_000)
         }
     }
-    LaunchedEffect(previewItems.size, timeline.size, working) {
+    // Text/tool upserts can change a row without changing the row count.
+    LaunchedEffect(previewItems, timeline.size, working) {
         val itemCount = timeline.size + if (working) 1 else 0
+        val previousCount = previousTimelineCount
+        previousTimelineCount = itemCount
         if (itemCount == 0) return@LaunchedEffect
         if (!positionedAtNewest) {
             listState.scrollToItem(itemCount - 1)
             positionedAtNewest = true
         } else {
             val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            if (lastVisible >= itemCount - 3) listState.animateScrollToItem(itemCount - 1)
+            // Judge the reader's position against the list they were reading,
+            // before an arbitrarily large catch-up page added more rows.
+            if (shouldFollowConversationUpdate(previousCount, lastVisible, listState.isScrollInProgress)) {
+                listState.scrollToItem(itemCount - 1)
+            }
         }
     }
     LaunchedEffect(imeBottom) {
@@ -2314,6 +2325,9 @@ private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aite
     }
     Text(label, style = MaterialTheme.typography.labelMedium, color = color)
 }
+
+internal fun shouldFollowConversationUpdate(previousCount: Int, lastVisible: Int, scrolling: Boolean): Boolean =
+    !scrolling && lastVisible >= previousCount - 2
 
 internal fun isConversationSessionLive(session: RemoteSession, tabs: List<RemoteTab>): Boolean =
     tabs.any { it.sessionId == session.id }
