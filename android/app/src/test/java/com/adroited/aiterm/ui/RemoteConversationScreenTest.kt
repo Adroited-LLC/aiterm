@@ -15,6 +15,13 @@ import org.junit.Test
 
 class RemoteConversationScreenTest {
     @Test
+    fun newestIndexIncludesCrewStripAndWorkingIndicator() {
+        assertEquals(4, conversationListItemCount(timelineCount = 3, working = true) - 1)
+        assertEquals(3, conversationListItemCount(timelineCount = 3, working = false) - 1)
+        assertEquals(1, conversationListItemCount(timelineCount = 0, working = true) - 1)
+    }
+
+    @Test
     fun catchingUpFollowsTheOldTailButPreservesReadingOlderMessages() {
         // A reader at row 19 stays following even if the next page adds 50
         // rows. Neither the new count nor a text-only upsert changes this.

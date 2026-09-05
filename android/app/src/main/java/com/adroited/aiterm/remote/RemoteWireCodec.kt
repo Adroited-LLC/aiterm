@@ -262,10 +262,25 @@ private class StrictCborValidator(private val bytes: ByteArray) {
             4 -> repeat(collection(length)) { scan(depth + 1) }
             5 -> {
                 val keys = HashSet<String>()
-                repeat(collection(length)) {
+                fun entry() {
                     val key = text()
                     if (!keys.add(key)) malformed()
                     scan(depth + 1)
+                }
+                if (length == -1L) {
+                    // serde(flatten) uses an indefinite map because the Rust
+                    // serializer does not know its field count up front.
+                    // Retain all key/depth/item checks and require its break.
+                    while (true) {
+                        if (position >= bytes.size) malformed()
+                        if (bytes[position].toInt() and 0xff == 0xff) {
+                            position++
+                            break
+                        }
+                        entry()
+                    }
+                } else {
+                    repeat(collection(length)) { entry() }
                 }
             }
             else -> malformed()
@@ -295,6 +310,7 @@ private class StrictCborValidator(private val bytes: ByteArray) {
             25 -> unsigned(2)
             26 -> unsigned(4)
             27 -> unsigned(8)
+            31 -> if (first ushr 5 == 5) -1L else malformed()
             else -> malformed()
         }
         return (first ushr 5) to value

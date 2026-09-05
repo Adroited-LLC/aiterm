@@ -1083,7 +1083,7 @@ private fun RemoteConversationContent(
     }
     // Text/tool upserts can change a row without changing the row count.
     LaunchedEffect(previewItems, timeline.size, working) {
-        val itemCount = timeline.size + if (working) 1 else 0
+        val itemCount = conversationListItemCount(timeline.size, working)
         val previousCount = previousTimelineCount
         previousTimelineCount = itemCount
         if (itemCount == 0) return@LaunchedEffect
@@ -1101,7 +1101,7 @@ private fun RemoteConversationContent(
     }
     LaunchedEffect(imeBottom) {
         if (imeBottom > 0) {
-            val newest = timeline.size + if (working) 1 else 0
+            val newest = conversationListItemCount(timeline.size, working)
             if (newest > 0) listState.scrollToItem(newest - 1)
         }
     }
@@ -2328,6 +2328,10 @@ private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aite
 
 internal fun shouldFollowConversationUpdate(previousCount: Int, lastVisible: Int, scrolling: Boolean): Boolean =
     !scrolling && lastVisible >= previousCount - 2
+
+// LazyColumn always starts with the crew strip, before timeline and status.
+internal fun conversationListItemCount(timelineCount: Int, working: Boolean): Int =
+    1 + timelineCount + if (working) 1 else 0
 
 internal fun isConversationSessionLive(session: RemoteSession, tabs: List<RemoteTab>): Boolean =
     tabs.any { it.sessionId == session.id }

@@ -8,6 +8,16 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class RemoteWireCodecTest {
+    @Test
+    fun indefiniteMapsStillRejectDuplicateKeysMissingValuesAndMissingBreaks() {
+        for (value in listOf("bf616101616102ff", "bf6161ff", "bf616101", "bf616101ffff", "bf01f5ff")) {
+            assertThrows(RemoteProtocolException::class.java) {
+                RemoteWireCodec.validateCborPayload(hex(value))
+            }
+        }
+        RemoteWireCodec.validateCborPayload(hex("bf6161bf616201ffff"))
+    }
+
 
     @Test
     fun requestEnvelopeMatchesTheRustCborShape() {

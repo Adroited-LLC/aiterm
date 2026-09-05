@@ -31,3 +31,21 @@ Reading older rows or actively scrolling suppresses automatic following.
 The desktop must restart after installation to expose the fixed endpoint.
 Installation preserves the running desktop process and phone pairing. Final
 phone-to-desktop verification of the native feed requires that restart.
+
+## Android 0.3.3: working indicator and wire compatibility
+
+Testing after the desktop restart exposed a second interoperability issue:
+Rust's `serde(flatten)` encodes each spine event as an indefinite-length CBOR
+map. Android's strict validator rejected those maps, again falling back to
+snapshots and losing native working status. The validator now accepts this map
+encoding while retaining duplicate-key, nesting, item-count, and termination
+checks. `cargo run --example spine_wire_fixture` generates the actual Rust
+payload used in the Android regression test. That test failed against the old
+validator and passes with the fix; all 233 Android tests pass.
+
+Automatic scrolling also counts the crew strip at the beginning of the list,
+so the target includes the working indicator instead of stopping one row short.
+
+Verified on the connected Pixel after installing 0.3.3: the visible API view
+shows “Codex is working…”, the header says “working”, and native tool rows show
+running status. Desktop 0.10.79 remained running throughout this verification.
