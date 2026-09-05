@@ -17,6 +17,9 @@ pub mod chat;
 #[path = "../../src-tauri/src/claudecfg/mod.rs"]
 pub mod claudecfg;
 #[allow(dead_code)]
+#[path = "../../src-tauri/src/codex_identity.rs"]
+pub mod codex_identity;
+#[allow(dead_code)]
 #[path = "../../src-tauri/src/detail.rs"]
 pub mod detail;
 #[allow(dead_code)]
