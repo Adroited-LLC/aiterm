@@ -603,18 +603,19 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun rapidTextOnlyImeRepeatsAcceptOnlyOnePromptBatch() {
+    fun rapidTextOnlyImeRepeatsWhileSubmissionPendingAcceptOnlyOnePromptBatch() {
         val store = TerminalDraftStore()
         store.updateComposer("tab-text-repeat") {
             it.open().updateValue(androidx.compose.ui.text.input.TextFieldValue("run once")).state
         }
         val accepted = mutableListOf<List<String>>()
+        val release = CompletableDeferred<Boolean>()
         compose.setContent {
             TerminalScreenContent(
                 state = connectedState(),
                 screen = oneCellScreen("tab-text-repeat"),
                 draftStore = store,
-                onInputBatch = { _, inputs -> accepted += inputs; true },
+                onInputBatch = { _, inputs -> accepted += inputs; release.await() },
             )
         }
         val imeAction = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
@@ -625,6 +626,12 @@ class TerminalScreenTest {
             imeAction?.invoke()
         }
 
+        compose.runOnIdle {
+            assertEquals(listOf(listOf("run once", "\r")), accepted)
+            assertEquals("run once", store.draftFor("tab-text-repeat").composer.value.text)
+        }
+        release.complete(true)
+        compose.waitUntil(5_000) { !store.hasDrafts() }
         compose.runOnIdle {
             assertEquals(listOf(listOf("run once", "\r")), accepted)
             assertFalse(store.hasDrafts())
@@ -755,7 +762,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun emptyComposerSendDoesNotEmitConsoleInput() {
+    fun emptyComposerSendEmitsEnterWithoutRequiringFillerText() {
         val sent = mutableListOf<String>()
         compose.setContent {
             TerminalScreenContent(
@@ -764,9 +771,16 @@ class TerminalScreenTest {
                 onInput = sent::add,
             )
         }
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
-        compose.runOnIdle { assertTrue(sent.isEmpty()) }
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed()
+        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+        composer.performImeAction()
+        compose.runOnIdle { assertEquals(listOf("\r"), sent) }
+        composer.performTextInput("a prompt")
+        composer.performImeAction()
+        compose.runOnIdle { assertEquals(listOf("\r", "a prompt", "\r"), sent) }
+        composer.assertIsDisplayed().assertTextEquals("")
+        // A further Enter must work after the draft has been cleared too.
+        composer.performImeAction()
+        compose.runOnIdle { assertEquals(listOf("\r", "a prompt", "\r", "\r"), sent) }
     }
 
     @Test

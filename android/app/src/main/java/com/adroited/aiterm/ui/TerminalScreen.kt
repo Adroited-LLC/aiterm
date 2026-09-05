@@ -269,9 +269,9 @@ internal fun TerminalScreenContent(
         val activeScreen = screen ?: return
         val tabId = activeScreen.tabId
         val current = activeDraftStore.draftFor(tabId)
-        if (current.attachments.preparing || current.attachments.submitting ||
-            (current.composer.value.text.isEmpty() && current.attachments.items.isEmpty())
-        ) return
+        // An empty Send is still Enter: the terminal may already hold a prompt
+        // or be waiting at a confirmation. Never require filler text to submit it.
+        if (current.attachments.preparing || current.attachments.submitting) return
         if (current.attachments.items.isEmpty()) {
             val outbound = formatTerminalSubmission(
                 text = current.composer.value.text,
