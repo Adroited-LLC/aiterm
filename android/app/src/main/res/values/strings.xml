@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">AITerm</string>
+    <string name="console_keyboard_name">aiterm Console</string>
+    <string name="console_terminal_only">Open an aiterm terminal to use this keyboard.</string>
+    <string name="console_switch_keyboard">Switch keyboard</string>
     <string name="desktops_title">Desktops</string>
     <string name="desktops_empty_title">No desktops paired</string>
     <string name="desktops_empty_body">Enable Remote Access on AITerm desktop, choose Pair phone, then scan the QR code it shows.</string>

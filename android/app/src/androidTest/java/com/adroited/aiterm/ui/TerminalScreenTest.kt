@@ -30,7 +30,6 @@ import androidx.compose.ui.test.performImeAction
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
-import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -102,64 +101,26 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun terminalKeyBarCollapsesToARestoreStrip() {
-        val expanded = mutableStateOf(true)
-        compose.setContent {
-            TerminalScreenContent(
-                state = connectedState(),
-                screen = oneCellScreen("tab-keys"),
-                keyBarExpanded = expanded.value,
-                onKeyBarExpandedChange = { expanded.value = it },
-            )
-        }
-
-        compose.onNodeWithTag("collapse-extra-keys").performClick()
-        assertTrue(compose.onAllNodesWithText("Esc").fetchSemanticsNodes().isEmpty())
-        compose.onNodeWithTag("expand-extra-keys").assertIsDisplayed().performClick()
-        compose.onNodeWithText("Esc").assertIsDisplayed()
-    }
-
-    @Test
-    fun collapsingTerminalKeysHidesComposerAndKeyboardThenRestoresTheDraft() {
-        val expanded = mutableStateOf(true)
-        val store = TerminalDraftStore()
-        val sent = mutableListOf<String>()
-        compose.setContent {
-            TerminalScreenContent(
-                state = connectedState(),
-                screen = oneCellScreen("tab-collapse-draft"),
-                draftStore = store,
-                keyBarExpanded = expanded.value,
-                onKeyBarExpandedChange = { expanded.value = it },
-                onInput = sent::add,
-            )
-        }
-        compose.onNodeWithText("Type").performClick()
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
-            .performTextInput("keep this draft")
-        compose.waitUntil(5_000) {
-            compose.activity.window.decorView.rootWindowInsets
-                ?.isVisible(WindowInsets.Type.ime()) == true
-        }
-
-        compose.onNodeWithTag("collapse-extra-keys").performClick()
-
-        compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true).assertDoesNotExist()
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertDoesNotExist()
-        compose.onNodeWithTag("expand-extra-keys").assertIsDisplayed()
-        compose.waitUntil(5_000) {
-            compose.activity.window.decorView.rootWindowInsets
-                ?.isVisible(WindowInsets.Type.ime()) != true
-        }
+    fun terminalComposerIsVisibleOnEntryWithoutOpeningTheKeyboardOrShowingSpecialKeys() {
         compose.runOnIdle {
-            assertEquals("keep this draft", store.draftFor("tab-collapse-draft").composer.value.text)
-            assertTrue(sent.isEmpty())
+            WindowCompat.getInsetsController(compose.activity.window, compose.activity.window.decorView)
+                .hide(WindowInsetsCompat.Type.ime())
+        }
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) != true
+        }
+        compose.setContent {
+            TerminalScreenContent(state = connectedState(), screen = oneCellScreen("tab-visible-composer"))
         }
 
-        compose.onNodeWithTag("expand-extra-keys").performClick()
-
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
-            .assertIsDisplayed().assertTextEquals("keep this draft")
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithTag("terminal-add-image").assertIsDisplayed()
+        compose.onNodeWithTag("extra-keys").assertDoesNotExist()
+        compose.onNodeWithTag("expand-extra-keys").assertDoesNotExist()
+        compose.onNodeWithText("Esc").assertDoesNotExist()
+        compose.runOnIdle {
+            assertTrue(compose.activity.window.decorView.rootWindowInsets?.isVisible(WindowInsets.Type.ime()) != true)
+        }
     }
 
     @Test
@@ -172,7 +133,7 @@ class TerminalScreenTest {
                 draftStore = store,
             )
         }
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
             .performTextInput("keep while browsing")
         compose.waitUntil(5_000) {
@@ -228,7 +189,7 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         compose.onNodeWithTag("terminal-add-image").performClick()
         compose.onNodeWithTag("terminal-image-source-camera").assertIsDisplayed()
         compose.onNodeWithTag("terminal-image-source-gallery").performClick()
@@ -268,7 +229,7 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         compose.onNodeWithTag("terminal-add-image").performClick()
         compose.onNodeWithTag("terminal-image-source-camera").performClick()
         compose.onNodeWithTag("terminal-image-camera-owned").assertIsDisplayed()
@@ -336,13 +297,13 @@ class TerminalScreenTest {
         compose.onNodeWithTag("terminal-image-source-gallery").performClick()
         compose.waitUntil(5_000) { store.draftFor("tab-preparing").attachments.preparing }
         compose.onNodeWithTag("terminal-add-image").assertIsNotEnabled()
-        compose.onNodeWithTag("terminal-enter").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
         compose.runOnIdle { assertTrue(sent.isEmpty()) }
 
         release.complete(Result.success(normalized))
         compose.waitUntil(5_000) { !store.draftFor("tab-preparing").attachments.preparing }
         compose.onNodeWithTag("terminal-image-prepared").assertIsDisplayed()
-        compose.onNodeWithTag("terminal-enter").assertIsEnabled()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsEnabled()
     }
 
     @Test
@@ -374,7 +335,7 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         compose.onNodeWithTag("terminal-add-image").performClick()
         compose.onNodeWithTag("terminal-image-source-gallery").performClick()
 
@@ -404,13 +365,13 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
         compose.onNodeWithTag("terminal-image-progress-slow").assertIsDisplayed()
-        compose.onNodeWithTag("terminal-enter").assertIsNotEnabled()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsNotEnabled()
         release.complete(Result.failure(IllegalStateException("Desktop disconnected.")))
         compose.waitForIdle()
 
-        compose.onNodeWithTag("terminal-enter").assertIsEnabled()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsEnabled()
         compose.onNodeWithTag("terminal-image-slow").assertIsDisplayed()
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("inspect this")
         compose.onNodeWithText("Desktop disconnected.").assertIsDisplayed()
@@ -439,7 +400,7 @@ class TerminalScreenTest {
             }
         }
 
-        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
         compose.waitUntil(5_000) { store.draftFor("tab-cancel").attachments.submitting }
         compose.runOnIdle { visible.value = false }
         compose.waitUntil(5_000) { !store.draftFor("tab-cancel").attachments.submitting }
@@ -515,7 +476,7 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
         compose.waitUntil(5_000) { store.draftFor("tab-mode-change").attachments.submitting }
         compose.runOnIdle {
             currentScreen.value = currentScreen.value.copy(
@@ -541,7 +502,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun attachmentOnlySubmissionUsesSharedEnterPathAndLocalRejectionKeepsTheDraft() {
+    fun attachmentOnlyImeSendPreservesTheDraftOnLocalRejection() {
         val store = TerminalDraftStore()
         val image = normalizedImage("only")
         store.updateComposer("tab-only") { it.open() }
@@ -557,7 +518,7 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
         compose.waitForIdle()
 
         compose.runOnIdle {
@@ -600,7 +561,7 @@ class TerminalScreenTest {
         }
 
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("A text")
-        compose.onNodeWithTag("terminal-enter").performScrollTo().performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
         compose.waitForIdle()
         compose.onNodeWithText("Update AITerm on the desktop to attach images.").assertIsDisplayed()
         compose.runOnIdle { selectedTab.value = "tab-b" }
@@ -700,7 +661,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun textComposerKeepsTheDraftVisibleUntilSend() {
+    fun textComposerKeepsTheDraftUntilSendThenStaysReadyForAnotherMessage() {
         val sent = mutableListOf<String>()
         compose.setContent {
             TerminalScreenContent(
@@ -722,8 +683,8 @@ class TerminalScreenTest {
             )
         }
 
-        assertTrue(compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed().assertTextEquals("")
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
         composer.assertIsDisplayed().performTextInput("hello phone")
         composer.assertTextEquals("hello phone")
@@ -733,12 +694,12 @@ class TerminalScreenTest {
         composer.performImeAction()
 
         compose.runOnIdle { assertEquals(listOf("hello phone", "\r"), sent) }
-        assertTrue(compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
-        compose.onNodeWithText("Type").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed().assertTextEquals("")
+        compose.onNodeWithTag("terminal-add-image").assertIsDisplayed()
     }
 
     @Test
-    fun imeSubmitUsesBracketedPasteBeforeTheToolbarEnterAction() {
+    fun imeSendSubmitsBracketedPasteBeforeCarriageReturn() {
         val sent = mutableListOf<String>()
         compose.setContent {
             TerminalScreenContent(
@@ -760,7 +721,7 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
         composer.performTextInput("hello phone")
         composer.performImeAction()
@@ -771,83 +732,40 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun terminalKeyEnterSubmitsAnOrdinaryComposerDraft() {
+    fun multilineComposerGrowsAndSubmitsWhitespaceWithoutSendingOnEachEdit() {
         val sent = mutableListOf<String>()
         compose.setContent {
             TerminalScreenContent(
                 state = connectedState(),
-                screen = oneCellScreen("tab-key-enter-ordinary"),
+                screen = oneCellScreen("tab-multiline-composer"),
                 onInput = sent::add,
             )
         }
+        val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+        val initialHeight = composer.fetchSemanticsNode().boundsInRoot.height
+        val draft = "  first line\nsecond line\nthird line  "
 
-        compose.onNodeWithText("Type").performClick()
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
-            .performTextInput("status")
-        compose.onNodeWithText("Enter").performScrollTo().performClick()
+        composer.performTextInput(draft)
 
-        compose.runOnIdle { assertEquals(listOf("status", "\r"), sent) }
-        assertTrue(
-            compose.onAllNodesWithTag("terminal-composer", useUnmergedTree = true)
-                .fetchSemanticsNodes().isEmpty(),
-        )
+        assertTrue(composer.fetchSemanticsNode().boundsInRoot.height > initialHeight)
+        compose.runOnIdle { assertTrue(sent.isEmpty()) }
+        composer.performImeAction()
+        compose.runOnIdle { assertEquals(listOf(draft, "\r"), sent) }
+        composer.assertIsDisplayed().assertTextEquals("")
     }
 
     @Test
-    fun terminalKeyEnterSubmitsBracketedDraftBeforeCarriageReturn() {
+    fun emptyComposerSendDoesNotEmitConsoleInput() {
         val sent = mutableListOf<String>()
         compose.setContent {
             TerminalScreenContent(
                 state = connectedState(),
-                screen = oneCellScreen("tab-key-enter-bracketed").copy(
-                    modes = TerminalModes(bracketedPaste = true),
-                ),
+                screen = oneCellScreen("tab-empty-composer"),
                 onInput = sent::add,
             )
         }
-
-        compose.onNodeWithText("Type").performClick()
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
-            .performTextInput("git status")
-        compose.onNodeWithText("Enter").performScrollTo().performClick()
-
-        compose.runOnIdle {
-            assertEquals(listOf("\u001b[200~git status\u001b[201~", "\r"), sent)
-        }
-    }
-
-    @Test
-    fun terminalKeyEnterSendsRawCarriageReturnWhenComposerIsClosed() {
-        val sent = mutableListOf<String>()
-        compose.setContent {
-            TerminalScreenContent(
-                state = connectedState(),
-                screen = oneCellScreen("tab-key-enter-closed"),
-                onInput = sent::add,
-            )
-        }
-
-        compose.onNodeWithText("Enter").performScrollTo().performClick()
-
-        compose.runOnIdle { assertEquals(listOf("\r"), sent) }
-    }
-
-    @Test
-    fun terminalKeyEnterKeepsAnEmptyComposerOpenAfterRawCarriageReturn() {
-        val sent = mutableListOf<String>()
-        compose.setContent {
-            TerminalScreenContent(
-                state = connectedState(),
-                screen = oneCellScreen("tab-key-enter-empty"),
-                onInput = sent::add,
-            )
-        }
-
-        compose.onNodeWithText("Type").performClick()
-        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed()
-        compose.onNodeWithText("Enter").performScrollTo().performClick()
-
-        compose.runOnIdle { assertEquals(listOf("\r"), sent) }
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
+        compose.runOnIdle { assertTrue(sent.isEmpty()) }
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsDisplayed()
     }
 
@@ -875,7 +793,7 @@ class TerminalScreenTest {
 
         compose.waitUntil(5_000) { sizes.isNotEmpty() }
         compose.runOnIdle { sizes.clear() }
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         compose.waitUntil(5_000) {
             compose.activity.window.decorView.rootWindowInsets
                 ?.isVisible(WindowInsets.Type.ime()) == true
@@ -890,7 +808,7 @@ class TerminalScreenTest {
             .fetchSemanticsNode().boundsInRoot
         val field = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
-        val placeholder = compose.onNodeWithText("Type a command or prompt…", useUnmergedTree = true)
+        val placeholder = compose.onNodeWithText("Message terminal", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
         val maxSingleRowHeight = 60f * compose.activity.resources.displayMetrics.density
 
@@ -946,7 +864,7 @@ class TerminalScreenTest {
 
         val surfaceBefore = compose.onNodeWithTag("terminal-surface", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
         composer.performClick().performTextInput("native")
         compose.waitUntil(5_000) {
@@ -990,7 +908,7 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         val composer = compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
         composer.performClick().performTextInput("visible")
         compose.waitUntil(5_000) {
@@ -1027,7 +945,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun nativeGridRemainsVisibleWhileReadOnlyAndOffersFocusAndExtraKeys() {
+    fun nativeGridRemainsVisibleWhileReadOnlyAndDisablesComposerUntilFocus() {
         var focusRequested = false
         compose.setContent {
             TerminalScreenContent(
@@ -1054,7 +972,7 @@ class TerminalScreenTest {
         compose.onNodeWithTag("terminal-grid").assertIsDisplayed()
         compose.onNodeWithText("hello").assertIsDisplayed()
         compose.onAllNodesWithText("CONNECTED").onFirst().assertIsDisplayed()
-        compose.onNodeWithText("Esc").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertIsNotEnabled()
         compose.onNodeWithText("Take Focus").performClick()
 
         assertTrue(focusRequested)

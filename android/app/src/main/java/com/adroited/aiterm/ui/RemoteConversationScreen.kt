@@ -165,7 +165,6 @@ fun RemoteDesktopScreen(
     pairedDesktops: List<PairedDesktop>,
     onBack: () -> Unit,
     onOpenDesktop: (PairedDesktop) -> Unit,
-    keyBarPreference: TerminalKeyBarPreference,
 ) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     var page by rememberSaveable { mutableStateOf(PAGE_SESSIONS) }
@@ -239,7 +238,6 @@ fun RemoteDesktopScreen(
                 selectedSessionId?.let(viewModel::previewSession)
                 page = if (selectedSessionId == null) PAGE_SESSIONS else PAGE_CONVERSATION
             },
-            keyBarPreference = keyBarPreference,
         )
 
         PAGE_CONVERSATION -> if (selected == null) {

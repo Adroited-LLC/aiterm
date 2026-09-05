@@ -2,13 +2,10 @@ package com.adroited.aiterm.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.imeNestedScroll
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -30,13 +27,15 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicText
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -44,7 +43,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -71,8 +69,6 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -81,16 +77,14 @@ import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.text
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.PlatformImeOptions
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardCapitalization
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -124,18 +118,14 @@ import java.net.URI
 fun RemoteTerminalScreen(
     viewModel: RemoteTerminalViewModel,
     onBack: () -> Unit,
-    keyBarPreference: TerminalKeyBarPreference,
 ) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     val screen by viewModel.client.screen.collectAsStateWithLifecycle()
     val scrollback by viewModel.client.scrollback.collectAsStateWithLifecycle()
-    val keyBarExpanded by keyBarPreference.expanded.collectAsStateWithLifecycle()
     TerminalScreenContent(
         state = state,
         screen = screen,
         scrollback = scrollback,
-        keyBarExpanded = keyBarExpanded,
-        onKeyBarExpandedChange = keyBarPreference::setExpanded,
         onBack = onBack,
         onReconnect = viewModel::reconnect,
         onInput = viewModel::sendInput,
@@ -155,8 +145,6 @@ internal fun TerminalScreenContent(
     state: RemoteClientState,
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow> = emptyList(),
-    keyBarExpanded: Boolean = true,
-    onKeyBarExpandedChange: (Boolean) -> Unit = {},
     onBack: () -> Unit = {},
     onReconnect: () -> Unit = {},
     onInput: (String) -> Unit = {},
@@ -198,7 +186,6 @@ internal fun TerminalScreenContent(
     val activeTabId = screen?.tabId
     val tabDraft = activeTabId?.let { allDrafts[it] } ?: TerminalTabDraft()
     val composer = tabDraft.composer
-    val composerVisible = keyBarExpanded && composer.expanded
     val attachments = tabDraft.attachments
     val defaultNormalizer = remember(context) { TerminalImageNormalizer(context) }
     val normalizer = imageNormalizer ?: remember(defaultNormalizer) {
@@ -218,17 +205,11 @@ internal fun TerminalScreenContent(
             viewportReady = true
         }
     }
-    val onRequestKeyboard = remember(
-        state.focus, activeTabId, activeDraftStore, composerVisible, onKeyBarExpandedChange, keyboard,
-    ) {
+    val onRequestKeyboard = remember(state.focus, activeTabId, keyboard) {
         {
             if (state.focus == FocusOwner.Self && activeTabId != null) {
-                onKeyBarExpandedChange(true)
-                activeDraftStore.updateComposer(activeTabId) { it.open() }
-                if (composerVisible) {
-                    inputFocus.requestFocus()
-                    keyboard?.show()
-                }
+                inputFocus.requestFocus()
+                keyboard?.show()
             }
         }
     }
@@ -284,6 +265,7 @@ internal fun TerminalScreenContent(
     val picker = imagePickerLauncher ?: nativePicker
 
     fun submitComposer() {
+        if (state.focus != FocusOwner.Self) return
         val activeScreen = screen ?: return
         val tabId = activeScreen.tabId
         val current = activeDraftStore.draftFor(tabId)
@@ -307,7 +289,6 @@ internal fun TerminalScreenContent(
                     }
                     if (accepted) {
                         activeDraftStore.clear(tabId)
-                        keyboard?.hide()
                     } else {
                         setAttachmentMessage(
                             tabId,
@@ -369,7 +350,6 @@ internal fun TerminalScreenContent(
                 val completed = activeDraftStore.completeSubmission(tabId)
                 completed.removed.forEach { it.image.file.delete() }
                 uploadBegan = false
-                keyboard?.hide()
             } catch (cancelled: CancellationException) {
                 if (uploadBegan) {
                     activeDraftStore.transitionAttachments(tabId) {
@@ -386,8 +366,7 @@ internal fun TerminalScreenContent(
     }
 
     BackHandler {
-        if (composerVisible && activeTabId != null) {
-            activeDraftStore.updateComposer(activeTabId) { it.close() }
+        if (imeInsets.getBottom(density) > 0) {
             keyboard?.hide()
         } else {
             requestLeave()
@@ -402,21 +381,11 @@ internal fun TerminalScreenContent(
             onTakeFocus(cols, rows)
         }
     }
-    LaunchedEffect(composerVisible, state.focus, screen?.tabId) {
-        if (composerVisible && state.focus == FocusOwner.Self && screen != null) {
-            inputFocus.requestFocus()
-            keyboard?.show()
-        }
-    }
-
-    LaunchedEffect(keyBarExpanded) {
-        if (!keyBarExpanded) keyboard?.hide()
-    }
-
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
+                actions = { ConsoleKeyboardMenu() },
                 navigationIcon = {
                     IconButton(onClick = ::requestLeave) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -461,16 +430,16 @@ internal fun TerminalScreenContent(
             Column(
                 Modifier.align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .background(MaterialTheme.colorScheme.surface)
                     .testTag("terminal-bottom-chrome")
                     .windowInsetsPadding(bottomInsets),
             ) {
                 Column(Modifier.onSizeChanged { chromeInteractiveHeightPx = it.height }) {
-                    if (screen != null && composerVisible) {
+                    if (screen != null) {
                         Column(
                             Modifier.fillMaxWidth()
                                 .testTag("terminal-composer-overlay")
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
                         ) {
                             TerminalAttachmentStrip(
                                 draft = attachments,
@@ -489,9 +458,13 @@ internal fun TerminalScreenContent(
                                     }
                                 },
                                 onSend = ::submitComposer,
+                                applicationCursor = screen.modes.applicationCursor,
+                                onInput = onInput,
                                 onAddImage = { showImageSources = true },
                                 addImageEnabled = state.focus == FocusOwner.Self &&
-                                    !attachments.preparing && !attachments.submitting,
+                                    !attachments.preparing && !attachments.submitting &&
+                                    attachments.items.size < TerminalAttachmentDraft.MAX_IMAGES,
+                                submitting = attachments.submitting,
                                 focusRequester = inputFocus,
                                 enabled = state.focus == FocusOwner.Self && !attachments.submitting,
                             )
@@ -503,23 +476,6 @@ internal fun TerminalScreenContent(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
                         ) { Text("Take Focus") }
                     }
-                    ExtraKeys(
-                        screen = screen,
-                        scrollback = scrollback,
-                        expanded = keyBarExpanded,
-                        onExpandedChange = onKeyBarExpandedChange,
-                        onInput = onInput,
-                        onOpenComposer = {
-                            screen?.tabId?.let { tabId ->
-                                activeDraftStore.updateComposer(tabId) { it.open() }
-                            }
-                        },
-                        submitComposerDraft = composerVisible &&
-                            (composer.value.text.isNotEmpty() || attachments.items.isNotEmpty() ||
-                                attachments.preparing),
-                        submissionEnabled = !attachments.preparing && !attachments.submitting,
-                        onSubmitComposer = ::submitComposer,
-                    )
                 }
             }
         }
@@ -856,73 +812,49 @@ private fun TerminalInputBar(
     value: TextFieldValue,
     onValueChange: (TextFieldValue) -> Unit,
     onSend: () -> Unit,
+    applicationCursor: Boolean,
+    onInput: (String) -> Unit,
     onAddImage: () -> Unit,
     addImageEnabled: Boolean,
+    submitting: Boolean,
     focusRequester: FocusRequester,
     enabled: Boolean,
 ) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.medium,
-        color = Color(0xFF0B1A26),
-        tonalElevation = 4.dp,
-        shadowElevation = 8.dp,
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+    Row(verticalAlignment = Alignment.Bottom) {
+        IconButton(
+            onClick = onAddImage,
+            enabled = addImageEnabled,
+            modifier = Modifier.testTag("terminal-add-image"),
         ) {
-            TextButton(
-                onClick = onAddImage,
-                enabled = addImageEnabled,
-                modifier = Modifier.size(48.dp)
-                    .semantics { contentDescription = "Attach image" }
-                    .testTag("terminal-add-image"),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
-            ) {
-                Text("＋", color = Color(0xFF63D3E1), fontSize = 22.sp)
-            }
-            BasicTextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier.weight(1f).height(44.dp)
-                    .focusRequester(focusRequester)
-                    .testTag("terminal-composer"),
-                enabled = enabled,
-                singleLine = true,
-                textStyle = MaterialTheme.typography.bodyMedium.copy(
-                    color = Color(0xFFD8E6EF),
-                    fontFamily = FontFamily.Monospace,
-                ),
-                cursorBrush = SolidColor(Color(0xFF63D3E1)),
-                keyboardOptions = KeyboardOptions(
-                    capitalization = KeyboardCapitalization.Sentences,
-                    autoCorrectEnabled = true,
-                    keyboardType = KeyboardType.Text,
-                    imeAction = ImeAction.Go,
-                ),
-                keyboardActions = KeyboardActions(onGo = { onSend() }),
-                decorationBox = { inner ->
-                    Box(
-                        Modifier.fillMaxSize()
-                            .border(1.dp, Color(0xFF315269), MaterialTheme.shapes.small)
-                            .background(Color(0xFF07111B), MaterialTheme.shapes.small)
-                            .padding(horizontal = 12.dp),
-                        contentAlignment = Alignment.CenterStart,
-                    ) {
-                        if (value.text.isEmpty()) {
-                            Text(
-                                if (!enabled) "Take focus to type" else "Type a command or prompt…",
-                                color = Color(0xFF6F8798),
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                        }
-                        inner()
-                    }
-                },
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = "Attach an image",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.weight(1f).focusRequester(focusRequester)
+                .terminalConsoleInput(enabled, applicationCursor, onInput)
+                .testTag("terminal-composer"),
+            placeholder = { Text("Message terminal") },
+            maxLines = 5,
+            shape = RoundedCornerShape(18.dp),
+            keyboardOptions = KeyboardOptions(
+                imeAction = ImeAction.Send,
+                platformImeOptions = PlatformImeOptions(
+                    privateImeOptions = "com.adroited.aiterm.CONSOLE_INPUT",
+                ),
+            ),
+            keyboardActions = KeyboardActions(onSend = { onSend() }),
+            enabled = enabled,
+            trailingIcon = {
+                if (submitting) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                }
+            },
+        )
     }
 }
 
@@ -1029,115 +961,6 @@ private fun rememberTerminalMetrics(): TerminalMetrics {
         lineHeightPx = measured.size.height,
         textStyle = textStyle,
     )
-}
-
-@Composable
-private fun ExtraKeys(
-    screen: ScreenSnapshot?,
-    scrollback: List<ScreenRow>,
-    expanded: Boolean,
-    onExpandedChange: (Boolean) -> Unit,
-    onInput: (String) -> Unit,
-    onOpenComposer: () -> Unit,
-    submitComposerDraft: Boolean,
-    submissionEnabled: Boolean,
-    onSubmitComposer: () -> Unit,
-) {
-    var control by remember { mutableStateOf(false) }
-    var alt by remember { mutableStateOf(false) }
-    val clipboard = LocalClipboardManager.current
-    val applicationCursor = screen?.modes?.applicationCursor == true
-    fun send(value: String) {
-        var output = value
-        if (control && output.length == 1) {
-            val code = output[0].uppercaseChar().code
-            if (code in 64..95) output = (code and 0x1f).toChar().toString()
-        }
-        if (alt) output = "\u001b$output"
-        onInput(output)
-        control = false
-        alt = false
-    }
-    if (expanded) {
-        Row(
-            Modifier.fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-                .padding(horizontal = 4.dp, vertical = 3.dp)
-                .testTag("extra-keys"),
-            horizontalArrangement = Arrangement.spacedBy(3.dp),
-        ) {
-            Row(
-                modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(3.dp),
-            ) {
-                ExtraKey("Type", action = onOpenComposer)
-                ExtraKey("Esc") { send("\u001b") }
-                ExtraKey(if (control) "Ctrl ●" else "Ctrl") { control = !control }
-                ExtraKey(if (alt) "Alt ●" else "Alt") { alt = !alt }
-                ExtraKey("Tab") { send("\t") }
-                ExtraKey(
-                    "Enter",
-                    modifier = Modifier.testTag("terminal-enter"),
-                    enabled = !submitComposerDraft || submissionEnabled,
-                ) {
-                    if (submitComposerDraft) {
-                        onSubmitComposer()
-                        control = false
-                        alt = false
-                    } else {
-                        send("\r")
-                    }
-                }
-                ExtraKey("⌫") { send("\u007f") }
-                ExtraKey("←") { send(if (applicationCursor) "\u001bOD" else "\u001b[D") }
-                ExtraKey("↑") { send(if (applicationCursor) "\u001bOA" else "\u001b[A") }
-                ExtraKey("↓") { send(if (applicationCursor) "\u001bOB" else "\u001b[B") }
-                ExtraKey("→") { send(if (applicationCursor) "\u001bOC" else "\u001b[C") }
-                ExtraKey("PgUp") { send("\u001b[5~") }
-                ExtraKey("PgDn") { send("\u001b[6~") }
-                ExtraKey("|") { send("|") }
-                ExtraKey("/") { send("/") }
-                ExtraKey("~") { send("~") }
-                ExtraKey("Paste") {
-                    clipboard.getText()?.text?.let { text ->
-                        send(if (screen?.modes?.bracketedPaste == true) "\u001b[200~$text\u001b[201~" else text)
-                    }
-                }
-                ExtraKey("Copy screen") {
-                    val text = (scrollback.asReversed() + (screen?.visible ?: emptyList()))
-                        .joinToString("\n", transform = ScreenRow::plainText)
-                    clipboard.setText(AnnotatedString(text))
-                }
-            }
-            ExtraKey(
-                label = "⌄",
-                action = { onExpandedChange(false) },
-                modifier = Modifier.testTag("collapse-extra-keys"),
-            )
-        }
-    } else {
-        Box(
-            modifier = Modifier.fillMaxWidth()
-                .height(28.dp)
-                .background(MaterialTheme.colorScheme.surfaceVariant)
-                .clickable { onExpandedChange(true) }
-                .semantics { contentDescription = "Show terminal keys" }
-                .testTag("expand-extra-keys"),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text("⌃")
-        }
-    }
-}
-
-@Composable
-private fun ExtraKey(
-    label: String,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    action: () -> Unit,
-) {
-    OutlinedButton(onClick = action, enabled = enabled, modifier = modifier.height(38.dp)) { Text(label) }
 }
 
 private fun CellAttributes.span(foreground: Color, background: Color) = SpanStyle(

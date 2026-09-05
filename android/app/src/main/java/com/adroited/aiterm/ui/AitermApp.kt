@@ -119,7 +119,6 @@ fun AitermApp(
                                     popUpTo(entry.destination.id) { inclusive = true }
                                 }
                             },
-                            keyBarPreference = container.terminalKeyBarPreference,
                         )
                     }
                 }
