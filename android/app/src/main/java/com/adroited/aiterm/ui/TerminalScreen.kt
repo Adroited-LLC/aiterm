@@ -5,6 +5,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.Box
@@ -13,7 +14,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -26,7 +26,6 @@ import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -35,24 +34,24 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -65,6 +64,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -100,7 +103,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
 import com.adroited.aiterm.remote.RemoteClientState
-import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.remote.RemoteUploadException
 import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.remote.TerminalSize
@@ -134,15 +136,6 @@ fun RemoteTerminalScreen(
         onKeyBarExpandedChange = keyBarPreference::setExpanded,
         onBack = onBack,
         onReconnect = viewModel::reconnect,
-        onSelectTab = viewModel::selectTab,
-        onCloseTab = viewModel::closeTab,
-        onOpenSession = { id, cols, rows -> viewModel.openSession(id, cols, rows) },
-        onPreviewSession = viewModel::previewSession,
-        onCloseSession = viewModel::closeSession,
-        onStopSession = viewModel::stopSession,
-        onForkSession = viewModel::forkSession,
-        onDeleteSession = viewModel::deleteSession,
-        onOpenShell = { cols, rows -> viewModel.openShell(null, cols, rows) },
         onInput = viewModel::sendInput,
         onInputBatch = viewModel::submitInputs,
         draftStore = viewModel.terminalDrafts,
@@ -150,6 +143,7 @@ fun RemoteTerminalScreen(
         onTakeFocus = viewModel::takeFocus,
         onResize = viewModel::resize,
         onLoadScrollback = viewModel::loadOlderScrollback,
+        onRestartScrollback = { viewModel.client.restartScrollback() },
     )
 }
 
@@ -163,15 +157,6 @@ internal fun TerminalScreenContent(
     onKeyBarExpandedChange: (Boolean) -> Unit = {},
     onBack: () -> Unit = {},
     onReconnect: () -> Unit = {},
-    onSelectTab: (String) -> Unit = {},
-    onCloseTab: (String) -> Unit = {},
-    onOpenSession: (String, Int, Int) -> Unit = { _, _, _ -> },
-    onPreviewSession: (String) -> Unit = {},
-    onCloseSession: (String) -> Unit = {},
-    onStopSession: (String) -> Unit = {},
-    onForkSession: (String) -> Unit = {},
-    onDeleteSession: (String) -> Unit = {},
-    onOpenShell: (Int, Int) -> Unit = { _, _ -> },
     onInput: (String) -> Unit = {},
     onInputBatch: (suspend (String, List<String>) -> Boolean)? = null,
     draftStore: TerminalDraftStore? = null,
@@ -187,10 +172,10 @@ internal fun TerminalScreenContent(
     onTakeFocus: (Int, Int) -> Unit = { _, _ -> },
     onResize: (Int, Int) -> Unit = { _, _ -> },
     onLoadScrollback: () -> Unit = {},
+    onRestartScrollback: () -> Unit = {},
     imeInsets: WindowInsets = WindowInsets.ime,
     navigationInsets: WindowInsets = WindowInsets.navigationBars,
 ) {
-    val drawerState = rememberDrawerState(DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
@@ -198,7 +183,6 @@ internal fun TerminalScreenContent(
     var viewportReady by remember { mutableStateOf(false) }
     var cols by remember { mutableIntStateOf(screen?.cols ?: 80) }
     var rows by remember { mutableIntStateOf(screen?.rows ?: 24) }
-    var deleteTarget by remember { mutableStateOf<RemoteSession?>(null) }
     val terminalMetrics = rememberTerminalMetrics()
     val inputFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
@@ -415,144 +399,113 @@ internal fun TerminalScreenContent(
         }
     }
 
-    ModalNavigationDrawer(
-        drawerState = drawerState,
-        drawerContent = {
-            ModalDrawerSheet(modifier = Modifier.fillMaxHeight().width(340.dp)) {
-                SessionDrawer(
-                    state = state,
-                    cols = cols,
-                    rows = rows,
-                    onSelectTab = {
-                        onSelectTab(it)
-                        coroutineScope.launch { drawerState.close() }
-                    },
-                    onCloseTab = onCloseTab,
-                    onOpenSession = { onOpenSession(it, cols, rows) },
-                    onPreviewSession = onPreviewSession,
-                    onCloseSession = onCloseSession,
-                    onStopSession = onStopSession,
-                    onForkSession = onForkSession,
-                    onDeleteSession = { id -> deleteTarget = state.sessions.firstOrNull { it.id == id } },
-                    onOpenShell = { onOpenShell(cols, rows) },
-                )
-            }
-        },
-    ) {
-        Scaffold(
-            contentWindowInsets = WindowInsets(0, 0, 0, 0),
-            topBar = {
-                TopAppBar(
-                    navigationIcon = {
-                        TextButton(onClick = { coroutineScope.launch { drawerState.open() } }) {
-                            Text("Sessions")
-                        }
-                    },
-                    title = {
-                        Column {
-                            Text(state.activeTitle ?: "Remote terminal")
-                            Text(
-                                state.connection.label(),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = state.connection.color(),
-                            )
-                        }
-                    },
-                    actions = { TextButton(onClick = ::requestLeave) { Text("Back") } },
-                )
-            },
-        ) { padding ->
-            Box(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
-                Column(Modifier.fillMaxSize().testTag("terminal-surface")) {
-                    ConnectionRail(state, onReconnect)
-                    TerminalViewport(
-                        screen = screen,
-                        scrollback = scrollback,
-                        metrics = terminalMetrics,
-                        bottomObstructionPx = bottomInsetPx + chromeInteractiveHeightPx,
-                        leftObstructionPx = navigationLeftInsetPx,
-                        rightObstructionPx = navigationRightInsetPx,
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
-                        emptyMessage = if (state.tabs.isEmpty()) {
-                            "No remote tabs are open."
-                        } else {
-                            "Choose a tab from Sessions."
-                        },
-                        onViewportSizeChanged = onViewportSizeChanged,
-                        onResize = onResize,
-                        resizeEnabled = resumed && state.focus == FocusOwner.Self,
-                        onRequestKeyboard = onRequestKeyboard,
-                    )
-                }
-                Column(
-                    Modifier.align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                        .testTag("terminal-bottom-chrome")
-                        .windowInsetsPadding(bottomInsets),
-                ) {
-                    Column(Modifier.onSizeChanged { chromeInteractiveHeightPx = it.height }) {
-                        if (screen != null && composer.expanded) {
-                            Column(
-                                Modifier.fillMaxWidth()
-                                    .testTag("terminal-composer-overlay")
-                                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                            ) {
-                                TerminalAttachmentStrip(
-                                    draft = attachments,
-                                    onRemove = { imageId ->
-                                        val removed = activeDraftStore.transitionAttachments(screen.tabId) {
-                                            it.remove(imageId)
-                                        }
-                                        removed.removed.forEach { it.image.file.delete() }
-                                    },
-                                )
-                                TerminalInputBar(
-                                    value = composer.value,
-                                    onValueChange = { next ->
-                                        activeDraftStore.updateComposer(screen.tabId) {
-                                            it.updateValue(next).state
-                                        }
-                                    },
-                                    onSend = ::submitComposer,
-                                    onAddImage = { showImageSources = true },
-                                    addImageEnabled = state.focus == FocusOwner.Self &&
-                                        !attachments.preparing && !attachments.submitting,
-                                    focusRequester = inputFocus,
-                                    enabled = state.focus == FocusOwner.Self && !attachments.submitting,
-                                )
-                            }
-                        }
-                        if (state.showTakeFocus && screen != null) {
-                            Button(
-                                onClick = { onTakeFocus(cols, rows) },
-                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                            ) { Text("Take Focus") }
-                        }
-                        if (screen != null) {
-                            TextButton(
-                                onClick = onLoadScrollback,
-                                modifier = Modifier.fillMaxWidth().height(36.dp).testTag("load-scrollback"),
-                            ) { Text("Load older history · ${scrollback.size} rows") }
-                        }
-                        ExtraKeys(
-                            screen = screen,
-                            scrollback = scrollback,
-                            expanded = keyBarExpanded,
-                            onExpandedChange = onKeyBarExpandedChange,
-                            onInput = onInput,
-                            onOpenComposer = {
-                                screen?.tabId?.let { tabId ->
-                                    activeDraftStore.updateComposer(tabId) { it.open() }
-                                }
-                            },
-                            submitComposerDraft = composer.expanded &&
-                                (composer.value.text.isNotEmpty() || attachments.items.isNotEmpty() ||
-                                    attachments.preparing),
-                            submissionEnabled = !attachments.preparing && !attachments.submitting,
-                            onSubmitComposer = ::submitComposer,
+    Scaffold(
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        topBar = {
+            TopAppBar(
+                navigationIcon = {
+                    IconButton(onClick = ::requestLeave) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                title = {
+                    Column {
+                        Text(state.activeTitle ?: "Remote terminal")
+                        Text(
+                            state.connection.label(),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = state.connection.color(),
                         )
                     }
+                },
+            )
+        },
+    ) { padding ->
+        Box(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
+            Column(Modifier.fillMaxSize().testTag("terminal-surface")) {
+                ConnectionRail(state, onReconnect)
+                TerminalViewport(
+                    screen = screen,
+                    scrollback = scrollback,
+                    scrollbackLoading = state.scrollbackLoading,
+                    scrollbackHasMore = state.scrollbackHasMore,
+                    scrollbackError = state.scrollbackError,
+                    onLoadScrollback = onLoadScrollback,
+                    onRestartScrollback = onRestartScrollback,
+                    metrics = terminalMetrics,
+                    bottomObstructionPx = bottomInsetPx + chromeInteractiveHeightPx,
+                    leftObstructionPx = navigationLeftInsetPx,
+                    rightObstructionPx = navigationRightInsetPx,
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    emptyMessage = "Opening terminal…",
+                    onViewportSizeChanged = onViewportSizeChanged,
+                    onResize = onResize,
+                    resizeEnabled = resumed && state.focus == FocusOwner.Self,
+                    onRequestKeyboard = onRequestKeyboard,
+                )
+            }
+            Column(
+                Modifier.align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .testTag("terminal-bottom-chrome")
+                    .windowInsetsPadding(bottomInsets),
+            ) {
+                Column(Modifier.onSizeChanged { chromeInteractiveHeightPx = it.height }) {
+                    if (screen != null && composer.expanded) {
+                        Column(
+                            Modifier.fillMaxWidth()
+                                .testTag("terminal-composer-overlay")
+                                .padding(horizontal = 8.dp, vertical = 6.dp),
+                        ) {
+                            TerminalAttachmentStrip(
+                                draft = attachments,
+                                onRemove = { imageId ->
+                                    val removed = activeDraftStore.transitionAttachments(screen.tabId) {
+                                        it.remove(imageId)
+                                    }
+                                    removed.removed.forEach { it.image.file.delete() }
+                                },
+                            )
+                            TerminalInputBar(
+                                value = composer.value,
+                                onValueChange = { next ->
+                                    activeDraftStore.updateComposer(screen.tabId) {
+                                        it.updateValue(next).state
+                                    }
+                                },
+                                onSend = ::submitComposer,
+                                onAddImage = { showImageSources = true },
+                                addImageEnabled = state.focus == FocusOwner.Self &&
+                                    !attachments.preparing && !attachments.submitting,
+                                focusRequester = inputFocus,
+                                enabled = state.focus == FocusOwner.Self && !attachments.submitting,
+                            )
+                        }
+                    }
+                    if (state.showTakeFocus && screen != null) {
+                        Button(
+                            onClick = { onTakeFocus(cols, rows) },
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                        ) { Text("Take Focus") }
+                    }
+                    ExtraKeys(
+                        screen = screen,
+                        scrollback = scrollback,
+                        expanded = keyBarExpanded,
+                        onExpandedChange = onKeyBarExpandedChange,
+                        onInput = onInput,
+                        onOpenComposer = {
+                            screen?.tabId?.let { tabId ->
+                                activeDraftStore.updateComposer(tabId) { it.open() }
+                            }
+                        },
+                        submitComposerDraft = composer.expanded &&
+                            (composer.value.text.isNotEmpty() || attachments.items.isNotEmpty() ||
+                                attachments.preparing),
+                        submissionEnabled = !attachments.preparing && !attachments.submitting,
+                        onSubmitComposer = ::submitComposer,
+                    )
                 }
             }
         }
@@ -635,26 +588,17 @@ internal fun TerminalScreenContent(
         )
     }
 
-    deleteTarget?.let { session ->
-        AlertDialog(
-            onDismissRequest = { deleteTarget = null },
-            title = { Text("Delete transcript?") },
-            text = { Text("${session.title}\n\nThis permanently removes the desktop session after its protected archive transaction completes.") },
-            confirmButton = {
-                Button(onClick = {
-                    onDeleteSession(session.id)
-                    deleteTarget = null
-                }) { Text("Delete") }
-            },
-            dismissButton = { TextButton(onClick = { deleteTarget = null }) { Text("Cancel") } },
-        )
-    }
 }
 
 @Composable
 private fun TerminalViewport(
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow>,
+    scrollbackLoading: Boolean,
+    scrollbackHasMore: Boolean,
+    scrollbackError: String?,
+    onLoadScrollback: () -> Unit,
+    onRestartScrollback: () -> Unit,
     metrics: TerminalMetrics,
     bottomObstructionPx: Int,
     leftObstructionPx: Int,
@@ -703,13 +647,20 @@ private fun TerminalViewport(
                 bottom = with(density) { verticalPaddingPx.toDp() },
             ),
         ) {
-            TerminalGrid(
-                screen = screen,
-                scrollback = scrollback,
-                modifier = Modifier.fillMaxSize(),
-                onRequestKeyboard = onRequestKeyboard,
-                metrics = metrics,
-            )
+            key(screen?.tabId) {
+                TerminalGrid(
+                    screen = screen,
+                    scrollback = scrollback,
+                    scrollbackLoading = scrollbackLoading,
+                    scrollbackHasMore = scrollbackHasMore,
+                    scrollbackError = scrollbackError,
+                    onLoadScrollback = onLoadScrollback,
+                    onRestartScrollback = onRestartScrollback,
+                    modifier = Modifier.fillMaxSize(),
+                    onRequestKeyboard = onRequestKeyboard,
+                    metrics = metrics,
+                )
+            }
             if (screen == null) {
                 Text(
                     emptyMessage,
@@ -749,73 +700,14 @@ private fun ConnectionRail(state: RemoteClientState, onReconnect: () -> Unit) {
 }
 
 @Composable
-private fun SessionDrawer(
-    state: RemoteClientState,
-    cols: Int,
-    rows: Int,
-    onSelectTab: (String) -> Unit,
-    onCloseTab: (String) -> Unit,
-    onOpenSession: (String) -> Unit,
-    onPreviewSession: (String) -> Unit,
-    onCloseSession: (String) -> Unit,
-    onStopSession: (String) -> Unit,
-    onForkSession: (String) -> Unit,
-    onDeleteSession: (String) -> Unit,
-    onOpenShell: () -> Unit,
-) {
-    Text("LIVE TABS", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.labelMedium)
-    state.tabs.forEach { tab ->
-        Row(
-            Modifier.fillMaxWidth().clickable { onSelectTab(tab.id) }.padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(if (tab.id == state.activeTabId) "●" else "○", color = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                Text(tab.title, maxLines = 1)
-                Text("${tab.size.cols}×${tab.size.rows} · ${tab.focus.name.lowercase()}", style = MaterialTheme.typography.labelMedium)
-            }
-            TextButton(onClick = { onCloseTab(tab.id) }) { Text("Close") }
-        }
-    }
-    OutlinedButton(onClick = onOpenShell, modifier = Modifier.padding(horizontal = 16.dp)) {
-        Text("New shell ${cols}×${rows}")
-    }
-    HorizontalDivider(Modifier.padding(vertical = 12.dp))
-    Text("SESSIONS", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.labelMedium)
-    LazyColumn(modifier = Modifier.fillMaxHeight()) {
-        items(state.sessions, key = RemoteSession::id) { session ->
-            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp)) {
-                Text(session.title, maxLines = 1)
-                Text("${session.agent} · ${session.projectPath}", style = MaterialTheme.typography.labelMedium, maxLines = 1)
-                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                    TextButton(onClick = { onOpenSession(session.id) }) { Text("Open") }
-                    TextButton(onClick = { onPreviewSession(session.id) }) { Text("Preview") }
-                    TextButton(onClick = { onCloseSession(session.id) }) { Text("Close") }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                    TextButton(onClick = { onStopSession(session.id) }) { Text("Stop") }
-                    TextButton(onClick = { onForkSession(session.id) }) { Text("Fork") }
-                    TextButton(onClick = { onDeleteSession(session.id) }) { Text("Delete") }
-                }
-                if (state.previewSessionId == session.id) {
-                    state.previewMessages.takeLast(8).forEach { message ->
-                        Text(
-                            "${message.role}: ${message.text}",
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 3,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun TerminalGrid(
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow>,
+    scrollbackLoading: Boolean,
+    scrollbackHasMore: Boolean,
+    scrollbackError: String?,
+    onLoadScrollback: () -> Unit,
+    onRestartScrollback: () -> Unit,
     modifier: Modifier,
     onRequestKeyboard: () -> Unit,
     metrics: TerminalMetrics,
@@ -826,6 +718,52 @@ private fun TerminalGrid(
     val listState = rememberLazyListState(
         initialFirstVisibleItemIndex = scrollback.size.coerceAtMost(terminalRows.lastIndex.coerceAtLeast(0)),
     )
+    val loading by rememberUpdatedState(scrollbackLoading)
+    val hasMore by rememberUpdatedState(scrollbackHasMore && screen != null)
+    val loadOlder by rememberUpdatedState(onLoadScrollback)
+    val restartHistory by rememberUpdatedState(onRestartScrollback)
+    val historySize by rememberUpdatedState(scrollback.size)
+    val revision by rememberUpdatedState(screen?.revision)
+    // Cached history can outlive this screen while the API view is open. Start
+    // a fresh browse on the next drag from live output when returning to it.
+    var lastBrowseRevision by remember {
+        mutableStateOf(if (scrollback.isNotEmpty() || !scrollbackHasMore) null else screen?.revision)
+    }
+    var requestedDuringDrag by remember { mutableStateOf(false) }
+    var dragStartedAtLiveOutput by remember { mutableStateOf(false) }
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction is DragInteraction.Start) {
+                requestedDuringDrag = false
+                // A terminal shorter than the drawable area cannot scroll its
+                // first live row all the way to the top; its tail is live too.
+                dragStartedAtLiveOutput = listState.firstVisibleItemIndex >= historySize ||
+                    !listState.canScrollForward
+            }
+        }
+    }
+    val historyScroll = remember(listState) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                // Only a deliberate drag toward older output requests a page. A page
+                // insertion, live update, fling, or recomposition never starts a request.
+                if (source == NestedScrollSource.UserInput && available.y > 0f &&
+                    !requestedDuringDrag && !loading && revision != null
+                ) {
+                    if (dragStartedAtLiveOutput && revision != lastBrowseRevision) {
+                        requestedDuringDrag = true
+                        lastBrowseRevision = revision
+                        restartHistory()
+                    } else if (listState.firstVisibleItemIndex <= 6 && hasMore) {
+                        requestedDuringDrag = true
+                        lastBrowseRevision = revision
+                        loadOlder()
+                    }
+                }
+                return Offset.Zero
+            }
+        }
+    }
     val density = LocalDensity.current
     Box(
         modifier.clickable(onClick = onRequestKeyboard).testTag("terminal-grid"),
@@ -833,14 +771,34 @@ private fun TerminalGrid(
         SelectionContainer {
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize().testTag("terminal-render-content"),
+                modifier = Modifier.fillMaxSize().nestedScroll(historyScroll).testTag("terminal-render-content"),
             ) {
                 itemsIndexed(
                     terminalRows,
-                    key = { index, _ -> "${screen?.tabId ?: "none"}:$index" },
+                    key = { index, _ ->
+                        val tabId = screen?.tabId ?: "none"
+                        if (index < scrollback.size) {
+                            "$tabId:history:${scrollback.size - index - 1}"
+                        } else {
+                            "$tabId:live:${index - scrollback.size}"
+                        }
+                    },
                 ) { index, row ->
                     TerminalRowGrid(row, index, metrics)
                 }
+            }
+        }
+        if (scrollbackLoading || scrollbackError != null) {
+            Surface(
+                modifier = Modifier.align(Alignment.TopCenter).padding(8.dp),
+                shape = MaterialTheme.shapes.small,
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+            ) {
+                Text(
+                    if (scrollbackLoading) "Loading history…" else "Couldn’t load history. Scroll back to retry.",
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                )
             }
         }
         val cursor = screen?.cursor

@@ -3,6 +3,7 @@ package com.adroited.aiterm.remote
 import com.adroited.aiterm.terminal.TerminalScreenStore
 import com.adroited.aiterm.terminal.ApplyResult
 import com.adroited.aiterm.terminal.ScreenRow
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineStart
@@ -44,6 +45,9 @@ data class RemoteClientState(
     val readOnly: Boolean = true,
     val showTakeFocus: Boolean = false,
     val pendingTransfers: Int = 0,
+    val scrollbackLoading: Boolean = false,
+    val scrollbackHasMore: Boolean = true,
+    val scrollbackError: String? = null,
     val tabs: List<RemoteTab> = emptyList(),
     val sessions: List<RemoteSession> = emptyList(),
     val sessionsRefreshing: Boolean = false,
@@ -192,6 +196,7 @@ class RemoteClient(
     private val terminalSubmissionMutex = Mutex()
     private val transfers = linkedSetOf<String>()
     private val terminalAssembler = TerminalTransferAssembler()
+    private val scrollbackAssembler = TerminalTransferAssembler(maxScrollbackRows = 512)
     private val rosterAssembler = RosterTransferAssembler()
     private var transport: RemoteTransport? = null
     private var eventJob: Job? = null
@@ -538,7 +543,7 @@ class RemoteClient(
             activeAttachmentTabId = null
             screenStore.clear()
             mutableScrollback.value = emptyList()
-            scrollbackRequest = null
+            resetScrollbackLocked()
             terminalAssembler.clear()
             recoveryRequested = false
             mutableState.value = mutableState.value.copy(
@@ -584,59 +589,93 @@ class RemoteClient(
     fun requestScrollback(offset: Int, count: Int): Boolean {
         if (offset < 0 || count !in 1..512) return false
         val context = synchronized(lifecycleLock) {
-            if (scrollbackRequest != null || offset != mutableScrollback.value.size) return false
+            if (mutableState.value.connection != ConnectionState.Connected ||
+                !mutableState.value.scrollbackHasMore || scrollbackRequest != null ||
+                offset != mutableScrollback.value.size || offset >= MAX_SCROLLBACK_ROWS
+            ) return false
             val (tabId, attachmentId) = activeTarget() ?: return false
             val active = transport ?: return false
-            ScrollbackRequest(lifecycleGeneration, active, tabId, attachmentId, offset).also {
+            ScrollbackRequest(
+                lifecycleGeneration, active, tabId, attachmentId, offset,
+                count.coerceAtMost(MAX_SCROLLBACK_ROWS - offset),
+            ).also {
                 scrollbackRequest = it
+                mutableState.value = mutableState.value.copy(scrollbackLoading = true, scrollbackError = null)
             }
         }
         val response = context.transport.request(
             "terminal.scrollback",
-            RemoteCommands.scrollback(context.tabId, context.attachmentId, offset, count),
+            RemoteCommands.scrollback(context.tabId, context.attachmentId, offset, context.count),
         ) { requestId ->
             synchronized(lifecycleLock) {
                 if (scrollbackRequest === context) context.requestId = requestId
             }
         }
+        synchronized(lifecycleLock) {
+            context.response = response
+            if (scrollbackRequest !== context) context.transport.abandonRequest(response)
+        }
         val launched = launchOwned(context.lifecycleGeneration) {
             try {
-                when (val result = response.await()) {
-                    is RemoteResponse.Error -> {
-                        synchronized(lifecycleLock) {
-                            if (scrollbackRequest === context) scrollbackRequest = null
-                        }
-                        accept(
-                            context.lifecycleGeneration,
-                            RemoteServerEvent.Failure(result.code, result.message),
-                            context.transport,
-                        )
+                withTimeout(SCROLLBACK_TIMEOUT_MILLIS) {
+                    when (val result = response.await()) {
+                        is RemoteResponse.Error -> failScrollback(context, result.message)
+                        // The reader completes the response after queuing the final chunk. Wait
+                        // until our collector has published that chunk before ending the deadline.
+                        is RemoteResponse.Success -> context.published.await()
                     }
-                    is RemoteResponse.Success -> Unit
                 }
+            } catch (_: TimeoutCancellationException) {
+                failScrollback(context, "History timed out. Scroll up to try again.")
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error
-            } catch (error: Exception) {
-                synchronized(lifecycleLock) {
-                    if (scrollbackRequest === context) scrollbackRequest = null
-                }
-                acceptRequestFailure(
-                    context.lifecycleGeneration,
-                    context.transport,
-                    error,
-                )
+            } catch (_: Exception) {
+                failScrollback(context, "History could not be loaded. Scroll up to try again.")
             }
         }
         if (!launched) {
-            response.cancel()
-            synchronized(lifecycleLock) { if (scrollbackRequest === context) scrollbackRequest = null }
+            failScrollback(context, "History is busy. Scroll up to try again.")
             return false
         }
         return true
     }
 
+    private fun failScrollback(context: ScrollbackRequest, message: String) {
+        synchronized(lifecycleLock) {
+            if (scrollbackRequest !== context || !isCurrent(context.lifecycleGeneration, context.transport)) return
+            scrollbackRequest = null
+            scrollbackAssembler.clear()
+            context.response?.let(context.transport::abandonRequest)
+            context.published.complete(Unit)
+            mutableState.value = mutableState.value.copy(scrollbackLoading = false, scrollbackError = message)
+        }
+    }
+
+    private fun resetScrollbackLocked() {
+        val previous = scrollbackRequest
+        scrollbackRequest = null
+        scrollbackAssembler.clear()
+        previous?.let { paging ->
+            paging.response?.let(paging.transport::abandonRequest)
+            paging.published.cancel()
+        }
+        mutableState.value = mutableState.value.copy(
+            scrollbackLoading = false, scrollbackHasMore = true, scrollbackError = null,
+        )
+    }
+
     fun requestNextScrollbackPage(count: Int = 128): Boolean =
         requestScrollback(mutableScrollback.value.size, count)
+
+    /** Starts a new history browse from the current viewport after live output has advanced. */
+    fun restartScrollback(): Boolean {
+        synchronized(lifecycleLock) {
+            if (mutableState.value.connection != ConnectionState.Connected || activeTarget() == null) return false
+            resetScrollbackLocked()
+            mutableScrollback.value = emptyList()
+        }
+        return requestScrollback(0, 128)
+    }
 
     fun refreshSessions() {
         synchronized(lifecycleLock) {
@@ -916,6 +955,38 @@ class RemoteClient(
         launchRequest("tab.close", RemoteCommands.tab(tabId))
     }
 
+    /** Opens the requested terminal without exposing a previous selection to the UI. */
+    suspend fun openTerminalTarget(sessionId: String?, size: TerminalSize): String {
+        val context = synchronized(lifecycleLock) {
+            check(mutableState.value.connection == ConnectionState.Connected) { "Connect to the desktop first." }
+            RequestContext(lifecycleGeneration, checkNotNull(transport))
+        }
+        val kind = if (sessionId == null) "tab.open" else "session.open"
+        val payload = if (sessionId == null) RemoteCommands.shell(null, null, size)
+            else RemoteCommands.openSession(sessionId, size)
+        val response = context.transport.request(kind, payload)
+        try {
+            val result = response.await()
+            val tabId = when (result) {
+                is RemoteResponse.Error -> throw RemoteProtocolException(result.message)
+                is RemoteResponse.Success -> {
+                    check(result.kind == kind) { "The desktop returned an unexpected terminal response." }
+                    if (sessionId == null) RemoteCommands.openedTab(result.payload)
+                    else RemoteCommands.openedSessionTab(result.payload)
+                }
+            }
+            synchronized(lifecycleLock) {
+                check(isCurrent(context.lifecycleGeneration, context.transport) &&
+                    mutableState.value.connection == ConnectionState.Connected
+                ) { "The desktop connection changed while opening the terminal." }
+                selectTab(tabId)
+            }
+            return tabId
+        } finally {
+            if (!response.isCompleted) context.transport.abandonRequest(response)
+        }
+    }
+
     fun openShell(projectPath: String?, size: TerminalSize) {
         launchRequest("tab.open", RemoteCommands.shell(projectPath, null, size)) { payload ->
             selectTab(RemoteCommands.openedTab(payload))
@@ -964,7 +1035,7 @@ class RemoteClient(
             activeAttachmentTabId = null
             screenStore.clear()
             mutableScrollback.value = emptyList()
-            scrollbackRequest = null
+            resetScrollbackLocked()
             mutableState.value = RemoteClientState(connection = ConnectionState.Locked)
         }
     }
@@ -1130,6 +1201,7 @@ class RemoteClient(
                     terminalAssembler.clear()
                     screenStore.clear()
                     mutableScrollback.value = emptyList()
+                    resetScrollbackLocked()
                     mutableState.value = mutableState.value.copy(
                         focus = FocusOwner.Unowned,
                         readOnly = true,
@@ -1290,6 +1362,27 @@ class RemoteClient(
             if (paging.tabId != chunk.tabId || paging.attachmentId != chunk.attachmentId ||
                 paging.requestId == null || paging.requestId != chunk.requestId
             ) return
+            when (val result = scrollbackAssembler.accept(chunk)) {
+                TerminalTransferResult.Pending -> Unit
+                is TerminalTransferResult.Scrollback -> {
+                    if (result.rows.size > paging.count || paging.offset != mutableScrollback.value.size) {
+                        failScrollback(paging, "History could not be loaded. Scroll up to try again.")
+                        return
+                    }
+                    // Freeze already fetched context while live viewport output continues.
+                    mutableScrollback.value = mutableScrollback.value + result.rows
+                    scrollbackRequest = null
+                    mutableState.value = mutableState.value.copy(
+                        scrollbackLoading = false,
+                        scrollbackHasMore = result.rows.size == paging.count &&
+                            mutableScrollback.value.size < MAX_SCROLLBACK_ROWS,
+                        scrollbackError = null,
+                    )
+                    paging.published.complete(Unit)
+                }
+                else -> failScrollback(paging, "History could not be loaded. Scroll up to try again.")
+            }
+            return
         }
         when (val result = terminalAssembler.accept(chunk)) {
             TerminalTransferResult.Pending -> mutableState.value = mutableState.value.copy(pendingTransfers = 1)
@@ -1312,16 +1405,7 @@ class RemoteClient(
                     requestRecovery(chunk.tabId, result.attachmentId)
                 }
             }
-            is TerminalTransferResult.Scrollback -> {
-                mutableState.value = mutableState.value.copy(pendingTransfers = 0)
-                val paging = scrollbackRequest
-                if (paging != null && result.tabId == screenStore.screen.value?.tabId &&
-                    paging.offset == mutableScrollback.value.size
-                ) {
-                    mutableScrollback.value = (mutableScrollback.value + result.rows).take(MAX_SCROLLBACK_ROWS)
-                }
-                scrollbackRequest = null
-            }
+            is TerminalTransferResult.Scrollback -> Unit
         }
     }
 
@@ -1376,7 +1460,7 @@ class RemoteClient(
         terminalAssembler.clear()
         rosterAssembler.clear()
         recoveryRequested = false
-        scrollbackRequest = null
+        resetScrollbackLocked()
         activeAttachmentId = null
         activeAttachmentTabId = null
         return ClosingTransport(active, jobs)
@@ -1387,7 +1471,7 @@ class RemoteClient(
         terminalAssembler.clear()
         rosterAssembler.clear()
         recoveryRequested = false
-        scrollbackRequest = null
+        resetScrollbackLocked()
         activeAttachmentId = null
         activeAttachmentTabId = null
         screenStore.clear()
@@ -1413,7 +1497,7 @@ class RemoteClient(
             terminalAssembler.clear()
             rosterAssembler.clear()
             recoveryRequested = false
-            scrollbackRequest = null
+            resetScrollbackLocked()
             mutableState.value = mutableState.value.copy(
                 connection = connectingState,
                 connectedEndpoint = null,
@@ -1643,7 +1727,10 @@ class RemoteClient(
         val tabId: String,
         val attachmentId: String,
         val offset: Int,
+        val count: Int,
         var requestId: Long? = null,
+        var response: Deferred<RemoteResponse>? = null,
+        val published: CompletableDeferred<Unit> = CompletableDeferred(),
     )
     private data class Selection(
         val lifecycleGeneration: Long,
@@ -1657,6 +1744,7 @@ class RemoteClient(
         const val MAX_PENDING_TRANSFERS = 4
         const val MAX_INPUT_BYTES = 64 * 1_024
         const val MAX_SCROLLBACK_ROWS = 5_000
+        const val SCROLLBACK_TIMEOUT_MILLIS = 8_000L
         const val MAX_OWNED_JOBS = 64
         const val UPLOAD_CLEANUP_TIMEOUT_MILLIS = 2_000L
         const val UPLOAD_RESUME_TIMEOUT_MILLIS = 2 * 60_000L

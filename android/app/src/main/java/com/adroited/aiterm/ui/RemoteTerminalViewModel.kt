@@ -108,6 +108,20 @@ class RemoteTerminalViewModel(
         client.refreshAgents()
     }
 
+    /** Wait for this exact terminal before navigating, so an old tab never takes focus. */
+    suspend fun openTerminal(sessionId: String?): Result<Unit> = try {
+        val ready = withTimeoutOrNull(15_000) {
+            val tabId = client.openTerminalTarget(sessionId, TerminalSize(80, 24))
+            client.screen.filterNotNull().first { it.tabId == tabId }
+        }
+        if (ready == null) Result.failure(IllegalStateException("The terminal did not open in time. Try again."))
+        else Result.success(Unit)
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        Result.failure(error)
+    }
+
     fun selectTab(tabId: String) = client.selectTab(tabId)
     fun sendInput(text: String) = client.sendInput(text)
     suspend fun submitInputs(tabId: String, texts: List<String>) = client.submitInputs(tabId, texts)

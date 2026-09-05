@@ -147,6 +147,7 @@ import com.adroited.aiterm.remote.RemoteUsageSource
 import com.adroited.aiterm.remote.SpinePhase
 import com.adroited.aiterm.ui.theme.AgentIcon
 import java.io.File
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -171,6 +172,49 @@ fun RemoteDesktopScreen(
     var selectedSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     var webPreviewUrl by rememberSaveable { mutableStateOf<String?>(null) }
     val selected = selectedSessionId?.let { id -> state.sessions.firstOrNull { it.id == id } }
+    val terminalScope = rememberCoroutineScope()
+    var terminalOpening by remember { mutableStateOf(false) }
+    var terminalError by remember { mutableStateOf<String?>(null) }
+    var terminalOpenJob by remember { mutableStateOf<Job?>(null) }
+
+    fun openTerminal(sessionId: String?) {
+        if (terminalOpening) return
+        terminalOpening = true
+        terminalOpenJob = terminalScope.launch {
+            try {
+                viewModel.openTerminal(sessionId).fold(
+                    onSuccess = {
+                        selectedSessionId = sessionId
+                        page = PAGE_TERMINAL
+                    },
+                    onFailure = { terminalError = it.message ?: "Could not open the terminal." },
+                )
+            } finally {
+                terminalOpening = false
+            }
+        }
+    }
+
+    if (terminalOpening) {
+        AlertDialog(
+            onDismissRequest = { terminalOpenJob?.cancel() },
+            title = { Text("Opening terminal") },
+            text = { CircularProgressIndicator(Modifier.size(28.dp)) },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { terminalOpenJob?.cancel() }) { Text("Cancel") }
+            },
+        )
+    }
+    terminalError?.let { message ->
+        AlertDialog(
+            onDismissRequest = { terminalError = null },
+            title = { Text("Could not open terminal") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { terminalError = null }) { Text("Close") } },
+        )
+    }
+
 
     when (page) {
         PAGE_WEB_PREVIEW -> {
@@ -213,6 +257,7 @@ fun RemoteDesktopScreen(
                 onBringIn = viewModel.client::bringInSession,
                 onStar = viewModel.client::starSession,
                 onOpen = { viewModel.openSession(it, 80, 24) },
+                onOpenTerminal = { openTerminal(selected.id) },
                 onStop = viewModel::stopSession,
                 onLoadFiles = viewModel::sessionChanges,
                 onLoadFile = viewModel::sessionFilePreview,
@@ -248,10 +293,7 @@ fun RemoteDesktopScreen(
                 viewModel.previewSession(session.id)
                 page = PAGE_CONVERSATION
             },
-            onOpenTerminal = {
-                selectedSessionId = null
-                page = PAGE_TERMINAL
-            },
+            onOpenTerminal = { openTerminal(null) },
         )
     }
 }
@@ -931,6 +973,7 @@ private fun RemoteConversationContent(
     onBringIn: (String, String, String?, String?, String, Int, Boolean) -> Unit,
     onStar: (String, Boolean) -> Unit,
     onOpen: (String) -> Unit,
+    onOpenTerminal: () -> Unit,
     onStop: (String) -> Unit,
     onLoadFiles: suspend (String) -> Result<List<RemoteSessionChange>>,
     onLoadFile: suspend (String, String, Int) -> Result<RemoteSessionFilePreview>,
@@ -1315,6 +1358,12 @@ private fun RemoteConversationContent(
                         Icon(Icons.Filled.MoreVert, contentDescription = "Session actions")
                     }
                     DropdownMenu(expanded = showActions, onDismissRequest = { showActions = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Open terminal") },
+                            leadingIcon = { Icon(Icons.Filled.Terminal, contentDescription = null) },
+                            enabled = state.connection == ConnectionState.Connected,
+                            onClick = { showActions = false; onOpenTerminal() },
+                        )
                         DropdownMenuItem(
                             text = { Text("Bring in a second agent") },
                             onClick = { showActions = false; showBringIn = true },

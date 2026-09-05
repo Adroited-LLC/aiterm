@@ -980,6 +980,216 @@ class RemoteClientTest {
     }
 
     @Test
+    fun scrollbackStopsAtShortPagesAndKeepsLoadedRowsWhenTheViewportChanges() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        client.acceptForTest(snapshotChunk("initial", "tab-1", "attachment-1", "live"))
+        assertTrue(client.requestNextScrollbackPage(2))
+        val request = transport.requests.last()
+        client.acceptForTest(scrollbackChunk(request.requestId, "older"))
+        assertFalse(client.state.value.scrollbackLoading)
+        assertFalse(client.state.value.scrollbackHasMore)
+        assertFalse(client.requestNextScrollbackPage())
+        client.acceptForTest(snapshotChunk("live", "tab-1", "attachment-1", "changed"))
+        assertEquals(listOf("older"), client.scrollback.value.map(ScreenRow::plainText))
+        client.lock()
+    }
+
+    @Test
+    fun restartingHistoryAfterNewOutputClearsEofAndAbandonsAnOlderBrowse() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        client.acceptForTest(snapshotChunk("initial", "tab-1", "attachment-1", "live"))
+        client.requestNextScrollbackPage()
+        client.acceptForTest(scrollbackChunk(transport.requests.last().requestId, "old"))
+        assertFalse(client.state.value.scrollbackHasMore)
+
+        val changed = snapshotChunk("changed", "tab-1", "attachment-1", "new output")
+        client.acceptForTest(changed.copy(chunk = changed.chunk.copy(baseRevision = 2, finalRevision = 2)))
+        assertEquals(listOf("old"), client.scrollback.value.map(ScreenRow::plainText))
+        assertTrue(client.restartScrollback())
+        val firstRestart = transport.requests.last()
+        assertArrayEquals(RemoteCommands.scrollback("tab-1", "attachment-1", 0, 128), firstRestart.payload)
+        assertTrue(client.scrollback.value.isEmpty())
+        assertTrue(client.state.value.scrollbackLoading)
+        assertTrue(client.state.value.scrollbackHasMore)
+        assertEquals(null, client.state.value.scrollbackError)
+
+        assertTrue(client.restartScrollback())
+        val current = transport.requests.last()
+        assertEquals(1, transport.abandonedRequests.size)
+        client.acceptForTest(scrollbackChunk(firstRestart.requestId, "stale"))
+        assertTrue(client.scrollback.value.isEmpty())
+        client.acceptForTest(scrollbackChunk(current.requestId, "new history"))
+        assertEquals(listOf("new history"), client.scrollback.value.map(ScreenRow::plainText))
+        assertFalse(client.state.value.scrollbackLoading)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertFalse(transport.closed)
+        client.lock()
+        assertFalse(client.restartScrollback())
+    }
+
+    @Test
+    fun emptyScrollbackAndTheFiveThousandRowLimitStopFurtherRequests() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        var remaining = 5_000
+        while (remaining > 0) {
+            assertTrue(client.requestNextScrollbackPage(512))
+            val request = transport.requests.last()
+            val count = minOf(512, remaining)
+            val page = scrollbackChunk(request.requestId, "row")
+            client.acceptForTest(page.copy(chunk = page.chunk.copy(
+                rowEnd = count,
+                part = TerminalTransferPart.Scrollback(List(count) { ScreenRow(listOf(ScreenCell("x"))) }),
+            )))
+            remaining -= count
+        }
+        assertEquals(5_000, client.scrollback.value.size)
+        assertFalse(client.state.value.scrollbackHasMore)
+        assertFalse(client.requestNextScrollbackPage())
+        client.lock()
+
+        val emptyTransport = FakeRemoteTransport()
+        val emptyClient = uploadClient(emptyTransport, this, StandardTestDispatcher(testScheduler))
+        emptyClient.connect()
+        emptyClient.selectTab("tab-1")
+        runCurrent()
+        emptyClient.requestNextScrollbackPage()
+        val page = scrollbackChunk(emptyTransport.requests.last().requestId, "unused")
+        emptyClient.acceptForTest(page.copy(chunk = page.chunk.copy(
+            rowEnd = 0, part = TerminalTransferPart.Scrollback(emptyList()),
+        )))
+        assertFalse(emptyClient.state.value.scrollbackHasMore)
+        assertFalse(emptyClient.state.value.scrollbackLoading)
+        assertFalse(emptyClient.requestNextScrollbackPage())
+        emptyClient.lock()
+    }
+
+    @Test
+    fun scrollbackTimeoutAbandonsTheRequestAndLateChunksCannotReplaceARetry() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { CompletableDeferred() }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        assertTrue(client.requestNextScrollbackPage())
+        val oldRequest = transport.requests.last()
+        assertTrue(client.state.value.scrollbackLoading)
+        advanceTimeBy(8_001)
+        runCurrent()
+        assertFalse(client.state.value.scrollbackLoading)
+        assertTrue(client.state.value.scrollbackError != null)
+        assertEquals(1, transport.abandonedRequests.size)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertFalse(transport.closed)
+
+        assertTrue(client.requestNextScrollbackPage())
+        val retry = transport.requests.last()
+        client.acceptForTest(scrollbackChunk(oldRequest.requestId, "stale"))
+        assertTrue(client.state.value.scrollbackLoading)
+        assertTrue(client.scrollback.value.isEmpty())
+        client.acceptForTest(scrollbackChunk(retry.requestId, "current"))
+        assertEquals(listOf("current"), client.scrollback.value.map(ScreenRow::plainText))
+        assertEquals(null, client.state.value.scrollbackError)
+        client.lock()
+    }
+
+    @Test
+    fun failedAndMalformedScrollbackPagesStayLocalAndAllowRetry() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request ->
+            CompletableDeferred(RemoteResponse.Error(request.requestId, "history.failed", "History unavailable"))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        client.requestNextScrollbackPage()
+        runCurrent()
+        assertEquals("History unavailable", client.state.value.scrollbackError)
+        assertFalse(client.state.value.scrollbackLoading)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertFalse(transport.closed)
+
+        transport.responseFor = { CompletableDeferred() }
+        assertTrue(client.requestNextScrollbackPage())
+        val request = transport.requests.last()
+        val invalid = scrollbackChunk(request.requestId, "invalid")
+        client.acceptForTest(invalid.copy(chunk = invalid.chunk.copy(index = 1, total = 2)))
+        assertFalse(client.state.value.scrollbackLoading)
+        assertTrue(client.state.value.scrollbackError != null)
+        assertFalse(transport.requests.any { it.kind == "terminal.resume" })
+        assertTrue(client.requestNextScrollbackPage())
+        client.lock()
+    }
+
+    @Test
+    fun liveSnapshotsCanArriveBetweenChunksOfAHistoryPage() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        client.requestNextScrollbackPage(2)
+        val request = transport.requests.last()
+        val first = scrollbackChunk(request.requestId, "newer")
+        client.acceptForTest(first.copy(chunk = first.chunk.copy(total = 2)))
+        assertTrue(client.state.value.scrollbackLoading)
+        client.acceptForTest(snapshotChunk("live", "tab-1", "attachment-1", "output"))
+        val second = scrollbackChunk(request.requestId, "older")
+        client.acceptForTest(second.copy(chunk = second.chunk.copy(index = 1, total = 2, rowStart = 1, rowEnd = 2)))
+        assertEquals(listOf("newer", "older"), client.scrollback.value.map(ScreenRow::plainText))
+        assertTrue(client.state.value.scrollbackHasMore)
+        assertFalse(client.state.value.scrollbackLoading)
+        client.lock()
+    }
+
+    @Test
+    fun reconnectClearsHistoryPagingAndOldFailuresCannotClearTheNewRequest() = runTest {
+        val old = FakeRemoteTransport()
+        val pending = CompletableDeferred<RemoteResponse>()
+        old.responseFor = { pending }
+        val current = FakeRemoteTransport()
+        current.responseFor = { CompletableDeferred() }
+        val transports = ArrayDeque(listOf(old, current))
+        val client = RemoteClient(
+            transportFactory = { transports.removeFirst() },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        client.requestNextScrollbackPage()
+        runCurrent()
+        client.connect()
+        runCurrent()
+        assertFalse(client.state.value.scrollbackLoading)
+        assertTrue(client.state.value.scrollbackHasMore)
+        assertEquals(1, old.abandonedRequests.size)
+        assertTrue(client.requestNextScrollbackPage())
+        pending.completeExceptionally(RemoteProtocolException("old connection ended"))
+        runCurrent()
+        assertTrue(client.state.value.scrollbackLoading)
+        assertEquals(null, client.state.value.scrollbackError)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        client.lock()
+    }
+
+    @Test
     fun completeScrollbackPageIsPublishedOnlyForTheVisibleTab() = runTest {
         val store = DefaultTerminalScreenStore()
         store.replace(

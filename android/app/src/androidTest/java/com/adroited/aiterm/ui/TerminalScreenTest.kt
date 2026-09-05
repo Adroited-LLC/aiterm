@@ -10,6 +10,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
@@ -17,6 +18,7 @@ import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -25,6 +27,9 @@ import androidx.compose.ui.test.onFirst
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performImeAction
+import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeDown
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.core.view.WindowCompat
@@ -33,9 +38,6 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
 import com.adroited.aiterm.remote.RemoteClientState
-import com.adroited.aiterm.remote.RemoteAgentChoice
-import com.adroited.aiterm.remote.RemoteModelOption
-import com.adroited.aiterm.remote.RemoteSession
 import com.adroited.aiterm.remote.RemoteUploadException
 import com.adroited.aiterm.remote.RemoteUploadProgress
 import com.adroited.aiterm.terminal.CursorState
@@ -592,12 +594,12 @@ class TerminalScreenTest {
             )
         }
 
-        compose.onNodeWithText("Back").performClick()
+        compose.onNodeWithContentDescription("Back").performClick()
         compose.onNodeWithTag("terminal-draft-discard-dialog").assertIsDisplayed()
         compose.onNodeWithText("Keep editing").performClick()
         compose.runOnIdle { assertEquals(0, left); assertTrue(image.file.exists()) }
 
-        compose.onNodeWithText("Back").performClick()
+        compose.onNodeWithContentDescription("Back").performClick()
         compose.onNodeWithText("Discard drafts and leave").performClick()
         compose.runOnIdle {
             assertEquals(1, left)
@@ -916,49 +918,21 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun sessionsDrawerOmitsTheAgentLauncherForTheRemoteClient() {
+    fun terminalHasOneBackArrowAndNoSessionManagementDrawer() {
+        var backRequests = 0
         compose.setContent {
             TerminalScreenContent(
-                state = RemoteClientState(
-                    connection = ConnectionState.Connected,
-                    sessions = listOf(
-                        RemoteSession(
-                            id = "session-1",
-                            agent = "codex",
-                            title = "AITerm",
-                            projectPath = "/projects/aiterm",
-                            groupPath = "/projects/aiterm",
-                            forked = false,
-                            background = false,
-                            lastActive = 1,
-                        ),
-                    ),
-                    agents = listOf(
-                        RemoteAgentChoice(
-                            id = "codex",
-                            displayName = "Codex",
-                            models = listOf(
-                                RemoteModelOption(
-                                    id = "gpt-5",
-                                    displayName = "GPT-5",
-                                    efforts = listOf("high"),
-                                ),
-                            ),
-                            mintsSessionId = true,
-                        ),
-                    ),
-                ),
-                screen = null,
+                state = connectedState(),
+                screen = oneCellScreen("tab-back-arrow"),
+                onBack = { backRequests++ },
             )
         }
 
-        compose.onNodeWithText("Sessions").performClick()
-        compose.waitForIdle()
-
-        compose.onNodeWithText("LIVE TABS").assertIsDisplayed()
-        compose.onNodeWithText("SESSIONS").assertIsDisplayed()
-        assertTrue(compose.onAllNodesWithText("NEW AGENT").fetchSemanticsNodes().isEmpty())
-        assertTrue(compose.onAllNodesWithText("Start Codex · GPT-5 · high").fetchSemanticsNodes().isEmpty())
+        compose.onNodeWithText("Sessions").assertDoesNotExist()
+        compose.onNodeWithText("LIVE TABS").assertDoesNotExist()
+        compose.onNodeWithTag("load-scrollback").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Back").assertIsDisplayed().performClick()
+        compose.runOnIdle { assertEquals(1, backRequests) }
     }
 
     @Test
@@ -1345,6 +1319,172 @@ class TerminalScreenTest {
         assertTrue("composed $composedRows rows", composedRows < 100)
         assertEquals(5_000, history.size)
     }
+
+    @Test
+    fun draggingBackLoadsHistoryOnceWithoutLoadingOnEntry() {
+        val state = mutableStateOf(connectedState())
+        var requests = 0
+        compose.setContent {
+            TerminalScreenContent(
+                state = state.value,
+                screen = oneCellScreen("tab-history-drag"),
+                onLoadScrollback = {
+                    requests++
+                    state.value = state.value.copy(scrollbackLoading = true)
+                },
+            )
+        }
+        compose.runOnIdle { assertEquals(0, requests) }
+
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+
+        compose.runOnIdle { assertEquals(1, requests) }
+        compose.onNodeWithText("Loading history…").assertIsDisplayed()
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+        compose.runOnIdle { assertEquals(1, requests) }
+    }
+
+    @Test
+    fun failedHistoryLoadRetriesOnlyAfterAnotherDeliberateDragAndStopsAtTheEnd() {
+        val state = mutableStateOf(connectedState().copy(scrollbackError = "Timed out"))
+        var requests = 0
+        compose.setContent {
+            TerminalScreenContent(
+                state = state.value,
+                screen = oneCellScreen("tab-history-retry"),
+                onLoadScrollback = {
+                    requests++
+                    state.value = state.value.copy(scrollbackLoading = true, scrollbackError = null)
+                },
+            )
+        }
+        compose.runOnIdle { assertEquals(0, requests) }
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+        compose.runOnIdle {
+            assertEquals(1, requests)
+            state.value = state.value.copy(scrollbackLoading = false, scrollbackError = "Timed out")
+        }
+        compose.runOnIdle { assertEquals(1, requests) }
+
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+        compose.runOnIdle {
+            assertEquals(2, requests)
+            state.value = state.value.copy(scrollbackLoading = false, scrollbackHasMore = false)
+        }
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+        compose.runOnIdle { assertEquals(2, requests) }
+    }
+
+    @Test
+    fun olderPagesAndLiveOutputPreserveTheVisibleHistoryAnchor() {
+        val history = mutableStateOf(List(100) { index -> historyRow("history-$index") })
+        val screen = mutableStateOf(oneCellScreen("tab-history-anchor"))
+        var requests = 0
+        compose.setContent {
+            Box(Modifier.size(400.dp, 400.dp)) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = screen.value,
+                    scrollback = history.value,
+                    onLoadScrollback = { requests++ },
+                )
+            }
+        }
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performScrollToIndex(25)
+        compose.runOnIdle { assertEquals(0, requests) }
+        val firstHistory = compose.onAllNodesWithTag("terminal-row", useUnmergedTree = true).fetchSemanticsNodes()
+            .first { it.boundsInRoot.height > 0f }
+        val anchorText = firstHistory.config[SemanticsProperties.Text].first().text
+        val anchorTop = firstHistory.boundsInRoot.top
+
+        compose.runOnIdle {
+            history.value = history.value + List(100) { index -> historyRow("older-$index") }
+            screen.value = screen.value.copy(revision = 2, visible = listOf(historyRow("new output")))
+        }
+
+        val anchoredRow = compose.onAllNodesWithTag("terminal-row", useUnmergedTree = true).fetchSemanticsNodes()
+            .first { it.config[SemanticsProperties.Text].first().text == anchorText }
+        assertEquals(anchorTop, anchoredRow.boundsInRoot.top, 1f)
+        compose.runOnIdle { assertEquals(0, requests) }
+    }
+
+    @Test
+    fun newLiveOutputRestartsHistoryAfterAnEarlierEndOnlyOnBackwardDrag() {
+        val screen = mutableStateOf(oneCellScreen("tab-history-refresh"))
+        val state = mutableStateOf(connectedState())
+        var restarts = 0
+        var pageRequests = 0
+        compose.setContent {
+            TerminalScreenContent(
+                state = state.value,
+                screen = screen.value,
+                onLoadScrollback = {
+                    pageRequests++
+                    state.value = state.value.copy(scrollbackHasMore = false)
+                },
+                onRestartScrollback = {
+                    restarts++
+                    state.value = state.value.copy(scrollbackLoading = true, scrollbackHasMore = true)
+                },
+            )
+        }
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+        compose.runOnIdle {
+            assertEquals(0, restarts)
+            screen.value = screen.value.copy(revision = 2, visible = listOf(historyRow("new output")))
+        }
+        compose.runOnIdle { assertEquals(0, restarts) }
+
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+
+        compose.runOnIdle {
+            assertEquals(1, restarts)
+            assertEquals(1, pageRequests)
+        }
+    }
+
+    @Test
+    fun newLiveOutputDoesNotRestartHistoryWhileDraggingWithinOlderPages() {
+        val screen = mutableStateOf(oneCellScreen("tab-frozen-history"))
+        val history = List(200) { index -> historyRow("history-$index") }
+        var restarts = 0
+        compose.setContent {
+            Box(Modifier.size(400.dp, 400.dp)) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = screen.value,
+                    scrollback = history,
+                    onRestartScrollback = { restarts++ },
+                )
+            }
+        }
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performScrollToIndex(100)
+        compose.runOnIdle { screen.value = screen.value.copy(revision = 2) }
+
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true).performTouchInput { swipeDown() }
+
+        compose.runOnIdle { assertEquals(0, restarts) }
+    }
+
+    @Test
+    fun enteringWithCachedEndOfHistoryRestartsOnTheFirstBackwardDrag() {
+        var restarts = 0
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState().copy(scrollbackHasMore = false),
+                screen = oneCellScreen("tab-cached-eof"),
+                onRestartScrollback = { restarts++ },
+            )
+        }
+        compose.runOnIdle { assertEquals(0, restarts) }
+
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .performTouchInput { swipeDown() }
+
+        compose.runOnIdle { assertEquals(1, restarts) }
+    }
+
+    private fun historyRow(text: String) = ScreenRow(text.map { ScreenCell(it.toString()) })
 
     private fun connectedState() = RemoteClientState(
         connection = ConnectionState.Connected,
