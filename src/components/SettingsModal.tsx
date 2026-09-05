@@ -1,6 +1,7 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { windowsWsl, getWorkspace } from "../platform";
 import ModelAccess from "./ModelAccess";
 import Icon from "./Icon";
 import { X } from "lucide-react";
@@ -50,6 +51,7 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
 
 export type SettingsTab =
   | "appearance"
+  | "windows"
   | "fonts"
   | "agents"
   | "models"
@@ -68,6 +70,7 @@ const NAV: { key: Tab; label: string }[] = [
   { key: "bringin", label: "Bring in" },
   { key: "remote", label: "Remote access" },
   { key: "diagnostics", label: "Diagnostics" },
+  ...(windowsWsl ? [{ key: "windows" as const, label: "Windows" }] : []),
 ];
 
 function ThemeCard({ id, active, onPick }: { id: string; active: boolean; onPick: () => void }) {
@@ -278,7 +281,7 @@ export default function SettingsModal({
       if (!paths.length) return;
       const n = await installFontFiles(paths);
       refreshFonts();
-      setNotice(`Installed ${n} font file${n === 1 ? "" : "s"} to ~/.local/share/fonts.`);
+      setNotice(`Installed ${n} font file${n === 1 ? "" : "s"}${windowsWsl ? " for your Windows account. Restart aiterm to use them." : " to ~/.local/share/fonts."}`);
     } catch (e) {
       setNotice(String(e));
     }
@@ -316,6 +319,11 @@ export default function SettingsModal({
             <button className="icon-btn" title="Close (Esc)" onClick={onClose}><Icon of={X} /></button>
           </div>
           <div className="sm-pane-body" ref={paneRef}>
+            {tab === "windows" && <Group title="Linux workspace">
+              <Row label="Distribution" desc="aiterm uses your default WSL distribution"><span>{getWorkspace()?.distribution}</span></Row>
+              <Row label="Home folder" desc={getWorkspace()?.home}><button className="set-action" onClick={() => void openPath(getWorkspace()!.home)}>Open in Explorer</button></Row>
+              <div className="sgroup-foot">Your sessions, agents, Git repositories, and tools run inside Linux. Appearance and window preferences belong to this Windows app.</div>
+            </Group>}
 
             {tab === "appearance" && <>
               <Group title="Theme">
@@ -493,15 +501,14 @@ export default function SettingsModal({
                 </div>
                 <Row
                   label="Install from file"
-                  desc="Nerd Fonts, anything downloaded — copied to ~/.local/share/fonts"
+                  desc={windowsWsl ? "Install downloaded fonts for your Windows account" : "Nerd Fonts, anything downloaded — copied to ~/.local/share/fonts"}
                 >
                   <button className="set-file-install" onClick={installFiles}>
                     Choose files…
                   </button>
                 </Row>
                 <div className="sgroup-foot">
-                  Packaged fonts come from the Fedora repositories and may ask for
-                  your password.
+                  {windowsWsl ? "The app uses Windows fonts. Fonts installed only inside WSL do not appear here." : "Packaged fonts come from the Fedora repositories and may ask for your password."}
                 </div>
                 {notice && <div className="set-notice">{notice}</div>}
               </Group>

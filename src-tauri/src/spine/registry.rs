@@ -4,6 +4,8 @@
 //! Lives in Tauri managed state as `Arc<Spine>`. See `docs/spine.md` for the
 //! lifecycle this implements.
 
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

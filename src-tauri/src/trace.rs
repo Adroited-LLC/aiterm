@@ -164,7 +164,7 @@ fn open_capture_file() -> bool {
 }
 
 /// Whether verbose capture is on, for the Diagnostics toggle to render.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn trace_status() -> bool {
     CAPTURING.load(Ordering::Relaxed)
 }
@@ -174,7 +174,7 @@ pub fn trace_status() -> bool {
 ///
 /// Truncates on every enable: a trace is for the thing being chased *now*,
 /// and an unbounded append-forever firehose is a disk full of nothing.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn trace_set(on: bool) -> Result<Option<String>, String> {
     let handle = RELOAD.get().ok_or("tracing was never installed")?;
     if on {
@@ -220,6 +220,7 @@ pub fn trace_set(on: bool) -> Result<Option<String>, String> {
 /// terminal-derived output, credentials, or configuration contents are
 /// summarized here instead. This boundary is fail-closed: adding fields to a
 /// sensitive command cannot make their values appear in the trace.
+#[cfg(not(aiterm_headless))]
 pub fn log_invokes<R, F>(
     handler: F,
 ) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static

@@ -220,7 +220,7 @@ export default function RemoteAccessSettings() {
           ) : (
           <Row
             label="Relay server"
-            desc="The first approved phone authorizes this desktop. AITerm creates the private route automatically as part of pairing."
+            desc="Scan a pairing code to set up the relay. Approve the phone on this desktop to grant access."
             wide
           >
             <div className="remote-managed-relay">

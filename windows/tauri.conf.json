@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "aiterm WSL Preview",
+  "version": "0.1.5",
+  "identifier": "com.adroited.aiterm.wsl-preview",
+  "build": { "frontendDist": "../dist-windows" },
+  "app": {
+    "windows": [{ "label": "main", "title": "aiterm", "width": 1100, "height": 760, "minWidth": 600, "minHeight": 400, "theme": "Dark", "backgroundColor": "#121317" }],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://asset.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://asset.localhost; media-src 'self' blob: http://asset.localhost; frame-src 'self' http://asset.localhost; worker-src 'self' blob:",
+      "assetProtocol": { "enable": true, "scope": [] }
+    }
+  },
+  "bundle": { "active": true, "targets": ["nsis"], "resources": { "setup/setup-wsl.ps1": "setup/setup-wsl.ps1" }, "windows": { "nsis": { "installerHooks": "./installer-hooks.nsh" } }, "icon": ["../src-tauri/icons/icon.ico"] }
+}

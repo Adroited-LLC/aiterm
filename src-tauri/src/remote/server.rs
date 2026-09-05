@@ -1,3 +1,5 @@
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use super::auth::{set_private_permissions, write_private_file, DeviceStore, PairingOutcome};
 use super::direct::DirectTunnelService;
 use super::model::{

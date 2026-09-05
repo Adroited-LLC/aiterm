@@ -3922,7 +3922,7 @@ mod tests {
         let lock = cache.join("remote-attachments/.attachments.lock");
         let holder = Command::new(&executable)
             .arg("--exact")
-            .arg("remote::uploads::tests::manifest_lock_boundary_holder_helper")
+            .arg(format!("{}::manifest_lock_boundary_holder_helper", module_path!().split_once("::").unwrap().1))
             .arg("--ignored")
             .env("AITERM_UPLOAD_UNIT_LOCK_PATH", &lock)
             .env("AITERM_UPLOAD_UNIT_LOCK_READY", &ready)
@@ -3934,7 +3934,7 @@ mod tests {
         assert!(wait_for_path_for(&ready, Duration::from_secs(5)));
         let writer = Command::new(&executable)
             .arg("--exact")
-            .arg("remote::uploads::tests::manifest_lock_boundary_writer_helper")
+            .arg(format!("{}::manifest_lock_boundary_writer_helper", module_path!().split_once("::").unwrap().1))
             .arg("--ignored")
             .env("AITERM_UPLOAD_UNIT_LOCK_CACHE", &cache)
             .env("AITERM_UPLOAD_UNIT_LOCK_BEFORE", &before)

@@ -78,7 +78,7 @@ pub fn default_target() -> (Option<String>, Option<String>) {
 
 /// The default OpenCode target, for a UI that needs to name it on a dispatch
 /// (the downgrade one-tap kick).
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn opencode_default_target() -> AgentTarget {
     let (provider, model) = default_target();
     AgentTarget { provider, model }
@@ -274,7 +274,7 @@ pub fn dispatch(
 /// `provider`/`model` are the same pair a session launch resolves (see
 /// `launch.rs`): the provider whose key and routing to run under, and the model
 /// id within it. Omit them to let OpenCode use its configured default.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn opencode_dispatch(
     prompt: String,
     cwd: String,

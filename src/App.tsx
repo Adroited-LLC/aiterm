@@ -1,7 +1,8 @@
 import { TimeFormatContext, fullTime } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog } from "./platformDialog";
+import { linuxPath } from "./platform";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import SessionsPanel, { SessionDisplayOpts } from "./components/SessionsPanel";
@@ -310,6 +311,12 @@ export default function App() {
    *  highlights and what files and bring-in controls key to. */
   const rootKey: TabId | null = activeTab === null ? null : (activeTabObj?.parentKey ?? activeTab);
   const rootObj = tabs.find((t) => t.key === rootKey) ?? null;
+  // Keep project panels with the tab being viewed, including plain shells
+  // opened from Home and tabs selected through the keyboard or tray.
+  useEffect(() => {
+    const cwd = previewSession?.project_path ?? rootObj?.cwd;
+    if (cwd) setActiveProject(cwd);
+  }, [previewSession?.project_path, rootObj?.cwd]);
   const [broughtIn, setBroughtIn] = useState<Record<string, BroughtIn[]>>(() => loadJSON(BROUGHT_KEY, {}));
   useEffect(() => localStorage.setItem(BROUGHT_KEY, JSON.stringify(broughtIn)), [broughtIn]);
 
@@ -1254,7 +1261,7 @@ export default function App() {
       // so claude recognizes image/file paths and shows [Image #N].
       e.payload.paths.forEach((p, i) => {
         if (i > 0) h?.write(" ");
-        h?.paste(shellEscape(p));
+        h?.paste(shellEscape(linuxPath(p)));
       });
     });
     return () => {

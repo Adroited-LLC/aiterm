@@ -12,6 +12,8 @@
 //! it never starts a tail. A session the spine is not following simply is not
 //! in the answer, and the renderer falls back to the sessions list for it.
 
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -58,7 +60,7 @@ pub struct SessionOverview {
 /// text and the last tool call — in a live session, within a handful of
 /// events. Nothing here touches the disk, so the renderer's 2 s poll while
 /// the home screen is up costs about what a `Vec` clone costs.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn spine_overview(spine: tauri::State<'_, Arc<Spine>>) -> Vec<SessionOverview> {
     spine.overview()
 }

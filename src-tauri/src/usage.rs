@@ -1302,7 +1302,7 @@ fn provider_source(p: &crate::providers::Provider) -> UsageSource {
 /// finishing a poll that runs every sixty, and the reading would never settle.
 /// Nothing is shared between the threads, so the concurrency is a `scope` and a
 /// join, with no locking.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn usage_report() -> Vec<UsageSource> {
     let providers = configured_providers();
     std::thread::scope(|s| {

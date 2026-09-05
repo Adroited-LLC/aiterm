@@ -37,6 +37,8 @@
 //! and hits in search. Everything else is still to do, and this comment is the
 //! honest list of what.
 
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -1725,7 +1727,7 @@ pub fn backend_messages(agent_id: &str, session_id: &str) -> Option<Vec<(String,
 /// can take seconds on a cold PATH; a plain `#[tauri::command]` runs on the
 /// main thread and would freeze the window for every one of them. Same reason
 /// `usage.rs` and `fonts.rs` are `async`.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn detect_agents(
     services: tauri::State<'_, crate::services::ApplicationServices>,
 ) -> Vec<Detection> {
@@ -1751,7 +1753,7 @@ pub fn detect_agents_from(services: &crate::services::ApplicationServices) -> Ve
 /// structs, so the thread hop would cost more than the work. Every backend
 /// appears, present or not — a row from an uninstalled engine still has to know
 /// what it can offer.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub fn agent_caps(
     services: tauri::State<'_, crate::services::ApplicationServices>,
 ) -> std::collections::HashMap<String, Caps> {
@@ -1778,7 +1780,7 @@ pub struct AgentChoice {
 
 /// `async` for the same reason as [`detect_agents`], plus `models()`, which for
 /// Codex shells out again to read its model list.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn agent_choices(
     services: tauri::State<'_, crate::services::ApplicationServices>,
 ) -> Vec<AgentChoice> {
@@ -1804,7 +1806,7 @@ pub fn agent_choices_from(services: &crate::services::ApplicationServices) -> Ve
 /// Identity by absence rather than by timestamp: mtime moves when an old
 /// session is merely appended to, and adopting a conversation the user is
 /// still using would be far worse than adopting nothing.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn adopt_agent_session(
     agent_id: String,
     cwd: String,
@@ -1875,7 +1877,7 @@ fn pick_clear_successor(
 /// session id while keeping the same PTY alive. The terminal supplies the
 /// exact clear submission and the session ids visible at that instant; this
 /// command accepts only one newly-written row, never a "newest wins" guess.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn clear_successor_session(
     agent_id: String,
     previous_id: String,

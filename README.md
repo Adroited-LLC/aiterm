@@ -4,6 +4,10 @@ A desktop workbench for running [Claude Code](https://claude.com/claude-code) se
 
 Built with Tauri 2, React, and xterm.js. Linux-first (developed and packaged on Fedora); the stack is cross-platform but other platforms are untested.
 
+An initial [Windows / WSL terminal preview](docs/windows-wsl-preview.md) is being
+developed on `feature/windows-wsl`. It has its own minimal Windows interface and
+requires WSL; the full workbench features below are currently Linux-only.
+
 > **Work in progress.** aiterm is built around one person's daily use and
 > released often, so interfaces move and rough edges are expected. Free to
 > build, run and modify for your own use, at home or at work — but it is not

@@ -102,7 +102,7 @@ pub(crate) fn touch_file(files: &mut Vec<String>, path: &str) {
     files.truncate(FILES_KEPT);
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_detail(session_id: String) -> Option<SessionDetail> {
     crate::run_blocking(move || session_detail_sync(session_id)).await
 }
@@ -727,7 +727,7 @@ mod tests {
 /// system blocks are left out; only what was said. Trimmed from the front
 /// to `max_chars`, keeping the opening user message so the ask is never
 /// lost, with a marker where the cut was made.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_conversation(session_id: String, max_chars: usize) -> Vec<(String, String)> {
     crate::run_blocking(move || conversation_sync(&session_id, max_chars)).await
 }
@@ -800,7 +800,7 @@ pub(crate) fn conversation_sync(session_id: &str, max_chars: usize) -> Vec<(Stri
 /// read it itself rather than be handed a paste of it. A backend that keeps
 /// sessions somewhere other than a file (opencode's database) gets a plain
 /// text export of the conversation under `~/.local/share/aiterm/relay/`.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn session_transcript_path(session_id: String) -> Result<String, String> {
     crate::run_blocking(move || {
         let list = crate::agents::backends();

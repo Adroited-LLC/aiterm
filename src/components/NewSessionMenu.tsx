@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "../platformDialog";
 import { homeAbbrev } from "../ipc";
 import StartControls, { StartChoice, useStartChoice } from "./StartControls";
 

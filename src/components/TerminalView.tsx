@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { parseOsc9, TermProgress } from "../osc9";
 import { Channel } from "@tauri-apps/api/core";
+import { terminalOutputConsumed, terminalOutputClosed } from "../platform";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import {
   AttachmentId, TabId, tabAttachDesktop, tabDetach, tabList, tabResize, tabTakeFocus, tabWrite,
@@ -257,7 +258,7 @@ export default function TerminalView({
     // renderer callback.
     const onOutput = new Channel<ArrayBuffer>();
     onOutput.onmessage = (chunk) => {
-      term.write(new Uint8Array(chunk));
+      term.write(new Uint8Array(chunk), () => terminalOutputConsumed(onOutput.id, chunk.byteLength));
       onActivity(tab.key);
     };
 
@@ -434,6 +435,7 @@ export default function TerminalView({
 
     return () => {
       disposed = true;
+      terminalOutputClosed(onOutput.id);
       exitCatchUp.dispose();
       if (fitTimer !== null) clearTimeout(fitTimer);
       ro.disconnect();

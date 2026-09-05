@@ -117,6 +117,19 @@ impl std::fmt::Debug for RelayEnrollmentDraft {
 }
 
 impl RelayEnrollmentDraft {
+    pub fn config(&self) -> &RelayConfig {
+        &self.config
+    }
+
+    /// Public commitment only; the connector token never enters the QR.
+    pub fn bootstrap_query(&self) -> String {
+        format!(
+            "&c={}&t={}",
+            super::percent_encode(&self.control_origin),
+            hex_bytes(&self.token_sha256)
+        )
+    }
+
     pub fn authorization_digest(&self) -> &[u8; 32] {
         &self.authorization_digest
     }
@@ -184,6 +197,8 @@ pub struct RelayConfig {
     pub token: String,
     #[serde(default)]
     pub managed: bool,
+    #[serde(default)]
+    pub enrollment_pending: bool,
 }
 
 impl RelayConfig {
@@ -262,7 +277,15 @@ impl RelayConfig {
         std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
         set_private_permissions(root, 0o700).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
-        write_private_file(&root.join(file), &bytes).map_err(|error| error.to_string())
+        let destination = root.join(file);
+        let temporary = destination.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        if let Err(error) = write_private_file(&temporary, &bytes)
+            .and_then(|()| std::fs::rename(&temporary, &destination))
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+        Ok(())
     }
 
     pub async fn prepare_enrollment(
@@ -293,6 +316,7 @@ impl RelayConfig {
             route_id,
             token,
             managed: true,
+            enrollment_pending: true,
         };
         config.validate()?;
         let authorization_digest = enrollment_digest(
@@ -304,6 +328,30 @@ impl RelayConfig {
         Ok(RelayEnrollmentDraft {
             control_origin,
             config,
+            token_sha256,
+            desktop_spki_sha256,
+            authorization_digest,
+        })
+    }
+
+    pub fn pending_enrollment(&self, fingerprint: &str) -> Result<RelayEnrollmentDraft, String> {
+        let server =
+            RelayServerConfig::from_route(self).ok_or("relay enrollment origin is unavailable")?;
+        let desktop_spki_sha256: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(fingerprint)
+            .map_err(|_| "invalid desktop fingerprint")?
+            .try_into()
+            .map_err(|_| "invalid desktop fingerprint")?;
+        let token_sha256 = Sha256::digest(self.token.as_bytes()).into();
+        let authorization_digest = enrollment_digest(
+            &server.control_origin,
+            &self.route_id,
+            &token_sha256,
+            &desktop_spki_sha256,
+        );
+        Ok(RelayEnrollmentDraft {
+            control_origin: server.control_origin,
+            config: self.clone(),
             token_sha256,
             desktop_spki_sha256,
             authorization_digest,
@@ -513,7 +561,11 @@ async fn run(
         backoff = if was_connected {
             Duration::from_secs(1)
         } else {
-            (backoff * 2).min(Duration::from_secs(30))
+            (backoff * 2).min(Duration::from_secs(if config.enrollment_pending {
+                1
+            } else {
+                30
+            }))
         };
     }
     let _ = state.send(RelayConnectionState::Off);
@@ -696,6 +748,47 @@ mod tests {
     use p256::elliptic_curve::rand_core::OsRng;
     use std::fs;
 
+    #[test]
+    fn pending_enrollment_preserves_route_and_keeps_connector_secret_out_of_qr() {
+        let mut config = valid_config();
+        config.managed = true;
+        config.enrollment_pending = true;
+        config.connector_url = "wss://control.example.com/v1/connect".into();
+        config.public_host = format!("{}.relay.example.com", config.route_id);
+        let fingerprint = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let draft = config.pending_enrollment(&fingerprint).unwrap();
+        assert_eq!(draft.config(), &config);
+        assert!(!draft.bootstrap_query().contains(&config.token));
+        assert_eq!(
+            draft.authorization_digest(),
+            &enrollment_digest(
+                "https://control.example.com",
+                &config.route_id,
+                &Sha256::digest(config.token.as_bytes()).into(),
+                &[7u8; 32]
+            )
+        );
+        let reloaded: RelayConfig =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(reloaded.enrollment_pending);
+        let root =
+            std::env::temp_dir().join(format!("aiterm-pending-relay-{}", uuid::Uuid::new_v4()));
+        config.save(&root).unwrap();
+        let mut approved = config.clone();
+        approved.enrollment_pending = false;
+        approved.save(&root).unwrap();
+        assert_eq!(RelayConfig::load(&root).unwrap(), Some(approved));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            reloaded
+                .pending_enrollment(&fingerprint)
+                .unwrap()
+                .bootstrap_query(),
+            draft.bootstrap_query()
+        );
+    }
+
     fn valid_config() -> RelayConfig {
         RelayConfig {
             connector_url: "wss://control.relay.example.com/v1/connect".into(),
@@ -704,6 +797,7 @@ mod tests {
             route_id: "desk-1234".into(),
             token: "x".repeat(43),
             managed: false,
+            enrollment_pending: false,
         }
     }
 

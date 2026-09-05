@@ -233,7 +233,7 @@ pub struct ReindexResult {
 
 /// Bring the index up to date with the session store (mtime-based, so only
 /// new/changed transcripts get re-read).
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn reindex_sessions() -> ReindexResult {
     crate::run_blocking(reindex_sessions_sync).await
 }
@@ -264,7 +264,7 @@ fn reindex_sessions_sync() -> ReindexResult {
 }
 
 /// Ranked full-text search across titles, project dirs, and message text.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn search_sessions(query: String) -> Vec<Session> {
     crate::run_blocking(move || search_sessions_sync(query)).await
 }

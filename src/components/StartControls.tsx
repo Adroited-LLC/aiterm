@@ -55,6 +55,7 @@ export const API_SOURCE = "api";
  */
 export function useStartChoice(reloadKey?: unknown) {
   const [agents, setAgents] = useState<AgentChoice[]>([]);
+  const [loadingAgents, setLoadingAgents] = useState(true);
   const [agentId, setAgentId] = useState("");
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
@@ -68,12 +69,14 @@ export function useStartChoice(reloadKey?: unknown) {
   const [apiModel, setApiModel] = useState("");
 
   useEffect(() => {
+    setLoadingAgents(true);
     agentChoices()
       .then((list) => {
         setAgents(list);
         setAgentId((cur) => cur || list[0]?.id || "");
       })
-      .catch(() => setAgents([]));
+      .catch(() => setAgents([]))
+      .finally(() => setLoadingAgents(false));
     providersList().then(setAllProviders).catch(() => {});
   }, [reloadKey]);
 
@@ -115,7 +118,7 @@ export function useStartChoice(reloadKey?: unknown) {
 
   return {
     agents, agentId, model, effort, models, efforts, providers, allProviders, apiModel,
-    isApi, apiReady,
+    isApi, apiReady, loadingAgents,
     pickAgent, pickModel, setEffort, setApiModel, choice,
     ready: isApi ? apiReady && apiModel !== "" : agents.length > 0,
   };
@@ -295,8 +298,7 @@ export default function StartControls({ ctl, onOpenModelAccess, allowApi = true,
       )}
       {agents.length === 0 && !isApi && (
         <div className="empty-note">
-          No agent CLI installed — install claude, codex, grok or antigravity
-          {allowApi ? ", or use the API tab" : ""}.
+          {ctl.loadingAgents ? "Finding installed agents…" : `No agent CLI installed — install claude, codex, grok or antigravity${allowApi ? ", or use the API tab" : ""}.`}
         </div>
       )}
     </div>

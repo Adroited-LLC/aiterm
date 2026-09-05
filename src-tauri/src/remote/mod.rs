@@ -1,3 +1,5 @@
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 pub mod auth;
 pub mod direct;
 pub mod model;
@@ -484,6 +486,7 @@ pub struct RemoteStatusView {
 #[derive(Clone, Debug, Serialize)]
 pub struct RelayStatusView {
     pub configured: bool,
+    pub enrollment_pending: bool,
     pub connector_url: Option<String>,
     pub public_host: Option<String>,
     pub public_port: Option<u16>,
@@ -520,6 +523,7 @@ struct Inner {
 #[derive(Default)]
 pub struct RemoteState {
     inner: Mutex<Inner>,
+    pairing_setup: Mutex<()>,
 }
 
 impl Inner {
@@ -583,6 +587,10 @@ impl Inner {
                 .unwrap_or_else(|| DEFAULT_RELAY_SERVER.to_string()),
             relay: RelayStatusView {
                 configured: self.relay_config.is_some(),
+                enrollment_pending: self
+                    .relay_config
+                    .as_ref()
+                    .is_some_and(|config| config.enrollment_pending),
                 connector_url: self
                     .relay_config
                     .as_ref()
@@ -649,6 +657,10 @@ impl Inner {
             relay,
             draft.map(RelayEnrollmentDraft::authorization_digest),
         );
+        if let Some(draft) = draft {
+            payload = payload.replacen("?v=3", "?v=4", 1);
+            payload.push_str(&draft.bootstrap_query());
+        }
         if self.startup.network_stack == RemoteNetworkStack::Iroh {
             let node = crate::iroh_tunnel::node_id_of(&self.startup.iroh_secret)
                 .ok_or_else(|| "the Iroh identity is unavailable".to_string())?;
@@ -665,7 +677,7 @@ impl Inner {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_status(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<RemoteStatusView, String> {
@@ -674,7 +686,7 @@ pub async fn remote_status(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_relay_configure(
     state: tauri::State<'_, RemoteState>,
     connector_url: String,
@@ -699,6 +711,7 @@ pub async fn remote_relay_configure(
         route_id,
         token,
         managed: false,
+        enrollment_pending: false,
     };
     config.save(&state_root()?)?;
     inner.relay_config = Some(config);
@@ -706,7 +719,7 @@ pub async fn remote_relay_configure(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_relay_server_set(
     state: tauri::State<'_, RemoteState>,
     server: String,
@@ -732,7 +745,7 @@ pub async fn remote_relay_server_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_relay_clear(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<RemoteStatusView, String> {
@@ -767,7 +780,7 @@ pub async fn remote_relay_clear(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_start_on_launch_set(
     state: tauri::State<'_, RemoteState>,
     enabled: bool,
@@ -797,7 +810,7 @@ pub async fn remote_start_on_launch_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_network_stack_set(
     state: tauri::State<'_, RemoteState>,
     network_stack: RemoteNetworkStack,
@@ -817,7 +830,7 @@ pub async fn remote_network_stack_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_iroh_relay_url_set(
     state: tauri::State<'_, RemoteState>,
     url: Option<String>,
@@ -840,7 +853,7 @@ pub async fn remote_iroh_relay_url_set(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_interfaces(
     _state: tauri::State<'_, RemoteState>,
 ) -> Result<Vec<String>, String> {
@@ -1005,7 +1018,7 @@ async fn start_remote(
     Ok(inner.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, RemoteState>,
@@ -1087,7 +1100,7 @@ pub fn start_on_launch(
     });
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteStatusView, String> {
     let (gateway, relay, iroh) = {
         let mut inner = state.inner.lock().await;
@@ -1113,11 +1126,12 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
     Ok(state.inner.lock().await.status())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_begin_pairing(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
-    let (devices, fingerprint, needs_relay, relay_server) = {
+    let _setup = state.pairing_setup.lock().await;
+    let (devices, fingerprint, needs_relay, relay_server, pending_config) = {
         let mut inner = state.inner.lock().await;
         inner.load_relay_config()?;
         if inner.gateway.is_none() {
@@ -1130,25 +1144,58 @@ pub async fn remote_begin_pairing(
                 .clone()
                 .ok_or("the remote identity is unavailable")?,
             inner.startup.network_stack == RemoteNetworkStack::Aiterm
-                && inner.relay_config.is_none(),
+                && inner
+                    .relay_config
+                    .as_ref()
+                    .is_none_or(|config| config.enrollment_pending),
             inner
                 .relay_server
                 .as_ref()
                 .map(|value| value.control_origin.clone())
                 .unwrap_or_else(|| DEFAULT_RELAY_SERVER.to_string()),
+            inner.relay_config.clone(),
         )
     };
     let draft = if needs_relay {
-        match RelayConfig::prepare_enrollment(&relay_server, &fingerprint).await {
-            Ok(draft) => Some(draft),
-            Err(error) => {
-                tracing::warn!(error = %error, "relay setup was unavailable during pairing");
-                None
+        if let Some(config) = pending_config {
+            Some(config.pending_enrollment(&fingerprint)?)
+        } else {
+            match RelayConfig::prepare_enrollment(&relay_server, &fingerprint).await {
+                Ok(draft) => Some(draft),
+                Err(error) => {
+                    tracing::warn!(error = %error, "relay setup was unavailable during pairing");
+                    None
+                }
             }
         }
     } else {
         None
     };
+    if let Some(draft) = &draft {
+        let mut inner = state.inner.lock().await;
+        if inner.gateway.is_none()
+            || inner.fingerprint.as_deref() != Some(&fingerprint)
+            || inner.startup.network_stack != RemoteNetworkStack::Aiterm
+            || inner
+                .relay_config
+                .as_ref()
+                .is_some_and(|config| config != draft.config())
+        {
+            return Err("remote access changed while preparing pairing".into());
+        }
+        if inner.relay_config.is_none() {
+            let config = draft.config().clone();
+            config.save(&state_root()?)?;
+            if let Some(gateway) = &inner.gateway {
+                gateway.set_relay_route(config.public_host.clone(), config.public_port);
+            }
+            inner.relay = Some(RelayConnectorHandle::start(
+                config.clone(),
+                inner.bound.ok_or("listener unavailable")?,
+            ));
+            inner.relay_config = Some(config);
+        }
+    }
     let now = SystemTime::now();
     let enrollment = devices
         .begin_enrollment_with_relay_at(now, draft)
@@ -1169,7 +1216,7 @@ pub async fn remote_begin_pairing(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_pending_pairings(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<Vec<PendingPairing>, String> {
@@ -1178,7 +1225,7 @@ pub async fn remote_pending_pairings(
     Ok(devices.list_pending_pairings())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_approve_device(
     state: tauri::State<'_, RemoteState>,
     request_id: String,
@@ -1195,25 +1242,45 @@ pub async fn remote_approve_device(
             let mut inner = state.inner.lock().await;
             inner.load_relay_config()?;
             inner.startup.network_stack == RemoteNetworkStack::Aiterm
-                && inner.relay_config.is_none()
+                && inner
+                    .relay_config
+                    .as_ref()
+                    .is_none_or(|config| config.enrollment_pending)
         };
         if should_register {
-            match enrollment
-                .draft
-                .register(&enrollment.authority_public_key, &enrollment.signature_der)
-                .await
-            {
-                Ok(config) => {
-                    config.save(&state_root()?)?;
+            let connected = {
+                let inner = state.inner.lock().await;
+                inner.relay_config.as_ref() == Some(enrollment.draft.config())
+                    && inner
+                        .relay
+                        .as_ref()
+                        .is_some_and(|relay| relay.state() == RelayConnectionState::Connected)
+            };
+            let registration = if connected {
+                Ok(enrollment.draft.config().clone())
+            } else {
+                enrollment
+                    .draft
+                    .register(&enrollment.authority_public_key, &enrollment.signature_der)
+                    .await
+            };
+            match registration {
+                Ok(mut config) => {
+                    config.enrollment_pending = false;
                     let mut inner = state.inner.lock().await;
-                    if inner.relay_config.is_none() {
+                    if inner.relay_config.as_ref() == Some(enrollment.draft.config()) {
+                        config.save(&state_root()?)?;
                         if let Some(gateway) = &inner.gateway {
                             gateway.set_relay_route(config.public_host.clone(), config.public_port);
                         }
                         if inner.startup.network_stack == RemoteNetworkStack::Aiterm {
                             if let Some(local_target) = inner.bound {
-                                inner.relay =
-                                    Some(RelayConnectorHandle::start(config.clone(), local_target));
+                                if inner.relay.is_none() {
+                                    inner.relay = Some(RelayConnectorHandle::start(
+                                        config.clone(),
+                                        local_target,
+                                    ));
+                                }
                             }
                         }
                         inner.relay_config = Some(config);
@@ -1229,7 +1296,7 @@ pub async fn remote_approve_device(
     Ok(device)
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_deny_device(
     state: tauri::State<'_, RemoteState>,
     request_id: String,
@@ -1240,7 +1307,7 @@ pub async fn remote_deny_device(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_devices(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<Vec<TrustedDevice>, String> {
@@ -1248,7 +1315,7 @@ pub async fn remote_devices(
     Ok(devices.list_devices())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn remote_revoke_device(
     state: tauri::State<'_, RemoteState>,
     device_id: String,
@@ -1315,6 +1382,7 @@ mod listener_advertisement_tests {
                 route_id: "desktop".into(),
                 token: "x".repeat(43),
                 managed: true,
+                enrollment_pending: false,
             }),
             ..Inner::default()
         };
@@ -1396,6 +1464,7 @@ mod listener_advertisement_tests {
             route_id: "desktop-1234".into(),
             token: "x".repeat(43),
             managed: true,
+            enrollment_pending: false,
         };
         assert_eq!(
             relay_certificate_dns(Some(&route), Some(&server)),

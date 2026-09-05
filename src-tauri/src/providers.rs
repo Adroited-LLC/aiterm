@@ -388,7 +388,7 @@ fn restrict(path: &std::path::Path, mode: u32) {
 #[cfg(not(unix))]
 fn restrict(_path: &std::path::Path, _mode: u32) {}
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn providers_list() -> Vec<ProviderView> {
     crate::run_blocking(providers_list_sync).await
 }
@@ -403,7 +403,7 @@ fn providers_list_sync() -> Vec<ProviderView> {
 /// a base URL does not require re-entering the secret — the UI cannot show it
 /// back, so asking for it again to change something unrelated would mean
 /// finding it again every time.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn provider_save(
     id: Option<String>,
     name: String,
@@ -453,7 +453,7 @@ fn provider_save_sync(
     Ok(list.iter().map(Provider::view).collect())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn provider_delete(id: String) -> Result<Vec<ProviderView>, String> {
     crate::run_blocking(move || provider_delete_sync(id)).await
 }
@@ -475,20 +475,20 @@ fn provider_delete_sync(id: String) -> Result<Vec<ProviderView>, String> {
 /// deliberately pulls in no TLS stack. `async` so a slow or unreachable
 /// provider does not freeze the window, which is the mistake `usage.rs`
 /// documents having made.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn provider_models(id: String) -> Result<Vec<String>, String> {
     parse_models(&fetch_models_response(&id)?)
 }
 
 /// The same `/models` call, kept whole — the browser's card view wants every
 /// field the provider offered, where Test wants only the ids.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn provider_model_cards(id: String) -> Result<Vec<ModelCard>, String> {
     parse_model_cards(&fetch_models_response(&id)?)
 }
 
 /// Replace a provider's startup shortlist and persist it.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn provider_startup_set(
     id: String,
     models: Vec<String>,
@@ -787,7 +787,7 @@ pub fn parse_endpoints(
 
 /// The endpoint list for one model. OpenRouter only — the path is theirs, and
 /// a `/endpoints` call to a bare llama.cpp is a 404 nobody can act on.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn provider_model_endpoints(id: String, model: String) -> Result<Vec<EndpointCard>, String> {
     let list = load();
     let p = list
@@ -899,7 +899,7 @@ pub fn resolve_ignore(
 /// `#[tauri::command(async)]` rather than `run_blocking`, matching the other
 /// commands here that make a network call: the curl is synchronous, and this
 /// keeps it off the GTK main thread.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn provider_directory(id: String) -> Result<Vec<DirectoryEntry>, String> {
     let list = load();
     let p = list
@@ -920,7 +920,7 @@ pub fn provider_directory(id: String) -> Result<Vec<DirectoryEntry>, String> {
 /// A directory that will not load is a hard error rather than a silent save:
 /// storing a policy whose `resolved_ignore` is empty would read in the panel
 /// as "nothing is blocked", which is the opposite of what was asked for.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn provider_policy_set(id: String, policy: Policy) -> Result<Vec<ProviderView>, String> {
     let dir = provider_directory(id.clone())?;
     let mut list = load();
@@ -966,7 +966,7 @@ pub fn set_route(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn provider_route_set(
     id: String,
     model: String,
@@ -1092,7 +1092,7 @@ fn activity_key(p: &Provider) -> &str {
 /// from the activity view, not the add-a-provider form, and threading it
 /// through that form would mean every save of a name or URL also carries a
 /// credential it has no business holding.
-#[tauri::command]
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn provider_management_key_set(
     id: String,
     key: String,
@@ -1122,7 +1122,7 @@ fn provider_management_key_set_sync(id: String, key: String) -> Result<Vec<Provi
 /// The account's recent activity. OpenRouter only, for the same reason
 /// `/endpoints` and `/providers` are: the path is theirs, and no other provider
 /// keeps a per-host record to read.
-#[tauri::command(async)]
+#[cfg_attr(not(aiterm_headless), tauri::command(async))]
 pub fn provider_activity(id: String) -> Result<Vec<ActivityRow>, String> {
     let list = load();
     let p = list
