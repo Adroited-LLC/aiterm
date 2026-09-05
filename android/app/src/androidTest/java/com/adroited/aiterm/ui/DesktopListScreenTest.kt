@@ -2,8 +2,12 @@ package com.adroited.aiterm.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeDown
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.adroited.aiterm.pairing.PairedDesktop
 import com.adroited.aiterm.pairing.PairedDesktopStore
@@ -47,7 +51,7 @@ class DesktopListScreenTest {
             )
         }
 
-        compose.onNodeWithText("Forget").performClick()
+        compose.onNodeWithText("Forget").performScrollTo().performClick()
         compose.onNodeWithText("Forget Workshop PC?").assertIsDisplayed()
         assertEquals(1, store.all().size)
 
@@ -55,6 +59,56 @@ class DesktopListScreenTest {
 
         compose.onNodeWithText("No desktops paired").assertIsDisplayed()
         assertEquals(emptyList<PairedDesktop>(), store.all())
+    }
+
+    @Test
+    fun connectOpensTheSelectedDesktop() {
+        val pairedDesktop = desktop()
+        val store = MemoryDesktopStore(listOf(pairedDesktop))
+        val viewModel = DesktopListViewModel(store)
+        var openedDesktop: PairedDesktop? = null
+        compose.setContent {
+            DesktopListScreen(
+                store = store,
+                onPairDesktop = {},
+                onOpenDesktop = { openedDesktop = it },
+                viewModel = viewModel,
+            )
+        }
+
+        compose.onNodeWithText("Connect").performScrollTo().performClick()
+
+        compose.runOnIdle { assertEquals(pairedDesktop, openedDesktop) }
+    }
+
+    @Test
+    fun cancellingForgetKeepsDesktopAvailable() {
+        val store = MemoryDesktopStore(listOf(desktop()))
+        val viewModel = DesktopListViewModel(store)
+        compose.setContent {
+            DesktopListScreen(store = store, onPairDesktop = {}, viewModel = viewModel)
+        }
+
+        compose.onNodeWithText("Forget").performScrollTo().performClick()
+        compose.onNodeWithText("Cancel").performClick()
+
+        compose.onNodeWithText("Workshop PC").assertIsDisplayed()
+        assertEquals(1, store.all().size)
+    }
+
+    @Test
+    fun pullToRefreshReloadsSavedDesktops() {
+        val store = MemoryDesktopStore(emptyList())
+        val viewModel = DesktopListViewModel(store)
+        compose.setContent {
+            DesktopListScreen(store = store, onPairDesktop = {}, viewModel = viewModel)
+        }
+        compose.onNodeWithText("No desktops paired").assertIsDisplayed()
+        compose.runOnIdle { store.save(desktop()) }
+
+        compose.onNodeWithTag("desktop-list").performTouchInput { swipeDown() }
+
+        compose.onNodeWithText("Workshop PC").assertIsDisplayed()
     }
 
     private fun desktop() = PairedDesktop(

@@ -160,6 +160,70 @@ class RemoteClientTest {
     }
 
     @Test
+    fun successfulSessionRefreshStopsLoading() = runTest {
+        val transport = FakeRemoteTransport()
+        val pending = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            if (request.kind == "session.roster") pending
+            else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.refreshSessions()
+        runCurrent()
+        assertTrue(client.state.value.sessionsRefreshing)
+        val request = transport.requests.single { it.kind == "session.roster" }
+        pending.complete(RemoteResponse.Success(
+            request.requestId,
+            request.kind,
+            uploadCbor.encodeToByteArray(TestSessionRosterReply.serializer(), TestSessionRosterReply(emptyList())),
+        ))
+        runCurrent()
+        assertFalse(client.state.value.sessionsRefreshing)
+        assertEquals(null, client.state.value.lastError)
+        client.lock()
+    }
+
+    @Test
+    fun sessionRefreshTracksFailureTimeoutAndDisconnectWithoutDuplicateRequests() = runTest {
+        val transport = FakeRemoteTransport()
+        var response = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            if (request.kind == "session.roster") response
+            else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+
+        client.refreshSessions()
+        client.refreshSessions()
+        runCurrent()
+        assertTrue(client.state.value.sessionsRefreshing)
+        assertEquals(1, transport.requests.count { it.kind == "session.roster" })
+        val request = transport.requests.single { it.kind == "session.roster" }
+        response.complete(RemoteResponse.Error(request.requestId, "roster.failed", "Try again"))
+        runCurrent()
+        assertFalse(client.state.value.sessionsRefreshing)
+
+        response = CompletableDeferred()
+        client.refreshSessions()
+        runCurrent()
+        assertTrue(client.state.value.sessionsRefreshing)
+        advanceTimeBy(8_001)
+        runCurrent()
+        assertFalse(client.state.value.sessionsRefreshing)
+        assertEquals(1, transport.abandonedRequests.size)
+
+        response = CompletableDeferred()
+        client.refreshSessions()
+        assertTrue(client.state.value.sessionsRefreshing)
+        client.lock()
+        assertFalse(client.state.value.sessionsRefreshing)
+        client.refreshSessions()
+        assertFalse(client.state.value.sessionsRefreshing)
+    }
+
+    @Test
     fun stalledSpineRefreshIsAbandonedAndDoesNotPinLaterRefreshes() = runTest {
         val transport = FakeRemoteTransport()
         transport.responseFor = { request ->
@@ -734,6 +798,51 @@ class RemoteClientTest {
         runCurrent()
         assertEquals("tab-c", client.state.value.activeTabId)
         client.lock()
+    }
+
+    @Test
+    fun serverRecoveryRequestRefreshesTheActiveSnapshotWithoutReconnecting() = runTest {
+        val transport = FakeRemoteTransport()
+        val store = DefaultTerminalScreenStore()
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = store,
+            isUnlocked = { true },
+            scope = this,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        val recovery = RemoteServerEvent.Failure("terminal.recovery_required", "terminal revision gap")
+        client.connect()
+        client.acceptForTest(recovery)
+        assertTrue(transport.requests.isEmpty())
+
+        client.selectTab("tab-1")
+        runCurrent()
+        client.acceptForTest(snapshotChunk("initial", "tab-1", "attachment-1", "old"))
+        client.acceptForTest(recovery)
+        client.acceptForTest(recovery)
+        runCurrent()
+
+        val request = transport.requests.single { it.kind == "terminal.resume" }
+        assertArrayEquals(
+            RemoteWireCodec.encodeTerminalResumePayload("tab-1", "attachment-1", 1),
+            request.payload,
+        )
+        assertEquals("old", store.screen.value?.visible?.single()?.plainText())
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertFalse(transport.closed)
+
+        // A resized replacement is authoritative and permits a later recovery request.
+        client.acceptForTest(snapshotChunk("recovered", "tab-1", "attachment-1", "resized"))
+        assertEquals(7, store.screen.value?.cols)
+        assertEquals("resized", store.screen.value?.visible?.single()?.plainText())
+        client.acceptForTest(recovery)
+        runCurrent()
+        assertEquals(2, transport.requests.count { it.kind == "terminal.resume" })
+
+        client.lock()
+        client.acceptForTest(recovery)
+        assertEquals(2, transport.requests.count { it.kind == "terminal.resume" })
     }
 
     @Test
@@ -1972,3 +2081,6 @@ private class RoundThreeBinarySocket : RemoteBinarySocket {
         incoming.close()
     }
 }
+
+@Serializable
+private data class TestSessionRosterReply(val sessions: List<RemoteSession>)

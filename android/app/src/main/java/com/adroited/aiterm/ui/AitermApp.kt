@@ -95,23 +95,6 @@ fun AitermApp(
                                     popUpTo(entry.destination.id) { inclusive = true }
                                 }
                             },
-                            onPairDesktop = { navController.navigate(PairingRoute) },
-                            onForgetDesktop = {
-                                runCatching {
-                                    container.pairedDesktopStore.remove(desktop.deviceId)
-                                    val remaining = container.pairedDesktopStore.all()
-                                    val only = remaining.singleOrNull()
-                                    if (only == null) {
-                                        navController.navigate(DesktopsRoute) {
-                                            popUpTo(entry.destination.id) { inclusive = true }
-                                        }
-                                    } else {
-                                        navController.navigate(TerminalRoute(only.deviceId)) {
-                                            popUpTo(entry.destination.id) { inclusive = true }
-                                        }
-                                    }
-                                }.isSuccess
-                            },
                             keyBarPreference = container.terminalKeyBarPreference,
                         )
                     }

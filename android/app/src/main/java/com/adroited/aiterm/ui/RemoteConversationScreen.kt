@@ -71,6 +71,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -92,11 +93,11 @@ import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Devices
-import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
@@ -122,6 +123,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -162,8 +164,6 @@ fun RemoteDesktopScreen(
     pairedDesktops: List<PairedDesktop>,
     onBack: () -> Unit,
     onOpenDesktop: (PairedDesktop) -> Unit,
-    onPairDesktop: () -> Unit,
-    onForgetDesktop: () -> Boolean,
     keyBarPreference: TerminalKeyBarPreference,
 ) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
@@ -239,8 +239,6 @@ fun RemoteDesktopScreen(
             pairedDesktops = pairedDesktops,
             onOpenDesktop = onOpenDesktop,
             onManageDesktops = onBack,
-            onPairDesktop = onPairDesktop,
-            onForgetDesktop = onForgetDesktop,
             onRefresh = { viewModel.client.refreshSessions() },
             onLoadUsage = viewModel.client::refreshUsage,
             onStarSession = viewModel.client::starSession,
@@ -260,14 +258,12 @@ fun RemoteDesktopScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun RemoteSessionDashboard(
+internal fun RemoteSessionDashboard(
     state: RemoteClientState,
     desktop: PairedDesktop,
     pairedDesktops: List<PairedDesktop>,
     onOpenDesktop: (PairedDesktop) -> Unit,
     onManageDesktops: () -> Unit,
-    onPairDesktop: () -> Unit,
-    onForgetDesktop: () -> Boolean,
     onRefresh: () -> Unit,
     onLoadUsage: () -> Unit,
     onStarSession: (String, Boolean) -> Unit,
@@ -281,8 +277,10 @@ private fun RemoteSessionDashboard(
     var activeOnly by rememberSaveable { mutableStateOf(false) }
     var foldedCrews by remember { mutableStateOf(emptySet<String>()) }
     var renameTarget by remember { mutableStateOf<RemoteSession?>(null) }
-    var forgetDesktop by remember { mutableStateOf(false) }
-    var forgetDesktopFailed by remember { mutableStateOf(false) }
+    var pullRefreshing by remember { mutableStateOf(false) }
+    LaunchedEffect(state.sessionsRefreshing, pullRefreshing) {
+        if (!state.sessionsRefreshing) pullRefreshing = false
+    }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val drawerScope = rememberCoroutineScope()
     val agents = remember(state.sessions) { state.sessions.map { it.agent }.distinct().sorted() }
@@ -321,35 +319,6 @@ private fun RemoteSessionDashboard(
             onDismiss = { renameTarget = null },
         )
     }
-    if (forgetDesktop) {
-        AlertDialog(
-            onDismissRequest = {
-                forgetDesktop = false
-                forgetDesktopFailed = false
-            },
-            title = { Text("Forget ${desktop.displayName}?") },
-            text = {
-                Text(
-                    if (forgetDesktopFailed) {
-                        "The saved desktop could not be removed. Nothing was changed."
-                    } else {
-                        "This removes the desktop key from this phone. You can pair it again later."
-                    },
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { forgetDesktopFailed = !onForgetDesktop() }) {
-                    Text("Forget desktop")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    forgetDesktop = false
-                    forgetDesktopFailed = false
-                }) { Text("Keep desktop") }
-            },
-        )
-    }
     LaunchedEffect(state.connection) {
         while (state.connection == ConnectionState.Connected) {
             delay(3_000)
@@ -369,26 +338,9 @@ private fun RemoteSessionDashboard(
                     onOpenDesktop(target)
                 },
                 onLoadUsage = onLoadUsage,
-                onRefresh = {
-                    onRefresh()
-                    onLoadUsage()
-                    drawerScope.launch { drawerState.close() }
-                },
-                onOpenTerminal = {
-                    drawerScope.launch { drawerState.close() }
-                    onOpenTerminal()
-                },
                 onManageDesktops = {
                     drawerScope.launch { drawerState.close() }
                     onManageDesktops()
-                },
-                onPairDesktop = {
-                    drawerScope.launch { drawerState.close() }
-                    onPairDesktop()
-                },
-                onForgetDesktop = {
-                    forgetDesktop = true
-                    drawerScope.launch { drawerState.close() }
                 },
             )
         },
@@ -497,41 +449,47 @@ private fun RemoteSessionDashboard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            when {
-                state.sessions.isEmpty() -> DashboardEmptyState(state.connection)
-                sessions.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("No sessions match that search.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                else -> LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(bottom = 20.dp),
-                ) {
-                    items(sessions, key = RemoteSession::id) { session ->
-                        SessionDashboardRow(
-                            session = session,
-                            live = isConversationSessionLive(session, state.tabs),
-                            activity = state.sessionActivity[session.id],
-                            starred = session.id in state.starredSessions,
-                            hasFiles = session.id in state.sessionsWithFiles,
-                            satellite = state.broughtInSessions[session.id]?.let { parent ->
-                                sessions.any { it.id == parent }
-                            } == true,
-                            crewAgents = state.broughtInSessions
-                                .filterValues { it == session.id }
-                                .keys
-                                .mapNotNull { child -> state.sessions.firstOrNull { it.id == child }?.agent },
-                            crewFolded = session.id in foldedCrews,
-                            onToggleCrew = {
-                                foldedCrews = if (session.id in foldedCrews) {
-                                    foldedCrews - session.id
-                                } else {
-                                    foldedCrews + session.id
-                                }
-                            },
-                            onToggleStar = { onStarSession(session.id, session.id !in state.starredSessions) },
-                            onRename = { renameTarget = session },
-                            onClick = { onOpenSession(session) },
-                        )
+            PullToRefreshBox(
+                isRefreshing = pullRefreshing && state.sessionsRefreshing,
+                onRefresh = { pullRefreshing = true; onRefresh(); onLoadUsage() },
+                modifier = Modifier.fillMaxSize(),
+            ) {
+                when {
+                    state.sessions.isEmpty() -> DashboardEmptyState(state.connection)
+                    sessions.isEmpty() -> Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), contentAlignment = Alignment.Center) {
+                        Text("No sessions match that search.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    else -> LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(bottom = 20.dp),
+                    ) {
+                        items(sessions, key = RemoteSession::id) { session ->
+                            SessionDashboardRow(
+                                session = session,
+                                live = isConversationSessionLive(session, state.tabs),
+                                activity = state.sessionActivity[session.id],
+                                starred = session.id in state.starredSessions,
+                                hasFiles = session.id in state.sessionsWithFiles,
+                                satellite = state.broughtInSessions[session.id]?.let { parent ->
+                                    sessions.any { it.id == parent }
+                                } == true,
+                                crewAgents = state.broughtInSessions
+                                    .filterValues { it == session.id }
+                                    .keys
+                                    .mapNotNull { child -> state.sessions.firstOrNull { it.id == child }?.agent },
+                                crewFolded = session.id in foldedCrews,
+                                onToggleCrew = {
+                                    foldedCrews = if (session.id in foldedCrews) {
+                                        foldedCrews - session.id
+                                    } else {
+                                        foldedCrews + session.id
+                                    }
+                                },
+                                onToggleStar = { onStarSession(session.id, session.id !in state.starredSessions) },
+                                onRename = { renameTarget = session },
+                                onClick = { onOpenSession(session) },
+                            )
+                        }
                     }
                 }
             }
@@ -541,18 +499,14 @@ private fun RemoteSessionDashboard(
 }
 
 @Composable
-private fun RemoteAppDrawer(
+internal fun RemoteAppDrawer(
     state: RemoteClientState,
     desktop: PairedDesktop,
     pairedDesktops: List<PairedDesktop>,
     onClose: () -> Unit,
     onOpenDesktop: (PairedDesktop) -> Unit,
     onLoadUsage: () -> Unit,
-    onRefresh: () -> Unit,
-    onOpenTerminal: () -> Unit,
     onManageDesktops: () -> Unit,
-    onPairDesktop: () -> Unit,
-    onForgetDesktop: () -> Unit,
 ) {
     LaunchedEffect(Unit) { onLoadUsage() }
     ModalDrawerSheet(
@@ -597,19 +551,8 @@ private fun RemoteAppDrawer(
 
             HorizontalDivider(Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.surfaceVariant)
             DrawerUsage(state.usage)
-            DrawerRow("Refresh", "Update sessions and usage", Icons.Filled.Refresh, onClick = onRefresh)
-            DrawerRow("Open terminal", "View the raw desktop session", Icons.Filled.Terminal, onClick = onOpenTerminal)
-
             HorizontalDivider(Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.surfaceVariant)
             DrawerRow("Manage desktops", "View and remove trusted computers", Icons.Filled.Devices, onClick = onManageDesktops)
-            DrawerRow("Add a desktop", "Scan another pairing code", Icons.Filled.Add, onClick = onPairDesktop)
-            DrawerRow(
-                title = "Forget this desktop",
-                detail = "Remove its key from this phone",
-                icon = Icons.Filled.LinkOff,
-                titleColor = MaterialTheme.colorScheme.error,
-                onClick = onForgetDesktop,
-            )
         }
     }
 }
@@ -695,12 +638,21 @@ private fun DrawerRow(
 
 @Composable
 private fun DrawerUsage(sources: List<RemoteUsageSource>) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.fillMaxWidth()
+                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
+                .clickable(onClickLabel = if (expanded) "Collapse usage" else "Expand usage") { expanded = !expanded }
+                .padding(vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Icon(Icons.Filled.Speed, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(10.dp))
-            Text("Usage", style = MaterialTheme.typography.titleSmall)
+            Text("Usage", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            Icon(if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, contentDescription = null)
         }
+        if (!expanded) return@Column
         if (sources.isEmpty()) {
             Text("Reading account limits…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(start = 30.dp, top = 5.dp))
@@ -808,7 +760,7 @@ private fun UsageDialog(sources: List<RemoteUsageSource>, onDismiss: () -> Unit)
 
 @Composable
 private fun DashboardEmptyState(connection: ConnectionState) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+    Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             if (connection == ConnectionState.Connecting || connection == ConnectionState.Reconnecting) {
                 CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp)
@@ -989,6 +941,10 @@ private fun RemoteConversationContent(
     onSelectSession: (RemoteSession) -> Unit,
     onQuickInput: (String, String) -> Unit,
 ) {
+    var pullRefreshing by remember(session.id) { mutableStateOf(false) }
+    LaunchedEffect(state.previewLoadingSessionId, pullRefreshing) {
+        if (state.previewLoadingSessionId != session.id) pullRefreshing = false
+    }
     var draft by rememberSaveable(session.id) { mutableStateOf("") }
     var sending by remember(session.id) { mutableStateOf(false) }
     var sendError by remember(session.id) { mutableStateOf<String?>(null) }
@@ -1485,11 +1441,20 @@ private fun RemoteConversationContent(
                 Spacer(Modifier.height(8.dp))
                 TextButton(onClick = onRefresh) { Text("Retry") }
             }
-            previewItems.isEmpty() && !working -> Box(
-                Modifier.fillMaxSize().padding(padding),
-                contentAlignment = Alignment.Center,
-            ) { Text("No conversation history yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            else -> Box(Modifier.fillMaxSize().padding(padding)) {
+            previewItems.isEmpty() && !working -> PullToRefreshBox(
+                isRefreshing = pullRefreshing && state.previewLoadingSessionId == session.id,
+                onRefresh = { pullRefreshing = true; onRefresh() },
+                modifier = Modifier.fillMaxSize().padding(padding),
+            ) {
+                Box(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), contentAlignment = Alignment.Center) {
+                    Text("No conversation history yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            else -> PullToRefreshBox(
+                isRefreshing = pullRefreshing && state.previewLoadingSessionId == session.id,
+                onRefresh = { pullRefreshing = true; onRefresh() },
+                modifier = Modifier.fillMaxSize().padding(padding),
+            ) {
                 SelectionContainer(state = conversationSelection) {
                     LazyColumn(
                         state = listState,

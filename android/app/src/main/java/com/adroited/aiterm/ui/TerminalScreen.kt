@@ -94,6 +94,8 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.adroited.aiterm.remote.ConnectionState
 import com.adroited.aiterm.remote.FocusOwner
@@ -190,6 +192,10 @@ internal fun TerminalScreenContent(
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val lifecycleState by lifecycle.currentStateFlow.collectAsStateWithLifecycle()
+    val resumed = lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+    var viewportReady by remember { mutableStateOf(false) }
     var cols by remember { mutableIntStateOf(screen?.cols ?: 80) }
     var rows by remember { mutableIntStateOf(screen?.rows ?: 24) }
     var deleteTarget by remember { mutableStateOf<RemoteSession?>(null) }
@@ -222,6 +228,7 @@ internal fun TerminalScreenContent(
         { size: TerminalSize ->
             cols = size.cols
             rows = size.rows
+            viewportReady = true
         }
     }
     val onRequestKeyboard = remember(state.focus, activeTabId, activeDraftStore) {
@@ -392,6 +399,15 @@ internal fun TerminalScreenContent(
             requestLeave()
         }
     }
+    // Claim once on entry, foreground return, or a newly attached screen. Do not
+    // react to ownership changes: a deliberate desktop click must not start a focus fight.
+    LaunchedEffect(resumed, state.connection, screen?.tabId, viewportReady) {
+        if (resumed && viewportReady && state.connection == ConnectionState.Connected &&
+            screen != null && state.focus != FocusOwner.Self
+        ) {
+            onTakeFocus(cols, rows)
+        }
+    }
     LaunchedEffect(composer.expanded, state.focus, screen?.tabId) {
         if (composer.expanded && state.focus == FocusOwner.Self && screen != null) {
             inputFocus.requestFocus()
@@ -464,6 +480,7 @@ internal fun TerminalScreenContent(
                         },
                         onViewportSizeChanged = onViewportSizeChanged,
                         onResize = onResize,
+                        resizeEnabled = resumed && state.focus == FocusOwner.Self,
                         onRequestKeyboard = onRequestKeyboard,
                     )
                 }
@@ -646,6 +663,7 @@ private fun TerminalViewport(
     emptyMessage: String,
     onViewportSizeChanged: (TerminalSize) -> Unit,
     onResize: (Int, Int) -> Unit,
+    resizeEnabled: Boolean,
     onRequestKeyboard: () -> Unit,
 ) {
     val density = LocalDensity.current
@@ -670,8 +688,8 @@ private fun TerminalViewport(
         LaunchedEffect(measuredSize) {
             onViewportSizeChanged(measuredSize)
         }
-        LaunchedEffect(screen?.tabId) {
-            if (screen != null) {
+        LaunchedEffect(screen?.tabId, resizeEnabled) {
+            if (screen != null && resizeEnabled) {
                 snapshotFlow { currentMeasuredSize }
                     .settledTerminalSizes()
                     .collect { size -> currentOnResize(size.cols, size.rows) }

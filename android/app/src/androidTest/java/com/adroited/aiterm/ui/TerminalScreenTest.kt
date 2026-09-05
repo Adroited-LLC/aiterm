@@ -59,6 +59,47 @@ class TerminalScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComposeTestActivity>()
 
     @Test
+    fun enteringTerminalTakesFocusOnceAndDoesNotFightDesktopOwnership() {
+        val state = mutableStateOf(connectedState().copy(focus = FocusOwner.Other))
+        val screen = mutableStateOf(oneCellScreen("tab-focus"))
+        var requests = 0
+        compose.setContent {
+            TerminalScreenContent(
+                state = state.value,
+                screen = screen.value,
+                onTakeFocus = { _, _ -> requests++ },
+            )
+        }
+        compose.runOnIdle { assertEquals(1, requests) }
+        compose.runOnIdle { state.value = state.value.copy(focus = FocusOwner.Self) }
+        compose.runOnIdle { state.value = state.value.copy(focus = FocusOwner.Other) }
+        compose.runOnIdle {
+            assertEquals(1, requests)
+            screen.value = oneCellScreen("tab-next")
+        }
+        compose.runOnIdle { assertEquals(2, requests) }
+    }
+
+    @Test
+    fun acquiringFocusAppliesViewportSizeEvenWhenLayoutHasNotChanged() {
+        val state = mutableStateOf(connectedState().copy(focus = FocusOwner.Other))
+        var resizes = 0
+        compose.setContent {
+            TerminalScreenContent(
+                state = state.value,
+                screen = oneCellScreen("tab-resize-focus"),
+                onResize = { _, _ -> resizes++ },
+            )
+        }
+        compose.waitForIdle()
+        compose.runOnIdle {
+            assertEquals(0, resizes)
+            state.value = state.value.copy(focus = FocusOwner.Self)
+        }
+        compose.waitUntil(5_000) { resizes > 0 }
+    }
+
+    @Test
     fun terminalKeyBarCollapsesToARestoreStrip() {
         val expanded = mutableStateOf(true)
         compose.setContent {

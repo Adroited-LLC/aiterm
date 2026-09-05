@@ -46,6 +46,7 @@ data class RemoteClientState(
     val pendingTransfers: Int = 0,
     val tabs: List<RemoteTab> = emptyList(),
     val sessions: List<RemoteSession> = emptyList(),
+    val sessionsRefreshing: Boolean = false,
     val sessionsWithFiles: Set<String> = emptySet(),
     val starredSessions: Set<String> = emptySet(),
     val broughtInSessions: Map<String, String> = emptyMap(),
@@ -637,15 +638,31 @@ class RemoteClient(
         requestScrollback(mutableScrollback.value.size, count)
 
     fun refreshSessions() {
-        launchRequest("session.roster", byteArrayOf()) { payload ->
-            val roster = RemoteCommands.sessionRoster(payload)
-            mutableState.value = mutableState.value.copy(
-                sessions = roster.sessions,
-                sessionsWithFiles = roster.withFiles,
-                starredSessions = roster.stars,
-                broughtInSessions = roster.broughtIn,
-                sessionActivity = roster.activity,
-            )
+        synchronized(lifecycleLock) {
+            if (mutableState.value.sessionsRefreshing) return
+            mutableState.value = mutableState.value.copy(sessionsRefreshing = true)
+            val accepted = launchRequest(
+                "session.roster",
+                byteArrayOf(),
+                timeoutMillis = 8_000,
+                onError = { _, message ->
+                    mutableState.value = mutableState.value.copy(
+                        sessionsRefreshing = false,
+                        lastError = message,
+                    )
+                },
+            ) { payload ->
+                val roster = RemoteCommands.sessionRoster(payload)
+                mutableState.value = mutableState.value.copy(
+                    sessions = roster.sessions,
+                    sessionsRefreshing = false,
+                    sessionsWithFiles = roster.withFiles,
+                    starredSessions = roster.stars,
+                    broughtInSessions = roster.broughtIn,
+                    sessionActivity = roster.activity,
+                )
+            }
+            if (!accepted) mutableState.value = mutableState.value.copy(sessionsRefreshing = false)
         }
     }
 
@@ -1051,6 +1068,14 @@ class RemoteClient(
                         closing = detachTransportLocked()
                         clearActiveTerminalLocked()
                         reconnect = true
+                    } else if (event.code == "terminal.recovery_required" && !recoveryRequested &&
+                        mutableState.value.connection == ConnectionState.Connected
+                    ) {
+                        // This connection-wide event has no attachment identity. Recover only the
+                        // currently committed selection; a pending selection will get its own snapshot.
+                        activeTarget()?.let { (tabId, attachmentId) ->
+                            requestRecovery(tabId, attachmentId)
+                        }
                     }
                 }
                 RemoteServerEvent.Revoked -> {
@@ -1338,6 +1363,7 @@ class RemoteClient(
     }
 
     private fun detachTransportLocked(): ClosingTransport {
+        mutableState.value = mutableState.value.copy(sessionsRefreshing = false)
         lifecycleGeneration += 1
         selectionGeneration += 1
         val jobs = ownedJobs.toList()
