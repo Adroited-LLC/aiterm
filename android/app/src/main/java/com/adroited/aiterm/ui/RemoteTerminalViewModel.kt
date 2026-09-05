@@ -94,13 +94,15 @@ class RemoteTerminalViewModel(
     private suspend fun refreshConnectedDesktop() {
         runCatching {
             val routes = client.gatewayRoutes()
-            desktop = desktop.copy(
-                hosts = routes.hosts,
-                port = routes.port,
-                relayHost = routes.relayHost,
-                relayPort = routes.relayPort,
-            )
-            pairedDesktopStore.save(desktop)
+            val updated = pairedDesktopStore.updateExisting(desktop.deviceId) { current ->
+                current.copy(
+                    hosts = routes.hosts,
+                    port = routes.port,
+                    relayHost = routes.relayHost,
+                    relayPort = routes.relayPort,
+                )
+            }
+            if (updated != null) desktop = updated
         }
         client.refreshSessions()
         client.refreshAgents()

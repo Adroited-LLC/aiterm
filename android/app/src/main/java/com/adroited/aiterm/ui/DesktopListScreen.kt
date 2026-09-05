@@ -18,6 +18,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -25,6 +26,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -65,6 +67,9 @@ fun DesktopListScreen(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     var forgetTarget by remember { mutableStateOf<PairedDesktop?>(null) }
+    var renameTargetId by rememberSaveable { mutableStateOf<String?>(null) }
+    var friendlyName by rememberSaveable { mutableStateOf("") }
+    var renameError by rememberSaveable { mutableStateOf<String?>(null) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { viewModel.refresh() }
 
     Scaffold(
@@ -138,6 +143,11 @@ fun DesktopListScreen(
                             desktop = desktop,
                             onOpen = { onOpenDesktop(desktop) },
                             onForget = { forgetTarget = desktop },
+                            onRename = {
+                                renameTargetId = desktop.deviceId
+                                friendlyName = desktop.friendlyName.orEmpty()
+                                renameError = null
+                            },
                             modifier = Modifier.widthIn(max = 640.dp).fillMaxWidth(),
                         )
                     }
@@ -146,11 +156,52 @@ fun DesktopListScreen(
         }
     }
 
+    renameTargetId?.let { deviceId ->
+        val originalName = uiState.desktops.firstOrNull { it.deviceId == deviceId }?.displayName.orEmpty()
+        val validName = friendlyName.trim().length <= 128 && !friendlyName.any(Char::isISOControl)
+        AlertDialog(
+            onDismissRequest = { renameTargetId = null },
+            title = { Text("Friendly name") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Choose a name for this desktop on your phone. Leave it empty to use $originalName.")
+                    OutlinedTextField(
+                        value = friendlyName,
+                        onValueChange = { friendlyName = it; renameError = null },
+                        label = { Text("Friendly name") },
+                        placeholder = { Text("Home PC") },
+                        singleLine = true,
+                        isError = !validName || renameError != null,
+                        supportingText = {
+                            when {
+                                !validName -> Text("Use up to 128 characters on one line.")
+                                renameError != null -> Text(renameError!!)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().testTag("desktop-friendly-name"),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = validName,
+                    onClick = {
+                        if (viewModel.saveFriendlyName(deviceId, friendlyName)) renameTargetId = null
+                        else renameError = "Couldn't save the name. Try again."
+                    },
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTargetId = null }) { Text("Cancel") }
+            },
+        )
+    }
+
     forgetTarget?.let { desktop ->
         AlertDialog(
             onDismissRequest = { forgetTarget = null },
             title = {
-                Text(stringResource(R.string.forget_desktop_title, desktop.displayName))
+                Text(stringResource(R.string.forget_desktop_title, desktop.label))
             },
             text = {
                 Text(stringResource(R.string.forget_desktop_body))
@@ -180,6 +231,7 @@ private fun DesktopCard(
     desktop: PairedDesktop,
     onOpen: () -> Unit,
     onForget: () -> Unit,
+    onRename: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var showIdentity by rememberSaveable(desktop.deviceId) { mutableStateOf(false) }
@@ -206,12 +258,15 @@ private fun DesktopCard(
                     }
                 }
                 Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(desktop.displayName, style = MaterialTheme.typography.titleLarge)
+                    Text(desktop.label, style = MaterialTheme.typography.titleLarge)
                     Text(
-                        "Paired desktop",
+                        if (desktop.friendlyName != null) desktop.displayName else "Paired desktop",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+                IconButton(onClick = onRename) {
+                    Icon(Icons.Default.Edit, contentDescription = "Edit friendly name for ${desktop.label}")
                 }
             }
             desktop.hosts.firstOrNull()?.let { host ->

@@ -38,4 +38,8 @@ data class PairedDesktop(
     val irohNodeId: String? = null,
     @SerialName("iroh_relay_url")
     val irohRelayUrl: String? = null,
-)
+    @SerialName("friendly_name")
+    val friendlyName: String? = null,
+) {
+    val label: String get() = friendlyName ?: displayName
+}

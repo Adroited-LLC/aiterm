@@ -361,7 +361,7 @@ internal fun RemoteSessionDashboard(
                             ConnectionDot(state.connection)
                             Spacer(Modifier.width(10.dp))
                             Column {
-                                Text(desktop.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(desktop.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 ConnectionLabel(state.connection, state.connectedEndpoint?.path)
                             }
                         }
@@ -526,7 +526,7 @@ internal fun RemoteAppDrawer(
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
                     Text(
-                        desktop.displayName,
+                        desktop.label,
                         style = MaterialTheme.typography.titleLarge,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -542,7 +542,7 @@ internal fun RemoteAppDrawer(
                 DrawerSectionLabel("Desktops")
                 pairedDesktops.forEach { candidate ->
                     DrawerRow(
-                        title = candidate.displayName,
+                        title = candidate.label,
                         detail = if (candidate.deviceId == desktop.deviceId) "Current desktop" else "Paired desktop",
                         icon = Icons.Filled.Devices,
                         selected = candidate.deviceId == desktop.deviceId,

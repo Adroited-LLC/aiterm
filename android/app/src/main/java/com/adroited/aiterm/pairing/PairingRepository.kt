@@ -223,12 +223,18 @@ class PairingRepository(
                         irohNodeId = payload.irohNodeId,
                         irohRelayUrl = payload.irohRelayUrl,
                     )
-                    try {
-                        store.save(desktop)
+                    val savedDesktop = try {
+                        synchronized(store) {
+                            val existing = store.all().firstOrNull {
+                                it.deviceId == desktop.deviceId &&
+                                    it.serverSpkiFingerprint == desktop.serverSpkiFingerprint
+                            }
+                            desktop.copy(friendlyName = existing?.friendlyName).also(store::save)
+                        }
                     } catch (_: PairedDesktopStoreException) {
                         return PairingResult.Rejected(PairingFailure.STORAGE_FAILURE)
                     }
-                    return PairingResult.Paired(desktop)
+                    return PairingResult.Paired(savedDesktop)
                 }
                 EnrollmentOutcome.Denied ->
                     return PairingResult.Rejected(PairingFailure.DENIED_BY_DESKTOP)

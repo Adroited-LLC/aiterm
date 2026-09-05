@@ -1,7 +1,9 @@
 package com.adroited.aiterm.ui
 
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -84,4 +86,39 @@ class RemoteAppDrawerTest {
         compose.onNodeWithText("Manage desktops").performClick()
         compose.runOnIdle { assertEquals(1, managementRequests) }
     }
+
+    @Test
+    fun friendlyNamesAppearInDrawerHeaderAndDesktopSwitcher() {
+        val current = PairedDesktop(
+            deviceId = "desktop-1",
+            displayName = "WORKSHOP-123",
+            hosts = listOf("10.0.0.151"),
+            port = 8443,
+            serverSpkiFingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            lastSeenEpochMillis = null,
+            friendlyName = "Home office",
+        )
+        val other = current.copy(
+            deviceId = "desktop-2",
+            displayName = "WORKSTATION-456",
+            friendlyName = "Work PC",
+        )
+        var openedDesktop: PairedDesktop? = null
+        compose.setContent {
+            RemoteAppDrawer(
+                state = RemoteClientState(),
+                desktop = current,
+                pairedDesktops = listOf(current, other),
+                onClose = {},
+                onOpenDesktop = { openedDesktop = it },
+                onLoadUsage = {},
+                onManageDesktops = {},
+            )
+        }
+
+        compose.onAllNodesWithText("Home office").assertCountEquals(2)
+        compose.onNodeWithText("Work PC").assertIsDisplayed().performClick()
+        compose.runOnIdle { assertEquals(other, openedDesktop) }
+    }
+
 }

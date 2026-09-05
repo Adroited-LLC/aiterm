@@ -47,6 +47,19 @@ class DesktopListViewModel(private val store: PairedDesktopStore) : ViewModel() 
         }
     }
 
+    fun saveFriendlyName(deviceId: String, name: String): Boolean {
+        val trimmed = name.trim()
+        if (trimmed.length > 128 || name.any(Char::isISOControl)) return false
+        return try {
+            store.updateExisting(deviceId) { it.copy(friendlyName = trimmed.ifEmpty { null }) }
+                ?: return false
+            _uiState.value = DesktopListUiState(desktops = store.all())
+            true
+        } catch (_: PairedDesktopStoreException) {
+            false
+        }
+    }
+
     companion object {
         fun factory(store: PairedDesktopStore): ViewModelProvider.Factory = viewModelFactory {
             initializer { DesktopListViewModel(store) }

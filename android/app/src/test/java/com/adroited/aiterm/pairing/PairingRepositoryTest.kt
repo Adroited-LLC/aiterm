@@ -368,6 +368,30 @@ class PairingRepositoryTest {
     // ---- Candidate hosts ----
 
     @Test
+    fun pairingTheSameIdentityAgainPreservesItsFriendlyName() = runBlocking {
+        val payload = parsedPayload(pairingUri(hosts = listOf("desktop.local")), scannedAt)
+        val existing = PairedDesktop(
+            deviceId = "device-7",
+            displayName = "Old advertised name",
+            hosts = listOf("old.local"),
+            port = 8443,
+            serverSpkiFingerprint = payload.serverSpkiFingerprint,
+            lastSeenEpochMillis = null,
+            friendlyName = "Home office",
+        )
+        store.save(existing)
+        val transport = RecordingPairingTransport(
+            outcomes = mapOf("desktop.local" to EnrollmentOutcome.Approved("device-7")),
+        )
+        val result = repositoryWith(transport).pair(payload, deviceName, scannedAt)
+
+        assertTrue(result is PairingResult.Paired)
+        assertEquals("Home office", (result as PairingResult.Paired).desktop.label)
+        assertEquals("Home office", store.all().single().friendlyName)
+        assertEquals(listOf("desktop.local"), store.all().single().hosts)
+    }
+
+    @Test
     fun hostCandidates_areTriedInPayloadOrder() = runBlocking {
         val payload = parsedPayload(
             pairingUri(hosts = listOf("first.local", "fe80::2", "third.local")),

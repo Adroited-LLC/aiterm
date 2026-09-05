@@ -12,6 +12,16 @@ interface PairedDesktopStore {
     fun all(): List<PairedDesktop>
     fun save(desktop: PairedDesktop)
     fun remove(deviceId: String)
+
+    /** Applies metadata edits to the latest record without recreating a forgotten desktop. */
+    fun updateExisting(deviceId: String, update: (PairedDesktop) -> PairedDesktop): PairedDesktop? =
+        synchronized(this) {
+            val current = all().firstOrNull { it.deviceId == deviceId } ?: return@synchronized null
+            val updated = update(current)
+            require(updated.deviceId == deviceId)
+            save(updated)
+            updated
+        }
 }
 
 class PairedDesktopStoreException(message: String, cause: Throwable? = null) :
@@ -59,6 +69,9 @@ object PairedDesktopJson {
                 desktop.displayName.isBlank() ||
                 desktop.displayName.length > 128 ||
                 desktop.displayName.any(Char::isISOControl) ||
+                desktop.friendlyName?.let {
+                    it.isBlank() || it.length > 128 || it.any(Char::isISOControl)
+                } == true ||
                 desktop.hosts.isEmpty() ||
                 desktop.hosts.size > 16 ||
                 desktop.hosts.any { !PairingPayload.isValidHost(it) } ||

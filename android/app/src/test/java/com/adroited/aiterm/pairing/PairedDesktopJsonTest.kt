@@ -25,6 +25,15 @@ class PairedDesktopJsonTest {
             ),
             decoded.single(),
         )
+        assertEquals("Workshop PC", decoded.single().label)
+        val renamed = decoded.single().copy(friendlyName = "Home office")
+        assertEquals(listOf(renamed), PairedDesktopJson.decode(PairedDesktopJson.encode(listOf(renamed))))
+        assertEquals("Home office", renamed.label)
+        for (invalid in listOf("", "   ", "x".repeat(129), "Office\nPC")) {
+            assertThrows(PairedDesktopStoreException::class.java) {
+                PairedDesktopJson.encode(listOf(renamed.copy(friendlyName = invalid)))
+            }
+        }
     }
 
     @Test

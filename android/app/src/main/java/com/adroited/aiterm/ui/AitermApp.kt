@@ -3,6 +3,11 @@ package com.adroited.aiterm.ui
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -80,9 +85,13 @@ fun AitermApp(
                 }
                 composable<TerminalRoute> { entry ->
                     val route = entry.toRoute<TerminalRoute>()
-                    val desktop = runCatching { container.pairedDesktopStore.all() }
-                        .getOrDefault(emptyList())
-                        .firstOrNull { it.deviceId == route.deviceId }
+                    var pairedDesktops by remember(entry) {
+                        mutableStateOf(runCatching { container.pairedDesktopStore.all() }.getOrDefault(emptyList()))
+                    }
+                    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+                        pairedDesktops = runCatching { container.pairedDesktopStore.all() }.getOrDefault(emptyList())
+                    }
+                    val desktop = pairedDesktops.firstOrNull { it.deviceId == route.deviceId }
                     if (desktop == null) {
                         LaunchedEffect(route.deviceId) {
                             if (!navController.popBackStack()) navController.navigate(DesktopsRoute)
@@ -101,8 +110,7 @@ fun AitermApp(
                         RemoteDesktopScreen(
                             viewModel = remoteViewModel,
                             desktop = desktop,
-                            pairedDesktops = runCatching { container.pairedDesktopStore.all() }
-                                .getOrDefault(listOf(desktop)),
+                            pairedDesktops = pairedDesktops,
                             onBack = {
                                 navController.navigate(DesktopsRoute) { launchSingleTop = true }
                             },

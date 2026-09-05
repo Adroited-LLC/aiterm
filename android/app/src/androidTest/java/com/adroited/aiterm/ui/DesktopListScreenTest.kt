@@ -7,6 +7,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeDown
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -148,6 +149,66 @@ class DesktopListScreenTest {
 
         compose.onNodeWithText("No desktops paired").assertIsDisplayed()
         compose.onNodeWithContentDescription("Back to main screen").assertDoesNotExist()
+    }
+
+    @Test
+    fun savingFriendlyNameTrimsAndPersistsAliasWithoutChangingMachineName() {
+        val original = desktop()
+        val store = MemoryDesktopStore(listOf(original))
+        val viewModel = DesktopListViewModel(store)
+        compose.setContent {
+            DesktopListScreen(store = store, onPairDesktop = {}, viewModel = viewModel)
+        }
+
+        compose.onNodeWithContentDescription("Edit friendly name for Workshop PC")
+            .performScrollTo().performClick()
+        compose.onNodeWithTag("desktop-friendly-name").performTextReplacement("  Home office  ")
+        compose.onNodeWithText("Save").performClick()
+
+        compose.onNodeWithText("Home office").assertIsDisplayed()
+        compose.onNodeWithText("Workshop PC").assertIsDisplayed()
+        compose.runOnIdle {
+            assertEquals(original.copy(friendlyName = "Home office"), store.all().single())
+        }
+    }
+
+    @Test
+    fun cancellingFriendlyNameEditKeepsSavedAlias() {
+        val original = desktop().copy(friendlyName = "Home office")
+        val store = MemoryDesktopStore(listOf(original))
+        val viewModel = DesktopListViewModel(store)
+        compose.setContent {
+            DesktopListScreen(store = store, onPairDesktop = {}, viewModel = viewModel)
+        }
+
+        compose.onNodeWithContentDescription("Edit friendly name for Home office")
+            .performScrollTo().performClick()
+        compose.onNodeWithTag("desktop-friendly-name").performTextReplacement("Changed name")
+        compose.onNodeWithText("Cancel").performClick()
+
+        compose.onNodeWithText("Home office").assertIsDisplayed()
+        compose.onNodeWithText("Changed name").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(original, store.all().single()) }
+    }
+
+    @Test
+    fun clearingFriendlyNameRestoresOriginalMachineName() {
+        val original = desktop()
+        val store = MemoryDesktopStore(listOf(original.copy(friendlyName = "Home office")))
+        val viewModel = DesktopListViewModel(store)
+        compose.setContent {
+            DesktopListScreen(store = store, onPairDesktop = {}, viewModel = viewModel)
+        }
+
+        compose.onNodeWithContentDescription("Edit friendly name for Home office")
+            .performScrollTo().performClick()
+        compose.onNodeWithTag("desktop-friendly-name").performTextReplacement("")
+        compose.onNodeWithText("Save").performClick()
+
+        compose.onNodeWithText("Workshop PC").assertIsDisplayed()
+        compose.onNodeWithText("Home office").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Edit friendly name for Workshop PC").assertIsDisplayed()
+        compose.runOnIdle { assertEquals(original, store.all().single()) }
     }
 
     private fun desktop() = PairedDesktop(

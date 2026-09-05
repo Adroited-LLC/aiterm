@@ -134,7 +134,7 @@ class PairingViewModel(
             )
             pendingPayload = null
             mutableState.value = when (result) {
-                is PairingResult.Paired -> PairingUiState.Paired(result.desktop.displayName)
+                is PairingResult.Paired -> PairingUiState.Paired(result.desktop.label)
                 is PairingResult.Rejected -> PairingUiState.Failed(result.failure)
             }
         }
