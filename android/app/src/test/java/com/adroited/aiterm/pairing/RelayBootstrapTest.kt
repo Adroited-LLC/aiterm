@@ -67,4 +67,14 @@ class RelayBootstrapTest {
         assertEquals(PairingResult.Rejected(PairingFailure.DENIED_BY_DESKTOP), repository.pair(parsedPayload(uri()), "phone", 0))
         assertTrue(store.all().isEmpty())
     }
+
+    @Test fun provisionedRelayCannotSubstituteAnotherDesktopIdentity() = runTest {
+        val transport = RecordingPairingTransport(mapOf(relay to EnrollmentOutcome.FingerprintMismatch))
+        val store = FakePairedDesktopStore()
+        val repository = PairingRepository(transport, FakeDeviceKeys(), store,
+            relayProvisioner = RelayProvisioner { _, _, _, _ -> true })
+        assertEquals(PairingResult.Rejected(PairingFailure.FINGERPRINT_MISMATCH), repository.pair(parsedPayload(uri()), "phone", 0))
+        assertEquals(listOf("localhost", relay), transport.attempted.map { it.host })
+        assertTrue(store.all().isEmpty())
+    }
 }

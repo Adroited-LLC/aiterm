@@ -108,9 +108,10 @@ endpoints fail does the phone provision the route, then attempt the pinned relay
 connection. Provisioning never sends the connector token or pairing secret to
 the relay and never substitutes for desktop approval.
 
-Validation: 243 Android unit tests passed and APK built. New tests cover QR
+Validation: 244 Android unit tests passed and APK built. New tests cover QR
 binding/tampering, HTTPS provisioning payloads, route-limit rejection, repeated
-registration, direct-path preservation, and required desktop approval. An
+registration, direct-path preservation, required desktop approval, and rejection
+of a substituted desktop TLS identity after relay provisioning. An
 isolated WSL service completed a real relay enrollment and approval exchange;
 its temporary relay route was deleted afterward (HTTP 204). The installed Linux
 desktop and Linux Rust sources were not changed for this fix.
