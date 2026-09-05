@@ -277,7 +277,15 @@ impl RelayConfig {
         std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
         set_private_permissions(root, 0o700).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
-        write_private_file(&root.join(file), &bytes).map_err(|error| error.to_string())
+        let destination = root.join(file);
+        let temporary = destination.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        if let Err(error) = write_private_file(&temporary, &bytes)
+            .and_then(|()| std::fs::rename(&temporary, &destination))
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+        Ok(())
     }
 
     pub async fn prepare_enrollment(
@@ -763,6 +771,15 @@ mod tests {
         let reloaded: RelayConfig =
             serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(reloaded.enrollment_pending);
+        let root =
+            std::env::temp_dir().join(format!("aiterm-pending-relay-{}", uuid::Uuid::new_v4()));
+        config.save(&root).unwrap();
+        let mut approved = config.clone();
+        approved.enrollment_pending = false;
+        approved.save(&root).unwrap();
+        assert_eq!(RelayConfig::load(&root).unwrap(), Some(approved));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(
             reloaded
                 .pending_enrollment(&fingerprint)

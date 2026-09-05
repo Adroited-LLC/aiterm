@@ -178,3 +178,11 @@ No relay-server deployment or VM network change is required. Android continues
 to support pairing versions 1–3 used by the installed Linux desktop. The Linux
 installation is unchanged. Pending routes can be removed with the existing relay
 removal control; a scan may authorize transport before desktop approval.
+
+Validation: 601 backend tests passed; the Windows frontend built. An isolated
+service generated a decodable QR, provisioned a temporary route through the real
+relay, verified the exact desktop TLS pin, required approval, delivered approval
+on the original relay socket, and persisted the approved configuration. The
+relay removed the temporary test route with HTTP 204. This check caught and fixed
+pending-to-approved configuration replacement: relay saves now use a private
+synced temporary file followed by atomic rename.

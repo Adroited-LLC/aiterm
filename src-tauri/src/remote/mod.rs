@@ -486,6 +486,7 @@ pub struct RemoteStatusView {
 #[derive(Clone, Debug, Serialize)]
 pub struct RelayStatusView {
     pub configured: bool,
+    pub enrollment_pending: bool,
     pub connector_url: Option<String>,
     pub public_host: Option<String>,
     pub public_port: Option<u16>,
@@ -586,6 +587,10 @@ impl Inner {
                 .unwrap_or_else(|| DEFAULT_RELAY_SERVER.to_string()),
             relay: RelayStatusView {
                 configured: self.relay_config.is_some(),
+                enrollment_pending: self
+                    .relay_config
+                    .as_ref()
+                    .is_some_and(|config| config.enrollment_pending),
                 connector_url: self
                     .relay_config
                     .as_ref()

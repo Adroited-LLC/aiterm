@@ -34,6 +34,7 @@ export interface RemoteStatus {
 
 export interface RelayStatus {
   configured: boolean;
+  enrollment_pending?: boolean;
   connector_url: string | null;
   public_host: string | null;
   public_port: number | null;
@@ -217,6 +218,7 @@ export function relayLabel(status: RemoteStatus): string {
     ? `${relay.public_host}:${relay.public_port}`
     : "configured";
   if (!status.enabled) return `${endpoint} — off`;
+  if (relay.enrollment_pending && relay.state !== "connected") return "Waiting for a phone to scan the pairing code";
   return `${endpoint} — ${relay.state}`;
 }
 
