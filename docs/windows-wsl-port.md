@@ -186,3 +186,24 @@ on the original relay socket, and persisted the approved configuration. The
 relay removed the temporary test route with HTTP 204. This check caught and fixed
 pending-to-approved configuration replacement: relay saves now use a private
 synced temporary file followed by atomic rename.
+
+## Installer networking guidance (Windows 0.1.4)
+
+The NSIS installer checks the active mode of the user's default WSL distribution
+with `wslinfo --networking-mode`, matching the distribution selected by the app.
+Mirrored mode proceeds without a warning. Other recognized modes prompt the user
+to choose Mirrored under WSL Settings > Networking; a failed or unavailable probe
+reports that the mode could not be confirmed. The probe has a 15-second output
+inactivity timeout. Silent installs use the message box's default response.
+
+The notice recommends mirrored networking for direct LAN access, identifies the
+Windows 11 22H2 requirement, and explains that reachability and firewall rules
+still matter. It does not edit `.wslconfig`, change firewall rules, or shut down
+WSL. Users save their work and restart WSL or Windows when ready. If WSL Settings
+is unavailable, update WSL or follow Microsoft's `.wslconfig` instructions:
+https://learn.microsoft.com/windows/wsl/networking#mirrored-mode-networking
+
+Validation: the Windows installer built successfully. A temporary NSIS harness
+verified real mirrored-mode detection plus simulated NAT and unavailable-probe
+responses, including noninteractive completion in silent mode. Existing Linux
+and Android application code is unchanged by this installer-only update.
