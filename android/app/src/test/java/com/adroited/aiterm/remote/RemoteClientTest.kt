@@ -508,6 +508,41 @@ class RemoteClientTest {
     }
 
     @Test
+    fun startupRefreshWaitsForAuthenticationAndSuccessfulConnectionClearsTheOldError() = runTest {
+        val transport = DeferredRemoteTransport(connectImmediately = false)
+        val client = RemoteClient(
+            transportFactory = { transport },
+            screenStore = DefaultTerminalScreenStore(),
+            isUnlocked = { true },
+            scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        client.acceptForTest(RemoteServerEvent.Failure("request.failed", "previous connection failed"))
+        val connecting = async { client.connect() }
+        runCurrent()
+        assertEquals(ConnectionState.Connecting, client.state.value.connection)
+
+        client.refreshUsage()
+        client.refreshSessions()
+        client.refreshAgents()
+        runCurrent()
+        assertTrue(transport.requests.isEmpty())
+        assertFalse(transport.closed)
+        assertFalse(client.state.value.sessionsRefreshing)
+        assertEquals(ConnectionState.Connecting, client.state.value.connection)
+        assertEquals("previous connection failed", client.state.value.lastError)
+
+        transport.allowConnect.complete(Unit)
+        runCurrent()
+        connecting.await()
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertEquals(null, client.state.value.lastError)
+        client.refreshUsage()
+        assertEquals(listOf("usage.report"), transport.requests.map { it.kind })
+        client.lock()
+    }
+
+    @Test
     fun lockDuringConnectCannotPublishTheLateConnection() = runTest {
         val transport = DeferredRemoteTransport(connectImmediately = false)
         val client = RemoteClient(

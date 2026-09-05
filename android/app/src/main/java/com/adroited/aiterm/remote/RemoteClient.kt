@@ -238,6 +238,7 @@ class RemoteClient(
                 mutableState.value = mutableState.value.copy(
                     connection = ConnectionState.Connected,
                     connectedEndpoint = candidate.endpoint,
+                    lastError = null,
                 )
                 mutableState.value.activeTabId
             }
@@ -1151,6 +1152,7 @@ class RemoteClient(
         onSuccess: (ByteArray) -> Unit = {},
     ): Boolean {
         val requestContext = synchronized(lifecycleLock) {
+            if (mutableState.value.connection != ConnectionState.Connected) return false
             val active = transport ?: return false
             RequestContext(lifecycleGeneration, active)
         }

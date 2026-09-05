@@ -1002,7 +1002,7 @@ class TerminalScreenTest {
         compose.setContent {
             Box(Modifier.size(if (landscape.value) 800.dp else 400.dp, if (landscape.value) 400.dp else 800.dp)) {
                 TerminalScreenContent(
-                    state = RemoteClientState(connection = ConnectionState.Connected),
+                    state = connectedState(),
                     screen = ScreenSnapshot(
                         tabId = "tab-rotation",
                         revision = 8,
@@ -1035,7 +1035,7 @@ class TerminalScreenTest {
             compose.setContent {
                 Box(Modifier.size(400.dp, height.value)) {
                     TerminalScreenContent(
-                        state = RemoteClientState(connection = ConnectionState.Connected),
+                        state = connectedState(),
                         screen = ScreenSnapshot(
                             tabId = "tab-resize-storm",
                             revision = 1,
@@ -1219,7 +1219,7 @@ class TerminalScreenTest {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density, 1.6f)) {
                 TerminalScreenContent(
-                    state = RemoteClientState(connection = ConnectionState.Connected),
+                    state = connectedState(),
                     screen = ScreenSnapshot(
                         tabId = "tab-geometry",
                         revision = 1,
@@ -1263,7 +1263,7 @@ class TerminalScreenTest {
                     Modifier.size(dimensions.value.first, dimensions.value.second),
                 ) {
                     TerminalScreenContent(
-                        state = RemoteClientState(connection = ConnectionState.Connected),
+                        state = connectedState(),
                         screen = ScreenSnapshot(
                             tabId = "tab-render-bounds",
                             revision = 1,
@@ -1324,7 +1324,7 @@ class TerminalScreenTest {
         compose.setContent {
             Box(Modifier.size(400.dp, 800.dp)) {
                 TerminalScreenContent(
-                    state = RemoteClientState(connection = ConnectionState.Connected),
+                    state = connectedState(),
                     screen = ScreenSnapshot(
                         tabId = "tab-history",
                         revision = 1,

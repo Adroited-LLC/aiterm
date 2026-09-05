@@ -508,7 +508,9 @@ internal fun RemoteAppDrawer(
     onLoadUsage: () -> Unit,
     onManageDesktops: () -> Unit,
 ) {
-    LaunchedEffect(Unit) { onLoadUsage() }
+    LaunchedEffect(state.connection) {
+        if (state.connection == ConnectionState.Connected) onLoadUsage()
+    }
     ModalDrawerSheet(
         modifier = Modifier.fillMaxHeight().widthIn(max = 340.dp),
         drawerContainerColor = MaterialTheme.colorScheme.surface,
