@@ -15,6 +15,7 @@ import com.adroited.aiterm.AitermApplication
 import com.adroited.aiterm.AppContainer
 import com.adroited.aiterm.pairing.PairedDesktop
 import kotlinx.serialization.Serializable
+import androidx.navigation.NavDestination.Companion.hasRoute
 import androidx.navigation.toRoute
 
 /** Type-safe navigation destinations. */
@@ -49,10 +50,25 @@ fun AitermApp(
             val desktops = runCatching { container.pairedDesktopStore.all() }.getOrDefault(emptyList())
             NavHost(navController = navController, startDestination = initialDestination(desktops)) {
                 composable<DesktopsRoute> {
+                    val previous = navController.previousBackStackEntry
+                    val previousDesktop = previous
+                        ?.takeIf { it.destination.hasRoute<TerminalRoute>() }
+                        ?.toRoute<TerminalRoute>()
                     DesktopListScreen(
                         store = container.pairedDesktopStore,
                         onPairDesktop = { navController.navigate(PairingRoute) },
-                        onOpenDesktop = { navController.navigate(TerminalRoute(it.deviceId)) },
+                        onOpenDesktop = { desktop ->
+                            if (previousDesktop?.deviceId == desktop.deviceId) {
+                                navController.popBackStack()
+                            } else {
+                                navController.navigate(TerminalRoute(desktop.deviceId)) {
+                                    if (previousDesktop != null) {
+                                        popUpTo<TerminalRoute> { inclusive = true }
+                                    }
+                                }
+                            }
+                        },
+                        onBack = if (previous != null) ({ navController.popBackStack(); Unit }) else null,
                     )
                 }
                 composable<PairingRoute> {
@@ -88,7 +104,7 @@ fun AitermApp(
                             pairedDesktops = runCatching { container.pairedDesktopStore.all() }
                                 .getOrDefault(listOf(desktop)),
                             onBack = {
-                                if (!navController.popBackStack()) navController.navigate(DesktopsRoute)
+                                navController.navigate(DesktopsRoute) { launchSingleTop = true }
                             },
                             onOpenDesktop = { target ->
                                 navController.navigate(TerminalRoute(target.deviceId)) {

@@ -2,6 +2,7 @@ package com.adroited.aiterm.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -109,6 +110,44 @@ class DesktopListScreenTest {
         compose.onNodeWithTag("desktop-list").performTouchInput { swipeDown() }
 
         compose.onNodeWithText("Workshop PC").assertIsDisplayed()
+    }
+
+    @Test
+    fun backButtonReturnsToTheMainScreen() {
+        val store = MemoryDesktopStore(listOf(desktop()))
+        val viewModel = DesktopListViewModel(store)
+        var backRequests = 0
+        compose.setContent {
+            DesktopListScreen(
+                store = store,
+                onPairDesktop = {},
+                viewModel = viewModel,
+                onBack = { backRequests++ },
+            )
+        }
+
+        compose.onNodeWithContentDescription("Back to main screen")
+            .assertIsDisplayed()
+            .performClick()
+
+        compose.runOnIdle { assertEquals(1, backRequests) }
+    }
+
+    @Test
+    fun initialDesktopScreenDoesNotShowABackButton() {
+        val store = MemoryDesktopStore(emptyList())
+        val viewModel = DesktopListViewModel(store)
+        compose.setContent {
+            DesktopListScreen(
+                store = store,
+                onPairDesktop = {},
+                viewModel = viewModel,
+                onBack = null,
+            )
+        }
+
+        compose.onNodeWithText("No desktops paired").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Back to main screen").assertDoesNotExist()
     }
 
     private fun desktop() = PairedDesktop(
