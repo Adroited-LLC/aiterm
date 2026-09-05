@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "aiterm-windows"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aiterm-wsl-protocol",
  "base64 0.22.1",

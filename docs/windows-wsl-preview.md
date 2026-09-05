@@ -48,6 +48,13 @@ reported in the window; reopen aiterm to reconnect.
 
 ## Building
 
+Preview 0.1.1 includes the Linux desktop's live conversation gateway fix:
+`session.spine` is accepted by the wire decoder instead of being rejected
+before dispatch. The shared decoder regression runs in the WSL companion's
+test suite. Use Android 0.3.3 or later for the matching CBOR decoding and
+working-indicator fixes. Updating the Windows app embeds the new companion;
+its normal startup installs the updated backend into WSL.
+
 Use a Windows-local checkout with Node.js, Rust MSVC, Visual Studio C++ Build
 Tools, and WebView2. Inside Ubuntu install Rust, `build-essential`, `curl`,
 `ca-certificates`, and `python3`.

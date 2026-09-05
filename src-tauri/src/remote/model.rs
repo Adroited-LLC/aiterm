@@ -19,6 +19,7 @@ const KNOWN_REQUESTS: &[&str] = &[
     "session.bring_in",
     "session.preview",
     "session.conversation",
+    "session.spine",
     "session.changes",
     "session.web_preview",
     "file.read",
@@ -307,5 +308,30 @@ impl TerminalSize {
 
     pub fn rows(&self) -> u16 {
         self.rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_conversation_request_reaches_the_gateway() {
+        let mut payload = Vec::new();
+        ciborium::into_writer(
+            &serde_json::json!({"session_id": "session-1", "after": 417}),
+            &mut payload,
+        )
+        .unwrap();
+        let envelope = serde_json::json!({
+            "version": 1, "request_id": 42, "kind": "session.spine", "payload": payload,
+        });
+        let mut wire = Vec::new();
+        ciborium::into_writer(&envelope, &mut wire).unwrap();
+        let request = RemoteRequest::decode(&wire)
+            .expect("live feed must not be rejected as unsupported before dispatch");
+        assert_eq!(request.kind(), "session.spine");
+        assert_eq!(request.request_id(), 42);
+        assert_eq!(request.payload(), payload);
     }
 }
