@@ -120,6 +120,97 @@ class TerminalScreenTest {
     }
 
     @Test
+    fun collapsingTerminalKeysHidesComposerAndKeyboardThenRestoresTheDraft() {
+        val expanded = mutableStateOf(true)
+        val store = TerminalDraftStore()
+        val sent = mutableListOf<String>()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-collapse-draft"),
+                draftStore = store,
+                keyBarExpanded = expanded.value,
+                onKeyBarExpandedChange = { expanded.value = it },
+                onInput = sent::add,
+            )
+        }
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .performTextInput("keep this draft")
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) == true
+        }
+
+        compose.onNodeWithTag("collapse-extra-keys").performClick()
+
+        compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithTag("expand-extra-keys").assertIsDisplayed()
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) != true
+        }
+        compose.runOnIdle {
+            assertEquals("keep this draft", store.draftFor("tab-collapse-draft").composer.value.text)
+            assertTrue(sent.isEmpty())
+        }
+
+        compose.onNodeWithTag("expand-extra-keys").performClick()
+
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .assertIsDisplayed().assertTextEquals("keep this draft")
+    }
+
+    @Test
+    fun draggingTerminalDownDismissesNativeKeyboardWithoutDiscardingTheDraft() {
+        val store = TerminalDraftStore()
+        compose.setContent {
+            TerminalScreenContent(
+                state = connectedState(),
+                screen = oneCellScreen("tab-drag-ime"),
+                draftStore = store,
+            )
+        }
+        compose.onNodeWithText("Type").performClick()
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .performTextInput("keep while browsing")
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) == true
+        }
+        val terminal = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+        val renderBounds = terminal.fetchSemanticsNode().boundsInRoot
+        val chromeTop = compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot.top
+        val exposedHeight = chromeTop - renderBounds.top
+        assertTrue("terminal must remain exposed above the composer", exposedHeight > 0f)
+
+        terminal.performTouchInput {
+            swipeDown(startY = exposedHeight * 0.1f, endY = exposedHeight * 0.9f, durationMillis = 350)
+        }
+
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) != true
+        }
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .assertIsDisplayed().assertTextEquals("keep while browsing")
+        compose.runOnIdle {
+            assertEquals("keep while browsing", store.draftFor("tab-drag-ime").composer.value.text)
+        }
+
+        compose.onNodeWithTag("terminal-grid").performClick()
+
+        compose.waitUntil(5_000) {
+            compose.activity.window.decorView.rootWindowInsets
+                ?.isVisible(WindowInsets.Type.ime()) == true
+        }
+        compose.onNodeWithTag("terminal-composer", useUnmergedTree = true)
+            .assertTextEquals("keep while browsing")
+    }
+
+    @Test
     fun imageChooserAddsAtMostFourGalleryImagesInSelectionOrderAndExplainsTheLimit() {
         val store = TerminalDraftStore()
         val picker = FakeTerminalImagePickerLauncher().apply {

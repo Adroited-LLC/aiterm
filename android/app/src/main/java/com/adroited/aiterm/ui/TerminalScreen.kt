@@ -6,6 +6,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.imeNestedScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.Box
@@ -196,6 +198,7 @@ internal fun TerminalScreenContent(
     val activeTabId = screen?.tabId
     val tabDraft = activeTabId?.let { allDrafts[it] } ?: TerminalTabDraft()
     val composer = tabDraft.composer
+    val composerVisible = keyBarExpanded && composer.expanded
     val attachments = tabDraft.attachments
     val defaultNormalizer = remember(context) { TerminalImageNormalizer(context) }
     val normalizer = imageNormalizer ?: remember(defaultNormalizer) {
@@ -215,10 +218,17 @@ internal fun TerminalScreenContent(
             viewportReady = true
         }
     }
-    val onRequestKeyboard = remember(state.focus, activeTabId, activeDraftStore) {
+    val onRequestKeyboard = remember(
+        state.focus, activeTabId, activeDraftStore, composerVisible, onKeyBarExpandedChange, keyboard,
+    ) {
         {
             if (state.focus == FocusOwner.Self && activeTabId != null) {
+                onKeyBarExpandedChange(true)
                 activeDraftStore.updateComposer(activeTabId) { it.open() }
+                if (composerVisible) {
+                    inputFocus.requestFocus()
+                    keyboard?.show()
+                }
             }
         }
     }
@@ -376,7 +386,7 @@ internal fun TerminalScreenContent(
     }
 
     BackHandler {
-        if (composer.expanded && activeTabId != null) {
+        if (composerVisible && activeTabId != null) {
             activeDraftStore.updateComposer(activeTabId) { it.close() }
             keyboard?.hide()
         } else {
@@ -392,11 +402,15 @@ internal fun TerminalScreenContent(
             onTakeFocus(cols, rows)
         }
     }
-    LaunchedEffect(composer.expanded, state.focus, screen?.tabId) {
-        if (composer.expanded && state.focus == FocusOwner.Self && screen != null) {
+    LaunchedEffect(composerVisible, state.focus, screen?.tabId) {
+        if (composerVisible && state.focus == FocusOwner.Self && screen != null) {
             inputFocus.requestFocus()
             keyboard?.show()
         }
+    }
+
+    LaunchedEffect(keyBarExpanded) {
+        if (!keyBarExpanded) keyboard?.hide()
     }
 
     Scaffold(
@@ -452,7 +466,7 @@ internal fun TerminalScreenContent(
                     .windowInsetsPadding(bottomInsets),
             ) {
                 Column(Modifier.onSizeChanged { chromeInteractiveHeightPx = it.height }) {
-                    if (screen != null && composer.expanded) {
+                    if (screen != null && composerVisible) {
                         Column(
                             Modifier.fillMaxWidth()
                                 .testTag("terminal-composer-overlay")
@@ -500,7 +514,7 @@ internal fun TerminalScreenContent(
                                 activeDraftStore.updateComposer(tabId) { it.open() }
                             }
                         },
-                        submitComposerDraft = composer.expanded &&
+                        submitComposerDraft = composerVisible &&
                             (composer.value.text.isNotEmpty() || attachments.items.isNotEmpty() ||
                                 attachments.preparing),
                         submissionEnabled = !attachments.preparing && !attachments.submitting,
@@ -699,6 +713,7 @@ private fun ConnectionRail(state: RemoteClientState, onReconnect: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun TerminalGrid(
     screen: ScreenSnapshot?,
@@ -771,7 +786,10 @@ private fun TerminalGrid(
         SelectionContainer {
             LazyColumn(
                 state = listState,
-                modifier = Modifier.fillMaxSize().nestedScroll(historyScroll).testTag("terminal-render-content"),
+                modifier = Modifier.fillMaxSize()
+                    .nestedScroll(historyScroll)
+                    .then(if (WindowInsets.ime.getBottom(density) > 0) Modifier.imeNestedScroll() else Modifier)
+                    .testTag("terminal-render-content"),
             ) {
                 itemsIndexed(
                     terminalRows,
