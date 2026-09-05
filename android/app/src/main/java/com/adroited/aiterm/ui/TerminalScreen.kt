@@ -385,7 +385,12 @@ internal fun TerminalScreenContent(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
-                actions = { ConsoleKeyboardMenu() },
+                actions = {
+                    if (state.connection == ConnectionState.Disconnected) {
+                        TextButton(onClick = onReconnect) { Text("Reconnect") }
+                    }
+                    ConsoleKeyboardMenu()
+                },
                 navigationIcon = {
                     IconButton(onClick = ::requestLeave) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -406,7 +411,6 @@ internal fun TerminalScreenContent(
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
             Column(Modifier.fillMaxSize().testTag("terminal-surface")) {
-                ConnectionRail(state, onReconnect)
                 TerminalViewport(
                     screen = screen,
                     scrollback = scrollback,
@@ -638,33 +642,6 @@ private fun TerminalViewport(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-        }
-    }
-}
-
-@Composable
-private fun ConnectionRail(state: RemoteClientState, onReconnect: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth()
-            .background(state.connection.color().copy(alpha = 0.14f))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        val path = state.connectedEndpoint?.path
-        val label = if (
-            state.connection == ConnectionState.Connected &&
-            path != null && path != com.adroited.aiterm.remote.RemotePath.UNKNOWN
-        ) {
-            "${state.connection.label()} · ${path.name}"
-        } else {
-            state.connection.label()
-        }
-        Text(label, style = MaterialTheme.typography.labelMedium)
-        state.lastError?.let {
-            Text("  $it", modifier = Modifier.weight(1f), maxLines = 1)
-        } ?: Spacer(Modifier.weight(1f))
-        if (state.connection == ConnectionState.Disconnected) {
-            TextButton(onClick = onReconnect) { Text("Reconnect") }
         }
     }
 }
