@@ -370,18 +370,26 @@ class RemoteClient(
             text.encodeToByteArray().also { if (it.size > MAX_INPUT_BYTES) return false }
         }
         return terminalSubmissionMutex.withLock {
-            encoded.forEachIndexed { index, data ->
-                val input = synchronized(lifecycleLock) {
-                    if (mutableState.value.focus != FocusOwner.Self) {
-                        mutableState.value = mutableState.value.copy(readOnly = true, showTakeFocus = true)
-                        return@withLock false
-                    }
-                    if (mutableState.value.activeTabId != tabId) return@withLock false
-                    val attachmentId = activeAttachmentId ?: return@withLock false
-                    if (activeAttachmentTabId != tabId) return@withLock false
-                    val active = transport ?: return@withLock false
-                    TerminalInputContext(lifecycleGeneration, active, attachmentId)
+            val input = synchronized(lifecycleLock) {
+                if (mutableState.value.focus != FocusOwner.Self) {
+                    mutableState.value = mutableState.value.copy(readOnly = true, showTakeFocus = true)
+                    return@withLock false
                 }
+                if (mutableState.value.activeTabId != tabId) return@withLock false
+                val attachmentId = activeAttachmentId ?: return@withLock false
+                if (activeAttachmentTabId != tabId) return@withLock false
+                val active = transport ?: return@withLock false
+                TerminalInputContext(lifecycleGeneration, active, attachmentId)
+            }
+            encoded.forEachIndexed { index, data ->
+                if (synchronized(lifecycleLock) {
+                        !isCurrent(input.lifecycleGeneration, input.transport) ||
+                            mutableState.value.focus != FocusOwner.Self ||
+                            mutableState.value.activeTabId != tabId ||
+                            activeAttachmentTabId != tabId ||
+                            activeAttachmentId != input.attachmentId
+                    }
+                ) return@withLock false
                 val response = input.transport.request(
                     "terminal.input",
                     RemoteCommands.input(tabId, input.attachmentId, data),
@@ -1624,7 +1632,9 @@ class RemoteClient(
         const val MAX_OWNED_JOBS = 64
         const val UPLOAD_CLEANUP_TIMEOUT_MILLIS = 2_000L
         const val UPLOAD_RESUME_TIMEOUT_MILLIS = 2 * 60_000L
-        const val TERMINAL_SUBMIT_SETTLE_MILLIS = 75L
+        // Codex suppresses Enter for 120 ms after an unbracketed paste burst.
+        // Leave additional time for the receiving TUI to process the accepted PTY write.
+        const val TERMINAL_SUBMIT_SETTLE_MILLIS = 250L
         const val PREVIEW_REFRESH_TIMEOUT_MILLIS = 8_000L
         val RECONNECT_DELAYS_MILLIS = longArrayOf(1_000, 2_000, 4_000, 8_000, 16_000)
     }

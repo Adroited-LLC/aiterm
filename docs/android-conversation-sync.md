@@ -80,3 +80,20 @@ without advancing the polling clock. All 236 Android tests and the Linux
 Three unrelated session filesystem tests failed in an initial unrestricted
 parallel run and passed on the limited-parallelism rerun. Windows/WSL includes
 the same backend changes in preview 0.1.2.
+
+## Android 0.3.5: composed prompt submission
+
+The terminal composer queued paste and Enter together, while the API composer
+waited only 75 ms after desktop acceptance. Codex's unbracketed paste detector
+keeps Enter in newline mode for 120 ms. Both composers now use the acknowledged
+submission path, with a 250 ms settling interval. A submission stays bound to its
+original transport and attachment and stops if focus is lost. The terminal
+composer retains its draft until acceptance and prevents another submission
+while the first is pending. Raw terminal keys remain immediate.
+
+Validation: 237 Android unit tests passed, debug APK built, and Android UI test
+sources compiled. A standalone harness against upstream Codex paste_burst.rs
+reproduced newline classification at 75 ms and submission eligibility at 250 ms.
+This is a timing regression check, not an end-to-end guarantee under arbitrary
+receiver stalls. Phone prompt submission still needs user confirmation.
+Source: https://raw.githubusercontent.com/openai/codex/main/codex-rs/tui/src/bottom_pane/paste_burst.rs

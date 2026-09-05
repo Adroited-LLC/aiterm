@@ -142,7 +142,7 @@ fun RemoteTerminalScreen(
         onDeleteSession = viewModel::deleteSession,
         onOpenShell = { cols, rows -> viewModel.openShell(null, cols, rows) },
         onInput = viewModel::sendInput,
-        onInputBatch = viewModel::sendInputs,
+        onInputBatch = viewModel::submitInputs,
         draftStore = viewModel.terminalDrafts,
         onUploadImages = viewModel::uploadDraftImages,
         onTakeFocus = viewModel::takeFocus,
@@ -171,7 +171,7 @@ internal fun TerminalScreenContent(
     onDeleteSession: (String) -> Unit = {},
     onOpenShell: (Int, Int) -> Unit = { _, _ -> },
     onInput: (String) -> Unit = {},
-    onInputBatch: ((String, List<String>) -> Boolean)? = null,
+    onInputBatch: (suspend (String, List<String>) -> Boolean)? = null,
     draftStore: TerminalDraftStore? = null,
     imagePickerLauncher: TerminalImagePickerLauncher? = null,
     imageNormalizer: TerminalImageNormalization? = null,
@@ -295,18 +295,29 @@ internal fun TerminalScreenContent(
                 paths = emptyList(),
                 bracketedPaste = activeScreen.modes.bracketedPaste,
             )
-            val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
-                outbound.forEach(onInput)
-                true
+            activeDraftStore.transitionAttachments(tabId) {
+                TerminalAttachmentDraftUpdate(it.copy(submitting = true, message = null))
             }
-            if (accepted) {
-                activeDraftStore.clear(tabId)
-                keyboard?.hide()
-            } else {
-                setAttachmentMessage(
-                    tabId,
-                    "Terminal input was not accepted. Take focus and try again.",
-                )
+            coroutineScope.launch {
+                try {
+                    val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
+                        outbound.forEach(onInput)
+                        true
+                    }
+                    if (accepted) {
+                        activeDraftStore.clear(tabId)
+                        keyboard?.hide()
+                    } else {
+                        setAttachmentMessage(
+                            tabId,
+                            "Terminal input was not accepted. Take focus and try again.",
+                        )
+                    }
+                } finally {
+                    activeDraftStore.transitionAttachments(tabId) {
+                        TerminalAttachmentDraftUpdate(it.copy(submitting = false))
+                    }
+                }
             }
             return
         }

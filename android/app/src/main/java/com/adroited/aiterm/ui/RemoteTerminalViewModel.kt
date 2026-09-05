@@ -108,6 +108,8 @@ class RemoteTerminalViewModel(
 
     fun selectTab(tabId: String) = client.selectTab(tabId)
     fun sendInput(text: String) = client.sendInput(text)
+    suspend fun submitInputs(tabId: String, texts: List<String>) = client.submitInputs(tabId, texts)
+
     fun sendInputs(tabId: String, texts: List<String>) = client.sendInputs(tabId, texts)
     /**
      * Uploads normalized drafts only. Prompt formatting and terminal input stay in the UI submit

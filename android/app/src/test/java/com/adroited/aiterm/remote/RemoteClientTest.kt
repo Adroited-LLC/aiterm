@@ -292,7 +292,11 @@ class RemoteClientTest {
         runCurrent()
         assertEquals(1, transport.requests.size)
 
-        advanceTimeBy(75)
+        // Enter inside Codex's 120 ms paste window becomes a newline, not submission.
+        advanceTimeBy(121)
+        runCurrent()
+        assertEquals(1, transport.requests.size)
+        advanceTimeBy(129)
         runCurrent()
 
         assertTrue(submission.await())
@@ -301,6 +305,31 @@ class RemoteClientTest {
             RemoteCommands.input("tab-1", "attachment-1", "\r".encodeToByteArray()),
             transport.requests.last().payload,
         )
+        client.lock()
+    }
+
+    @Test
+    fun terminalSubmissionDoesNotSendEnterAfterFocusIsLostDuringPasteSettle() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+
+        val submission = async { client.submitInputs("tab-1", listOf("hello", "\r")) }
+        runCurrent()
+        assertEquals(1, transport.requests.size)
+        client.acceptForTest(
+            RemoteServerEvent.FocusChanged(
+                "tab-1", "attachment-1", FocusOwner.Other, TerminalSize(80, 24),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertFalse(submission.await())
+        assertEquals(1, transport.requests.count { it.kind == "terminal.input" })
         client.lock()
     }
 
