@@ -1,0 +1,15 @@
+[Unit]
+Description=AITerm private update distribution
+After=network.target
+[Service]
+User=aiterm-updates
+Group=aiterm-updates
+ExecStart=/usr/bin/python3 /opt/aiterm-updates/server.py --root /var/lib/aiterm-updates/current --invites /etc/aiterm-updates/invites.json
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+[Install]
+WantedBy=multi-user.target

@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--android-code', required=True, type=int)
     parser.add_argument('--windows-version', required=True)
     parser.add_argument('--notes', required=True, type=pathlib.Path)
+    parser.add_argument('--cache-out', type=pathlib.Path, help='Save the verified release set for invite-service deployment')
     parser.add_argument('--publish', action='store_true')
     args = parser.parse_args()
     assert json.loads(gh('repo','view',REPO,'--json','visibility'))['visibility'] == 'PRIVATE', 'Distribution repository must be private'
@@ -49,6 +50,9 @@ def main():
         for path in folder.iterdir():
             expected = 'sha256:'+hashlib.file_digest(path.open('rb'),'sha256').hexdigest()
             assert assets[path.name]['size']==path.stat().st_size and assets[path.name]['digest']==expected, f'Upload verification failed: {path.name}'
+        if args.cache_out:
+            assert not args.cache_out.exists(), 'Cache output already exists'
+            shutil.copytree(folder,args.cache_out)
         if args.publish:
             assert json.loads(gh('repo','view',REPO,'--json','visibility'))['visibility']=='PRIVATE'
             gh('release','edit',args.tag,'--repo',REPO,'--draft=false','--latest')

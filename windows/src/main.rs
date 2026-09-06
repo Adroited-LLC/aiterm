@@ -151,6 +151,7 @@ fn main() {
         })
         .manage(Terminal::default())
         .invoke_handler(tauri::generate_handler![
+            app_updates::app_update_settings,
             app_updates::app_update_connect,
             app_updates::app_update_check,
             app_updates::app_update_install,

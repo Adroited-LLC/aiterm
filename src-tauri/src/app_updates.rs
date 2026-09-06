@@ -10,8 +10,8 @@ use std::{
 };
 use tauri::Manager;
 
-const API: &str = "https://api.github.com/repos/Adroited-LLC/aiterm-releases";
-const ORIGIN: &str = "https://api.github.com/repos/Adroited-LLC/aiterm-releases/releases/assets/";
+const API: &str = "https://control.34-23-107-73.sslip.io:8443/updates";
+
 static INSTALLING: AtomicBool = AtomicBool::new(false);
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +66,13 @@ fn platform() -> Result<&'static str, String> {
 }
 fn validate(p: &Package, target: &str) -> Result<(), String> {
     version(&p.version)?;
+    if !p
+        .asset
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return Err("Invalid asset name".into());
+    }
     let suffix = if target == "windows-x86_64" {
         ".exe"
     } else {
@@ -88,21 +95,19 @@ fn client() -> Result<reqwest::Client, String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("AITerm updater")
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())
 }
-#[derive(Deserialize)]
-struct Asset {
-    id: u64,
-    name: String,
-    size: u64,
-}
-#[derive(Deserialize)]
-struct Release {
-    assets: Vec<Asset>,
+fn valid_invite(value: &str) -> bool {
+    value.strip_prefix("aiterm_").is_some_and(|v| {
+        v.len() == 43
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
 }
 fn credential_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(app
@@ -152,12 +157,8 @@ fn credential(app: &tauri::AppHandle) -> Result<Option<String>, String> {
         Ok(value) => {
             #[cfg(windows)]
             let value = protect_credential(&value, true)?;
-            Ok(Some(
-                String::from_utf8(value)
-                    .map_err(|_| "Invalid stored credential")?
-                    .trim()
-                    .to_string(),
-            ))
+            let value = String::from_utf8(value).map_err(|_| "Invalid stored credential")?;
+            Ok(valid_invite(value.trim()).then(|| value.trim().to_string()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err("Could not read update credential".into()),
@@ -172,16 +173,16 @@ async fn get(token: &str, url: &str, binary: bool, limit: usize) -> Result<Vec<u
             if binary {
                 "application/octet-stream"
             } else {
-                "application/vnd.github+json"
+                "application/json"
             },
         )
         .timeout(Duration::from_secs(30))
         .send()
         .await
-        .map_err(|_| "Could not reach GitHub. Try again.")?;
+        .map_err(|_| "Could not reach the update service. Try again.")?;
     if !response.status().is_success() {
         return Err(format!(
-            "GitHub returned {}. Check your token and repository access.",
+            "Update service returned {}. Check that your invite code is still active.",
             response.status().as_u16()
         ));
     }
@@ -199,19 +200,9 @@ async fn get(token: &str, url: &str, binary: bool, limit: usize) -> Result<Vec<u
     Ok(body)
 }
 async fn package(token: &str, current: &str) -> Result<Option<Package>, String> {
-    let release: Release = serde_json::from_slice(
-        &get(token, &format!("{API}/releases/latest"), false, 1024 * 1024).await?,
-    )
-    .map_err(|_| "Invalid release response")?;
-    let feed = release
-        .assets
-        .iter()
-        .find(|a| a.name == "updates.json")
-        .ok_or("This release has no update manifest")?;
-    let manifest: Manifest = serde_json::from_slice(
-        &get(token, &format!("{ORIGIN}{}", feed.id), true, 256 * 1024).await?,
-    )
-    .map_err(|_| "Invalid update feed")?;
+    let manifest: Manifest =
+        serde_json::from_slice(&get(token, &format!("{API}/latest"), false, 256 * 1024).await?)
+            .map_err(|_| "Invalid update feed")?;
     if manifest.schema != 1 {
         return Err("Unsupported update feed".into());
     }
@@ -220,15 +211,7 @@ async fn package(token: &str, current: &str) -> Result<Option<Package>, String> 
         return Ok(None);
     };
     validate(&p, target)?;
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == p.asset)
-        .ok_or("Update package is missing")?;
-    if asset.size != p.size {
-        return Err("Update package size does not match the manifest".into());
-    }
-    p.url = format!("{ORIGIN}{}", asset.id);
+    p.url = format!("{API}/assets/{}", p.asset);
     Ok((version(&p.version)? > version(current)?).then_some(p))
 }
 #[tauri::command]
@@ -241,7 +224,10 @@ pub async fn app_update_connect(app: tauri::AppHandle, token: String) -> Result<
         }
         return Ok(());
     }
-    get(token, API, false, 256 * 1024).await?;
+    if !valid_invite(token) {
+        return Err("Enter the invite code supplied by your AITerm administrator".into());
+    }
+    get(token, &format!("{API}/access"), false, 1024).await?;
     let path = credential_path(&app)?;
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|_| "Could not save credential")?;
     let mut options = std::fs::OpenOptions::new();
@@ -260,6 +246,23 @@ pub async fn app_update_connect(app: tauri::AppHandle, token: String) -> Result<
         .and_then(|mut f| f.write_all(&data))
         .map_err(|_| "Could not save credential")?;
     Ok(())
+}
+#[tauri::command]
+pub fn app_update_settings(app: tauri::AppHandle, automatic: Option<bool>) -> Result<bool, String> {
+    let path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("automatic-updates");
+    if let Some(value) = automatic {
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(&path, if value { "true" } else { "false" }).map_err(|e| e.to_string())?;
+        Ok(value)
+    } else {
+        Ok(std::fs::read_to_string(path)
+            .ok()
+            .is_some_and(|v| v.trim() == "true"))
+    }
 }
 #[tauri::command]
 pub async fn app_update_check(app: tauri::AppHandle) -> Result<UpdateStatus, String> {
@@ -282,23 +285,35 @@ impl Drop for InstallGuard {
     }
 }
 #[tauri::command]
-pub async fn app_update_install(app: tauri::AppHandle, version: String) -> Result<(), String> {
+pub async fn app_update_install(
+    app: tauri::AppHandle,
+    version: String,
+    automatic: Option<bool>,
+) -> Result<String, String> {
     if INSTALLING.swap(true, Ordering::AcqRel) {
         return Err("An update is already downloading".into());
     }
     let _guard = InstallGuard;
-    let token = credential(&app)?.ok_or("Connect your GitHub update access first")?;
+    let token = credential(&app)?.ok_or("Enter your invite code first")?;
     let p = package(&token, &app.package_info().version.to_string())
         .await?
         .ok_or("No update available")?;
     if p.version != version {
         return Err("The release changed. Check for updates again.".into());
     }
+    let automatic = automatic.unwrap_or(false);
     let dir = app
         .path()
         .app_cache_dir()
         .map_err(|e| e.to_string())?
         .join("updates");
+    let marker = dir.join("automatic-update");
+    let marker_value = format!("{}:{}", std::process::id(), p.version);
+    if automatic && std::fs::read_to_string(&marker).ok().as_deref() == Some(&marker_value) {
+        return Ok(
+            "The update is already prepared. It will apply when you next close AITerm.".into(),
+        );
+    }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ext = if cfg!(windows) { "exe" } else { "rpm" };
     let path = dir.join(format!(
@@ -339,29 +354,43 @@ pub async fn app_update_install(app: tauri::AppHandle, version: String) -> Resul
         }
         let install_path = path.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            #[cfg(windows)]
-            let result = std::process::Command::new(&install_path)
-                .spawn()
-                .map(|_| ());
-            #[cfg(not(windows))]
-            let result = std::process::Command::new("xdg-open")
-                .arg(&install_path)
-                .status()
-                .and_then(|s| {
-                    if s.success() {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::other(
-                            "Could not open the system package installer",
-                        ))
+            #[cfg(windows)] {
+                if automatic {
+                    use base64::Engine;
+                    use std::os::windows::process::CommandExt;
+                    let quoted = install_path.to_string_lossy().replace('\'', "''");
+                    let script = format!("$ErrorActionPreference='Stop'; Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -FilePath '{}' -ArgumentList '/S' -Wait", std::process::id(), quoted);
+                    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                    std::process::Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &base64::engine::general_purpose::STANDARD.encode(bytes)])
+                        .creation_flags(0x08000000).spawn().map_err(|e| e.to_string())?;
+                    Ok("Update downloaded. It will install automatically when you close AITerm.".to_string())
+                } else {
+                    std::process::Command::new(&install_path).spawn().map_err(|e| e.to_string())?;
+                    Ok("Continue in the Windows installer.".to_string())
+                }
+            }
+            #[cfg(not(windows))] {
+                let status = if automatic {
+                    {
+                        let unattended = std::process::Command::new("sudo").args(["-n", "true"])
+                            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+                        let mut command = std::process::Command::new(if unattended { "sudo" } else { "pkexec" });
+                        if unattended { command.arg("-n"); }
+                        command.args(["/usr/bin/dnf", "install", "-y"]).arg(&install_path).status()
                     }
-                });
-            result.map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| e.to_string())?
+                } else {
+                    std::process::Command::new("xdg-open").arg(&install_path).status()
+                }.map_err(|e| e.to_string())?;
+                if !status.success() { return Err("Installation was cancelled or could not start. Try again from App updates.".into()); }
+                Ok(if automatic { "Update installed. It will take effect the next time you launch AITerm." } else { "Continue in the system package installer." }.to_string())
+            }
+        }).await.map_err(|e| e.to_string())?
+
     }
     .await;
+    if result.is_ok() && automatic {
+        let _ = std::fs::write(marker, marker_value);
+    }
     if result.is_err() {
         let _ = std::fs::remove_file(path);
     }
@@ -370,6 +399,13 @@ pub async fn app_update_install(app: tauri::AppHandle, version: String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_invites_are_sent_to_the_update_service() {
+        assert!(valid_invite(&format!("aiterm_{}", "x".repeat(43))));
+        for value in ["github_pat_secret", "ghp_secret", "aiterm_short", ""] {
+            assert!(!valid_invite(value));
+        }
+    }
     #[test]
     fn version_order_and_invalid_versions() {
         assert!(version("0.10.100").unwrap() > version("0.10.99").unwrap());

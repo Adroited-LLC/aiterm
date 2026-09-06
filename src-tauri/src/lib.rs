@@ -77,6 +77,7 @@ pub fn run() {
         // In release `log_invokes` is the identity function and the generated
         // handler is passed straight through — see `trace.rs`.
         .invoke_handler(trace::log_invokes(tauri::generate_handler![
+            app_updates::app_update_settings,
             app_updates::app_update_connect,
             app_updates::app_update_check,
             app_updates::app_update_install,

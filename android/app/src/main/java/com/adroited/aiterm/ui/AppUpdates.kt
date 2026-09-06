@@ -10,10 +10,14 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.Modifier
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
@@ -44,14 +48,13 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-private const val UPDATE_API = "https://api.github.com/repos/Adroited-LLC/aiterm-releases"
+private const val UPDATE_API = "https://control.34-23-107-73.sslip.io:8443/updates"
 internal val updateJson = Json { ignoreUnknownKeys = true }
 @Serializable internal data class AndroidUpdatePackage(val version: String, val versionCode: Int, val asset: String, val sha256: String, val size: Long, val notes: String = "")
 // Decode only Android's entry: the other platforms intentionally have no versionCode.
-@Serializable private data class ReleaseAsset(val id: Long, val name: String, val size: Long)
-@Serializable private data class PrivateRelease(val assets: List<ReleaseAsset>)
 internal fun validateAndroidUpdate(p: AndroidUpdatePackage) {
     require(Regex("[0-9]+\\.[0-9]+\\.[0-9]+").matches(p.version)) { "Invalid update version" }
+    require(Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,180}").matches(p.asset)) { "Invalid asset name" }
     require(p.versionCode > 0 && p.asset.endsWith(".apk") && !p.asset.contains('/') && !p.asset.contains('\\')) { "Invalid update package" }
     require(p.size in 1..1024L * 1024 * 1024 && Regex("[a-fA-F0-9]{64}").matches(p.sha256)) { "Invalid update verification data" }
 }
@@ -69,7 +72,7 @@ private class UpdateCredential(private val app: Application) {
         val bytes = Base64.decode(stored, Base64.NO_WRAP)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, bytes.copyOfRange(0, 12)))
-        return cipher.doFinal(bytes.copyOfRange(12, bytes.size)).toString(Charsets.UTF_8)
+        return cipher.doFinal(bytes.copyOfRange(12, bytes.size)).toString(Charsets.UTF_8).takeIf { validUpdateInvite(it) }
     }
     fun write(token: String) {
         if (token.isEmpty()) { check(prefs.edit().remove("credential").commit()); return }
@@ -78,25 +81,19 @@ private class UpdateCredential(private val app: Application) {
         check(prefs.edit().putString("credential", Base64.encodeToString(cipher.iv + cipher.doFinal(token.toByteArray()), Base64.NO_WRAP)).commit())
     }
 }
+internal fun validUpdateInvite(code: String) = Regex("aiterm_[A-Za-z0-9_-]{43}").matches(code)
 private fun connection(url: String, token: String, binary: Boolean): HttpURLConnection {
-    var target = URL(url)
-    repeat(6) {
-        require(target.protocol == "https") { "Update requests require HTTPS" }
-        val c = (target.openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15000; readTimeout = 60000; instanceFollowRedirects = false
-            setRequestProperty("User-Agent", "AITerm updater")
-            setRequestProperty("Accept", if (binary) "application/octet-stream" else "application/vnd.github+json")
-            if (target.host == "api.github.com") setRequestProperty("Authorization", "Bearer $token")
-        }
-        if (c.responseCode in listOf(301, 302, 303, 307, 308)) {
-            val next = c.getHeaderField("Location") ?: error("Invalid update redirect")
-            c.disconnect(); target = URL(target, next)
-        } else {
-            if (c.responseCode != 200) { val code = c.responseCode; c.disconnect(); error("GitHub returned $code. Check your token and repository access.") }
-            return c
-        }
+    require(url.startsWith("$UPDATE_API/")) { "Invalid update URL" }
+    val c = (URL(url).openConnection() as HttpURLConnection).apply {
+        connectTimeout = 15000; readTimeout = 60000; instanceFollowRedirects = false
+        setRequestProperty("User-Agent", "AITerm updater")
+        setRequestProperty("Authorization", "Bearer $token")
     }
-    error("Too many update redirects")
+    if (c.responseCode != 200) {
+        val code = c.responseCode; c.disconnect()
+        error(if (code == 401) "Your invite code is invalid or revoked." else "Update service returned $code. Try again later.")
+    }
+    return c
 }
 private fun readUpdate(url: String, token: String, binary: Boolean, limit: Int): String {
     val c = connection(url, token, binary)
@@ -108,24 +105,28 @@ private fun readUpdate(url: String, token: String, binary: Boolean, limit: Int):
     } } finally { c.disconnect() }
 }
 private fun hex(bytes: ByteArray) = bytes.joinToString("") { "%02x".format(it) }
-private suspend fun latest(token: String): Pair<AndroidUpdatePackage, Long>? = withContext(Dispatchers.IO) {
-    val release = updateJson.decodeFromString<PrivateRelease>(readUpdate("$UPDATE_API/releases/latest", token, false, 1024 * 1024))
-    val feed = release.assets.single { it.name == "updates.json" }
-    val root = updateJson.parseToJsonElement(readUpdate("$UPDATE_API/releases/assets/${feed.id}", token, true, 256 * 1024))
+private suspend fun latest(token: String): AndroidUpdatePackage? = withContext(Dispatchers.IO) {
+    val root = updateJson.parseToJsonElement(readUpdate("$UPDATE_API/latest", token, false, 256 * 1024))
     val manifest = root as kotlinx.serialization.json.JsonObject
     require(manifest["schema"].toString() == "1") { "Unsupported update feed" }
     val entry = (manifest["platforms"] as? kotlinx.serialization.json.JsonObject)?.get("android-arm64") ?: return@withContext null
     val p = updateJson.decodeFromJsonElement(AndroidUpdatePackage.serializer(), entry)
     validateAndroidUpdate(p)
-    val asset = release.assets.single { it.name == p.asset }
-    require(asset.size == p.size) { "Package size does not match the manifest" }
-    if (p.versionCode > BuildConfig.VERSION_CODE) p to asset.id else null
+    if (p.versionCode > BuildConfig.VERSION_CODE) p else null
 }
 internal data class UpdateUiState(val connected: Boolean = false, val busy: Boolean = false, val message: String = "", val available: AndroidUpdatePackage? = null)
 internal class AppUpdateViewModel(application: Application) : AndroidViewModel(application) {
     private val credential = UpdateCredential(application)
     val state = MutableStateFlow(UpdateUiState())
     private var pending: Pair<File, AndroidUpdatePackage>? = null
+    private val preferences = application.getSharedPreferences("private-updates", 0)
+    val automatic = MutableStateFlow(preferences.getBoolean("automatic", false))
+    private var automaticAttempt: String? = null
+    fun setAutomatic(value: Boolean) { preferences.edit().putBoolean("automatic", value).apply(); automatic.value = value; automaticAttempt = null }
+    fun installAutomatically() {
+        val p = state.value.available ?: return
+        if (automatic.value && !state.value.busy && automaticAttempt != p.version) { automaticAttempt = p.version; install() }
+    }
     private fun run(action: suspend () -> Unit) {
         if (state.value.busy) return
         state.value = state.value.copy(busy = true, message = "")
@@ -136,25 +137,25 @@ internal class AppUpdateViewModel(application: Application) : AndroidViewModel(a
     }
     fun check() = run {
         val token = withContext(Dispatchers.IO) { credential.read() }
-        val found = token?.let { latest(it) }?.first
+        val found = token?.let { latest(it) }
         state.value = state.value.copy(connected = token != null, available = found,
             message = if (token == null) "Connect your update access first." else if (found == null) "You’re up to date." else "Version ${found.version} is available.")
     }
     fun connect(token: String) = run {
         withContext(Dispatchers.IO) {
-            if (token.isNotBlank()) readUpdate(UPDATE_API, token.trim(), false, 256 * 1024)
+            if (token.isNotBlank()) { require(validUpdateInvite(token.trim())) { "Enter your AITerm invite code" }; readUpdate("$UPDATE_API/access", token.trim(), false, 1024) }
             credential.write(token.trim())
         }
         state.value = UpdateUiState(connected = token.isNotBlank(), busy = true, message = if (token.isBlank()) "Disconnected." else "Connected. Check for updates to continue.")
     }
     fun install() = run {
         val token = withContext(Dispatchers.IO) { credential.read() } ?: error("Connect your update access first")
-        val (p, id) = latest(token) ?: error("No update available")
+        val p = latest(token) ?: error("No update available")
         val app = getApplication<Application>()
         val file = withContext(Dispatchers.IO) {
             val dir = File(app.cacheDir, "updates").apply { mkdirs() }
             val file = File(dir, "aiterm-${UUID.randomUUID()}.apk")
-            val c = connection("$UPDATE_API/releases/assets/$id", token, true)
+            val c = connection("$UPDATE_API/assets/${p.asset}", token, true)
             try {
                 val hash = MessageDigest.getInstance("SHA-256"); var size = 0L
                 c.inputStream.use { input -> file.outputStream().use { output ->
@@ -200,20 +201,25 @@ private val showUpdates = MutableStateFlow(false)
 @Composable internal fun AppUpdateHost() {
     val model: AppUpdateViewModel = viewModel()
     val state by model.state.collectAsStateWithLifecycle()
+    val automatic by model.automatic.collectAsStateWithLifecycle()
     val show by showUpdates.collectAsStateWithLifecycle()
     var token by remember { mutableStateOf("") }
     var dismissed by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) { while (true) { model.check(); delay(6 * 60 * 60 * 1000L) } }
+    LaunchedEffect(automatic, state.available?.version, state.busy) { model.installAutomatically() }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { model.resumeInstall() }
     if (show || (state.available != null && dismissed != state.available?.version)) {
         AlertDialog(onDismissRequest = { if (!state.busy) { dismissed = state.available?.version; showUpdates.value = false } },
             title = { Text("App updates") },
-            text = { Column {
+            text = { Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text("Installed version ${BuildConfig.VERSION_NAME}")
-                Text("Private updates from Adroited-LLC/aiterm-releases. Use a GitHub token with Contents: read access to this repository.")
-                OutlinedTextField(value = token, onValueChange = { token = it }, label = { Text("GitHub access token") }, visualTransformation = PasswordVisualTransformation(), singleLine = true)
+                Text("Enter the personal invite code supplied by your AITerm administrator. No GitHub account is needed.")
+                OutlinedTextField(value = token, onValueChange = { token = it }, label = { Text("Invite code") }, visualTransformation = PasswordVisualTransformation(), singleLine = true)
                 TextButton(enabled = !state.busy && token.isNotBlank(), onClick = { model.connect(token); token = "" }) { Text("Connect") }
                 if (state.connected) TextButton(enabled = !state.busy, onClick = { model.connect("") }) { Text("Disconnect") }
+                Text("Automatically install updates")
+                Switch(checked = automatic, onCheckedChange = model::setAutomatic)
+                Text("Downloads and starts installation automatically. Android still requires you to confirm Install.")
                 Text(if (state.busy) "Checking or downloading…" else state.message)
                 if (state.available != null) Button(enabled = !state.busy, onClick = model::install) { Text("Download and install ${state.available?.version}") }
             } },

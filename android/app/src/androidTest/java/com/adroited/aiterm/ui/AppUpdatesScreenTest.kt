@@ -13,12 +13,13 @@ class AppUpdatesScreenTest {
     @Test fun privateUpdatesCanBeOpenedCheckedAndDismissedWithoutCredentials() {
         compose.setContent { MaterialTheme { AppUpdateButton(); AppUpdateHost() } }
         compose.onNodeWithText("App updates").performClick()
-        compose.onNodeWithText("GitHub access token").assertIsDisplayed()
+        compose.onNodeWithText("Invite code").assertIsDisplayed()
         compose.onNodeWithText("Connect").assertIsNotEnabled()
-        compose.waitUntil(5000) { compose.onAllNodesWithText("Connect your update access first.").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10000) { compose.onAllNodesWithText("Checking or downloading…").fetchSemanticsNodes().isEmpty() }
+        compose.onNode(isToggleable()).assertIsOff().performClick().assertIsOn().performClick().assertIsOff()
         compose.onNodeWithText("Check for updates").performClick()
-        compose.waitUntil(5000) { compose.onAllNodesWithText("Connect your update access first.").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10000) { compose.onAllNodesWithText("Checking or downloading…").fetchSemanticsNodes().isEmpty() }
         compose.onNodeWithText("Close").performClick()
-        compose.onNodeWithText("GitHub access token").assertDoesNotExist()
+        compose.onNodeWithText("Invite code").assertDoesNotExist()
     }
 }
