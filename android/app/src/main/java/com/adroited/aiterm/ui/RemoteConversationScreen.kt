@@ -79,6 +79,7 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
@@ -372,12 +373,7 @@ internal fun RemoteSessionDashboard(
             RemoteAppDrawer(
                 state = state,
                 desktop = desktop,
-                pairedDesktops = pairedDesktops,
                 onClose = { drawerScope.launch { drawerState.close() } },
-                onOpenDesktop = { target ->
-                    drawerScope.launch { drawerState.close() }
-                    onOpenDesktop(target)
-                },
                 onLoadUsage = onLoadUsage,
                 onManageDesktops = {
                     drawerScope.launch { drawerState.close() }
@@ -398,14 +394,7 @@ internal fun RemoteSessionDashboard(
                         }
                     },
                     title = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            ConnectionDot(state.connection)
-                            Spacer(Modifier.width(10.dp))
-                            Column {
-                                Text(desktop.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                ConnectionLabel(state.connection, state.connectedEndpoint?.path)
-                            }
-                        }
+                        DesktopSwitcher(state, desktop, pairedDesktops, onOpenDesktop)
                     },
                     actions = {
                         IconButton(
@@ -540,12 +529,73 @@ internal fun RemoteSessionDashboard(
 }
 
 @Composable
-internal fun RemoteAppDrawer(
+internal fun DesktopSwitcher(
     state: RemoteClientState,
     desktop: PairedDesktop,
     pairedDesktops: List<PairedDesktop>,
-    onClose: () -> Unit,
     onOpenDesktop: (PairedDesktop) -> Unit,
+) {
+    var expanded by remember(desktop.deviceId) { mutableStateOf(false) }
+    val choices = (listOf(desktop) + pairedDesktops).distinctBy { it.deviceId }
+    Box {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                .clickable(onClickLabel = "Switch desktop") { expanded = !expanded }
+                .padding(vertical = 4.dp, horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ConnectionDot(state.connection)
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(desktop.label, modifier = Modifier.weight(1f, fill = false),
+                        style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.width(6.dp))
+                    Icon(if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = "Switch desktop", modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                ConnectionLabel(state.connection, state.connectedEndpoint?.path)
+            }
+        }
+        DropdownMenu(
+            expanded = expanded, onDismissRequest = { expanded = false },
+            modifier = Modifier.width(300.dp).heightIn(max = 440.dp),
+            shape = RoundedCornerShape(20.dp),
+            containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        ) {
+            Text("Switch desktop", style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp))
+            choices.forEach { candidate ->
+                val current = candidate.deviceId == desktop.deviceId
+                DropdownMenuItem(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        .background(if (current) MaterialTheme.colorScheme.primary.copy(alpha = 0.10f) else Color.Transparent,
+                            RoundedCornerShape(12.dp)),
+                    text = {
+                        Column(Modifier.padding(vertical = 6.dp)) {
+                            Text(candidate.label, style = MaterialTheme.typography.titleSmall,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text(if (current) "Current desktop" else "Paired desktop",
+                                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    },
+                    leadingIcon = { Icon(Icons.Filled.Devices, null,
+                        tint = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant) },
+                    trailingIcon = { if (current) Icon(Icons.Filled.Check, "Selected desktop", tint = MaterialTheme.colorScheme.primary) },
+                    onClick = { expanded = false; if (!current) onOpenDesktop(candidate) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun RemoteAppDrawer(
+    state: RemoteClientState,
+    desktop: PairedDesktop,
+    onClose: () -> Unit,
     onLoadUsage: () -> Unit,
     onManageDesktops: () -> Unit,
 ) {
@@ -576,19 +626,6 @@ internal fun RemoteAppDrawer(
                 }
                 IconButton(onClick = onClose) {
                     Icon(Icons.Filled.Close, contentDescription = "Close menu")
-                }
-            }
-
-            if (pairedDesktops.size > 1) {
-                DrawerSectionLabel("Desktops")
-                pairedDesktops.forEach { candidate ->
-                    DrawerRow(
-                        title = candidate.label,
-                        detail = if (candidate.deviceId == desktop.deviceId) "Current desktop" else "Paired desktop",
-                        icon = Icons.Filled.Devices,
-                        selected = candidate.deviceId == desktop.deviceId,
-                        onClick = { if (candidate.deviceId != desktop.deviceId) onOpenDesktop(candidate) },
-                    )
                 }
             }
 
@@ -642,16 +679,6 @@ private fun SessionStateChip(label: String, color: Color) {
         Spacer(Modifier.width(5.dp))
         Text(label, style = MaterialTheme.typography.labelSmall, color = color, maxLines = 1)
     }
-}
-
-@Composable
-private fun DrawerSectionLabel(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-    )
 }
 
 @Composable

@@ -66,14 +66,14 @@ class RemoteAppDrawerTest {
             RemoteAppDrawer(
                 state = RemoteClientState(),
                 desktop = desktop,
-                pairedDesktops = listOf(desktop),
                 onClose = {},
-                onOpenDesktop = {},
                 onLoadUsage = {},
                 onManageDesktops = { managementRequests++ },
             )
         }
 
+        compose.onNodeWithText("Desktops").assertDoesNotExist()
+        compose.onNodeWithText("Paired desktop").assertDoesNotExist()
         compose.onNodeWithText("Open terminal").assertDoesNotExist()
         compose.onNodeWithText("Refresh").assertDoesNotExist()
         compose.onNodeWithText("Add a desktop").assertDoesNotExist()
@@ -88,7 +88,7 @@ class RemoteAppDrawerTest {
     }
 
     @Test
-    fun friendlyNamesAppearInDrawerHeaderAndDesktopSwitcher() {
+    fun desktopSelectionLivesInTheDashboardHeader() {
         val current = PairedDesktop(
             deviceId = "desktop-1",
             displayName = "WORKSHOP-123",
@@ -105,18 +105,19 @@ class RemoteAppDrawerTest {
         )
         var openedDesktop: PairedDesktop? = null
         compose.setContent {
-            RemoteAppDrawer(
-                state = RemoteClientState(),
-                desktop = current,
-                pairedDesktops = listOf(current, other),
-                onClose = {},
+            DesktopSwitcher(
+                state = RemoteClientState(), desktop = current, pairedDesktops = listOf(current, other),
                 onOpenDesktop = { openedDesktop = it },
-                onLoadUsage = {},
-                onManageDesktops = {},
             )
         }
 
+        compose.onNodeWithText("Work PC").assertDoesNotExist()
+        compose.onNodeWithText("Home office").performClick()
         compose.onAllNodesWithText("Home office").assertCountEquals(2)
+        compose.onNodeWithText("Current desktop").performClick()
+        compose.runOnIdle { assertEquals(null, openedDesktop) }
+        compose.onNodeWithText("Work PC").assertDoesNotExist()
+        compose.onNodeWithText("Home office").performClick()
         compose.onNodeWithText("Work PC").assertIsDisplayed().performClick()
         compose.runOnIdle { assertEquals(other, openedDesktop) }
     }
