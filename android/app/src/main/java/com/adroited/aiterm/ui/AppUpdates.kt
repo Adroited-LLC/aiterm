@@ -197,7 +197,8 @@ internal class AppUpdateViewModel(application: Application) : AndroidViewModel(a
     }
 }
 private val showUpdates = MutableStateFlow(false)
-@Composable internal fun AppUpdateButton() { TextButton(onClick = { showUpdates.value = true }) { Text("App updates") } }
+internal fun openAppUpdates() { showUpdates.value = true }
+@Composable internal fun AppUpdateButton() { TextButton(onClick = ::openAppUpdates) { Text("App updates") } }
 @Composable internal fun AppUpdateHost() {
     val model: AppUpdateViewModel = viewModel()
     val state by model.state.collectAsStateWithLifecycle()

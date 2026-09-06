@@ -96,6 +96,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Stop
@@ -558,7 +559,6 @@ internal fun RemoteAppDrawer(
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 14.dp),
         ) {
-            AppUpdateButton()
             Row(
                 modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -596,6 +596,10 @@ internal fun RemoteAppDrawer(
             DrawerUsage(state.usage)
             HorizontalDivider(Modifier.padding(vertical = 10.dp), color = MaterialTheme.colorScheme.surfaceVariant)
             DrawerRow("Manage desktops", "View and remove trusted computers", Icons.Filled.Devices, onClick = onManageDesktops)
+            DrawerRow("App updates", "Check for updates and automatic installs", Icons.Filled.SystemUpdate, onClick = {
+                onClose()
+                openAppUpdates()
+            })
         }
     }
 }
