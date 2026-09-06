@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--publish', action='store_true')
     args = parser.parse_args()
     assert json.loads(gh('repo','view',REPO,'--json','visibility'))['visibility'] == 'PRIVATE', 'Distribution repository must be private'
+    assert subprocess.check_output(['rpm','-qp','--qf','%{NAME} %{ARCH}',str(args.rpm)],text=True) == 'aiterm x86_64', 'Wrong RPM package or architecture'
     rpm_version = subprocess.check_output(['rpm','-qp','--qf','%{VERSION}',str(args.rpm)],text=True)
     import re
     for version in (rpm_version,args.android_version,args.windows_version):
