@@ -48,6 +48,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -173,11 +175,56 @@ private fun SpineUserBubble(item: Item.User, onLongPress: () -> Unit) {
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
 private fun SpineAgentBlock(item: Item.AgentText, onLongPress: () -> Unit) {
+    val subagent = remember(item.text) { parseSubagentMessage(item.text) }
+    if (subagent != null) {
+        SpineSubagentCard(item.id, subagent, onLongPress)
+        return
+    }
     Column(
         Modifier.fillMaxWidth().stationaryMessageHold(onLongPress).padding(end = 14.dp),
     ) {
         ConversationMarkdown(item.text)
         if (!item.done) SpineCaret()
+    }
+}
+
+@Composable
+private fun SpineSubagentCard(id: String, message: SubagentMessage, onLongPress: () -> Unit) {
+    var expanded by rememberSaveable(id) { mutableStateOf(false) }
+    val hasPayload = message.payload.isNotBlank()
+    Column(
+        Modifier.fillMaxWidth()
+            .stationaryMessageHold(onLongPress)
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f), RoundedCornerShape(10.dp)),
+    ) {
+        Row(
+            Modifier.fillMaxWidth()
+                .then(if (hasPayload) Modifier.clickable { expanded = !expanded } else Modifier)
+                .semantics { if (hasPayload) stateDescription = if (expanded) "Expanded" else "Collapsed" }
+                .padding(horizontal = 11.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.Psychology, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
+            Spacer(Modifier.width(7.dp))
+            Text(
+                message.headline,
+                color = MaterialTheme.colorScheme.primary,
+                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (hasPayload) {
+                Text(if (expanded) "⌃" else "⌄", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (expanded && hasPayload) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+            Box(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
+                ConversationMarkdown(message.payload)
+            }
+        }
     }
 }
 
