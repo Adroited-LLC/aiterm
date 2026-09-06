@@ -50,8 +50,8 @@ android {
         applicationId = "com.adroited.aiterm"
         minSdk = 26
         targetSdk = 37
-        versionCode = 22
-        versionName = "0.3.19"
+        versionCode = 23
+        versionName = "0.3.20"
 
         // Our native QUIC bridge is ARM64-only. Declaring the supported ABI
         // also prevents dependency AARs from advertising unusable variants.

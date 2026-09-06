@@ -10,6 +10,9 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Modifier
@@ -141,12 +144,13 @@ internal class AppUpdateViewModel(application: Application) : AndroidViewModel(a
         state.value = state.value.copy(connected = token != null, available = found,
             message = if (token == null) "Connect your update access first." else if (found == null) "You’re up to date." else "Version ${found.version} is available.")
     }
-    fun connect(token: String) = run {
+    fun connect(token: String, onSuccess: () -> Unit = {}) = run {
         withContext(Dispatchers.IO) {
             if (token.isNotBlank()) { require(validUpdateInvite(token.trim())) { "Enter your AITerm invite code" }; readUpdate("$UPDATE_API/access", token.trim(), false, 1024) }
             credential.write(token.trim())
         }
         state.value = UpdateUiState(connected = token.isNotBlank(), busy = true, message = if (token.isBlank()) "Disconnected." else "Connected. Check for updates to continue.")
+        onSuccess()
     }
     fun install() = run {
         val token = withContext(Dispatchers.IO) { credential.read() } ?: error("Connect your update access first")
@@ -204,7 +208,6 @@ internal fun openAppUpdates() { showUpdates.value = true }
     val state by model.state.collectAsStateWithLifecycle()
     val automatic by model.automatic.collectAsStateWithLifecycle()
     val show by showUpdates.collectAsStateWithLifecycle()
-    var token by remember { mutableStateOf("") }
     var dismissed by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) { while (true) { model.check(); delay(6 * 60 * 60 * 1000L) } }
     LaunchedEffect(automatic, state.available?.version, state.busy) { model.installAutomatically() }
@@ -212,12 +215,9 @@ internal fun openAppUpdates() { showUpdates.value = true }
     if (show || (state.available != null && dismissed != state.available?.version)) {
         AlertDialog(onDismissRequest = { if (!state.busy) { dismissed = state.available?.version; showUpdates.value = false } },
             title = { Text("App updates") },
-            text = { Column(Modifier.verticalScroll(rememberScrollState())) {
+            text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Installed version ${BuildConfig.VERSION_NAME}")
-                Text("Enter the personal invite code supplied by your AITerm administrator. No GitHub account is needed.")
-                OutlinedTextField(value = token, onValueChange = { token = it }, label = { Text("Invite code") }, visualTransformation = PasswordVisualTransformation(), singleLine = true)
-                TextButton(enabled = !state.busy && token.isNotBlank(), onClick = { model.connect(token); token = "" }) { Text("Connect") }
-                if (state.connected) TextButton(enabled = !state.busy, onClick = { model.connect("") }) { Text("Disconnect") }
+                AppUpdateAccess(state.connected, state.busy, model::connect, { model.connect("") })
                 Text("Automatically install updates")
                 Switch(checked = automatic, onCheckedChange = model::setAutomatic)
                 Text("Downloads and starts installation automatically. Android still requires you to confirm Install.")
@@ -226,5 +226,37 @@ internal fun openAppUpdates() { showUpdates.value = true }
             } },
             confirmButton = { TextButton(enabled = !state.busy, onClick = model::check) { Text("Check for updates") } },
             dismissButton = { TextButton(enabled = !state.busy, onClick = { dismissed = state.available?.version; showUpdates.value = false }) { Text("Close") } })
+    }
+}
+
+@Composable
+internal fun AppUpdateAccess(
+    connected: Boolean,
+    busy: Boolean,
+    onConnect: (String, () -> Unit) -> Unit,
+    onDisconnect: () -> Unit,
+) {
+    var editing by remember { mutableStateOf(false) }
+    var token by remember { mutableStateOf("") }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (connected) {
+            Text("Private updates connected")
+            Text("Your invite is saved securely on this device.")
+        }
+        if (!connected || editing) {
+            Text(if (connected) "Enter a replacement invite code." else "Enter your personal invite code to receive updates.")
+            OutlinedTextField(
+                value = token, onValueChange = { token = it }, modifier = Modifier.fillMaxWidth(),
+                label = { Text("Invite code") }, visualTransformation = PasswordVisualTransformation(),
+                singleLine = true, enabled = !busy,
+            )
+            TextButton(enabled = !busy && token.isNotBlank(), onClick = {
+                onConnect(token) { token = ""; editing = false }
+            }) { Text(if (connected) "Save invite code" else "Connect") }
+            if (connected) TextButton(enabled = !busy, onClick = { token = ""; editing = false }) { Text("Cancel") }
+        } else {
+            TextButton(enabled = !busy, onClick = { editing = true }) { Text("Change invite code") }
+            TextButton(enabled = !busy, onClick = onDisconnect) { Text("Disconnect") }
+        }
     }
 }
