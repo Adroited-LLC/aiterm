@@ -38,6 +38,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -91,27 +92,28 @@ internal sealed interface SpineTimelineItem {
         override val key: String = item.key
     }
 
-    data class Tools(val tools: List<Item.Tool>) : SpineTimelineItem {
-        override val key: String = "tools:${tools.first().key}"
+    data class Activity(val items: List<Item>) : SpineTimelineItem {
+        override val key: String = "activity:${items.first().key}"
     }
 }
 
 /** Keep human and agent turns full-size while folding consecutive machine work into one row. */
 internal fun spineTimeline(items: List<Item>): List<SpineTimelineItem> {
     val result = mutableListOf<SpineTimelineItem>()
-    val tools = mutableListOf<Item.Tool>()
-    fun flushTools() {
-        if (tools.isNotEmpty()) result += SpineTimelineItem.Tools(tools.toList())
-        tools.clear()
+    val activity = mutableListOf<Item>()
+    fun flushActivity() {
+        if (activity.isNotEmpty()) result += SpineTimelineItem.Activity(activity.toList())
+        activity.clear()
     }
     items.forEach { item ->
-        if (item is Item.Tool) tools += item
-        else {
-            flushTools()
+        if (item is Item.Tool || (item is Item.AgentText && parseSubagentMessage(item.text) != null)) {
+            activity += item
+        } else {
+            flushActivity()
             result += SpineTimelineItem.Row(item)
         }
     }
-    flushTools()
+    flushActivity()
     return result
 }
 
@@ -119,7 +121,7 @@ internal fun spineTimeline(items: List<Item>): List<SpineTimelineItem> {
 internal fun SpineTimelineRow(row: SpineTimelineItem, onLongPress: (SpineTimelineItem) -> Unit = {}) {
     when (row) {
         is SpineTimelineItem.Row -> SpineItemRow(row.item, onLongPress = { onLongPress(row) })
-        is SpineTimelineItem.Tools -> SpineToolGroup(row.tools, onLongPress = { onLongPress(row) })
+        is SpineTimelineItem.Activity -> SpineActivityGroup(row, onLongPress)
     }
 }
 
@@ -270,24 +272,25 @@ private fun SpineThoughtBlock(item: Item.Thought, onLongPress: () -> Unit) {
 
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
-private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
-    var expanded by rememberSaveable(tools.first().id) { mutableStateOf(false) }
-    val active = tools.count { !it.status.settled }
+private fun SpineActivityGroup(activity: SpineTimelineItem.Activity, onLongPress: (SpineTimelineItem) -> Unit) {
+    var expanded by rememberSaveable(activity.key) { mutableStateOf(false) }
+    val active = activity.items.count { it is Item.Tool && !it.status.settled }
     Column(
         Modifier.fillMaxWidth()
             .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f), RoundedCornerShape(10.dp)),
     ) {
         Row(
             Modifier.fillMaxWidth()
-                .stationaryMessageHold(onLongPress)
+                .stationaryMessageHold { onLongPress(activity) }
                 .clickable { expanded = !expanded }
+                .semantics { stateDescription = if (expanded) "Expanded" else "Collapsed" }
                 .padding(horizontal = 11.dp, vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(Icons.Filled.Build, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(15.dp))
             Spacer(Modifier.width(7.dp))
             Text(
-                toolGroupHeadline(tools),
+                "Activity · ${activity.items.size} ${if (activity.items.size == 1) "step" else "steps"}",
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.SemiBold,
                 style = MaterialTheme.typography.labelMedium,
@@ -296,11 +299,14 @@ private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
                 modifier = Modifier.weight(1f),
             )
             Spacer(Modifier.width(7.dp))
-            Text(
-                if (active > 0) "${tools.size} steps · $active running" else "${tools.size} steps",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelSmall,
-            )
+            if (active > 0) {
+                Text(
+                    "$active running",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                Spacer(Modifier.width(7.dp))
+            }
             Text(
                 if (expanded) "⌃" else "⌄",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -312,38 +318,14 @@ private fun SpineToolGroup(tools: List<Item.Tool>, onLongPress: () -> Unit) {
                 Modifier.padding(start = 8.dp, top = 7.dp, end = 7.dp, bottom = 7.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                tools.forEach { SpineToolCard(it) }
+                activity.items.forEach { item ->
+                    key(item.key) {
+                        SpineItemRow(item, onLongPress = { onLongPress(SpineTimelineItem.Row(item)) })
+                    }
+                }
             }
         }
     }
-}
-
-/** A folded group must still say what happened; otherwise valid tool events look absent. */
-internal fun toolGroupHeadline(tools: List<Item.Tool>): String {
-    val latest = tools.asReversed().firstOrNull { toolHeadlineDetail(it) != null } ?: return "Activity"
-    val verb = when (latest.category) {
-        ToolCategory.Execute -> "Ran"
-        ToolCategory.Edit -> "Edited"
-        ToolCategory.Read -> "Read"
-        ToolCategory.Search -> "Searched"
-        ToolCategory.Fetch -> "Fetched"
-        ToolCategory.Think -> "Reasoned"
-        ToolCategory.Other -> "Used"
-    }
-    val raw = toolHeadlineDetail(latest) ?: return "Activity"
-    val detail = if (raw.startsWith("$verb ", ignoreCase = true)) raw.substring(verb.length + 1) else raw
-    val clipped = if (detail.length > 72) detail.take(71).trimEnd() + "…" else detail
-    return "$verb $clipped"
-}
-
-private fun toolHeadlineDetail(tool: Item.Tool): String? {
-    fun clean(value: String): String = value.lineSequence().firstOrNull().orEmpty()
-        .trim().replace(Regex("\\s+"), " ")
-    val title = clean(tool.title.ifBlank { tool.tool })
-    val protocolNames = setOf("exec", "tool", "tool_output", "custom_tool_call_output", "write_stdin")
-    if (title.lowercase() !in protocolNames && title.isNotBlank()) return title
-    val input = clean(tool.input)
-    return input.takeIf { it.isNotBlank() && it.lowercase() !in protocolNames }
 }
 
 @OptIn(ExperimentalFoundationApi::class)

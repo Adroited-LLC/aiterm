@@ -8,6 +8,7 @@ import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -40,6 +41,11 @@ class ConversationFileLinkTest {
 
         tapLink(label)
         compose.onNodeWithText("README.md").assertIsDisplayed()
+        // The production preview debounces Markdown parsing before publishing its document.
+        // Compose can be idle while that coroutine is suspended; wait for the rendered result.
+        compose.waitUntil(timeoutMillis = 5_000) {
+            compose.onAllNodesWithText(contents).fetchSemanticsNodes().isNotEmpty()
+        }
         compose.onNodeWithText(contents).assertIsDisplayed()
         compose.runOnIdle {
             assertEquals(listOf(Triple("file-link-test", path, 512 * 1024)), requests)

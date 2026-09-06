@@ -72,9 +72,8 @@ internal fun timelineText(row: SpineTimelineItem): String = when (row) {
             .filter(String::isNotBlank).joinToString("\n\n")
         is Item.TurnEnd -> ""
     }
-    is SpineTimelineItem.Tools -> row.tools.joinToString("\n\n") { tool ->
-        listOf(tool.title.ifBlank { tool.tool }, tool.input, tool.output.orEmpty())
-            .filter(String::isNotBlank).joinToString("\n")
+    is SpineTimelineItem.Activity -> row.items.joinToString("\n\n") { item ->
+        timelineText(SpineTimelineItem.Row(item))
     }
 }
 
@@ -123,7 +122,9 @@ internal fun ConversationMessageSheet(
                     Text(
                         raw,
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
-                        fontFamily = if (item is Item.Tool || row is SpineTimelineItem.Tools) FontFamily.Monospace else null,
+                        fontFamily = if (item is Item.Tool ||
+                            (row is SpineTimelineItem.Activity && row.items.all { it is Item.Tool })
+                        ) FontFamily.Monospace else null,
                     )
                 }
                 return@Column
