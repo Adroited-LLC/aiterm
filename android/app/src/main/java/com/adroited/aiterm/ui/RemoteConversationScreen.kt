@@ -957,7 +957,7 @@ private fun SessionRenameDialog(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun RemoteConversationContent(
+internal fun RemoteConversationContent(
     state: RemoteClientState,
     session: RemoteSession,
     onBack: () -> Unit,
@@ -999,6 +999,7 @@ private fun RemoteConversationContent(
     var filesLoading by remember(session.id) { mutableStateOf(false) }
     var files by remember(session.id) { mutableStateOf<List<RemoteSessionChange>>(emptyList()) }
     var filesError by remember(session.id) { mutableStateOf<String?>(null) }
+    var fileLinkError by remember(session.id) { mutableStateOf<String?>(null) }
     var filePreviewTarget by remember(session.id) { mutableStateOf<RemoteSessionChange?>(null) }
     var filePreviewLoading by remember(session.id) { mutableStateOf(false) }
     var filePreview by remember(session.id) { mutableStateOf<RemoteSessionFilePreview?>(null) }
@@ -1043,7 +1044,6 @@ private fun RemoteConversationContent(
                 filePreviewTarget = null
                 filePreview = null
                 filePreviewError = null
-                showFiles = true
             }
             showFiles -> showFiles = false
             else -> onBack()
@@ -1221,6 +1221,25 @@ private fun RemoteConversationContent(
         }
     }
 
+    ConversationLinkHandler(
+        onOpenFile = { path ->
+            scope.launch {
+                onLoadFiles(session.id).fold(
+                    onSuccess = { currentFiles ->
+                        files = currentFiles
+                        val target = conversationLinkedFile(path, session.projectPath, currentFiles)
+                        when {
+                            target == null -> fileLinkError = "This file is not available in this session's files: $path"
+                            target.kind == "deleted" -> fileLinkError = "This file has been deleted: $path"
+                            else -> openFile(target)
+                        }
+                    },
+                    onFailure = { fileLinkError = it.message ?: "Could not load this session's files." },
+                )
+            }
+        },
+        onError = { fileLinkError = it },
+    ) {
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1232,7 +1251,6 @@ private fun RemoteConversationContent(
                                     filePreviewTarget = null
                                     filePreview = null
                                     filePreviewError = null
-                                    showFiles = true
                                 }
                                 showFiles -> showFiles = false
                                 else -> onBack()
@@ -1243,7 +1261,7 @@ private fun RemoteConversationContent(
                         Icon(
                             Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = when {
-                                filePreviewTarget != null -> "Back to files"
+                                filePreviewTarget != null -> if (showFiles) "Back to files" else "Back to conversation"
                                 showFiles -> "Back to conversation"
                                 else -> "Back to sessions"
                             },
@@ -1568,6 +1586,19 @@ private fun RemoteConversationContent(
                 }
             }
         }
+    }
+
+    }
+
+    fileLinkError?.let { message ->
+        AlertDialog(
+            onDismissRequest = { fileLinkError = null },
+            title = { Text("Could not open link") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = { fileLinkError = null }) { Text("OK") }
+            },
+        )
     }
 
     if (showImageSources) {

@@ -484,7 +484,7 @@ private val CONVERSATION_INLINE = Regex(
         "|(\\*[^*\\s][^*]*\\*)" +
         "|((?<![\\w])_[^_\\s][^_]*_(?![\\w]))" +
         "|(~~[^~]+~~)" +
-        "|(\\[[^\\]]+]\\([^)\\s]+\\))" +
+        "|(\\[[^\\]]+]\\((?:<[^>\\r\\n]+>|[^)\\s]+)\\))" +
         "|(https?://[^\\s<>\"]+)",
 )
 
@@ -535,7 +535,7 @@ private fun conversationInline(raw: String): AnnotatedString {
 
                 token.startsWith("[") -> {
                     val label = token.substringAfter('[').substringBefore(']')
-                    val url = token.substringAfter('(').substringBeforeLast(')')
+                    val url = token.substringAfter("](").dropLast(1).removeSurrounding("<", ">")
                     withLink(
                         LinkAnnotation.Url(
                             url,
