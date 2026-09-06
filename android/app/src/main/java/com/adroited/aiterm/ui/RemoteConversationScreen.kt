@@ -558,6 +558,7 @@ internal fun RemoteAppDrawer(
         Column(
             Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 14.dp),
         ) {
+            AppUpdateButton()
             Row(
                 modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,

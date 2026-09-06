@@ -6,4 +6,5 @@
     <cache-path
         name="session-previews"
         path="session-previews/" />
+    <cache-path name="updates" path="updates/" />
 </paths>

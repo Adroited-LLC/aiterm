@@ -52,6 +52,7 @@ fun AitermApp(
         if (locked) {
             LockedContent(onUnlock = onRequestUnlock, error = unlockError)
         } else {
+            AppUpdateHost()
             val desktops = runCatching { container.pairedDesktopStore.all() }.getOrDefault(emptyList())
             NavHost(navController = navController, startDestination = initialDestination(desktops)) {
                 composable<DesktopsRoute> {

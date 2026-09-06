@@ -1,4 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#[path = "../../src-tauri/src/app_updates.rs"]
+mod app_updates;
 mod bridge;
 mod native;
 #[path = "../../src-tauri/src/tray.rs"]
@@ -149,6 +151,9 @@ fn main() {
         })
         .manage(Terminal::default())
         .invoke_handler(tauri::generate_handler![
+            app_updates::app_update_connect,
+            app_updates::app_update_check,
+            app_updates::app_update_install,
             start_terminal,
             terminal_request,
             workspace_rpc,

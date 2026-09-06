@@ -1,3 +1,4 @@
+import { UpdateNotice } from "./components/AppUpdates";
 import { TimeFormatContext, fullTime } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -2517,6 +2518,7 @@ export default function App() {
   return (
     <TimeFormatContext.Provider value={timeFormatCtx}>
     <div className="app">
+      <UpdateNotice />
       {notice && (
         <div className="app-toast" role="status" onClick={() => setNotice(null)}>
           {notice}

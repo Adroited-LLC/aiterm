@@ -2,6 +2,7 @@ import { ReactNode, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { windowsWsl, getWorkspace } from "../platform";
+import AppUpdates from "./AppUpdates";
 import ModelAccess from "./ModelAccess";
 import Icon from "./Icon";
 import { X } from "lucide-react";
@@ -50,6 +51,7 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
 ];
 
 export type SettingsTab =
+  | "updates"
   | "appearance"
   | "windows"
   | "fonts"
@@ -62,6 +64,7 @@ export type SettingsTab =
 type Tab = SettingsTab;
 
 const NAV: { key: Tab; label: string }[] = [
+  { key: "updates", label: "App updates" },
   { key: "appearance", label: "Appearance" },
   { key: "fonts", label: "Fonts" },
   { key: "agents", label: "Agents" },
@@ -575,6 +578,7 @@ export default function SettingsModal({
               </Group>
             </>}
 
+            {tab === "updates" && <AppUpdates />}
             {tab === "remote" && <RemoteAccessSettings />}
             {tab === "bringin" && (
               <BringInPane prompts={settings.bringIn} onChange={(next) => onChange({ ...settings, bringIn: next })} />

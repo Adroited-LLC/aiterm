@@ -75,6 +75,7 @@ fun DesktopListScreen(
     Scaffold(
         topBar = {
             TopAppBar(
+                actions = { AppUpdateButton() },
                 title = { Text(stringResource(R.string.desktops_title)) },
                 navigationIcon = {
                     if (onBack != null) {

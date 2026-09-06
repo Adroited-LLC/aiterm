@@ -253,6 +253,7 @@ fn format_json_invoke(command: &str, value: &serde_json::Value) -> String {
                 .unwrap_or_else(|| "redacted terminal input".to_string());
             format!("{{tabId:{tab_id}, attachmentId:{attachment_id}, data:<{data}>}}")
         }
+        "app_update_connect" => "<update credential redacted>".to_string(),
         "provider_save" | "provider_management_key_set" => {
             "<provider credentials redacted>".to_string()
         }
@@ -292,6 +293,16 @@ fn bounded_json(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn update_credentials_are_never_logged() {
+        let text = format_json_invoke(
+            "app_update_connect",
+            &json!({"token":"SECRET-UPDATE-TOKEN"}),
+        );
+        assert!(!text.contains("SECRET-UPDATE-TOKEN"));
+        assert!(text.contains("redacted"));
+    }
 
     #[test]
     fn terminal_input_is_never_formatted_into_the_invoke_trace() {
