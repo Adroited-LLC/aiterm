@@ -1,6 +1,6 @@
 //! Resolve a running Codex terminal from the rollout its process actually owns.
-//! Command-line resume ids become stale after `/clear`; transcript timestamps
-//! and other sessions in the same directory are not evidence of ownership.
+//! Command-line resume ids become stale after `/clear`. Only open descriptors
+//! establish ownership; root creation metadata orders retained cleared roots.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -9,8 +9,8 @@ use std::path::Path;
 
 const MAX_HEADER_BYTES: u64 = 64 * 1024;
 
-/// Return the sole user conversation held open by this PTY process tree.
-/// Unavailable process information or multiple root conversations yield no id.
+/// Return the current user conversation held open by this PTY process tree.
+/// Multiple owning processes or ambiguous root metadata yield no id.
 pub(crate) fn resolve(root_pid: u32) -> Option<String> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -44,7 +44,7 @@ fn resolve_at(root_pid: u32, proc_root: &Path, sessions: &Path) -> Option<String
     let mut pending = vec![root_pid];
     let mut visited = HashSet::new();
     let mut paths = HashSet::new();
-    let mut ids = HashSet::new();
+    let mut owners = HashMap::<u32, Vec<RootSession>>::new();
     while let Some(pid) = pending.pop() {
         if !visited.insert(pid) {
             continue;
@@ -79,19 +79,40 @@ fn resolve_at(root_pid: u32, proc_root: &Path, sessions: &Path) -> Option<String
                 continue;
             }
             if let Some(id) = root_session(&canonical)? {
-                ids.insert(id);
-                if ids.len() > 1 {
-                    return None;
-                }
+                owners.entry(pid).or_default().push(id);
             }
         }
     }
-    ids.into_iter().next()
+    // A /clear retains the previous root's writer in the same Codex process.
+    // Do not confuse that with multiple independently running Codex instances.
+    if owners.len() != 1 {
+        return None;
+    }
+    let mut roots = owners.into_values().next()?;
+    if roots.len() == 1 {
+        return Some(roots.pop()?.id);
+    }
+    // Never rank by mtime: background completions can touch an old rollout.
+    // Require creation metadata on every candidate and a unique newest root.
+    if roots.iter().any(|root| root.created.is_none()) {
+        return None;
+    }
+    roots.sort_by(|left, right| left.created.cmp(&right.created));
+    let newest = roots.pop()?;
+    if roots.last()?.created == newest.created {
+        return None;
+    }
+    Some(newest.id)
 }
 
 // Outer None means unreadable/incomplete metadata, so ownership is unknown;
 // Some(None) is a known non-user rollout that is safe to ignore.
-fn root_session(path: &Path) -> Option<Option<String>> {
+struct RootSession {
+    id: String,
+    created: Option<String>,
+}
+
+fn root_session(path: &Path) -> Option<Option<RootSession>> {
     let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES + 1));
     let mut line = String::new();
@@ -118,7 +139,27 @@ fn root_session(path: &Path) -> Option<Option<String>> {
     if id.is_empty() {
         return None;
     }
-    Some(Some(id.to_owned()))
+    let created = payload
+        .get("timestamp")
+        .and_then(|value| value.as_str())
+        .filter(|value| {
+            // Codex writes UTC with millisecond precision. Require that exact
+            // form so lexical ordering cannot misorder offsets or precision.
+            value.len() == 24
+                && value.bytes().enumerate().all(|(i, b)| match i {
+                    4 | 7 => b == b'-',
+                    10 => b == b'T',
+                    13 | 16 => b == b':',
+                    19 => b == b'.',
+                    23 => b == b'Z',
+                    _ => b.is_ascii_digit(),
+                })
+        })
+        .map(str::to_owned);
+    Some(Some(RootSession {
+        id: id.to_owned(),
+        created,
+    }))
 }
 
 #[cfg(all(test, unix))]
@@ -206,6 +247,42 @@ mod tests {
         f.process(100, 1, "codex");
         f.rollout(100, 3, "old", "cli".into(), "user");
         f.rollout(100, 4, "new", "cli".into(), "user");
+        assert_eq!(f.resolve(), None);
+    }
+
+    fn stamp(f: &Fixture, id: &str, timestamp: &str) {
+        let path = f.0.join(format!("sessions/rollout-{id}.jsonl"));
+        let mut header: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        header["payload"]["timestamp"] = timestamp.into();
+        fs::write(path, format!("{header}\n")).unwrap();
+    }
+
+    #[test]
+    fn clear_selects_new_root_even_when_old_writer_remains_open_and_is_touched() {
+        let f = Fixture::new();
+        f.process(100, 1, "codex");
+        f.rollout(100, 3, "old", "cli".into(), "user");
+        f.rollout(100, 4, "new", "cli".into(), "user");
+        stamp(&f, "new", "2026-09-06T03:51:50.882Z");
+        stamp(&f, "old", "2026-09-06T00:12:14.738Z");
+        assert_eq!(f.resolve().as_deref(), Some("new"));
+        stamp(&f, "old", "2026-09-06T03:51:50.882Z");
+        assert_eq!(f.resolve(), None, "equal creation times are ambiguous");
+        stamp(&f, "old", "2026-09-06T00:12:14+00:00");
+        assert_eq!(f.resolve(), None, "do not compare mixed timestamp formats");
+    }
+
+    #[test]
+    fn newer_root_in_another_codex_process_is_not_evidence_of_clear() {
+        let f = Fixture::new();
+        f.process(100, 1, "zsh");
+        f.process(101, 100, "codex");
+        f.process(102, 100, "codex");
+        f.rollout(101, 3, "old", "cli".into(), "user");
+        f.rollout(102, 4, "new", "cli".into(), "user");
+        stamp(&f, "old", "2026-09-06T00:12:14.738Z");
+        stamp(&f, "new", "2026-09-06T03:51:50.882Z");
         assert_eq!(f.resolve(), None);
     }
 
