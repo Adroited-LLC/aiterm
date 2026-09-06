@@ -784,7 +784,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun composerOverlaysTheTerminalWhileAdvertisedRowsExcludeBottomChrome() {
+    fun composerStaysBelowTheRenderedTerminalWhileAdvertisedRowsMatchTheGrid() {
         val sizes = mutableListOf<Pair<Int, Int>>()
         compose.setContent {
             TerminalScreenContent(
@@ -830,10 +830,10 @@ class TerminalScreenTest {
             "composer input must remain a compact single row",
             field.height <= maxSingleRowHeight,
         )
-        assertTrue("composer must overlay the stable terminal render", render.bottom > overlay.top)
+        assertTrue("terminal output must end above the composer", render.bottom <= overlay.top)
         val rowHeight = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot.height
-        val expectedRows = ((chrome.top - render.top) / rowHeight).toInt().coerceIn(1, 512)
+        val expectedRows = (render.height / rowHeight).toInt().coerceIn(1, 512)
         compose.runOnIdle {
             assertEquals(
                 "advertised rows must exclude the terminal area hidden by bottom chrome",
@@ -1062,7 +1062,7 @@ class TerminalScreenTest {
             val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
                 .fetchSemanticsNode().boundsInRoot
             val finalViewport = (render.width / cell.width).toInt().coerceIn(1, 512) to
-                ((chrome.top - render.top) / row.height).toInt().coerceIn(1, 512)
+                (render.height / row.height).toInt().coerceIn(1, 512)
             compose.runOnIdle { assertTrue(sizes.isEmpty()) }
             compose.mainClock.advanceTimeBy(TERMINAL_RESIZE_SETTLE_MILLIS)
             compose.runOnIdle { assertEquals(listOf(finalViewport), sizes) }
@@ -1072,7 +1072,7 @@ class TerminalScreenTest {
     }
 
     @Test
-    fun advertisedRowsIncludeTheViewportBottomPaddingAtALineThreshold() {
+    fun advertisedRowsExcludeBottomPaddingAtALineThreshold() {
         val sizes = mutableListOf<Pair<Int, Int>>()
         val height = mutableStateOf(480.dp)
         compose.setContent {
@@ -1081,14 +1081,13 @@ class TerminalScreenTest {
                     state = connectedState(),
                     screen = oneCellScreen("tab-bottom-padding-threshold"),
                     onResize = { cols, rows -> sizes += cols to rows },
+                    imeInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
+                    navigationInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
                 )
             }
         }
 
-        val density = compose.activity.resources.displayMetrics.density
-        val viewportBottomPaddingPx = 3f * density
-        var thresholdHeight = 0.dp
-        var rowStep = 0.dp
+        var expectedRows = 0
         for (candidateHeight in 480..504) {
             compose.runOnIdle { height.value = candidateHeight.dp }
             compose.waitForIdle()
@@ -1098,41 +1097,96 @@ class TerminalScreenTest {
                 .fetchSemanticsNode().boundsInRoot
             val rowHeight = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
                 .fetchSemanticsNode().boundsInRoot.height
-            val visibleHeight = chrome.top - render.top
-            val visibleRows = (visibleHeight / rowHeight).toInt().coerceIn(1, 512)
-            val undercountedRows = ((visibleHeight - viewportBottomPaddingPx) / rowHeight)
+            val renderedRows = (render.height / rowHeight).toInt().coerceIn(1, 512)
+            val rowsIncludingPadding = ((chrome.top - render.top) / rowHeight)
                 .toInt().coerceIn(1, 512)
-            if (visibleRows > undercountedRows) {
-                thresholdHeight = candidateHeight.dp
-                rowStep = (rowHeight / density).dp
+            if (rowsIncludingPadding > renderedRows) {
+                expectedRows = renderedRows
                 break
             }
         }
-        assertTrue("test geometry must cross a row boundary within the bottom 3 dp", rowStep > 0.dp)
+        assertTrue("fixture must cross a row boundary inside the bottom padding", expectedRows > 0)
+        compose.waitUntil(5_000) { sizes.lastOrNull()?.second == expectedRows }
+    }
 
-        compose.runOnIdle {
-            sizes.clear()
-            height.value = thresholdHeight + rowStep
+    @Test
+    fun finalOutputCanScrollFullyAboveComposerWithAnUnresizedSnapshot() {
+        val visible = List(80) { ScreenRow(listOf(ScreenCell("Z"))) }
+        val history = List(100) { ScreenRow(listOf(ScreenCell("H"))) }
+        compose.setContent {
+            Box(Modifier.size(400.dp, 600.dp)) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = ScreenSnapshot(
+                        tabId = "tab-scroll-tail",
+                        revision = 1,
+                        cols = 1,
+                        rows = visible.size,
+                        visible = visible,
+                        cursor = CursorState(0, 0, false),
+                    ),
+                    scrollback = history,
+                    imeInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
+                    navigationInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 61),
+                )
+            }
         }
-        compose.waitUntil(5_000) { sizes.isNotEmpty() }
 
+        val finalIndex = history.size + visible.lastIndex
+        compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .performScrollToIndex(finalIndex)
+        val finalCell = compose.onNodeWithTag("terminal-cell-$finalIndex-0", useUnmergedTree = true)
+            .assertIsDisplayed().fetchSemanticsNode().boundsInRoot
         val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
-        val chrome = compose.onNodeWithTag("terminal-bottom-chrome", useUnmergedTree = true)
+        val composer = compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot
-        val rowHeight = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
-            .fetchSemanticsNode().boundsInRoot.height
-        val visibleHeight = chrome.top - render.top
-        val expectedRows = (visibleHeight / rowHeight).toInt().coerceIn(1, 512)
-        val undercountedRows = ((visibleHeight - viewportBottomPaddingPx) / rowHeight)
-            .toInt().coerceIn(1, 512)
-        assertTrue("threshold must distinguish the old undercount", expectedRows > undercountedRows)
-        compose.runOnIdle {
-            assertEquals(
-                "advertised rows must include the render's bottom padding above chrome",
-                expectedRows,
-                sizes.last().second,
-            )
+        assertTrue("the final output row must be fully inside the viewport", finalCell.bottom <= render.bottom + 1f)
+        assertTrue("scrolling to the end must expose output above the composer", finalCell.bottom <= composer.top)
+    }
+
+    @Test
+    fun imeInsetsConstrainTheGridBeforeTheBackendResizeSettles() {
+        val sizes = mutableListOf<Pair<Int, Int>>()
+        val ime = mutableStateOf(androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0))
+        compose.setContent {
+            Box(Modifier.size(400.dp, 600.dp)) {
+                TerminalScreenContent(
+                    state = connectedState(),
+                    screen = oneCellScreen("tab-ime-immediate"),
+                    onResize = { cols, rows -> sizes += cols to rows },
+                    imeInsets = ime.value,
+                    navigationInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
+                )
+            }
+        }
+        compose.waitUntil(5_000) { sizes.isNotEmpty() }
+        val before = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+            .fetchSemanticsNode().boundsInRoot
+        val originalAutoAdvance = compose.mainClock.autoAdvance
+        compose.mainClock.autoAdvance = false
+        try {
+            compose.runOnIdle {
+                sizes.clear()
+                ime.value = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 300)
+            }
+            repeat(2) { compose.mainClock.advanceTimeByFrame() }
+            val render = compose.onNodeWithTag("terminal-render-content", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            val composer = compose.onNodeWithTag("terminal-composer-overlay", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            assertEquals("IME must constrain the rendered viewport immediately", before.height - 300f, render.height, 1f)
+            assertTrue(render.bottom <= composer.top)
+            compose.runOnIdle { assertTrue("network resize must still be debounced", sizes.isEmpty()) }
+            val row = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
+                .fetchSemanticsNode().boundsInRoot
+            compose.mainClock.advanceTimeBy(TERMINAL_RESIZE_SETTLE_MILLIS + 32)
+            compose.runOnIdle {
+                assertEquals(1, sizes.size)
+                assertEquals((render.height / row.height).toInt().coerceIn(1, 512), sizes.single().second)
+            }
+        } finally {
+            compose.mainClock.autoAdvance = originalAutoAdvance
         }
     }
 
@@ -1204,7 +1258,7 @@ class TerminalScreenTest {
             .fetchSemanticsNode().boundsInRoot
         val rowHeightPx = compose.onNodeWithTag("terminal-row", useUnmergedTree = true)
             .fetchSemanticsNode().boundsInRoot.height.roundToInt()
-        val visibleHeightPx = (chrome.top - render.top).roundToInt()
+        val visibleHeightPx = render.height.roundToInt()
         val expectedRows = (visibleHeightPx / rowHeightPx).coerceIn(1, 512)
 
         compose.runOnIdle { assertEquals(expectedRows, sizes.last().second) }
@@ -1292,11 +1346,11 @@ class TerminalScreenTest {
             )
             assertEquals(
                 "advertised rows must come from the unobscured padded grid height",
-                ((chrome.top - grid.top) / row.height).toInt().coerceIn(1, 512),
+                (grid.height / row.height).toInt().coerceIn(1, 512),
                 advertised.second,
             )
             assertTrue(advertised.first * cell.width <= grid.width + 1f)
-            assertTrue(advertised.second * row.height <= chrome.top - grid.top + 1f)
+            assertTrue(advertised.second * row.height <= grid.height + 1f)
         }
 
         compose.waitUntil(5_000) { sizes.isNotEmpty() }

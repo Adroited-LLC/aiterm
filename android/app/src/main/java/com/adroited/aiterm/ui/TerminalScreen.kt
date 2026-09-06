@@ -6,9 +6,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.imeNestedScroll
-import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -49,6 +47,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -71,7 +70,6 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.platform.testTag
@@ -108,6 +106,8 @@ import com.adroited.aiterm.terminal.ScreenCell
 import com.adroited.aiterm.terminal.ScreenSnapshot
 import com.adroited.aiterm.terminal.ScreenRow
 import com.adroited.aiterm.terminal.TerminalColor
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
@@ -178,7 +178,6 @@ internal fun TerminalScreenContent(
     val keyboard = LocalSoftwareKeyboardController.current
     val context = LocalContext.current
     val density = LocalDensity.current
-    val layoutDirection = LocalLayoutDirection.current
     val localDraftStore = remember { TerminalDraftStore() }
     val activeDraftStore = draftStore ?: localDraftStore
     val allDrafts by activeDraftStore.drafts.collectAsStateWithLifecycle()
@@ -195,9 +194,6 @@ internal fun TerminalScreenContent(
     var showDiscardDrafts by remember { mutableStateOf(false) }
     var chromeInteractiveHeightPx by remember(screen?.tabId) { mutableIntStateOf(0) }
     val bottomInsets = imeInsets.union(navigationInsets)
-    val bottomInsetPx = bottomInsets.getBottom(density)
-    val navigationLeftInsetPx = navigationInsets.getLeft(density, layoutDirection)
-    val navigationRightInsetPx = navigationInsets.getRight(density, layoutDirection)
     val onViewportSizeChanged = remember {
         { size: TerminalSize ->
             cols = size.cols
@@ -420,9 +416,8 @@ internal fun TerminalScreenContent(
                     onLoadScrollback = onLoadScrollback,
                     onRestartScrollback = onRestartScrollback,
                     metrics = terminalMetrics,
-                    bottomObstructionPx = bottomInsetPx + chromeInteractiveHeightPx,
-                    leftObstructionPx = navigationLeftInsetPx,
-                    rightObstructionPx = navigationRightInsetPx,
+                    bottomInsets = bottomInsets,
+                    chromeHeightPx = chromeInteractiveHeightPx,
                     modifier = Modifier.weight(1f).fillMaxWidth(),
                     emptyMessage = "Opening terminal…",
                     onViewportSizeChanged = onViewportSizeChanged,
@@ -574,9 +569,8 @@ private fun TerminalViewport(
     onLoadScrollback: () -> Unit,
     onRestartScrollback: () -> Unit,
     metrics: TerminalMetrics,
-    bottomObstructionPx: Int,
-    leftObstructionPx: Int,
-    rightObstructionPx: Int,
+    bottomInsets: WindowInsets,
+    chromeHeightPx: Int,
     modifier: Modifier,
     emptyMessage: String,
     onViewportSizeChanged: (TerminalSize) -> Unit,
@@ -585,41 +579,42 @@ private fun TerminalViewport(
     onRequestKeyboard: () -> Unit,
 ) {
     val density = LocalDensity.current
-    val horizontalPaddingPx = with(density) { 4.dp.roundToPx() }
-    val verticalPaddingPx = with(density) { 3.dp.roundToPx() }
-    BoxWithConstraints(
-        modifier.background(Color(0xFF07111B)),
+    // Read animated insets in layout, without recomposing every terminal row
+    // on each keyboard frame. PTY resizing can settle independently of drawing.
+    var measuredSize by remember { mutableStateOf<TerminalSize?>(null) }
+    val currentOnViewportSizeChanged by rememberUpdatedState(onViewportSizeChanged)
+    val currentOnResize by rememberUpdatedState(onResize)
+    LaunchedEffect(Unit) {
+        snapshotFlow { measuredSize }.filterNotNull().distinctUntilChanged()
+            .collect { currentOnViewportSizeChanged(it) }
+    }
+    LaunchedEffect(screen?.tabId, resizeEnabled) {
+        if (screen != null && resizeEnabled) {
+            snapshotFlow { measuredSize }.filterNotNull()
+                .settledTerminalSizes()
+                .collect { size -> currentOnResize(size.cols, size.rows) }
+        }
+    }
+    Box(
+        modifier.background(Color(0xFF07111B))
+            .windowInsetsPadding(bottomInsets)
+            .padding(bottom = with(density) { chromeHeightPx.toDp() }),
     ) {
-        val measuredSize = terminalViewportSizePx(
-            viewportWidthPx = constraints.maxWidth,
-            viewportHeightPx = constraints.maxHeight,
-            leftObstructionPx = leftObstructionPx,
-            rightObstructionPx = rightObstructionPx,
-            bottomObstructionPx = bottomObstructionPx,
-            horizontalPaddingPx = horizontalPaddingPx,
-            verticalPaddingPx = verticalPaddingPx,
-            cellWidthPx = metrics.cellWidthPx,
-            lineHeightPx = metrics.lineHeightPx,
-        )
-        val currentMeasuredSize by rememberUpdatedState(measuredSize)
-        val currentOnResize by rememberUpdatedState(onResize)
-        LaunchedEffect(measuredSize) {
-            onViewportSizeChanged(measuredSize)
-        }
-        LaunchedEffect(screen?.tabId, resizeEnabled) {
-            if (screen != null && resizeEnabled) {
-                snapshotFlow { currentMeasuredSize }
-                    .settledTerminalSizes()
-                    .collect { size -> currentOnResize(size.cols, size.rows) }
-            }
-        }
         Box(
-            Modifier.fillMaxSize().absolutePadding(
-                left = with(density) { (leftObstructionPx + horizontalPaddingPx).toDp() },
-                top = with(density) { verticalPaddingPx.toDp() },
-                right = with(density) { (rightObstructionPx + horizontalPaddingPx).toDp() },
-                bottom = with(density) { verticalPaddingPx.toDp() },
-            ),
+            Modifier.fillMaxSize().padding(horizontal = 4.dp, vertical = 3.dp)
+                .onSizeChanged { drawable ->
+                    measuredSize = terminalViewportSizePx(
+                        viewportWidthPx = drawable.width,
+                        viewportHeightPx = drawable.height,
+                        leftObstructionPx = 0,
+                        rightObstructionPx = 0,
+                        bottomObstructionPx = 0,
+                        horizontalPaddingPx = 0,
+                        verticalPaddingPx = 0,
+                        cellWidthPx = metrics.cellWidthPx,
+                        lineHeightPx = metrics.lineHeightPx,
+                    )
+                },
         ) {
             key(screen?.tabId) {
                 TerminalGrid(
@@ -713,6 +708,10 @@ private fun TerminalGrid(
         }
     }
     val density = LocalDensity.current
+    val ime = WindowInsets.ime
+    val keyboardVisible by remember(ime, density) {
+        derivedStateOf { ime.getBottom(density) > 0 }
+    }
     Box(
         modifier.clickable(onClick = onRequestKeyboard).testTag("terminal-grid"),
     ) {
@@ -721,7 +720,7 @@ private fun TerminalGrid(
                 state = listState,
                 modifier = Modifier.fillMaxSize()
                     .nestedScroll(historyScroll)
-                    .then(if (WindowInsets.ime.getBottom(density) > 0) Modifier.imeNestedScroll() else Modifier)
+                    .then(if (keyboardVisible) Modifier.imeNestedScroll() else Modifier)
                     .testTag("terminal-render-content"),
             ) {
                 itemsIndexed(

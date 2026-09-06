@@ -47,7 +47,7 @@ class TerminalViewportSizingTest {
     }
 
     @Test
-    fun fractionalDensityRoundedVerticalPaddingKeepsABoundaryRow() {
+    fun fractionalDensityRoundedVerticalPaddingExcludesAnUnrenderableBoundaryRow() {
         val size = terminalViewportSizePx(
             viewportWidthPx = 100,
             viewportHeightPx = 165,
@@ -61,6 +61,6 @@ class TerminalViewportSizingTest {
         )
 
         // At density 1.5, 3 dp layout padding rounds from 4.5 to 5 px.
-        assertEquals(TerminalSize(cols = 10, rows = 3), size)
+        assertEquals(TerminalSize(cols = 10, rows = 2), size)
     }
 }

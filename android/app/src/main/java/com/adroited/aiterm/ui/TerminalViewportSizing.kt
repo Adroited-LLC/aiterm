@@ -21,7 +21,7 @@ internal fun terminalViewportSizePx(
     ).coerceAtLeast(safeCellWidthPx)
     val availableHeightPx = (
         viewportHeightPx - bottomObstructionPx.coerceAtLeast(0) -
-            verticalPaddingPx.coerceAtLeast(0)
+            2 * verticalPaddingPx.coerceAtLeast(0)
     ).coerceAtLeast(safeLineHeightPx)
     return TerminalSize(
         cols = (availableWidthPx / safeCellWidthPx).coerceIn(1, 512),
