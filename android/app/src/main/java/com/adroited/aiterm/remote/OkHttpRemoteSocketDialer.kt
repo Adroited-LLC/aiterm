@@ -174,6 +174,7 @@ class OkHttpRemoteSocketDialer(private val context: Context? = null) : DirectRem
         // replaces CA path validation, never endpoint-name validation.
         return OkHttpClient.Builder()
             .connectTimeout(5, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
             .socketFactory(socketFactory)
             .sslSocketFactory(sslContext.socketFactory, trustManager)
             .connectionSpecs(listOf(tls13Only))

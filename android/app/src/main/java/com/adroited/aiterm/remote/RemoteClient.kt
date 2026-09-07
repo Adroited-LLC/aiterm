@@ -151,6 +151,9 @@ sealed interface RemoteTransportTerminalOutcome {
     data object Revoked : RemoteTransportTerminalOutcome
 }
 
+/** A single rejected/timed-out request does not imply the socket was lost. */
+class RemoteRequestException(val code: String, message: String) : Exception(message)
+
 class RemoteTransportTerminatedException(
     val outcome: RemoteTransportTerminalOutcome,
 ) : Exception(
@@ -210,6 +213,7 @@ class RemoteClient(
     private val ownedJobs = linkedSetOf<Job>()
     private val spineConversations = HashMap<String, SpineConversationStore>()
     private val spineRefreshPending = HashSet<String>()
+    private var desiredPreviewSessionId: String? = null
 
     suspend fun connect(): Boolean {
         synchronized(lifecycleLock) {
@@ -285,6 +289,7 @@ class RemoteClient(
             }
             if (!published) return false
             selectedTab?.let(::selectTab)
+            synchronized(lifecycleLock) { desiredPreviewSessionId }?.let(::previewSession)
             if (synchronized(lifecycleLock) { mutableState.value.sessions.isNotEmpty() }) refreshSessions()
             synchronized(lifecycleLock) { isCurrent(generation, candidate) }
         } catch (error: Exception) {
@@ -771,6 +776,7 @@ class RemoteClient(
 
     private fun previewSession(sessionId: String, subscribe: Boolean) {
         synchronized(lifecycleLock) {
+            desiredPreviewSessionId = sessionId
             if (mutableState.value.previewLoadingSessionId == sessionId) {
                 spineRefreshPending.add(sessionId)
                 return
@@ -788,6 +794,7 @@ class RemoteClient(
             RemoteCommands.spine(sessionId, requestedAfter),
             timeoutMillis = PREVIEW_REFRESH_TIMEOUT_MILLIS,
             onError = { code, message ->
+                if (desiredPreviewSessionId != sessionId) return@launchRequest
                 if (subscribe && code == "remote.unsupported") {
                     mutableState.value = mutableState.value.copy(previewLoadingSessionId = null)
                     previewSession(sessionId, subscribe = false)
@@ -801,6 +808,7 @@ class RemoteClient(
                 }
             },
             onSuccess = { payload ->
+                if (desiredPreviewSessionId != sessionId) return@launchRequest
                 val page = RemoteCommands.spinePage(payload)
                 // The server filtered this page using the old desktop's cursor.
                 // After a restart it may be empty, or omit the beginning of the
@@ -869,12 +877,14 @@ class RemoteClient(
             "session.conversation",
             RemoteCommands.conversation(sessionId),
             onError = { _, message ->
+                if (desiredPreviewSessionId != sessionId) return@launchRequest
                 mutableState.value = mutableState.value.copy(
                     previewLoadingSessionId = null,
                     previewError = message,
                 )
             },
             onSuccess = { payload ->
+                if (desiredPreviewSessionId != sessionId) return@launchRequest
                 val messages = RemoteCommands.sessionPreview(payload)
                 val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
                 store.legacy(messages)
@@ -1036,6 +1046,8 @@ class RemoteClient(
             screenStore.clear()
             mutableScrollback.value = emptyList()
             resetScrollbackLocked()
+            desiredPreviewSessionId = null
+            spineRefreshPending.clear()
             mutableState.value = RemoteClientState(connection = ConnectionState.Locked)
         }
     }
@@ -1100,11 +1112,13 @@ class RemoteClient(
                         closing = detachTransportLocked()
                         transfers.clear()
                         mutableState.value = mutableState.value.copy(
-                            connection = ConnectionState.Disconnected,
+                            connection = ConnectionState.Reconnecting,
                             pendingTransfers = 0,
                             lastError = "Too many pending terminal transfers",
                             connectedEndpoint = null,
                         )
+                        clearActiveTerminalLocked()
+                        reconnect = true
                     } else {
                         transfers += event.transferId
                         mutableState.value = mutableState.value.copy(pendingTransfers = transfers.size)
@@ -1167,8 +1181,7 @@ class RemoteClient(
         when (event.kind) {
             "session.spine.changed" -> {
                 val changed = RemoteCommands.spineChanged(event.payload)
-                val state = mutableState.value
-                if (changed.sessionId == state.previewSessionId || changed.sessionId == state.previewLoadingSessionId) {
+                if (changed.sessionId == desiredPreviewSessionId) {
                     val store = spineConversations[changed.sessionId]
                     if (store == null || store.epoch != changed.epoch || store.lastSeq < changed.latestSeq) {
                         previewSession(changed.sessionId)
@@ -1183,7 +1196,7 @@ class RemoteClient(
             }
             "session.changed" -> {
                 refreshSessions()
-                mutableState.value.previewSessionId?.let(::previewSession)
+                desiredPreviewSessionId?.let(::previewSession)
             }
             "agent.changed" -> refreshAgents()
             "tab.changed" -> refreshTabs()
@@ -1300,7 +1313,7 @@ class RemoteClient(
             } catch (error: Exception) {
                 synchronized(lifecycleLock) {
                     if (isCurrent(generation, active)) {
-                        onError?.invoke("protocol.invalid_response", error.message ?: "Invalid desktop response")
+                        onError?.invoke((error as? RemoteRequestException)?.code ?: "protocol.invalid_response", error.message ?: "Invalid desktop response")
                     }
                 }
                 if (onError == null || error is RemoteTransportTerminatedException) {
@@ -1321,7 +1334,9 @@ class RemoteClient(
         candidate: RemoteTransport,
         error: Exception,
     ) {
-        if (error is RemoteTransportTerminatedException) {
+        if (error is RemoteRequestException) {
+            accept(expectedGeneration, RemoteServerEvent.Failure(error.code, error.message ?: "Request failed"), candidate)
+        } else if (error is RemoteTransportTerminatedException) {
             acceptTerminalOutcome(expectedGeneration, candidate, error.outcome)
         } else {
             accept(
@@ -1449,7 +1464,8 @@ class RemoteClient(
     }
 
     private fun detachTransportLocked(): ClosingTransport {
-        mutableState.value = mutableState.value.copy(sessionsRefreshing = false)
+        spineRefreshPending.clear()
+        mutableState.value = mutableState.value.copy(sessionsRefreshing = false, previewLoadingSessionId = null)
         lifecycleGeneration += 1
         selectionGeneration += 1
         val jobs = ownedJobs.toList()
@@ -1492,6 +1508,7 @@ class RemoteClient(
             val previous = transport
             eventJob = null
             transport = candidate
+            spineRefreshPending.clear()
             activeAttachmentId = null
             activeAttachmentTabId = null
             terminalAssembler.clear()
@@ -1500,6 +1517,8 @@ class RemoteClient(
             resetScrollbackLocked()
             mutableState.value = mutableState.value.copy(
                 connection = connectingState,
+                sessionsRefreshing = false,
+                previewLoadingSessionId = null,
                 connectedEndpoint = null,
             )
             Triple(previous, jobs, lifecycleGeneration)

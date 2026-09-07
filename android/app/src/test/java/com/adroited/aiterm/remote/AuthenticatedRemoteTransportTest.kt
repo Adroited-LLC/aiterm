@@ -35,6 +35,57 @@ import kotlin.concurrent.thread
 @OptIn(ExperimentalCoroutinesApi::class)
 class AuthenticatedRemoteTransportTest {
     @Test
+    fun failedWriterClosesTheConnectionAndFailsAllWaitingRequests() = runTest {
+        val socket = authenticatedSocket()
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(), deviceKeys = RecordingDeviceKeys(), appLock = unlockedAppLock(),
+            dialer = FakeDialer(socket), scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        transport.connect()
+        socket.failSends = true
+        val first = transport.request("tab.list", byteArrayOf())
+        val second = transport.request("agent.list", byteArrayOf())
+        runCurrent()
+        assertTrue(socket.closed)
+        assertTrue(runCatching { first.await() }.exceptionOrNull() is RemoteTransportTerminatedException)
+        assertTrue(runCatching { second.await() }.exceptionOrNull() is RemoteTransportTerminatedException)
+    }
+
+    @Test
+    fun requestTimeoutKeepsSocketUsableAndIgnoresItsLateResponse() = runTest {
+        val socket = FakeBinarySocket().apply {
+            incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
+            incoming.trySend(hex("a1646b696e6467617574682e6f6b"))
+        }
+        val transport = AuthenticatedRemoteTransport(
+            desktop = desktop(), deviceKeys = RecordingDeviceKeys(), appLock = unlockedAppLock(),
+            dialer = FakeDialer(socket), scope = backgroundScope,
+            dispatcher = StandardTestDispatcher(testScheduler),
+        )
+        transport.connect()
+        val first = transport.request("tab.list", byteArrayOf())
+        runCurrent()
+        advanceTimeBy(130_001)
+        runCurrent()
+        val failure = runCatching { first.await() }.exceptionOrNull()
+        assertTrue(failure is RemoteRequestException)
+        assertEquals("request.timeout", (failure as RemoteRequestException).code)
+        assertFalse(socket.closed)
+        fun respond(id: Int) = socket.incoming.trySend(cborFixture(linkedMapOf(
+            "version" to 1, "request_id" to id, "kind" to "tab.list", "payload" to byteArrayOf(),
+        )))
+        respond(1)
+        val second = transport.request("tab.list", byteArrayOf())
+        runCurrent()
+        respond(2)
+        runCurrent()
+        assertTrue(second.await() is RemoteResponse.Success)
+        assertFalse(socket.closed)
+        transport.close()
+    }
+
+    @Test
     fun authenticatedConnectionDeliversUnsolicitedSpineNotifications() = runTest {
         val socket = FakeBinarySocket().apply {
             incoming.trySend(PairingFrames.encode(AuthChallengeFrame(ByteArray(32) { 3 })))
@@ -561,7 +612,7 @@ class AuthenticatedRemoteTransportTest {
         requester.join(2_000)
 
         val failure = runCatching { withTimeout(1_000) { response.get().await() } }.exceptionOrNull()
-        assertTrue("accepted request must fail on close, got $failure", failure is RemoteProtocolException)
+        assertTrue("enqueue rejected by close must fail promptly, got $failure", failure is RemoteRequestException)
     }
 
     @Test
@@ -906,9 +957,11 @@ private class FakeBinarySocket(override val endpoint: RemoteEndpoint? = null) : 
     val incoming = Channel<ByteArray>(Channel.UNLIMITED)
     val sent = mutableListOf<ByteArray>()
     var closed = false
+    var failSends = false
 
     override suspend fun receive(): ByteArray = incoming.receive()
     override fun send(bytes: ByteArray): Boolean {
+        if (failSends) throw java.io.IOException("socket write failed")
         sent += bytes.copyOf()
         return true
     }

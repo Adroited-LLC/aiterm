@@ -130,7 +130,14 @@ class AuthenticatedRemoteTransport(
                 socket = candidate
             }
             logInfo("remote transport connected over ${candidate.endpoint?.path ?: RemotePath.UNKNOWN}")
-            writerJob = scope.launch(dispatcher) { writeLoop() }
+            writerJob = scope.launch(dispatcher) {
+                try { writeLoop() }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    logWarning("remote transport writer ended", error)
+                    closeWithOutcome(RemoteTransportTerminalOutcome.Recoverable(error.message ?: "Connection ended"))
+                }
+            }
             for (event in earlyEvents) accept(event)
             readerJob = scope.launch(dispatcher) { readLoop(candidate) }
         } catch (error: Exception) {
@@ -281,7 +288,7 @@ class AuthenticatedRemoteTransport(
     ): CompletableDeferred<RemoteResponse> {
         return requestBatch(listOf(RemoteRequestInput(kind, payload, onAssigned)))?.single()
             ?: CompletableDeferred<RemoteResponse>().also {
-                it.completeExceptionally(RemoteProtocolException("invalid or over-bound remote request"))
+                it.completeExceptionally(RemoteRequestException("request.busy", "Remote request queue is full or unavailable. Try again."))
             }
     }
 
@@ -329,7 +336,7 @@ class AuthenticatedRemoteTransport(
             outgoing.drop(sent.size).forEach { it.payload.fill(0) }
             outgoing.forEach {
                 it.deferred.completeExceptionally(
-                    RemoteProtocolException("invalid or over-bound remote request"),
+                    RemoteRequestException("request.busy", "Remote request queue is full or unavailable. Try again."),
                 )
             }
             return null
@@ -398,8 +405,8 @@ class AuthenticatedRemoteTransport(
                 outgoing.payload.fill(0)
             }
             if (!sent) {
-                failPendingSend(requestId, "remote request send failed")
-                continue
+                closeWithOutcome(RemoteTransportTerminalOutcome.Recoverable("Remote request send failed"))
+                return
             }
             val timeout = scope.launch(dispatcher) {
                 delay(REQUEST_TIMEOUT_MILLIS)
@@ -419,7 +426,7 @@ class AuthenticatedRemoteTransport(
                 request?.let { acceptedRequests.remove(it.deferred) }
             }
         }
-        request?.deferred?.completeExceptionally(RemoteProtocolException(message))
+        request?.deferred?.completeExceptionally(RemoteRequestException("request.failed", message))
     }
 
     private fun timeoutPending(requestId: Long) {
@@ -430,7 +437,7 @@ class AuthenticatedRemoteTransport(
             }
         } ?: return
         rememberCompleted(requestId)
-        request.deferred.completeExceptionally(RemoteProtocolException("remote request timed out"))
+        request.deferred.completeExceptionally(RemoteRequestException("request.timeout", "Remote request timed out. Try again."))
     }
 
     override fun close() = closeWithOutcome(null)

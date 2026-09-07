@@ -42,6 +42,98 @@ import kotlin.concurrent.thread
 @OptIn(ExperimentalCoroutinesApi::class, ExperimentalSerializationApi::class)
 class RemoteClientTest {
     @Test
+    fun latePreviewFromPreviousSessionCannotReplaceCurrentConversation() = runTest {
+        val transport = FakeRemoteTransport()
+        val old = CompletableDeferred<RemoteResponse>()
+        var reads = 0
+        transport.responseFor = { request ->
+            reads++
+            if (reads == 1) old else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind,
+                uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), SpineSnapshotWire(
+                    1, true, false, 1, 1, events = listOf(SpineEventWire(1, 1, "new", "codex", 1,
+                        "agent_text", id = "new", text = "new conversation", done = true))))))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("old")
+        runCurrent()
+        client.previewSession("new")
+        runCurrent()
+        val request = transport.requests.first()
+        old.complete(RemoteResponse.Success(request.requestId, request.kind,
+            uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), SpineSnapshotWire(
+                1, true, false, 1, 1, events = listOf(SpineEventWire(1, 1, "old", "codex", 1,
+                    "agent_text", id = "old", text = "old conversation", done = true))))))
+        runCurrent()
+        assertEquals("new", client.state.value.previewSessionId)
+        assertEquals(listOf("new conversation"), client.state.value.previewMessages.map { it.text })
+        client.lock()
+    }
+
+    @Test
+    fun transferOverflowRecoversInsteadOfLeavingTheClientDisconnected() = runTest {
+        val first = FakeRemoteTransport()
+        val second = FakeRemoteTransport()
+        val transports = ArrayDeque(listOf(first, second))
+        val client = RemoteClient({ transports.removeFirst() }, DefaultTerminalScreenStore(), { true },
+            backgroundScope, StandardTestDispatcher(testScheduler))
+        client.connect()
+        repeat(5) { client.acceptForTest(RemoteServerEvent.TransferStarted("transfer-$it")) }
+        assertEquals(ConnectionState.Reconnecting, client.state.value.connection)
+        assertTrue(first.closed)
+        advanceTimeBy(2000)
+        runCurrent()
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        client.lock()
+    }
+
+    @Test
+    fun requestTimeoutAndQueuePressureDoNotDisconnectTheDesktop() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        for (code in listOf("request.timeout", "request.busy")) {
+            transport.responseFor = { CompletableDeferred<RemoteResponse>().apply {
+                completeExceptionally(RemoteRequestException(code, "Try again"))
+            } }
+            client.refreshTabs()
+            runCurrent()
+            assertEquals(ConnectionState.Connected, client.state.value.connection)
+            assertFalse(transport.closed)
+            assertEquals("Try again", client.state.value.lastError)
+        }
+        client.lock()
+    }
+
+    @Test
+    fun reconnectResubscribesAnInterruptedPreviewAndClearsItsLoadingFlag() = runTest {
+        val first = FakeRemoteTransport().apply {
+            responseFor = { CompletableDeferred() }
+        }
+        val second = FakeRemoteTransport().apply {
+            responseFor = { request -> CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind,
+                uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), SpineSnapshotWire(
+                    1, true, false, 1, 1, events = listOf(SpineEventWire(1, 1, "session-1", "codex", 1,
+                        "agent_text", id = "a1", text = "caught up", done = true)))))) }
+        }
+        val transports = ArrayDeque(listOf(first, second))
+        val client = RemoteClient({ transports.removeFirst() }, DefaultTerminalScreenStore(), { true },
+            backgroundScope, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("session-1")
+        runCurrent()
+        assertEquals("session-1", client.state.value.previewLoadingSessionId)
+        client.acceptForTest(RemoteServerEvent.Failure("transport.disconnected", "network interrupted"))
+        advanceTimeBy(2000)
+        runCurrent()
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertEquals(null, client.state.value.previewLoadingSessionId)
+        assertEquals(listOf("caught up"), client.state.value.previewMessages.map { it.text })
+        assertEquals(1, second.requests.count { it.kind == "session.spine.subscribe" })
+        client.lock()
+    }
+
+    @Test
     fun pushedChangesCatchUpEvenWhenAnotherNotificationArrivesDuringFetch() = runTest {
         val transport = FakeRemoteTransport()
         val delayed = CompletableDeferred<RemoteResponse>()
