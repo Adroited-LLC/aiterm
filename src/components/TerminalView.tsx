@@ -115,6 +115,8 @@ export interface TermHandle {
   /** Paste text: bracketed when the running app enabled paste mode, so TUIs
    *  (claude turns image paths into [Image #N]) can tell it from typing. */
   paste: (text: string) => void;
+  /** Take input ownership, then paste paths without sending Enter. */
+  attachPaths: (paths: string[]) => Promise<void>;
   /** Send composed input from the bottom input box (adds Enter, wraps
    *  multiline text in bracketed paste when the running app supports it). */
   sendComposed: (text: string) => void;
@@ -399,6 +401,18 @@ export default function TerminalView({
             attachmentId,
             term.modes.bracketedPasteMode ? `\x1b[200~${text}\x1b[201~` : text,
           );
+        },
+        attachPaths: async (paths) => {
+          await takeFocus();
+          if (disposed || focusRef.current !== "desktop") throw new Error("Terminal focus is unavailable. Try again.");
+          for (const path of paths) {
+            // Separate paste frames preserve image recognition in CLI clients.
+            if (pending > 0) await tabWrite(tab.key, attachmentId, " ");
+            await tabWrite(tab.key, attachmentId,
+              term.modes.bracketedPasteMode ? `\x1b[200~${path}\x1b[201~` : path);
+            inputLine.paste(path);
+            pending += path.length;
+          }
         },
         sendComposed: (text) => {
           const bracketed = term.modes.bracketedPasteMode;

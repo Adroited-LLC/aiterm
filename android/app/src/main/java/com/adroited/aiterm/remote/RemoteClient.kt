@@ -86,6 +86,7 @@ data class RemoteUploadSource(
     val file: File,
     val length: Long,
     val sha256: ByteArray,
+    val fileName: String? = null,
 )
 
 data class RemoteUploadProgress(val sourceId: String, val sent: Long, val total: Long)
@@ -94,7 +95,7 @@ internal data class RemoteUploadSubmission(val count: Int, val bytes: Long)
 
 internal fun validateRemoteUploadSources(sources: List<RemoteUploadSource>): RemoteUploadSubmission {
     if (sources.isEmpty() || sources.size > RemoteCommands.MAX_UPLOADS_PER_SUBMISSION) {
-        throw RemoteUploadException(null, "choose between one and four images")
+        throw RemoteUploadException(null, "choose between one and four attachments")
     }
     val ids = hashSetOf<String>()
     var total = 0L
@@ -103,11 +104,11 @@ internal fun validateRemoteUploadSources(sources: List<RemoteUploadSource>): Rem
             !ids.add(source.id) || !source.file.isFile || source.file.length() != source.length ||
             source.length !in 1..RemoteCommands.MAX_UPLOAD_BYTES || source.sha256.size != 32
         ) {
-            throw RemoteUploadException(null, "the selected image is invalid or changed")
+            throw RemoteUploadException(null, "the selected attachment is invalid or changed")
         }
         total += source.length
         if (total > RemoteCommands.MAX_SUBMISSION_BYTES) {
-            throw RemoteUploadException(null, "selected images exceed the 48 MiB upload limit")
+            throw RemoteUploadException(null, "selected attachments exceed the 48 MiB upload limit")
         }
     }
     return RemoteUploadSubmission(sources.size, total)
@@ -464,6 +465,7 @@ class RemoteClient(
                                 submissionBytes = submission.bytes,
                                 length = source.length,
                                 sha256 = source.sha256,
+                                fileName = source.fileName,
                             ),
                         )
                         RemoteCommands.uploadBegan(beganPayload)

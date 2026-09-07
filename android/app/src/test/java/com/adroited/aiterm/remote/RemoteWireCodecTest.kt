@@ -241,6 +241,18 @@ class RemoteWireCodecTest {
     }
 
     @Test
+    fun fileUploadDeclaresOriginalNameAndGenericBytes() {
+        assertArrayEquals(
+            fixture(linkedMapOf("tab_id" to "tab", "attachment_id" to "attachment",
+                "submission_id" to "submission", "submission_count" to 1, "member_index" to 0,
+                "submission_bytes" to 3, "length" to 3, "media_type" to "application/octet-stream",
+                "file_name" to "log.pdf", "sha256" to ByteArray(32))),
+            RemoteCommands.uploadBegin("tab", "attachment", "submission", 1,
+                submissionBytes = 3, length = 3, sha256 = ByteArray(32), fileName = "log.pdf"),
+        )
+    }
+
+    @Test
     fun terminalImageUploadPayloadsMatchTheRustCborContract() {
         val digest = ByteArray(32) { it.toByte() }
 

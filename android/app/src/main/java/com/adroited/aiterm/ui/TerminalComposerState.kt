@@ -31,15 +31,18 @@ internal fun formatTerminalSubmission(
     text: String,
     paths: List<String>,
     bracketedPaste: Boolean = false,
+    hasFiles: Boolean = false,
 ): List<String> {
+    val label = if (hasFiles) "files" else "images"
     val paste = when {
         paths.isEmpty() -> text
         text.isEmpty() -> buildString {
-            append("Please inspect the attached image(s):\n\nAttached images:")
+            append(if (hasFiles) "Please inspect the attached file(s):" else "Please inspect the attached image(s):")
+            append("\n\nAttached $label:")
             paths.forEach { append("\n- ").append(it) }
         }
         else -> buildString {
-            append(text).append("\n\nAttached images:")
+            append(text).append("\n\nAttached $label:")
             paths.forEach { append("\n- ").append(it) }
         }
     }

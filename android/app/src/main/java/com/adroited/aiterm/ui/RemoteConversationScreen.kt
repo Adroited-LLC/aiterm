@@ -77,6 +77,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Check
@@ -119,6 +120,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -997,7 +999,7 @@ internal fun RemoteConversationContent(
     onSend: suspend (
         String,
         String,
-        List<TerminalAttachmentImage>,
+        List<TerminalAttachment>,
         (RemoteUploadProgress) -> Unit,
     ) -> Result<Unit>,
     onBringIn: (String, String, String?, String?, String, Int, Boolean) -> Unit,
@@ -1157,11 +1159,12 @@ internal fun RemoteConversationContent(
                 }
                 try {
                     val distinct = result.uris.distinct()
-                    val remaining = TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size
+                    val remaining = TerminalAttachmentDraft.MAX_ATTACHMENTS - attachments.items.size
                     var message: String? = null
                     for (uri in distinct.take(remaining.coerceAtLeast(0))) {
-                        val normalized = normalizer.normalize(uri).getOrElse { error ->
-                            message = terminalImageErrorMessage(error)
+                        val normalized = (if (result.files) prepareTerminalFile(context, uri)
+                            else normalizer.normalize(uri).map(TerminalAttachment::from)).getOrElse { error ->
+                            message = if (result.files) error.message else terminalImageErrorMessage(error)
                             continue
                         }
                         val added = updateAttachments { it.add(normalized) }
@@ -1172,8 +1175,8 @@ internal fun RemoteConversationContent(
                     }
                     attachments = attachments.copy(
                         message = when {
-                            result.uris.size != distinct.size -> "This image is already attached."
-                            distinct.size > remaining -> "You can attach up to 4 images."
+                            result.uris.size != distinct.size -> "This attachment is already attached."
+                            distinct.size > remaining -> "You can attach up to 4 attachments."
                             else -> message
                         },
                     )
@@ -1184,7 +1187,10 @@ internal fun RemoteConversationContent(
             }
         }
     }
-    val picker = rememberTerminalImagePicker { _, result -> handlePickerResult(result) }
+    val picker = rememberTerminalImagePicker { destination, result ->
+        if (destination == session.id) handlePickerResult(result)
+        else if (result is TerminalImagePickerResult.Selected) result.ownedCaptureFiles.forEach(File::delete)
+    }
 
     fun submit() {
         val text = draft.trim()
@@ -1464,11 +1470,11 @@ internal fun RemoteConversationContent(
                     IconButton(
                         onClick = { showImageSources = true },
                         enabled = !sending && !attachments.preparing &&
-                            attachments.items.size < TerminalAttachmentDraft.MAX_IMAGES,
+                            attachments.items.size < TerminalAttachmentDraft.MAX_ATTACHMENTS,
                     ) {
                         Icon(
                             Icons.Filled.Add,
-                            contentDescription = "Attach an image",
+                            contentDescription = "Attach files or photos",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -1636,7 +1642,7 @@ internal fun RemoteConversationContent(
     if (showImageSources) {
         AlertDialog(
             onDismissRequest = { showImageSources = false },
-            title = { Text("Attach image") },
+            title = { Text("Attach files or photos") },
             text = {
                 Column {
                     Text(
@@ -1654,7 +1660,7 @@ internal fun RemoteConversationContent(
                             showImageSources = false
                             picker.launch(
                                 TerminalImageSource.Camera,
-                                TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
+                                TerminalAttachmentDraft.MAX_ATTACHMENTS - attachments.items.size,
                                 session.id,
                             ) { handlePickerResult(it) }
                         },
@@ -1677,6 +1683,18 @@ internal fun RemoteConversationContent(
                         },
                     )
                     ListItem(
+                        headlineContent = { Text("Files") },
+                        supportingContent = { Text("Documents, PDFs, logs and more") },
+                        leadingContent = { Icon(Icons.Filled.InsertDriveFile, contentDescription = null) },
+                        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                        modifier = Modifier.clickable {
+                            showImageSources = false
+                            picker.launch(TerminalImageSource.Files,
+                                TerminalAttachmentDraft.MAX_ATTACHMENTS - attachments.items.size,
+                                session.id) { handlePickerResult(it) }
+                        }.testTag("conversation-attachment-files"),
+                    )
+                    ListItem(
                         headlineContent = { Text("Gallery") },
                         leadingContent = {
                             Icon(Icons.Filled.PhotoLibrary, contentDescription = null)
@@ -1686,7 +1704,7 @@ internal fun RemoteConversationContent(
                             showImageSources = false
                             picker.launch(
                                 TerminalImageSource.Gallery,
-                                TerminalAttachmentDraft.MAX_IMAGES - attachments.items.size,
+                                TerminalAttachmentDraft.MAX_ATTACHMENTS - attachments.items.size,
                                 session.id,
                             ) { handlePickerResult(it) }
                         },
@@ -2156,7 +2174,7 @@ private fun ConversationTurn(message: RemotePreviewMessage) {
                     }
                     content.imagePaths.forEach { path ->
                         ConversationActivityRow(
-                            label = "Image attachment",
+                            label = "Attachment",
                             summary = path.substringAfterLast('/').ifBlank { path },
                             detail = path,
                             foreground = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -2352,7 +2370,7 @@ internal fun splitConversationAttachments(text: String): ConversationAttachmentC
     val paths = mutableListOf<String>()
     var index = 0
     while (index < lines.size) {
-        if (lines[index].trim() != "Attached images:") {
+        if (lines[index].trim() !in setOf("Attached images:", "Attached files:")) {
             body += lines[index]
             index += 1
             continue

@@ -1340,6 +1340,8 @@ struct UploadBeginPayload {
     submission_bytes: u64,
     length: u64,
     media_type: String,
+    #[serde(default)]
+    file_name: Option<String>,
     #[serde(with = "serde_bytes")]
     sha256: Vec<u8>,
 }
@@ -3393,7 +3395,10 @@ impl RemoteServices {
             "terminal.upload.begin" => {
                 let body: UploadBeginPayload = decode_payload(request)?;
                 bounded(&body.submission_id, MAX_IDENTIFIER_BYTES)?;
-                if body.media_type != "image/jpeg" {
+                if !matches!(
+                    (body.media_type.as_str(), body.file_name.as_ref()),
+                    ("image/jpeg", None) | ("application/octet-stream", Some(_))
+                ) {
                     return Err("terminal.upload_invalid_image");
                 }
                 let sha256: [u8; 32] = body
@@ -3429,6 +3434,7 @@ impl RemoteServices {
                             submission_bytes: body.submission_bytes,
                             length: body.length,
                             sha256,
+                            file_name: body.file_name,
                         },
                     )
                     .map_err(upload_error_code)?;

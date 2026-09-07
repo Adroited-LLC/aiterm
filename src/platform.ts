@@ -7,9 +7,12 @@ export function setWorkspace(value: WslWorkspace) { workspace = value; }
 export function getWorkspace() { return workspace; }
 export function linuxPath(path: string) {
   if (!windowsWsl) return path;
-  const unc = workspace && `\\\\wsl.localhost\\${workspace.distribution}\\`;
-  if (unc && path.toLowerCase().startsWith(unc.toLowerCase())) return "/" + path.slice(unc.length).split("\\").join("/");
+  for (const host of ["wsl.localhost", "wsl$"]) {
+    const unc = workspace && `\\\\${host}\\${workspace.distribution}\\`;
+    if (unc && path.toLowerCase().startsWith(unc.toLowerCase())) return "/" + path.slice(unc.length).split("\\").join("/");
+  }
   if (/^[a-z]:[\\/]/i.test(path)) return `/mnt/${path[0].toLowerCase()}/${path.slice(3).split("\\").join("/")}`;
+  if (path.startsWith("\\\\")) throw new Error("Choose a file on this PC or in the active Linux workspace.");
   return path;
 }
 export function convertFileSrc(path: string, protocol?: string) {

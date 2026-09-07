@@ -19,12 +19,13 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.util.UUID
 
-enum class TerminalImageSource { Camera, Gallery }
+enum class TerminalImageSource { Camera, Gallery, Files }
 
 sealed interface TerminalImagePickerResult {
     data class Selected(
         val uris: List<Uri>,
         val ownedCaptureFiles: Set<File> = emptySet(),
+        val files: Boolean = false,
     ) : TerminalImagePickerResult
 
     data class Failed(val message: String) : TerminalImagePickerResult
@@ -73,7 +74,7 @@ internal fun rememberTerminalImagePicker(
             else TerminalImagePickerResult.Selected(listOf(uri)),
         )
     }
-    val galleryLaunchers = (2..TerminalAttachmentDraft.MAX_IMAGES).map { maximum ->
+    val galleryLaunchers = (2..TerminalAttachmentDraft.MAX_ATTACHMENTS).map { maximum ->
         rememberLauncherForActivityResult(
             ActivityResultContracts.PickMultipleVisualMedia(maximum),
         ) { uris ->
@@ -82,6 +83,10 @@ internal fun rememberTerminalImagePicker(
                 else TerminalImagePickerResult.Selected(uris.distinct()),
             )
         }
+    }
+    val filesLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        publish(if (uris.isEmpty()) TerminalImagePickerResult.Cancelled
+            else TerminalImagePickerResult.Selected(uris.distinct(), files = true))
     }
     val cameraLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.TakePicture(),
@@ -107,16 +112,17 @@ internal fun rememberTerminalImagePicker(
         }
     }
 
-    return remember(context, singleGalleryLauncher, galleryLaunchers, cameraLauncher) {
+    return remember(context, singleGalleryLauncher, galleryLaunchers, cameraLauncher, filesLauncher) {
         TerminalImagePickerLauncher { source, requestedSlots, destinationTabId, callback ->
             if (pendingTabId != null) {
-                callback(TerminalImagePickerResult.Failed("Finish choosing the current image first."))
+                callback(TerminalImagePickerResult.Failed("Finish choosing the current attachment first."))
                 return@TerminalImagePickerLauncher
             }
-            val slots = requestedSlots.coerceIn(1, TerminalAttachmentDraft.MAX_IMAGES)
+            val slots = requestedSlots.coerceIn(1, TerminalAttachmentDraft.MAX_ATTACHMENTS)
             pendingTabId = destinationTabId
             try {
                 when (source) {
+                    TerminalImageSource.Files -> filesLauncher.launch(arrayOf("*/*"))
                     TerminalImageSource.Gallery -> {
                         val request = PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                         if (slots == 1) singleGalleryLauncher.launch(request)
@@ -141,7 +147,7 @@ internal fun rememberTerminalImagePicker(
             } catch (_: Exception) {
                 pendingCapturePath?.let(::File)?.delete()
                 pendingCapturePath = null
-                publish(TerminalImagePickerResult.Failed("Could not open the image source. Try again."))
+                publish(TerminalImagePickerResult.Failed("Could not open the attachment source. Try again."))
             }
         }
     }

@@ -49,6 +49,8 @@ pub struct UploadBegin {
     pub submission_bytes: u64,
     pub length: u64,
     pub sha256: [u8; 32],
+    /// None preserves the normalized JPEG protocol used by older clients.
+    pub file_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +173,7 @@ impl AttachmentStore {
         &self,
         tab_cwd: Option<&Path>,
         length: u64,
+        file_name: Option<&str>,
         now: SystemTime,
     ) -> Result<StagedFile, UploadError> {
         let directory = match tab_cwd {
@@ -184,8 +187,12 @@ impl AttachmentStore {
         };
 
         let basename = Uuid::new_v4().hyphenated().to_string();
-        let published_name = OsString::from(format!("{basename}.jpg"));
-        let part_name = OsString::from(format!("{basename}.jpg.part"));
+        let name = file_name.map_or_else(
+            || format!("{basename}.jpg"),
+            |name| format!("{basename}--{name}"),
+        );
+        let published_name = OsString::from(&name);
+        let part_name = OsString::from(format!("{name}.part"));
         let staged_directory = directory.duplicate()?;
         let file = directory
             .create_anonymous_file()
@@ -250,6 +257,7 @@ impl UploadSet {
         }) {
             if member.declared_length != request.length
                 || member.declared_digest != request.sha256
+                || member.file_name != request.file_name
                 || self.submission.as_ref().is_some_and(|group| {
                     group.declared_count != request.submission_count
                         || group.declared_bytes != request.submission_bytes
@@ -361,15 +369,19 @@ impl UploadSet {
             }
         };
 
-        let staged = match self.store.stage(tab_cwd, request.length, now) {
-            Ok(staged) => staged,
-            Err(error) => {
-                if self.submission.is_some() {
-                    self.abort_submission(&request.submission_id);
+        let staged =
+            match self
+                .store
+                .stage(tab_cwd, request.length, request.file_name.as_deref(), now)
+            {
+                Ok(staged) => staged,
+                Err(error) => {
+                    if self.submission.is_some() {
+                        self.abort_submission(&request.submission_id);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
         let upload_id = Uuid::new_v4().hyphenated().to_string();
         let active = ActiveUpload {
             tab_id: request.tab_id.clone(),
@@ -377,6 +389,7 @@ impl UploadSet {
             submission_id: request.submission_id.clone(),
             declared_length: request.length,
             declared_digest: request.sha256,
+            file_name: request.file_name.clone(),
             next_chunk: 0,
             written: 0,
             hasher: Sha256::new(),
@@ -400,6 +413,7 @@ impl UploadSet {
                 member_index: request.member_index,
                 declared_length: request.length,
                 declared_digest: request.sha256,
+                file_name: request.file_name.clone(),
                 published_path: None,
             },
         );
@@ -650,6 +664,7 @@ struct ActiveUpload {
     submission_id: String,
     declared_length: u64,
     declared_digest: [u8; 32],
+    file_name: Option<String>,
     next_chunk: u32,
     written: u64,
     hasher: Sha256,
@@ -663,6 +678,7 @@ struct UploadMember {
     member_index: u8,
     declared_length: u64,
     declared_digest: [u8; 32],
+    file_name: Option<String>,
     published_path: Option<PathBuf>,
 }
 
@@ -812,7 +828,29 @@ impl SubmissionState {
     }
 }
 
+/// A display basename, never a client-selected path. Also safe on Windows filesystems.
+fn valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 180
+        && name != "."
+        && name != ".."
+        && !name.ends_with(['.', ' '])
+        && !name
+            .chars()
+            .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c))
+}
+
 fn validate_begin(request: &UploadBegin) -> Result<(), UploadError> {
+    if request
+        .file_name
+        .as_deref()
+        .is_some_and(|name| !valid_file_name(name))
+    {
+        return Err(UploadError::new(
+            UploadErrorKind::InvalidSubmission,
+            "attachment filename is invalid",
+        ));
+    }
     if request.submission_id.is_empty() || request.submission_id.len() > 128 {
         return Err(UploadError::new(
             UploadErrorKind::InvalidSubmission,
@@ -940,7 +978,9 @@ fn finish_upload_with_hooks_cancellable(
         ));
     }
 
-    validate_strict_jpeg(&contents)?;
+    if upload.file_name.is_none() {
+        validate_strict_jpeg(&contents)?;
+    }
     ensure_not_cancelled(cancelled)?;
     let publication = upload.staged.publication_snapshot(&contents)?;
     let publication_contents = read_exact_file(&publication, upload.declared_length)?;
@@ -951,7 +991,9 @@ fn finish_upload_with_hooks_cancellable(
             "anonymous publication inode does not match the declared attachment",
         ));
     }
-    validate_strict_jpeg(&publication_contents)?;
+    if upload.file_name.is_none() {
+        validate_strict_jpeg(&publication_contents)?;
+    }
     ensure_not_cancelled(cancelled)?;
 
     let manifest = upload.staged.manifest.clone();
@@ -2285,7 +2327,17 @@ fn validate_manifest(
             ManifestState::Partial => path == part_path || path == published_path,
             ManifestState::Complete => path == published_path,
         };
-        if !path_is_valid {
+        let file_path_is_valid = path.parent() == Some(root.as_path())
+            && path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .and_then(|name| name.strip_prefix(&format!("{}--", record.id)))
+                .is_some_and(|name| {
+                    valid_file_name(name)
+                        || (record.state == ManifestState::Partial
+                            && name.strip_suffix(".part").is_some_and(valid_file_name))
+                });
+        if !path_is_valid && !file_path_is_valid {
             return Err(UploadError::new(
                 UploadErrorKind::UnsafePath,
                 "attachment manifest path escapes its confinement root",
@@ -3551,6 +3603,7 @@ mod tests {
             submission_bytes: jpeg.len() as u64,
             length: jpeg.len() as u64,
             sha256: Sha256::digest(&jpeg).into(),
+            file_name: None,
         };
         let began = uploads.begin_at(Some(&cwd), request, UNIX_EPOCH).unwrap();
         uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
@@ -3656,7 +3709,7 @@ mod tests {
             let cache = root.join("cache");
             fs::create_dir_all(&cwd).unwrap();
             let store = AttachmentStore::new_at(cache.clone(), UNIX_EPOCH).unwrap();
-            let mut staged = store.stage(Some(&cwd), 1, UNIX_EPOCH).unwrap();
+            let mut staged = store.stage(Some(&cwd), 1, None, UNIX_EPOCH).unwrap();
             let part_path = staged.directory.path.join(&staged.part_name);
 
             let error = store
@@ -3758,6 +3811,7 @@ mod tests {
             submission_bytes: jpeg.len() as u64,
             length: jpeg.len() as u64,
             sha256: Sha256::digest(&jpeg).into(),
+            file_name: None,
         };
         let began = uploads.begin_at(Some(&cwd), request, UNIX_EPOCH).unwrap();
         uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
@@ -3803,6 +3857,7 @@ mod tests {
             submission_bytes: jpeg.len() as u64,
             length: jpeg.len() as u64,
             sha256: Sha256::digest(&jpeg).into(),
+            file_name: None,
         };
         let began = uploads.begin_at(Some(&cwd), request, UNIX_EPOCH).unwrap();
         uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
@@ -3922,7 +3977,10 @@ mod tests {
         let lock = cache.join("remote-attachments/.attachments.lock");
         let holder = Command::new(&executable)
             .arg("--exact")
-            .arg(format!("{}::manifest_lock_boundary_holder_helper", module_path!().split_once("::").unwrap().1))
+            .arg(format!(
+                "{}::manifest_lock_boundary_holder_helper",
+                module_path!().split_once("::").unwrap().1
+            ))
             .arg("--ignored")
             .env("AITERM_UPLOAD_UNIT_LOCK_PATH", &lock)
             .env("AITERM_UPLOAD_UNIT_LOCK_READY", &ready)
@@ -3934,7 +3992,10 @@ mod tests {
         assert!(wait_for_path_for(&ready, Duration::from_secs(5)));
         let writer = Command::new(&executable)
             .arg("--exact")
-            .arg(format!("{}::manifest_lock_boundary_writer_helper", module_path!().split_once("::").unwrap().1))
+            .arg(format!(
+                "{}::manifest_lock_boundary_writer_helper",
+                module_path!().split_once("::").unwrap().1
+            ))
             .arg("--ignored")
             .env("AITERM_UPLOAD_UNIT_LOCK_CACHE", &cache)
             .env("AITERM_UPLOAD_UNIT_LOCK_BEFORE", &before)

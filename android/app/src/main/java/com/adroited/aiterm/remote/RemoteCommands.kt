@@ -309,6 +309,7 @@ object RemoteCommands {
         submissionBytes: Long,
         length: Long,
         sha256: ByteArray,
+        fileName: String? = null,
     ): ByteArray {
         requireIdentifier(tabId)
         requireIdentifier(attachmentId)
@@ -331,6 +332,8 @@ object RemoteCommands {
                 submissionBytes = submissionBytes,
                 length = length,
                 sha256 = sha256,
+                mediaType = if (fileName == null) "image/jpeg" else "application/octet-stream",
+                fileName = fileName,
             ),
         )
     }
@@ -677,6 +680,8 @@ object RemoteCommands {
         @SerialName("submission_bytes") val submissionBytes: Long,
         val length: Long,
         @SerialName("media_type") val mediaType: String = "image/jpeg",
+        @kotlinx.serialization.EncodeDefault(kotlinx.serialization.EncodeDefault.Mode.NEVER)
+        @SerialName("file_name") val fileName: String? = null,
         @ByteString val sha256: ByteArray,
     )
     @Serializable private data class UploadChunkPayload(

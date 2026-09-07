@@ -34,7 +34,7 @@ class TerminalAttachmentDraftTest {
         val duplicate = initial.add(image("duplicate", 30))
 
         assertFalse(duplicate.accepted)
-        assertEquals("This image is already attached.", duplicate.draft.message)
+        assertEquals("This attachment is already attached.", duplicate.draft.message)
         assertEquals(listOf("duplicate"), duplicate.draft.items.map { it.image.id })
     }
 
@@ -49,7 +49,7 @@ class TerminalAttachmentDraftTest {
         )
 
         assertFalse(duplicate.accepted)
-        assertEquals("This image is already attached.", duplicate.draft.message)
+        assertEquals("This attachment is already attached.", duplicate.draft.message)
         assertEquals(listOf("first-id"), duplicate.draft.items.map { it.image.id })
     }
 
@@ -62,7 +62,7 @@ class TerminalAttachmentDraftTest {
         val fifth = four.add(image("image-5", 1))
 
         assertFalse(fifth.accepted)
-        assertEquals("You can attach up to 4 images.", fifth.draft.message)
+        assertEquals("You can attach up to 4 attachments.", fifth.draft.message)
         assertEquals(4, fifth.draft.items.size)
     }
 
@@ -92,11 +92,11 @@ class TerminalAttachmentDraftTest {
     @Test
     fun oversizedImageIsRejectedWithAnExplicitMessage() {
         val rejected = TerminalAttachmentDraft().add(
-            image("oversized", TerminalAttachmentDraft.MAX_IMAGE_BYTES + 1),
+            image("oversized", TerminalAttachmentDraft.MAX_ATTACHMENT_BYTES + 1),
         )
 
         assertFalse(rejected.accepted)
-        assertEquals("Each image must be 12 MiB or smaller.", rejected.draft.message)
+        assertEquals("Each attachment must be 12 MiB or smaller.", rejected.draft.message)
         assertTrue(rejected.draft.items.isEmpty())
     }
 

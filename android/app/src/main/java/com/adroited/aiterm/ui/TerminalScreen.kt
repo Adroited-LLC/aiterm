@@ -154,7 +154,7 @@ internal fun TerminalScreenContent(
     imageNormalizer: TerminalImageNormalization? = null,
     onUploadImages: suspend (
         String,
-        List<TerminalAttachmentImage>,
+        List<TerminalAttachment>,
         (RemoteUploadProgress) -> Unit,
     ) -> Result<List<String>> = { _, _, _ ->
         Result.failure(IllegalStateException("Image upload is unavailable."))
@@ -226,12 +226,13 @@ internal fun TerminalScreenContent(
                 }
                 try {
                     val currentCount = activeDraftStore.draftFor(tabId).attachments.items.size
-                    val remaining = (TerminalAttachmentDraft.MAX_IMAGES - currentCount).coerceAtLeast(0)
+                    val remaining = (TerminalAttachmentDraft.MAX_ATTACHMENTS - currentCount).coerceAtLeast(0)
                     val distinctUris = result.uris.distinct()
                     var selectionMessage: String? = null
                     for (uri in distinctUris.take(remaining)) {
-                        val normalizedImage = normalizer.normalize(uri).getOrElse { error ->
-                            selectionMessage = terminalImageErrorMessage(error)
+                        val normalizedImage = (if (result.files) prepareTerminalFile(context, uri)
+                            else normalizer.normalize(uri).map(TerminalAttachment::from)).getOrElse { error ->
+                            selectionMessage = if (result.files) error.message else terminalImageErrorMessage(error)
                             continue
                         }
                         val transition = activeDraftStore.transitionAttachments(tabId) {
@@ -244,9 +245,9 @@ internal fun TerminalScreenContent(
                     }
                     val finalMessage = when {
                         result.uris.size != distinctUris.size ->
-                            "This image is already attached."
+                            "This attachment is already attached."
                         distinctUris.size > remaining ->
-                            "You can attach up to 4 images."
+                            "You can attach up to 4 attachments."
                         else -> selectionMessage
                     }
                     finalMessage?.let { setAttachmentMessage(tabId, it) }
@@ -323,7 +324,7 @@ internal fun TerminalScreenContent(
                 val submissionScreen = latestScreen
                 if (submissionScreen?.tabId != tabId) {
                     activeDraftStore.transitionAttachments(tabId) {
-                        it.failSubmission("Terminal tab changed while images were uploading. Try again.")
+                        it.failSubmission("Terminal tab changed while attachments were uploading. Try again.")
                     }
                     uploadBegan = false
                     return@launch
@@ -332,6 +333,7 @@ internal fun TerminalScreenContent(
                     text = latest.composer.value.text,
                     paths = paths,
                     bracketedPaste = submissionScreen.modes.bracketedPaste,
+                    hasFiles = latest.attachments.items.any { it.image.fileName != null },
                 )
                 val accepted = onInputBatch?.invoke(tabId, outbound) ?: run {
                     outbound.forEach(onInput)
@@ -462,7 +464,7 @@ internal fun TerminalScreenContent(
                                 onAddImage = { showImageSources = true },
                                 addImageEnabled = state.focus == FocusOwner.Self &&
                                     !attachments.preparing && !attachments.submitting &&
-                                    attachments.items.size < TerminalAttachmentDraft.MAX_IMAGES,
+                                    attachments.items.size < TerminalAttachmentDraft.MAX_ATTACHMENTS,
                                 submitting = attachments.submitting,
                                 focusRequester = inputFocus,
                                 enabled = state.focus == FocusOwner.Self && !attachments.submitting,
@@ -483,44 +485,28 @@ internal fun TerminalScreenContent(
     if (showImageSources) {
         AlertDialog(
             onDismissRequest = { showImageSources = false },
-            title = { Text("Attach image") },
-            text = { Text("Choose a source") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showImageSources = false
-                        val tabId = screen?.tabId ?: return@TextButton
-                        val remaining = TerminalAttachmentDraft.MAX_IMAGES -
-                            activeDraftStore.draftFor(tabId).attachments.items.size
-                        if (remaining <= 0) {
-                            setAttachmentMessage(tabId, "You can attach up to 4 images.")
-                        } else {
-                            picker.launch(TerminalImageSource.Gallery, remaining, tabId) {
-                                handlePickerResult(tabId, it)
-                            }
-                        }
-                    },
-                    modifier = Modifier.testTag("terminal-image-source-gallery"),
-                ) { Text("Gallery") }
+            title = { Text("Attach files or photos") },
+            text = {
+                Column {
+                    TerminalImageSource.entries.forEach { source ->
+                        TextButton(
+                            onClick = {
+                                showImageSources = false
+                                val tabId = screen?.tabId ?: return@TextButton
+                                val remaining = TerminalAttachmentDraft.MAX_ATTACHMENTS -
+                                    activeDraftStore.draftFor(tabId).attachments.items.size
+                                if (remaining <= 0) {
+                                    setAttachmentMessage(tabId, "You can attach up to 4 attachments.")
+                                } else {
+                                    picker.launch(source, remaining, tabId) { handlePickerResult(tabId, it) }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("terminal-image-source-${source.name.lowercase()}"),
+                        ) { Text(source.name) }
+                    }
+                }
             },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showImageSources = false
-                        val tabId = screen?.tabId ?: return@TextButton
-                        val remaining = TerminalAttachmentDraft.MAX_IMAGES -
-                            activeDraftStore.draftFor(tabId).attachments.items.size
-                        if (remaining <= 0) {
-                            setAttachmentMessage(tabId, "You can attach up to 4 images.")
-                        } else {
-                            picker.launch(TerminalImageSource.Camera, remaining, tabId) {
-                                handlePickerResult(tabId, it)
-                            }
-                        }
-                    },
-                    modifier = Modifier.testTag("terminal-image-source-camera"),
-                ) { Text("Camera") }
-            },
+            confirmButton = { },
         )
     }
 
@@ -535,9 +521,9 @@ internal fun TerminalScreenContent(
             text = {
                 Text(
                     if (draftWorkInProgress) {
-                        "Wait for image preparation or upload to finish before leaving."
+                        "Wait for attachment preparation or upload to finish before leaving."
                     } else {
-                        "Draft text and attached images are still on this phone."
+                        "Draft text and attachments are still on this phone."
                     },
                 )
             },
@@ -804,7 +790,7 @@ private fun TerminalInputBar(
         ) {
             Icon(
                 Icons.Filled.Add,
-                contentDescription = "Attach an image",
+                contentDescription = "Attach files or photos",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -988,10 +974,12 @@ private fun terminalUploadErrorMessage(error: Throwable): String = when {
     error is RemoteUploadException && error.code in setOf(
         "remote.unsupported",
         "protocol.unknown_request",
+        "protocol.invalid_payload",
+        "terminal.upload_invalid_image",
     ) ->
-        "Update AITerm on the desktop to attach images."
+        "Update AITerm on the desktop to attach files and photos."
     !error.message.isNullOrBlank() -> error.message!!
-    else -> "The image upload failed. Check the connection and try again."
+    else -> "The attachment upload failed. Check the connection and try again."
 }
 
 private fun ConnectionState.label(): String = when (this) {

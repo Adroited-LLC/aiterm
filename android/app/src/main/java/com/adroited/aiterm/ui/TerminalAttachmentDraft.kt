@@ -13,18 +13,19 @@ enum class TerminalAttachmentUploadState {
 }
 
 /**
- * Immutable normalized-image metadata kept by a terminal draft.
+ * Immutable attachment metadata kept by a terminal draft.
  *
  * SHA-256 data never leaves this model by reference. Callers that need it for a remote upload
  * receive a fresh byte array, so a UI state transition cannot accidentally alter validation data.
  */
-class TerminalAttachmentImage private constructor(
+class TerminalAttachment private constructor(
     val id: String,
     val file: File,
     val width: Int,
     val height: Int,
     val length: Long,
     private val digest: ByteArray,
+    val fileName: String? = null,
 ) {
     val sha256: ByteArray
         get() = digest.copyOf()
@@ -34,14 +35,16 @@ class TerminalAttachmentImage private constructor(
         file = file,
         length = length,
         sha256 = digest.copyOf(),
+        fileName = fileName,
     )
 
-    override fun equals(other: Any?): Boolean = other is TerminalAttachmentImage &&
+    override fun equals(other: Any?): Boolean = other is TerminalAttachment &&
         id == other.id &&
         file == other.file &&
         width == other.width &&
         height == other.height &&
         length == other.length &&
+        fileName == other.fileName &&
         digest.contentEquals(other.digest)
 
     override fun hashCode(): Int {
@@ -50,13 +53,18 @@ class TerminalAttachmentImage private constructor(
         result = 31 * result + width
         result = 31 * result + height
         result = 31 * result + length.hashCode()
+        result = 31 * result + (fileName?.hashCode() ?: 0)
         result = 31 * result + digest.contentHashCode()
         return result
     }
 
     companion object {
-        fun from(normalized: NormalizedTerminalImage): TerminalAttachmentImage =
-            TerminalAttachmentImage(
+        internal fun from(prepared: PreparedTerminalFile): TerminalAttachment = TerminalAttachment(
+            prepared.id, prepared.file, 0, 0, prepared.length, prepared.sha256.copyOf(), prepared.name,
+        )
+
+        fun from(normalized: NormalizedTerminalImage): TerminalAttachment =
+            TerminalAttachment(
                 id = normalized.id,
                 file = normalized.file,
                 width = normalized.width,
@@ -68,7 +76,7 @@ class TerminalAttachmentImage private constructor(
 }
 
 data class TerminalAttachmentItem(
-    val image: TerminalAttachmentImage,
+    val image: TerminalAttachment,
     val sentBytes: Long = 0,
     val state: TerminalAttachmentUploadState = TerminalAttachmentUploadState.Pending,
     val message: String? = null,
@@ -90,26 +98,27 @@ data class TerminalAttachmentDraft(
     val totalBytes: Long
         get() = items.sumOf { it.image.length }
 
-    fun add(normalized: NormalizedTerminalImage): TerminalAttachmentDraftUpdate {
-        if (submitting) return rejected("Images are uploading.")
-        val image = TerminalAttachmentImage.from(normalized)
+    fun add(normalized: NormalizedTerminalImage) = add(TerminalAttachment.from(normalized))
+
+    fun add(image: TerminalAttachment): TerminalAttachmentDraftUpdate {
+        if (submitting) return rejected("Attachments are uploading.")
         if (image.id.isBlank() || image.sha256.size != SHA256_BYTES) {
-            return rejected("The selected image is invalid.")
+            return rejected("The selected attachment is invalid.")
         }
-        if (image.length !in 1..MAX_IMAGE_BYTES) return rejected("Each image must be 12 MiB or smaller.")
+        if (image.length !in 1..MAX_ATTACHMENT_BYTES) return rejected("Each attachment must be 12 MiB or smaller.")
         if (items.any { it.image.id == image.id || it.image.sha256.contentEquals(image.sha256) }) {
-            return rejected("This image is already attached.")
+            return rejected("This attachment is already attached.")
         }
-        if (items.size >= MAX_IMAGES) return rejected("You can attach up to 4 images.")
+        if (items.size >= MAX_ATTACHMENTS) return rejected("You can attach up to 4 attachments.")
         if (image.length > MAX_TOTAL_BYTES - totalBytes) {
-            return rejected("Selected images exceed the 48 MiB limit.")
+            return rejected("Selected attachments exceed the 48 MiB limit.")
         }
         return TerminalAttachmentDraftUpdate(copy(items = items + TerminalAttachmentItem(image), message = null))
     }
 
     fun remove(imageId: String): TerminalAttachmentDraftUpdate {
-        if (preparing) return rejected("Wait for the selected image to finish preparing.")
-        if (submitting) return rejected("Images are uploading.")
+        if (preparing) return rejected("Wait for the selected attachment to finish preparing.")
+        if (submitting) return rejected("Attachments are uploading.")
         val item = items.firstOrNull { it.image.id == imageId } ?: return TerminalAttachmentDraftUpdate(this)
         return TerminalAttachmentDraftUpdate(
             draft = copy(items = items.filterNot { it.image.id == imageId }, message = null),
@@ -118,9 +127,9 @@ data class TerminalAttachmentDraft(
     }
 
     fun beginSubmission(): TerminalAttachmentDraftUpdate {
-        if (preparing) return rejected("Wait for the selected image to finish preparing.")
-        if (submitting) return rejected("Images are already uploading.")
-        if (items.isEmpty()) return rejected("Choose an image before uploading.")
+        if (preparing) return rejected("Wait for the selected attachment to finish preparing.")
+        if (submitting) return rejected("Attachments are already uploading.")
+        if (items.isEmpty()) return rejected("Choose an attachment before uploading.")
         return TerminalAttachmentDraftUpdate(
             copy(
                 items = items.map { it.copy(sentBytes = 0, state = TerminalAttachmentUploadState.Uploading, message = null) },
@@ -182,9 +191,9 @@ data class TerminalAttachmentDraft(
     )
 
     fun beginPreparation(): TerminalAttachmentDraftUpdate {
-        if (preparing) return rejected("An image is already being prepared.")
-        if (submitting) return rejected("Images are uploading.")
-        if (items.size >= MAX_IMAGES) return rejected("You can attach up to 4 images.")
+        if (preparing) return rejected("An attachment is already being prepared.")
+        if (submitting) return rejected("Attachments are uploading.")
+        if (items.size >= MAX_ATTACHMENTS) return rejected("You can attach up to 4 attachments.")
         return TerminalAttachmentDraftUpdate(copy(preparing = true, message = null))
     }
 
@@ -194,14 +203,14 @@ data class TerminalAttachmentDraft(
 
     /** Clears state only after caller has locally accepted the complete terminal submission. */
     fun completeSubmission(): TerminalAttachmentDraftUpdate {
-        if (!submitting) return rejected("No image upload is in progress.")
+        if (!submitting) return rejected("No attachment upload is in progress.")
         return TerminalAttachmentDraftUpdate(draft = TerminalAttachmentDraft(), removed = items)
     }
 
     /** Lets the UI discard a non-uploading draft and delete the returned private files. */
     fun discard(): TerminalAttachmentDraftUpdate {
-        if (preparing) return rejected("Wait for the selected image to finish preparing.")
-        if (submitting) return rejected("Images are uploading.")
+        if (preparing) return rejected("Wait for the selected attachment to finish preparing.")
+        if (submitting) return rejected("Attachments are uploading.")
         return TerminalAttachmentDraftUpdate(draft = TerminalAttachmentDraft(), removed = items)
     }
 
@@ -209,8 +218,8 @@ data class TerminalAttachmentDraft(
         TerminalAttachmentDraftUpdate(copy(message = reason), accepted = false)
 
     companion object {
-        const val MAX_IMAGES = 4
-        const val MAX_IMAGE_BYTES = 12L * 1024L * 1024L
+        const val MAX_ATTACHMENTS = 4
+        const val MAX_ATTACHMENT_BYTES = 12L * 1024L * 1024L
         const val MAX_TOTAL_BYTES = 48L * 1024L * 1024L
         private const val SHA256_BYTES = 32
     }

@@ -140,7 +140,7 @@ class RemoteTerminalViewModel(
     /** Upload counterpart for the immutable images retained by [terminalDrafts]. */
     internal suspend fun uploadDraftImages(
         expectedTabId: String,
-        images: List<TerminalAttachmentImage>,
+        images: List<TerminalAttachment>,
         onProgress: (RemoteUploadProgress) -> Unit = {},
     ): Result<List<String>> = client.uploadImages(
         expectedTabId,
@@ -247,7 +247,7 @@ class RemoteTerminalViewModel(
     suspend fun sendConversationPrompt(
         sessionId: String,
         text: String,
-        images: List<TerminalAttachmentImage> = emptyList(),
+        images: List<TerminalAttachment> = emptyList(),
         onProgress: (RemoteUploadProgress) -> Unit = {},
     ): Result<Unit> {
         val prompt = text.trim()
@@ -291,6 +291,7 @@ class RemoteTerminalViewModel(
                 text = prompt,
                 paths = paths,
                 bracketedPaste = latestScreen.modes.bracketedPaste,
+                hasFiles = images.any { it.fileName != null },
             )
             if (!client.submitInputs(activeScreen.tabId, outbound)) {
                 return Result.failure(IllegalStateException("The terminal did not accept the message."))

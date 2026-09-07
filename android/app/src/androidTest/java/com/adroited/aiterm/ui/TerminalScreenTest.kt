@@ -172,6 +172,40 @@ class TerminalScreenTest {
     }
 
     @Test
+    fun filesChoicePreservesDocumentNameAndBytesWithoutSendingOrNormalizing() {
+        val store = TerminalDraftStore()
+        val source = File(compose.activity.cacheDir, "terminal-image-captures/Wayland test log.txt")
+            .apply { parentFile?.mkdirs(); writeText("Wayland test log\nExact bytes") }
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            compose.activity, "${compose.activity.packageName}.terminal-images", source)
+        val picker = FakeTerminalImagePickerLauncher().apply {
+            galleryResult = TerminalImagePickerResult.Selected(listOf(uri), files = true)
+        }
+        try {
+            compose.setContent {
+                TerminalScreenContent(state = connectedState(), screen = oneCellScreen("tab-files"),
+                    draftStore = store, imagePickerLauncher = picker,
+                    imageNormalizer = TerminalImageNormalization { error("Documents must not be decoded as photos") },
+                    onInput = { error("Choosing files must not send input") })
+            }
+            compose.onNodeWithTag("terminal-add-image").performClick()
+            compose.onNodeWithTag("terminal-image-source-files").performClick()
+            compose.waitUntil(5_000) { store.draftFor("tab-files").attachments.items.size == 1 }
+            compose.onNodeWithText("Wayland test log.txt").assertIsDisplayed()
+            val attachment = store.draftFor("tab-files").attachments.items.single().image
+            assertEquals(source.readText(), attachment.file.readText())
+            compose.onNodeWithTag("terminal-image-remove-${attachment.id}").performClick()
+            compose.runOnIdle {
+                assertTrue(source.exists())
+                assertTrue(!attachment.file.exists())
+            }
+        } finally {
+            store.discardAll().forEach { it.image.file.delete() }
+            source.delete()
+        }
+    }
+
+    @Test
     fun imageChooserAddsAtMostFourGalleryImagesInSelectionOrderAndExplainsTheLimit() {
         val store = TerminalDraftStore()
         val picker = FakeTerminalImagePickerLauncher().apply {
@@ -191,6 +225,7 @@ class TerminalScreenTest {
 
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performClick()
         compose.onNodeWithTag("terminal-add-image").performClick()
+        compose.onNodeWithTag("terminal-image-source-files").assertIsDisplayed()
         compose.onNodeWithTag("terminal-image-source-camera").assertIsDisplayed()
         compose.onNodeWithTag("terminal-image-source-gallery").performClick()
 
@@ -198,7 +233,7 @@ class TerminalScreenTest {
             compose.onNodeWithTag("terminal-image-image-$index").assertIsDisplayed()
         }
         assertTrue(compose.onAllNodesWithTag("terminal-image-image-5").fetchSemanticsNodes().isEmpty())
-        compose.onNodeWithText("You can attach up to 4 images.").assertIsDisplayed()
+        compose.onNodeWithText("You can attach up to 4 attachments.").assertIsDisplayed()
         compose.runOnIdle {
             assertEquals(
                 listOf("image-1", "image-2", "image-3", "image-4"),
@@ -563,7 +598,7 @@ class TerminalScreenTest {
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("A text")
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).performImeAction()
         compose.waitForIdle()
-        compose.onNodeWithText("Update AITerm on the desktop to attach images.").assertIsDisplayed()
+        compose.onNodeWithText("Update AITerm on the desktop to attach files and photos.").assertIsDisplayed()
         compose.runOnIdle { selectedTab.value = "tab-b" }
         compose.onNodeWithTag("terminal-composer", useUnmergedTree = true).assertTextEquals("B text")
         compose.onNodeWithTag("terminal-add-image").performClick()

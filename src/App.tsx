@@ -3,6 +3,7 @@ import { TimeFormatContext, fullTime } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "./platformDialog";
+import { attachmentPaths } from "./fileAttachments";
 import { linuxPath } from "./platform";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
@@ -32,7 +33,7 @@ import { useLibrarian } from "./librarian";
 import BringIn from "./components/BringIn";
 import { engineName, useRelay } from "./relay";
 import {
-  FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
+  Paperclip, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -1245,30 +1246,52 @@ export default function App() {
   // WebKitGTK DMABUF renderer, now disabled at the Rust entry point. No more
   // window growing/shrinking on launch.)
 
-  // Dropping files onto the window pastes their quoted paths into the
-  // active terminal (like any terminal emulator) instead of letting the
-  // webview navigate to the file.
+  // Native drag/drop works in WebKitGTK and WebView2. Pin picker results to
+  // their originating tab so switching sessions cannot misdirect attachments.
   const previewRef = useRef<Session | null>(null);
-  useEffect(() => {
-    previewRef.current = previewSession;
-  }, [previewSession]);
-  useEffect(() => {
-    const un = getCurrentWebview().onDragDropEvent((e) => {
-      if (e.payload.type !== "drop" || e.payload.paths.length === 0) return;
-      const key = activeTabRef.current;
-      if (key === null || previewRef.current) return;
-      const h = handles.current.get(key);
-      // One paste per path, like a real terminal drop — pasted (not typed)
-      // so claude recognizes image/file paths and shows [Image #N].
-      e.payload.paths.forEach((p, i) => {
-        if (i > 0) h?.write(" ");
-        h?.paste(shellEscape(linuxPath(p)));
-      });
-    });
-    return () => {
-      un.then((f) => f());
-    };
+  const [fileDragActive, setFileDragActive] = useState(false);
+  useEffect(() => { previewRef.current = previewSession; }, [previewSession]);
+  const attachFiles = useCallback(async (key: TabId, paths: string[]) => {
+    if (activeTabRef.current !== key || previewRef.current) {
+      setNotice("The session changed. Select your files again in the intended terminal.");
+      return;
+    }
+    const handle = handles.current.get(key);
+    if (!handle) { setNotice("Open a terminal before attaching files."); return; }
+    try {
+      await handle.attachPaths(attachmentPaths(paths.map(linuxPath)));
+      setActiveFileTab(null);
+      handle.focus();
+    } catch (error) {
+      setNotice(`Could not attach files: ${String(error)}`);
+    }
   }, []);
+  const chooseFiles = async () => {
+    const key = activeTabRef.current;
+    if (key === null || previewRef.current) return;
+    try {
+      const selected = await openDialog({ title: "Attach files", multiple: true, directory: false });
+      if (selected) await attachFiles(key, Array.isArray(selected) ? selected : [selected]);
+    } catch (error) {
+      setNotice(`Could not open the file picker: ${String(error)}`);
+    }
+  };
+  useEffect(() => {
+    const un = getCurrentWebview().onDragDropEvent((event) => {
+      const payload = event.payload;
+      const key = activeTabRef.current;
+      if (payload.type === "enter" || payload.type === "over") {
+        setFileDragActive(key !== null && !previewRef.current);
+      } else {
+        setFileDragActive(false);
+        if (payload.type === "drop" && payload.paths.length > 0) {
+          if (key === null || previewRef.current) setNotice("Open a terminal before attaching files.");
+          else void attachFiles(key, payload.paths);
+        }
+      }
+    });
+    return () => { void un.then(unlisten => unlisten()); };
+  }, [attachFiles]);
 
   // Watch the active project: git changes refresh the repo panel, tree
   // changes refresh the explorer (git status also follows tree edits).
@@ -2551,6 +2574,13 @@ export default function App() {
             title="Toggle input composer"
             onClick={() => setShowComposer(!showComposer)}
           ><Icon of={Keyboard} /></button>
+          <button
+            className="icon-btn"
+            title="Attach files (or drag files into the terminal)"
+            aria-label="Attach files"
+            disabled={activeTab === null || !!previewSession}
+            onClick={() => void chooseFiles()}
+          ><Icon of={Paperclip} /></button>
           <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
         </div>
         <div className="topbar-spacer" />
@@ -2641,6 +2671,11 @@ export default function App() {
         )}
 
         <div className="panel terminal-panel">
+          {fileDragActive && <div className="file-drop-overlay" role="status">
+            <Icon of={Paperclip} />
+            <strong>Drop files to attach</strong>
+            <span>Add them to the current terminal prompt</span>
+          </div>}
           {(tabs.length > 0 || previewSession || fileTabs.some(showsFile)) && (
             <div className="center-tabs">
               {/* Leftmost, always: the way back to the start view — or the
@@ -3159,10 +3194,4 @@ export default function App() {
 
 function basename(p: string): string {
   return p.split("/").filter(Boolean).pop() ?? p;
-}
-
-// Backslash-escape (the way terminals escape dropped paths) — claude's
-// pasted-path detection understands this form, unlike single quotes.
-function shellEscape(p: string): string {
-  return p.replace(/[^A-Za-z0-9_\-./~+:@%=]/g, (c) => "\\" + c);
 }

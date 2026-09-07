@@ -119,6 +119,7 @@ impl UploadFixture {
             submission_bytes,
             length: length as u64,
             sha256: digest,
+            file_name: None,
         }
     }
 
@@ -579,6 +580,7 @@ fn concurrent_upload_sets_preserve_every_manifest_record() {
                     submission_bytes: jpeg.len() as u64,
                     length: jpeg.len() as u64,
                     sha256: digest(&jpeg),
+                    file_name: None,
                 };
                 let began = uploads.begin(Some(&cwd), request).unwrap();
                 uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
@@ -755,6 +757,7 @@ fn manifest_subprocess_writer_helper() {
         submission_bytes: jpeg.len() as u64,
         length: jpeg.len() as u64,
         sha256: digest(&jpeg),
+        file_name: None,
     };
     let began = uploads.begin(Some(&cwd), request).unwrap();
     uploads.chunk(&began.upload_id, 0, &jpeg).unwrap();
@@ -1650,6 +1653,7 @@ fn concurrent_git_exclude_updates_preserve_every_writer() {
                     submission_bytes: jpeg.len() as u64,
                     length: jpeg.len() as u64,
                     sha256: digest(&jpeg),
+                    file_name: None,
                 };
                 barrier.wait();
                 let began = uploads.begin(Some(&cwd), request).unwrap();
@@ -2005,4 +2009,105 @@ fn staged_and_published_files_are_owner_only() {
             & 0o777,
         0o700
     );
+}
+
+#[test]
+fn document_upload_preserves_bytes_and_name_across_resume_and_restart() {
+    let mut fixture = UploadFixture::new("document");
+    let bytes = b"%PDF-1.7\nWayland log\n\0\xff\r\n%%EOF";
+    let mut request = fixture.begin(bytes.len(), digest(bytes));
+    request.file_name = Some("Wayland log résumé.pdf".into());
+    let began = fixture
+        .uploads
+        .begin(Some(&fixture.cwd), request.clone())
+        .unwrap();
+    fixture
+        .uploads
+        .chunk(&began.upload_id, 0, &bytes[..10])
+        .unwrap();
+    let resumed = fixture
+        .uploads
+        .begin(Some(&fixture.cwd), request.clone())
+        .unwrap();
+    assert_eq!(resumed.next_chunk, 1);
+    let mut changed = request.clone();
+    changed.file_name = Some("other.pdf".into());
+    assert_eq!(
+        fixture
+            .uploads
+            .begin(Some(&fixture.cwd), changed)
+            .unwrap_err()
+            .kind(),
+        UploadErrorKind::InvalidSubmission
+    );
+    fixture
+        .uploads
+        .chunk(&began.upload_id, 1, &bytes[10..])
+        .unwrap();
+    let path = fixture.uploads.finish(&began.upload_id).unwrap().path;
+    assert!(path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .ends_with("--Wayland log résumé.pdf"));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        fixture
+            .uploads
+            .begin(Some(&fixture.cwd), request)
+            .unwrap()
+            .published_path,
+        Some(path.clone())
+    );
+    let restarted = AttachmentStore::new(fixture.cache.clone()).unwrap();
+    restarted.maintain(SystemTime::now()).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    restarted
+        .maintain(SystemTime::now() + Duration::from_secs(25 * 60 * 60))
+        .unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn document_names_cannot_escape_storage_or_inject_prompt_lines() {
+    for name in [
+        "../secret",
+        "..\\secret",
+        "/tmp/x",
+        "C:evil",
+        "log\ncommand",
+        "log\0",
+        "",
+        "..",
+        "log.",
+        "log ",
+    ] {
+        let mut fixture = UploadFixture::new("bad-document-name");
+        let mut request = fixture.begin(3, digest(b"log"));
+        request.file_name = Some(name.into());
+        assert_eq!(
+            fixture
+                .uploads
+                .begin(Some(&fixture.cwd), request)
+                .unwrap_err()
+                .kind(),
+            UploadErrorKind::InvalidSubmission
+        );
+        assert!(fixture.part_files().is_empty());
+    }
+}
+
+#[test]
+fn document_bytes_still_require_the_declared_hash() {
+    let mut fixture = UploadFixture::new("document-hash");
+    let mut request = fixture.begin(3, digest(b"old"));
+    request.file_name = Some("log.txt".into());
+    let began = fixture.uploads.begin(Some(&fixture.cwd), request).unwrap();
+    fixture.uploads.chunk(&began.upload_id, 0, b"new").unwrap();
+    assert_eq!(
+        fixture.uploads.finish(&began.upload_id).unwrap_err().kind(),
+        UploadErrorKind::DigestMismatch
+    );
+    assert!(fixture.part_files().is_empty());
 }

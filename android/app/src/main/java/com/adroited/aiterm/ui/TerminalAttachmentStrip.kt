@@ -31,6 +31,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.style.TextOverflow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -79,7 +80,7 @@ private fun TerminalAttachmentTile(
     onRemove: () -> Unit,
 ) {
     val preview by produceState<Bitmap?>(null, item.image.file, item.image.length) {
-        value = withContext(Dispatchers.IO) { decodePreview(item.image.file.path) }
+        value = if (item.image.fileName == null) withContext(Dispatchers.IO) { decodePreview(item.image.file.path) } else null
     }
     // Compose can retain this bitmap in a recorded graphics layer for a frame
     // after the tile leaves composition. Recycling it here races that draw and
@@ -91,7 +92,7 @@ private fun TerminalAttachmentTile(
         TerminalAttachmentUploadState.Pending -> Color(0xFF315269)
     }
     Box(
-        Modifier.size(72.dp)
+        Modifier.size(width = if (item.image.fileName == null) 72.dp else 180.dp, height = 72.dp)
             .border(1.dp, borderColor, MaterialTheme.shapes.small)
             .background(Color(0xFF07111B), MaterialTheme.shapes.small)
             .testTag("terminal-image-${item.image.id}"),
@@ -106,8 +107,10 @@ private fun TerminalAttachmentTile(
                     .clip(MaterialTheme.shapes.extraSmall),
             )
         } ?: Text(
-            "IMG",
-            modifier = Modifier.align(Alignment.Center),
+            item.image.fileName ?: "IMG",
+            modifier = Modifier.align(Alignment.Center).padding(start = 12.dp, end = 40.dp),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
             color = Color(0xFF75D8B4),
             style = MaterialTheme.typography.labelSmall,
         )
@@ -116,7 +119,7 @@ private fun TerminalAttachmentTile(
             enabled = removalEnabled,
             modifier = Modifier.align(Alignment.TopEnd)
                 .size(48.dp)
-                .semantics { contentDescription = "Remove attached image" }
+                .semantics { contentDescription = if (item.image.fileName == null) "Remove attached image" else "Remove attached file ${item.image.fileName}" }
                 .testTag("terminal-image-remove-${item.image.id}"),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
         ) {
