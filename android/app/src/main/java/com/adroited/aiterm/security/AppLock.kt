@@ -46,7 +46,14 @@ class AppLock(private val clock: () -> Long) {
     @Synchronized
     fun signChallengeWhileUnlocked(signer: () -> ByteArray): ByteArray? {
         if (mutableLocked.value) return null
-        return signer()
+        return try {
+            signer()
+        } catch (expired: DeviceAuthenticationRequiredException) {
+            // Keystore's authentication window can expire while the app
+            // stays foregrounded. Retrying the network cannot renew it.
+            lockNow()
+            throw expired
+        }
     }
 
     companion object {

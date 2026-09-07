@@ -5,6 +5,7 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
+import android.security.keystore.UserNotAuthenticatedException
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -19,8 +20,11 @@ interface DeviceKeys {
     fun signChallenge(nonce: ByteArray): ByteArray
 }
 
-class DeviceKeyException(message: String, cause: Throwable? = null) :
+open class DeviceKeyException(message: String, cause: Throwable? = null) :
     IllegalStateException(message, cause)
+
+class DeviceAuthenticationRequiredException(cause: Throwable? = null) :
+    DeviceKeyException("Unlock AITerm to reconnect to the desktop.", cause)
 
 /**
  * The private key is generated inside Android Keystore and is never exported.
@@ -52,6 +56,8 @@ class AndroidDeviceKeyStore(private val alias: String = DEFAULT_ALIAS) : DeviceK
                 update(nonce)
                 sign()
             }
+        } catch (error: UserNotAuthenticatedException) {
+            throw DeviceAuthenticationRequiredException(error)
         } catch (error: DeviceKeyException) {
             throw error
         } catch (error: Exception) {

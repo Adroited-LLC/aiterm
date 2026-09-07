@@ -22,6 +22,9 @@ const SERVER_CONFIG_FILE: &str = "relay-server.json";
 const MAX_STREAMS: usize = 128;
 const STREAM_QUEUE: usize = 32;
 const OUTGOING_QUEUE: usize = 256;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
+const RELAY_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -592,17 +595,31 @@ async fn connect_once(
             .map_err(|_| "connection timed out".to_string())?
             .map_err(|error| format!("connection failed: {error}"))?;
     let _ = state.send(RelayConnectionState::Connected);
+    forward_connected_socket(socket, local, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT).await
+}
+
+async fn forward_connected_socket<S>(
+    socket: tokio_tungstenite::WebSocketStream<S>,
+    local: SocketAddr,
+    heartbeat_interval: Duration,
+    heartbeat_timeout: Duration,
+) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut sink, mut source) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Frame>(OUTGOING_QUEUE);
     let (done_tx, mut done_rx) = mpsc::channel::<u64>(MAX_STREAMS);
     let mut streams = HashMap::<u64, mpsc::Sender<Vec<u8>>>::new();
     let mut tasks = JoinSet::new();
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    let mut heartbeat = tokio::time::interval(heartbeat_interval);
+    let mut last_received = tokio::time::Instant::now();
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = loop {
         tokio::select! {
             _ = heartbeat.tick() => {
+                if last_received.elapsed() >= heartbeat_timeout { break Err("relay heartbeat timed out".into()); }
                 if send_frame(&mut sink, Frame::Ping).await.is_err() { break Err("relay heartbeat failed".into()); }
             }
             Some(stream_id) = done_rx.recv() => { streams.remove(&stream_id); }
@@ -616,11 +633,19 @@ async fn connect_once(
                     if matches!(message, Message::Close(_)) { break Err("relay connection closed".into()); }
                     continue;
                 };
-                let frame = Frame::decode(&bytes).map_err(|error| error.to_string())?;
+                let frame = match Frame::decode(&bytes) {
+                    Ok(frame) => frame,
+                    Err(error) => break Err(error.to_string()),
+                };
+                last_received = tokio::time::Instant::now();
                 match frame {
                     Frame::Open { stream_id } => {
                         if streams.contains_key(&stream_id) || streams.len() >= MAX_STREAMS {
-                            let _ = outgoing_tx.send(Frame::Close { stream_id, reason: b"stream limit".to_vec() }).await;
+                            // This loop is the queue's only consumer. Sending
+                            // into its own full queue would deadlock all streams.
+                            if send_frame(&mut sink, Frame::Close { stream_id, reason: b"stream limit".to_vec() }).await.is_err() {
+                                break Err("relay write failed".into());
+                            }
                             continue;
                         }
                         let (tx, rx) = mpsc::channel(STREAM_QUEUE);
@@ -633,14 +658,16 @@ async fn connect_once(
                         let Some(stream) = streams.get(&stream_id).cloned() else { continue };
                         if stream.try_send(bytes).is_err() {
                             streams.remove(&stream_id);
-                            let _ = outgoing_tx.try_send(Frame::Close {
+                            if send_frame(&mut sink, Frame::Close {
                                 stream_id,
                                 reason: b"desktop too slow".to_vec(),
-                            });
+                            }).await.is_err() { break Err("relay write failed".into()); }
                         }
                     }
                     Frame::Close { stream_id, .. } => { streams.remove(&stream_id); }
-                    Frame::Ping => { let _ = outgoing_tx.send(Frame::Pong).await; }
+                    Frame::Ping => {
+                        if send_frame(&mut sink, Frame::Pong).await.is_err() { break Err("relay write failed".into()); }
+                    }
                     Frame::Pong => {}
                 }
             }
@@ -657,9 +684,22 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    send_frame_with_timeout(sink, frame, RELAY_SEND_TIMEOUT).await
+}
+
+async fn send_frame_with_timeout<S>(
+    sink: &mut S,
+    frame: Frame,
+    timeout: Duration,
+) -> Result<(), String>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
     let bytes = frame.encode().map_err(|error| error.to_string())?;
-    sink.send(Message::Binary(bytes.into()))
+    tokio::time::timeout(timeout, sink.send(Message::Binary(bytes.into())))
         .await
+        .map_err(|_| "relay write timed out".to_string())?
         .map_err(|error| error.to_string())
 }
 
@@ -747,6 +787,80 @@ mod tests {
     use p256::ecdsa::{signature::Signer, Signature, SigningKey};
     use p256::elliptic_curve::rand_core::OsRng;
     use std::fs;
+
+    #[tokio::test]
+    async fn silent_relay_expires_instead_of_staying_connected_forever() {
+        let (local, _silent_peer) = tokio::io::duplex(16 * 1024);
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            local,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            forward_connected_socket(
+                socket,
+                "127.0.0.1:1".parse().unwrap(),
+                Duration::from_millis(10),
+                Duration::from_millis(40),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), "relay heartbeat timed out");
+    }
+
+    #[tokio::test]
+    async fn relay_heartbeat_keeps_an_idle_connection_alive() {
+        let (local, peer) = tokio::io::duplex(16 * 1024);
+        let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            local,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let mut peer = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            peer,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        let connector = tokio::spawn(forward_connected_socket(
+            socket,
+            "127.0.0.1:1".parse().unwrap(),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        ));
+        for _ in 0..12 {
+            let message = tokio::time::timeout(Duration::from_secs(2), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let Message::Binary(bytes) = message else {
+                panic!("expected relay ping")
+            };
+            assert!(matches!(Frame::decode(&bytes).unwrap(), Frame::Ping));
+            send_frame(&mut peer, Frame::Pong).await.unwrap();
+        }
+        assert!(!connector.is_finished());
+        peer.close(None).await.unwrap();
+        assert_eq!(
+            connector.await.unwrap().unwrap_err(),
+            "relay connection closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_relay_writer_is_bounded() {
+        let mut sink = Box::pin(futures_util::sink::unfold((), |(), _: Message| async {
+            std::future::pending::<Result<(), std::io::Error>>().await
+        }));
+        let result =
+            send_frame_with_timeout(&mut sink, Frame::Ping, Duration::from_millis(10)).await;
+        assert_eq!(result.unwrap_err(), "relay write timed out");
+    }
 
     #[test]
     fn pending_enrollment_preserves_route_and_keeps_connector_secret_out_of_qr() {

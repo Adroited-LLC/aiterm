@@ -75,7 +75,6 @@ class AuthenticatedRemoteTransport(
     private val publicationMutex = Mutex()
     private val pending = LinkedHashMap<Long, PendingRequest>()
     private val acceptedRequests = LinkedHashSet<CompletableDeferred<RemoteResponse>>()
-    private val completed = LinkedHashSet<Long>()
     private val heldAttachments = LinkedHashMap<Long, HeldAttachment>()
     private var socket: RemoteBinarySocket? = null
     private var connectingSocket: RemoteBinarySocket? = null
@@ -353,7 +352,6 @@ class AuthenticatedRemoteTransport(
                 pending.remove(requestId)
                 heldAttachments.remove(requestId)
                 pendingRequest.timeout?.cancel()
-                rememberCompletedLocked(requestId)
             }
             accepted
         }
@@ -436,7 +434,6 @@ class AuthenticatedRemoteTransport(
                 request?.let { acceptedRequests.remove(it.deferred) }
             }
         } ?: return
-        rememberCompleted(requestId)
         request.deferred.completeExceptionally(RemoteRequestException("request.timeout", "Remote request timed out. Try again."))
     }
 
@@ -462,7 +459,6 @@ class AuthenticatedRemoteTransport(
             acceptedRequests.clear()
             pending.clear()
             queuedRequests = 0
-            completed.clear()
             heldAttachments.clear()
             accepted
         }
@@ -520,36 +516,31 @@ class AuthenticatedRemoteTransport(
 
     internal suspend fun acceptEnvelopeForTest(event: RemoteEventEnvelope) = accept(event)
 
+    // IDs are allocated monotonically for this socket. Keep that high-water
+    // mark instead of an expiring cache: a timed-out reply can legitimately
+    // arrive after hundreds of newer requests have completed.
+    private fun wasIssuedLocked(requestId: Long): Boolean = requestId > 0L && requestId < nextRequestId
+
+    private fun takeResponse(requestId: Long, expectedKind: String? = null): PendingRequest? =
+        synchronized(stateLock) {
+            if (!wasIssuedLocked(requestId)) protocolFailure()
+            val request = pending[requestId] ?: return@synchronized null
+            // Validate before removing the waiter. Teardown must still find
+            // and fail it if a malformed response terminates the reader.
+            if (expectedKind != null && expectedKind != request.kind) protocolFailure()
+            pending.remove(requestId)
+            acceptedRequests.remove(request.deferred)
+            request.timeout?.cancel()
+            request
+        }
+
     private fun acceptResponse(event: RemoteEventEnvelope) {
-        if (event.requestId <= 0) protocolFailure()
-        val request = synchronized(stateLock) {
-            pending.remove(event.requestId).also { request ->
-                request?.let { acceptedRequests.remove(it.deferred) }
-            }
-        }
-        if (request == null) {
-            if (synchronized(stateLock) { completed.contains(event.requestId) }) return
-            protocolFailure()
-        }
-        if (event.kind != request.kind) protocolFailure()
-        request.timeout?.cancel()
-        rememberCompleted(event.requestId)
+        val request = takeResponse(event.requestId, event.kind) ?: return
         request.deferred.complete(RemoteResponse.Success(event.requestId, event.kind, event.payload))
     }
 
     private fun completeTransferOnlyRequest(event: RemoteEventEnvelope) {
-        val request = synchronized(stateLock) {
-            pending.remove(event.requestId).also { request ->
-                request?.let { acceptedRequests.remove(it.deferred) }
-            }
-        }
-        if (request == null) {
-            if (synchronized(stateLock) { completed.contains(event.requestId) }) return
-            protocolFailure()
-        }
-        if (request.kind != "terminal.scrollback") protocolFailure()
-        request.timeout?.cancel()
-        rememberCompleted(event.requestId)
+        val request = takeResponse(event.requestId, "terminal.scrollback") ?: return
         request.deferred.complete(RemoteResponse.Success(event.requestId, request.kind, event.payload))
     }
 
@@ -559,38 +550,13 @@ class AuthenticatedRemoteTransport(
             emit(RemoteServerEvent.Failure(error.code, error.message))
             return
         }
-        val request = synchronized(stateLock) {
-            pending.remove(event.requestId).also { request ->
-                request?.let { acceptedRequests.remove(it.deferred) }
-            }
-        }
-        if (request == null) {
-            if (synchronized(stateLock) { completed.contains(event.requestId) }) return
-            protocolFailure()
-        }
+        val request = takeResponse(event.requestId) ?: return
         synchronized(stateLock) { heldAttachments.remove(event.requestId) }
-        request.timeout?.cancel()
-        rememberCompleted(event.requestId)
         request.deferred.complete(RemoteResponse.Error(event.requestId, error.code, error.message))
     }
 
     private fun requireKnownCorrelation(requestId: Long) {
-        if (requestId == 0L) return
-        val known = synchronized(stateLock) {
-            pending.containsKey(requestId) || completed.contains(requestId) || heldAttachments.containsKey(requestId)
-        }
-        if (!known) protocolFailure()
-    }
-
-    private fun rememberCompleted(requestId: Long) = synchronized(stateLock) {
-        rememberCompletedLocked(requestId)
-    }
-
-    private fun rememberCompletedLocked(requestId: Long) {
-        completed += requestId
-        while (completed.size > MAX_COMPLETED_CORRELATIONS) {
-            completed.remove(completed.first())
-        }
+        if (requestId != 0L && !synchronized(stateLock) { wasIssuedLocked(requestId) }) protocolFailure()
     }
 
     private suspend fun emit(event: RemoteServerEvent) = eventChannel.send(event)
@@ -692,7 +658,6 @@ class AuthenticatedRemoteTransport(
         // rather than reconnecting while a protected delete is still active.
         const val REQUEST_TIMEOUT_MILLIS = 130_000L
         const val MAX_PENDING_REQUESTS = 64
-        const val MAX_COMPLETED_CORRELATIONS = 64
         const val MAX_EVENTS = 64
         const val MAX_EARLY_EVENTS = 16
         const val MAX_EARLY_UPGRADE_EVENTS = 48

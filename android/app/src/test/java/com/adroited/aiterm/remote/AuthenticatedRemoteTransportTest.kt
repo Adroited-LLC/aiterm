@@ -35,6 +35,48 @@ import kotlin.concurrent.thread
 @OptIn(ExperimentalCoroutinesApi::class)
 class AuthenticatedRemoteTransportTest {
     @Test
+    fun veryLateRepliesRemainHarmlessAfterManyNewerRequests() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+        val abandoned = transport.request("tab.list", byteArrayOf())
+        runCurrent()
+        transport.abandonRequest(abandoned)
+        repeat(80) { index ->
+            val next = transport.request("tab.list", byteArrayOf())
+            runCurrent()
+            transport.acceptEnvelopeForTest(RemoteEventEnvelope(index + 2L, "tab.list", byteArrayOf()))
+            assertTrue(next.await() is RemoteResponse.Success)
+        }
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "tab.list", byteArrayOf()))
+        transport.acceptEnvelopeForTest(RemoteEventEnvelope(1, "error",
+            cborFixture(linkedMapOf("code" to "cancelled", "message" to "late"))))
+        assertFalse(socket.closed)
+        // The monotonic issued range still rejects replies to future requests.
+        assertTrue(runCatching {
+            transport.acceptEnvelopeForTest(RemoteEventEnvelope(1000, "tab.list", byteArrayOf()))
+        }.isFailure)
+        transport.close()
+    }
+
+    @Test
+    fun mismatchedResponseFailsItsWaiterWhenTheReaderCloses() = runTest {
+        val socket = authenticatedSocket()
+        val transport = transport(socket, backgroundScope, StandardTestDispatcher(testScheduler))
+        transport.connect()
+        val pending = transport.request("tab.list", byteArrayOf())
+        runCurrent()
+        socket.incoming.trySend(cborFixture(linkedMapOf(
+            "version" to 1, "request_id" to 1, "kind" to "agent.list", "payload" to byteArrayOf(),
+        )))
+        runCurrent()
+        assertTrue(socket.closed)
+        assertTrue("A rejected response must not orphan its waiter", pending.isCompleted)
+        assertTrue(runCatching { pending.await() }.exceptionOrNull() is RemoteTransportTerminatedException)
+        transport.close()
+    }
+
+    @Test
     fun failedWriterClosesTheConnectionAndFailsAllWaitingRequests() = runTest {
         val socket = authenticatedSocket()
         val transport = AuthenticatedRemoteTransport(

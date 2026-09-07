@@ -214,6 +214,7 @@ class RemoteClient(
     private val spineConversations = HashMap<String, SpineConversationStore>()
     private val spineRefreshPending = HashSet<String>()
     private var desiredPreviewSessionId: String? = null
+    private var previewGeneration = 0L
 
     suspend fun connect(): Boolean {
         synchronized(lifecycleLock) {
@@ -294,6 +295,10 @@ class RemoteClient(
             synchronized(lifecycleLock) { isCurrent(generation, candidate) }
         } catch (error: Exception) {
             candidate.close()
+            if (!isUnlocked()) {
+                lock()
+                return false
+            }
             if (error is RemoteAccessRevokedException) {
                 accept(generation, RemoteServerEvent.Revoked, candidate)
                 return false
@@ -774,19 +779,18 @@ class RemoteClient(
 
     fun previewSession(sessionId: String) = previewSession(sessionId, subscribe = true)
 
-    private fun previewSession(sessionId: String, subscribe: Boolean) {
-        synchronized(lifecycleLock) {
-            desiredPreviewSessionId = sessionId
-            if (mutableState.value.previewLoadingSessionId == sessionId) {
-                spineRefreshPending.add(sessionId)
-                return
-            }
-            spineRefreshPending.remove(sessionId)
-            mutableState.value = mutableState.value.copy(
-                previewLoadingSessionId = sessionId,
-                previewError = null,
-            )
+    private fun previewSession(sessionId: String, subscribe: Boolean): Unit = synchronized(lifecycleLock) {
+        desiredPreviewSessionId = sessionId
+        if (mutableState.value.previewLoadingSessionId == sessionId) {
+            spineRefreshPending.add(sessionId)
+            return@synchronized
         }
+        spineRefreshPending.remove(sessionId)
+        mutableState.value = mutableState.value.copy(
+            previewLoadingSessionId = sessionId,
+            previewError = null,
+        )
+        val refreshGeneration = ++previewGeneration
         val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
         val requestedAfter = store.lastSeq
         val started = launchRequest(
@@ -794,12 +798,12 @@ class RemoteClient(
             RemoteCommands.spine(sessionId, requestedAfter),
             timeoutMillis = PREVIEW_REFRESH_TIMEOUT_MILLIS,
             onError = { code, message ->
-                if (desiredPreviewSessionId != sessionId) return@launchRequest
+                if (desiredPreviewSessionId != sessionId || previewGeneration != refreshGeneration) return@launchRequest
                 if (subscribe && code == "remote.unsupported") {
                     mutableState.value = mutableState.value.copy(previewLoadingSessionId = null)
                     previewSession(sessionId, subscribe = false)
                 } else if (code == "remote.unsupported") {
-                    previewSessionLegacy(sessionId)
+                    previewSessionLegacy(sessionId, refreshGeneration)
                 } else {
                     mutableState.value = mutableState.value.copy(
                         previewLoadingSessionId = null,
@@ -808,7 +812,7 @@ class RemoteClient(
                 }
             },
             onSuccess = { payload ->
-                if (desiredPreviewSessionId != sessionId) return@launchRequest
+                if (desiredPreviewSessionId != sessionId || previewGeneration != refreshGeneration) return@launchRequest
                 val page = RemoteCommands.spinePage(payload)
                 // The server filtered this page using the old desktop's cursor.
                 // After a restart it may be empty, or omit the beginning of the
@@ -872,19 +876,19 @@ class RemoteClient(
     }
 
     /** Compatibility with a desktop from before the spine joined our gateway. */
-    private fun previewSessionLegacy(sessionId: String) {
+    private fun previewSessionLegacy(sessionId: String, refreshGeneration: Long) {
         val started = launchRequest(
             "session.conversation",
             RemoteCommands.conversation(sessionId),
             onError = { _, message ->
-                if (desiredPreviewSessionId != sessionId) return@launchRequest
+                if (desiredPreviewSessionId != sessionId || previewGeneration != refreshGeneration) return@launchRequest
                 mutableState.value = mutableState.value.copy(
                     previewLoadingSessionId = null,
                     previewError = message,
                 )
             },
             onSuccess = { payload ->
-                if (desiredPreviewSessionId != sessionId) return@launchRequest
+                if (desiredPreviewSessionId != sessionId || previewGeneration != refreshGeneration) return@launchRequest
                 val messages = RemoteCommands.sessionPreview(payload)
                 val store = spineConversations.getOrPut(sessionId, ::SpineConversationStore)
                 store.legacy(messages)
@@ -1258,7 +1262,17 @@ class RemoteClient(
                 ?: throw RemoteProtocolException("remote transport is disconnected")
             RequestContext(lifecycleGeneration, active)
         }
-        return when (val response = requestContext.transport.request(kind, payload).await()) {
+        val pending = requestContext.transport.request(kind, payload)
+        val response = try {
+            pending.await()
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            requestContext.transport.abandonRequest(pending)
+            throw cancelled
+        }
+        synchronized(lifecycleLock) {
+            check(isCurrent(requestContext.lifecycleGeneration, requestContext.transport)) { "The desktop connection changed. Try again." }
+        }
+        return when (response) {
             is RemoteResponse.Success -> {
                 if (response.kind != kind) throw RemoteProtocolException("unexpected remote resource response")
                 response.payload
@@ -1308,8 +1322,9 @@ class RemoteClient(
                         onError?.invoke("request.timeout", "Conversation refresh timed out. Retrying…")
                     }
                 }
-            } catch (_: kotlinx.coroutines.CancellationException) {
-                throw kotlinx.coroutines.CancellationException("remote request canceled")
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                active.abandonRequest(response)
+                throw cancelled
             } catch (error: Exception) {
                 synchronized(lifecycleLock) {
                     if (isCurrent(generation, active)) {

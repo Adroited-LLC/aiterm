@@ -1,5 +1,3 @@
-#[cfg(aiterm_headless)]
-use crate::runtime as tauri;
 use super::auth::{set_private_permissions, write_private_file, DeviceStore, PairingOutcome};
 use super::direct::DirectTunnelService;
 use super::model::{
@@ -14,6 +12,8 @@ use super::uploads::{
     AttachmentStore, UploadBegin, UploadError, UploadErrorKind, UploadSet, PARTIAL_ATTACHMENT_TTL,
 };
 use crate::launch::LaunchRequest;
+#[cfg(aiterm_headless)]
+use crate::runtime as tauri;
 use crate::services::agents::AgentService;
 use crate::services::sessions::SessionService;
 use crate::tabs::{
@@ -62,13 +62,15 @@ const SESSION_OPEN_LOCK_STRIPES: usize = 64;
 const ATTACHMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const ATTACHMENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const ATTACHMENT_REAP_INTERVAL: Duration = Duration::from_millis(100);
-const EGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+// Cellular links can briefly stop draining a snapshot without being dead.
+const EGRESS_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const EGRESS_CONTROL_QUEUE: usize = 64;
 const EGRESS_TRANSFER_QUEUE: usize = 1;
 const EGRESS_CONTROL_BURST: usize = 16;
 const REMOTE_BLOCKING_OPERATIONS: usize = 32;
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
-const INBOUND_QUEUE: usize = 16;
+// Match Android's maximum accepted request batch, even while dispatch is busy.
+const INBOUND_QUEUE: usize = 64;
 const CLOSED_ATTACHMENT_CACHE: usize = 16;
 const ATTACHMENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const WEB_PREVIEW_TTL: Duration = Duration::from_secs(60 * 60);
@@ -3709,10 +3711,10 @@ async fn encode_event(event: RemoteEvent) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-async fn send_egress(
-    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    message: Message,
-) -> Result<(), ()> {
+async fn send_egress<S>(sink: &mut S, message: Message) -> Result<(), ()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
     tokio::time::timeout(EGRESS_SEND_TIMEOUT, sink.send(message))
         .await
         .map_err(|_| ())?
@@ -4623,8 +4625,6 @@ fn recovery_error() -> RemoteEvent {
 
 enum InboundMessage {
     Binary(Vec<u8>),
-    Ping(Vec<u8>),
-    Pong,
 }
 
 enum AttachmentCommandOutcome {
@@ -4703,10 +4703,10 @@ async fn socket_reader(
             Ok(Message::Binary(bytes)) if bytes.len() < MAX_MESSAGE_SIZE => {
                 InboundMessage::Binary(bytes.to_vec())
             }
-            Ok(Message::Ping(bytes)) if bytes.len() < MAX_MESSAGE_SIZE => {
-                InboundMessage::Ping(bytes.to_vec())
-            }
-            Ok(Message::Pong(_)) => InboundMessage::Pong,
+            // Tungstenite queues the pong automatically; the next stream poll
+            // flushes it. Keep heartbeats out of the application request queue
+            // so a slow dispatch cannot delay them or exhaust request slots.
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
             Ok(Message::Close(_)) | Err(_) => {
                 let _ = cancelled.send(true);
                 return;
@@ -5267,17 +5267,6 @@ async fn run_authenticated_socket(
                     );
                 }
             }
-            InboundMessage::Ping(bytes) => {
-                if outbound
-                    .controls
-                    .send(EgressControl::Message(Message::Pong(bytes.into())))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            InboundMessage::Pong => {}
         }
     }
     cancelled.send_replace(true);
@@ -5357,6 +5346,81 @@ async fn reap_finished_attachments(
 
 #[cfg(test)]
 mod request_guard_tests {
+    #[tokio::test]
+    async fn queued_request_burst_does_not_block_websocket_heartbeat() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+        let (ready, mut receiver) = tokio::sync::mpsc::channel(1);
+        let router = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| {
+                let ready = ready.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        let (inbound, requests) = tokio::sync::mpsc::channel(INBOUND_QUEUE);
+                        let (cancelled, cancellation) = tokio::sync::watch::channel(false);
+                        ready
+                            .send((requests, cancelled.clone(), cancellation))
+                            .await
+                            .unwrap();
+                        let (_sink, stream) = socket.split();
+                        socket_reader(stream, inbound, cancelled).await;
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let (mut requests, cancelled, mut cancellation) = receiver.recv().await.unwrap();
+        // Android can send 64 accepted requests while one desktop operation
+        // is running. A heartbeat must still be answered without dispatch.
+        for _ in 0..64 {
+            client
+                .send(ClientMessage::Binary(vec![1].into()))
+                .await
+                .unwrap();
+        }
+        client
+            .send(ClientMessage::Ping(vec![7].into()))
+            .await
+            .unwrap();
+        let pong = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong, ClientMessage::Pong(vec![7].into()));
+        assert_eq!(requests.len(), 64);
+        assert!(!*cancellation.borrow());
+        // The larger queue remains bounded; an abusive peer still closes.
+        client
+            .send(ClientMessage::Binary(vec![1].into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cancellation.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*cancellation.borrow());
+        requests.close();
+        cancelled.send_replace(true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn brief_write_backpressure_does_not_disconnect_the_phone() {
+        let mut sink = Box::pin(futures_util::sink::unfold((), |(), _: Message| async {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            Ok::<_, ()>(())
+        }));
+        assert!(send_egress(&mut sink, Message::Binary(vec![1].into()))
+            .await
+            .is_ok());
+    }
+
     #[test]
     fn spine_notifications_coalesce_and_only_follow_the_selected_session() {
         let spine = crate::spine::Spine::new();

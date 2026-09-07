@@ -42,6 +42,73 @@ import kotlin.concurrent.thread
 @OptIn(ExperimentalCoroutinesApi::class, ExperimentalSerializationApi::class)
 class RemoteClientTest {
     @Test
+    fun cancelledResourceReadReleasesTheTransportRequest() = runTest {
+        val transport = FakeRemoteTransport()
+        val pending = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { pending }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        val reading = async { client.sessionChanges("session-1") }
+        runCurrent()
+        reading.cancelAndJoin()
+        assertEquals(listOf(pending), transport.abandonedRequests)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        client.lock()
+    }
+
+    @Test
+    fun expiredAuthenticationStopsReconnectAttemptsUntilUnlock() = runTest {
+        val lock = AppLock { 0L }
+        var attempts = 0
+        val transport = object : RemoteTransport {
+            override val events = MutableSharedFlow<RemoteServerEvent>()
+            override suspend fun connect() {
+                attempts++
+                lock.signChallengeWhileUnlocked {
+                    throw com.adroited.aiterm.security.DeviceAuthenticationRequiredException()
+                }
+            }
+            override fun request(kind: String, payload: ByteArray, onAssigned: (Long) -> Unit): Deferred<RemoteResponse> = error("unexpected request")
+            override fun requestBatch(requests: List<RemoteRequestInput>): List<Deferred<RemoteResponse>>? = error("unexpected batch")
+            override fun close() = Unit
+        }
+        val client = RemoteClient({ transport }, DefaultTerminalScreenStore(), { !lock.isLocked.value },
+            backgroundScope, StandardTestDispatcher(testScheduler))
+        assertFalse(client.connect())
+        advanceTimeBy(60_000)
+        runCurrent()
+        assertEquals(1, attempts)
+        assertEquals(ConnectionState.Locked, client.state.value.connection)
+        client.lock()
+    }
+
+    @Test
+    fun returningToAConversationIgnoresItsEarlierRefresh() = runTest {
+        val transport = FakeRemoteTransport()
+        val replies = ArrayList<CompletableDeferred<RemoteResponse>>()
+        transport.responseFor = { CompletableDeferred<RemoteResponse>().also { replies += it } }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("a")
+        runCurrent()
+        client.previewSession("b")
+        runCurrent()
+        client.previewSession("a")
+        runCurrent()
+        replies[0].complete(RemoteResponse.Error(1, "request.failed", "old failure"))
+        runCurrent()
+        assertEquals("a", client.state.value.previewLoadingSessionId)
+        assertEquals(null, client.state.value.previewError)
+        replies[2].complete(RemoteResponse.Success(3, "session.spine.subscribe",
+            uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), SpineSnapshotWire(
+                1, true, false, 1, 1, events = listOf(SpineEventWire(1, 1, "a", "codex", 1,
+                    "agent_text", id = "a", text = "current", done = true))))))
+        runCurrent()
+        assertEquals(listOf("current"), client.state.value.previewMessages.map { it.text })
+        client.lock()
+    }
+
+    @Test
     fun latePreviewFromPreviousSessionCannotReplaceCurrentConversation() = runTest {
         val transport = FakeRemoteTransport()
         val old = CompletableDeferred<RemoteResponse>()

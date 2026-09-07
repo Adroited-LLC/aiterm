@@ -19,6 +19,18 @@ class AppLockTest {
     private val lock = AppLock(clock = { now })
 
     @Test
+    fun expiredKeystoreAuthenticationRequiresUnlockBeforeRetrying() {
+        val result = runCatching {
+            lock.signChallengeWhileUnlocked { throw DeviceAuthenticationRequiredException() }
+        }
+        assertTrue(result.exceptionOrNull() is DeviceAuthenticationRequiredException)
+        assertTrue(lock.isLocked.value)
+        assertTrue(lock.signChallengeWhileUnlocked { error("must not retry while locked") } == null)
+        lock.unlock()
+        assertArrayEquals(byteArrayOf(1), lock.signChallengeWhileUnlocked { byteArrayOf(1) })
+    }
+
+    @Test
     fun freshlyStartedApp_isNotLocked() {
         assertFalse(lock.isLocked.value)
     }
