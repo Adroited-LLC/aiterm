@@ -43,6 +43,9 @@ WebSocket dispatch, and the desktop relay connector.
 - Pixel 10 Pro XL: Android 0.3.23 installed; 8 device tests passed, including
   Keystore policy and lock-screen checks. Verified a live LAN connection and
   the API view displaying the latest messages in the active desktop session.
+- Installed Linux 0.10.86 and restarted it at the user's request. Confirmed
+  the running version and both Android terminal/API views showing new messages
+  after the desktop restart.
 - New socket tests exercise a full request queue with a live WebSocket ping,
   queue overflow, delayed writes, relay heartbeat replies, and relay silence.
 - This does not establish a long-duration Wi-Fi/cellular handover result on
