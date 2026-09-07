@@ -39,6 +39,10 @@ WebSocket dispatch, and the desktop relay connector.
 
 - Android: 296 unit tests passed; debug APK, instrumentation APK, and lint passed.
 - Desktop: 657 library tests passed; 17 existing opt-in tests remained ignored.
+- Shared Windows/WSL backend: 62 remote tests passed; 2 opt-in tests ignored.
+- Pixel 10 Pro XL: Android 0.3.23 installed; 8 device tests passed, including
+  Keystore policy and lock-screen checks. Verified a live LAN connection and
+  the API view displaying the latest messages in the active desktop session.
 - New socket tests exercise a full request queue with a live WebSocket ping,
   queue overflow, delayed writes, relay heartbeat replies, and relay silence.
 - This does not establish a long-duration Wi-Fi/cellular handover result on
