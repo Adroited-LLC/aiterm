@@ -1951,17 +1951,18 @@ pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
 /// user has it installed and aiterm would flatly report "not installed".
 /// *Observed 2026-07-27: `codex-cli 0.145.0` resolving only inside a shell.*
 ///
-/// Interactive as well as login (`-lic`), because rc files that set these shims
-/// up are usually the interactive ones. Bounded, because an interactive shell
-/// can block on anything a user has put in their profile, and a settings panel
-/// that never finishes loading is no better than one that hangs.
+/// Login, but deliberately non-interactive: an interactive Bash checks terminal
+/// job control during startup and can send SIGTTIN to AITerm's entire process
+/// group when the app was launched in the background. Login profiles can still
+/// supply PATH; interactive-only rc setup belongs to actual terminal sessions.
+/// The probe is bounded because a user profile can run arbitrary commands.
 pub(crate) fn which_via_login_shell(bin: &str) -> Option<std::path::PathBuf> {
     let shell = std::env::var("SHELL").ok()?;
     // `bin` is a literal from our own backend list, never user input, but keep
     // the quoting correct anyway rather than relying on that staying true.
     let script = format!("command -v '{}' 2>/dev/null", bin.replace('\'', "'\\''"));
-    let out = run_bounded(&shell, &["-l", "-i", "-c", &script], Duration::from_secs(4))?;
-    // An interactive shell may print a banner or an rc-file warning first, so
+    let out = run_bounded(&shell, &["-l", "-c", &script], Duration::from_secs(4))?;
+    // A login profile may print a banner or a warning first, so
     // take the last line that is actually a path to an executable rather than
     // assuming the output is clean. It must also be named `bin`: a banner line
     // that happens to name some other executable is not an answer to the
@@ -1984,7 +1985,14 @@ pub(crate) fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Opti
     let program = program.to_string();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     std::thread::spawn(move || {
-        let result = std::process::Command::new(&program).args(&args).output();
+        let mut command = std::process::Command::new(&program);
+        command.args(&args).stdin(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let result = command.output();
         let _ = tx.send(result);
     });
     match rx.recv_timeout(limit) {
@@ -2032,10 +2040,14 @@ pub(crate) fn detect_cli(id: &str, display_name: &str, bin: &str) -> Detection {
 /// A tool that is installed but will not report a version is still usable, so
 /// this never affects `available`.
 fn read_version(bin: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(bin);
+    command.arg("--version").stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let out = command.output().ok()?;
     let text = if out.stdout.is_empty() {
         &out.stderr
     } else {
@@ -2078,6 +2090,53 @@ mod tests {
             "claude has settings.json to show"
         );
         assert!(!CodexBackend.caps().config, "nothing is read for codex yet");
+    }
+
+    // Invoked only by the controlling-terminal regression harness below.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn background_detection_probe() {
+        assert_eq!(std::env::var("AITERM_JOB_CONTROL_PROBE").as_deref(), Ok("1"));
+        assert!(which_via_login_shell("sh").is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_agent_detection_does_not_trigger_terminal_job_control() {
+        // Give the probe a controlling terminal owned by a DIFFERENT foreground
+        // group. This reproduces the reported nohup/background launch without
+        // touching the developer's terminal, GUI, or running AITerm process.
+        let script = r#"
+import fcntl, os, signal, subprocess, sys, termios
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+os.setsid()
+master, slave = os.openpty()
+fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+os.tcsetpgrp(slave, os.getpgrp())
+probe = subprocess.Popen([sys.argv[1], '--ignored', '--exact',
+    'agents::tests::background_detection_probe', '--nocapture'],
+    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    process_group=0, env=dict(os.environ, SHELL='/bin/bash', AITERM_JOB_CONTROL_PROBE='1'))
+try:
+    out, err = probe.communicate(timeout=8)
+    sys.stdout.buffer.write(out)
+    sys.stderr.buffer.write(err)
+    sys.exit(probe.returncode)
+except subprocess.TimeoutExpired:
+    os.killpg(probe.pid, signal.SIGKILL)
+    probe.communicate()
+    raise AssertionError('background detection stopped or hung')
+finally:
+    os.close(slave)
+    os.close(master)
+"#;
+        let result = std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(std::env::current_exe().unwrap())
+            .output().unwrap();
+        assert!(result.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
     }
 
     #[test]
