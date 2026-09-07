@@ -43,6 +43,7 @@ class RemoteTerminalViewModel(
     private var desktop = initialDesktop
     /** Survives terminal tab changes and configuration changes for this ViewModel's lifetime. */
     internal val terminalDrafts = TerminalDraftStore()
+    internal val conversationDrafts = ConversationDraftStore()
     private val screenStore = DefaultTerminalScreenStore()
     private val dialer = OkHttpRemoteSocketDialer(context.applicationContext)
     private val networkMonitor = AndroidNetworkMonitor(context)
@@ -124,7 +125,22 @@ class RemoteTerminalViewModel(
 
     fun selectTab(tabId: String) = client.selectTab(tabId)
     fun sendInput(text: String) = client.sendInput(text)
-    suspend fun submitInputs(tabId: String, texts: List<String>) = client.submitInputs(tabId, texts)
+    suspend fun submitInputs(tabId: String, texts: List<String>): Boolean {
+        val state = client.state.value
+        val sessionId = state.tabs.firstOrNull { it.id == tabId }?.sessionId
+            ?.takeIf { id -> state.sessions.any { it.id == id } }
+        return try {
+            if (sessionId != null && texts.size == 2 && texts.last() == "\r") {
+                client.submitConversationInputs(sessionId, tabId, texts)
+            } else {
+                client.submitInputs(tabId, texts)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false // Preserve the terminal draft if input or receipt preparation fails.
+        }
+    }
 
     fun sendInputs(tabId: String, texts: List<String>) = client.sendInputs(tabId, texts)
     /**
@@ -293,10 +309,9 @@ class RemoteTerminalViewModel(
                 bracketedPaste = latestScreen.modes.bracketedPaste,
                 hasFiles = images.any { it.fileName != null },
             )
-            if (!client.submitInputs(activeScreen.tabId, outbound)) {
+            if (!client.submitConversationInputs(sessionId, activeScreen.tabId, outbound)) {
                 return Result.failure(IllegalStateException("The terminal did not accept the message."))
             }
-            delay(350)
             client.previewSession(sessionId)
             Result.success(Unit)
         } catch (cancelled: CancellationException) {
@@ -322,6 +337,7 @@ class RemoteTerminalViewModel(
     ) = client.startAgent(agent, modelId, effort, cwd, TerminalSize(cols, rows))
 
     override fun onCleared() {
+        conversationDrafts.clear()
         connectJob?.cancel()
         networkMonitor.close()
         client.lock()

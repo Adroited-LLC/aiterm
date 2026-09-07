@@ -489,6 +489,70 @@ class RemoteClientTest {
     }
 
     @Test
+    fun acceptedConversationPromptRemainsPendingAcrossViewsUntilSpineConfirmsIt() = runTest {
+        val transport = FakeRemoteTransport()
+        var latest = 10L
+        transport.responseFor = { request ->
+            val payload = if (request.kind.startsWith("session.spine")) {
+                uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), SpineSnapshotWire(
+                    epoch = 1, live = true, hasMore = false, latestSeq = latest,
+                    events = if (request.kind == "session.spine") emptyList() else listOf(
+                        SpineEventWire(latest, 1, "session-1", "codex", 0,
+                            "user_message", id = "user-$latest", text = "hello")),
+                ))
+            } else byteArrayOf()
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        transport.requests.clear()
+        val submission = async {
+            client.submitConversationInputs("session-1", "tab-1", listOf("\u001b[200~hello\u001b[201~", "\r"))
+        }
+        runCurrent()
+        assertFalse(client.state.value.pendingPrompts.single().accepted)
+        advanceUntilIdle()
+        assertTrue(submission.await())
+        assertTrue(client.state.value.pendingPrompts.single().accepted)
+        assertEquals("hello", client.state.value.pendingPrompts.single().text)
+        assertEquals(listOf("session.spine", "terminal.input", "terminal.input"), transport.requests.map { it.kind })
+        client.previewSession("session-1") // Old identical user message is not a receipt.
+        advanceUntilIdle()
+        assertEquals(1, client.state.value.pendingPrompts.size)
+        client.previewSession("another-session")
+        advanceUntilIdle()
+        assertEquals("session-1", client.state.value.pendingPrompts.single().sessionId)
+        latest = 11
+        client.previewSession("session-1")
+        advanceUntilIdle()
+        assertTrue(client.state.value.pendingPrompts.isEmpty())
+        assertTrue(client.state.value.previewItems.any { it is Item.User && it.text == "hello" })
+        client.lock()
+    }
+
+    @Test
+    fun failedConversationInputRemovesOnlyItsPendingCard() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request ->
+            if (request.kind == "session.spine") CompletableDeferred(RemoteResponse.Success(
+                request.requestId, request.kind, uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(),
+                    SpineSnapshotWire(1, true, false, latestSeq = 10, events = emptyList()))))
+            else CompletableDeferred(RemoteResponse.Error(request.requestId, "terminal.no_focus", "Focus lost"))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        assertFalse(client.submitConversationInputs("session-1", "tab-1", listOf("hello", "\r")))
+        assertTrue(client.state.value.pendingPrompts.isEmpty())
+        client.lock()
+    }
+
+    @Test
     fun terminalSubmissionWaitsForPasteAcceptanceAndSettleBeforeSendingEnter() = runTest {
         val transport = FakeRemoteTransport()
         val pasteAccepted = CompletableDeferred<RemoteResponse>()

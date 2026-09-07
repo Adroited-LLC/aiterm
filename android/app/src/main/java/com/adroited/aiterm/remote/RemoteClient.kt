@@ -58,6 +58,7 @@ data class RemoteClientState(
     val usage: List<RemoteUsageSource> = emptyList(),
     val previewSessionId: String? = null,
     val previewItems: List<Item> = emptyList(),
+    val pendingPrompts: List<PendingConversationPrompt> = emptyList(),
     val previewPhase: SpinePhase = SpinePhase.Idle,
     val previewPhaseDetail: String = "",
     val previewLive: Boolean = true,
@@ -212,6 +213,7 @@ class RemoteClient(
     private var lifecycleGeneration = 0L
     private var selectionGeneration = 0L
     private val ownedJobs = linkedSetOf<Job>()
+    private val conversationOutbox = ConversationOutbox()
     private val spineConversations = HashMap<String, SpineConversationStore>()
     private val spineRefreshPending = HashSet<String>()
     private var desiredPreviewSessionId: String? = null
@@ -426,6 +428,48 @@ class RemoteClient(
             }
             true
         }
+    }
+
+    /** Keep the prompt visible until the agent's transcript confirms it, even across view switches. */
+    suspend fun submitConversationInputs(sessionId: String, tabId: String, texts: List<String>): Boolean {
+        if (texts.size < 2) return false
+        // Obtain a fresh server cursor BEFORE writing. Cached history can lag behind the CLI,
+        // and matching text against it would acknowledge a repeated prompt from an older turn.
+        // An after cursor beyond the log requests only its atomic watermark, not the whole history.
+        val page = try {
+            RemoteCommands.spinePage(requestResource("session.spine", RemoteCommands.spine(sessionId, Long.MAX_VALUE)))
+        } catch (error: RemoteUploadException) {
+            // Preserve input support for desktops predating transcript receipts.
+            if (error.code == "remote.unsupported") return submitInputs(tabId, texts)
+            throw error
+        }
+        val text = texts.first().removePrefix("\u001b[200~").removeSuffix("\u001b[201~")
+        val id = synchronized(lifecycleLock) {
+            if (mutableState.value.activeTabId != tabId) return false
+            conversationOutbox.reconcile(sessionId, page)
+            conversationOutbox.begin(sessionId, text, page.epoch,
+                maxOf(page.latestSeq, page.events.maxOfOrNull { it.seq } ?: 0L)).also {
+                mutableState.value = mutableState.value.copy(pendingPrompts = conversationOutbox.prompts)
+            }
+        }
+        var accepted = false
+        try {
+            accepted = submitInputs(tabId, texts)
+            return accepted
+        } finally {
+            synchronized(lifecycleLock) {
+                if (accepted) conversationOutbox.accepted(id) else conversationOutbox.remove(id)
+                if (mutableState.value.connection != ConnectionState.Locked &&
+                    mutableState.value.connection != ConnectionState.Revoked) {
+                    mutableState.value = mutableState.value.copy(pendingPrompts = conversationOutbox.prompts)
+                }
+            }
+        }
+    }
+
+    fun hidePendingPrompt(id: String) = synchronized(lifecycleLock) {
+        conversationOutbox.remove(id)
+        mutableState.value = mutableState.value.copy(pendingPrompts = conversationOutbox.prompts)
     }
 
     /**
@@ -828,6 +872,7 @@ class RemoteClient(
                     return@launchRequest
                 }
                 val items = store.apply(page)
+                conversationOutbox.reconcile(sessionId, page)
                 val activity = if (store.phaseSeen) {
                     mutableState.value.sessionActivity + (
                         sessionId to when (store.phase) {
@@ -842,6 +887,7 @@ class RemoteClient(
                 mutableState.value = mutableState.value.copy(
                     previewSessionId = sessionId,
                     previewItems = items,
+                    pendingPrompts = conversationOutbox.prompts,
                     previewPhase = store.phase,
                     previewPhaseDetail = store.phaseDetail,
                     previewLive = store.live,

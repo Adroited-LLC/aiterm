@@ -118,6 +118,7 @@ import java.net.URI
 fun RemoteTerminalScreen(
     viewModel: RemoteTerminalViewModel,
     onBack: () -> Unit,
+    onSelectSession: (com.adroited.aiterm.remote.RemoteSession) -> Unit = {},
 ) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     val screen by viewModel.client.screen.collectAsStateWithLifecycle()
@@ -127,6 +128,7 @@ fun RemoteTerminalScreen(
         screen = screen,
         scrollback = scrollback,
         onBack = onBack,
+        onSelectSession = onSelectSession,
         onReconnect = viewModel::reconnect,
         onInput = viewModel::sendInput,
         onInputBatch = viewModel::submitInputs,
@@ -146,6 +148,7 @@ internal fun TerminalScreenContent(
     screen: ScreenSnapshot?,
     scrollback: List<ScreenRow> = emptyList(),
     onBack: () -> Unit = {},
+    onSelectSession: (com.adroited.aiterm.remote.RemoteSession) -> Unit = {},
     onReconnect: () -> Unit = {},
     onInput: (String) -> Unit = {},
     onInputBatch: (suspend (String, List<String>) -> Boolean)? = null,
@@ -395,13 +398,23 @@ internal fun TerminalScreenContent(
                     }
                 },
                 title = {
-                    Column {
-                        Text(state.activeTitle ?: "Remote terminal")
-                        Text(
-                            state.connection.label(),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = state.connection.color(),
-                        )
+                    val activeSessionId = state.tabs.firstOrNull { it.id == activeTabId }?.sessionId
+                    val activeSession = state.sessions.firstOrNull { it.id == activeSessionId }
+                    if (activeSession != null) {
+                        SessionSwitcher(
+                            state = state, session = activeSession,
+                            enabled = !attachments.submitting && !attachments.preparing,
+                            onSelectSession = onSelectSession,
+                        ) {
+                            Text(state.connection.label(), style = MaterialTheme.typography.labelMedium,
+                                color = state.connection.color())
+                        }
+                    } else {
+                        Column {
+                            Text(state.activeTitle ?: "Remote terminal")
+                            Text(state.connection.label(), style = MaterialTheme.typography.labelMedium,
+                                color = state.connection.color())
+                        }
                     }
                 },
             )

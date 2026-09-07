@@ -104,6 +104,8 @@ import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
+import com.adroited.aiterm.remote.RemoteTabState
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -238,6 +240,7 @@ fun RemoteDesktopScreen(
 
         PAGE_TERMINAL -> RemoteTerminalScreen(
             viewModel = viewModel,
+            onSelectSession = { openTerminal(it.id) },
             onBack = {
                 selectedSessionId?.let(viewModel::previewSession)
                 page = if (selectedSessionId == null) PAGE_SESSIONS else PAGE_CONVERSATION
@@ -250,34 +253,38 @@ fun RemoteDesktopScreen(
                 page = PAGE_SESSIONS
             }
         } else {
-            RemoteConversationContent(
-                state = state,
-                session = selected,
-                onBack = { page = PAGE_SESSIONS },
-                onRefresh = { viewModel.previewSession(selected.id) },
-                onSend = viewModel::sendConversationPrompt,
-                onBringIn = viewModel.client::bringInSession,
-                onStar = viewModel.client::starSession,
-                onOpen = { viewModel.openSession(it, 80, 24) },
-                onOpenTerminal = { openTerminal(selected.id) },
-                onStop = viewModel::stopSession,
-                onLoadFiles = viewModel::sessionChanges,
-                onLoadFile = viewModel::sessionFilePreview,
-                onParseMarkdown = viewModel::parseMarkdown,
-                onSaveMarkdown = viewModel::saveMarkdown,
-                onRenderSvg = viewModel::renderSvg,
-                onProbeWebPreview = viewModel::hasWebPreview,
-                onOpenWebPreview = viewModel::openWebPreview,
-                onShowWebPreview = { url ->
-                    webPreviewUrl = url
-                    page = PAGE_WEB_PREVIEW
-                },
-                onSelectSession = { target ->
-                    selectedSessionId = target.id
-                    viewModel.previewSession(target.id)
-                },
-                onQuickInput = { tabId, key -> viewModel.sendInputs(tabId, listOf(key)) },
-            )
+            key(selected.id) {
+                RemoteConversationContent(
+                    state = state,
+                    session = selected,
+                    onBack = { page = PAGE_SESSIONS },
+                    onRefresh = { viewModel.previewSession(selected.id) },
+                    onSend = viewModel::sendConversationPrompt,
+                    onBringIn = viewModel.client::bringInSession,
+                    onStar = viewModel.client::starSession,
+                    onOpen = { viewModel.openSession(it, 80, 24) },
+                    onOpenTerminal = { openTerminal(selected.id) },
+                    onStop = viewModel::stopSession,
+                    onLoadFiles = viewModel::sessionChanges,
+                    onLoadFile = viewModel::sessionFilePreview,
+                    onParseMarkdown = viewModel::parseMarkdown,
+                    onSaveMarkdown = viewModel::saveMarkdown,
+                    onRenderSvg = viewModel::renderSvg,
+                    onProbeWebPreview = viewModel::hasWebPreview,
+                    onOpenWebPreview = viewModel::openWebPreview,
+                    onShowWebPreview = { url ->
+                        webPreviewUrl = url
+                        page = PAGE_WEB_PREVIEW
+                    },
+                    onSelectSession = { target ->
+                        selectedSessionId = target.id
+                        viewModel.previewSession(target.id)
+                    },
+                    onQuickInput = { tabId, key -> viewModel.sendInputs(tabId, listOf(key)) },
+                    conversationDraftStore = viewModel.conversationDrafts,
+                    onHidePending = viewModel.client::hidePendingPrompt,
+                )
+            }
         }
 
         else -> RemoteSessionDashboard(
@@ -1017,15 +1024,19 @@ internal fun RemoteConversationContent(
     onShowWebPreview: (String) -> Unit,
     onSelectSession: (RemoteSession) -> Unit,
     onQuickInput: (String, String) -> Unit,
+    conversationDraftStore: ConversationDraftStore? = null,
+    onHidePending: (String) -> Unit = {},
 ) {
     var pullRefreshing by remember(session.id) { mutableStateOf(false) }
     LaunchedEffect(state.previewLoadingSessionId, pullRefreshing) {
         if (state.previewLoadingSessionId != session.id) pullRefreshing = false
     }
-    var draft by rememberSaveable(session.id) { mutableStateOf("") }
+    val localDraftStore = remember { ConversationDraftStore() }
+    val sessionDraft = (conversationDraftStore ?: localDraftStore).forSession(session.id)
+    var draft by sessionDraft::text
     var sending by remember(session.id) { mutableStateOf(false) }
     var sendError by remember(session.id) { mutableStateOf<String?>(null) }
-    var attachments by remember(session.id) { mutableStateOf(TerminalAttachmentDraft()) }
+    var attachments by sessionDraft::attachments
     var showImageSources by remember(session.id) { mutableStateOf(false) }
     var showFiles by remember(session.id) { mutableStateOf(false) }
     var showBringIn by remember(session.id) { mutableStateOf(false) }
@@ -1052,13 +1063,13 @@ internal fun RemoteConversationContent(
     val listState = rememberLazyListState()
     val conversationSelection = rememberSelectionState()
     val working = isConversationWorking(
-        phase = state.previewPhase,
-        spineLive = state.previewLive,
-        turnOpen = state.previewTurnOpen,
+        phase = state.previewPhase.takeIf { state.previewSessionId == session.id } ?: SpinePhase.Idle,
+        spineLive = state.previewSessionId == session.id && state.previewLive,
+        turnOpen = state.previewTurnOpen.takeIf { state.previewSessionId == session.id },
         rosterActivity = state.sessionActivity[session.id],
     )
     val live = isConversationSessionLive(session, state.tabs)
-    val needsYou = state.previewPhase == SpinePhase.NeedsYou
+    val needsYou = state.previewSessionId == session.id && state.previewPhase == SpinePhase.NeedsYou
     val starred = session.id in state.starredSessions
     val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
     var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
@@ -1070,7 +1081,6 @@ internal fun RemoteConversationContent(
             layout.totalItemsCount > 0 && last < layout.totalItemsCount - 1
         }
     }
-    val latestAttachments by rememberUpdatedState(attachments)
 
     BackHandler(enabled = !sending && !attachments.preparing) {
         when {
@@ -1083,8 +1093,8 @@ internal fun RemoteConversationContent(
             else -> onBack()
         }
     }
-    DisposableEffect(session.id) {
-        onDispose { latestAttachments.items.forEach { it.image.file.delete() } }
+    DisposableEffect(localDraftStore) {
+        onDispose { localDraftStore.clear() }
     }
 
     val refreshConversation by rememberUpdatedState(onRefresh)
@@ -1206,23 +1216,27 @@ internal fun RemoteConversationContent(
         }
         val submittedImages = attachments.items.map { it.image }
         scope.launch {
-            onSend(session.id, text, submittedImages) { progress ->
-                updateAttachments { it.recordProgress(progress.sourceId, progress.sent, progress.total) }
-            }.fold(
-                onSuccess = {
-                    draft = ""
-                    val removed = attachments.items
-                    attachments = TerminalAttachmentDraft()
-                    removed.forEach { it.image.file.delete() }
-                },
-                onFailure = {
-                    sendError = it.message ?: "The desktop did not accept the message."
-                    if (attachments.submitting) {
-                        updateAttachments { draftState -> draftState.failSubmission(sendError!!) }
-                    }
-                },
-            )
-            sending = false
+            try {
+                onSend(session.id, text, submittedImages) { progress ->
+                    updateAttachments { it.recordProgress(progress.sourceId, progress.sent, progress.total) }
+                }.fold(
+                    onSuccess = {
+                        draft = ""
+                        val removed = attachments.items
+                        attachments = TerminalAttachmentDraft()
+                        removed.forEach { it.image.file.delete() }
+                    },
+                    onFailure = {
+                        sendError = it.message ?: "The desktop did not accept the message."
+                        if (attachments.submitting) {
+                            updateAttachments { draftState -> draftState.failSubmission(sendError!!) }
+                        }
+                    },
+                )
+            } finally {
+                sending = false
+                if (attachments.submitting) attachments = attachments.copy(submitting = false)
+            }
         }
     }
 
@@ -1307,46 +1321,40 @@ internal fun RemoteConversationContent(
                     }
                 },
                 title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        AgentIcon(session.agent, size = 26.dp)
-                        Spacer(Modifier.width(10.dp))
-                        Column {
+                    SessionSwitcher(
+                        state = state, session = session,
+                        enabled = !sending && !attachments.preparing,
+                        onSelectSession = onSelectSession,
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                session.title.ifBlank { "Untitled session" },
+                                session.groupPath.trimEnd('/').substringAfterLast('/').ifBlank {
+                                    session.projectPath.trimEnd('/').substringAfterLast('/')
+                                },
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.titleMedium,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.widthIn(max = 120.dp),
                             )
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    session.groupPath.trimEnd('/').substringAfterLast('/').ifBlank {
-                                        session.projectPath.trimEnd('/').substringAfterLast('/')
-                                    },
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.widthIn(max = 120.dp),
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                SessionStateChip(
-                                    label = when {
-                                        state.connection != ConnectionState.Connected -> "disconnected"
-                                        state.previewError != null -> "sync interrupted"
-                                        needsYou -> "needs you"
-                                        working -> "working"
-                                        live -> "on desktop"
-                                        else -> "history"
-                                    },
-                                    color = when {
-                                        state.connection != ConnectionState.Connected || state.previewError != null -> MaterialTheme.colorScheme.error
-                                        needsYou -> MaterialTheme.colorScheme.error
-                                        working -> Color(0xFFF6C453)
-                                        live -> MaterialTheme.colorScheme.tertiary
-                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                    },
-                                )
-                            }
+                            Spacer(Modifier.width(8.dp))
+                            SessionStateChip(
+                                label = when {
+                                    state.connection != ConnectionState.Connected -> "disconnected"
+                                    state.previewError != null -> "sync interrupted"
+                                    needsYou -> "needs you"
+                                    working -> "working"
+                                    live -> "on desktop"
+                                    else -> "history"
+                                },
+                                color = when {
+                                    state.connection != ConnectionState.Connected || state.previewError != null -> MaterialTheme.colorScheme.error
+                                    needsYou -> MaterialTheme.colorScheme.error
+                                    working -> Color(0xFFF6C453)
+                                    live -> MaterialTheme.colorScheme.tertiary
+                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
                         }
                     }
                 },
@@ -1415,7 +1423,7 @@ internal fun RemoteConversationContent(
                         DropdownMenuItem(
                             text = { Text("Open terminal") },
                             leadingIcon = { Icon(Icons.Filled.Terminal, contentDescription = null) },
-                            enabled = state.connection == ConnectionState.Connected,
+                            enabled = state.connection == ConnectionState.Connected && !sending && !attachments.preparing,
                             onClick = { showActions = false; onOpenTerminal() },
                         )
                         DropdownMenuItem(
@@ -1455,6 +1463,11 @@ internal fun RemoteConversationContent(
                     .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                     .padding(horizontal = 10.dp, vertical = 8.dp),
             ) {
+                PendingPromptCards(
+                    prompts = state.pendingPrompts.filter { it.sessionId == session.id },
+                    connected = state.connection == ConnectionState.Connected,
+                    onHide = onHidePending,
+                )
                 sendError?.let {
                     Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(4.dp))
@@ -1577,7 +1590,7 @@ internal fun RemoteConversationContent(
                                         sessions = state.sessions,
                                         broughtIn = state.broughtInSessions,
                                         activity = state.sessionActivity,
-                                        onSelect = onSelectSession,
+                                        onSelect = { if (!sending && !attachments.preparing) onSelectSession(it) },
                                     )
                                     state.previewError?.let { error ->
                                         Text("Conversation updates interrupted: $error", color = MaterialTheme.colorScheme.error)
@@ -2437,7 +2450,7 @@ internal fun conversationListItemCount(timelineCount: Int, working: Boolean): In
     1 + timelineCount + if (working) 1 else 0
 
 internal fun isConversationSessionLive(session: RemoteSession, tabs: List<RemoteTab>): Boolean =
-    tabs.any { it.sessionId == session.id }
+    tabs.any { it.sessionId == session.id && it.state == RemoteTabState.Running }
 
 /** Shell tabs are useful in the raw terminal, but are not conversation rows. */
 internal fun liveConversationCount(sessions: List<RemoteSession>, tabs: List<RemoteTab>): Int =
