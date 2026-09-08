@@ -489,6 +489,62 @@ class RemoteClientTest {
     }
 
     @Test
+    fun sessionMenuMutationWaitsForAcceptanceAndSurfacesErrors() = runTest {
+        val transport = FakeRemoteTransport()
+        val reply = CompletableDeferred<RemoteResponse>()
+        transport.responseFor = { request ->
+            if (request.kind == "session.delete") reply
+            else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        advanceUntilIdle()
+        transport.requests.clear()
+        val deletion = async { runCatching { client.mutateSession(RemoteSessionMutation.Delete, "session-1") } }
+        runCurrent()
+        assertFalse(deletion.isCompleted)
+        assertEquals(listOf("session.delete"), transport.requests.map { it.kind })
+        reply.complete(RemoteResponse.Error(transport.requests.single().requestId, "session.running", "Session is running"))
+        advanceUntilIdle()
+        assertEquals("Session is running", deletion.await().exceptionOrNull()?.message)
+        assertTrue(transport.requests.none { it.kind == "session.roster" })
+        client.lock()
+    }
+
+    @Test
+    fun sessionMenuTimeoutReturnsAnErrorInsteadOfCancellingTheMenu() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request ->
+            if (request.kind == "session.fork") CompletableDeferred()
+            else CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        advanceUntilIdle()
+        val action = async { runCatching { client.mutateSession(RemoteSessionMutation.Fork, "session-1") } }
+        advanceUntilIdle()
+        assertEquals("No confirmation from the desktop. Refresh before trying again.", action.await().exceptionOrNull()?.message)
+        assertEquals(1, transport.abandonedRequests.size)
+        client.lock()
+    }
+
+    @Test
+    fun newShellUsesTheSelectedSessionsProjectDirectory() = runTest {
+        val transport = FakeRemoteTransport()
+        transport.responseFor = { request ->
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind,
+                if (request.kind == "tab.open") cborMap("tab_id" to "tab-1") else byteArrayOf()))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        advanceUntilIdle()
+        assertEquals("tab-1", client.openTerminalTarget(null, TerminalSize(80, 24), "/work/selected project"))
+        assertArrayEquals(RemoteCommands.shell("/work/selected project", null, TerminalSize(80, 24)),
+            transport.requests.single { it.kind == "tab.open" }.payload)
+        client.lock()
+    }
+
+    @Test
     fun acceptedConversationPromptRemainsPendingAcrossViewsUntilSpineConfirmsIt() = runTest {
         val transport = FakeRemoteTransport()
         var latest = 10L

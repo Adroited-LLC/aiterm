@@ -182,15 +182,18 @@ fun RemoteDesktopScreen(
     var terminalError by remember { mutableStateOf<String?>(null) }
     var terminalOpenJob by remember { mutableStateOf<Job?>(null) }
 
-    fun openTerminal(sessionId: String?) {
+    fun openTerminal(sessionId: String?, projectPath: String? = null, conversation: Boolean = false) {
         if (terminalOpening) return
         terminalOpening = true
         terminalOpenJob = terminalScope.launch {
             try {
-                viewModel.openTerminal(sessionId).fold(
+                viewModel.openTerminal(sessionId, projectPath).fold(
                     onSuccess = {
                         selectedSessionId = sessionId
-                        page = PAGE_TERMINAL
+                        if (conversation && sessionId != null) {
+                            viewModel.previewSession(sessionId)
+                            page = PAGE_CONVERSATION
+                        } else page = PAGE_TERMINAL
                     },
                     onFailure = { terminalError = it.message ?: "Could not open the terminal." },
                 )
@@ -303,6 +306,16 @@ fun RemoteDesktopScreen(
                 page = PAGE_CONVERSATION
             },
             onOpenTerminal = { openTerminal(null) },
+            onResumeSession = { openTerminal(it.id, conversation = true) },
+            onNewShell = { openTerminal(null, it.projectPath) },
+            onMutateSession = { session, action ->
+                try {
+                    viewModel.client.mutateSession(action, session.id)
+                    Result.success(Unit)
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) { Result.failure(error) }
+            },
         )
     }
 }
@@ -321,6 +334,10 @@ internal fun RemoteSessionDashboard(
     onRenameSession: (String, String) -> Unit,
     onOpenSession: (RemoteSession) -> Unit,
     onOpenTerminal: () -> Unit,
+    onResumeSession: (RemoteSession) -> Unit = {},
+    onNewShell: (RemoteSession) -> Unit = {},
+    onMutateSession: suspend (RemoteSession, com.adroited.aiterm.remote.RemoteSessionMutation) -> Result<Unit> =
+        { _, _ -> Result.failure(IllegalStateException("Session management is unavailable.")) },
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var agentFilter by rememberSaveable { mutableStateOf<String?>(null) }
@@ -328,6 +345,7 @@ internal fun RemoteSessionDashboard(
     var activeOnly by rememberSaveable { mutableStateOf(false) }
     var foldedCrews by remember { mutableStateOf(emptySet<String>()) }
     var renameTarget by remember { mutableStateOf<RemoteSession?>(null) }
+    var menuSessionId by remember { mutableStateOf<String?>(null) }
     var pullRefreshing by remember { mutableStateOf(false) }
     LaunchedEffect(state.sessionsRefreshing, pullRefreshing) {
         if (!state.sessionsRefreshing) pullRefreshing = false
@@ -358,6 +376,26 @@ internal fun RemoteSessionDashboard(
             filesOnly = filesOnly,
             activeOnly = activeOnly,
             foldedCrews = foldedCrews,
+        )
+    }
+    menuSessionId?.let { id ->
+        val target = state.sessions.firstOrNull { it.id == id }
+        if (target == null) {
+            LaunchedEffect(id) { menuSessionId = null }
+        } else SessionActionsSheet(
+            state = state, session = target, onDismiss = { menuSessionId = null },
+            onAction = { action ->
+                menuSessionId = null
+                when (action) {
+                    SessionMenuAction.Open -> onOpenSession(target)
+                    SessionMenuAction.Resume -> onResumeSession(target)
+                    SessionMenuAction.Rename -> renameTarget = target
+                    SessionMenuAction.Star -> onStarSession(id, id !in state.starredSessions)
+                    SessionMenuAction.NewShell -> onNewShell(target)
+                    else -> Unit
+                }
+            },
+            onMutate = { onMutateSession(target, it) },
         )
     }
     renameTarget?.let { session ->
@@ -525,7 +563,7 @@ internal fun RemoteSessionDashboard(
                                     }
                                 },
                                 onToggleStar = { onStarSession(session.id, session.id !in state.starredSessions) },
-                                onRename = { renameTarget = session },
+                                onLongClick = { menuSessionId = session.id },
                                 onClick = { onOpenSession(session) },
                             )
                         }
@@ -869,12 +907,12 @@ private fun SessionDashboardRow(
     crewFolded: Boolean,
     onToggleCrew: () -> Unit,
     onToggleStar: () -> Unit,
-    onRename: () -> Unit,
+    onLongClick: () -> Unit,
     onClick: () -> Unit,
 ) {
     Row(
         Modifier.fillMaxWidth()
-            .combinedClickable(onClick = onClick, onLongClick = onRename)
+            .combinedClickable(onClick = onClick, onLongClickLabel = "Session actions", onLongClick = onLongClick)
             .padding(start = if (satellite) 30.dp else 14.dp, end = 14.dp, top = 11.dp, bottom = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

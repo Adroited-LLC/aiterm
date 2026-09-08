@@ -39,6 +39,10 @@ data class TerminalSize(val cols: Int, val rows: Int) {
 enum class FocusOwner { Self, Other, Unowned }
 enum class ConnectionState { Disconnected, Connecting, Connected, Reconnecting, Locked, Revoked }
 
+enum class RemoteSessionMutation(val wire: String) {
+    Fork("session.fork"), Close("session.close"), Stop("session.stop"), Delete("session.delete")
+}
+
 data class RemoteClientState(
     val connection: ConnectionState = ConnectionState.Disconnected,
     val focus: FocusOwner = FocusOwner.Unowned,
@@ -1009,6 +1013,30 @@ class RemoteClient(
         }
     }
 
+    /** Session menus await the desktop response before dismissing, so failures stay visible. */
+    suspend fun mutateSession(action: RemoteSessionMutation, sessionId: String) {
+        val state = mutableState.value
+        check(state.connection == ConnectionState.Connected) { "Connect to the desktop first." }
+        if (action == RemoteSessionMutation.Delete) {
+            check(state.tabs.none { it.sessionId == sessionId && it.state == RemoteTabState.Running } &&
+                state.sessionActivity[sessionId] !in setOf("output", "attention")) {
+                "This session is running. Close it before deleting it."
+            }
+        }
+        val payload = if (action == RemoteSessionMutation.Close) {
+            RemoteCommands.closeSession(sessionId, state.tabs.singleOrNull {
+                it.sessionId == sessionId && it.state == RemoteTabState.Running
+            }?.id)
+        } else RemoteCommands.session(sessionId)
+        try {
+            withTimeout(10_000) { requestResource(action.wire, payload) }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            throw RemoteProtocolException("No confirmation from the desktop. Refresh before trying again.")
+        }
+        refreshSessions()
+        refreshTabs()
+    }
+
     fun deleteSession(sessionId: String) = sessionMutation("session.delete", sessionId)
     fun forkSession(sessionId: String) = sessionMutation("session.fork", sessionId)
     fun stopSession(sessionId: String) = sessionMutation("session.stop", sessionId)
@@ -1018,13 +1046,13 @@ class RemoteClient(
     }
 
     /** Opens the requested terminal without exposing a previous selection to the UI. */
-    suspend fun openTerminalTarget(sessionId: String?, size: TerminalSize): String {
+    suspend fun openTerminalTarget(sessionId: String?, size: TerminalSize, projectPath: String? = null): String {
         val context = synchronized(lifecycleLock) {
             check(mutableState.value.connection == ConnectionState.Connected) { "Connect to the desktop first." }
             RequestContext(lifecycleGeneration, checkNotNull(transport))
         }
         val kind = if (sessionId == null) "tab.open" else "session.open"
-        val payload = if (sessionId == null) RemoteCommands.shell(null, null, size)
+        val payload = if (sessionId == null) RemoteCommands.shell(projectPath, null, size)
             else RemoteCommands.openSession(sessionId, size)
         val response = context.transport.request(kind, payload)
         try {
