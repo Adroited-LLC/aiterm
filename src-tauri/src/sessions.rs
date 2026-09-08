@@ -6412,7 +6412,9 @@ fn read_roster_uncached() -> Vec<RosterEntry> {
 }
 
 fn roster_from_cli() -> Vec<RosterEntry> {
-    let Ok(out) = std::process::Command::new("claude")
+    let Ok(out) = std::process::Command::new(
+        crate::agents::which("claude").unwrap_or_else(|| "claude".into()),
+    )
         .args(["agents", "--json"])
         .output()
     else {

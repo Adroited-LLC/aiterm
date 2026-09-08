@@ -1926,16 +1926,19 @@ pub fn clear_successor_session(
     )
 }
 
-/// Resolve `bin` against PATH, the way a shell would.
-///
-/// Deliberately not `which`/`command -v`: spawning a shell to ask whether a
-/// program exists costs more than the answer, and would make "is Codex
-/// installed?" a process spawn per backend per call.
+#[path = "cli_discovery.rs"]
+mod cli_discovery;
+use cli_discovery::is_executable_file;
+
+/// Resolve a CLI from PATH, then stable user and system install locations.
+/// This filesystem-only lookup also works when the desktop launcher omits
+/// ~/.local/bin and the user's rc file is intentionally not sourced.
 pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| is_executable_file(candidate))
+    cli_discovery::find_executable(
+        bin,
+        std::env::var_os("PATH").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
 }
 
 /// Ask the user's login shell where `bin` is.
@@ -1999,17 +2002,6 @@ pub(crate) fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Opti
         Ok(Ok(out)) if out.status.success() => Some(out.stdout),
         _ => None,
     }
-}
-
-#[cfg(unix)]
-fn is_executable_file(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(p: &std::path::Path) -> bool {
-    p.is_file()
 }
 
 /// Detection for a backend that is a command-line program.

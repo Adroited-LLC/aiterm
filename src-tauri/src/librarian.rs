@@ -332,7 +332,9 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
     let mut last_file: Option<std::path::PathBuf> = None;
     match agent {
         "claude" => {
-            cmd = std::process::Command::new("claude");
+            cmd = std::process::Command::new(
+                crate::agents::which("claude").unwrap_or_else(|| "claude".into()),
+            );
             cmd.args([
                 "-p",
                 "--output-format",
@@ -351,7 +353,9 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
             // Its stdout carries a token count; the reply itself goes to a
             // file of our naming.
             let f = dir.join(format!("codex-last-{}.txt", std::process::id()));
-            cmd = std::process::Command::new("codex");
+            cmd = std::process::Command::new(
+                crate::agents::which("codex").unwrap_or_else(|| "codex".into()),
+            );
             cmd.args(["exec", "--ephemeral", "--skip-git-repo-check", "-o"])
                 .arg(&f)
                 .arg("-");
@@ -364,7 +368,9 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
             let f = dir.join(format!("grok-prompt-{}.txt", std::process::id()));
             crate::providers::write_private(&f, &combined)
                 .map_err(|e| format!("could not stage the prompt: {e}"))?;
-            cmd = std::process::Command::new("grok");
+            cmd = std::process::Command::new(
+                crate::agents::which("grok").unwrap_or_else(|| "grok".into()),
+            );
             cmd.args(["--output-format", "plain", "--prompt-file"])
                 .arg(&f);
             if let Some(m) = model.filter(|m| !m.is_empty()) {
@@ -380,7 +386,9 @@ fn ask_cli(agent: &str, model: Option<&str>, system: &str, user: &str) -> Result
             // run still leaves a conversation in agy's store, which is why
             // it runs under the librarian's own directory.
             // [observed: agy 1.1.24]
-            cmd = std::process::Command::new("agy");
+            cmd = std::process::Command::new(
+                crate::agents::which("agy").unwrap_or_else(|| "agy".into()),
+            );
             cmd.arg(format!("-p={combined}"));
             cmd.args(["--output-format", "text", "--disable-slash-commands"]);
             if let Some(m) = model.filter(|m| !m.is_empty()) {
