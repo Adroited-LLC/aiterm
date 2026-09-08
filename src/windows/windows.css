@@ -19,3 +19,13 @@
 .wsl-path { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 7px; color: var(--text); font: inherit; user-select: text; }
 .wsl-app button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .wsl-connection-error { position: fixed; bottom: 0; left: 0; right: 0; z-index: 1000; padding: 12px; color: var(--text); background: var(--bg-raised); border-top: 1px solid var(--red); }
+
+/* Match the shared desktop spacing in Windows-only setup and folder dialogs. */
+.workspace-overlay { gap: 8px; padding: 32px; line-height: 1.6; }
+.wsl-setup-actions, .wsl-dialog-actions { flex-wrap: wrap; gap: 12px; }
+.wsl-dialog-actions { padding: 16px; }
+.wsl-folder-list { padding: 8px; }
+.wsl-folder-row { min-height: 36px; align-items: center; padding: 9px 12px; }
+.wsl-dialog .btn, .wsl-path { min-height: 36px; }
+.wsl-dialog { max-height: calc(100vh - 48px); overflow-y: auto; }
+.wsl-connection-error { padding: 16px 20px; line-height: 1.5; }

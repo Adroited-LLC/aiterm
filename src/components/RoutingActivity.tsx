@@ -93,10 +93,10 @@ export default function RoutingActivity({ prov }: { prov: ProviderView }) {
               <span className="acty-name">
                 <BrandIcon name={brandForName(h.name) ?? brandForName(h.slug)} size={12} className="inline" />
                 {h.name || "Unnamed host"}
-              </span>
               {why && (
                 <span className="acty-blocked" title={`Excluded: ${why}`}>now blocked</span>
               )}
+              </span>
               <span className="acty-n">{plural(h.requests, "request")}</span>
               <span className="acty-tok">{fmtTok(h.tokens)} tok</span>
               <span className="acty-usd">{fmtUsd(h.usage)}</span>

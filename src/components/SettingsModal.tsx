@@ -2,6 +2,7 @@ import { ReactNode, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { windowsWsl, getWorkspace } from "../platform";
+import { readableText } from "../themeContrast";
 import AppUpdates from "./AppUpdates";
 import ModelAccess from "./ModelAccess";
 import Icon from "./Icon";
@@ -81,6 +82,7 @@ function ThemeCard({ id, active, onPick }: { id: string; active: boolean; onPick
   return (
     <button
       className={"theme-card" + (active ? " on" : "")}
+      aria-pressed={active}
       onClick={onPick}
       style={{ background: t.vars.bgPanel, borderColor: active ? t.vars.accent : t.vars.border }}
     >
@@ -90,7 +92,7 @@ function ThemeCard({ id, active, onPick }: { id: string; active: boolean; onPick
         ))}
       </div>
       <div className="theme-card-name" style={{ color: t.vars.text }}>{t.name}</div>
-      <div className="theme-card-sub" style={{ color: t.vars.textFaint }}>Aa ❯ _</div>
+      <div className="theme-card-sub" style={{ color: readableText(t.vars.textFaint, [t.vars.bgPanel]) }}>Aa ❯ _</div>
     </button>
   );
 }
@@ -292,7 +294,7 @@ export default function SettingsModal({
 
   return (
     <div className="modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal settings-modal" ref={modalRef}>
+      <div className="modal settings-modal" ref={modalRef} role="dialog" aria-modal="true" aria-label="Settings">
 
         <nav className="sm-rail">
           <div className="sm-rail-title">Settings</div>
@@ -300,6 +302,7 @@ export default function SettingsModal({
             <button
               key={n.key}
               className={"sm-nav" + (tab === n.key ? " on" : "")}
+              aria-current={tab === n.key ? "page" : undefined}
               onClick={() => setTab(n.key)}
             >{n.label}</button>
           ))}

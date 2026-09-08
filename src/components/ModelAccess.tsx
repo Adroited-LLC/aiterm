@@ -748,8 +748,7 @@ export default function ModelAccess({ focusProvider }: Props) {
         <div className="set-label">{editing ? `Edit ${name}` : "Add a provider"}</div>
         {!editing && (
           <div className="set-hint">
-            Any OpenAI-compatible endpoint. The key is kept in
-            {" "}<code>~/.config/aiterm/providers.json</code> (0600) and never shown again.
+            Connect an OpenAI-compatible provider. Your API key is saved privately on this computer.
           </div>
         )}
         {!editing && (
@@ -766,19 +765,24 @@ export default function ModelAccess({ focusProvider }: Props) {
             ))}
           </div>
         )}
-        <input
-          className="set-input" placeholder="Name"
-          value={name} onChange={(e) => setName(e.target.value)}
-        />
-        <input
-          className="set-input" placeholder="Base URL — https://openrouter.ai/api/v1"
-          value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
-        />
-        <input
-          className="set-input" type="password" autoComplete="off"
-          placeholder={editing ? "API key — leave blank to keep the saved one" : "API key"}
-          value={apiKey} onChange={(e) => setApiKey(e.target.value)}
-        />
+        <div className="prov-fields">
+          <label className="prov-field">
+            Provider name
+            <input className="set-input" placeholder="e.g. OpenRouter"
+              value={name} onChange={(e) => setName(e.target.value)} />
+          </label>
+          <label className="prov-field">
+            Base URL
+            <input className="set-input" placeholder="https://openrouter.ai/api/v1"
+              value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+          </label>
+          <label className="prov-field prov-field-key">
+            API key
+            <input className="set-input" type="password" autoComplete="off"
+              placeholder={editing ? "Leave blank to keep the saved key" : "Enter your API key"}
+              value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+          </label>
+        </div>
         {error && <div className="set-notice">{error}</div>}
         <div className="prov-form-acts">
           <button className="set-done" disabled={busy} onClick={submit}>
@@ -790,7 +794,7 @@ export default function ModelAccess({ focusProvider }: Props) {
   );
 
   return (
-    <div className="set-section">
+    <div className="set-section model-access">
       {/* Two things live here and the page says which is which: the
           providers (accounts — a key and a URL), and for one of them at a
           time, its catalogue. */}
@@ -1102,6 +1106,7 @@ export default function ModelAccess({ focusProvider }: Props) {
             <input
               className="set-input mb-search"
               placeholder="Search models"
+              aria-label="Search models"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
@@ -1125,7 +1130,7 @@ export default function ModelAccess({ focusProvider }: Props) {
                 sorted now becomes what the browser opens with. Lit when the
                 current view is the saved one. */}
             <button
-              className={"act-btn mb-pin" + (isDefault ? " on" : "")}
+              className={"act-btn mb-default" + (isDefault ? " on" : "")}
               title={isDefault ? "This is the default view" : "Make this the default view"}
               onClick={pinDefault}
               disabled={isDefault}
@@ -1150,30 +1155,36 @@ export default function ModelAccess({ focusProvider }: Props) {
             <>
               <div className="mb-body">
                 <div className="mb-list">
+                  <div className="mb-list-head" aria-hidden="true">
+                    <span>Model</span><span>Context</span><span>Input / output¹</span>
+                  </div>
                   {shown.slice(0, limit).map((m) => (
                     <button
                       key={m.id}
                       className={"mb-item" + (sel?.id === m.id ? " on" : "")}
                       onClick={() => setPicked(m.id)}
+                      aria-pressed={sel?.id === m.id}
                     >
-                      <span className="mb-item-name" title={m.id}>
-                        <BrandIcon name={brandForModel(m.id)} size={13} className="inline" />
-                        {m.name ?? m.id}
+                      <span className="mb-identity">
+                        <span className="mb-item-name" title={m.id}>
+                          <BrandIcon name={brandForModel(m.id)} size={14} className="inline" />
+                          {m.name ?? m.id}
+                        </span>
+                        <span className="mb-item-tags">
+                          {browsingProv?.startup_models.includes(m.id) && (
+                            <span className="mb-star" title="On the startup list"><Icon of={Star} size="sm" fill="currentColor" /></span>
+                          )}
+                          {isFree(m) && <span className="mb-free">Free</span>}
+                          {sort === "used" && (usedBy?.get(m.id) ?? 0) > 0 && (
+                            <span title="Requests, last 30 days">{usedBy!.get(m.id)} requests</span>
+                          )}
+                          {sort === "newest" && m.created && <span title="Listed">{ago(m.created)}</span>}
+                        </span>
                       </span>
-                      {browsingProv?.startup_models.includes(m.id) && (
-                        <span className="mb-star" title="On the startup list"><Icon of={Star} size="sm" fill="currentColor" /></span>
-                      )}
-                      {isFree(m) && <span className="mb-free">free</span>}
                       <span className="mb-col mb-col-ctx" title="Context length">{fmtCtx(m.context_length)}</span>
                       <span className="mb-col mb-col-price" title="Input / output $ per million tokens">
-                        {isFree(m) ? "" : `${fmtPrice(m.prompt_price)} / ${fmtPrice(m.completion_price)}`}
+                        {isFree(m) ? "$0 / $0" : `${fmtPrice(m.prompt_price).replace("/M", "")} / ${fmtPrice(m.completion_price).replace("/M", "")}`}
                       </span>
-                      {sort === "used" && (usedBy?.get(m.id) ?? 0) > 0 && (
-                        <span className="mb-col mb-col-used" title="Requests, last 30 days">{usedBy!.get(m.id)}×</span>
-                      )}
-                      {sort === "newest" && m.created && (
-                        <span className="mb-col mb-col-used" title="Listed">{ago(m.created)}</span>
-                      )}
                     </button>
                   ))}
                   {shown.length === 0 && (
@@ -1192,7 +1203,7 @@ export default function ModelAccess({ focusProvider }: Props) {
                       {sel.name ?? sel.id}
                     </div>
                     <div className="mb-card-id">
-                      <code>{sel.id}</code>
+                      <code title={sel.id}>{sel.id}</code>
                       <button className="act-btn" onClick={() => copyId(sel.id)}>
                         {copied ? "Copied" : "Copy id"}
                       </button>
@@ -1205,9 +1216,24 @@ export default function ModelAccess({ focusProvider }: Props) {
                       onClick={() => toggleStartup(sel.id)}
                     >
                       {browsingProv?.startup_models.includes(sel.id)
-                        ? <><Icon of={Star} size="sm" fill="currentColor" /> On the startup list — remove</>
+                        ? <><Icon of={Star} size="sm" fill="currentColor" /> Remove from startup list</>
                         : <><Icon of={Star} size="sm" /> Add to startup list</>}
                     </button>
+                    <div className="mb-meta">
+                      <span className="mb-k">Context</span>
+                      <span className="mb-v">{fmtCtx(sel.context_length)}</span>
+                      <span className="mb-k">Input</span>
+                      <span className="mb-v">{fmtPrice(sel.prompt_price)}</span>
+                      <span className="mb-k">Output</span>
+                      <span className="mb-v">{fmtPrice(sel.completion_price)}</span>
+                      {sel.modalities.length > 0 && (
+                        <>
+                          <span className="mb-k">Accepts</span>
+                          <span className="mb-v">{sel.modalities.join(", ")}</span>
+                        </>
+                      )}
+                    </div>
+                    {sel.description && <div className="mb-desc">{sel.description}</div>}
                     {isOpenRouter && (
                       <div className="ep">
                         {browsingProv?.routes[sel.id]?.order[0] && (
@@ -1266,15 +1292,15 @@ export default function ModelAccess({ focusProvider }: Props) {
                                       <BrandIcon name={brandForName(e.provider_name)} size={12} className="inline" />
                                       {e.provider_name}
                                     </span>
-                                    <span className="ep-tag">{e.quantization ?? ""}</span>
-                                    <span className="ep-price">
+                                    <span className="ep-tag" data-label="Quantization">{e.quantization ?? ""}</span>
+                                    <span className="ep-price" data-label="In / out $/M">
                                       {fmtPrice(e.prompt_price)} / {fmtPrice(e.completion_price)}
                                     </span>
-                                    <span className="ep-ctx">{fmtCtx(e.context_length)}</span>
-                                    <span className="ep-up">
+                                    <span className="ep-ctx" data-label="Context">{fmtCtx(e.context_length)}</span>
+                                    <span className="ep-up" data-label="Uptime">
                                       {e.uptime_30m == null ? "—" : `${e.uptime_30m.toFixed(1)}%`}
                                     </span>
-                                    {e.excluded && <span className="ep-off">{e.excluded}</span>}
+                                    {e.excluded && <span className="ep-off" data-label="Excluded">{e.excluded}</span>}
                                   </button>
                                 ))}
                                 <div className="set-hint">
@@ -1313,24 +1339,11 @@ export default function ModelAccess({ focusProvider }: Props) {
                         )}
                       </div>
                     )}
-                    <div className="mb-meta">
-                      <span className="mb-k">Context</span>
-                      <span className="mb-v">{fmtCtx(sel.context_length)}</span>
-                      <span className="mb-k">Input</span>
-                      <span className="mb-v">{fmtPrice(sel.prompt_price)}</span>
-                      <span className="mb-k">Output</span>
-                      <span className="mb-v">{fmtPrice(sel.completion_price)}</span>
-                      {sel.modalities.length > 0 && (
-                        <>
-                          <span className="mb-k">Accepts</span>
-                          <span className="mb-v">{sel.modalities.join(", ")}</span>
-                        </>
-                      )}
-                    </div>
-                    {sel.description && <div className="mb-desc">{sel.description}</div>}
+
                   </div>
                 )}
               </div>
+              <div className="mb-price-note">¹ Prices in USD per million tokens.</div>
               <div className="mb-count">
                 {shown.length === all.length
                   ? `${all.length} models`

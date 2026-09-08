@@ -1,4 +1,5 @@
 /** App-wide appearance settings: theme, fonts, per-panel sizing. */
+import { readableText, onAccent } from "./themeContrast";
 import type { TimeFormat } from "./timefmt";
 import { setDisplayZone } from "./timefmt";
 
@@ -336,8 +337,10 @@ export function applySettings(s: AppSettings) {
   r.setProperty("--bg-active", t.vars.bgActive);
   r.setProperty("--border", t.vars.border);
   r.setProperty("--text", t.vars.text);
-  r.setProperty("--text-dim", t.vars.textDim);
-  r.setProperty("--text-faint", t.vars.textFaint);
+  const surfaces = [t.vars.bg, t.vars.bgPanel, t.vars.bgRaised, t.vars.bgHover, t.vars.bgActive];
+  r.setProperty("--text-dim", readableText(t.vars.textDim, surfaces, 5));
+  r.setProperty("--text-faint", readableText(t.vars.textFaint, surfaces));
+  r.setProperty("--accent-on", onAccent(s.accent ?? t.vars.accent));
   r.setProperty("--accent", s.accent ?? t.vars.accent);
   r.setProperty("--green", t.vars.green);
   r.setProperty("--red", t.vars.red);

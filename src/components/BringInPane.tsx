@@ -27,9 +27,7 @@ export default function BringInPane({ prompts, onChange }: {
           <Row
             label="Bring in a second agent"
             desc="Rounds are how many times the second agent speaks. With one, it reads the session and writes once; the first agent takes that in and carries on. With more, the first agent replies and they go back and forth, and the second agent's last message is handed back the same way. Nothing here limits what either may do; the second agent launches in whatever mode its engine is set to."
-          >
-            <span />
-          </Row>
+          />
         </div>
       </div>
       <div className="sgroup">
