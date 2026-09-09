@@ -52,7 +52,7 @@ import {
   reindexSessions, sessionFork, uiLog, usageReport,
   resolveResumableId, liveSessionIds, stopSession, unstoppableSessionIds, sessionMovedTo,
   drainSessionEvents,
-  sessionDelete, trashDelete, trashEmpty, trashList, trashRestore,
+  sessionDelete, sessionExternalOwners, trashDelete, trashEmpty, trashList, trashRestore,
   watchProject,
   adoptAgentSession, clearSuccessorSession, resolveLaunch,
   taskbarBadge,
@@ -230,6 +230,7 @@ function loadUsageCache(): UsageSourceAt[] {
 
 export default function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [externalOwners, setExternalOwners] = useState<Record<string, string>>({});
   const [activeProject, setActiveProject] = useState<string | null>(null);
   // Transient bottom toast (e.g. a resume with nothing resumable left).
   const [notice, setNotice] = useState<string | null>(null);
@@ -695,6 +696,7 @@ export default function App() {
   }, []);
   const refreshSessions = useCallback(() => {
     refreshSessionList();
+    sessionExternalOwners().then(setExternalOwners).catch(console.error);
     // Keep the full-text index warm in the background (30s poll only).
     reindexSessions().catch(() => {});
   }, [refreshSessionList]);
@@ -2058,7 +2060,8 @@ export default function App() {
     try {
       await sessionDelete(s.id);
     } catch (e) {
-      console.error("delete failed:", e);
+      setNotice(`Could not delete "${s.title}": ${e}`);
+      return;
     }
     setPreviewSession((p) => (p?.id === s.id ? null : p));
     refreshSessions();
@@ -2069,17 +2072,17 @@ export default function App() {
    *  same directory at once is how a half-moved session happens. One refresh at
    *  the end, so the sidebar redraws once instead of thirty times.
    *
-   *  Failures are counted and reported. A per-row delete can afford to fail
-   *  quietly — you can see the row is still there — but in a set of thirty,
-   *  four that did not move would be invisible. */
+   *  Failures include their reason so an externally open session is explained. */
   const trashSessions = async (list: Session[]) => {
     if (list.length === 0) return;
     let failed = 0;
+    let firstFailure = "";
     for (const s of list) {
       try {
         await sessionDelete(s.id);
       } catch (e) {
         failed += 1;
+        if (!firstFailure) firstFailure = `"${s.title}": ${e}`;
         uiLog(`bulk trash failed for ${s.id}: ${e}`);
       }
     }
@@ -2089,7 +2092,7 @@ export default function App() {
     setNotice(
       failed === 0
         ? `Moved ${moved} session${moved === 1 ? "" : "s"} to the trash.`
-        : `Moved ${moved} of ${list.length}; ${failed} could not be trashed.`,
+        : `Moved ${moved} of ${list.length}; ${failed} could not be trashed. ${firstFailure}`,
     );
   };
 
@@ -2608,6 +2611,7 @@ export default function App() {
               <SessionsPanel
                 hoverSummary={settings.sessionHover}
                 sessions={sessions}
+                externalOwners={externalOwners}
                 projects={projects}
                 activeProject={activeProject}
                 liveSlots={new Set(tabs.map((t) => t.slotId))}

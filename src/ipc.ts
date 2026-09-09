@@ -150,6 +150,8 @@ export const relayReport = (
 ) => invoke<void>("relay_report", {
   sessionId, bSessionId, bName, phase, round, rounds, note,
 });
+export const sessionExternalOwners = () =>
+  invoke<Record<string, string>>("session_external_owners");
 export const sessionDelete = (sessionId: string) =>
   invoke<void>("session_delete", { sessionId });
 

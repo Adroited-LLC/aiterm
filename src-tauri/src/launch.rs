@@ -98,6 +98,9 @@ pub fn resolve(request: LaunchRequest) -> Option<LaunchPlan> {
 /// command presents. Kept transport-independent so the remote agent/session
 /// adapters and desktop command cannot drift in launch semantics.
 pub fn resolve_result(request: LaunchRequest) -> Result<LaunchPlan, String> {
+    if let LaunchRequest::Resume { session_id } | LaunchRequest::Restart { session_id } = &request {
+        crate::agents::external_sessions::ensure_available(session_id)?;
+    }
     let list = crate::agents::backends();
     let providers = crate::providers::load_providers();
     resolve_result_with(&list, &providers, request, |backend| {

@@ -1204,6 +1204,7 @@ pub(crate) fn session_delete_service(session_id: &str) -> Result<(), String> {
 }
 
 fn session_delete_sync(session_id: String) -> Result<(), String> {
+    crate::agents::external_sessions::ensure_available(&session_id)?;
     if session_id.contains('/') || session_id.contains("..") {
         return Err("invalid session id".into());
     }
@@ -9735,6 +9736,11 @@ mod tests {
         );
         assert_eq!(s.group_path, "/home/x/proj");
     }
+}
+
+#[cfg_attr(not(aiterm_headless), tauri::command)]
+pub async fn session_external_owners() -> std::collections::HashMap<String, String> {
+    crate::run_blocking(crate::agents::external_sessions::owners).await
 }
 
 #[cfg_attr(not(aiterm_headless), tauri::command)]

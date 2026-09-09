@@ -113,6 +113,7 @@ interface DragArm {
 
 interface Props {
   sessions: Session[];
+  externalOwners?: Record<string, string>;
   projects: ProjectInfo[];
   activeProject: string | null;
   /** Slot ids aiterm has a terminal tab open for. Tab ownership only — NOT
@@ -190,7 +191,7 @@ interface Props {
 const RECENT_WINDOW = 80;
 
 export default function SessionsPanel({
-  sessions, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
+  sessions, externalOwners = {}, projects, activeProject, liveSlots, liveSessions, runningSlots, attentionSlots,
   attentionText, progressSlots, activeSlot, rekey, opts,
   capsOf, onOptsChange, onSelect, onResume, onFork, onClear, onExit, onNewShell, onDelete,
   onOpenModelAccess, onSelectProject, onProjectShell, onProjectClaude, onNewSession,
@@ -328,12 +329,16 @@ export default function SessionsPanel({
   // so the card never runs off the bottom.
   const [fly, setFly] = useState<{ s: Session; top?: number; bottom?: number; left: number } | null>(null);
   const flyTimer = useRef<number | null>(null);
+  const flyRequest = useRef(0);
   const flyCache = useRef<Map<string, SessionDetail>>(new Map());
   const [flyDetail, setFlyDetail] = useState<SessionDetail | null>(null);
   const flyEnter = (s: Session, el: HTMLElement, running: boolean) => {
     if (!hoverSummary) return;
+    const request = ++flyRequest.current;
     if (flyTimer.current) window.clearTimeout(flyTimer.current);
     flyTimer.current = window.setTimeout(() => {
+      flyTimer.current = null;
+      if (!el.isConnected) return;
       const r = el.getBoundingClientRect();
       const panel = el.closest(".panel")?.getBoundingClientRect();
       const left = (panel?.right ?? r.right) + 8;
@@ -347,10 +352,11 @@ export default function SessionsPanel({
         sessionDetail(s.id).then((d) => {
           if (!d) return;
           flyCache.current.set(s.id, d);
+          if (request !== flyRequest.current) return;
           setFlyDetail((cur) => (cur === null || cur.id === d.id ? d : cur));
         }).catch(() => {});
       }
-    }, 450);
+    }, 1000);
   };
   // Leaving the row does not close the card at once: the pointer needs the
   // gap between row and card to cross into it, and once in it the card is
@@ -368,11 +374,28 @@ export default function SessionsPanel({
     // Anything that moves the row from under the pointer closes the card —
     // except acting inside the card itself, which is selecting its text.
     const inCard = (e: Event) => (e.target as HTMLElement | null)?.closest?.(".sfly") != null;
-    const close = (e: Event) => { if (!inCard(e)) setFly(null); };
+    const dismiss = () => {
+      if (flyTimer.current !== null) window.clearTimeout(flyTimer.current);
+      if (flyClose.current !== null) window.clearTimeout(flyClose.current);
+      flyTimer.current = flyClose.current = null;
+      ++flyRequest.current;
+      setFly(null);
+    };
+    const close = (e: Event) => { if (!inCard(e)) dismiss(); };
+    const hidden = () => { if (document.hidden) dismiss(); };
+    window.addEventListener("blur", dismiss);
+    document.addEventListener("mouseleave", dismiss);
+    document.addEventListener("visibilitychange", hidden);
     window.addEventListener("scroll", close, true);
     window.addEventListener("pointerdown", close, true);
     window.addEventListener("keydown", close, true);
     return () => {
+      if (flyTimer.current !== null) window.clearTimeout(flyTimer.current);
+      if (flyClose.current !== null) window.clearTimeout(flyClose.current);
+      ++flyRequest.current;
+      window.removeEventListener("blur", dismiss);
+      document.removeEventListener("mouseleave", dismiss);
+      document.removeEventListener("visibilitychange", hidden);
       window.removeEventListener("scroll", close, true);
       window.removeEventListener("pointerdown", close, true);
       window.removeEventListener("keydown", close, true);
@@ -867,7 +890,7 @@ export default function SessionsPanel({
         key={s.id}
         data-item={container ? s.id : undefined}
         data-container={container}
-        onMouseEnter={(e) => { if (!isDragging) flyEnter(s, e.currentTarget, isRunning); }}
+        onMouseEnter={(e) => { if (!isDragging && e.buttons === 0) flyEnter(s, e.currentTarget, isRunning); }}
         onMouseLeave={flyLeave}
         onPointerDown={(e) => {
           if (e.button !== 0 || !container || searchList) return;
@@ -968,6 +991,11 @@ export default function SessionsPanel({
             })()}
             {opts.showTime && <span className="session-time" title={fullTime(s.last_active)}>{fmtTimeShort(s.last_active, timeFormat)}</span>}
           </div>
+          {externalOwners[s.id] && (
+            <div className="session-meta" title="Close the session in that app before resuming or deleting it in AITerm.">
+              Open in {externalOwners[s.id]}
+            </div>
+          )}
           {(opts.showPath || (opts.showBranch && s.branch)) && (
             <div className="session-meta">
               {opts.showPath && (

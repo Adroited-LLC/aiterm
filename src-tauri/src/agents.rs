@@ -1926,6 +1926,9 @@ pub fn clear_successor_session(
     )
 }
 
+#[path = "external_sessions.rs"]
+pub(crate) mod external_sessions;
+
 #[path = "cli_discovery.rs"]
 mod cli_discovery;
 use cli_discovery::is_executable_file;
