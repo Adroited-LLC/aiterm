@@ -2235,7 +2235,7 @@ private fun ConversationTurn(message: RemotePreviewMessage) {
             }
         }
         "assistant" -> Column(Modifier.fillMaxWidth().padding(end = 14.dp)) {
-            ConversationMarkdown(message.text)
+            AssistantMarkdown(message.text)
         }
         "thinking" -> Text(
             message.text,

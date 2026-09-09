@@ -115,3 +115,9 @@ of a substituted desktop TLS identity after relay provisioning. An
 isolated WSL service completed a real relay enrollment and approval exchange;
 its temporary relay route was deleted afterward (HTTP 204). The installed Linux
 desktop and Linux Rust sources were not changed for this fix.
+
+## Memory references in assistant replies
+
+Android 0.3.27 renders a recognized Codex memory-citation footer as a collapsed Memory references section. Expanding it shows source file/line references and their notes, without the raw XML wrapper or rollout identifiers. Live spine rows, history fallback, and Copy/Share use the same parsing. User messages, code examples, unsupported markup, and incomplete footers remain unchanged; stored and transported conversation text is preserved.
+
+Validation: all 322 Android unit tests, APK assembly, and lint passed. The five new regressions cover the reported footer, multiple source ranges, malformed/incomplete input, code examples, and assistant-only Copy/Share normalization. No device installation was performed.

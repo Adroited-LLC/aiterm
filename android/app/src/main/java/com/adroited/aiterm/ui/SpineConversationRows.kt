@@ -185,7 +185,7 @@ private fun SpineAgentBlock(item: Item.AgentText, onLongPress: () -> Unit) {
     Column(
         Modifier.fillMaxWidth().stationaryMessageHold(onLongPress).padding(end = 14.dp),
     ) {
-        ConversationMarkdown(item.text)
+        AssistantMarkdown(item.text)
         if (!item.done) SpineCaret()
     }
 }
