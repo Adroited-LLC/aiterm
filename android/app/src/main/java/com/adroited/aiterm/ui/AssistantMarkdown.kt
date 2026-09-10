@@ -66,6 +66,11 @@ internal fun assistantContent(text: String): AssistantContent {
 
 @Composable
 internal fun AssistantMarkdown(text: String) {
+    val tools = remember(text) { externalAgentTools(text, "assistant", 0L) }
+    if (tools != null) {
+        Column { tools.forEach { SpineToolCard(it) } }
+        return
+    }
     val content = remember(text) { assistantContent(text) }
     var expanded by rememberSaveable { mutableStateOf(false) }
     Column {

@@ -105,7 +105,7 @@ internal fun spineTimeline(items: List<Item>): List<SpineTimelineItem> {
         if (activity.isNotEmpty()) result += SpineTimelineItem.Activity(activity.toList())
         activity.clear()
     }
-    items.forEach { item ->
+    normalizeExternalTools(items).forEach { item ->
         if (item is Item.Tool || (item is Item.AgentText && parseSubagentMessage(item.text) != null)) {
             activity += item
         } else {
@@ -224,7 +224,7 @@ private fun SpineSubagentCard(id: String, message: SubagentMessage, onLongPress:
         if (expanded && hasPayload) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
             Box(Modifier.padding(horizontal = 11.dp, vertical = 9.dp)) {
-                ConversationMarkdown(message.payload)
+                AssistantMarkdown(message.payload)
             }
         }
     }
@@ -330,7 +330,7 @@ private fun SpineActivityGroup(activity: SpineTimelineItem.Activity, onLongPress
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SpineToolCard(item: Item.Tool) {
+internal fun SpineToolCard(item: Item.Tool) {
     var expanded by rememberSaveable(item.id) { mutableStateOf(false) }
     val output = item.output?.takeIf(String::isNotBlank)
     Column(
@@ -415,6 +415,7 @@ private fun ToolStatusMark(status: ToolStatus) {
             tint = MaterialTheme.colorScheme.error,
             modifier = Modifier.size(15.dp),
         )
+        ToolStatus.Recorded -> Text("Recorded", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelSmall)
         ToolStatus.Cancelled -> StatusDot(MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

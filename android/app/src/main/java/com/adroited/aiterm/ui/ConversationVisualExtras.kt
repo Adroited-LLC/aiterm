@@ -66,7 +66,7 @@ import kotlinx.coroutines.launch
 internal fun timelineText(row: SpineTimelineItem): String = when (row) {
     is SpineTimelineItem.Row -> when (val item = row.item) {
         is Item.User -> splitConversationAttachments(item.text).text
-        is Item.AgentText -> assistantContent(item.text).copyText()
+        is Item.AgentText -> assistantCopyText(item.text)
         is Item.Thought -> item.text
         is Item.Tool -> listOf(item.title.ifBlank { item.tool }, item.input, item.output.orEmpty())
             .filter(String::isNotBlank).joinToString("\n\n")

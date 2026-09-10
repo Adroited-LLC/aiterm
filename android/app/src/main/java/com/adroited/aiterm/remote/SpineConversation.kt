@@ -65,9 +65,9 @@ enum class ToolCategory(val wire: String) {
 }
 
 enum class ToolStatus(val wire: String) {
-    Pending("pending"), Running("running"), Completed("completed"), Failed("failed"), Cancelled("cancelled");
+    Pending("pending"), Running("running"), Completed("completed"), Failed("failed"), Cancelled("cancelled"), Recorded("recorded");
 
-    val settled: Boolean get() = this == Completed || this == Failed || this == Cancelled
+    val settled: Boolean get() = this == Completed || this == Failed || this == Cancelled || this == Recorded
 
     companion object {
         fun from(value: String?): ToolStatus = entries.firstOrNull { it.wire == value } ?: Pending
