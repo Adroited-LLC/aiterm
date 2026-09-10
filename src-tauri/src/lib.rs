@@ -17,6 +17,7 @@ pub mod indexer;
 pub mod iroh_tunnel;
 pub mod launch;
 pub mod librarian;
+mod linux_graphics;
 pub mod markdown;
 pub mod mcp;
 pub mod notify;
@@ -51,8 +52,14 @@ pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'sta
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    let injected_nv_explicit_sync = linux_graphics::apply_workaround();
+
+    #[cfg(not(target_os = "linux"))]
+    let injected_nv_explicit_sync = false;
+
     trace::init();
-    let pty = pty::PtyManager::default();
+    let pty = pty::PtyManager::with_injected_explicit_sync_workaround(injected_nv_explicit_sync);
     let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
     // The spine's epoch is set the moment this is built: a phone that sees a
     // new one knows the desktop restarted and its seq numbers started over.

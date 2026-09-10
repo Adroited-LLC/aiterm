@@ -90,6 +90,7 @@ impl<T> PtyTable<T> {
 pub struct PtyManager {
     ptys: PtyTable<PtyInstance>,
     next_id: Arc<AtomicU32>,
+    injected_nv_explicit_sync: bool,
 }
 
 /// Receives the lifetime of one spawned PTY.
@@ -207,6 +208,12 @@ fn reap_failed_spawn(child: &mut dyn portable_pty::Child) {
 }
 
 impl PtyManager {
+    pub(crate) fn with_injected_explicit_sync_workaround(injected: bool) -> Self {
+        Self {
+            injected_nv_explicit_sync: injected,
+            ..Self::default()
+        }
+    }
     /// Spawn one PTY and deliver its bytes and terminal exit to `sink`.
     ///
     /// The passed sink is the single owner of output and exit delivery for this
@@ -225,6 +232,12 @@ impl PtyManager {
             }
             None => CommandBuilder::new(&shell),
         };
+
+        if self.injected_nv_explicit_sync {
+            // If the application injected the workaround, remove it from PTY children
+            // so the setting does not leak into programs launched from the terminal.
+            cmd.env_remove("__NV_DISABLE_EXPLICIT_SYNC");
+        }
         describe_terminal(&mut cmd);
         scrub_agent_markers(&mut cmd);
         // A provider-backed tab (OpenCode on an OpenRouter model) gets the key as
