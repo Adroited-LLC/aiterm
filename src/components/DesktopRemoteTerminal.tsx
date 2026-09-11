@@ -2,7 +2,9 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { ArrowDown } from "lucide-react";
 import { type AppSettings, termFontFamily, termTheme } from "../settings";
-import { desktopInput, desktopResize, desktopScrollback, remoteScreenAnsi, type RemoteClientView } from "../desktopRemote";
+import { desktopType, desktopResize, desktopScrollback, remoteScreenAnsi, type RemoteClientView } from "../desktopRemote";
+import { makeWriteQueue } from "../writeQueue";
+import { onTerminalInput } from "../terminalUserInput";
 import type { RemoteRow } from "../desktopRemoteScreen";
 
 /** Keep the host's grid intact. Scrolling this viewport never sends input or
@@ -102,11 +104,20 @@ export default function DesktopRemoteTerminal({ view, settings, onError }: { vie
       node.scrollLeft += event.deltaX * unit;
     };
     node.addEventListener("wheel", wheel, { capture: true, passive: false });
-    const data = term.onData(value => {
-      if (current.current.has_focus && current.current.connection === "connected") {
-        goLive();
-        void desktopInput(value).catch(e => error.current(String(e)));
-      }
+    const type = makeWriteQueue<{ attachment: string; cols: number; rows: number }>(async (target, value) => {
+      if (disposed || current.current.connection !== "connected" || current.current.attachment_id !== target.attachment) throw new Error("Terminal connection changed; input was not replayed");
+      await desktopType(value, target.cols, target.rows, target.attachment);
+    }, target => target.attachment);
+    const data = onTerminalInput(term, (value, user) => {
+      const v = current.current;
+      if (!user || v.connection !== "connected" || !v.attachment_id) return;
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
+      if (!screen) return;
+      const rect = screen.getBoundingClientRect();
+      const cols = Math.min(512, Math.max(2, Math.floor((node.clientWidth - 40) / (rect.width / term.cols))));
+      const rows = Math.min(512, Math.max(2, Math.floor((node.clientHeight - 32) / (rect.height / term.rows))));
+      goLive();
+      void type({attachment: v.attachment_id, cols, rows}, value).catch(e => { if (!disposed) error.current(String(e)); });
     });
     return () => {
       disposed = true; clearTimeout(timer); observer.disconnect(); rendered.dispose(); data.dispose();
@@ -118,12 +129,12 @@ export default function DesktopRemoteTerminal({ view, settings, onError }: { vie
   useEffect(() => {
     const term = terminal.current;
     if (!term) return;
-    term.options.disableStdin = !view.has_focus || view.connection !== "connected";
+    term.options.disableStdin = view.connection !== "connected" || !view.attachment_id;
     if (view.screen) {
       if (term.cols !== view.screen.cols || term.rows !== view.screen.rows) term.resize(view.screen.cols, view.screen.rows);
       term.write(remoteScreenAnsi(view.screen));
     } else term.write("\x1b[0m\x1b[2J\x1b[H");
-  }, [view.screen?.revision, view.screen?.tab_id, view.has_focus, view.connection, settings.themeId, settings.termFont, settings.termFontSize]);
+  }, [view.screen?.revision, view.screen?.tab_id, view.has_focus, view.attachment_id, view.connection, settings.themeId, settings.termFont, settings.termFontSize]);
 
   useEffect(() => { goLive(); }, [view.connection]);
 

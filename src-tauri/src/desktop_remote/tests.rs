@@ -283,6 +283,28 @@ async fn real_gateway_auth_snapshot_focus_input_scrollback_and_reconnect() {
         !connection.shared.view.lock().unwrap().has_focus,
         "reconnect must not reclaim input"
     );
+    let attachment = connection.attachment.as_ref().unwrap().1.clone();
+    let (typed, result) = job(
+        &connection,
+        Action::Type("first typed input".into(), 45, 12, attachment),
+    );
+    connection.job(typed).await.unwrap();
+    drain_until(&mut connection, |c| {
+        !c.pending.values().any(|p| p.kind == "terminal.input")
+    })
+    .await;
+    assert!(result.await.unwrap().is_ok());
+    drain_until(&mut connection, |c| c.shared.view.lock().unwrap().has_focus).await;
+    assert_eq!(
+        pty.writes.lock().unwrap().last().unwrap(),
+        b"first typed input"
+    );
+    let (stale, result) = job(
+        &connection,
+        Action::Type("wrong attachment".into(), 45, 12, "old".into()),
+    );
+    connection.job(stale).await.unwrap();
+    assert!(result.await.unwrap().is_err());
     connection.socket.close(None).await.ok();
     drop(connection);
     registry.close(&tab).ok();

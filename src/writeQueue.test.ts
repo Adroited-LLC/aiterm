@@ -122,3 +122,18 @@ test("different attachment identities drain independently", () => {
     { target: { tabId: "tab-a", attachmentId: "desktop-b" }, data: "right" },
   ]);
 });
+
+test("a failed burst discards queued keys instead of replaying them on later input", async () => {
+  let reject!: (e: Error) => void;
+  const sent: string[] = [];
+  const write = makeWriteQueue<number>(async (_, data) => {
+    sent.push(data);
+    if (sent.length === 1) await new Promise<void>((_, no) => { reject = no; });
+  });
+  const first = write(1, 'first');
+  const queued = write(1, 'must not replay');
+  reject(new Error('connection changed'));
+  await assert.rejects(first); await assert.rejects(queued);
+  await write(1, 'new input');
+  assert.deepEqual(sent, ['first', 'new input']);
+});

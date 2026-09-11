@@ -6,7 +6,7 @@ AiTerm can view and control another computer’s live terminal sessions through 
 2. Under **Pair a device**, choose **Save pairing file**. Transfer that file to the other computer and open it within five minutes.
 3. On the client, choose the monitor button (**Connected desktops**) in the top toolbar, then **Pair another desktop**. Enter the client’s device name and open the pairing file.
 4. Approve the request on the host. The client saves its own key and the host’s pinned identity.
-5. Select a desktop and live session. Choose **Take control** to type. Scroll with the mouse or trackpad to read the screen and load earlier output, even while viewing. **Back to live** returns to the prompt; typing while in control also returns there. **Give back control** returns to viewing without ending the session. The host can reclaim input by clicking its terminal. **This desktop** disconnects and returns to local sessions.
+5. Select a desktop and live session. Start typing to take control automatically; the first keystroke is included. Typing on the host takes control back. You can also choose **Take control** explicitly. Scroll with the mouse or trackpad to read the screen and load earlier output, even while viewing. **Back to live** returns to the prompt; typing while in control also returns there. **Give back control** returns to viewing without ending the session. The host reclaims input when you type or paste there. Clicking and scrolling do not take control. **This desktop** disconnects and returns to local sessions.
 
 Pairing files are single-use invitations, expire after five minutes, and are written with private file permissions. They are not session archives. The host retains approval and revocation controls under Remote Access. Forgetting a pairing only removes the client’s saved identity; revoke the trusted device on the host to remove its authorization there.
 
@@ -16,8 +16,12 @@ Pairing files are single-use invitations, expire after five minutes, and are wri
 
 The client uses the existing `/v1/ws` gateway, `tab.list`, `session.roster`, and `terminal.*` operations. LAN/VPN addresses and the saved TLS relay route are tried with the same SPKI pin. Iroh and direct QUIC optimization are not implemented in the desktop client; use the AITerm network stack for desktop pairing.
 
+The monitor button reconnects to the last desktop and restores its last live session. This choice is saved across app restarts. If the host restarted, the client matches the agent session ID to its new live tab; closed sessions are not reopened automatically.
+
 Reconnects authenticate again and recover the selected terminal with a new attachment and snapshot. They do not automatically take input control. Queued input is bound to the connection generation, reconnect attempt, selected tab, and terminal attachment; stale or canceled requests are rejected, and writes are never replayed. A lost write acknowledgement is reported as a connection change rather than retried.
 
 Tests exercise the real TLS gateway for pairing approval, authentication, terminal attachment, focus, input, history, and reattachment after a disconnect. Additional tests cover certificate pinning, route validation, private identity storage, stale input, and safe screen rendering.
 
 The viewer preserves the host’s terminal grid. A smaller client viewport opens at the bottom and scrolls locally without resizing the host. Taking control fits the terminal to the client window. Repaints erase stale cells, and output updates preserve the viewer’s reading position. Earlier output is fetched on demand in bounded pages; returning to live refreshes that history on the next browse.
+
+Automatic control on typing requires the updated gateway (Linux 0.10.97 or newer). The optional `terminal.input.focus_size` field lets the gateway acquire focus, resize and write the input under one ordering lock. Older Android clients keep their existing explicit-focus protocol. Terminal parser replies never request focus, and failed queued input is discarded instead of replayed.

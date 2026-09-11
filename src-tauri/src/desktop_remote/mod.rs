@@ -1,5 +1,6 @@
 //! Desktop client of the existing device gateway. Network, keys, recovery and
 //! terminal state stay in Rust; the renderer receives a display-only projection.
+mod navigation;
 mod store;
 mod transport;
 use crate::{
@@ -42,8 +43,7 @@ pub struct ClientView {
     pub scrollback: Vec<crate::terminal::model::ScreenRow>,
     #[serde(skip)]
     epoch: u64,
-    #[serde(skip)]
-    attachment_id: Option<String>,
+    pub attachment_id: Option<String>,
 }
 struct Shared {
     view: Mutex<ClientView>,
@@ -256,6 +256,22 @@ pub async fn desktop_client_disconnect() {
     });
 }
 #[cfg_attr(not(aiterm_headless), tauri::command)]
+pub async fn desktop_client_restore() -> Result<(), String> {
+    if shared().view.lock().unwrap().connection != "disconnected" {
+        return Ok(());
+    }
+    let desktops = store::load()?;
+    let nav = navigation::load()?;
+    let id = nav
+        .desktop_id
+        .filter(|id| desktops.iter().any(|d| &d.id == id))
+        .or_else(|| (desktops.len() == 1).then(|| desktops[0].id.clone()));
+    if let Some(id) = id {
+        desktop_client_connect(id).await?;
+    }
+    Ok(())
+}
+#[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn desktop_client_connect(id: String) -> Result<(), String> {
     let desktop = store::load()?
         .into_iter()
@@ -292,6 +308,7 @@ enum Action {
     Attach(String),
     Focus,
     Input(String),
+    Type(String, u16, u16, String),
     Resize(u16, u16),
     Scrollback(usize),
 }
@@ -357,6 +374,19 @@ pub async fn desktop_client_input(data: String) -> Result<(), String> {
         return Err("Terminal input is empty or too large".into());
     }
     dispatch(Action::Input(data)).await
+}
+#[cfg_attr(not(aiterm_headless), tauri::command)]
+pub async fn desktop_client_type(
+    data: String,
+    cols: u16,
+    rows: u16,
+    attachment_id: String,
+) -> Result<(), String> {
+    if data.is_empty() || data.len() > 65536 {
+        return Err("Terminal input is empty or too large".into());
+    }
+    crate::remote::model::TerminalSize::try_new(cols, rows).map_err(|e| e.to_string())?;
+    dispatch(Action::Type(data, cols, rows, attachment_id)).await
 }
 #[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn desktop_client_resize(cols: u16, rows: u16) -> Result<(), String> {
@@ -470,6 +500,7 @@ impl Connection {
             v.attachment_id = None;
             v.scrollback.clear();
             v.has_focus = false;
+            v.error = None;
         });
         self.request(
             "terminal.attach",
@@ -505,6 +536,14 @@ impl Connection {
             let _ = job.reply.send(Err("Select a live session first".into()));
             return Ok(());
         };
+        if let Action::Type(_, _, _, expected) = &job.action {
+            if expected != &id {
+                let _ = job.reply.send(Err(
+                    "Terminal attachment changed; input was not replayed".into()
+                ));
+                return Ok(());
+            }
+        }
         let focused = self.shared.view.lock().unwrap().has_focus;
         if matches!(job.action, Action::Input(_) | Action::Resize(..)) && !focused {
             let _ = job
@@ -530,9 +569,11 @@ impl Connection {
                     )?,
                 )
             }
-            Action::Input(data) => {
+            Action::Input(data) | Action::Type(data, ..) => {
                 #[derive(Serialize)]
                 struct Input {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    focus_size: Option<crate::remote::model::TerminalSize>,
                     tab_id: String,
                     attachment_id: String,
                     #[serde(with = "serde_bytes")]
@@ -541,6 +582,13 @@ impl Connection {
                 (
                     "terminal.input",
                     transport::encode(&Input {
+                        focus_size: match &job.action {
+                            Action::Type(_, cols, rows, _) => Some(
+                                crate::remote::model::TerminalSize::try_new(*cols, *rows)
+                                    .map_err(|e| e.to_string())?,
+                            ),
+                            _ => None,
+                        },
                         tab_id: tab,
                         attachment_id: id,
                         data: data.as_bytes().to_vec(),
@@ -695,6 +743,30 @@ impl Connection {
                                     .map_err(|_| "Invalid attachment identity")?,
                             ),
                     );
+                    let selected = {
+                        let v = self.shared.view.lock().unwrap();
+                        v.desktop_id.clone().map(|desktop| {
+                            (
+                                desktop,
+                                navigation::Selection {
+                                    tab_id: tab.clone(),
+                                    session_id: v
+                                        .tabs
+                                        .iter()
+                                        .find(|t| t["id"] == tab)
+                                        .and_then(|t| t["sessionId"].as_str())
+                                        .map(str::to_owned),
+                                },
+                            )
+                        })
+                    };
+                    if let Some((desktop, selection)) = selected {
+                        if let Err(error) = navigation::remember(&desktop, Some(selection)) {
+                            self.shared.publish(self.generation, |v| {
+                                v.error = Some(format!("Could not remember this session: {error}"))
+                            });
+                        }
+                    }
                     self.attachment = Some((tab, id.clone()));
                     self.shared.publish(self.generation, |v| {
                         v.attachment_id = Some(id);
@@ -778,7 +850,23 @@ async fn connection_loop(
                 assembler: None, shared: shared.clone(), generation, epoch,
             };
             connection.refresh().await?;
-            if let Some(tab) = selected { connection.attach(tab, None).await?; }
+            // Resolve against a fresh roster, including session IDs after host restarts.
+            while connection.pending.values().any(|p| p.kind == "tab.list") {
+                let bytes = tokio::time::timeout(Duration::from_secs(10), transport::receive(&mut connection.socket)).await.map_err(|_| "Desktop session list timed out")??;
+                connection.frame(&bytes)?;
+            }
+            let navigation = navigation::load().unwrap_or_default();
+            let saved = navigation.sessions.get(&desktop.id);
+            let tab = navigation::resolve(&shared.view.lock().unwrap().tabs, selected.as_deref(), saved);
+            if let Err(error) = navigation::remember(&desktop.id, None) {
+                shared.publish(generation, |v| v.error = Some(format!("Could not remember this desktop: {error}")));
+            }
+            if let Some(tab) = tab { connection.attach(tab, None).await?; }
+            else { shared.publish(generation, |v| {
+                v.selected_tab = None;
+                if saved.is_some() { v.error = Some("The previous session is no longer open. Choose a live session.".into()); }
+            }); }
+
             let mut refresh = tokio::time::interval(Duration::from_secs(4));
             let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
             let mut last_frame = Instant::now();

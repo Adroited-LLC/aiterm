@@ -532,13 +532,13 @@ export const tabAttachDesktop = (
 export const tabDetach = (tabId: TabId, attachmentId: AttachmentId) =>
   invoke<void>("tab_detach", { tabId, attachmentId });
 
-type TabWriteTarget = { tabId: TabId; attachmentId: AttachmentId };
+type TabWriteTarget = { tabId: TabId; attachmentId: AttachmentId; focusSize?: { cols: number; rows: number } };
 const queuedTabWrite = makeWriteQueue<TabWriteTarget>(
   (target, data) => invoke<void>("tab_write", { ...target, data }),
-  (target) => `${target.tabId}\0${target.attachmentId}`,
+  (target) => `${target.tabId}\0${target.attachmentId}\0${!!target.focusSize}`,
 );
-export const tabWrite = (tabId: TabId, attachmentId: AttachmentId, data: string) =>
-  queuedTabWrite({ tabId, attachmentId }, data);
+export const tabWrite = (tabId: TabId, attachmentId: AttachmentId, data: string, focusSize?: { cols: number; rows: number }) =>
+  queuedTabWrite({ tabId, attachmentId, focusSize }, data);
 
 const pendingTabSize = new Map<string, {
   target: TabWriteTarget;

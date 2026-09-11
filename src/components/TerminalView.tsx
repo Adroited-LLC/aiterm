@@ -11,6 +11,7 @@ import {
 } from "../ipc";
 import { boldWeightFor } from "../settings";
 import { createTabExitCatchUp } from "../tabModel";
+import { onTerminalInput } from "../terminalUserInput";
 import { TerminalInputLine } from "../terminalInput";
 import { projectTerminalGrid } from "../terminalSizing";
 import { terminalLinkHandler } from "../terminalLinks";
@@ -188,7 +189,6 @@ export default function TerminalView({
   activeRef.current = active;
   const focusRef = useRef(tab.focus ?? "desktop");
   const canonicalSizeRef = useRef(tab.size);
-  const takeFocusRef = useRef<(() => void) | null>(null);
   /** The live WebGL addon, when one is attached. Held because switching back to
    *  the DOM renderer is done by disposing it. */
   const webglRef = useRef<WebglAddon | null>(null);
@@ -314,6 +314,11 @@ export default function TerminalView({
       // modelled, so this can report text pending when the line is actually
       // clear. That is the safe direction to be wrong in — the cost is a
       // confirmation you did not need, never a half-written prompt sent.
+      const writeTyped = (data: string) => {
+        if (disposed) return Promise.reject(new Error("Terminal attachment closed"));
+        const size = fit.proposeDimensions() ?? { cols: term.cols, rows: term.rows };
+        return tabWrite(tab.key, attachmentId, data, size);
+      };
       let pending = 0;
       const inputLine = new TerminalInputLine();
 
@@ -340,12 +345,16 @@ export default function TerminalView({
       term.attachCustomKeyEventHandler((ev) => {
         if (ev.type === "keydown" && ev.key === "Enter" && ev.shiftKey) {
           pending += 1; // the line is definitely not empty now
-          tabWrite(tab.key, attachmentId, "\\\r");
+          void writeTyped("\\\r").catch(() => onAttention(tab.key, true));
           return false;
         }
         return true;
       });
-      term.onData((data) => {
+      onTerminalInput(term, (data, user) => {
+        if (!user) {
+          if (focusRef.current === "desktop") void tabWrite(tab.key, attachmentId, data).catch(() => {});
+          return;
+        }
         onAttention(tab.key, false);
         const submitted = inputLine.write(data);
         if (data === "\r" || data === "\n") {
@@ -358,7 +367,7 @@ export default function TerminalView({
         } else if (data >= " ") {
           pending += data.length;
         }
-        tabWrite(tab.key, attachmentId, data);
+        void writeTyped(data).catch(() => onAttention(tab.key, true));
       });
       term.onResize(({ cols, rows }) => {
         if (focusRef.current === "desktop") {
@@ -386,29 +395,24 @@ export default function TerminalView({
           focusPending = false;
         }
       };
-      const requestFocus = () => { void takeFocus(); };
-      takeFocusRef.current = requestFocus;
-      term.textarea?.addEventListener("focus", requestFocus);
 
       onRegister(tab.key, {
-        write: (data) => tabWrite(tab.key, attachmentId, data),
+        write: writeTyped,
         redraw,
         paste: (text) => {
           inputLine.paste(text);
           pending += text.length;
-          tabWrite(
-            tab.key,
-            attachmentId,
+          void writeTyped(
             term.modes.bracketedPasteMode ? `\x1b[200~${text}\x1b[201~` : text,
-          );
+          ).catch(() => onAttention(tab.key, true));
         },
         attachPaths: async (paths) => {
           await takeFocus();
           if (disposed || focusRef.current !== "desktop") throw new Error("Terminal focus is unavailable. Try again.");
           for (const path of paths) {
             // Separate paste frames preserve image recognition in CLI clients.
-            if (pending > 0) await tabWrite(tab.key, attachmentId, " ");
-            await tabWrite(tab.key, attachmentId,
+            if (pending > 0) await writeTyped(" ");
+            await writeTyped(
               term.modes.bracketedPasteMode ? `\x1b[200~${path}\x1b[201~` : path);
             inputLine.paste(path);
             pending += path.length;
@@ -425,7 +429,7 @@ export default function TerminalView({
             payload = text + "\r";
           }
           pending = 0; // this call ends in Enter, so the line is spent
-          tabWrite(tab.key, attachmentId, payload);
+          void writeTyped(payload).catch(() => onAttention(tab.key, true));
         },
         focus: () => term.focus(),
         pendingInput: () => pending > 0,
@@ -439,7 +443,7 @@ export default function TerminalView({
           return rows;
         },
       });
-      if (activeRef.current) requestFocus();
+
     })().catch(() => {});
 
     // Debounce resize→fit: splitter drags fire the observer continuously, and
@@ -463,7 +467,6 @@ export default function TerminalView({
       ro.disconnect();
       unlistenExit?.();
       onRegister(tab.key, null);
-      takeFocusRef.current = null;
       const attachmentId = attachmentIdRef.current;
       attachmentIdRef.current = null;
       if (attachmentId !== null) tabDetach(tab.key, attachmentId).catch(() => {});
@@ -475,7 +478,6 @@ export default function TerminalView({
 
   useEffect(() => {
     if (active) {
-      takeFocusRef.current?.();
       if (autoFocus) termRef.current?.focus();
     }
   }, [active, autoFocus]);
@@ -484,10 +486,8 @@ export default function TerminalView({
     focusRef.current = tab.focus ?? "desktop";
     canonicalSizeRef.current = tab.size;
     if (focusRef.current !== "desktop") {
-      // A phone can take focus while xterm's hidden textarea is still focused.
-      // Blur it so the next deliberate click produces a fresh focus event and
-      // an explicit desktop focus request instead of silently dropping input.
-      termRef.current?.blur();
+      // Keep keyboard focus: the next actual keystroke reclaims ownership.
+      // Clicking, viewing and terminal-generated replies must not steal it.
       projectGrid();
     }
   }, [projectGrid, tab.focus, tab.size?.cols, tab.size?.rows]);

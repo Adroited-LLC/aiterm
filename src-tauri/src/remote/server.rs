@@ -1298,6 +1298,8 @@ struct AttachmentPayload {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputPayload {
+    #[serde(default)]
+    focus_size: Option<TerminalSize>,
     tab_id: TabId,
     attachment_id: AttachmentId,
     #[serde(with = "serde_bytes")]
@@ -3381,9 +3383,10 @@ impl RemoteServices {
                 if request.data.len() > MAX_TERMINAL_INPUT_BYTES {
                     return Err("terminal.input_too_large");
                 }
-                let result =
-                    self.terminal
-                        .input(&request.tab_id, &request.attachment_id, &request.data);
+                let result = match request.focus_size {
+                    Some(size) => self.terminal.input_with_focus(&request.tab_id, &request.attachment_id, size, &request.data),
+                    None => self.terminal.input(&request.tab_id, &request.attachment_id, &request.data),
+                };
                 authorize_attachment(attachments, &request.tab_id, &request.attachment_id)?;
                 result.map_err(|error| error.code())?;
                 Ok(DispatchOutcome::frames(vec![response(

@@ -1805,42 +1805,46 @@ impl TabRegistry {
         Ok(())
     }
 
-    pub fn take_focus(
-        &self,
-        id: &TabId,
-        attachment: &AttachmentId,
-        size: TerminalSize,
-    ) -> Result<(), TabError> {
+    pub fn take_focus(&self, id: &TabId, attachment: &AttachmentId, size: TerminalSize) -> Result<(), TabError> {
+        self.focus_and_input(id, attachment, size, None)
+    }
+
+    /// User input acquires ownership and reaches the PTY under the same ordering
+    /// lock. Terminal-generated replies must continue using owner-only `input`.
+    pub fn input_with_focus(&self, id: &TabId, attachment: &AttachmentId, size: TerminalSize, bytes: &[u8]) -> Result<(), TabError> {
+        if bytes.is_empty() { return Ok(()); }
+        self.focus_and_input(id, attachment, size, Some(bytes))
+    }
+
+    fn focus_and_input(&self, id: &TabId, attachment: &AttachmentId, size: TerminalSize, bytes: Option<&[u8]>) -> Result<(), TabError> {
         let tab = self.inner.tab(id)?;
         let _output_order = tab.raw.send_order.lock().unwrap();
         tab.raw.require_open()?;
-        let descriptor = {
+        let (descriptor, result) = {
             let mut live = tab.live.lock().unwrap();
             if !live.attachments.contains_key(attachment) {
-                return Err(TabError::new(
-                    "terminal.attachment_not_found",
-                    "the attachment does not belong to this tab",
-                ));
+                return Err(TabError::new("terminal.attachment_not_found", "the attachment does not belong to this tab"));
             }
             let pty_id = live.live_pty()?;
-            self.inner
-                .backend
-                .resize(pty_id, size.cols(), size.rows())
-                .map_err(|error| TabError::new("terminal.resize_failed", error))?;
-            live.descriptor.input_owner = Some(attachment.clone());
-            live.descriptor.focus = match live.attachments[attachment].kind {
-                AttachmentKind::Desktop => TabFocus::Desktop,
-                AttachmentKind::Remote => TabFocus::Remote,
-            };
-            live.resize(id, size);
-            live.enqueue_control_all(TabEvent::FocusChanged {
-                owner: Some(attachment.clone()),
-                size,
-            });
-            live.descriptor.clone()
+            let changed = live.descriptor.input_owner.as_ref() != Some(attachment) || live.descriptor.size != size;
+            let descriptor = if changed {
+                self.inner.backend.resize(pty_id, size.cols(), size.rows())
+                    .map_err(|error| TabError::new("terminal.resize_failed", error))?;
+                live.descriptor.input_owner = Some(attachment.clone());
+                live.descriptor.focus = match live.attachments[attachment].kind {
+                    AttachmentKind::Desktop => TabFocus::Desktop,
+                    AttachmentKind::Remote => TabFocus::Remote,
+                };
+                live.resize(id, size);
+                live.enqueue_control_all(TabEvent::FocusChanged { owner: Some(attachment.clone()), size });
+                Some(live.descriptor.clone())
+            } else { None };
+            let result = bytes.map_or(Ok(()), |bytes| self.inner.backend.write(pty_id, bytes)
+                .map_err(|error| TabError::new("terminal.write_failed", error)));
+            (descriptor, result)
         };
-        self.inner.publish_changed(descriptor);
-        Ok(())
+        if let Some(descriptor) = descriptor { self.inner.publish_changed(descriptor); }
+        result
     }
 
     pub fn close(&self, id: &TabId) -> Result<(), TabError> {
@@ -2277,12 +2281,14 @@ pub async fn tab_write(
     tab_id: TabId,
     attachment_id: AttachmentId,
     data: String,
+    focus_size: Option<TerminalSize>,
 ) -> Result<(), String> {
     let registry = (*state).clone();
     crate::run_blocking(move || {
-        registry
-            .input(&tab_id, &attachment_id, data.as_bytes())
-            .map_err(command_error)
+        match focus_size {
+            Some(size) => registry.input_with_focus(&tab_id, &attachment_id, size, data.as_bytes()),
+            None => registry.input(&tab_id, &attachment_id, data.as_bytes()),
+        }.map_err(command_error)
     })
     .await
 }

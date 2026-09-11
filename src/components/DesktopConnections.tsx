@@ -4,7 +4,7 @@ import DesktopRemoteTerminal from "./DesktopRemoteTerminal";
 import { ArrowLeft, Monitor, Plus, Unplug, X } from "lucide-react";
 import { linuxPath } from "../platform";
 import { type AppSettings } from "../settings";
-import { desktopAttach, desktopCancelPairing, desktopConnect, desktopDisconnect, desktopFocus, desktopForget, desktopList, desktopPair, desktopWatch, type RemoteClientView, type RemoteDesktop } from "../desktopRemote";
+import { desktopAttach, desktopCancelPairing, desktopConnect, desktopDisconnect, desktopFocus, desktopForget, desktopList, desktopPair, desktopRestore, desktopWatch, type RemoteClientView, type RemoteDesktop } from "../desktopRemote";
 import "@xterm/xterm/css/xterm.css";
 import "./DesktopConnections.css";
 
@@ -24,6 +24,7 @@ export default function DesktopConnections({ settings, onClose }: { settings: Ap
     let stopped = false;
     desktopList().then(setDesktops).catch(e => setError(String(e)));
     void (async () => {
+      try { await desktopRestore(); } catch (e) { if (!stopped) setError(String(e)); }
       let revision: number | undefined;
       while (!stopped) {
         try {
@@ -95,7 +96,7 @@ export default function DesktopConnections({ settings, onClose }: { settings: Ap
       </aside>
       <main className="dc-workspace">
         {active && view ? <>
-          <div className="dc-session-header"><div><h3>{sessionTitle(active)}</h3><span>{view.has_focus ? "You have input control" : "Viewing live · Scroll for history"}</span></div>
+          <div className="dc-session-header"><div><h3>{sessionTitle(active)}</h3><span>{view.has_focus ? "You have input control" : "Type to take control · Scroll for history"}</span></div>
             <button className="dc-primary" disabled={!connected || busy || !view.screen} onClick={() => void run(() => view.has_focus ? desktopAttach(active.id) : desktopFocus())}>{view.has_focus ? "Give back control" : "Take control"}</button>
           </div>
           <DesktopRemoteTerminal key={`${view.desktop_id}:${view.selected_tab}`} view={view} settings={settings} onError={setError} />

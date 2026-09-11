@@ -434,6 +434,10 @@ impl RemoteTerminal {
             .map_err(Into::into)
     }
 
+    pub fn input_with_focus(&self, tab: &TabId, attachment: &AttachmentId, size: TerminalSize, bytes: &[u8]) -> Result<(), TerminalError> {
+        self.registry.input_with_focus(tab, attachment, size, bytes).map_err(Into::into)
+    }
+
     pub fn resize(
         &self,
         tab: &TabId,

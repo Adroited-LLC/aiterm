@@ -1853,3 +1853,23 @@ fn concurrent_remote_attach_and_output_always_expose_snapshot_before_diff() {
         ));
     }
 }
+
+#[test]
+fn typing_hands_control_between_desktops_without_losing_the_first_input() {
+    let (registry, pty) = registry();
+    let tab = registry.open(shell_launch("type-to-control")).unwrap();
+    let host = registry.attach(&tab, AttachmentKind::Desktop).unwrap();
+    let client = registry.attach(&tab, AttachmentKind::Remote).unwrap();
+    registry.input_with_focus(&tab, &client.id, size(50, 18), b"remote first").unwrap();
+    assert_eq!(registry.get(&tab).unwrap().input_owner(), Some(&client.id));
+    assert!(registry.input(&tab, &host.id, b"\x1b[1;1R").is_err(), "parser replies cannot steal control");
+    registry.input_with_focus(&tab, &host.id, size(80, 24), b"host first").unwrap();
+    assert_eq!(registry.get(&tab).unwrap().input_owner(), Some(&host.id));
+    registry.input_with_focus(&tab, &host.id, size(80, 24), b" next").unwrap();
+    registry.input_with_focus(&tab, &client.id, size(50, 18), b"remote again").unwrap();
+    assert_eq!(pty.writes(), [b"remote first".to_vec(), b"host first".to_vec(), b" next".to_vec(), b"remote again".to_vec()]);
+    assert_eq!(pty.resizes(), [(50,18), (80,24), (50,18)], "typing in the current owner should not repeatedly resize");
+    registry.detach(&tab, &client.id).unwrap();
+    assert!(registry.input_with_focus(&tab, &client.id, size(50,18), b"stale").is_err());
+    assert_eq!(pty.writes().len(), 4);
+}

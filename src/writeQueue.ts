@@ -36,6 +36,9 @@ export function makeWriteQueue<K>(
         outbox.delete(id);
         await send(pending.key, pending.data);
       }
+    } catch (error) {
+      outbox.delete(id); // Never replay a failed burst on a later keystroke.
+      throw error;
     } finally {
       inflight.delete(id);
     }
