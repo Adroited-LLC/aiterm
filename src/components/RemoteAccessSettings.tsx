@@ -90,6 +90,9 @@ export default function RemoteAccessSettings() {
   const [relayToken, setRelayToken] = useState("");
   const [irohRelayUrl, setIrohRelayUrl] = useState("");
   const [invite, setInvite] = useState<PairingInvite | null>(null);
+  const [pairingFilePath, setPairingFilePath] = useState<string | null>(null);
+  const [pairingFileError, setPairingFileError] = useState<string | null>(null);
+  const [savingPairingFile, setSavingPairingFile] = useState(false);
   const [pending, setPending] = useState<PendingPairing[]>([]);
   const [devices, setDevices] = useState<TrustedDevice[]>([]);
   /** Device the revoke button is armed for; a second click on the same row commits. */
@@ -477,10 +480,12 @@ export default function RemoteAccessSettings() {
           >
             <button
               className="set-recheck"
-              disabled={!status.enabled || (!usesIroh && relayServerChanged)}
+              disabled={savingPairingFile || !status.enabled || (!usesIroh && relayServerChanged)}
               onClick={() => {
                 setError(null);
                 setNow(Date.now());
+                setPairingFilePath(null);
+                setPairingFileError(null);
                 remoteBeginPairing()
                   .then(setInvite)
                   .catch((cause) => setError(String(cause)));
@@ -488,18 +493,26 @@ export default function RemoteAccessSettings() {
             >Pair device</button>
           </Row>
           <Row label="Connect another desktop" desc="Save a single-use pairing file, then open it from Connected desktops on the other computer.">
-            <button className="set-recheck" disabled={!status.enabled || usesIroh || relayServerChanged} onClick={() => {
+            <button className="set-recheck" disabled={savingPairingFile || !status.enabled || usesIroh || relayServerChanged} onClick={() => {
               void (async () => {
-                setError(null);
+                setPairingFileError(null);
+                setSavingPairingFile(true);
                 try {
                   const path = await save({ title: "Save desktop pairing file", defaultPath: "desktop.aiterm-pair", filters: [{ name: "AiTerm pairing", extensions: ["aiterm-pair"] }] });
                   if (!path) return;
                   setNow(Date.now());
                   setInvite(await invoke<PairingInvite>("remote_export_pairing", { path: linuxPath(path) }));
-                } catch (cause) { setError(String(cause)); }
+                  setPairingFilePath(path);
+                } catch (cause) { setPairingFileError(String(cause)); }
+                finally { setSavingPairingFile(false); }
               })();
-            }}>Save pairing file</button>
+            }}>{savingPairingFile ? "Saving…" : "Save pairing file"}</button>
           </Row>
+          {pairingFileError && <div className="set-notice" role="alert">Could not save the pairing file: {pairingFileError}</div>}
+          {pairingFilePath && <div className="sgroup-foot" role="status" style={{ overflowWrap: "anywhere" }}>
+            Saved pairing file: <code>{pairingFilePath}</code><br />
+            {shownInvite ? "Open this file on the other desktop before the invite expires." : "This invite is no longer active. Save a new pairing file to connect."}
+          </div>}
           {usesIroh && <div className="sgroup-foot">Desktop connections currently use the AITerm network stack.</div>}
           {shownInvite && (
             <Row label="Scan this in AITerm on your device" wide>

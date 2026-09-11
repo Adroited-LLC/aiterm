@@ -92,7 +92,7 @@ export default function DesktopConnections({ settings, onClose }: { settings: Ap
   const pair = async () => {
     setError(null);
     try {
-      const path = await open({ title: "Open AiTerm pairing file", multiple: false, directory: false, filters: [{ name: "AiTerm pairing", extensions: ["aiterm-pair"] }] });
+      const path = await open({ title: "Open AiTerm pairing file", multiple: false, directory: false, filters: [{ name: "AiTerm pairing", extensions: ["aiterm-pair"] }, { name: "All files", extensions: ["*"] }] });
       if (!path || typeof path !== "string") return;
       setPairing(true);
       const desktop = await desktopPair(linuxPath(path), deviceName.trim());
