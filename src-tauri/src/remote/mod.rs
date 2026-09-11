@@ -632,7 +632,7 @@ impl Inner {
             self.fingerprint.as_deref(),
             self.advertised_hosts.as_deref(),
         ) else {
-            return Err("turn remote access on before pairing a phone".into());
+            return Err("turn remote access on before pairing a device".into());
         };
         if hosts.is_empty()
             || hosts.len() > MAX_ADVERTISED_HOSTS
@@ -1130,12 +1130,32 @@ pub async fn remote_stop(state: tauri::State<'_, RemoteState>) -> Result<RemoteS
 pub async fn remote_begin_pairing(
     state: tauri::State<'_, RemoteState>,
 ) -> Result<PairingInviteView, String> {
+    begin_pairing(state, None).await
+}
+
+#[cfg_attr(not(aiterm_headless), tauri::command)]
+pub async fn remote_export_pairing(
+    state: tauri::State<'_, RemoteState>,
+    path: String,
+) -> Result<PairingInviteView, String> {
+    begin_pairing(state, Some(path)).await
+}
+
+async fn begin_pairing(
+    state: tauri::State<'_, RemoteState>,
+    export_path: Option<String>,
+) -> Result<PairingInviteView, String> {
+    if export_path.is_some()
+        && state.inner.lock().await.startup.network_stack != RemoteNetworkStack::Aiterm
+    {
+        return Err("Desktop connections currently use the AITerm network stack".into());
+    }
     let _setup = state.pairing_setup.lock().await;
     let (devices, fingerprint, needs_relay, relay_server, pending_config) = {
         let mut inner = state.inner.lock().await;
         inner.load_relay_config()?;
         if inner.gateway.is_none() {
-            return Err("turn remote access on before pairing a phone".into());
+            return Err("turn remote access on before pairing a device".into());
         }
         (
             inner.devices()?,
@@ -1210,6 +1230,16 @@ pub async fn remote_begin_pairing(
         enrollment.relay(),
     )?;
     let svg = pairing_qr_svg(&payload).ok_or("the pairing payload could not be rendered")?;
+    if let Some(path) = export_path {
+        let path = std::path::PathBuf::from(path);
+        let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        write_private_file(&temp, payload.as_bytes()).map_err(|e| e.to_string())?;
+        if let Err(error) = std::fs::rename(&temp, &path) {
+            let _ = std::fs::remove_file(temp);
+            return Err(error.to_string());
+        }
+    }
+
     Ok(PairingInviteView {
         svg,
         expires_at: unix_millis(now + ENROLLMENT_LIFETIME),
@@ -1288,7 +1318,7 @@ pub async fn remote_approve_device(
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(error = %error, "phone pairing succeeded but relay registration failed");
+                    tracing::warn!(error = %error, "device pairing succeeded but relay registration failed");
                 }
             }
         }

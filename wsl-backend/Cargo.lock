@@ -106,6 +106,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "x509-parser",
  "zune-core",
  "zune-jpeg",
 ]

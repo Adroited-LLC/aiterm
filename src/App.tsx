@@ -1,3 +1,4 @@
+import DesktopConnections from "./components/DesktopConnections";
 import { UpdateNotice } from "./components/AppUpdates";
 import { TimeFormatContext, fullTime } from "./timefmt";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -33,7 +34,7 @@ import { useLibrarian } from "./librarian";
 import BringIn from "./components/BringIn";
 import { engineName, useRelay } from "./relay";
 import {
-  Paperclip, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
+  Monitor, Paperclip, FolderOpen, GitBranch, Home, Keyboard, ListChecks, PanelLeft, RefreshCw, RotateCcw, Settings as SettingsIcon, Users, X,
 } from "lucide-react";
 import { agentTint } from "./brand";
 import SettingsModal, { SettingsTab } from "./components/SettingsModal";
@@ -510,6 +511,7 @@ export default function App() {
   // Its names reach the list through the backend (`apply_session_names`),
   // the same way a name set by hand does, so the phone sees them too.
   const librarian = useLibrarian(settings.librarian, sessions);
+  const [showDesktopConnections, setShowDesktopConnections] = useState(false);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   /** Where the settings window should open, when a caller has somewhere in
    *  mind. Cleared on close so the ⚙ button still opens on the first tab. */
@@ -554,6 +556,7 @@ export default function App() {
   // Ctrl+Shift+L: force a clean repaint of the active terminal.
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
+      if (e.target instanceof Element && e.target.closest(".dc-overlay")) return;
       if (!e.ctrlKey || e.altKey || e.metaKey) return;
       if (e.shiftKey && (e.key === "L" || e.key === "l")) {
         e.preventDefault();
@@ -1764,6 +1767,7 @@ export default function App() {
   // that is delete-word to every shell and editor in the terminal.
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
+      if (e.target instanceof Element && e.target.closest(".dc-overlay")) return;
       if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
       if (e.key !== "PageDown" && e.key !== "PageUp") return;
       const list = tabsRef.current.filter((t) => t.parentKey === undefined);
@@ -2494,7 +2498,7 @@ export default function App() {
       // The phone's list can be newer than ours — read fresh rather than trust state.
       const list = sessionsRef.current.find((x) => x.id === id) ? sessionsRef.current : await listSessions();
       const s = list.find((x) => x.id === id);
-      if (!s) { setNotice(`The phone asked for a session that is not listed: ${id.slice(0, 8)}…`); return; }
+      if (!s) { setNotice(`The device asked for a session that is not listed: ${id.slice(0, 8)}…`); return; }
       // A session already open in a tab is FOCUSED, not resumed. `resumeSession`
       // stops the live process and relaunches `--resume`, and under the daemon
       // Claude Code answers a resume of a live conversation with a FORK — a
@@ -2513,7 +2517,7 @@ export default function App() {
       // resolver as an agent and died as "api:… isn't installed", which is
       // what a phone asking for a local model used to get back.
       if (agentId.startsWith("api:")) {
-        if (!model) { setNotice("The phone asked for a provider model but named no model"); return; }
+        if (!model) { setNotice("The device asked for a provider model but named no model"); return; }
         void remoteRef.current.newSession(
           cwd, { kind: "api", providerId: agentId.slice(4), modelId: model }, prompt ?? undefined,
           title ? { title } : {},
@@ -2528,7 +2532,7 @@ export default function App() {
     const unBring = listen<{ session_id: string; kind?: string; agent_id: string; provider_id?: string | null; model: string | null; effort: string | null; focus: string; rounds: number }>("remote://bring-in", (e) => {
       const p = e.payload;
       const tab = remoteRef.current.tabs.find((t) => t.sessionId === p.session_id);
-      if (!tab) { setNotice("The phone asked to bring in a second agent, but that session has no tab here"); return; }
+      if (!tab) { setNotice("The device asked to bring in a second agent, but that session has no tab here"); return; }
       const choice: StartChoice = p.kind === "api" && p.provider_id && p.model
         ? { kind: "api", providerId: p.provider_id, modelId: p.model }
         : { kind: "agent", agentId: p.agent_id, model: p.model ?? null, effort: p.effort ?? null };
@@ -2588,6 +2592,7 @@ export default function App() {
         </div>
         <div className="topbar-spacer" />
         <div className="topbar-right">
+          <button className="icon-btn" title="Connect to another desktop" aria-label="Connected desktops" onClick={() => setShowDesktopConnections(true)}><Icon of={Monitor} /></button>
           <Clock />
           <button className="icon-btn" title="Smaller fonts (Ctrl+-)" onClick={() => bumpFont(-1)}>A−</button>
           <button
@@ -2954,7 +2959,7 @@ export default function App() {
                   {activeTabObj?.sessionId && (
                     <div className="term-ended-sub dim">
                       A session listed by <code>claude agents</code> can be stopped from
-                      any terminal, or from your phone. That looks exactly like this.
+                      any terminal, or from another device. That looks exactly like this.
                     </div>
                   )}
                   <div className="term-ended-acts">
@@ -3179,6 +3184,7 @@ export default function App() {
           </>
         )}
       </div>
+      {showDesktopConnections && <DesktopConnections settings={settings} onClose={() => setShowDesktopConnections(false)} />}
       {showSettingsModal && (
         <SettingsModal
           settings={settings}

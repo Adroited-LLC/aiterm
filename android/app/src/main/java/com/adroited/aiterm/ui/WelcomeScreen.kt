@@ -146,7 +146,7 @@ fun WelcomeScreen(
                     shape = RoundedCornerShape(14.dp),
                 ) {
                     Text(
-                        text = "One QR scan pairs this phone. Your desktop identity stays pinned here.",
+                        text = "One QR scan pairs this device. Your desktop identity stays pinned here.",
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 13.dp),
                         color = MaterialTheme.colorScheme.onSurface,
                         style = MaterialTheme.typography.bodyMedium,
@@ -257,7 +257,7 @@ private fun LiveSessionPreview() {
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    text = "continue from my phone",
+                    text = "continue from my device",
                     color = TerminalText,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 13.sp,

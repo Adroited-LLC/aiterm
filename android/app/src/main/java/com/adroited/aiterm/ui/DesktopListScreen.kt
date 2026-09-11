@@ -55,7 +55,7 @@ import com.adroited.aiterm.R
 import com.adroited.aiterm.pairing.PairedDesktop
 import com.adroited.aiterm.pairing.PairedDesktopStore
 
-/** The desktops trusted by this phone, with pairing and removal in one place. */
+/** The desktops trusted by this device, with pairing and removal in one place. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DesktopListScreen(
@@ -165,7 +165,7 @@ fun DesktopListScreen(
             title = { Text("Friendly name") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Choose a name for this desktop on your phone. Leave it empty to use $originalName.")
+                    Text("Choose a name for this desktop on your device. Leave it empty to use $originalName.")
                     OutlinedTextField(
                         value = friendlyName,
                         onValueChange = { friendlyName = it; renameError = null },

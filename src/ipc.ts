@@ -1137,8 +1137,8 @@ export const isVideoPath = (path: string) => /\.(mp4|webm|m4v)$/i.test(path);
 
 // --- Remote Access -----------------------------------------------------
 //
-// The phone gateway. Every one of these is a desktop-only decision: the
-// gateway deliberately exposes no way for a paired phone to enable itself,
+// The device gateway. Every one of these is a desktop-only decision: the
+// gateway deliberately exposes no way for a paired device to enable itself,
 // approve another device, or revoke one. Trust is granted at this keyboard.
 
 export type {
@@ -1157,7 +1157,7 @@ import type {
 /** Whether the gateway is listening, and on what, with its pinned fingerprint. */
 export const remoteStatus = () => invoke<RemoteStatus>("remote_status");
 
-/** Addresses the gateway may bind. Loopback is excluded: a phone cannot reach
+/** Addresses the gateway may bind. Loopback is excluded: a device cannot reach
  *  it, so offering it would only ever be a mistake the user has to debug. */
 export const remoteInterfaces = () => invoke<string[]>("remote_interfaces");
 
@@ -1165,7 +1165,7 @@ export const remoteStart = (address: string, port: number) =>
   invoke<RemoteStatus>("remote_start", { address, port });
 
 /** Closes the listener and every live connection. Does not revoke devices —
- *  turning remote access off is not the same statement as distrusting a phone. */
+ *  turning remote access off is not the same statement as distrusting a device. */
 export const remoteStop = () => invoke<RemoteStatus>("remote_stop");
 
 /** Persist whether the saved relay route should return when AITerm opens. */
@@ -1202,7 +1202,7 @@ export const remoteRelayClear = () => invoke<RemoteStatus>("remote_relay_clear")
  *  the secret never exists as a string in this process. */
 export const remoteBeginPairing = () => invoke<PairingInvite>("remote_begin_pairing");
 
-/** Phones that have scanned a QR and are waiting for a decision here. */
+/** Devices that have scanned a QR and are waiting for a decision here. */
 export const remotePendingPairings = () =>
   invoke<PendingPairing[]>("remote_pending_pairings");
 

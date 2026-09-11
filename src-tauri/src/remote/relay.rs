@@ -147,7 +147,7 @@ impl RelayEnrollmentDraft {
         signature_der: &[u8],
     ) -> Result<RelayConfig, String> {
         if authority_public_key.len() != 33 || !(8..=80).contains(&signature_der.len()) {
-            return Err("the phone returned an invalid relay authorization".into());
+            return Err("the device returned an invalid relay authorization".into());
         }
         let mut endpoint = validated_server_origin(&self.control_origin)?;
         endpoint.set_path("/v1/provision");
@@ -168,7 +168,7 @@ impl RelayEnrollmentDraft {
             return Err(match response.status().as_u16() {
                 404 => "this relay server does not support automatic setup".into(),
                 409 => "the relay route was already claimed".into(),
-                429 => "this phone or network has reached the relay route limit".into(),
+                429 => "this device or network has reached the relay route limit".into(),
                 _ => format!(
                     "relay setup failed with status {}",
                     response.status().as_u16()
@@ -182,7 +182,7 @@ impl RelayEnrollmentDraft {
             || provisioned.route_id != self.config.route_id
         {
             return Err(
-                "the relay server returned a different route than the phone authorized".into(),
+                "the relay server returned a different route than the device authorized".into(),
             );
         }
         self.config.validate()?;

@@ -218,7 +218,7 @@ export function relayLabel(status: RemoteStatus): string {
     ? `${relay.public_host}:${relay.public_port}`
     : "configured";
   if (!status.enabled) return `${endpoint} — off`;
-  if (relay.enrollment_pending && relay.state !== "connected") return "Waiting for a phone to scan the pairing code";
+  if (relay.enrollment_pending && relay.state !== "connected") return "Waiting for a device to use the pairing code";
   return `${endpoint} — ${relay.state}`;
 }
 

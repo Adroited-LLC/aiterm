@@ -73,7 +73,7 @@ impl DirectTunnelService {
         )?;
         let phone_cookie: DirectCookie = decode_fixed::<DIRECT_COOKIE_BYTES>(
             &relay_offer.phone_cookie,
-            "phone rendezvous cookie",
+            "device rendezvous cookie",
         )?;
         if relay_offer.port == 0 || relay_offer.expires_in_millis == 0 {
             return Err("the relay returned an invalid direct endpoint".into());
@@ -218,7 +218,7 @@ async fn run_attempt(
     let peer = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err("phone did not join the direct rendezvous".into());
+            return Err("device did not join the direct rendezvous".into());
         }
         match tokio::time::timeout(remaining, socket.recv_from(&mut bytes)).await {
             Ok(Ok((count, source))) if source == relay => {
@@ -234,7 +234,7 @@ async fn run_attempt(
             }
             Ok(Ok(_)) => continue,
             Ok(Err(_)) => return Err("the direct UDP socket failed".into()),
-            Err(_) => return Err("phone did not join the direct rendezvous".into()),
+            Err(_) => return Err("device did not join the direct rendezvous".into()),
         }
     };
     let probe = DirectPacket::Probe { id }.encode();

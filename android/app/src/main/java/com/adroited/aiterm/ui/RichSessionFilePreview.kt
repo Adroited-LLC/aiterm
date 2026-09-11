@@ -190,7 +190,7 @@ internal fun RichSessionFilePreviewBody(
                     when {
                         isMarkdown -> "This Markdown file is larger than the 512 KB safe editing limit. Open it from the desktop for the complete file."
                         isSvg -> "This SVG is larger than the 2 MB safe rendering limit. Open it from the desktop for the complete file."
-                        else -> "This file is larger than the 8 MB phone preview limit. Open it from the desktop for the complete file."
+                        else -> "This file is larger than the 8 MB device preview limit. Open it from the desktop for the complete file."
                     },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

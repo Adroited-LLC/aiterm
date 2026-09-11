@@ -1494,8 +1494,8 @@ fn default_conversation_chars() -> usize {
 const MAX_CONVERSATION_CHARS: usize = 512 * 1024;
 const MAX_CONVERSATION_MESSAGES: usize = 512;
 const MAX_CONVERSATION_MESSAGE_BYTES: usize = 64 * 1024;
-const CONVERSATION_OMISSION: &str = "[… earlier turns omitted for phone view …]";
-const CONVERSATION_TRUNCATION: &str = "\n[… message truncated for phone view …]";
+const CONVERSATION_OMISSION: &str = "[… earlier turns omitted for device view …]";
+const CONVERSATION_TRUNCATION: &str = "\n[… message truncated for device view …]";
 const MAX_SPINE_TEXT_BYTES: usize = 512 * 1024;
 
 fn bound_remote_spine_event(mut event: crate::spine::SpineEvent) -> crate::spine::SpineEvent {
@@ -5496,7 +5496,7 @@ mod request_guard_tests {
         assert_eq!(bounded.len(), MAX_CONVERSATION_MESSAGES);
         assert_eq!(bounded[0].text, "start");
         assert_eq!(bounded[1].role, "system");
-        assert!(bounded[1].text.contains("phone view"));
+        assert!(bounded[1].text.contains("device view"));
         assert!(bounded
             .iter()
             .all(|message| message.text.len() <= MAX_CONVERSATION_MESSAGE_BYTES));

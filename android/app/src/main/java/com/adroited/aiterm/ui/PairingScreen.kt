@@ -93,7 +93,7 @@ class PairingViewModel(
     private val repository: PairingRepository,
     private val clock: () -> Long = System::currentTimeMillis,
     private val deviceName: () -> String = {
-        Build.MODEL?.take(128)?.ifBlank { "Android phone" } ?: "Android phone"
+        Build.MODEL?.take(128)?.ifBlank { "Android device" } ?: "Android device"
     },
 ) : ViewModel() {
 
@@ -126,7 +126,7 @@ class PairingViewModel(
         viewModelScope.launch {
             val result = repository.pair(
                 payload = payload,
-                deviceName = deviceName().take(128).ifBlank { "Android phone" },
+                deviceName = deviceName().take(128).ifBlank { "Android device" },
                 nowEpochMillis = clock(),
                 onAwaitingApproval = {
                     mutableState.value = PairingUiState.AwaitingApproval(desktopName)
@@ -299,7 +299,7 @@ fun PairingContent(
                     }
                 }
                 Text(
-                    "Confirm the name and key before this phone asks the desktop for approval.",
+                    "Confirm the name and key before this device asks the desktop for approval.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Row(
@@ -326,7 +326,7 @@ fun PairingContent(
                 CenteredPairingStatus {
                     CircularProgressIndicator()
                     Text(
-                        "Approve this phone on ${state.desktopName}",
+                        "Approve this device on ${state.desktopName}",
                         style = MaterialTheme.typography.headlineSmall,
                         textAlign = TextAlign.Center,
                     )
@@ -342,7 +342,7 @@ fun PairingContent(
                 CenteredPairingStatus {
                     Text("Desktop paired", style = MaterialTheme.typography.headlineMedium)
                     Text(
-                        "${state.desktopName} now trusts this phone's protected device key.",
+                        "${state.desktopName} now trusts this device's protected device key.",
                         textAlign = TextAlign.Center,
                     )
                     Button(onClick = onDone) { Text("Done") }
@@ -594,7 +594,7 @@ private fun failureMessage(failure: PairingFailure): String = when (failure) {
     PairingFailure.PROTOCOL_ERROR ->
         "The desktop returned an invalid pairing response. Nothing was saved."
     PairingFailure.KEY_UNAVAILABLE ->
-        "This phone could not create its protected device key. A secure device lock is required."
+        "This device could not create its protected device key. A secure device lock is required."
     PairingFailure.STORAGE_FAILURE ->
-        "The desktop approved, but this phone could not save the pairing. Revoke it on the desktop before scanning a new code."
+        "The desktop approved, but this device could not save the pairing. Revoke it on the desktop before scanning a new code."
 }

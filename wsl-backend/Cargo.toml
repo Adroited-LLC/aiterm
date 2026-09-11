@@ -8,6 +8,7 @@ syn = { version = "2", features = ["full"] }
 quote = "1"
 
 [dependencies]
+x509-parser = "0.18"
 aiterm-wsl-protocol = { path = "../wsl-protocol" }
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }

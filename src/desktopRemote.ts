@@ -1,0 +1,17 @@
+import { invoke } from "./platform";
+export type RemoteDesktop = { id: string; name: string; address: string; fingerprint: string };
+import type { RemoteScreen, RemoteRow } from "./desktopRemoteScreen";
+export { remoteScreenAnsi } from "./desktopRemoteScreen";
+export type RemoteClientView = { revision: number; connection: string; desktop_id: string | null; error: string | null; tabs: { id: string; title: string; cwd: string; sessionId?: string; state: string }[]; sessions: { id: string; title?: string; custom_title?: string }[]; selected_tab: string | null; has_focus: boolean; screen: RemoteScreen | null; scrollback: RemoteRow[] };
+export const desktopList = () => invoke<RemoteDesktop[]>("desktop_client_list");
+export const desktopWatch = (after?: number) => invoke<RemoteClientView>("desktop_client_watch", { after: after ?? null });
+export const desktopConnect = (id: string) => invoke<void>("desktop_client_connect", { id });
+export const desktopDisconnect = () => invoke<void>("desktop_client_disconnect");
+export const desktopPair = (path: string, name: string) => invoke<RemoteDesktop>("desktop_client_pair", { path, name });
+export const desktopCancelPairing = () => invoke<void>("desktop_client_cancel_pairing");
+export const desktopForget = (id: string) => invoke<void>("desktop_client_forget", { id });
+export const desktopAttach = (tabId: string) => invoke<void>("desktop_client_attach", { tabId });
+export const desktopFocus = () => invoke<void>("desktop_client_focus");
+export const desktopInput = (data: string) => invoke<void>("desktop_client_input", { data });
+export const desktopResize = (cols: number, rows: number) => invoke<void>("desktop_client_resize", { cols, rows });
+export const desktopScrollback = (offset: number) => invoke<void>("desktop_client_scrollback", { offset });

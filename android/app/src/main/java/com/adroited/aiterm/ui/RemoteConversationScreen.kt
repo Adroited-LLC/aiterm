@@ -2160,7 +2160,7 @@ private fun SessionFilePreviewBody(
             Text("No preview available.")
         }
         preview.mime.startsWith("image/") && preview.truncated -> Text(
-            "This image is larger than the 8 MB phone preview limit (${preview.total} bytes).",
+            "This image is larger than the 8 MB device preview limit (${preview.total} bytes).",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = modifier,
         )

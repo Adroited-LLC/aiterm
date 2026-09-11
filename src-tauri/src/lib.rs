@@ -7,6 +7,7 @@ pub mod chat;
 pub mod claudecfg;
 mod codex_identity;
 pub mod detail;
+pub mod desktop_remote;
 pub mod diag;
 pub mod fonts;
 pub mod fsx;
@@ -121,6 +122,18 @@ pub fn run() {
             diag::diag_log_path,
             diag::diag_log_tail,
             diag::diag_environment,
+            desktop_remote::desktop_client_list,
+            desktop_remote::desktop_client_watch,
+            desktop_remote::desktop_client_pair,
+            desktop_remote::desktop_client_cancel_pairing,
+            desktop_remote::desktop_client_forget,
+            desktop_remote::desktop_client_disconnect,
+            desktop_remote::desktop_client_connect,
+            desktop_remote::desktop_client_attach,
+            desktop_remote::desktop_client_focus,
+            desktop_remote::desktop_client_input,
+            desktop_remote::desktop_client_resize,
+            desktop_remote::desktop_client_scrollback,
             linux_graphics::graphics_settings,
             linux_graphics::graphics_settings_set,
             agents::agent_choices,
@@ -212,6 +225,7 @@ pub fn run() {
             remote::remote_network_stack_set,
             remote::remote_iroh_relay_url_set,
             remote::remote_begin_pairing,
+            remote::remote_export_pairing,
             remote::remote_pending_pairings,
             remote::remote_approve_device,
             remote::remote_deny_device,

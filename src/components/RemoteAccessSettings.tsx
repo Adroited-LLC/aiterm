@@ -1,3 +1,5 @@
+import { save } from "@tauri-apps/plugin-dialog";
+import { invoke, linuxPath } from "../platform";
 import { useCallback, useEffect, useState } from "react";
 import Row from "./SettingsRow";
 import SettingsSwitch from "./SettingsSwitch";
@@ -64,10 +66,10 @@ function saveListenerPreference(config: ListenerConfig) {
 }
 
 /**
- * Remote Access: the desktop side of phone pairing.
+ * Remote Access: the desktop side of device pairing.
  *
  * Every decision that grants or removes trust is made here and nowhere else.
- * A paired phone cannot enable the listener, approve another phone, or revoke
+ * A paired device cannot enable the listener, approve another device, or revoke
  * one — so this panel is the whole trust boundary, and it is built to be read
  * rather than clicked through: the fingerprint is grouped for comparison, the
  * QR shows its own expiry, and revoking asks twice.
@@ -137,7 +139,7 @@ export default function RemoteAccessSettings() {
     return () => clearInterval(timer);
   }, [status?.enabled, status?.relay?.configured]);
 
-  // A phone that scans the QR appears here only once the desktop notices it,
+  // A device that scans the QR appears here only once the desktop notices it,
   // so poll while a pairing is actually in flight — and only then.
   useEffect(() => {
     if (!invite) return;
@@ -151,7 +153,7 @@ export default function RemoteAccessSettings() {
   const shownInvite = status ? inviteToShow(status, invite, now) : null;
   const addressOptions = listenerAddressOptions(address, addresses);
   // Drop a spent invite from state as well as from the screen, so the next
-  // "Pair phone" starts clean rather than flashing the dead one.
+  // "Pair device" starts clean rather than flashing the dead one.
   useEffect(() => {
     if (invite && !shownInvite) setInvite(null);
   }, [invite, shownInvite]);
@@ -178,7 +180,7 @@ export default function RemoteAccessSettings() {
         <div className="sgroup-rows">
           <Row
             label="Network stack"
-            desc="Choose one complete transport stack. Switching is available while remote access is off; the other stack remains dormant. Re-pair phones after switching so they receive the selected route."
+            desc="Choose one complete transport stack. Switching is available while remote access is off; the other stack remains dormant. Re-pair devices after switching so they receive the selected route."
           >
             <select
               className="set-select"
@@ -220,7 +222,7 @@ export default function RemoteAccessSettings() {
           ) : (
           <Row
             label="Relay server"
-            desc="Scan a pairing code to set up the relay. Approve the phone on this desktop to grant access."
+            desc="Scan a pairing code to set up the relay. Approve the device on this desktop to grant access."
             wide
           >
             <div className="remote-managed-relay">
@@ -260,7 +262,7 @@ export default function RemoteAccessSettings() {
                     ? relayLabel(status)
                     : relayServerChanged
                       ? "Save this server before turning remote access on. AITerm verifies its control identity and public domain first."
-                      : "Pair and approve a phone. LAN, VPN, and relay setup complete together."}
+                      : "Pair and approve a device. LAN, VPN, and relay setup complete together."}
               </div>
             </div>
           </Row>
@@ -300,7 +302,7 @@ export default function RemoteAccessSettings() {
           </Row>
           <Row
             label="Address"
-            desc="Preferred local address. AITerm listens on the other shareable LAN/VPN addresses too, so phones can switch routes automatically."
+            desc="Preferred local address. AITerm listens on the other shareable LAN/VPN addresses too, so devices can switch routes automatically."
           >
             <div className="remote-listener-control">
               <select
@@ -389,7 +391,7 @@ export default function RemoteAccessSettings() {
             </span>
           </Row>}
           {!usesIroh && !status.relay?.configured && (
-          <Row label="Advanced manual route" desc="For self-hosted relays that do not support phone-authorized setup." wide>
+          <Row label="Advanced manual route" desc="For self-hosted relays that do not support device-authorized setup." wide>
             <details className="remote-relay-advanced">
               <summary>Enter route details manually</summary>
               <div className="remote-relay-grid">
@@ -458,7 +460,7 @@ export default function RemoteAccessSettings() {
           )}
           <Row
             label="Certificate fingerprint"
-            desc="Your phone pins this. If it ever shows a different one, do not continue."
+            desc="Your device pins this. If it ever shows a different one, do not continue."
             wide
           >
             <code className="diag-val">{fingerprintLabel(status.fingerprint ?? "")}</code>
@@ -467,7 +469,7 @@ export default function RemoteAccessSettings() {
       </div>
 
       <div className="sgroup">
-        <div className="sgroup-title">Pair a phone</div>
+        <div className="sgroup-title">Pair a device</div>
         <div className="sgroup-rows">
           <Row
             label="Pairing code"
@@ -483,10 +485,24 @@ export default function RemoteAccessSettings() {
                   .then(setInvite)
                   .catch((cause) => setError(String(cause)));
               }}
-            >Pair phone</button>
+            >Pair device</button>
           </Row>
+          <Row label="Connect another desktop" desc="Save a single-use pairing file, then open it from Connected desktops on the other computer.">
+            <button className="set-recheck" disabled={!status.enabled || usesIroh || relayServerChanged} onClick={() => {
+              void (async () => {
+                setError(null);
+                try {
+                  const path = await save({ title: "Save desktop pairing file", defaultPath: "desktop.aiterm-pair", filters: [{ name: "AiTerm pairing", extensions: ["aiterm-pair"] }] });
+                  if (!path) return;
+                  setNow(Date.now());
+                  setInvite(await invoke<PairingInvite>("remote_export_pairing", { path: linuxPath(path) }));
+                } catch (cause) { setError(String(cause)); }
+              })();
+            }}>Save pairing file</button>
+          </Row>
+          {usesIroh && <div className="sgroup-foot">Desktop connections currently use the AITerm network stack.</div>}
           {shownInvite && (
-            <Row label="Scan this in AITerm on your phone" wide>
+            <Row label="Scan this in AITerm on your device" wide>
               <div className="remote-qr">
                 {/* The backend rendered this; the payload it encodes never
                     became a string in the renderer. */}
@@ -523,10 +539,10 @@ export default function RemoteAccessSettings() {
       </div>
 
       <div className="sgroup">
-        <div className="sgroup-title">Paired phones</div>
+        <div className="sgroup-title">Paired devices</div>
         <div className="sgroup-rows">
           {devices.length === 0 ? (
-            <div className="sgroup-foot">No phones paired.</div>
+            <div className="sgroup-foot">No devices paired.</div>
           ) : (
             <div className="agent-list">
               {devices.map((device) => (
@@ -560,8 +576,8 @@ export default function RemoteAccessSettings() {
             </div>
           )}
           <div className="sgroup-foot">
-            Revoking forgets the phone's key and drops its connection. Turning
-            remote access off does not — the phone stays trusted for next time.
+            Revoking forgets the device's key and drops its connection. Turning
+            remote access off does not — the device stays trusted for next time.
           </div>
         </div>
       </div>

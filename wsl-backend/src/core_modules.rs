@@ -100,3 +100,7 @@ pub mod usage;
 #[allow(dead_code)]
 #[path = "../../src-tauri/src/watcher.rs"]
 pub mod watcher;
+
+#[allow(dead_code)]
+#[path = "../../src-tauri/src/desktop_remote/mod.rs"]
+pub mod desktop_remote;

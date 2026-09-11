@@ -536,7 +536,7 @@ internal fun TerminalScreenContent(
                     if (draftWorkInProgress) {
                         "Wait for attachment preparation or upload to finish before leaving."
                     } else {
-                        "Draft text and attachments are still on this phone."
+                        "Draft text and attachments are still on this device."
                     },
                 )
             },
