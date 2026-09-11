@@ -13,7 +13,7 @@ struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            nvidia_wayland_compatibility: true,
+            nvidia_wayland_compatibility: false,
         }
     }
 }
@@ -198,9 +198,11 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("aiterm-graphics-{}", uuid::Uuid::new_v4()));
         let path = directory.join("graphics.json");
-        assert!(load(&path).nvidia_wayland_compatibility);
+        assert!(!load(&path).nvidia_wayland_compatibility);
         let state = GraphicsState {
-            preferences: Mutex::new(Preferences::default()),
+            preferences: Mutex::new(Preferences {
+                nvidia_wayland_compatibility: true,
+            }),
             startup_enabled: true,
             injected: true,
             environment_override: false,
@@ -219,13 +221,13 @@ mod tests {
         std::fs::write(&path, "not a directory").unwrap();
         let state = GraphicsState {
             preferences: Mutex::new(Preferences::default()),
-            startup_enabled: true,
+            startup_enabled: false,
             injected: false,
             environment_override: true,
         };
-        assert!(state.set_at(&path.join("graphics.json"), false).is_err());
+        assert!(state.set_at(&path.join("graphics.json"), true).is_err());
         let snapshot = state.snapshot(&state.preferences.lock().unwrap());
-        assert!(snapshot.enabled && snapshot.environment_override);
+        assert!(!snapshot.enabled && snapshot.environment_override);
         assert!(!snapshot.restart_required);
         std::fs::remove_file(path).unwrap();
     }

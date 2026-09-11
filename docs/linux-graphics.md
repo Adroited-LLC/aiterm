@@ -1,7 +1,7 @@
 # NVIDIA Wayland compatibility
 
 Settings → Diagnostics → Graphics compatibility contains the **NVIDIA Wayland
-compatibility** switch. It defaults on, but AiTerm injects
+compatibility** switch. It defaults off. When explicitly enabled, AiTerm injects
 `__NV_DISABLE_EXPLICIT_SYNC=1` only on Linux when the NVIDIA kernel module is
 loaded and the launch environment indicates Wayland. This works around NVIDIA
 EGL explicit-sync compatibility failures without disabling DMA-BUF rendering.
