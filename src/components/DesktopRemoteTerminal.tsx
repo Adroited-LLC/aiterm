@@ -38,7 +38,8 @@ export default function DesktopRemoteTerminal({ view, settings, onError }: { vie
       const page = await desktopScrollback(state.offset);
       if (generation !== historyState.current.generation) return;
       const node = viewport.current;
-      if (node) anchor.current = { top: node.scrollTop, height: node.scrollHeight };
+      // Reveal fetched lines on the first gesture, including when the live grid fits.
+      if (node) anchor.current = { top: node.scrollTop - settings.termFontSize * 6, height: node.scrollHeight };
       follow.current = false; setAtLive(false);
       state.offset += page.length;
       state.exhausted = page.length < 100 || state.offset >= 10000;
