@@ -20,5 +20,5 @@ export function remoteRowsAnsi(rows: RemoteRow[]): string {
 }
 export function remoteScreenAnsi(screen: RemoteScreen): string {
   const cursor = screen.cursor;
-  return `\x1b[?25l\x1b[?7l\x1b[H${remoteRowsAnsi(screen.visible)}\x1b[0m\x1b[${cursor.row + 1};${cursor.col + 1}H\x1b[${cursor.shape === "Bar" ? 6 : cursor.shape === "Underline" ? 4 : 2} q\x1b[?25${cursor.visible ? "h" : "l"}\x1b[?1${screen.modes.application_cursor ? "h" : "l"}\x1b[?2004${screen.modes.bracketed_paste ? "h" : "l"}`;
+  return `\x1b[?25l\x1b[?7l\x1b[0m\x1b[2J${screen.visible.map((row, index) => `\x1b[${index + 1};1H${remoteRowsAnsi([row])}`).join("")}\x1b[0m\x1b[${cursor.row + 1};${cursor.col + 1}H\x1b[${cursor.shape === "Bar" ? 6 : cursor.shape === "Underline" ? 4 : 2} q\x1b[?25${cursor.visible ? "h" : "l"}\x1b[?1${screen.modes.application_cursor ? "h" : "l"}\x1b[?2004${screen.modes.bracketed_paste ? "h" : "l"}`;
 }

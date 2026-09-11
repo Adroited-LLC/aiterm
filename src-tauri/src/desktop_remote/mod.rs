@@ -42,6 +42,8 @@ pub struct ClientView {
     pub scrollback: Vec<crate::terminal::model::ScreenRow>,
     #[serde(skip)]
     epoch: u64,
+    #[serde(skip)]
+    attachment_id: Option<String>,
 }
 struct Shared {
     view: Mutex<ClientView>,
@@ -296,13 +298,19 @@ enum Action {
 struct Job {
     generation: u64,
     target: Option<String>,
+    attachment_id: Option<String>,
     epoch: u64,
     action: Action,
-    reply: oneshot::Sender<Result<(), String>>,
+    reply: oneshot::Sender<Result<Option<Vec<crate::terminal::model::ScreenRow>>, String>>,
 }
 async fn dispatch(action: Action) -> Result<(), String> {
+    dispatch_response(action).await.map(|_| ())
+}
+async fn dispatch_response(
+    action: Action,
+) -> Result<Option<Vec<crate::terminal::model::ScreenRow>>, String> {
     let shared = shared();
-    let (epoch, generation, target) = {
+    let (epoch, generation, target, attachment_id) = {
         let view = shared.view.lock().unwrap();
         if view.connection != "connected" {
             return Err("Desktop is not connected".into());
@@ -311,6 +319,7 @@ async fn dispatch(action: Action) -> Result<(), String> {
             view.epoch,
             shared.generation.load(Ordering::SeqCst),
             view.selected_tab.clone(),
+            view.attachment_id.clone(),
         )
     };
     let tx = shared
@@ -323,6 +332,7 @@ async fn dispatch(action: Action) -> Result<(), String> {
     tx.try_send(Job {
         generation,
         target,
+        attachment_id,
         epoch,
         action,
         reply,
@@ -354,8 +364,12 @@ pub async fn desktop_client_resize(cols: u16, rows: u16) -> Result<(), String> {
     dispatch(Action::Resize(cols, rows)).await
 }
 #[cfg_attr(not(aiterm_headless), tauri::command)]
-pub async fn desktop_client_scrollback(offset: usize) -> Result<(), String> {
-    dispatch(Action::Scrollback(offset)).await
+pub async fn desktop_client_scrollback(
+    offset: usize,
+) -> Result<Vec<crate::terminal::model::ScreenRow>, String> {
+    Ok(dispatch_response(Action::Scrollback(offset))
+        .await?
+        .unwrap_or_default())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -418,6 +432,27 @@ impl Connection {
         Ok(())
     }
     async fn attach(&mut self, tab: String, job: Option<Job>) -> Result<(), String> {
+        if self.pending.values().any(|p| p.kind == "terminal.attach") {
+            if let Some(job) = job {
+                let _ = job.reply.send(Err("A session is already opening".into()));
+            }
+            return Ok(());
+        }
+        // Requests already sent belong to the old attachment. Do not leave
+        // abandoned history/input acknowledgements triggering a reconnect.
+        let obsolete: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.kind.starts_with("terminal."))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in obsolete {
+            if let Some(Pending { job: Some(job), .. }) = self.pending.remove(&id) {
+                let _ = job.reply.send(Err(
+                    "Terminal attachment changed; input was not replayed".into()
+                ));
+            }
+        }
         if let Some((old, id)) = self.attachment.take() {
             self.request(
                 "terminal.detach",
@@ -428,8 +463,11 @@ impl Connection {
         }
         self.assembler = None;
         self.shared.publish(self.generation, |v| {
+            if v.selected_tab.as_deref() != Some(&tab) {
+                v.screen = None;
+            }
             v.selected_tab = Some(tab.clone());
-            v.screen = None;
+            v.attachment_id = None;
             v.scrollback.clear();
             v.has_focus = false;
         });
@@ -453,9 +491,13 @@ impl Connection {
         if let Action::Attach(tab) = &job.action {
             return self.attach(tab.clone(), Some(job)).await;
         }
-        if job.target != self.shared.view.lock().unwrap().selected_tab {
+        let matches_attachment = {
+            let view = self.shared.view.lock().unwrap();
+            job.target == view.selected_tab && job.attachment_id == view.attachment_id
+        };
+        if !matches_attachment {
             let _ = job.reply.send(Err(
-                "Selected session changed; input was not replayed".into()
+                "Terminal attachment changed; input was not replayed".into()
             ));
             return Ok(());
         }
@@ -580,7 +622,9 @@ impl Connection {
                                 return Err("Mismatched scrollback response".into());
                             }
                             if let Some(job) = pending.job {
-                                let _ = job.reply.send(Ok(()));
+                                let _ = job.reply.send(Ok(Some(
+                                    self.shared.view.lock().unwrap().scrollback.clone(),
+                                )));
                             }
                         }
                     }
@@ -598,6 +642,9 @@ impl Connection {
                     | "auth.denied"
             )
         {
+            return Ok(());
+        }
+        if frame.request_id != 0 && !self.pending.contains_key(&frame.request_id) {
             return Ok(());
         }
         let payload: Value = if frame.payload.is_empty() {
@@ -648,8 +695,9 @@ impl Connection {
                                     .map_err(|_| "Invalid attachment identity")?,
                             ),
                     );
-                    self.attachment = Some((tab, id));
+                    self.attachment = Some((tab, id.clone()));
                     self.shared.publish(self.generation, |v| {
+                        v.attachment_id = Some(id);
                         v.has_focus = payload["has_focus"].as_bool().unwrap_or(false)
                     });
                 }
@@ -670,7 +718,7 @@ impl Connection {
             _ => {}
         }
         if let Some(Pending { job: Some(job), .. }) = pending {
-            let _ = job.reply.send(Ok(()));
+            let _ = job.reply.send(Ok(None));
         }
         Ok(())
     }
@@ -718,6 +766,7 @@ async fn connection_loop(
             v.has_focus = false;
             v.screen = None;
             v.epoch = epoch;
+            v.attachment_id = None;
         });
         let result: Result<(), String> = async {
             let mut socket = transport::open(&desktop).await?;

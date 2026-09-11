@@ -14,4 +14,4 @@ export const desktopAttach = (tabId: string) => invoke<void>("desktop_client_att
 export const desktopFocus = () => invoke<void>("desktop_client_focus");
 export const desktopInput = (data: string) => invoke<void>("desktop_client_input", { data });
 export const desktopResize = (cols: number, rows: number) => invoke<void>("desktop_client_resize", { cols, rows });
-export const desktopScrollback = (offset: number) => invoke<void>("desktop_client_scrollback", { offset });
+export const desktopScrollback = (offset: number) => invoke<RemoteRow[]>("desktop_client_scrollback", { offset });

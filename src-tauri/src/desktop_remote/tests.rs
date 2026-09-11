@@ -56,13 +56,21 @@ async fn drain_until(connection: &mut Connection, ready: impl Fn(&Connection) ->
     .await
     .expect("gateway did not reach the expected state");
 }
-fn job(connection: &Connection, action: Action) -> (Job, oneshot::Receiver<Result<(), String>>) {
+fn job(
+    connection: &Connection,
+    action: Action,
+) -> (
+    Job,
+    oneshot::Receiver<Result<Option<Vec<crate::terminal::model::ScreenRow>>, String>>,
+) {
     let (reply, result) = oneshot::channel();
+    let view = connection.shared.view.lock().unwrap().clone();
     (
         Job {
             generation: connection.generation,
             epoch: connection.epoch,
-            target: connection.shared.view.lock().unwrap().selected_tab.clone(),
+            target: view.selected_tab.clone(),
+            attachment_id: view.attachment_id.clone(),
             action,
             reply,
         },
@@ -222,6 +230,29 @@ async fn real_gateway_auth_snapshot_focus_input_scrollback_and_reconnect() {
     stale.target = Some("other tab".into());
     connection.job(stale).await.unwrap();
     assert!(result.await.unwrap().is_err());
+    assert_eq!(pty.writes.lock().unwrap().len(), 1);
+    // Giving control back reattaches read-only, without ending the terminal.
+    let old_attachment = connection.attachment.clone();
+    let (history, history_result) = job(&connection, Action::Scrollback(0));
+    connection.job(history).await.unwrap();
+    let (queued, queued_result) = job(&connection, Action::Input("stale after handoff".into()));
+    connection.attach(tab.as_str().into(), None).await.unwrap();
+    drain_until(&mut connection, |c| {
+        c.attachment.is_some() && c.attachment != old_attachment
+    })
+    .await;
+    assert!(history_result.await.unwrap().is_err());
+    assert!(!connection
+        .pending
+        .values()
+        .any(|p| p.kind == "terminal.scrollback"));
+    assert!(!shared.view.lock().unwrap().has_focus);
+    assert!(registry.get(&tab).unwrap().input_owner().is_none());
+    let (focus, _result) = job(&connection, Action::Focus);
+    connection.job(focus).await.unwrap();
+    drain_until(&mut connection, |c| c.shared.view.lock().unwrap().has_focus).await;
+    connection.job(queued).await.unwrap();
+    assert!(queued_result.await.unwrap().is_err());
     assert_eq!(pty.writes.lock().unwrap().len(), 1);
     connection.socket.close(None).await.unwrap();
     drop(connection);
