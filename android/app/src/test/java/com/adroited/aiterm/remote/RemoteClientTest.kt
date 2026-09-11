@@ -319,6 +319,45 @@ class RemoteClientTest {
     }
 
     @Test
+    fun dashboardPollsTurnStateWithoutOpeningOrReplacingAConversation() = runTest {
+        val transport = FakeRemoteTransport()
+        val sessions = listOf("one", "two", "three").map {
+            RemoteSession(it, "codex", it, "/work", "/work", forked = false, background = false, lastActive = 1)
+        }
+        var open = false
+        var seq = 10L
+        transport.responseFor = { request ->
+            val payload = when (request.kind) {
+                "session.roster" -> uploadCbor.encodeToByteArray(TestSessionRosterReply.serializer(),
+                    TestSessionRosterReply(sessions, sessions.associate { it.id to "output" }))
+                else -> uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(),
+                    SpineSnapshotWire(1, true, false, latestSeq = seq, turnOpen = open, events = emptyList()))
+            }
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.previewSession("one")
+        runCurrent()
+        repeat(3) {
+            client.refreshSessions()
+            runCurrent()
+            assertEquals(mapOf("one" to "idle", "two" to "idle", "three" to "idle"), client.state.value.sessionActivity)
+            advanceTimeBy(4_000)
+        }
+        assertEquals("one", client.state.value.previewSessionId)
+        assertEquals(1, transport.requests.count { it.kind == "session.spine.subscribe" })
+        assertTrue(transport.requests.none { it.kind == "session.open" })
+        open = true; seq++
+        client.refreshSessions(); runCurrent()
+        assertTrue(client.state.value.sessionActivity.values.all { it == "output" })
+        open = false; seq++
+        client.refreshSessions(); runCurrent()
+        assertTrue(client.state.value.sessionActivity.values.all { it == "idle" })
+        client.lock()
+    }
+
+    @Test
     fun successfulSessionRefreshStopsLoading() = runTest {
         val transport = FakeRemoteTransport()
         val pending = CompletableDeferred<RemoteResponse>()
@@ -2607,4 +2646,4 @@ private class RoundThreeBinarySocket : RemoteBinarySocket {
 }
 
 @Serializable
-private data class TestSessionRosterReply(val sessions: List<RemoteSession>)
+private data class TestSessionRosterReply(val sessions: List<RemoteSession>, val activity: Map<String, String> = emptyMap())

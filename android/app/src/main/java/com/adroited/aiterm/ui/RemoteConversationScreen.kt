@@ -2,6 +2,7 @@ package com.adroited.aiterm.ui
 
 import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
+import com.adroited.aiterm.remote.conversationPhase
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -1100,14 +1101,16 @@ internal fun RemoteConversationContent(
     val timeline = remember(previewItems) { spineTimeline(previewItems) }
     val listState = rememberLazyListState()
     val conversationSelection = rememberSelectionState()
-    val working = isConversationWorking(
+    val phase = conversationPhase(
         phase = state.previewPhase.takeIf { state.previewSessionId == session.id } ?: SpinePhase.Idle,
-        spineLive = state.previewSessionId == session.id && state.previewLive,
+        detail = state.previewPhaseDetail.takeIf { state.previewSessionId == session.id }.orEmpty(),
+        live = state.previewSessionId == session.id && state.previewLive,
         turnOpen = state.previewTurnOpen.takeIf { state.previewSessionId == session.id },
         rosterActivity = state.sessionActivity[session.id],
     )
+    val working = phase == SpinePhase.Working
     val live = isConversationSessionLive(session, state.tabs)
-    val needsYou = state.previewSessionId == session.id && state.previewPhase == SpinePhase.NeedsYou
+    val needsYou = phase == SpinePhase.NeedsYou
     val starred = session.id in state.starredSessions
     val imeBottom = WindowInsets.ime.getBottom(LocalDensity.current)
     var positionedAtNewest by remember(session.id) { mutableStateOf(false) }
@@ -1165,8 +1168,8 @@ internal fun RemoteConversationContent(
         }
     }
     // Text/tool upserts can change a row without changing the row count.
-    LaunchedEffect(previewItems, timeline.size, working) {
-        val itemCount = conversationListItemCount(timeline.size, working)
+    LaunchedEffect(previewItems, timeline.size) {
+        val itemCount = conversationListItemCount(timeline.size)
         val previousCount = previousTimelineCount
         previousTimelineCount = itemCount
         if (itemCount == 0) return@LaunchedEffect
@@ -1184,7 +1187,7 @@ internal fun RemoteConversationContent(
     }
     LaunchedEffect(imeBottom) {
         if (imeBottom > 0) {
-            val newest = conversationListItemCount(timeline.size, working)
+            val newest = conversationListItemCount(timeline.size)
             if (newest > 0) listState.scrollToItem(newest - 1)
         }
     }
@@ -1501,6 +1504,18 @@ internal fun RemoteConversationContent(
                     .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                     .padding(horizontal = 10.dp, vertical = 8.dp),
             ) {
+                if (live) {
+                    Box(Modifier.fillMaxWidth().height(52.dp), contentAlignment = Alignment.CenterStart) {
+                        when {
+                            needsYou -> state.tabs.firstOrNull { it.sessionId == session.id }?.let { tab ->
+                                NeedsYouQuickKeys { key -> onQuickInput(tab.id, key) }
+                            }
+                            working -> ConversationWorkingRow(session.agent, state.previewPhaseDetail)
+                            else -> Text("Session open", style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
                 PendingPromptCards(
                     prompts = state.pendingPrompts.filter { it.sessionId == session.id },
                     connected = state.connection == ConnectionState.Connected,
@@ -1633,11 +1648,6 @@ internal fun RemoteConversationContent(
                                     state.previewError?.let { error ->
                                         Text("Conversation updates interrupted: $error", color = MaterialTheme.colorScheme.error)
                                     }
-                                    if (needsYou) {
-                                        state.tabs.firstOrNull { it.sessionId == session.id }?.let { tab ->
-                                            NeedsYouQuickKeys { key -> onQuickInput(tab.id, key) }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -1646,13 +1656,6 @@ internal fun RemoteConversationContent(
                                 conversationSelection.clear()
                                 messageActions = it
                             })
-                        }
-                        if (working) {
-                            item(key = "working") {
-                                DisableSelection {
-                                    ConversationWorkingRow(session.agent, state.previewPhaseDetail)
-                                }
-                            }
                         }
                     }
                 }
@@ -2483,9 +2486,8 @@ private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aite
 internal fun shouldFollowConversationUpdate(previousCount: Int, lastVisible: Int, scrolling: Boolean): Boolean =
     !scrolling && lastVisible >= previousCount - 2
 
-// LazyColumn always starts with the crew strip, before timeline and status.
-internal fun conversationListItemCount(timelineCount: Int, working: Boolean): Int =
-    1 + timelineCount + if (working) 1 else 0
+// Status and approval controls live outside the scrolling conversation.
+internal fun conversationListItemCount(timelineCount: Int): Int = 1 + timelineCount
 
 internal fun isConversationSessionLive(session: RemoteSession, tabs: List<RemoteTab>): Boolean =
     tabs.any { it.sessionId == session.id && it.state == RemoteTabState.Running }
@@ -2506,15 +2508,7 @@ internal fun isConversationWorking(
     turnOpen: Boolean?,
     rosterActivity: String?,
 ): Boolean {
-    // A completed native turn is stronger evidence than the last phase
-    // packet. It also makes the UI robust if an idle phase is delayed or
-    // lost while the conversation is paging through a large history.
-    if (spineLive && turnOpen == false) return false
-    return when (phase) {
-        SpinePhase.Working -> true
-        SpinePhase.NeedsYou -> false
-        SpinePhase.Idle -> !spineLive && rosterActivity == "output"
-    }
+    return conversationPhase(phase, "", spineLive, turnOpen, rosterActivity) == SpinePhase.Working
 }
 
 internal fun conversationSessions(

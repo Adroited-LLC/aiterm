@@ -121,3 +121,37 @@ desktop and Linux Rust sources were not changed for this fix.
 Android 0.3.27 renders a recognized Codex memory-citation footer as a collapsed Memory references section. Expanding it shows source file/line references and their notes, without the raw XML wrapper or rollout identifiers. Live spine rows, history fallback, and Copy/Share use the same parsing. User messages, code examples, unsupported markup, and incomplete footers remain unchanged; stored and transported conversation text is preserved.
 
 Validation: all 322 Android unit tests, APK assembly, and lint passed. The five new regressions cover the reported footer, multiple source ranges, malformed/incomplete input, code examples, and assistant-only Copy/Share normalization. No device installation was performed.
+
+### Android session status and scroll stability (0.3.29)
+
+The dashboard's three-second roster refresh used terminal byte cadence as its
+working verdict. Idle Codex terminals repaint, so opening a conversation briefly
+corrected the row before the next roster response replaced it with `output`.
+Android now reads the existing spine endpoint's atomic turn gate for running
+sessions. A metadata-only cursor avoids downloading history; when its sequence
+changes, a bounded recent tail supplies explicit permission phases. These reads
+use `session.spine`, never replace the selected subscription, and keep their
+status cursors separate from the conversation/outbox cursors. Requests are
+deduplicated and time out after eight seconds. Sequence checks reject older
+replies; reconnects reset status caches. Unknown status stays open rather than
+claiming work from terminal redraws.
+
+Both views use the same phase rule. A closed native turn is idle; an open native
+turn stays working through quiet periods. Older desktop phase details `approval`
+and `a tool call is waiting` are transcript timeout guesses, so they do not alone
+raise Needs you. Explicit permission phases remain visible. This cannot identify
+an approval that the desktop reports only through that timeout heuristic; its
+terminal remains available for inspecting and answering the prompt.
+
+The API conversation keeps its status/approval controls in a fixed-height area
+above the composer, outside the message list. Phase-only updates neither add or
+remove message rows nor trigger follow-to-newest scrolling. Regression coverage
+includes repeated roster refreshes, starting/completing turns, stale responses,
+permission retention, desktop epochs, partial history, and message/composer
+geometry at the newest message and while reading older context.
+
+Validation: 341 Android unit tests, lint, and APK assembly passed. All four
+SessionNavigationTest device tests passed on the Pixel 10 Pro XL, including
+repeated Working/Needs you/Idle geometry checks at the newest message and
+in older history. Pixel upgraded in place to 0.3.29/code 32; pairing preferences
+were byte-for-byte unchanged. No desktop update or restart was required.

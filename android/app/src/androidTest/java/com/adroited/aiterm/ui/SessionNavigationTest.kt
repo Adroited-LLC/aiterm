@@ -88,6 +88,54 @@ class SessionNavigationTest {
         compose.onNodeWithText("Check the queued message").assertIsDisplayed()
     }
 
+    @Test fun statusChangesPreserveMessageAndComposerPositionsAtTailAndInHistory() {
+        val session = session("stable", "Stable conversation")
+        val state = mutableStateOf(RemoteClientState(
+            connection = ConnectionState.Connected,
+            sessions = listOf(session),
+            tabs = listOf(RemoteTab("tab", "Stable", sessionId = session.id, size = TerminalSize(80, 24))),
+            previewSessionId = session.id, previewLive = true, previewTurnOpen = true,
+            previewPhase = SpinePhase.Working,
+            previewItems = (0..79).map { Item.User("message-$it", "Message $it", it.toLong()) },
+        ))
+        compose.setContent { MaterialTheme {
+            RemoteConversationContent(state = state.value, session = session,
+                onBack = {}, onRefresh = {}, onSend = { _, _, _, _ -> Result.success(Unit) },
+                onBringIn = { _, _, _, _, _, _, _ -> }, onStar = { _, _ -> },
+                onOpen = {}, onOpenTerminal = {}, onStop = {},
+                onLoadFiles = { Result.success(emptyList()) },
+                onLoadFile = { _, _, _ -> error("Unexpected file") },
+                onParseMarkdown = { Result.success(RemoteMarkdownDocument(emptyList())) },
+                onSaveMarkdown = { _, _, _, _ -> error("Unexpected save") },
+                onRenderSvg = { _, _ -> error("Unexpected SVG") },
+                onProbeWebPreview = { Result.success(false) },
+                onOpenWebPreview = { error("Unexpected web preview") }, onShowWebPreview = {},
+                onSelectSession = {}, onQuickInput = { _, _ -> })
+        } }
+        fun checkAnchor(text: String) {
+            compose.onNodeWithText(text).assertIsDisplayed()
+            val message = compose.onNodeWithText(text).fetchSemanticsNode().boundsInRoot
+            val composer = compose.onNode(hasSetTextAction()).fetchSemanticsNode().boundsInRoot
+            repeat(4) { index ->
+                compose.runOnIdle { state.value = state.value.copy(
+                    previewPhase = if (index % 2 == 0) SpinePhase.NeedsYou else SpinePhase.Working,
+                    previewPhaseDetail = if (index % 2 == 0) "permission: Bash" else "Running tests",
+                ) }
+                compose.waitForIdle()
+                assertEquals(message, compose.onNodeWithText(text).fetchSemanticsNode().boundsInRoot)
+                assertEquals(composer, compose.onNode(hasSetTextAction()).fetchSemanticsNode().boundsInRoot)
+            }
+            compose.runOnIdle { state.value = state.value.copy(previewTurnOpen = false, previewPhase = SpinePhase.Idle) }
+            compose.waitForIdle()
+            assertEquals(message, compose.onNodeWithText(text).fetchSemanticsNode().boundsInRoot)
+            assertEquals(composer, compose.onNode(hasSetTextAction()).fetchSemanticsNode().boundsInRoot)
+            compose.runOnIdle { state.value = state.value.copy(previewTurnOpen = true, previewPhase = SpinePhase.Working) }
+        }
+        checkAnchor("Message 79")
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText("Message 30"))
+        checkAnchor("Message 30")
+    }
+
     @Test fun pendingCardShowsAcceptanceAndConnectionStateUntilConfirmed() {
         val prompts = mutableStateOf(listOf(PendingConversationPrompt("p", "a", "Please check this next")))
         val connected = mutableStateOf(true)

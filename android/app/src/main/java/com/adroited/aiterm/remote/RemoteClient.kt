@@ -220,6 +220,8 @@ class RemoteClient(
     private val conversationOutbox = ConversationOutbox()
     private val spineConversations = HashMap<String, SpineConversationStore>()
     private val spineRefreshPending = HashSet<String>()
+    private val sessionStatuses = HashMap<String, SessionActivity>()
+    private val statusReads = HashSet<String>()
     private var desiredPreviewSessionId: String? = null
     private var previewGeneration = 0L
 
@@ -759,11 +761,56 @@ class RemoteClient(
                     sessionsWithFiles = roster.withFiles,
                     starredSessions = roster.stars,
                     broughtInSessions = roster.broughtIn,
-                    sessionActivity = roster.activity,
+                    sessionActivity = roster.activity.mapValues { (id, cadence) ->
+                        sessionStatuses[id]?.activity ?: cadence.takeUnless { it == "output" } ?: "idle"
+                    },
                 )
+                sessionStatuses.keys.retainAll(roster.sessions.map { it.id }.toSet())
+                // The roster's activity keys identify running terminals, including
+                // those whose tab discovery response has not arrived yet.
+                roster.activity.keys.forEach(::refreshSessionStatus)
             }
             if (!accepted) mutableState.value = mutableState.value.copy(sessionsRefreshing = false)
         }
+    }
+
+    private fun refreshSessionStatus(sessionId: String) {
+        if (!statusReads.add(sessionId)) return
+        // A cursor beyond the ring asks only for its atomic bounds and turn gate.
+        // It neither switches the selected subscription nor downloads history.
+        val accepted = launchRequest(
+            "session.spine", RemoteCommands.spine(sessionId, Long.MAX_VALUE),
+            timeoutMillis = 8_000,
+            onError = { _, _ -> statusReads.remove(sessionId) },
+        ) { payload ->
+            val page = RemoteCommands.spinePage(payload)
+            val status = sessionStatuses.getOrPut(sessionId, ::SessionActivity)
+            val changed = status.epoch != page.epoch || status.latestSeq != page.latestSeq
+            status.apply(page)
+            publishSessionStatus(sessionId)
+            if (changed && page.latestSeq > 0) {
+                // Inspect a bounded recent tail only when there were events, so
+                // explicit permission phases are retained without replaying a chat.
+                val tailStarted = launchRequest(
+                    "session.spine", RemoteCommands.spine(sessionId, (page.latestSeq - 32).coerceAtLeast(0)),
+                    timeoutMillis = 8_000,
+                    onError = { _, _ -> statusReads.remove(sessionId) },
+                ) { tail ->
+                    status.apply(RemoteCommands.spinePage(tail))
+                    publishSessionStatus(sessionId)
+                    statusReads.remove(sessionId)
+                }
+                if (!tailStarted) statusReads.remove(sessionId)
+            } else statusReads.remove(sessionId)
+        }
+        if (!accepted) statusReads.remove(sessionId)
+    }
+
+    private fun publishSessionStatus(sessionId: String) {
+        val activity = sessionStatuses[sessionId]?.activity ?: return
+        mutableState.value = mutableState.value.copy(
+            sessionActivity = mutableState.value.sessionActivity + (sessionId to activity),
+        )
     }
 
     fun refreshUsage() {
@@ -877,17 +924,10 @@ class RemoteClient(
                 }
                 val items = store.apply(page)
                 conversationOutbox.reconcile(sessionId, page)
-                val activity = if (store.phaseSeen) {
-                    mutableState.value.sessionActivity + (
-                        sessionId to when (store.phase) {
-                            SpinePhase.Working -> "output"
-                            SpinePhase.NeedsYou -> "attention"
-                            SpinePhase.Idle -> "idle"
-                        }
-                    )
-                } else {
-                    mutableState.value.sessionActivity
-                }
+                sessionStatuses.getOrPut(sessionId, ::SessionActivity).apply(page)
+                val activity = sessionStatuses[sessionId]?.activity?.let {
+                    mutableState.value.sessionActivity + (sessionId to it)
+                } ?: mutableState.value.sessionActivity
                 mutableState.value = mutableState.value.copy(
                     previewSessionId = sessionId,
                     previewItems = items,
@@ -1556,6 +1596,7 @@ class RemoteClient(
 
     private fun detachTransportLocked(): ClosingTransport {
         spineRefreshPending.clear()
+        statusReads.clear()
         mutableState.value = mutableState.value.copy(sessionsRefreshing = false, previewLoadingSessionId = null)
         lifecycleGeneration += 1
         selectionGeneration += 1
@@ -1600,6 +1641,8 @@ class RemoteClient(
             eventJob = null
             transport = candidate
             spineRefreshPending.clear()
+            statusReads.clear()
+            sessionStatuses.clear()
             activeAttachmentId = null
             activeAttachmentTabId = null
             terminalAssembler.clear()
