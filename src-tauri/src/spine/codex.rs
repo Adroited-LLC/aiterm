@@ -367,9 +367,9 @@ impl CodexAdapter {
                 category,
                 input: clip(&detail, INPUT_CAP),
                 // Not `Pending`: codex writes the record as it dispatches.
-                // Waiting on a person is reported on the phase channel, which
-                // is where `transcript_verdict` already reads codex's open
-                // turn for an approval.
+                // Dispatch is not evidence of waiting on a person. Codex
+                // rollouts without explicit permission records stay working;
+                // neither a pending tool nor silence proves an approval prompt.
                 status: ToolStatus::Running,
             },
         ));

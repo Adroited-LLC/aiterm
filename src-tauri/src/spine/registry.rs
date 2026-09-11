@@ -50,13 +50,6 @@ const SLOW_OPEN_RETRY: Duration = Duration::from_secs(10);
 /// starting; a minute of nothing means something else is wrong.
 const FAST_OPEN_RETRY_FOR: Duration = Duration::from_secs(60);
 
-/// How long after the last write to a session's files its phase verdict can
-/// still move on its own. `transcript_verdict` flips an open codex turn from
-/// working to attention once the file has been quiet for 45 s, and nothing
-/// writes to mark that — so the stamp gate below must not start skipping
-/// until past it.
-const VERDICT_SETTLES_AFTER: Duration = Duration::from_secs(60);
-
 /// How often to look again for the files a session's phase verdict reads,
 /// when the last look found none. `phase_sources` goes through `owner_in`,
 /// which asks every backend in turn — not a per-tick cost now that the tick
@@ -107,6 +100,10 @@ struct SessionLog {
     /// they run: without this, the second after a hook said "permission:
     /// Edit" cadence would say "working" and be believed.
     hook: Option<(Phase, String)>,
+    adapter_phase: Option<(Phase, String)>,
+    transcript: Option<(&'static str, &'static str)>,
+    cadence: String,
+    phase_revision: u64,
 }
 
 impl SessionLog {
@@ -123,12 +120,27 @@ impl SessionLog {
             last_phase: None,
             turn: None,
             hook: None,
+            adapter_phase: None,
+            transcript: None,
+            cadence: "idle".into(),
+            phase_revision: 0,
         }
     }
 
     fn tailing(&self) -> bool {
         self.tail.as_ref().is_some_and(|h| !h.inner().is_finished())
     }
+}
+
+enum PhaseInput<'a> {
+    Cadence(&'a str),
+    Transcript {
+        cadence: Option<&'a str>,
+        verdict: Option<(&'static str, &'static str)>,
+        revision: u64,
+    },
+    Adapter(Phase, &'a str),
+    Hook(HookPhase),
 }
 
 pub struct Spine {
@@ -183,43 +195,70 @@ impl Spine {
             let log = sessions
                 .entry(session_id.to_string())
                 .or_insert_with(|| SessionLog::new(agent));
-            let ev = SpineEvent {
-                seq: log.next_seq,
-                epoch: self.epoch,
-                session_id: session_id.to_string(),
-                agent: agent.to_string(),
-                ts,
-                kind,
-            };
-            log.next_seq += 1;
-            // The turn bracket, recorded where nothing can route around it.
-            // It is what lets the phase rule below distinguish a TUI still
-            // redrawing from an agent still working.
-            match &ev.kind {
-                Kind::TurnStarted { .. } => log.turn = Some((true, ev.ts)),
-                Kind::TurnEnded { .. } => log.turn = Some((false, ev.ts)),
-                _ => {}
-            }
-            // A reset says everything before it is gone. Keeping the old
-            // events would only hand a reconnecting phone history it is
-            // about to throw away — and they are the events most likely to
-            // be the bulk of the ring.
-            if matches!(ev.kind, Kind::Reset) {
-                log.events.clear();
-                log.bytes = 0;
-            }
-            log.bytes += weight(&ev);
-            log.events.push_back(ev.clone());
-            while log.events.len() > MAX_EVENTS || (log.bytes > MAX_BYTES && log.events.len() > 1) {
-                if let Some(old) = log.events.pop_front() {
-                    log.bytes = log.bytes.saturating_sub(weight(&old));
-                }
-            }
-            ev
+            Self::append_event(log, self.epoch, session_id, agent, ts, kind)
         };
         // Outside the lock: a subscriber's wake must never be able to
         // re-enter the registry while it is held.
         let _ = self.tx.send(ev.clone());
+        ev
+    }
+
+    fn append_event(
+        log: &mut SessionLog,
+        epoch: u64,
+        session_id: &str,
+        agent: &str,
+        ts: u64,
+        kind: Kind,
+    ) -> SpineEvent {
+        let ev = SpineEvent {
+            seq: log.next_seq,
+            epoch,
+            session_id: session_id.to_string(),
+            agent: agent.to_string(),
+            ts,
+            kind,
+        };
+        log.next_seq += 1;
+        // The turn bracket, recorded where nothing can route around it.
+        // It is what lets the phase rule below distinguish a TUI still
+        // redrawing from an agent still working.
+        match &ev.kind {
+            Kind::TurnStarted { .. } | Kind::TurnEnded { .. }
+                if log.turn.is_none_or(|(_, at)| ev.ts >= at) =>
+            {
+                log.turn = Some((matches!(ev.kind, Kind::TurnStarted { .. }), ev.ts));
+                log.hook = None;
+                log.adapter_phase = None;
+                log.transcript = None;
+                log.phase_revision += 1;
+            }
+            Kind::Reset => {
+                log.turn = None;
+                log.hook = None;
+                log.adapter_phase = None;
+                log.transcript = None;
+                log.cadence = "idle".into();
+                log.last_phase = None;
+                log.phase_revision += 1;
+            }
+            _ => {}
+        }
+        // A reset says everything before it is gone. Keeping the old
+        // events would only hand a reconnecting phone history it is
+        // about to throw away — and they are the events most likely to
+        // be the bulk of the ring.
+        if matches!(ev.kind, Kind::Reset) {
+            log.events.clear();
+            log.bytes = 0;
+        }
+        log.bytes += weight(&ev);
+        log.events.push_back(ev.clone());
+        while log.events.len() > MAX_EVENTS || (log.bytes > MAX_BYTES && log.events.len() > 1) {
+            if let Some(old) = log.events.pop_front() {
+                log.bytes = log.bytes.saturating_sub(weight(&old));
+            }
+        }
         ev
     }
 
@@ -371,29 +410,6 @@ impl Spine {
             .map(|(open, _)| open)
     }
 
-    /// Remember what a hook last said about a session. Only for a session
-    /// the registry already knows: a phase with no log behind it has nobody
-    /// to tell, and inventing a log here would leak one per foreign claude.
-    fn set_hook_phase(&self, session_id: &str, hook: Option<(Phase, String)>) {
-        if let Some(log) = self.sessions.lock().unwrap().get_mut(session_id) {
-            log.hook = hook;
-        }
-    }
-
-    /// A hook said the turn opened or closed. The bracket, not the events:
-    /// the transcript stays the only source of `turn_started` /
-    /// `turn_ended`, and this only moves the gate cadence is measured
-    /// against — a beat earlier than the transcript can, which is the whole
-    /// difference between "idle" landing at the end of an answer and the
-    /// TUI's last few repaints re-raising "working" for another second
-    /// [observed live: Stop's idle undone 28 ms later by a cadence push,
-    /// 2026-09-02].
-    fn note_hook_turn(&self, session_id: &str, open: bool) {
-        if let Some(log) = self.sessions.lock().unwrap().get_mut(session_id) {
-            log.turn = Some((open, now_ms()));
-        }
-    }
-
     fn hook_phase(&self, session_id: &str) -> Option<(Phase, String)> {
         self.sessions
             .lock()
@@ -430,38 +446,115 @@ impl Spine {
         )));
     }
 
-    /// Record a phase for a session that already has a tail, unless it is
-    /// the one already standing.
+    /// Adapter phases are explicit observations, retained until their source
+    /// resolves them or a new turn clears them. Cadence never erases a question.
     pub fn push_phase_if_tailed(&self, session_id: &str, phase: Phase, detail: &str) {
-        let agent = {
+        self.update_phase(session_id, PhaseInput::Adapter(phase, detail));
+    }
+
+    fn phase_revision(&self, session_id: &str) -> u64 {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map_or(0, |log| log.phase_revision)
+    }
+
+    /// Every producer updates its evidence, resolves priority, and appends the
+    /// resulting event under the same lock. A slow transcript read cannot
+    /// publish a verdict computed before a newer hook or turn boundary.
+    fn update_phase(&self, session_id: &str, input: PhaseInput<'_>) -> bool {
+        let event = {
             let mut sessions = self.sessions.lock().unwrap();
             let Some(log) = sessions.get_mut(session_id) else {
-                return;
+                return false;
             };
-            // Deliberately not started here: a phase with no content behind
-            // it is not worth opening a transcript for.
             if !log.tailing() {
-                return;
+                return false;
             }
-            if log
-                .last_phase
-                .as_ref()
-                .is_some_and(|(p, d)| *p == phase && d == detail)
-            {
-                return;
+            let source = match input {
+                PhaseInput::Cadence(activity) => {
+                    log.cadence = activity.to_string();
+                    "terminal"
+                }
+                PhaseInput::Transcript {
+                    cadence,
+                    verdict,
+                    revision,
+                } => {
+                    if revision != log.phase_revision {
+                        return false;
+                    }
+                    log.cadence = cadence.unwrap_or("idle").to_string();
+                    log.transcript = verdict;
+                    "transcript"
+                }
+                PhaseInput::Adapter(phase, detail) => {
+                    log.adapter_phase = Some((phase, detail.to_string()));
+                    log.transcript = None;
+                    log.phase_revision += 1;
+                    "adapter"
+                }
+                PhaseInput::Hook(hook) => {
+                    match hook {
+                        HookPhase::NeedsYou(detail) => log.hook = Some((Phase::NeedsYou, detail)),
+                        HookPhase::Working(detail) => log.hook = Some((Phase::Working, detail)),
+                        HookPhase::TurnOpened => {
+                            log.turn = Some((true, now_ms()));
+                            log.hook = Some((Phase::Working, String::new()));
+                            log.adapter_phase = None;
+                        }
+                        HookPhase::Idle | HookPhase::Stopped => {
+                            log.turn = Some((false, now_ms()));
+                            log.hook = None;
+                            log.adapter_phase = None;
+                        }
+                    }
+                    log.transcript = None;
+                    log.phase_revision += 1;
+                    "hook"
+                }
+            };
+            let turn = log.turn.map(|(open, _)| open);
+            // Hooks and adapter records identify actual requests and their
+            // resolution. Terminal bytes carry no such information.
+            let explicit = log.hook.as_ref().or(log.adapter_phase.as_ref());
+            let (phase, detail) = if let Some((phase, detail)) = explicit {
+                (*phase, detail.clone())
+            } else {
+                let (activity, detail) = crate::spine::activity::activity_verdict(
+                    Some(&log.cadence),
+                    log.transcript,
+                    turn,
+                    false,
+                );
+                (phase_of(activity), detail.to_string())
+            };
+            if log.last_phase.as_ref() == Some(&(phase, detail.clone())) {
+                return true;
             }
-            log.last_phase = Some((phase, detail.to_string()));
-            log.agent.clone()
+            let previous = log.last_phase.as_ref().map(|(p, _)| *p);
+            log.last_phase = Some((phase, detail.clone()));
+            let agent = log.agent.clone();
+            let event = Self::append_event(
+                log,
+                self.epoch,
+                session_id,
+                &agent,
+                now_ms(),
+                Kind::Phase { phase, detail },
+            );
+            // Metadata only: no tool arguments, prompt text, or permission body.
+            tracing::debug!(target: "aiterm::phase", session = short(session_id), source,
+                seq = event.seq, epoch = self.epoch, ?previous, ?phase, ?turn,
+                transcript = ?log.transcript.map(|(state, _)| state),
+                hook = ?log.hook.as_ref().map(|(p, _)| p),
+                adapter = ?log.adapter_phase.as_ref().map(|(p, _)| p),
+                "session phase transition");
+            event
         };
-        self.push(
-            session_id,
-            &agent,
-            now_ms(),
-            Kind::Phase {
-                phase,
-                detail: detail.to_string(),
-            },
-        );
+        let _ = self.tx.send(event);
+        true
     }
 
     /// A running tail is what gates a phase push, and a unit test has no
@@ -643,8 +736,8 @@ fn push_from_adapter(spine: &Spine, session_id: &str, agent: &str, ts: u64, kind
 /// Through the same rule as the tick, turn gate and all — otherwise a TUI
 /// still repainting after `turn_ended` would re-raise Working half a second
 /// after the tick correctly said Idle, which is the flap this rule exists to
-/// stop. No transcript half: cadence knows no reason, and reading one here
-/// would put a 256 KB tail read on the pty's output path.
+/// stop. It shares retained transcript evidence with the tick without reading
+/// files on the terminal-output path.
 pub fn push_phase(app: &AppHandle, session_id: &str, activity: &str) {
     let Some(spine) = app.try_state::<Arc<Spine>>() else {
         return;
@@ -655,15 +748,7 @@ pub fn push_phase(app: &AppHandle, session_id: &str, activity: &str) {
 /// [`push_phase`] without the state lookup, so the rule can be exercised
 /// against a bare registry.
 fn push_cadence(spine: &Spine, session_id: &str, activity: &str) {
-    let hook = spine.hook_phase(session_id);
-    let (verdict, detail) = crate::spine::activity::activity_verdict(
-        Some(activity),
-        None,
-        spine.turn_open(session_id),
-        matches!(hook, Some((Phase::NeedsYou, _))),
-    );
-    let phase = phase_of(verdict);
-    spine.push_phase_if_tailed(session_id, phase, &with_hook_detail(phase, detail, &hook));
+    spine.update_phase(session_id, PhaseInput::Cadence(activity));
 }
 
 /// What a Claude Code hook said about a session, in the spine's own terms.
@@ -700,41 +785,7 @@ pub async fn push_hook_phase(app: &AppHandle, session_id: &str, hook: HookPhase)
     let Some(spine) = app.try_state::<Arc<Spine>>().map(|s| s.inner().clone()) else {
         return;
     };
-    let (phase, detail) = match hook {
-        // A permission dialog does not close a turn: the tool that asked
-        // for it is part of an answer still being given.
-        HookPhase::NeedsYou(detail) => (Phase::NeedsYou, detail),
-        HookPhase::Working(detail) => (Phase::Working, detail),
-        HookPhase::TurnOpened => {
-            spine.note_hook_turn(session_id, true);
-            (Phase::Working, String::new())
-        }
-        HookPhase::Idle => {
-            spine.note_hook_turn(session_id, false);
-            (Phase::Idle, String::new())
-        }
-        HookPhase::Stopped => {
-            // The turn is over whatever the transcript's own bracket says
-            // yet — its `turn_duration` line lands a moment after this — so
-            // the gate is closed by hand and cadence cannot hold "working".
-            // A transcript that says a person is being waited on still wins.
-            spine.set_hook_phase(session_id, None);
-            spine.note_hook_turn(session_id, false);
-            let sid = session_id.to_string();
-            let transcript =
-                crate::run_blocking(move || crate::spine::activity::transcript_verdict(&sid)).await;
-            let (activity, detail) = crate::spine::activity::activity_verdict(
-                cadence_of(app, session_id).as_deref(),
-                transcript,
-                Some(false),
-                false,
-            );
-            spine.push_phase_if_tailed(session_id, phase_of(activity), detail);
-            return;
-        }
-    };
-    spine.set_hook_phase(session_id, Some((phase, detail.clone())));
-    spine.push_phase_if_tailed(session_id, phase, &detail);
+    spine.update_phase(session_id, PhaseInput::Hook(hook));
 }
 
 /// The tab registry's cadence for one session, or `None` when no tab of
@@ -747,25 +798,6 @@ fn cadence_of(app: &AppHandle, session_id: &str) -> Option<String> {
                 .find(|(id, _)| id == session_id)
                 .map(|(_, a)| a)
         })
-}
-
-/// The detail to push, given the verdict and what a hook last said.
-///
-/// A hook's own words for the state — "running Bash: npm test",
-/// "permission: Edit" — replace whatever the tick a second later would say
-/// for the same phase, which is "" from cadence and one flat word from the
-/// transcript. Without this the phone would see the tool's name for one
-/// second and an unexplained "working" for the rest of the call, and the
-/// permission prompt would lose the name of what it is asking about.
-///
-/// Only while the hook's phase is still the standing one: a hook that said
-/// "running Edit" has nothing to say about a session that has since gone
-/// idle.
-fn with_hook_detail(phase: Phase, detail: &str, hook: &Option<(Phase, String)>) -> String {
-    match hook {
-        Some((hp, hd)) if *hp == phase && !hd.is_empty() => hd.clone(),
-        _ => detail.to_string(),
-    }
 }
 
 /// Answer `GET /v1/sessions/{id}/spine`: register interest, wait out a
@@ -805,7 +837,7 @@ struct PhaseGate {
     /// When those paths were last looked for, while none have been found.
     looked: Instant,
     /// (len, mtime) of each of them at the last read.
-    stamp: Option<Vec<(u64, u64)>>,
+    stamp: Option<Vec<(u64, u128)>>,
     /// What that read said, held until one of the files moves.
     transcript: Option<(&'static str, &'static str)>,
 }
@@ -834,12 +866,13 @@ impl PhaseGate {
             self.paths = crate::run_blocking(move || phase_sources(&sid)).await;
             self.looked = Instant::now();
         }
+        let revision = spine.phase_revision(session_id);
         let sid = session_id.to_string();
         let paths = self.paths.clone();
         let last = self.stamp.clone();
         let (stamp, fresh) = crate::run_blocking(move || {
-            let (stamp, quiet) = stamp_of(&paths);
-            if !force && stamp.is_some() && stamp == last && quiet > VERDICT_SETTLES_AFTER {
+            let stamp = stamp_of(&paths);
+            if !force && stamp.is_some() && stamp == last {
                 return (stamp, None); // nothing it reads moved, and nothing will
             }
             let verdict = crate::spine::activity::transcript_verdict(&sid);
@@ -854,15 +887,16 @@ impl PhaseGate {
         // and a terminal falling quiet is exactly the change the cached
         // transcript half cannot see.
         let cadence = cadence_of(app, session_id);
-        let hook = spine.hook_phase(session_id);
-        let (activity, detail) = crate::spine::activity::activity_verdict(
-            cadence.as_deref(),
-            self.transcript,
-            spine.turn_open(session_id),
-            matches!(hook, Some((Phase::NeedsYou, _))),
-        );
-        let phase = phase_of(activity);
-        spine.push_phase_if_tailed(session_id, phase, &with_hook_detail(phase, detail, &hook));
+        if !spine.update_phase(
+            session_id,
+            PhaseInput::Transcript {
+                cadence: cadence.as_deref(),
+                verdict: self.transcript,
+                revision,
+            },
+        ) {
+            self.stamp = None;
+        }
     }
 }
 
@@ -894,30 +928,21 @@ fn phase_sources(session_id: &str) -> Vec<PathBuf> {
     out
 }
 
-/// (len, mtime seconds) for each path that exists, and how long ago the most
-/// recent of them was written. `None` when none of them do.
-fn stamp_of(paths: &[PathBuf]) -> (Option<Vec<(u64, u64)>>, Duration) {
+/// Length and full-resolution mtime for each existing evidence source.
+fn stamp_of(paths: &[PathBuf]) -> Option<Vec<(u64, u128)>> {
     let mut out = Vec::new();
-    let mut newest = Duration::MAX;
     for path in paths {
         let Ok(meta) = std::fs::metadata(path) else {
             continue;
         };
         let modified = meta.modified().ok();
-        let secs = modified
+        let nanos = modified
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .map(|d| d.as_nanos())
             .unwrap_or(0);
-        if let Some(age) = modified.and_then(|t| t.elapsed().ok()) {
-            newest = newest.min(age);
-        }
-        out.push((meta.len(), secs));
+        out.push((meta.len(), nanos));
     }
-    if out.is_empty() {
-        (None, Duration::ZERO)
-    } else {
-        (Some(out), newest)
-    }
+    (!out.is_empty()).then_some(out)
 }
 
 // ------------------------------------------------------------- the driver
@@ -1334,6 +1359,191 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn explicit_adapter_question_survives_repaints_until_answered() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "antigravity");
+        spine.push(
+            "s",
+            "antigravity",
+            1,
+            Kind::TurnStarted { turn: "t".into() },
+        );
+        push_from_adapter(
+            &spine,
+            "s",
+            "antigravity",
+            2,
+            Kind::Phase {
+                phase: Phase::NeedsYou,
+                detail: "question".into(),
+            },
+        );
+        for _ in 0..10 {
+            push_cadence(&spine, "s", "output");
+        }
+        assert_eq!(
+            phases(&spine, "s"),
+            vec![(Phase::NeedsYou, "question".into())]
+        );
+        push_from_adapter(
+            &spine,
+            "s",
+            "antigravity",
+            3,
+            Kind::Phase {
+                phase: Phase::Working,
+                detail: String::new(),
+            },
+        );
+        assert_eq!(phases(&spine, "s").last().unwrap().0, Phase::Working);
+    }
+
+    #[test]
+    fn same_length_subsecond_evidence_changes_invalidate_the_stamp() {
+        let path =
+            std::env::temp_dir().join(format!("aiterm-phase-stamp-{}", uuid::Uuid::new_v4()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + Duration::new(100, 100_000_000))
+            .unwrap();
+        let before = stamp_of(std::slice::from_ref(&path));
+        file.set_modified(std::time::UNIX_EPOCH + Duration::new(100, 200_000_000))
+            .unwrap();
+        let after = stamp_of(std::slice::from_ref(&path));
+        std::fs::remove_file(path).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn alternating_timeout_guesses_and_repaints_never_flap() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "codex");
+        spine.push("s", "codex", 1, Kind::TurnStarted { turn: "t".into() });
+        for _ in 0..10 {
+            let revision = spine.phase_revision("s");
+            spine.update_phase(
+                "s",
+                PhaseInput::Transcript {
+                    cadence: Some("idle"),
+                    verdict: Some(("attention", "approval")),
+                    revision,
+                },
+            );
+            push_cadence(&spine, "s", "output");
+        }
+        assert_eq!(phases(&spine, "s"), vec![(Phase::Working, String::new())]);
+    }
+
+    #[test]
+    fn transcript_permission_is_retained_until_its_source_resolves_it() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "grok");
+        spine.push("s", "grok", 1, Kind::TurnStarted { turn: "t".into() });
+        let revision = spine.phase_revision("s");
+        spine.update_phase(
+            "s",
+            PhaseInput::Transcript {
+                cadence: Some("output"),
+                verdict: Some(("attention", "permission")),
+                revision,
+            },
+        );
+        for _ in 0..10 {
+            push_cadence(&spine, "s", "output");
+        }
+        assert_eq!(
+            phases(&spine, "s"),
+            vec![(Phase::NeedsYou, "permission".into())]
+        );
+        spine.update_phase(
+            "s",
+            PhaseInput::Transcript {
+                cadence: Some("idle"),
+                verdict: Some(("working", "")),
+                revision,
+            },
+        );
+        assert_eq!(phases(&spine, "s").last().unwrap().0, Phase::Working);
+    }
+
+    #[test]
+    fn slow_transcript_cannot_undo_a_newer_permission_resolution() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "claude");
+        spine.update_phase("s", PhaseInput::Hook(HookPhase::TurnOpened));
+        spine.update_phase(
+            "s",
+            PhaseInput::Hook(HookPhase::NeedsYou("permission: Bash".into())),
+        );
+        let old_revision = spine.phase_revision("s");
+        spine.update_phase(
+            "s",
+            PhaseInput::Hook(HookPhase::Working("running Bash".into())),
+        );
+        assert!(!spine.update_phase(
+            "s",
+            PhaseInput::Transcript {
+                cadence: Some("idle"),
+                verdict: Some(("attention", "permission")),
+                revision: old_revision,
+            }
+        ));
+        assert_eq!(
+            phases(&spine, "s").last().unwrap(),
+            &(Phase::Working, "running Bash".into())
+        );
+    }
+
+    #[test]
+    fn completed_turn_and_reset_retire_pending_attention() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "grok");
+        spine.push("s", "grok", 1, Kind::TurnStarted { turn: "t".into() });
+        spine.push_phase_if_tailed("s", Phase::NeedsYou, "permission");
+        let revision = spine.phase_revision("s");
+        spine.push(
+            "s",
+            "grok",
+            3,
+            Kind::TurnEnded {
+                turn: "t".into(),
+                reason: "cancelled".into(),
+            },
+        );
+        push_cadence(&spine, "s", "output");
+        assert_eq!(phases(&spine, "s").last().unwrap().0, Phase::Idle);
+        assert!(!spine.update_phase(
+            "s",
+            PhaseInput::Transcript {
+                cadence: Some("output"),
+                verdict: Some(("attention", "permission")),
+                revision,
+            }
+        ));
+        spine.push("s", "grok", 4, Kind::Reset);
+        spine.update_phase("s", PhaseInput::Cadence("idle"));
+        assert_eq!(phases(&spine, "s"), vec![(Phase::Idle, String::new())]);
+    }
+
+    #[test]
+    fn old_transcript_boundary_cannot_close_a_new_hook_turn() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "claude");
+        spine.update_phase("s", PhaseInput::Hook(HookPhase::TurnOpened));
+        spine.push(
+            "s",
+            "claude",
+            1,
+            Kind::TurnEnded {
+                turn: "old".into(),
+                reason: "completed".into(),
+            },
+        );
+        push_cadence(&spine, "s", "output");
+        assert_eq!(spine.turn_open("s"), Some(true));
+        assert_eq!(phases(&spine, "s").last().unwrap().0, Phase::Working);
+    }
+
     /// The bug this rule exists for: Claude's TUI goes on repainting after
     /// the answer is finished, so cadence held "working" for the ten
     /// seconds `session_activities` counts as recent and the phone's header
@@ -1426,8 +1636,10 @@ mod tests {
         push_cadence(&spine, "s", "output");
 
         // The hook fires: the dialog is up.
-        spine.set_hook_phase("s", Some((Phase::NeedsYou, "permission: Edit".into())));
-        spine.push_phase_if_tailed("s", Phase::NeedsYou, "permission: Edit");
+        spine.update_phase(
+            "s",
+            PhaseInput::Hook(HookPhase::NeedsYou("permission: Edit".into())),
+        );
         for _ in 0..8 {
             push_cadence(&spine, "s", "output");
         }
@@ -1442,11 +1654,10 @@ mod tests {
 
         // Answered: the tool runs, the hook says so, and cadence is
         // believed again.
-        spine.set_hook_phase(
+        spine.update_phase(
             "s",
-            Some((Phase::Working, "running Edit: src/main.rs".into())),
+            PhaseInput::Hook(HookPhase::Working("running Edit: src/main.rs".into())),
         );
-        spine.push_phase_if_tailed("s", Phase::Working, "running Edit: src/main.rs");
         push_cadence(&spine, "s", "output");
         assert_eq!(
             phases(&spine, "s").last().unwrap(),
@@ -1455,29 +1666,33 @@ mod tests {
         );
     }
 
-    /// What a hook said about a tool call outlives the tick that follows it,
-    /// but only while its phase is still the standing one.
     #[test]
-    fn a_hooks_detail_survives_a_tick_with_nothing_to_say() {
-        let working = Some((Phase::Working, "running Bash: npm test".to_string()));
-        assert_eq!(
-            with_hook_detail(Phase::Working, "", &working),
-            "running Bash: npm test"
+    fn source_details_survive_ticks_and_clear_on_completion() {
+        let spine = Spine::new();
+        spine.pretend_tailing("s", "claude");
+        spine.update_phase("s", PhaseInput::Hook(HookPhase::TurnOpened));
+        spine.update_phase(
+            "s",
+            PhaseInput::Hook(HookPhase::Working("running Bash: tests".into())),
         );
-        // And it outranks the one flat word the other sources have for the
-        // same phase: "permission: Edit" says more than "permission".
-        assert_eq!(
-            with_hook_detail(Phase::Working, "busy", &working),
-            "running Bash: npm test"
+        let revision = spine.phase_revision("s");
+        spine.update_phase(
+            "s",
+            PhaseInput::Transcript {
+                cadence: Some("idle"),
+                verdict: None,
+                revision,
+            },
         );
-        // A different phase is a different state; the hook's words do not
-        // follow it there.
-        assert_eq!(with_hook_detail(Phase::Idle, "", &working), "");
-        assert_eq!(with_hook_detail(Phase::NeedsYou, "", &working), "");
-        assert_eq!(with_hook_detail(Phase::Working, "", &None), "");
-        // PostToolUse clears the detail by saying nothing.
-        let cleared = Some((Phase::Working, String::new()));
-        assert_eq!(with_hook_detail(Phase::Working, "", &cleared), "");
+        assert_eq!(
+            phases(&spine, "s").last().unwrap(),
+            &(Phase::Working, "running Bash: tests".into())
+        );
+        spine.update_phase("s", PhaseInput::Hook(HookPhase::Stopped));
+        assert_eq!(
+            phases(&spine, "s").last().unwrap(),
+            &(Phase::Idle, String::new())
+        );
     }
 
     /// The other half of the same rule: a `Stop` hook lands before the
@@ -1494,8 +1709,7 @@ mod tests {
         assert_eq!(phases(&spine, "s"), vec![(Phase::Working, String::new())]);
 
         // Stop fires. The transcript's own turn_ended is still a poll away.
-        spine.note_hook_turn("s", false);
-        spine.push_phase_if_tailed("s", Phase::Idle, "");
+        spine.update_phase("s", PhaseInput::Hook(HookPhase::Stopped));
         for _ in 0..4 {
             push_cadence(&spine, "s", "output");
         }
@@ -1509,7 +1723,7 @@ mod tests {
 
         // And the next prompt re-opens it before the transcript's user line
         // has been written, so the phone does not wait a second to go busy.
-        spine.note_hook_turn("s", true);
+        spine.update_phase("s", PhaseInput::Hook(HookPhase::TurnOpened));
         push_cadence(&spine, "s", "output");
         assert_eq!(
             phases(&spine, "s").last().unwrap(),
@@ -1523,8 +1737,11 @@ mod tests {
     #[test]
     fn a_hook_for_an_unknown_session_leaves_nothing_behind() {
         let spine = Spine::new();
-        spine.set_hook_phase("nobody", Some((Phase::NeedsYou, "permission: Bash".into())));
-        spine.note_hook_turn("nobody", false);
+        spine.update_phase(
+            "nobody",
+            PhaseInput::Hook(HookPhase::NeedsYou("permission: Bash".into())),
+        );
+        spine.update_phase("nobody", PhaseInput::Hook(HookPhase::Stopped));
         assert!(!spine.hook_attention("nobody"));
         assert_eq!(spine.hook_phase("nobody"), None);
         assert_eq!(spine.turn_open("nobody"), None);

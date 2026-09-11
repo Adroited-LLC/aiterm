@@ -1,7 +1,6 @@
 //! Session activity inference used by the spine.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// The tail of `path`, at most `keep` bytes. `None` for a missing file or a
 /// tail that is not valid UTF-8 from the seek point — the same shrug the
@@ -266,92 +265,38 @@ fn antigravity_confirmation_after(since_ms: u64) -> bool {
         .any(|at| at > since_ms)
 }
 
-/// When the transcript's verdict replaces what the terminal reported.
-/// Cadence may promote to working, but it must not HOLD working against a
-/// transcript that says a person is being waited on: codex's TUI keeps
-/// animating (a ticking elapsed counter) while its approval dialog is up,
-/// so cadence never goes quiet and, left alone, a session mid-approval
-/// reads "working" forever — a brought-in codex sat exactly there
-/// [observed: codex-cli 0.150.1]. Idle from cadence yields to any
-/// transcript verdict (the old rule); attention beats working (this one).
-/// A cadence "working" is never demoted to idle from here — output is
-/// output.
-fn transcript_outranks(terminal: &str, transcript: &str) -> bool {
-    terminal == "idle" || (transcript == "attention" && terminal == "working")
-}
-
-/// The single place one session's activity is decided: the tab's output
-/// cadence, corrected by what the session's own files say and by what a
-/// Claude Code hook said as it happened. The sessions list and the spine's
-/// phase tick both come through here, so neither can
-/// hold a verdict the other would not.
-///
-/// Returns the verdict and a short human detail — "" when the source has
-/// nothing to add beyond the state itself.
+/// Resolve facts about a turn. Silence and terminal redraws cannot establish
+/// a request for human input. Legacy timeout verdicts are rejected here too,
+/// so cached evidence cannot reintroduce that inference.
 pub(crate) fn activity_verdict(
     terminal: Option<&str>,
     transcript: Option<(&'static str, &'static str)>,
     turn_open: Option<bool>,
     hook_attention: bool,
 ) -> (&'static str, &'static str) {
-    // `session_activities` spells cadence "output"; the phone's session
-    // state, the spine's phases and `transcript_outranks` all speak
-    // working/attention/idle. Normalising here is what lets the rule below
-    // fire at all: against the raw "output" spelling `transcript_outranks`
-    // matched neither arm, so a codex parked on an approval kept reading as
-    // busy — the exact case that rule was written for.
-    let mut cadence: &'static str = match terminal {
-        Some("output" | "working") => "working",
-        Some("attention") => "attention",
-        _ => "idle",
-    };
-    // Cadence is bytes on a pty, and a TUI goes on repainting after the
-    // answer is finished — a spinner clearing, a footer redrawn, the prompt
-    // coming back. Held on its own it kept the phone's header on "working"
-    // for the ten seconds `session_activities` counts as recent, well after
-    // the turn had visibly ended [observed: Claude Code, 2026-09-02]. So
-    // when the spine's adapter has told us the turn is closed, cadence may
-    // no longer promote to working. It may still say attention, and a new
-    // `turn_started` re-opens the gate within a poll of the user's line
-    // being written. `None` — the legacy adapter reports no turns at all —
-    // leaves the old rule exactly as it was.
-    if cadence == "working" && turn_open == Some(false) {
-        cadence = "idle";
-    }
-    let verdict = match transcript {
-        Some((state, detail)) if transcript_outranks(cadence, state) => (state, detail),
-        _ => (cadence, ""),
-    };
-    // A Claude Code hook said a permission dialog is up. That is the harness
-    // announcing its own state as it happens — not a file read after the
-    // fact, not bytes on a pty — so it is the one input here that is not an
-    // inference, and nothing below it may demote it. Cadence in particular
-    // would: claude's TUI redraws its own dialog, so the pty is busy for as
-    // long as the person takes to answer. It stands until a later hook (the
-    // tool running, the turn ending) or the transcript retires it. A
-    // transcript that already says attention keeps its own reason, which is
-    // more specific than this one; the caller replaces even that with the
-    // hook's detail when it has one ("permission: Edit").
-    if hook_attention && verdict.0 != "attention" {
+    if hook_attention {
         return ("attention", "permission");
     }
-    verdict
+    if turn_open == Some(false) {
+        return ("idle", "");
+    }
+    if let Some(("attention", detail)) = transcript {
+        if !matches!(detail, "approval" | "a tool call is waiting") {
+            return ("attention", detail);
+        }
+    }
+    if turn_open == Some(true)
+        || matches!(transcript, Some(("working", _)))
+        || matches!(terminal, Some("output" | "working"))
+    {
+        return ("working", "");
+    }
+    ("idle", "")
 }
 
-/// `Some(("working", …))`, `Some(("attention", …))` — codex mid-approval, or
-/// a grok permission prompt — or `None`.
-/// Public within the crate: the pty layer consults it before believing a
-/// quiet terminal means an idle session, and the spine's phase tick turns
-/// it into a `phase` event.
-/// Codex writes nothing while its approval prompt is up, so "waiting on a
-/// person" is read as: a turn in progress whose last act is a tool call
-/// with no output, and a transcript that has gone quiet. Grok ≥1.0.13 writes
-/// explicit events instead ([`grok_events_state`]), which short-circuit that
-/// inference for grok sessions only.
-///
-/// The second half is a short human reason, "" when there is none. It is
-/// never inferred: each return below names only what the record it read
-/// actually says.
+/// Read active turns and explicit permission/question records. A quiet
+/// transcript is insufficient to distinguish model/tool execution from an
+/// approval prompt; Codex rollouts without a permission record stay Working.
 pub(crate) fn transcript_verdict(session_id: &str) -> Option<(&'static str, &'static str)> {
     // OpenCode sessions live in a SQLite store, not a transcript file —
     // `owner_in` resolves one to `opencode.db` itself, and the tail read
@@ -425,11 +370,6 @@ pub(crate) fn transcript_verdict(session_id: &str) -> Option<(&'static str, &'st
         // `ask_permission` / `ask_custom_permission` call.
         return verdict.map(|s| (s, if s == "attention" { "permission" } else { "" }));
     }
-    let stale = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|e| e > Duration::from_secs(45));
     let Ok(mut f) = std::fs::File::open(&path) else {
         return None;
     };
@@ -443,11 +383,11 @@ pub(crate) fn transcript_verdict(session_id: &str) -> Option<(&'static str, &'st
     if f.read_to_string(&mut buf).is_err() {
         return None;
     }
+    transcript_turn_verdict(&buf)
+}
+
+fn transcript_turn_verdict(buf: &str) -> Option<(&'static str, &'static str)> {
     let mut state: Option<bool> = None;
-    let mut pending_call = false;
-    // Codex-shaped records seen: gates the no-pending-call attention
-    // fallback below to codex rollouts only.
-    let mut saw_codex = false;
     for line in buf.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -456,31 +396,15 @@ pub(crate) fn transcript_verdict(session_id: &str) -> Option<(&'static str, &'st
             continue;
         }
         match v.get("type").and_then(|t| t.as_str()) {
-            Some("event_msg") => {
-                saw_codex = true;
-                match v.pointer("/payload/type").and_then(|t| t.as_str()) {
-                    Some("task_started") => {
-                        state = Some(true);
-                        pending_call = false
-                    }
-                    Some("task_complete") | Some("turn_aborted") => {
-                        state = Some(false);
-                        pending_call = false
-                    }
-                    _ => {}
+            Some("event_msg") => match v.pointer("/payload/type").and_then(|t| t.as_str()) {
+                Some("task_started") => {
+                    state = Some(true);
                 }
-            }
-            Some("turn_context") | Some("session_meta") => saw_codex = true,
-            Some("response_item") => {
-                saw_codex = true;
-                match v.pointer("/payload/type").and_then(|t| t.as_str()) {
-                    Some("custom_tool_call") | Some("function_call") => pending_call = true,
-                    Some("custom_tool_call_output") | Some("function_call_output") => {
-                        pending_call = false
-                    }
-                    _ => {}
+                Some("task_complete") | Some("turn_aborted") => {
+                    state = Some(false);
                 }
-            }
+                _ => {}
+            },
             Some("user") => {
                 // A tool result is Claude talking to itself, not a new ask.
                 let is_result = v
@@ -520,18 +444,56 @@ pub(crate) fn transcript_verdict(session_id: &str) -> Option<(&'static str, &'st
         }
     }
     match state {
-        Some(true) if pending_call && stale => Some(("attention", "a tool call is waiting")),
-        // Codex asks for command approval BEFORE writing the exec record, so
-        // a dialog can be up with NO unanswered call on disk — a live stuck
-        // approval showed exactly that: open turn, all steps completed, phone
-        // said "working" [observed: codex-cli 0.150.1, 2026-08-31; the audit
-        // found no approval record type in any rollout 0.144→0.150.1]. For
-        // codex files only: an open turn that has written nothing for 45s is
-        // a person being waited on — or a wedge, which wants the same glance.
-        // Claude keeps the pending-call requirement: its long silent Bash
-        // calls are routine, and its prompts ring the terminal bell instead.
-        Some(true) if saw_codex && stale => Some(("attention", "approval")),
         Some(true) => Some(("working", "")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod phase_regression_tests {
+    use super::*;
+
+    #[test]
+    fn silence_is_not_a_permission_request() {
+        for detail in ["approval", "a tool call is waiting"] {
+            for cadence in ["output", "idle"] {
+                assert_eq!(
+                    activity_verdict(
+                        Some(cadence),
+                        Some(("attention", detail)),
+                        Some(true),
+                        false
+                    ),
+                    ("working", "")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_tail_uses_turn_boundaries_without_inventing_approval() {
+        let open = r#"{"type":"event_msg","payload":{"type":"task_started"}}"#;
+        let call = r#"{"type":"response_item","payload":{"type":"function_call","call_id":"one"}}"#;
+        let output =
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"one"}}"#;
+        let end = r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+        assert_eq!(transcript_turn_verdict(open), Some(("working", "")));
+        assert_eq!(
+            transcript_turn_verdict(&format!("{open}\n{call}")),
+            Some(("working", ""))
+        );
+        assert_eq!(
+            transcript_turn_verdict(&format!("{open}\n{call}\n{output}")),
+            Some(("working", ""))
+        );
+        assert_eq!(transcript_turn_verdict(&format!("{open}\n{end}")), None);
+    }
+
+    #[test]
+    fn open_turn_stays_working_without_terminal_output() {
+        assert_eq!(
+            activity_verdict(Some("idle"), None, Some(true), false),
+            ("working", "")
+        );
     }
 }
