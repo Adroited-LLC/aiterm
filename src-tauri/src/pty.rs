@@ -90,6 +90,7 @@ impl<T> PtyTable<T> {
 pub struct PtyManager {
     ptys: PtyTable<PtyInstance>,
     next_id: Arc<AtomicU32>,
+    injected_nv_explicit_sync: bool,
 }
 
 /// Receives the lifetime of one spawned PTY.
@@ -207,6 +208,19 @@ fn reap_failed_spawn(child: &mut dyn portable_pty::Child) {
 }
 
 impl PtyManager {
+    pub(crate) fn with_injected_explicit_sync_workaround(injected: bool) -> Self {
+        Self {
+            injected_nv_explicit_sync: injected,
+            ..Self::default()
+        }
+    }
+    fn scrub_graphics_workaround(&self, cmd: &mut CommandBuilder) {
+        if self.injected_nv_explicit_sync {
+            // Strip only our injected workaround; preserve a user-provided override.
+            cmd.env_remove("__NV_DISABLE_EXPLICIT_SYNC");
+        }
+    }
+
     /// Spawn one PTY and deliver its bytes and terminal exit to `sink`.
     ///
     /// The passed sink is the single owner of output and exit delivery for this
@@ -225,6 +239,8 @@ impl PtyManager {
             }
             None => CommandBuilder::new(&shell),
         };
+
+        self.scrub_graphics_workaround(&mut cmd);
         describe_terminal(&mut cmd);
         scrub_agent_markers(&mut cmd);
         // A provider-backed tab (OpenCode on an OpenRouter model) gets the key as
@@ -566,6 +582,20 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graphics_workaround_is_removed_only_when_injected_by_aiterm() {
+        for (injected, value) in [(true, "1"), (false, "1"), (false, "0")] {
+            let manager = PtyManager::with_injected_explicit_sync_workaround(injected);
+            let mut command = CommandBuilder::new("/bin/sh");
+            command.env("__NV_DISABLE_EXPLICIT_SYNC", value);
+            manager.clone().scrub_graphics_workaround(&mut command);
+            assert_eq!(
+                command.get_env("__NV_DISABLE_EXPLICIT_SYNC"),
+                if injected { None } else { Some(std::ffi::OsStr::new(value)) }
+            );
+        }
+    }
+
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;

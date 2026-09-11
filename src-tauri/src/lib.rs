@@ -17,6 +17,7 @@ pub mod indexer;
 pub mod iroh_tunnel;
 pub mod launch;
 pub mod librarian;
+mod linux_graphics;
 pub mod markdown;
 pub mod mcp;
 pub mod notify;
@@ -51,8 +52,9 @@ pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'sta
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let graphics = linux_graphics::GraphicsState::initialize();
     trace::init();
-    let pty = pty::PtyManager::default();
+    let pty = pty::PtyManager::with_injected_explicit_sync_workaround(graphics.injected);
     let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
     // The spine's epoch is set the moment this is built: a phone that sees a
     // new one knows the desktop restarted and its seq numbers started over.
@@ -63,6 +65,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .manage(graphics)
         .manage(pty)
         .manage(tabs.clone())
         .manage(spine)
@@ -118,6 +121,8 @@ pub fn run() {
             diag::diag_log_path,
             diag::diag_log_tail,
             diag::diag_environment,
+            linux_graphics::graphics_settings,
+            linux_graphics::graphics_settings_set,
             agents::agent_choices,
             agents::clear_successor_session,
             launch::resolve_launch,

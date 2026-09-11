@@ -1217,3 +1217,13 @@ export const remoteDevices = () => invoke<TrustedDevice[]>("remote_devices");
 /** Forgets the device's key and drops its live connections. */
 export const remoteRevokeDevice = (deviceId: string) =>
   invoke<boolean>("remote_revoke_device", { deviceId });
+
+export interface GraphicsSettings {
+  supported: boolean;
+  enabled: boolean;
+  active: boolean;
+  environment_override: boolean;
+  restart_required: boolean;
+}
+export const graphicsSettings = () => invoke<GraphicsSettings>("graphics_settings");
+export const graphicsSettingsSet = (enabled: boolean) => invoke<GraphicsSettings>("graphics_settings_set", { enabled });

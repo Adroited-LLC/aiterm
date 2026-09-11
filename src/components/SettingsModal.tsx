@@ -9,6 +9,7 @@ import Icon from "./Icon";
 import { X } from "lucide-react";
 import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
+import GraphicsCompatibility from "./GraphicsCompatibility";
 import Row from "./SettingsRow";
 import RemoteAccessSettings from "./RemoteAccessSettings";
 import LibrarianPane from "./LibrarianPane";
@@ -527,6 +528,7 @@ export default function SettingsModal({
                 The log survives the process, so a crash leaves something to read
                 instead of nothing. */}
             {tab === "diagnostics" && <>
+              {!windowsWsl && <GraphicsCompatibility />}
               <Group>
                 <Row
                   label="Verbose trace"
