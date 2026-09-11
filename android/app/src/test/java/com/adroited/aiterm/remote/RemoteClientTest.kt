@@ -629,6 +629,47 @@ class RemoteClientTest {
     }
 
     @Test
+    fun transcriptClearsBothPendingCardsWhenCliAppendsFollowUpToUnsubmittedDraft() = runTest {
+        val transport = FakeRemoteTransport()
+        val text = "Please inspect this\n\nAttached images:\n- /project/first.jpg"
+        val dot = ".\n\nAttached images:\n- /project/second.jpg"
+        var recorded = false
+        transport.responseFor = { request ->
+            val payload = if (request.kind.startsWith("session.spine")) {
+                uploadCbor.encodeToByteArray(SpineSnapshotWire.serializer(), SpineSnapshotWire(
+                    epoch = 1, live = true, hasMore = false, latestSeq = if (recorded) 12 else 10,
+                    events = if (recorded) listOf(
+                        SpineEventWire(11, 1, "session-1", "codex", 0,
+                            "user_message", id = "user-11", text = text + dot),
+                        SpineEventWire(12, 1, "session-1", "codex", 0,
+                            "assistant_message", id = "assistant-12", text = "I will inspect it."),
+                    ) else emptyList(),
+                ))
+            } else byteArrayOf()
+            CompletableDeferred(RemoteResponse.Success(request.requestId, request.kind, payload))
+        }
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        advanceUntilIdle()
+        client.grantUploadFocus()
+        for (prompt in listOf(text, dot)) {
+            val submission = async { client.submitConversationInputs("session-1", "tab-1",
+                listOf("\u001b[200~$prompt\u001b[201~", "\r")) }
+            advanceUntilIdle()
+            assertTrue(submission.await())
+        }
+        assertEquals(listOf(text, dot), client.state.value.pendingPrompts.map { it.text })
+        assertTrue(client.state.value.pendingPrompts.all { it.accepted })
+        recorded = true
+        client.previewSession("session-1")
+        advanceUntilIdle()
+        assertTrue(client.state.value.pendingPrompts.isEmpty())
+        assertTrue(client.state.value.previewItems.any { it is Item.User && it.text == text + dot })
+        client.lock()
+    }
+
+    @Test
     fun failedConversationInputRemovesOnlyItsPendingCard() = runTest {
         val transport = FakeRemoteTransport()
         transport.responseFor = { request ->

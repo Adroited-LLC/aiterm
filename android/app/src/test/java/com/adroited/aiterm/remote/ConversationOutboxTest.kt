@@ -53,6 +53,39 @@ class ConversationOutboxTest {
         assertEquals(second, outbox.prompts.single().id)
     }
 
+    @Test fun attachmentPromptAndFollowUpDotConfirmFromOneUnseparatedUserMessage() {
+        val outbox = ConversationOutbox()
+        val prompt = "Please inspect this\n\nAttached images:\n- /project/first.jpg"
+        val followUp = ".\n\nAttached images:\n- /project/second.jpg"
+        outbox.accepted(outbox.begin("a", prompt, 1, 10))
+        outbox.accepted(outbox.begin("a", followUp, 1, 12))
+        outbox.reconcile("a", page(13L to prompt + followUp))
+        assertTrue(outbox.prompts.isEmpty())
+    }
+
+    @Test fun coalescedReceiptDoesNotConsumeAnOlderUnmatchedPromptOrALaterRepeat() {
+        val outbox = ConversationOutbox()
+        val unmatched = outbox.begin("a", "unconfirmed", 1, 10)
+        outbox.begin("a", "prompt", 1, 10)
+        outbox.begin("a", ".", 1, 10)
+        val repeated = outbox.begin("a", ".", 1, 10)
+        repeat(2) { outbox.reconcile("a", page(11L to "prompt.")) }
+        assertEquals(listOf(unmatched, repeated), outbox.prompts.map { it.id })
+    }
+
+    @Test fun coalescedMessagesStillRequireCausalityAndCompleteExactText() {
+        val outbox = ConversationOutbox()
+        outbox.begin("a", "prompt", 1, 10)
+        outbox.begin("a", ".", 1, 12)
+        outbox.reconcile("a", page(11L to "prompt."))
+        outbox.reconcile("a", page(13L to "prompt.", epoch = 2))
+        outbox.reconcile("b", page(13L to "prompt.", session = "b"))
+        outbox.reconcile("a", page(13L to "echo: prompt."))
+        assertEquals(2, outbox.prompts.size)
+        outbox.reconcile("a", page(14L to "prompt\n."))
+        assertTrue(outbox.prompts.isEmpty())
+    }
+
     @Test fun fastTranscriptReceiptIsNotResurrectedByLateInputAcknowledgement() {
         val outbox = ConversationOutbox()
         val id = outbox.begin("a", "hello", 1, 10)

@@ -271,13 +271,18 @@ class RemoteTerminalViewModel(
             return Result.failure(IllegalArgumentException("Write a message or attach an image first."))
         }
         return try {
-            val existing = client.state.value.tabs.firstOrNull { it.sessionId == sessionId }
+            val existing = client.state.value.tabs.firstOrNull {
+                it.sessionId == sessionId && it.state == com.adroited.aiterm.remote.RemoteTabState.Running
+            }
             if (existing != null) client.selectTab(existing.id)
             else client.openSession(sessionId, TerminalSize(80, 24))
 
             val activeScreen = withTimeoutOrNull(10_000) {
                 client.screen.filterNotNull().first { screen ->
-                    client.state.value.tabs.any { it.id == screen.tabId && it.sessionId == sessionId }
+                    client.state.value.tabs.any {
+                        it.id == screen.tabId && it.sessionId == sessionId &&
+                            it.state == com.adroited.aiterm.remote.RemoteTabState.Running
+                    }
                 }
             } ?: return Result.failure(IllegalStateException("The session did not open on the desktop."))
 
@@ -296,13 +301,18 @@ class RemoteTerminalViewModel(
                 }
             }
 
-            val latestScreen = client.screen.value
-                ?.takeIf { it.tabId == activeScreen.tabId }
-                ?: return Result.failure(IllegalStateException("The terminal changed before sending."))
             val paths = if (images.isEmpty()) emptyList() else {
                 client.uploadImages(activeScreen.tabId, images.map { it.asRemoteUploadSource() }, onProgress)
                     .getOrElse { return Result.failure(it) }
             }
+            // Uploading can outlast CLI startup. Read modes after it completes, and wait
+            // for a usable composer instead of submitting against the initial blank PTY.
+            val agentId = client.state.value.tabs.firstOrNull { it.id == activeScreen.tabId }?.agentId
+                ?: client.state.value.sessions.firstOrNull { it.id == sessionId }?.agent
+            val latestScreen = awaitConversationInputScreen(client.screen, activeScreen.tabId, agentId)
+                ?: return Result.failure(IllegalStateException(
+                    "The agent is still starting or the terminal changed. Your draft has been kept.",
+                ))
             val outbound = formatTerminalSubmission(
                 text = prompt,
                 paths = paths,

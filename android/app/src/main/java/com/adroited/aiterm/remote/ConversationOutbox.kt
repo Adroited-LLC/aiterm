@@ -42,14 +42,23 @@ internal class ConversationOutbox {
             val match = eligible.firstOrNull { normalize(it.prompt.text) == text }
             if (match != null) { entries.remove(match); consumed += receipt }
             else {
-                // Some CLIs coalesce several queued messages into a single user turn.
-                for (count in 2..eligible.size) {
-                    val group = eligible.take(count)
-                    if (normalize(group.joinToString("\n\n") { it.prompt.text }) == text) {
-                        entries.removeAll(group.toSet())
-                        consumed += receipt
-                        break
+                // A CLI may queue messages with newlines, or append a later paste directly
+                // to an unsubmitted draft (including an attachment path followed by ".").
+                // Match complete, consecutive prompts only: a substring of another user
+                // message or an assistant echo is not proof that we delivered this prompt.
+                val group = eligible.indices.firstNotNullOfOrNull { start ->
+                    (2..eligible.size - start).firstNotNullOfOrNull { count ->
+                        val candidates = eligible.subList(start, start + count)
+                        candidates.takeIf {
+                            listOf("", "\n", "\n\n").any { separator ->
+                                normalize(candidates.joinToString(separator) { it.prompt.text }) == text
+                            }
+                        }
                     }
+                }
+                if (group != null) {
+                    entries.removeAll(group.toSet())
+                    consumed += receipt
                 }
             }
         }
