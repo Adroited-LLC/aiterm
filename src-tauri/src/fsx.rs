@@ -104,6 +104,21 @@ fn list_dir_sync(path: String) -> Result<Vec<DirEntry>, String> {
     Ok(entries)
 }
 
+/// A cheap revision token for previews. Nanoseconds remain exact as text.
+/// Checking this never reads or decodes the file's contents.
+#[cfg_attr(not(aiterm_headless), tauri::command)]
+pub async fn file_revision(path: String) -> Result<String, String> {
+    crate::run_blocking(move || file_revision_sync(&path)).await
+}
+
+fn file_revision_sync(path: &str) -> Result<String, String> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() { return Err("not a regular file".into()); }
+    let modified = metadata.modified().map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?;
+    Ok(format!("{}:{}", metadata.len(), modified.as_nanos()))
+}
+
 /// A text file's content for the in-app viewer, with what a save needs to
 /// detect a concurrent writer: the mtime the content was read at.
 #[derive(Serialize)]
@@ -190,4 +205,30 @@ fn write_text_file_sync(
     }
     std::fs::write(path, content).map_err(|e| e.to_string())?;
     file_mtime_ms(path)
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    #[test]
+    fn preview_revision_ignores_neighbors_and_detects_replacement() {
+        let root = std::env::temp_dir().join(format!("aiterm-image-revision-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let image = root.join("preview.png");
+        std::fs::write(&image, b"first image").unwrap();
+        let path = image.to_str().unwrap();
+        let first = file_revision_sync(path).unwrap();
+        std::fs::write(root.join("unrelated.txt"), b"agent working").unwrap();
+        assert_eq!(file_revision_sync(path).unwrap(), first);
+        // Same length, different timestamp: size alone must not decide freshness.
+        let file = std::fs::OpenOptions::new().write(true).open(&image).unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        file.set_times(std::fs::FileTimes::new().set_modified(future)).unwrap();
+        assert_ne!(file_revision_sync(path).unwrap(), first);
+        assert!(file_revision_sync(root.to_str().unwrap()).is_err());
+        std::fs::remove_file(&image).unwrap();
+        assert!(file_revision_sync(path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

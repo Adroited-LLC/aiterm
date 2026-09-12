@@ -47,6 +47,7 @@ async fn dispatch(command: &str, a: &Value) -> Result<Value, String> {
             value(projects)
         }
         "list_dir" => value(fsx::list_dir(path()?).await?),
+        "file_revision" => value(fsx::file_revision(path()?).await?),
         "read_text_file" => value(fsx::read_text_file(path()?).await?),
         "write_text_file" => value(
             fsx::write_text_file(path()?, arg(a, "content")?, a["expectedMtimeMs"].as_u64())

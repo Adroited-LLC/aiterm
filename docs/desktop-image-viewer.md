@@ -8,7 +8,9 @@ or follow its file link in the terminal. It opens in a normal file tab.
 - The zoom buttons enlarge or reduce the image. With the image area focused,
   use + and - to zoom, 0 to fit, 1 for actual size, and arrow keys to pan.
 - The footer shows the image dimensions. Transparent areas have a checkerboard.
-- Reload reads the file again; the project watcher also refreshes visible images.
+- Reload reads the file again; project notifications check the image’s own file revision.
+  Unrelated writes do not reload it. Changed images are decoded before replacing
+  the display, and a failed refresh keeps the last good image visible.
   Hidden image tabs catch up when selected and retain their chosen zoom.
 - Open with the system app remains available, including for decoding failures.
 
@@ -25,3 +27,6 @@ For interactive checks, run the Vite dev server and open
 supported extensions plus a corrupt file; the SVG is large enough to test fit,
 zoom, and scrolling. Check fit after resizing, keyboard panning at actual size,
 zoom preservation across tab hiding and file refresh, and error/retry feedback.
+
+Use **Run refresh checks** in the browser fixture to exercise unrelated project
+notifications, in-place decoded swaps, corrupt replacements, and hidden tabs.

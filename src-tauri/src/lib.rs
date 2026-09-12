@@ -205,6 +205,7 @@ pub fn run() {
             fsx::open_path,
             fsx::list_projects,
             fsx::read_text_file,
+            fsx::file_revision,
             fsx::write_text_file,
             indexer::reindex_sessions,
             indexer::search_sessions,

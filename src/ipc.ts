@@ -439,6 +439,8 @@ export const watchProject = (path: string) => invoke<void>("watch_project", { pa
 export const listDir = (path: string) => invoke<DirEntry[]>("list_dir", { path });
 export const openPath = (path: string) => invoke<void>("open_path", { path });
 
+export const fileRevision = (path: string) => invoke<string>("file_revision", { path });
+
 /** A text file for the in-app viewer — see `fsx.rs`. */
 export interface TextFile {
   content: string;
