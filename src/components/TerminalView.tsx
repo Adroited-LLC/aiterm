@@ -201,7 +201,7 @@ export default function TerminalView({
   const projectGrid = useCallback(() => {
     const term = termRef.current;
     const fit = fitRef.current;
-    if (!term || !fit) return;
+    if (!term || !fit || !elRef.current?.offsetWidth || !elRef.current.offsetHeight) return;
     const fitted = fit.proposeDimensions();
     if (!fitted && focusRef.current === "desktop") return;
     if (!canonicalSizeRef.current && focusRef.current !== "desktop") return;
@@ -212,10 +212,17 @@ export default function TerminalView({
     );
     if (projected.resizeBackend) {
       fit.fit();
+      // Attachment/ownership can change after the canvas already fits. Do not
+      // rely on an xterm resize event to synchronize the PTY in that case.
+      const attachment = attachmentIdRef.current;
+      const canonical = canonicalSizeRef.current;
+      if (attachment && (canonical?.cols !== term.cols || canonical?.rows !== term.rows)) {
+        void tabResize(tab.key, attachment, term.cols, term.rows).catch(() => {});
+      }
     } else if (term.cols !== projected.size.cols || term.rows !== projected.size.rows) {
       term.resize(projected.size.cols, projected.size.rows);
     }
-  }, []);
+  }, [tab.key]);
 
   useEffect(() => {
     if (!elRef.current || started.current) return;
@@ -317,7 +324,13 @@ export default function TerminalView({
       const writeTyped = (data: string) => {
         if (disposed) return Promise.reject(new Error("Terminal attachment closed"));
         const size = fit.proposeDimensions() ?? { cols: term.cols, rows: term.rows };
-        return tabWrite(tab.key, attachmentId, data, size);
+        // Size the receiving canvas before the host can send its resized TUI
+        // redraw. A denied takeover restores the authoritative viewing grid.
+        if (term.cols !== size.cols || term.rows !== size.rows) term.resize(size.cols, size.rows);
+        return tabWrite(tab.key, attachmentId, data, size).catch(error => {
+          projectGrid();
+          throw error;
+        });
       };
       let pending = 0;
       const inputLine = new TerminalInputLine();
@@ -368,11 +381,6 @@ export default function TerminalView({
           pending += data.length;
         }
         void writeTyped(data).catch(() => onAttention(tab.key, true));
-      });
-      term.onResize(({ cols, rows }) => {
-        if (focusRef.current === "desktop") {
-          tabResize(tab.key, attachmentId, cols, rows).catch(() => {});
-        }
       });
 
       let focusPending = false;
@@ -443,6 +451,7 @@ export default function TerminalView({
           return rows;
         },
       });
+      projectGrid();
 
     })().catch(() => {});
 
@@ -478,18 +487,18 @@ export default function TerminalView({
 
   useEffect(() => {
     if (active) {
+      projectGrid();
       if (autoFocus) termRef.current?.focus();
     }
-  }, [active, autoFocus]);
+  }, [active, autoFocus, projectGrid]);
 
   useEffect(() => {
     focusRef.current = tab.focus ?? "desktop";
     canonicalSizeRef.current = tab.size;
-    if (focusRef.current !== "desktop") {
-      // Keep keyboard focus: the next actual keystroke reclaims ownership.
-      // Clicking, viewing and terminal-generated replies must not steal it.
-      projectGrid();
-    }
+    // Refit in BOTH directions. Otherwise a local owner keeps the old narrow
+    // remote grid even after the PTY has returned to the full local size.
+    // projectGrid only publishes a resize when this desktop already owns input.
+    projectGrid();
   }, [projectGrid, tab.focus, tab.size?.cols, tab.size?.rows]);
 
   useEffect(() => {
