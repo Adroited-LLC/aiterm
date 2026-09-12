@@ -226,6 +226,7 @@ class RemoteClient(
     private var previewGeneration = 0L
 
     suspend fun connect(): Boolean {
+        logConnection("connection explicitly requested")
         synchronized(lifecycleLock) {
             reconnectJob?.cancel()
             reconnectJob = null
@@ -267,7 +268,13 @@ class RemoteClient(
             }
             val collector = scope.launch(dispatcher, start = CoroutineStart.LAZY) {
                 try {
-                    candidate.events.collect { event -> accept(generation, event, candidate) }
+                    candidate.events.collect { event ->
+                        try { accept(generation, event, candidate) }
+                        catch (error: Exception) {
+                            logConnection("event handler failed: ${event.javaClass.simpleName}", error)
+                            throw error
+                        }
+                    }
                     acceptTerminalOutcome(
                         generation,
                         candidate,
@@ -1183,6 +1190,7 @@ class RemoteClient(
         var reconnect = false
         synchronized(lifecycleLock) {
             if (!isCurrent(expectedGeneration, candidate)) return
+            logConnection("transport ended: $outcome")
             reconnectJob?.cancel()
             reconnectJob = null
             closing = detachTransportLocked()
@@ -1271,6 +1279,7 @@ class RemoteClient(
                         connectedEndpoint = if (disconnected) null else mutableState.value.connectedEndpoint,
                     )
                     if (disconnected) {
+                        logConnection("disconnect requested: ${event.message}")
                         closing = detachTransportLocked()
                         clearActiveTerminalLocked()
                         reconnect = true
@@ -1427,7 +1436,24 @@ class RemoteClient(
                     }
                     is RemoteResponse.Success -> synchronized(lifecycleLock) {
                         if (isCurrent(generation, active)) {
-                            onSuccess(result.payload)
+                            try {
+                                onSuccess(result.payload)
+                                if (mutableState.value.lastError == invalidResponseMessage(result.kind)) {
+                                    mutableState.value = mutableState.value.copy(lastError = null)
+                                }
+                            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                throw cancelled
+                            } catch (terminated: RemoteTransportTerminatedException) {
+                                throw terminated
+                            } catch (error: Exception) {
+                                // A correlated reply arrived successfully. Failure to apply its
+                                // payload is local to this request, not evidence of socket loss.
+                                logConnection("response handling failed: ${result.kind}", error)
+                                throw RemoteRequestException(
+                                    "response.invalid_payload",
+                                    invalidResponseMessage(result.kind),
+                                )
+                            }
                         }
                     }
                 }
@@ -1465,6 +1491,7 @@ class RemoteClient(
         candidate: RemoteTransport,
         error: Exception,
     ) {
+        logConnection("request failed: ${error.javaClass.simpleName}", error)
         if (error is RemoteRequestException) {
             accept(expectedGeneration, RemoteServerEvent.Failure(error.code, error.message ?: "Request failed"), candidate)
         } else if (error is RemoteTransportTerminatedException) {
@@ -1475,6 +1502,17 @@ class RemoteClient(
                 RemoteServerEvent.Failure("transport.disconnected", error.message ?: "Connection ended"),
                 candidate,
             )
+        }
+    }
+
+    private fun invalidResponseMessage(kind: String) =
+        "Could not read the desktop's $kind response. Try refreshing."
+
+    private fun logConnection(message: String, error: Exception? = null) {
+        // No request payloads, prompt text, keys, or authentication material.
+        runCatching {
+            if (error == null) android.util.Log.i("AITermClient", message)
+            else android.util.Log.w("AITermClient", "$message (${error.javaClass.simpleName})")
         }
     }
 

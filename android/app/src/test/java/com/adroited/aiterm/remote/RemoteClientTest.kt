@@ -42,6 +42,35 @@ import kotlin.concurrent.thread
 @OptIn(ExperimentalCoroutinesApi::class, ExperimentalSerializationApi::class)
 class RemoteClientTest {
     @Test
+    fun malformedReplyDoesNotDisconnectHealthyTransportOrLoseSelection() = runTest {
+        val transport = FakeRemoteTransport()
+        val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        val selected = client.state.value.activeTabId
+        // The socket delivers a correlated success, but the tab-list body is malformed.
+        repeat(10) {
+            client.refreshTabs()
+            runCurrent()
+            assertEquals(ConnectionState.Connected, client.state.value.connection)
+            assertFalse(transport.closed)
+            assertEquals(selected, client.state.value.activeTabId)
+        }
+        assertTrue(client.state.value.lastError!!.contains("tab.list"))
+        transport.responseFor = { request -> CompletableDeferred(RemoteResponse.Success(
+            request.requestId, request.kind,
+            byteArrayOf(0xa1.toByte(), 0x64, 0x74, 0x61, 0x62, 0x73, 0x80.toByte()), // {tabs: []}
+        )) }
+        client.refreshTabs()
+        runCurrent()
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertTrue(client.state.value.tabs.isEmpty())
+        assertEquals(null, client.state.value.lastError)
+        client.lock()
+    }
+
+    @Test
     fun cancelledResourceReadReleasesTheTransportRequest() = runTest {
         val transport = FakeRemoteTransport()
         val pending = CompletableDeferred<RemoteResponse>()

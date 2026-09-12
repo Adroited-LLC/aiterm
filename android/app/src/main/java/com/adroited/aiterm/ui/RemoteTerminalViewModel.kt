@@ -68,7 +68,10 @@ class RemoteTerminalViewModel(
         viewModelScope.launch {
             networkMonitor.changes.collectLatest {
                 delay(NETWORK_SETTLE_MILLIS)
-                if (!appLock.isLocked.value) reconnect()
+                if (!appLock.isLocked.value) {
+                    runCatching { android.util.Log.i("AITermClient", "default network changed; reconnect requested") }
+                    reconnect()
+                }
             }
         }
         viewModelScope.launch {
