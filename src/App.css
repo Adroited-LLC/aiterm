@@ -4385,3 +4385,22 @@ button:focus-visible, summary:focus-visible, input[type="range"]:focus-visible {
 .preview-title { overflow-wrap: anywhere; }
 .preview-foot { padding: 12px 20px; line-height: 1.5; }
 .home-actions { flex-wrap: wrap; }
+
+/* Image tabs: quiet chrome, a full canvas, and a transparency grid only under the image. */
+.image-view { min-height: 0; }
+.image-bar { padding: 8px 12px; flex-wrap: wrap; gap: 8px; }
+.image-bar .file-bar-path { flex: 1 1 240px; min-width: 120px; }
+.image-controls { display: flex; align-items: center; gap: 4px; }
+.image-zoom { min-width: 46px; text-align: center; font-variant-numeric: tabular-nums; }
+.image-action { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-dim); font: inherit; cursor: pointer; }
+.image-action:hover { background: var(--bg-hover); color: var(--text); }
+.image-action.on { border-color: var(--border); background: var(--bg-raised); color: var(--text); }
+.image-view button:disabled { opacity: .4; cursor: default; }
+.image-view button:focus-visible, .image-viewport:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.image-viewport { flex: 1; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; }
+.image-stage { display: flex; width: max-content; height: max-content; min-width: 100%; min-height: 100%; padding: 24px; }
+.image-canvas { display: block; flex: none; max-width: none; margin: auto; background-color: #fff; background-image: conic-gradient(#ddd 25%, transparent 0 50%, #ddd 0 75%, transparent 0); background-size: 16px 16px; box-shadow: 0 2px 16px #0002; }
+.image-loading { margin: auto; color: var(--text-dim); }
+.image-message { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; min-height: 100%; padding: 32px; text-align: center; color: var(--text-dim); }
+.image-message strong { color: var(--text); font-size: 15px; }
+.image-footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--border); color: var(--text-dim); font-size: 11px; }

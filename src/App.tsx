@@ -26,6 +26,8 @@ import {
 import { cycleModeTo } from "./term/drive";
 import AgentPanel from "./components/AgentPanel";
 import FileView from "./components/FileView";
+import ImageView from "./components/ImageView";
+import { isImage } from "./imageFiles";
 import PdfView, { isPdf } from "./components/PdfView";
 import AgentIcon from "./components/AgentIcon";
 import Icon from "./components/Icon";
@@ -2924,7 +2926,9 @@ export default function App() {
                   display: showsFile(f) && f.key === activeFileTab ? "flex" : "none",
                 }}
               >
-                {isPdf(f.path) ? (
+                {isImage(f.path) ? (
+                  <ImageView path={f.path} active={showsFile(f) && f.key === activeFileTab} refreshKey={explorerRefresh} />
+                ) : isPdf(f.path) ? (
                   <PdfView path={f.path} active={showsFile(f) && f.key === activeFileTab} refreshKey={explorerRefresh} />
                 ) : (
                   <FileView
