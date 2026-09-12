@@ -1218,12 +1218,14 @@ export const remoteDevices = () => invoke<TrustedDevice[]>("remote_devices");
 export const remoteRevokeDevice = (deviceId: string) =>
   invoke<boolean>("remote_revoke_device", { deviceId });
 
+export type GraphicsMode = "automatic" | "on" | "off";
 export interface GraphicsSettings {
   supported: boolean;
-  enabled: boolean;
+  mode: GraphicsMode;
+  eligible: boolean;
   active: boolean;
   environment_override: boolean;
   restart_required: boolean;
 }
 export const graphicsSettings = () => invoke<GraphicsSettings>("graphics_settings");
-export const graphicsSettingsSet = (enabled: boolean) => invoke<GraphicsSettings>("graphics_settings_set", { enabled });
+export const graphicsSettingsSet = (mode: GraphicsMode) => invoke<GraphicsSettings>("graphics_settings_set", { mode });

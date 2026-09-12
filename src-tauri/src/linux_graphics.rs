@@ -5,22 +5,47 @@ use std::{
     sync::Mutex,
 };
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(default)]
-struct Preferences {
-    nvidia_wayland_compatibility: bool,
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GraphicsMode {
+    #[default]
+    Automatic,
+    On,
+    Off,
 }
-impl Default for Preferences {
-    fn default() -> Self {
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(from = "StoredPreferences")]
+struct Preferences {
+    mode: GraphicsMode,
+}
+
+// A missing setting gets automatic hardware detection. A previously saved
+// boolean was an explicit user choice: never turn an old Off into Automatic.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredPreferences {
+    mode: Option<GraphicsMode>,
+    nvidia_wayland_compatibility: Option<bool>,
+}
+impl From<StoredPreferences> for Preferences {
+    fn from(stored: StoredPreferences) -> Self {
         Self {
-            nvidia_wayland_compatibility: false,
+            mode: stored
+                .mode
+                .unwrap_or(match stored.nvidia_wayland_compatibility {
+                    Some(true) => GraphicsMode::On,
+                    Some(false) => GraphicsMode::Off,
+                    None => GraphicsMode::Automatic,
+                }),
         }
     }
 }
 
 pub(crate) struct GraphicsState {
     preferences: Mutex<Preferences>,
-    startup_enabled: bool,
+    startup_mode: GraphicsMode,
+    eligible: bool,
     pub(crate) injected: bool,
     environment_override: bool,
 }
@@ -28,7 +53,8 @@ pub(crate) struct GraphicsState {
 #[derive(Serialize)]
 pub(crate) struct GraphicsSettings {
     supported: bool,
-    enabled: bool,
+    mode: GraphicsMode,
+    eligible: bool,
     active: bool,
     environment_override: bool,
     restart_required: bool,
@@ -40,10 +66,16 @@ fn settings_path() -> Result<PathBuf, String> {
         .ok_or("App data directory unavailable".into())
 }
 fn load(path: &Path) -> Preferences {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Preferences {
+            mode: GraphicsMode::Off,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Preferences::default(),
+        // An unreadable or corrupt saved choice must not silently opt someone in.
+        Err(_) => Preferences {
+            mode: GraphicsMode::Off,
+        },
+    }
 }
 fn save(path: &Path, preferences: &Preferences) -> Result<(), String> {
     let parent = path.parent().ok_or("Invalid graphics settings path")?;
@@ -81,13 +113,13 @@ fn expects_wayland(backend: Option<&str>, wayland_available: bool, x11_available
     false
 }
 fn should_inject(
-    enabled: bool,
+    mode: GraphicsMode,
     supported: bool,
     nvidia: bool,
     wayland: bool,
     overridden: bool,
 ) -> bool {
-    enabled && supported && nvidia && wayland && !overridden
+    mode != GraphicsMode::Off && supported && nvidia && wayland && !overridden
 }
 fn present(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty())
@@ -98,15 +130,19 @@ impl GraphicsState {
         let preferences = settings_path().map(|p| load(&p)).unwrap_or_default();
         let environment_override = std::env::var_os("__NV_DISABLE_EXPLICIT_SYNC").is_some();
         let backend = std::env::var("GDK_BACKEND").ok();
+        let supported = cfg!(target_os = "linux");
+        let nvidia = Path::new("/sys/module/nvidia").exists();
+        let wayland = expects_wayland(
+            backend.as_deref(),
+            present("WAYLAND_DISPLAY") || present("WAYLAND_SOCKET"),
+            present("DISPLAY"),
+        );
+        let eligible = supported && nvidia && wayland;
         let injected = should_inject(
-            preferences.nvidia_wayland_compatibility,
-            cfg!(target_os = "linux"),
-            Path::new("/sys/module/nvidia").exists(),
-            expects_wayland(
-                backend.as_deref(),
-                present("WAYLAND_DISPLAY") || present("WAYLAND_SOCKET"),
-                present("DISPLAY"),
-            ),
+            preferences.mode,
+            supported,
+            nvidia,
+            wayland,
             environment_override,
         );
         // Called once at the start of run(), before GTK and the async runtime.
@@ -114,7 +150,8 @@ impl GraphicsState {
             std::env::set_var("__NV_DISABLE_EXPLICIT_SYNC", "1");
         }
         Self {
-            startup_enabled: preferences.nvidia_wayland_compatibility,
+            startup_mode: preferences.mode,
+            eligible,
             preferences: Mutex::new(preferences),
             injected,
             environment_override,
@@ -123,17 +160,16 @@ impl GraphicsState {
     fn snapshot(&self, preferences: &Preferences) -> GraphicsSettings {
         GraphicsSettings {
             supported: cfg!(target_os = "linux"),
-            enabled: preferences.nvidia_wayland_compatibility,
+            mode: preferences.mode,
+            eligible: self.eligible,
             active: self.injected,
             environment_override: self.environment_override,
-            restart_required: preferences.nvidia_wayland_compatibility != self.startup_enabled,
+            restart_required: preferences.mode != self.startup_mode,
         }
     }
-    fn set_at(&self, path: &Path, enabled: bool) -> Result<GraphicsSettings, String> {
+    fn set_at(&self, path: &Path, mode: GraphicsMode) -> Result<GraphicsSettings, String> {
         let mut preferences = self.preferences.lock().map_err(|e| e.to_string())?;
-        let next = Preferences {
-            nvidia_wayland_compatibility: enabled,
-        };
+        let next = Preferences { mode };
         save(path, &next)?;
         *preferences = next;
         Ok(self.snapshot(&preferences))
@@ -149,13 +185,13 @@ pub(crate) fn graphics_settings(
 }
 #[tauri::command]
 pub(crate) fn graphics_settings_set(
-    enabled: bool,
+    mode: GraphicsMode,
     state: tauri::State<'_, GraphicsState>,
 ) -> Result<GraphicsSettings, String> {
     if !cfg!(target_os = "linux") {
         return Err("This setting is only available on Linux".into());
     }
-    state.set_at(&settings_path()?, enabled)
+    state.set_at(&settings_path()?, mode)
 }
 
 #[cfg(test)]
@@ -179,39 +215,70 @@ mod tests {
         }
     }
     #[test]
-    fn opt_out_other_platforms_other_gpus_and_environment_overrides_disable_injection() {
-        assert!(should_inject(true, true, true, true, false));
-        for (enabled, supported, nvidia, wayland, overridden) in [
-            (false, true, true, true, false),
-            (true, false, true, true, false),
-            (true, true, false, true, false),
-            (true, true, true, false, false),
-            (true, true, true, true, true),
+    fn automatic_and_on_are_limited_to_nvidia_wayland_without_overrides() {
+        use GraphicsMode::{Automatic, Off, On};
+        for (mode, supported, nvidia, wayland, overridden, expected) in [
+            (Automatic, true, true, true, false, true),
+            (On, true, true, true, false, true),
+            (Off, true, true, true, false, false),
+            (Automatic, true, false, true, false, false),
+            (Automatic, true, true, false, false, false),
+            (Automatic, false, true, true, false, false),
+            (Automatic, true, true, true, true, false),
+            (On, true, false, true, false, false),
+            (On, true, true, false, false, false),
+            (On, false, true, true, false, false),
+            (On, true, true, true, true, false),
         ] {
-            assert!(!should_inject(
-                enabled, supported, nvidia, wayland, overridden
-            ));
+            assert_eq!(should_inject(mode, supported, nvidia, wayland, overridden), expected,
+                "{mode:?}, supported={supported}, nvidia={nvidia}, wayland={wayland}, override={overridden}");
+        }
+    }
+
+    #[test]
+    fn new_settings_default_to_automatic_but_legacy_explicit_choices_survive() {
+        for (json, expected) in [
+            ("{}", GraphicsMode::Automatic),
+            (r#"{"nvidia_wayland_compatibility":true}"#, GraphicsMode::On),
+            (
+                r#"{"nvidia_wayland_compatibility":false}"#,
+                GraphicsMode::Off,
+            ),
+            (
+                r#"{"mode":"automatic","nvidia_wayland_compatibility":false}"#,
+                GraphicsMode::Automatic,
+            ),
+            (r#"{"mode":"off"}"#, GraphicsMode::Off),
+        ] {
+            let preferences: Preferences = serde_json::from_str(json).unwrap();
+            assert_eq!(preferences.mode, expected);
+        }
+    }
+    fn state(mode: GraphicsMode) -> GraphicsState {
+        GraphicsState {
+            preferences: Mutex::new(Preferences { mode }),
+            startup_mode: mode,
+            eligible: true,
+            injected: mode != GraphicsMode::Off,
+            environment_override: false,
         }
     }
     #[test]
-    fn preference_persists_without_changing_current_run_and_can_be_reverted() {
+    fn all_modes_persist_without_changing_the_running_graphics_stack() {
         let directory =
             std::env::temp_dir().join(format!("aiterm-graphics-{}", uuid::Uuid::new_v4()));
         let path = directory.join("graphics.json");
-        assert!(!load(&path).nvidia_wayland_compatibility);
-        let state = GraphicsState {
-            preferences: Mutex::new(Preferences {
-                nvidia_wayland_compatibility: true,
-            }),
-            startup_enabled: true,
-            injected: true,
-            environment_override: false,
-        };
-        let updated = state.set_at(&path, false).unwrap();
-        assert!(!updated.enabled);
-        assert!(updated.active && updated.restart_required);
-        assert!(!load(&path).nvidia_wayland_compatibility);
-        assert!(!state.set_at(&path, true).unwrap().restart_required);
+        assert_eq!(load(&path).mode, GraphicsMode::Automatic);
+        let state = state(GraphicsMode::Automatic);
+        for mode in [GraphicsMode::Off, GraphicsMode::On, GraphicsMode::Automatic] {
+            let updated = state.set_at(&path, mode).unwrap();
+            assert_eq!(load(&path).mode, mode);
+            assert_eq!(updated.mode, mode);
+            assert!(updated.active && updated.eligible);
+            assert_eq!(updated.restart_required, mode != GraphicsMode::Automatic);
+        }
+        std::fs::write(&path, "broken settings").unwrap();
+        assert_eq!(load(&path).mode, GraphicsMode::Off);
         std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
@@ -219,16 +286,13 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("aiterm-graphics-file-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, "not a directory").unwrap();
-        let state = GraphicsState {
-            preferences: Mutex::new(Preferences::default()),
-            startup_enabled: false,
-            injected: false,
-            environment_override: true,
-        };
-        assert!(state.set_at(&path.join("graphics.json"), true).is_err());
+        let state = state(GraphicsMode::Off);
+        assert!(state
+            .set_at(&path.join("graphics.json"), GraphicsMode::Automatic)
+            .is_err());
         let snapshot = state.snapshot(&state.preferences.lock().unwrap());
-        assert!(!snapshot.enabled && snapshot.environment_override);
-        assert!(!snapshot.restart_required);
+        assert_eq!(snapshot.mode, GraphicsMode::Off);
+        assert!(!snapshot.active && !snapshot.restart_required);
         std::fs::remove_file(path).unwrap();
     }
 }
