@@ -144,7 +144,7 @@ private fun SpineItemRow(item: Item, onLongPress: () -> Unit) {
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
 private fun SpineUserBubble(item: Item.User, onLongPress: () -> Unit) {
-    val content = remember(item.text) { splitConversationAttachments(item.text) }
+    val content = remember(item.text) { splitConversationAttachments(userCommandText(item.text)) }
     if (content.text.isBlank() && content.imagePaths.isEmpty()) return
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
         Column(

@@ -1784,7 +1784,7 @@ internal fun RemoteConversationContent(
         val promptAbove = if (rowItem is com.adroited.aiterm.remote.Item.AgentText) {
             val index = previewItems.indexOfFirst { it.key == rowItem.key }
             previewItems.take(index.coerceAtLeast(0)).lastOrNull { it is com.adroited.aiterm.remote.Item.User }
-                ?.let { (it as com.adroited.aiterm.remote.Item.User).text }
+                ?.let { userCommandText((it as com.adroited.aiterm.remote.Item.User).text) }
         } else null
         ConversationMessageSheet(
             row = held,
@@ -2216,7 +2216,7 @@ private fun decodeBoundedPreviewBitmap(data: ByteArray): android.graphics.Bitmap
 private fun ConversationTurn(message: RemotePreviewMessage) {
     when (message.role.lowercase()) {
         "user" -> Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
-            val content = remember(message.text) { splitConversationAttachments(message.text) }
+            val content = remember(message.text) { splitConversationAttachments(userCommandText(message.text)) }
             Box(
                 Modifier.widthIn(max = 330.dp)
                     .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp))
