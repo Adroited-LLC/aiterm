@@ -1096,7 +1096,7 @@ export default function SessionsPanel({
               )}
               {/* Branching is a deliberate act (two divergent lines from one
                   history), not a workaround for resume being unavailable.
-                  Only where the engine has fork machinery in its transcript —
+                  Only where the engine supports creating a saved branch —
                   an API chat has none. */}
               {caps.fork && (
                 <button

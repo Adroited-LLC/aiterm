@@ -45,6 +45,9 @@ use serde::Serialize;
 
 use crate::sessions::{ClaudeProvider, Session, SessionProvider};
 
+#[path = "codex_fork.rs"]
+mod codex_fork;
+
 /// What an engine supports, so the UI can stop asking what it is called.
 ///
 /// Every flag names one affordance the renderer used to gate on an agent id —
@@ -259,6 +262,11 @@ pub trait AgentBackend: Send + Sync {
     /// cannot be told to resume — the caller keeps whatever fallback it had.
     fn resume(&self, session_id: &str) -> Option<String> {
         let _ = session_id;
+        None
+    }
+
+    /// Provider-native branching where transcript copying is not supported.
+    fn fork_session(&self, _session_id: &str) -> Option<Result<String, String>> {
         None
     }
 
@@ -635,6 +643,7 @@ struct CodexHeader {
     id: String,
     cwd: String,
     branch: Option<String>,
+    fork_parent: Option<String>,
 }
 
 /// Read a rollout's header. `None` for anything that is not one — a partial
@@ -655,6 +664,11 @@ fn parse_codex_header(first_line: &str) -> Option<CodexHeader> {
             .as_str()?
             .to_string(),
         cwd: p.get("cwd")?.as_str()?.to_string(),
+        fork_parent: p
+            .get("forked_from_id")
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
+            .map(String::from),
         branch: p
             .pointer("/git/branch")
             .and_then(|b| b.as_str())
@@ -848,9 +862,9 @@ fn read_codex_row_from(
             project_path: h.cwd.clone(),
             group_path: h.cwd,
             branch: h.branch,
-            forked: false,
+            forked: h.fork_parent.is_some(),
             background: false,
-            fork_parent: None,
+            fork_parent: h.fork_parent,
             last_active,
         },
         path.to_path_buf(),
@@ -1214,7 +1228,7 @@ impl AgentBackend for CodexBackend {
         &CodexSessions
     }
 
-    /// Resume and delete.
+    /// Resume, native fork, and delete.
     ///
     /// `resume` was parked while the reopen path was claude-shaped, but the
     /// `tui_drive` split settled that: a Codex row now resumes through the same
@@ -1233,11 +1247,16 @@ impl AgentBackend for CodexBackend {
     /// away wholesale.)
     fn caps(&self) -> Caps {
         Caps {
+            fork: true,
             resume: true,
             delete: true,
             tasks: true,
             ..Default::default()
         }
+    }
+
+    fn fork_session(&self, session_id: &str) -> Option<Result<String, String>> {
+        Some(codex_fork::fork(session_id))
     }
 
     /// `codex resume <SESSION_ID>` — reopen a session by its UUID, confirmed on
@@ -2335,6 +2354,7 @@ finally:
                 id: "019fab53-92d3-7c10-91a5-e3bc82210418".into(),
                 cwd: "/home/m/Projects/opcode".into(),
                 branch: Some("main".into()),
+                fork_parent: None,
             })
         );
     }
@@ -2350,6 +2370,7 @@ finally:
                 id: "abc".into(),
                 cwd: "/tmp/scratch".into(),
                 branch: None,
+                fork_parent: None,
             })
         );
     }
@@ -3119,6 +3140,7 @@ finally:
         assert_eq!(
             CodexBackend.caps(),
             Caps {
+                fork: true,
                 resume: true,
                 delete: true,
                 tasks: true,

@@ -7141,7 +7141,8 @@ fn rewrite_session_ids(text: &str, old: &str, new: &str) -> (String, usize) {
 
 /// Branch a session: copy its transcript to a fresh id and hand back that id.
 ///
-/// This is the whole fork. No process is started and no tab is opened, so the
+/// Claude copies its verified transcript; Codex uses its native app-server fork.
+/// No agent turn is started and no tab is opened, so the
 /// session you forked from keeps running untouched and the branch shows up as
 /// an ordinary inactive row you can resume later, at exactly the point you
 /// forked. Doing it by launching `claude --fork-session --resume` instead
@@ -7168,6 +7169,16 @@ pub(crate) fn session_fork_service(session_id: &str) -> Result<String, String> {
 }
 
 fn session_fork_sync(session_id: String) -> Result<String, String> {
+    let list = crate::agents::backends();
+    let backend = crate::agents::owner_in(&list, &session_id)
+        .map(|(backend, _)| backend)
+        .ok_or_else(|| "that session has no transcript left to fork".to_string())?;
+    if !backend.caps().fork {
+        return Err("this agent does not support branching sessions".into());
+    }
+    if let Some(result) = backend.fork_session(&session_id) {
+        return result;
+    }
     let src = resolve_live_session_file(&session_id)
         .ok_or_else(|| "that session has no transcript left to fork".to_string())?;
     if src
@@ -7180,10 +7191,6 @@ fn session_fork_sync(session_id: String) -> Result<String, String> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or_else(|| "unreadable transcript name".to_string())?;
-    let list = crate::agents::backends();
-    let backend = crate::agents::owner_in(&list, &session_id)
-        .map(|(backend, _)| backend)
-        .ok_or_else(|| "that session has no transcript left to fork".to_string())?;
     let home = dirs::home_dir().ok_or("no home dir")?;
     let verified = verified_session_file(backend.id(), &src, &home)
         .map_err(|e| format!("couldn't verify transcript: {e}"))?;
