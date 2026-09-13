@@ -358,3 +358,20 @@ Remote access logs listener lifecycle, a device id prefix, connection state,
 protocol version, and the reason a connection was denied. It never logs a QR
 payload, an enrollment secret, a credential, or a single byte of terminal
 input or output.
+
+### LAN burst regression (Android 0.3.33)
+
+`OkHttpRemoteSocketDialerTest` runs the production TLS WebSocket dialer against a
+local mock gateway. It sends 512 ordered binary frames while the consumer pauses,
+then checks every frame and a client acknowledgement. The old 64-frame `trySend`
+queue cancels the socket in this scenario; the bounded `trySendBlocking` callback
+applies backpressure and keeps the connection alive. A second test closes the
+socket with a full queue and verifies that the reader is released. The callback
+runs on OkHttp's reader thread, never the UI thread. Frame size bounds remain.
+
+On-device investigation recorded repeated `Remote request send failed` outcomes
+over LAN. Socket diagnostics now distinguish frame violations, peer close codes,
+and network exception classes without logging message content. The burst test
+proves the queue failure independently; do not treat it as proof that every
+reported LAN disconnect has the same cause. Foreground traffic and background
+network loss should be validated separately.

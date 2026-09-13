@@ -1,6 +1,7 @@
 package com.adroited.aiterm.remote
 
 import android.content.Context
+import android.util.Log
 import com.adroited.aiterm.pairing.PairedDesktop
 import com.adroited.aiterm.pairing.RemoteNetworkStack
 import com.adroited.aiterm.pairing.tls13Context
@@ -13,6 +14,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.trySendBlocking
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -222,25 +224,34 @@ class OkHttpRemoteSocketDialer(private val context: Context? = null) : DirectRem
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
+                    runCatching { Log.w("AITermSocket", "Rejected text frame on $path") }
                     incoming.close(RemoteProtocolException("text remote frame received"))
                     webSocket.cancel()
                 }
 
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                    if (bytes.size <= 0 || bytes.size >= RemoteWireCodec.MAX_FRAME_BYTES ||
-                        incoming.trySend(bytes.toByteArray()).isFailure
-                    ) {
-                        incoming.close(RemoteProtocolException("remote frame queue or size bound exceeded"))
+                    if (bytes.size <= 0 || bytes.size >= RemoteWireCodec.MAX_FRAME_BYTES) {
+                        runCatching { Log.w("AITermSocket", "Frame size limit exceeded: bytes=${bytes.size}, path=$path") }
+                        incoming.close(RemoteProtocolException("remote frame size bound exceeded"))
                         webSocket.cancel()
+                        return
                     }
+                    // OkHttp delivers messages on this socket's reader thread, not the UI
+                    // thread. Wait for bounded queue space so TCP applies backpressure.
+                    // Dropping a frame corrupts terminal revisions; cancelling here makes
+                    // a normal output burst reconnect and replay the same burst forever.
+                    // Closing incoming releases a blocked sender during app teardown.
+                    if (incoming.trySendBlocking(bytes.toByteArray()).isFailure) webSocket.cancel()
                 }
 
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    runCatching { Log.w("AITermSocket", "Peer closed socket: code=$code path=$path") }
                     incoming.close(RemoteProtocolException("desktop closed the remote connection"))
                     webSocket.cancel()
                 }
 
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    runCatching { Log.w("AITermSocket", "Socket failed on $path: ${t.javaClass.simpleName}") }
                     incoming.close(t)
                     if (continuation.isActive) continuation.resumeWithException(t)
                 }
