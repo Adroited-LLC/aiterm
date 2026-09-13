@@ -66,6 +66,12 @@ class RemoteTerminalViewModel(
     init {
         reconnect()
         viewModelScope.launch {
+            networkMonitor.blocked.collect { blocked ->
+                if (blocked) connectJob?.cancel()
+                client.setNetworkBlocked(blocked)
+            }
+        }
+        viewModelScope.launch {
             networkMonitor.changes.collectLatest {
                 delay(NETWORK_SETTLE_MILLIS)
                 if (!appLock.isLocked.value) {

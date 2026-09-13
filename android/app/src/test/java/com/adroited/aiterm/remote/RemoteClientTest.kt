@@ -42,6 +42,50 @@ import kotlin.concurrent.thread
 @OptIn(ExperimentalCoroutinesApi::class, ExperimentalSerializationApi::class)
 class RemoteClientTest {
     @Test
+    fun androidNetworkBlockPausesRetriesAndResumesTheSelectedSession() = runTest {
+        val connections = mutableListOf<FakeRemoteTransport>()
+        val client = RemoteClient({ FakeRemoteTransport().also(connections::add) },
+            DefaultTerminalScreenStore(), { true }, backgroundScope, StandardTestDispatcher(testScheduler))
+        client.connect()
+        client.selectTab("tab-1")
+        runCurrent()
+        client.setNetworkBlocked(true)
+        assertEquals(ConnectionState.NetworkPaused, client.state.value.connection)
+        assertTrue(connections.single().closed)
+        assertEquals("tab-1", client.state.value.activeTabId)
+        assertFalse(client.connect())
+        advanceTimeBy(120_000)
+        runCurrent()
+        assertEquals("Blocked network must not trigger more connection attempts", 1, connections.size)
+        client.setNetworkBlocked(false)
+        advanceTimeBy(2_000)
+        runCurrent()
+        assertEquals(2, connections.size)
+        assertEquals(ConnectionState.Connected, client.state.value.connection)
+        assertEquals("tab-1", client.state.value.activeTabId)
+        assertTrue(connections.last().requests.any { it.kind == "terminal.attach" })
+        client.lock()
+    }
+
+    @Test
+    fun networkUnblockDoesNotBypassAppLock() = runTest {
+        var connections = 0
+        var unlocked = true
+        val client = RemoteClient({ connections++; FakeRemoteTransport() }, DefaultTerminalScreenStore(),
+            { unlocked }, backgroundScope, StandardTestDispatcher(testScheduler))
+        client.setNetworkBlocked(true)
+        assertFalse(client.connect())
+        assertEquals(0, connections)
+        unlocked = false
+        client.lock()
+        client.setNetworkBlocked(false)
+        advanceTimeBy(120_000)
+        runCurrent()
+        assertEquals(ConnectionState.Locked, client.state.value.connection)
+        assertEquals(0, connections)
+    }
+
+    @Test
     fun malformedReplyDoesNotDisconnectHealthyTransportOrLoseSelection() = runTest {
         val transport = FakeRemoteTransport()
         val client = uploadClient(transport, this, StandardTestDispatcher(testScheduler))

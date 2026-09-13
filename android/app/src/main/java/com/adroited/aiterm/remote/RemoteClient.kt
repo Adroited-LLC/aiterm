@@ -37,7 +37,7 @@ data class TerminalSize(val cols: Int, val rows: Int) {
 }
 
 enum class FocusOwner { Self, Other, Unowned }
-enum class ConnectionState { Disconnected, Connecting, Connected, Reconnecting, Locked, Revoked }
+enum class ConnectionState { Disconnected, Connecting, Connected, Reconnecting, Locked, Revoked, NetworkPaused }
 
 enum class RemoteSessionMutation(val wire: String) {
     Fork("session.fork"), Close("session.close"), Stop("session.stop"), Delete("session.delete")
@@ -210,6 +210,7 @@ class RemoteClient(
     private var transport: RemoteTransport? = null
     private var eventJob: Job? = null
     private var reconnectJob: Job? = null
+    private var networkBlocked = false
     private var recoveryRequested = false
     private var scrollbackRequest: ScrollbackRequest? = null
     private var activeAttachmentId: String? = null
@@ -224,6 +225,36 @@ class RemoteClient(
     private val statusReads = HashSet<String>()
     private var desiredPreviewSessionId: String? = null
     private var previewGeneration = 0L
+
+    /** Android may keep Wi-Fi connected while its firewall denies this app network access. */
+    fun setNetworkBlocked(blocked: Boolean) {
+        var closing: ClosingTransport? = null
+        var resume = false
+        synchronized(lifecycleLock) {
+            if (networkBlocked == blocked) return
+            networkBlocked = blocked
+            logConnection("Android network access blocked=$blocked")
+            if (blocked) {
+                reconnectJob?.cancel()
+                reconnectJob = null
+                closing = detachTransportLocked()
+                clearActiveTerminalLocked()
+                if (mutableState.value.connection !in setOf(ConnectionState.Locked, ConnectionState.Revoked)) {
+                    mutableState.value = mutableState.value.copy(
+                        connection = ConnectionState.NetworkPaused,
+                        focus = FocusOwner.Unowned, readOnly = true, showTakeFocus = false,
+                        pendingTransfers = 0, connectedEndpoint = null,
+                        lastError = "Android has paused network access for AiTerm. Reconnecting when access returns.",
+                    )
+                }
+            } else if (mutableState.value.connection == ConnectionState.NetworkPaused) {
+                mutableState.value = mutableState.value.copy(connection = ConnectionState.Reconnecting, lastError = null)
+                resume = isUnlocked()
+            }
+        }
+        closing?.let(::finishTransportClose)
+        if (resume) scheduleReconnect()
+    }
 
     suspend fun connect(): Boolean {
         logConnection("connection explicitly requested")
@@ -249,8 +280,9 @@ class RemoteClient(
             lock()
             return false
         }
+        if (synchronized(lifecycleLock) { networkBlocked }) return false
         val candidate = transportFactory()
-        val generation = beginConnection(candidate, connectingState)
+        val generation = beginConnection(candidate, connectingState) ?: run { candidate.close(); return false }
         return try {
             candidate.connect()
             val selectedTab = synchronized(lifecycleLock) {
@@ -1518,7 +1550,7 @@ class RemoteClient(
 
     private fun scheduleReconnect() {
         val job = synchronized(lifecycleLock) {
-            if (reconnectJob?.isActive == true || !isUnlocked()) return
+            if (reconnectJob?.isActive == true || !isUnlocked() || networkBlocked) return
             scope.launch(dispatcher, start = CoroutineStart.LAZY) {
                 var attempt = 0
                 while (true) {
@@ -1526,7 +1558,7 @@ class RemoteClient(
                         attempt.coerceAtMost(RECONNECT_DELAYS_MILLIS.lastIndex)
                     ]
                     delay(delayMillis)
-                    if (!isUnlocked() || mutableState.value.connection == ConnectionState.Revoked ||
+                    if (synchronized(lifecycleLock) { networkBlocked } || !isUnlocked() || mutableState.value.connection == ConnectionState.Revoked ||
                         mutableState.value.connection == ConnectionState.Locked
                     ) return@launch
                     if (connectOnce(ConnectionState.Reconnecting)) return@launch
@@ -1669,8 +1701,9 @@ class RemoteClient(
         closing.transport?.close()
     }
 
-    private fun beginConnection(candidate: RemoteTransport, connectingState: ConnectionState): Long {
+    private fun beginConnection(candidate: RemoteTransport, connectingState: ConnectionState): Long? {
         val closing = synchronized(lifecycleLock) {
+            if (networkBlocked) return null
             lifecycleGeneration += 1
             selectionGeneration += 1
             val jobs = ownedJobs.toList()

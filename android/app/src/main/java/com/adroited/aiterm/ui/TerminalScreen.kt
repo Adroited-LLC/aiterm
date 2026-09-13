@@ -996,6 +996,7 @@ private fun terminalUploadErrorMessage(error: Throwable): String = when {
 }
 
 private fun ConnectionState.label(): String = when (this) {
+    ConnectionState.NetworkPaused -> "NETWORK PAUSED"
     ConnectionState.Disconnected -> "DISCONNECTED"
     ConnectionState.Connecting -> "CONNECTING"
     ConnectionState.Connected -> "CONNECTED"
@@ -1006,6 +1007,7 @@ private fun ConnectionState.label(): String = when (this) {
 
 @Composable
 private fun ConnectionState.color(): Color = when (this) {
+    ConnectionState.NetworkPaused -> MaterialTheme.colorScheme.onSurfaceVariant
     ConnectionState.Connected -> MaterialTheme.colorScheme.tertiary
     ConnectionState.Connecting, ConnectionState.Reconnecting -> MaterialTheme.colorScheme.primary
     ConnectionState.Disconnected, ConnectionState.Locked, ConnectionState.Revoked -> MaterialTheme.colorScheme.error

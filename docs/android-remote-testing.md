@@ -375,3 +375,21 @@ and network exception classes without logging message content. The burst test
 proves the queue failure independently; do not treat it as proof that every
 reported LAN disconnect has the same cause. Foreground traffic and background
 network loss should be validated separately.
+
+### Android background network policy (0.3.34)
+
+A Pixel trace showed AiTerm leaving the foreground at 12:50:07, Android removing
+its background firewall allowance at 12:50:12.819, and the LAN socket failing at
+12:50:12.942. Netpolicy reported effective `APP_BACKGROUND` blocking for AiTerm
+while Wi-Fi remained validated. This is a real socket loss, not terminal status.
+
+The default network monitor now observes `onBlockedStatusChanged`. The client
+pauses retries and detaches once while blocked, preserves the selected session,
+and reconnects when Android allows networking again. Unblocking does not bypass
+app lock or revoked access. The API header distinguishes network paused,
+connecting, reconnecting, unlock required, revoked, and disconnected states.
+
+Validate by opening a session, backgrounding AiTerm long enough for Android's
+policy to apply, and returning. Expect one `blocked=true` event with no repeated
+connection attempts, then `blocked=false` and reconnection to the same session.
+Do not disable user security/background restrictions as part of this test.

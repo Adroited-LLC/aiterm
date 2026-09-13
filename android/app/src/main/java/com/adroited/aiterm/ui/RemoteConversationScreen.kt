@@ -695,7 +695,7 @@ private fun ConnectionDot(connection: ConnectionState) {
         ConnectionState.Connected -> MaterialTheme.colorScheme.tertiary
         ConnectionState.Connecting, ConnectionState.Reconnecting -> MaterialTheme.colorScheme.primary
         ConnectionState.Locked, ConnectionState.Revoked -> MaterialTheme.colorScheme.error
-        ConnectionState.Disconnected -> MaterialTheme.colorScheme.onSurfaceVariant
+        ConnectionState.Disconnected, ConnectionState.NetworkPaused -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     val transition = rememberInfiniteTransition(label = "connection-pulse")
     val alpha by transition.animateFloat(
@@ -1381,7 +1381,12 @@ internal fun RemoteConversationContent(
                             Spacer(Modifier.width(8.dp))
                             SessionStateChip(
                                 label = when {
-                                    state.connection != ConnectionState.Connected -> "disconnected"
+                                    state.connection == ConnectionState.NetworkPaused -> "network paused"
+                                    state.connection == ConnectionState.Connecting -> "connecting"
+                                    state.connection == ConnectionState.Reconnecting -> "reconnecting"
+                                    state.connection == ConnectionState.Locked -> "unlock required"
+                                    state.connection == ConnectionState.Revoked -> "access revoked"
+                                    state.connection == ConnectionState.Disconnected -> "disconnected"
                                     state.previewError != null -> "sync interrupted"
                                     needsYou -> "needs you"
                                     working -> "working"
@@ -2478,6 +2483,7 @@ private fun ConnectionLabel(connection: ConnectionState, path: com.adroited.aite
         ConnectionState.Reconnecting -> "reconnecting" to MaterialTheme.colorScheme.primary
         ConnectionState.Locked -> "locked" to MaterialTheme.colorScheme.error
         ConnectionState.Revoked -> "revoked" to MaterialTheme.colorScheme.error
+        ConnectionState.NetworkPaused -> "network paused" to MaterialTheme.colorScheme.onSurfaceVariant
         ConnectionState.Disconnected -> "offline" to MaterialTheme.colorScheme.onSurfaceVariant
     }
     Text(label, style = MaterialTheme.typography.labelMedium, color = color)
