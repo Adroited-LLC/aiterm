@@ -1,6 +1,7 @@
 //! Desktop client of the existing device gateway. Network, keys, recovery and
 //! terminal state stay in Rust; the renderer receives a display-only projection.
 mod navigation;
+mod sessions;
 mod store;
 mod transport;
 use crate::{
@@ -37,6 +38,12 @@ pub struct ClientView {
     pub error: Option<String>,
     pub tabs: Vec<Value>,
     pub sessions: Vec<Value>,
+    pub stars: Vec<String>,
+    pub activity: HashMap<String, String>,
+    pub agent_caps: HashMap<String, Value>,
+    pub preview_session: Option<String>,
+    pub preview_messages: Vec<Value>,
+    pub preview_loading: bool,
     pub selected_tab: Option<String>,
     pub has_focus: bool,
     pub screen: Option<ScreenSnapshot>,
@@ -306,6 +313,7 @@ pub async fn desktop_client_connect(id: String) -> Result<(), String> {
 #[derive(Clone)]
 enum Action {
     Attach(String),
+    Session(String, String, Option<String>, Option<bool>),
     Focus,
     Input(String),
     Type(String, u16, u16, String),
@@ -364,6 +372,35 @@ async fn dispatch_response(
 pub async fn desktop_client_attach(tab_id: String) -> Result<(), String> {
     dispatch(Action::Attach(tab_id)).await
 }
+/// An allowlisted session operation, executed by the paired desktop's gateway.
+#[cfg_attr(not(aiterm_headless), tauri::command)]
+pub async fn desktop_client_session(
+    action: String,
+    session_id: String,
+    title: Option<String>,
+    on: Option<bool>,
+) -> Result<(), String> {
+    if !matches!(
+        action.as_str(),
+        "preview" | "open" | "rename" | "star" | "fork" | "close" | "stop" | "delete"
+    ) {
+        return Err("Unsupported session action".into());
+    }
+    if session_id.is_empty() || session_id.len() > 512 {
+        return Err("Invalid session".into());
+    }
+    if action == "rename"
+        && title
+            .as_ref()
+            .is_none_or(|v| v.trim().is_empty() || v.len() > 1024)
+    {
+        return Err("Enter a session name of 1–1024 bytes".into());
+    }
+    if action == "star" && on.is_none() {
+        return Err("Choose a star state".into());
+    }
+    dispatch(Action::Session(action, session_id, title, on)).await
+}
 #[cfg_attr(not(aiterm_headless), tauri::command)]
 pub async fn desktop_client_focus() -> Result<(), String> {
     dispatch(Action::Focus).await
@@ -412,6 +449,7 @@ struct Frame {
 }
 struct Pending {
     kind: String,
+    session_id: Option<String>,
     started: Instant,
     job: Option<Job>,
 }
@@ -424,6 +462,9 @@ struct Connection {
     shared: Arc<Shared>,
     generation: u64,
     epoch: u64,
+    statuses: HashMap<String, sessions::SessionStatus>,
+    status_supported: bool,
+    agents_loaded: bool,
 }
 impl Connection {
     async fn request(
@@ -438,6 +479,9 @@ impl Connection {
             id,
             Pending {
                 kind: kind.into(),
+                session_id: transport::decode::<Value>(&payload)
+                    .ok()
+                    .and_then(|p| p["session_id"].as_str().map(str::to_owned)),
                 started: Instant::now(),
                 job,
             },
@@ -454,7 +498,10 @@ impl Connection {
         .await
     }
     async fn refresh(&mut self) -> Result<(), String> {
-        for kind in ["tab.list", "session.roster"] {
+        for kind in ["tab.list", "session.roster", "agent.list"] {
+            if kind == "agent.list" && self.agents_loaded {
+                continue;
+            }
             if !self.pending.values().any(|p| p.kind == kind) {
                 self.request(kind, vec![], None).await?;
             }
@@ -497,6 +544,9 @@ impl Connection {
                 v.screen = None;
             }
             v.selected_tab = Some(tab.clone());
+            v.preview_session = None;
+            v.preview_messages.clear();
+            v.preview_loading = false;
             v.attachment_id = None;
             v.scrollback.clear();
             v.has_focus = false;
@@ -518,6 +568,62 @@ impl Connection {
                 .reply
                 .send(Err("Connection changed; input was not replayed".into()));
             return Ok(());
+        }
+        if let Action::Session(action, session, title, on) = &job.action {
+            let action = action.clone();
+            let session = session.clone();
+            // Restrict queued mutations to the selected connection generation, never local sessions.
+            if action == "delete" {
+                let v = self.shared.view.lock().unwrap();
+                if v.tabs
+                    .iter()
+                    .any(|t| t["sessionId"] == session && t["state"] == "running")
+                    || matches!(
+                        v.activity.get(&session).map(String::as_str),
+                        Some("output" | "attention")
+                    )
+                {
+                    let _ = job
+                        .reply
+                        .send(Err("Close the running session before deleting it".into()));
+                    return Ok(());
+                }
+            }
+            let mut payload = json!({"session_id":session});
+            match action.as_str() {
+                "open" => payload["size"] = json!({"cols":100,"rows":30}),
+                "rename" => payload["title"] = json!(title),
+                "star" => payload["on"] = json!(on),
+                "preview" => {
+                    payload["max_chars"] = json!(200_000);
+                    self.shared.publish(self.generation, |v| {
+                        v.preview_session = Some(session.clone());
+                        v.preview_messages.clear();
+                        v.preview_loading = true;
+                        v.error = None;
+                    });
+                }
+                "close" => {
+                    let v = self.shared.view.lock().unwrap();
+                    let tabs: Vec<_> = v
+                        .tabs
+                        .iter()
+                        .filter(|t| t["sessionId"] == session && t["state"] == "running")
+                        .collect();
+                    if tabs.len() == 1 {
+                        payload["tab_id"] = tabs[0]["id"].clone();
+                    }
+                }
+                _ => {}
+            }
+            let kind = if action == "preview" {
+                "session.conversation".into()
+            } else {
+                format!("session.{action}")
+            };
+            return self
+                .request(&kind, transport::encode(&payload)?, Some(job))
+                .await;
         }
         if let Action::Attach(tab) = &job.action {
             return self.attach(tab.clone(), Some(job)).await;
@@ -607,11 +713,11 @@ impl Connection {
                     &json!({"tab_id":tab,"attachment_id":id,"offset":offset,"count":100}),
                 )?,
             ),
-            Action::Attach(_) => unreachable!(),
+            Action::Attach(_) | Action::Session(..) => unreachable!(),
         };
         self.request(kind, payload, Some(job)).await
     }
-    fn frame(&mut self, bytes: &[u8]) -> Result<(), String> {
+    async fn frame(&mut self, bytes: &[u8]) -> Result<(), String> {
         let frame: Frame = transport::decode(bytes)?;
         if frame.version != 1 {
             return Err("Unsupported remote protocol".into());
@@ -681,6 +787,17 @@ impl Connection {
             return Ok(());
         }
         if frame.request_id == 0
+            && matches!(
+                frame.kind.as_str(),
+                "session.changed" | "tab.changed" | "agent.changed"
+            )
+        {
+            if frame.kind == "agent.changed" {
+                self.agents_loaded = false;
+            }
+            return self.refresh().await;
+        }
+        if frame.request_id == 0
             && !matches!(
                 frame.kind.as_str(),
                 "terminal.focus_changed"
@@ -709,6 +826,23 @@ impl Connection {
                 .as_str()
                 .unwrap_or("Remote request failed")
                 .to_string();
+            if pending.as_ref().is_some_and(|p| p.kind == "session.spine")
+                && payload["code"] == "remote.unsupported"
+            {
+                self.status_supported = false;
+            }
+            if pending
+                .as_ref()
+                .is_some_and(|p| p.kind == "session.conversation")
+            {
+                self.shared.publish(self.generation, |v| {
+                    if v.preview_session.as_ref()
+                        == pending.as_ref().and_then(|p| p.session_id.as_ref())
+                    {
+                        v.preview_loading = false;
+                    }
+                });
+            }
             if let Some(Pending { job: Some(job), .. }) = pending {
                 let _ = job.reply.send(Err(message));
             }
@@ -723,9 +857,99 @@ impl Connection {
             "tab.list" => self.shared.publish(self.generation, |v| {
                 v.tabs = payload["tabs"].as_array().cloned().unwrap_or_default()
             }),
-            "session.roster" => self.shared.publish(self.generation, |v| {
-                v.sessions = payload["sessions"].as_array().cloned().unwrap_or_default()
-            }),
+            "agent.list" => {
+                self.agents_loaded = true;
+                self.shared.publish(self.generation, |v| {
+                    v.agent_caps =
+                        serde_json::from_value(payload["caps"].clone()).unwrap_or_default();
+                });
+            }
+            "session.roster" => {
+                let activity: HashMap<String, String> =
+                    serde_json::from_value(payload["activity"].clone()).unwrap_or_default();
+                self.statuses.retain(|id, _| activity.contains_key(id));
+                self.shared.publish(self.generation, |v| {
+                    v.sessions = payload["sessions"].as_array().cloned().unwrap_or_default();
+                    v.stars = serde_json::from_value(payload["stars"].clone()).unwrap_or_default();
+                    v.activity = activity
+                        .iter()
+                        .map(|(id, fallback)| {
+                            let value = self.statuses.get(id).and_then(|s| s.activity()).unwrap_or(
+                                if fallback == "attention" {
+                                    "attention"
+                                } else {
+                                    "idle"
+                                },
+                            );
+                            (id.clone(), value.into())
+                        })
+                        .collect();
+                });
+                if self.status_supported {
+                    for id in activity.keys().take(128) {
+                        if !self
+                            .pending
+                            .values()
+                            .any(|p| p.kind == "session.spine" && p.session_id.as_ref() == Some(id))
+                        {
+                            self.request(
+                                "session.spine",
+                                transport::encode(&json!({"session_id":id,"after":i64::MAX}))?,
+                                None,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            "session.spine" => {
+                if let Some(id) = pending.as_ref().and_then(|p| p.session_id.clone()) {
+                    let status = self.statuses.entry(id.clone()).or_default();
+                    let changed = status.epoch != payload["epoch"].as_u64().unwrap_or(0)
+                        || status.latest != payload["latest_seq"].as_u64().unwrap_or(0);
+                    status.apply(&payload);
+                    let latest = status.latest;
+                    if let Some(activity) = status.activity() {
+                        self.shared.publish(self.generation, |v| {
+                            if v.activity.contains_key(&id) {
+                                v.activity.insert(id.clone(), activity.into());
+                            }
+                        });
+                    }
+                    if changed && latest > 0 {
+                        self.request(
+                            "session.spine",
+                            transport::encode(
+                                &json!({"session_id":id,"after":latest.saturating_sub(32)}),
+                            )?,
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            "session.conversation" => {
+                let id = pending.as_ref().and_then(|p| p.session_id.as_ref());
+                self.shared.publish(self.generation, |v| {
+                    if v.preview_session.as_ref() == id {
+                        v.preview_messages =
+                            payload["messages"].as_array().cloned().unwrap_or_default();
+                        v.preview_loading = false;
+                    }
+                });
+            }
+            "session.open" => {
+                let tab = payload["tab_id"]
+                    .as_str()
+                    .ok_or("Invalid opened session")?
+                    .to_string();
+                self.refresh().await?;
+                return self.attach(tab, pending.and_then(|p| p.job)).await;
+            }
+            "session.rename" | "session.star" | "session.fork" | "session.close"
+            | "session.stop" | "session.delete" => {
+                self.refresh().await?;
+            }
             "terminal.attach" => {
                 let tab = payload["tab_id"]
                     .as_str()
@@ -848,12 +1072,14 @@ async fn connection_loop(
             let mut connection = Connection {
                 socket, next_id: 0, pending: HashMap::new(), attachment: None,
                 assembler: None, shared: shared.clone(), generation, epoch,
+                statuses: HashMap::new(), status_supported: true,
+        agents_loaded: false,
             };
             connection.refresh().await?;
             // Resolve against a fresh roster, including session IDs after host restarts.
             while connection.pending.values().any(|p| p.kind == "tab.list") {
                 let bytes = tokio::time::timeout(Duration::from_secs(10), transport::receive(&mut connection.socket)).await.map_err(|_| "Desktop session list timed out")??;
-                connection.frame(&bytes)?;
+                connection.frame(&bytes).await?;
             }
             let navigation = navigation::load().unwrap_or_default();
             let saved = navigation.sessions.get(&desktop.id);
@@ -876,7 +1102,7 @@ async fn connection_loop(
                         let message = message.ok_or("Desktop disconnected")?.map_err(|e| e.to_string())?;
                         last_frame = Instant::now();
                         match message {
-                            Message::Binary(bytes) => connection.frame(&bytes)?,
+                            Message::Binary(bytes) => connection.frame(&bytes).await?,
                             Message::Ping(_) => {
                                 tokio::time::timeout(Duration::from_secs(10), connection.socket.flush())
                                     .await.map_err(|_| "Desktop write timed out")?.map_err(|e| e.to_string())?;

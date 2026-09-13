@@ -35,7 +35,7 @@
 .dc-session-header { padding: 18px 24px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--border); }
 .dc-session-header > div { flex: 1; min-width: 0; }
 .dc-session-header h3 { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dc-session-header span { display: block; margin-top: 5px; font-size: 12px; color: var(--text-dim); }
+.dc-session-header span { overflow-wrap: anywhere; display: block; margin-top: 5px; font-size: 12px; color: var(--text-dim); }
 .dc-overlay .dc-primary { border-color: var(--accent); }
 .dc-terminal-frame { flex: 1; min-height: 0; position: relative; }
 .dc-terminal { position: absolute; inset: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; scrollbar-color: var(--border) var(--bg); scrollbar-width: thin; padding: 16px 20px; }
@@ -57,3 +57,39 @@
 @media (max-width: 720px) { .dc-body { grid-template-columns: 220px minmax(0, 1fr); } .dc-header { gap: 8px; padding: 12px; } .dc-heading h2 { font-size: 14px; } .dc-session-header { flex-wrap: wrap; padding: 12px; } .dc-session-header > div { flex-basis: 100%; } }
 
 .dc-terminal .xterm:not(.allow-transparency) .xterm-viewport { background-color: var(--bg); }
+
+/* Session manager: generous rows with stable status placement across themes. */
+.dc-body { grid-template-columns: 320px minmax(0, 1fr); }
+.dc-search { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 7px; padding: 0 10px; color: var(--text-dim); background: var(--bg); }
+.dc-search input { border: 0; background: transparent; padding: 9px 0; width: 100%; min-width: 0; font-size: 12px; }
+.dc-filters { display: flex; gap: 4px; }
+.dc-filters button { flex: 1; padding: 6px 3px; font-size: 11px; background: transparent; border-color: transparent; }
+.dc-filters button[aria-pressed="true"] { background: var(--bg-active); border-color: var(--border); }
+.dc-session-row { position: relative; flex: none; }
+.dc-session-row > button:first-child { width: 100%; padding-right: 34px; font-size: 12px; }
+.dc-row-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dc-row-title strong { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dc-row-title > svg { flex: none; }
+.dc-row-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 18px; }
+.dc-row-meta small { display: flex; align-items: center; gap: 4px; }
+.dc-phase { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+.dc-phase::before { content: ""; display: inline-block; width: 5px; height: 5px; margin-right: 6px; border-radius: 50%; background: currentColor; }
+.dc-phase[data-phase="Working"] { color: var(--yellow); }
+.dc-phase[data-phase="Needs you"] { color: var(--red); }
+.dc-phase[data-phase="Open"] { color: var(--green); }
+.dc-sessions .dc-row-menu { position: absolute; right: 2px; top: 9px; padding: 5px; align-items: center; }
+.dc-session-menu { display: flex; flex-direction: column; gap: 2px; padding: 6px; margin: 4px 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-raised); }
+.dc-session-menu button { font-size: 12px; padding: 8px; }
+.dc-conversation { flex: 1; min-height: 0; overflow: auto; padding: 28px clamp(20px, 5vw, 72px); }
+.dc-conversation article { max-width: 900px; margin: 0 auto 28px; line-height: 1.65; font-size: 13px; }
+.dc-conversation article > span { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 8px; }
+.dc-conversation article > div { white-space: pre-wrap; overflow-wrap: anywhere; }
+.dc-conversation article[data-role="user"] { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; }
+.dc-prompt-shade { position: absolute; inset: 0; display: grid; place-items: center; background: #0008; padding: 24px; z-index: 5; }
+.dc-prompt { width: min(440px, 100%); padding: 24px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-panel); box-shadow: 0 16px 64px #0005; }
+.dc-prompt, .dc-prompt form { display: flex; flex-direction: column; gap: 16px; }
+.dc-prompt p { line-height: 1.6; font-size: 13px; }
+.dc-prompt label { font-size: 12px; }
+.dc-prompt input { width: 100%; }
+.dc-prompt div { display: flex; justify-content: flex-end; gap: 8px; }
+@media (max-width: 900px) { .dc-body { grid-template-columns: 260px minmax(0, 1fr); } .dc-sidebar { padding: 16px 12px; } .dc-session-header { flex-wrap: wrap; } }

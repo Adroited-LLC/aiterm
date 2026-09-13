@@ -50,7 +50,7 @@ async fn drain_until(connection: &mut Connection, ready: impl Fn(&Connection) ->
     tokio::time::timeout(Duration::from_secs(5), async {
         while !ready(connection) {
             let bytes = transport::receive(&mut connection.socket).await.unwrap();
-            connection.frame(&bytes).unwrap();
+            connection.frame(&bytes).await.unwrap();
         }
     })
     .await
@@ -139,6 +139,9 @@ async fn real_gateway_auth_snapshot_focus_input_scrollback_and_reconnect() {
         shared: shared.clone(),
         generation: 1,
         epoch: 1,
+        statuses: HashMap::new(),
+        status_supported: true,
+        agents_loaded: false,
     };
     connection.refresh().await.unwrap();
     drain_until(&mut connection, |c| {
@@ -273,6 +276,9 @@ async fn real_gateway_auth_snapshot_focus_input_scrollback_and_reconnect() {
         shared,
         generation: 1,
         epoch: 2,
+        statuses: HashMap::new(),
+        status_supported: true,
+        agents_loaded: false,
     };
     connection.attach(tab.as_str().into(), None).await.unwrap();
     drain_until(&mut connection, |c| {
@@ -365,6 +371,217 @@ async fn pairing_requires_host_approval_then_uses_the_saved_key() {
         .await
         .unwrap();
     socket.close(None).await.ok();
+    gateway.stop().await.unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+struct ResumeAgent;
+impl crate::services::agents::AgentOperations for ResumeAgent {
+    fn detect(&self) -> Vec<crate::agents::Detection> {
+        vec![]
+    }
+    fn caps(&self) -> HashMap<String, crate::agents::Caps> {
+        HashMap::new()
+    }
+    fn list(&self) -> Vec<crate::agents::AgentChoice> {
+        vec![]
+    }
+    fn resolve(
+        &self,
+        request: crate::launch::LaunchRequest,
+    ) -> Result<crate::launch::LaunchPlan, crate::services::agents::AgentServiceError> {
+        let crate::launch::LaunchRequest::Resume { session_id } = request else {
+            panic!("only resume expected");
+        };
+        Ok(crate::launch::LaunchPlan {
+            command: "fixture-resume".into(),
+            env_provider: None,
+            env_model: None,
+            session_id: Some(session_id),
+            agent_id: "claude".into(),
+            caps: crate::agents::Caps::default(),
+        })
+    }
+}
+#[tokio::test]
+async fn manager_previews_resumes_existing_history_and_keeps_request_errors_connected() {
+    let root = std::env::temp_dir().join(format!("aiterm-desktop-client-{}", uuid::Uuid::new_v4()));
+    let store = Arc::new(DeviceStore::open(root.join("devices")).unwrap());
+    let key = SigningKey::random(&mut OsRng);
+    let now = std::time::SystemTime::now();
+    let invite = store.begin_enrollment_at(now).unwrap();
+    let device = store
+        .approve_at(
+            invite.secret(),
+            "Test desktop",
+            key.verifying_key().to_encoded_point(true).as_bytes(),
+            now,
+        )
+        .unwrap();
+    let pty = Arc::new(TestPty::default());
+    let registry = Arc::new(TabRegistry::with_backend(pty.clone()));
+    use crate::services::sessions::{SessionRoots, SessionService};
+    let session_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(sessions.join("project")).unwrap();
+    std::fs::write(sessions.join("project").join(format!("{session_id}.jsonl")), format!("{}\n", json!({"type":"user","uuid":"first","parentUuid":null,"sessionId":session_id,"cwd":"/fixture/project","message":{"role":"user","content":"Saved conversation"}}))).unwrap();
+    let service = SessionService::from_roots(SessionRoots::new(
+        sessions,
+        root.join("trash"),
+        root.join("tasks"),
+        root.join("jobs"),
+        root.join("forks.json"),
+    ));
+    let identity =
+        TlsIdentity::load_or_create(root.join("tls"), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).unwrap();
+    let gateway = RemoteGateway::start(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        store.clone(),
+        identity,
+        RemoteServices::with_application_services(
+            registry.clone(),
+            service.clone(),
+            crate::services::agents::AgentService::from_operations(Arc::new(ResumeAgent)),
+        ),
+    )
+    .await
+    .unwrap();
+    let desktop = Desktop {
+        id: "test".into(),
+        name: "Test desktop".into(),
+        hosts: vec!["127.0.0.1".into()],
+        port: gateway.local_addr().port(),
+        fingerprint: gateway.spki_fingerprint().into(),
+        relay: None,
+        device_id: device.id,
+        key: key.to_bytes().to_vec(),
+    };
+    let mut socket = transport::open(&desktop).await.unwrap();
+    transport::authenticate(&mut socket, &desktop)
+        .await
+        .unwrap();
+    let shared = test_shared();
+    let mut connection = Connection {
+        socket,
+        next_id: 0,
+        pending: HashMap::new(),
+        attachment: None,
+        assembler: None,
+        shared: shared.clone(),
+        generation: 1,
+        epoch: 1,
+        statuses: HashMap::new(),
+        status_supported: true,
+        agents_loaded: false,
+    };
+
+    connection.refresh().await.unwrap();
+    drain_until(&mut connection, |c| {
+        !c.shared.view.lock().unwrap().sessions.is_empty()
+    })
+    .await;
+    let (preview, result) = job(
+        &connection,
+        Action::Session("preview".into(), session_id.into(), None, None),
+    );
+    connection.job(preview).await.unwrap();
+    drain_until(&mut connection, |c| {
+        !c.shared.view.lock().unwrap().preview_loading
+    })
+    .await;
+    assert!(result.await.unwrap().is_ok());
+    assert!(
+        registry.list().is_empty(),
+        "preview must not start an agent"
+    );
+    assert_eq!(
+        shared.view.lock().unwrap().preview_session.as_deref(),
+        Some(session_id)
+    );
+    // The rich conversation reader uses the application catalog; inject its
+    // bounded reply so the fixture never reads or writes real user history.
+    connection.next_id += 1;
+    let id = connection.next_id;
+    connection.pending.insert(
+        id,
+        Pending {
+            kind: "session.conversation".into(),
+            session_id: Some(session_id.into()),
+            started: Instant::now(),
+            job: None,
+        },
+    );
+    connection
+        .frame(
+            &transport::encode(&Frame {
+                version: 1,
+                request_id: id,
+                kind: "session.conversation".into(),
+                payload: transport::encode(
+                    &json!({"messages":[{"role":"user","text":"Saved conversation"}]}),
+                )
+                .unwrap(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        shared.view.lock().unwrap().preview_messages[0]["text"],
+        "Saved conversation"
+    );
+    for _ in 0..2 {
+        let (open, result) = job(
+            &connection,
+            Action::Session("open".into(), session_id.into(), None, None),
+        );
+        connection.job(open).await.unwrap();
+        drain_until(&mut connection, |c| {
+            !c.pending
+                .values()
+                .any(|p| p.kind == "session.open" || p.kind == "terminal.attach")
+        })
+        .await;
+        assert!(result.await.unwrap().is_ok());
+        drain_until(&mut connection, |c| {
+            c.shared.view.lock().unwrap().screen.is_some()
+        })
+        .await;
+        assert_eq!(
+            registry.list().len(),
+            1,
+            "reopen must reuse the existing tab"
+        );
+        assert!(shared.view.lock().unwrap().preview_session.is_none());
+        assert!(
+            !shared.view.lock().unwrap().has_focus,
+            "reading does not take control"
+        );
+    }
+    // A missing session is an action error, not a transport failure.
+    let (bad, result) = job(
+        &connection,
+        Action::Session("open".into(), "missing-session".into(), None, None),
+    );
+    connection.job(bad).await.unwrap();
+    drain_until(&mut connection, |c| {
+        !c.pending.values().any(|p| p.kind == "session.open")
+    })
+    .await;
+    assert!(result.await.unwrap().is_err());
+    assert_eq!(shared.view.lock().unwrap().connection, "connected");
+    let (delete, result) = job(
+        &connection,
+        Action::Session("delete".into(), session_id.into(), None, None),
+    );
+    connection.job(delete).await.unwrap();
+    assert!(
+        result.await.unwrap().is_err(),
+        "live sessions cannot be deleted"
+    );
+    assert!(service.find(session_id).is_ok());
+    connection.socket.close(None).await.ok();
+    drop(connection);
     gateway.stop().await.unwrap();
     std::fs::remove_dir_all(root).ok();
 }

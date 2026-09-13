@@ -132,6 +132,7 @@ pub fn run() {
             desktop_remote::desktop_client_restore,
             desktop_remote::desktop_client_attach,
             desktop_remote::desktop_client_focus,
+            desktop_remote::desktop_client_session,
             desktop_remote::desktop_client_input,
             desktop_remote::desktop_client_type,
             desktop_remote::desktop_client_resize,
