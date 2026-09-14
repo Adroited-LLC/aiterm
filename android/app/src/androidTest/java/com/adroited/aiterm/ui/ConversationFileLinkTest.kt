@@ -58,6 +58,42 @@ class ConversationFileLinkTest {
     }
 
     @Test
+    fun fileCitationButtonUsesTheSessionFilePreview() {
+        showConversation(response = "Created: :codex-file-citation{path=\"$path\" purpose=\"output\"}")
+        compose.onNodeWithText("README.md").assertIsDisplayed().performClick()
+        compose.waitUntil(timeoutMillis = 5_000) {
+            compose.onAllNodesWithText(contents).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.runOnIdle {
+            assertEquals(listOf(Triple("file-link-test", path, 512 * 1024)), requests)
+            assertTrue(externalLinks.isEmpty())
+        }
+        compose.onNodeWithContentDescription("Back to conversation").performClick()
+        compose.onNodeWithText("README.md").assertIsDisplayed()
+    }
+
+    @Test
+    fun reportedWordCitationRoutesToTheDesktopFileHandler() {
+        val path = "/home/matt/Downloads/khris/VextorLogix_Lee_County_Development_Review.docx"
+        val opened = mutableListOf<String>()
+        val external = mutableListOf<String>()
+        compose.setContent {
+            CompositionLocalProvider(LocalUriHandler provides recordingUriHandler(external)) {
+                MaterialTheme {
+                    ConversationLinkHandler(onOpenFile = opened::add, onError = { error(it) }) {
+                        AssistantMarkdown("Created the document: :codex-file-citation{path=\"$path\" purpose=\"output\"}")
+                    }
+                }
+            }
+        }
+        compose.onNodeWithText(path.substringAfterLast('/')).assertIsDisplayed().performClick()
+        compose.runOnIdle {
+            assertEquals(listOf(path), opened)
+            assertTrue(external.isEmpty())
+        }
+    }
+
+    @Test
     fun unavailableFileShowsErrorWithoutLoadingOrLaunchingAndroidIntent() {
         showConversation(fileAvailable = false)
         tapLink(label)
@@ -122,7 +158,7 @@ class ConversationFileLinkTest {
     private val externalLinks = mutableListOf<String>()
     private var leaveConversation = 0
 
-    private fun showConversation(fileAvailable: Boolean = true) {
+    private fun showConversation(fileAvailable: Boolean = true, response: String = "[$label]($path)") {
         val session = RemoteSession(
             id = "file-link-test", agent = "codex", title = "File link test",
             projectPath = "/home/matt/Projects/mojo", groupPath = "/home/matt/Projects/mojo",
@@ -135,7 +171,7 @@ class ConversationFileLinkTest {
                         state = RemoteClientState(
                             connection = ConnectionState.Connected,
                             sessions = listOf(session), previewSessionId = session.id,
-                            previewItems = listOf(Item.AgentText("reply", "[$label]($path)", true, 0)),
+                            previewItems = listOf(Item.AgentText("reply", response, true, 0)),
                         ),
                         session = session,
                         onBack = { leaveConversation++ }, onRefresh = {},

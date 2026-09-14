@@ -6,6 +6,9 @@ import kotlinx.serialization.json.Json
 internal sealed interface AssistantPart {
     data class Markdown(val text: String) : AssistantPart
     data class Followup(val label: String, val prompt: String) : AssistantPart
+    data class FileCitation(val path: String) : AssistantPart {
+        val label: String get() = path.substringAfterLast('/')
+    }
 }
 
 internal val LocalAssistantFollowup = staticCompositionLocalOf<((String) -> Unit)?> { null }
@@ -44,13 +47,16 @@ internal fun assistantParts(text: String): List<AssistantPart> {
         }
     }
     flush()
-    return result
+    return result.flatMap { part ->
+        if (part is AssistantPart.Markdown) assistantFileParts(part.text) else listOf(part)
+    }
 }
 
-internal fun assistantFollowupPlain(text: String): String = assistantParts(text).joinToString("\n") {
+internal fun assistantFollowupPlain(text: String): String = assistantParts(text).joinToString("") {
     when (it) {
         is AssistantPart.Markdown -> it.text
-        is AssistantPart.Followup -> "${it.label}\n${it.prompt}"
+        is AssistantPart.Followup -> "\n${it.label}\n${it.prompt}\n"
+        is AssistantPart.FileCitation -> it.path
     }
 }
 

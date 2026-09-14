@@ -13,6 +13,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
@@ -76,10 +77,15 @@ internal fun AssistantMarkdown(text: String) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     val parts = remember(content.body) { assistantParts(content.body) }
     val onFollowup = LocalAssistantFollowup.current
+    val uriHandler = LocalUriHandler.current
     Column {
         parts.forEach { part ->
             when (part) {
                 is AssistantPart.Markdown -> if (part.text.isNotBlank()) ConversationMarkdown(part.text)
+                is AssistantPart.FileCitation -> OutlinedButton(
+                    onClick = { uriHandler.openUri(part.path) },
+                    modifier = Modifier.padding(vertical = 4.dp),
+                ) { Text(part.label) }
                 is AssistantPart.Followup -> if (onFollowup != null) {
                     OutlinedButton(onClick = { onFollowup(part.prompt) }, modifier = Modifier.padding(vertical = 4.dp)) {
                         Text(part.label)
