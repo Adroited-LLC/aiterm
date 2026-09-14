@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -18,8 +19,8 @@ import androidx.compose.ui.unit.dp
 
 internal data class MemoryReference(val source: String, val note: String)
 internal data class AssistantContent(val body: String, val references: List<MemoryReference>) {
-    fun copyText(): String = if (references.isEmpty()) body else buildString {
-        append(body.trimEnd())
+    fun copyText(): String = if (references.isEmpty()) assistantFollowupPlain(body) else buildString {
+        append(assistantFollowupPlain(body).trimEnd())
         if (isNotEmpty()) append("\n\n")
         append("Memory references:\n")
         append(references.joinToString("\n") { "${it.source} — ${it.note}" })
@@ -73,8 +74,22 @@ internal fun AssistantMarkdown(text: String) {
     }
     val content = remember(text) { assistantContent(text) }
     var expanded by rememberSaveable { mutableStateOf(false) }
+    val parts = remember(content.body) { assistantParts(content.body) }
+    val onFollowup = LocalAssistantFollowup.current
     Column {
-        if (content.body.isNotBlank()) ConversationMarkdown(content.body)
+        parts.forEach { part ->
+            when (part) {
+                is AssistantPart.Markdown -> if (part.text.isNotBlank()) ConversationMarkdown(part.text)
+                is AssistantPart.Followup -> if (onFollowup != null) {
+                    OutlinedButton(onClick = { onFollowup(part.prompt) }, modifier = Modifier.padding(vertical = 4.dp)) {
+                        Text(part.label)
+                    }
+                } else {
+                    Text(part.label, style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp))
+                    Text(part.prompt, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
         if (content.references.isNotEmpty()) {
             Text(
                 "Memory references · ${content.references.size} ${if (expanded) "⌃" else "⌄"}",

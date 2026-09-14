@@ -1314,6 +1314,13 @@ internal fun RemoteConversationContent(
         }
     }
 
+    androidx.compose.runtime.CompositionLocalProvider(LocalAssistantFollowup provides { prompt ->
+        draft = draftWithFollowup(draft, prompt)
+        scope.launch {
+            composerFocus.requestFocus()
+            keyboard?.show()
+        }
+    }) {
     ConversationLinkHandler(
         onOpenFile = { path ->
             scope.launch {
@@ -1804,6 +1811,7 @@ internal fun RemoteConversationContent(
             },
             onSendAgain = ::sendAgain,
         )
+    }
     }
 }
 
