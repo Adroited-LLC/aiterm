@@ -348,7 +348,13 @@ fn assistant_line(v: &serde_json::Value, uuid: &str, ts: u64, out: &mut Vec<(u64
                         tool: name.to_string(),
                         title: clip(&title(name, input), TITLE_CAP),
                         category: category(name),
-                        input: clip(&crate::detail::tool_input_summary(input), INPUT_CAP),
+                        input: super::question_input(
+                            name,
+                            &input.map(ToString::to_string).unwrap_or_default(),
+                        )
+                        .unwrap_or_else(|| {
+                            clip(&crate::detail::tool_input_summary(input), INPUT_CAP)
+                        }),
                         // Not `Pending`: the record is written ~15 ms before
                         // the tool runs, and unless a permission prompt
                         // intervenes it runs at once. A prompt is reported on

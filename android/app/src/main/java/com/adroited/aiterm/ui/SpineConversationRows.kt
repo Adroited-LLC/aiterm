@@ -106,7 +106,7 @@ internal fun spineTimeline(items: List<Item>): List<SpineTimelineItem> {
         activity.clear()
     }
     normalizeExternalTools(items).forEach { item ->
-        if (item is Item.Tool || (item is Item.AgentText && parseSubagentMessage(item.text) != null)) {
+        if ((item is Item.Tool && !isQuestionTool(item.tool)) || (item is Item.AgentText && parseSubagentMessage(item.text) != null)) {
             activity += item
         } else {
             flushActivity()
@@ -131,7 +131,7 @@ private fun SpineItemRow(item: Item, onLongPress: () -> Unit) {
         is Item.User -> SpineUserBubble(item, onLongPress)
         is Item.AgentText -> SpineAgentBlock(item, onLongPress)
         is Item.Thought -> SpineThoughtBlock(item, onLongPress)
-        is Item.Tool -> SpineToolCard(item)
+        is Item.Tool -> if (isQuestionTool(item.tool)) AgentQuestionsCard(item) else SpineToolCard(item)
         is Item.TurnEnd -> HorizontalDivider(
             Modifier.padding(vertical = 4.dp),
             color = MaterialTheme.colorScheme.outline.copy(

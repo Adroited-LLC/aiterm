@@ -148,6 +148,20 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Questions must retain their structured choices instead of a short tool summary.
+pub(crate) fn is_question_tool(name: &str) -> bool {
+    let name = name.rsplit(['.', ':']).next().unwrap_or(name);
+    let name = name.rsplit("__").next().unwrap_or(name);
+    matches!(
+        name,
+        "request_user_input" | "request_user_input_async" | "AskUserQuestion"
+    )
+}
+
+pub(crate) fn question_input(name: &str, input: &str) -> Option<String> {
+    is_question_tool(name).then(|| clip(input, 64 * 1024))
+}
+
 /// Clip text for the wire: tool inputs and outputs can be megabytes and
 /// none of it needs to cross to a phone whole.
 pub fn clip(s: &str, max: usize) -> String {
@@ -162,6 +176,23 @@ pub fn clip(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_payloads_are_bounded_and_other_tools_are_unchanged() {
+        assert!(question_input("exec_command", "{} ").is_none());
+        assert_eq!(
+            question_input("functions.request_user_input", "{}"),
+            Some("{}".into())
+        );
+        assert_eq!(question_input("AskUserQuestion", "{}"), Some("{}".into()));
+        assert_eq!(
+            question_input("request_user_input_async", &"x".repeat(70_000))
+                .unwrap()
+                .chars()
+                .count(),
+            64 * 1024 + 1
+        );
+    }
 
     #[test]
     fn the_wire_shape_is_flat_with_a_kind_tag() {

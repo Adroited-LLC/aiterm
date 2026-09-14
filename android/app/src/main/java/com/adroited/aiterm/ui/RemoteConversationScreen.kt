@@ -180,10 +180,11 @@ fun RemoteDesktopScreen(
     val selected = selectedSessionId?.let { id -> state.sessions.firstOrNull { it.id == id } }
     val terminalScope = rememberCoroutineScope()
     var terminalOpening by remember { mutableStateOf(false) }
+    var terminalQuestionControls by remember { mutableStateOf(false) }
     var terminalError by remember { mutableStateOf<String?>(null) }
     var terminalOpenJob by remember { mutableStateOf<Job?>(null) }
 
-    fun openTerminal(sessionId: String?, projectPath: String? = null, conversation: Boolean = false) {
+    fun openTerminal(sessionId: String?, projectPath: String? = null, conversation: Boolean = false, questions: Boolean = false) {
         if (terminalOpening) return
         terminalOpening = true
         terminalOpenJob = terminalScope.launch {
@@ -191,6 +192,7 @@ fun RemoteDesktopScreen(
                 viewModel.openTerminal(sessionId, projectPath).fold(
                     onSuccess = {
                         selectedSessionId = sessionId
+                        terminalQuestionControls = questions
                         if (conversation && sessionId != null) {
                             viewModel.previewSession(sessionId)
                             page = PAGE_CONVERSATION
@@ -244,6 +246,7 @@ fun RemoteDesktopScreen(
 
         PAGE_TERMINAL -> RemoteTerminalScreen(
             viewModel = viewModel,
+            showQuestionControls = terminalQuestionControls,
             onSelectSession = { openTerminal(it.id) },
             onBack = {
                 selectedSessionId?.let(viewModel::previewSession)
@@ -268,6 +271,7 @@ fun RemoteDesktopScreen(
                     onStar = viewModel.client::starSession,
                     onOpen = { viewModel.openSession(it, 80, 24) },
                     onOpenTerminal = { openTerminal(selected.id) },
+                    onAnswerQuestions = { openTerminal(selected.id, questions = true) },
                     onStop = viewModel::stopSession,
                     onLoadFiles = viewModel::sessionChanges,
                     onLoadFile = viewModel::sessionFilePreview,
@@ -1064,6 +1068,7 @@ internal fun RemoteConversationContent(
     onSelectSession: (RemoteSession) -> Unit,
     onQuickInput: (String, String) -> Unit,
     conversationDraftStore: ConversationDraftStore? = null,
+    onAnswerQuestions: () -> Unit = onOpenTerminal,
     onHidePending: (String) -> Unit = {},
 ) {
     var pullRefreshing by remember(session.id) { mutableStateOf(false) }
@@ -1314,7 +1319,9 @@ internal fun RemoteConversationContent(
         }
     }
 
-    androidx.compose.runtime.CompositionLocalProvider(LocalAssistantFollowup provides { prompt ->
+    androidx.compose.runtime.CompositionLocalProvider(
+        LocalQuestionAction provides onAnswerQuestions.takeIf { live && state.connection == ConnectionState.Connected },
+        LocalAssistantFollowup provides { prompt ->
         draft = draftWithFollowup(draft, prompt)
         scope.launch {
             composerFocus.requestFocus()
@@ -1479,6 +1486,13 @@ internal fun RemoteConversationContent(
                             enabled = state.connection == ConnectionState.Connected && !sending && !attachments.preparing,
                             onClick = { showActions = false; onOpenTerminal() },
                         )
+                        if (live && session.agent in setOf("codex", "claude")) {
+                            DropdownMenuItem(
+                                text = { Text("Answer questions") },
+                                enabled = state.connection == ConnectionState.Connected && !sending,
+                                onClick = { showActions = false; onAnswerQuestions() },
+                            )
+                        }
                         DropdownMenuItem(
                             text = { Text("Bring in a second agent") },
                             onClick = { showActions = false; showBringIn = true },

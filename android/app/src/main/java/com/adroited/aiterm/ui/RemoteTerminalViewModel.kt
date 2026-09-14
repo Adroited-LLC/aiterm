@@ -134,12 +134,12 @@ class RemoteTerminalViewModel(
 
     fun selectTab(tabId: String) = client.selectTab(tabId)
     fun sendInput(text: String) = client.sendInput(text)
-    suspend fun submitInputs(tabId: String, texts: List<String>): Boolean {
+    suspend fun submitInputs(tabId: String, texts: List<String>, rawTerminal: Boolean = false): Boolean {
         val state = client.state.value
         val sessionId = state.tabs.firstOrNull { it.id == tabId }?.sessionId
             ?.takeIf { id -> state.sessions.any { it.id == id } }
         return try {
-            if (sessionId != null && texts.size == 2 && texts.last() == "\r") {
+            if (!rawTerminal && sessionId != null && texts.size == 2 && texts.last() == "\r") {
                 client.submitConversationInputs(sessionId, tabId, texts)
             } else {
                 client.submitInputs(tabId, texts)

@@ -365,7 +365,8 @@ impl CodexAdapter {
                 // whole script, and the verb is at the top of it.
                 title: clip(detail.lines().next().unwrap_or(&detail), TITLE_CAP),
                 category,
-                input: clip(&detail, INPUT_CAP),
+                input: super::question_input(name, &input)
+                    .unwrap_or_else(|| clip(&detail, INPUT_CAP)),
                 // Not `Pending`: codex writes the record as it dispatches.
                 // Dispatch is not evidence of waiting on a person. Codex
                 // rollouts without explicit permission records stay working;
@@ -1140,6 +1141,24 @@ mod tests {
             ],
             "the patch's own answer is an empty object — the files come from patch_apply_end"
         );
+    }
+
+    #[test]
+    fn questions_keep_every_choice_beyond_the_tool_summary_limit() {
+        let input = serde_json::json!({"questions": (0..6).map(|i| serde_json::json!({
+            "title": format!("Question {i}: {}", "detail ".repeat(90)),
+            "options": ["First choice", "Second choice"]
+        })).collect::<Vec<_>>()})
+        .to_string();
+        let record = serde_json::json!({"type":"response_item", "payload":{
+            "type":"function_call", "call_id":"questions", "name":"request_user_input_async", "arguments":input
+        }}).to_string();
+        let out = kinds(&[&record]);
+        let Kind::ToolCall { input: actual, .. } = &out[0] else {
+            panic!("missing questions")
+        };
+        assert_eq!(actual, &input);
+        assert!(actual.len() > INPUT_CAP);
     }
 
     #[test]

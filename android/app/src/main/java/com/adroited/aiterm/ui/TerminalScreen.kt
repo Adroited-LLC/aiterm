@@ -119,6 +119,7 @@ fun RemoteTerminalScreen(
     viewModel: RemoteTerminalViewModel,
     onBack: () -> Unit,
     onSelectSession: (com.adroited.aiterm.remote.RemoteSession) -> Unit = {},
+    showQuestionControls: Boolean = false,
 ) {
     val state by viewModel.client.state.collectAsStateWithLifecycle()
     val screen by viewModel.client.screen.collectAsStateWithLifecycle()
@@ -129,9 +130,10 @@ fun RemoteTerminalScreen(
         scrollback = scrollback,
         onBack = onBack,
         onSelectSession = onSelectSession,
+        showQuestionControls = showQuestionControls,
         onReconnect = viewModel::reconnect,
         onInput = viewModel::sendInput,
-        onInputBatch = viewModel::submitInputs,
+        onInputBatch = { tabId, texts -> viewModel.submitInputs(tabId, texts, rawTerminal = showQuestionControls) },
         draftStore = viewModel.terminalDrafts,
         onUploadImages = viewModel::uploadDraftImages,
         onTakeFocus = viewModel::takeFocus,
@@ -149,6 +151,7 @@ internal fun TerminalScreenContent(
     scrollback: List<ScreenRow> = emptyList(),
     onBack: () -> Unit = {},
     onSelectSession: (com.adroited.aiterm.remote.RemoteSession) -> Unit = {},
+    showQuestionControls: Boolean = false,
     onReconnect: () -> Unit = {},
     onInput: (String) -> Unit = {},
     onInputBatch: (suspend (String, List<String>) -> Boolean)? = null,
@@ -195,6 +198,7 @@ internal fun TerminalScreenContent(
     }
     var showImageSources by remember { mutableStateOf(false) }
     var showDiscardDrafts by remember { mutableStateOf(false) }
+    var questionControls by remember(screen?.tabId, showQuestionControls) { mutableStateOf(showQuestionControls) }
     var chromeInteractiveHeightPx by remember(screen?.tabId) { mutableIntStateOf(0) }
     val bottomInsets = imeInsets.union(navigationInsets)
     val onViewportSizeChanged = remember {
@@ -455,6 +459,22 @@ internal fun TerminalScreenContent(
                                 .testTag("terminal-composer-overlay")
                                 .padding(horizontal = 10.dp, vertical = 8.dp),
                         ) {
+                            if (questionControls) {
+                                val sessionId = state.tabs.firstOrNull { it.id == screen.tabId }?.sessionId
+                                val codex = state.sessions.firstOrNull { it.id == sessionId }?.agent == "codex"
+                                QuestionTerminalControls(
+                                    enabled = state.connection == ConnectionState.Connected && state.focus == FocusOwner.Self && !attachments.submitting,
+                                    codex = codex,
+                                    applicationCursor = screen.modes.applicationCursor,
+                                    onClose = { questionControls = false },
+                                    onKey = { key ->
+                                        coroutineScope.launch {
+                                            val accepted = onInputBatch?.invoke(screen.tabId, listOf(key)) ?: false
+                                            if (!accepted) setAttachmentMessage(screen.tabId, "Question input was not accepted. Take focus and try again.")
+                                        }
+                                    },
+                                )
+                            }
                             TerminalAttachmentStrip(
                                 draft = attachments,
                                 onRemove = { imageId ->
