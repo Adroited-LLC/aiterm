@@ -2558,6 +2558,11 @@ export default function App() {
       )}
       <div className="topbar">
         <div className="topbar-left">
+          {!settings.showSessionTabs && (
+            <button className={"icon-btn" + (onHome ? " on" : "")} title="Home — start a session" onClick={goHome}>
+              <Icon of={Home} />
+            </button>
+          )}
           <button
             className={"icon-btn" + (showSessions ? " on" : "")}
             title="Toggle sessions panel"
@@ -2687,7 +2692,7 @@ export default function App() {
             <strong>Drop files to attach</strong>
             <span>Add them to the current terminal prompt</span>
           </div>}
-          {(tabs.length > 0 || previewSession || fileTabs.some(showsFile)) && (
+          {settings.showSessionTabs && (tabs.length > 0 || previewSession || fileTabs.some(showsFile)) && (
             <div className="center-tabs">
               {/* Leftmost, always: the way back to the start view — or the
                   preview that stands in for it — so a file or a session is

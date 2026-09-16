@@ -53,6 +53,7 @@ const PANEL_LABELS: { key: keyof PanelScales; label: string }[] = [
 ];
 
 export type SettingsTab =
+  | "general"
   | "updates"
   | "appearance"
   | "windows"
@@ -66,6 +67,7 @@ export type SettingsTab =
 type Tab = SettingsTab;
 
 const NAV: { key: Tab; label: string }[] = [
+  { key: "general", label: "General" },
   { key: "updates", label: "App updates" },
   { key: "appearance", label: "Appearance" },
   { key: "fonts", label: "Fonts" },
@@ -131,7 +133,7 @@ const SIZE_KEY = "aiterm.settingsModalSize";
 export default function SettingsModal({
   settings, onChange, onClose, capsOf, activeProject, initialTab, focusProvider, librarian,
 }: Props) {
-  const [tab, setTab] = useState<Tab>(initialTab ?? "appearance");
+  const [tab, setTab] = useState<Tab>(initialTab ?? "general");
   // Resizable via the CSS corner grip; the size carries over to the next
   // open. Written straight to el.style rather than through React state so a
   // re-render can never fight the browser over the size mid-drag. The CSS
@@ -331,6 +333,14 @@ export default function SettingsModal({
               <Row label="Home folder" desc={getWorkspace()?.home}><button className="set-action" onClick={() => void openPath(getWorkspace()!.home)}>Open in Explorer</button></Row>
               <div className="sgroup-foot">Your sessions, agents, Git repositories, and tools run inside Linux. Appearance and window preferences belong to this Windows app.</div>
             </Group>}
+
+            {tab === "general" && (
+              <Group title="Navigation">
+                <Row label="Show session tab bar" desc="Display open sessions across the top of the workspace. You can also switch sessions from the sidebar.">
+                  <Switch checked={settings.showSessionTabs} onChange={(on) => set({ showSessionTabs: on })} label="Show session tab bar" />
+                </Row>
+              </Group>
+            )}
 
             {tab === "appearance" && <>
               <Group title="Theme">
