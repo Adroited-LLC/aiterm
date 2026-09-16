@@ -41,6 +41,7 @@ pub mod tray;
 pub mod usage;
 pub mod watcher;
 pub mod winstate;
+mod window_appearance;
 
 /// Run a blocking body on the async runtime's blocking pool. Tauri executes
 /// non-async commands on the GTK main thread, where every millisecond is a
@@ -53,9 +54,11 @@ pub async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'sta
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let window_appearance = window_appearance::WindowAppearance::initialize();
     let graphics = linux_graphics::GraphicsState::initialize();
     trace::init();
-    let pty = pty::PtyManager::with_injected_explicit_sync_workaround(graphics.injected);
+    let pty = pty::PtyManager::with_injected_explicit_sync_workaround(graphics.injected)
+        .with_injected_titlebar_preference(window_appearance.injected);
     let tabs = std::sync::Arc::new(tabs::TabRegistry::new(pty.clone()));
     // The spine's epoch is set the moment this is built: a phone that sees a
     // new one knows the desktop restarted and its seq numbers started over.
@@ -67,6 +70,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(graphics)
+        .manage(window_appearance)
         .manage(pty)
         .manage(tabs.clone())
         .manage(spine)
@@ -81,6 +85,8 @@ pub fn run() {
         // In release `log_invokes` is the identity function and the generated
         // handler is passed straight through — see `trace.rs`.
         .invoke_handler(trace::log_invokes(tauri::generate_handler![
+            window_appearance::window_appearance_settings,
+            window_appearance::window_appearance_settings_set,
             app_updates::app_update_settings,
             app_updates::app_update_connect,
             app_updates::app_update_check,

@@ -10,6 +10,7 @@ import { X } from "lucide-react";
 import AgentIcon from "./AgentIcon";
 import RendererLab from "./RendererLab";
 import GraphicsCompatibility from "./GraphicsCompatibility";
+import WindowAppearance from "./WindowAppearance";
 import Row from "./SettingsRow";
 import RemoteAccessSettings from "./RemoteAccessSettings";
 import LibrarianPane from "./LibrarianPane";
@@ -334,13 +335,14 @@ export default function SettingsModal({
               <div className="sgroup-foot">Your sessions, agents, Git repositories, and tools run inside Linux. Appearance and window preferences belong to this Windows app.</div>
             </Group>}
 
-            {tab === "general" && (
+            {tab === "general" && (<>
               <Group title="Navigation">
                 <Row label="Show session tab bar" desc="Display open sessions across the top of the workspace. You can also switch sessions from the sidebar.">
                   <Switch checked={settings.showSessionTabs} onChange={(on) => set({ showSessionTabs: on })} label="Show session tab bar" />
                 </Row>
               </Group>
-            )}
+              {!windowsWsl && <WindowAppearance />}
+            </>)}
 
             {tab === "appearance" && <>
               <Group title="Theme">
