@@ -341,7 +341,7 @@ export default function SettingsModal({
                   <Switch checked={settings.showSessionTabs} onChange={(on) => set({ showSessionTabs: on })} label="Show session tab bar" />
                 </Row>
               </Group>
-              {!windowsWsl && <WindowAppearance />}
+              <WindowAppearance shown={settings.showTitleBar} onChange={showTitleBar => set({ showTitleBar })} />
             </>)}
 
             {tab === "appearance" && <>

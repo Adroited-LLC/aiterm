@@ -91,7 +91,6 @@ pub struct PtyManager {
     ptys: PtyTable<PtyInstance>,
     next_id: Arc<AtomicU32>,
     injected_nv_explicit_sync: bool,
-    injected_gtk_csd: bool,
 }
 
 /// Receives the lifetime of one spawned PTY.
@@ -215,15 +214,7 @@ impl PtyManager {
             ..Self::default()
         }
     }
-    pub(crate) fn with_injected_titlebar_preference(mut self, injected: bool) -> Self {
-        self.injected_gtk_csd = injected;
-        self
-    }
     fn scrub_graphics_workaround(&self, cmd: &mut CommandBuilder) {
-        // AiTerm's title bar choice must not change GUI apps launched in a terminal.
-        if self.injected_gtk_csd {
-            cmd.env_remove("GTK_CSD");
-        }
         if self.injected_nv_explicit_sync {
             // Strip only our injected workaround; preserve a user-provided override.
             cmd.env_remove("__NV_DISABLE_EXPLICIT_SYNC");
@@ -591,20 +582,6 @@ pub fn kill_tree(root: u32, grace: std::time::Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn titlebar_preference_does_not_leak_into_terminal_apps() {
-        for injected in [true, false] {
-            let manager = PtyManager::default().with_injected_titlebar_preference(injected);
-            let mut command = CommandBuilder::new("/bin/sh");
-            command.env("GTK_CSD", "0");
-            manager.clone().scrub_graphics_workaround(&mut command);
-            assert_eq!(
-                command.get_env("GTK_CSD"),
-                if injected { None } else { Some(std::ffi::OsStr::new("0")) }
-            );
-        }
-    }
-
     #[test]
     fn graphics_workaround_is_removed_only_when_injected_by_aiterm() {
         for (injected, value) in [(true, "1"), (false, "1"), (false, "0")] {

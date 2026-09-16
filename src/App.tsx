@@ -538,6 +538,21 @@ export default function App() {
     saveSettings(settings);
   }, [settings]);
   useEffect(() => {
+    let current = true;
+    const shown = settings.showTitleBar;
+    void getCurrentWindow().setDecorations(shown).catch(reason => {
+      if (!current) return;
+      setNotice(`Could not change the title bar: ${String(reason)}`);
+      // Keep the switch honest if the window manager rejects the change.
+      void getCurrentWindow().isDecorated().then(actual => {
+        if (current && actual !== shown) {
+          setSettings(value => ({ ...value, showTitleBar: actual }));
+        }
+      }).catch(() => {});
+    });
+    return () => { current = false; };
+  }, [settings.showTitleBar]);
+  useEffect(() => {
     if (!showSettingsModal) return;
     const h = (e: KeyboardEvent) => e.key === "Escape" && closeSettings();
     window.addEventListener("keydown", h, true);
@@ -2556,7 +2571,7 @@ export default function App() {
           {notice}
         </div>
       )}
-      <div className="topbar">
+      <div className="topbar" data-tauri-drag-region>
         <div className="topbar-left">
           {!settings.showSessionTabs && (
             <button className={"icon-btn" + (onHome ? " on" : "")} title="Home — start a session" onClick={goHome}>
@@ -2597,7 +2612,7 @@ export default function App() {
           ><Icon of={Paperclip} /></button>
           <UsagePanel sources={usageSources} onRefresh={readUsage} refreshing={usageBusy} />
         </div>
-        <div className="topbar-spacer" />
+        <div className="topbar-spacer" data-tauri-drag-region />
         <div className="topbar-right">
           <button className="icon-btn" title="Connect to another desktop" aria-label="Connected desktops" onClick={() => setShowDesktopConnections(true)}><Icon of={Monitor} /></button>
           <Clock />

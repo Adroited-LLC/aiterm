@@ -71,6 +71,8 @@ export interface AppSettings {
   themeId: string;
   /** Show the top strip of open sessions. */
   showSessionTabs: boolean;
+  /** Show the native Tauri window title bar and controls. */
+  showTitleBar: boolean;
   /** Rest the pointer on a session row and a card opens beside it with the
    *  session's summary, files and tasks. Off, the list is just a list. */
   sessionHover: boolean;
@@ -117,6 +119,7 @@ export interface AppSettings {
 export const DEFAULT_SETTINGS: AppSettings = {
   themeId: "warp-dark",
   showSessionTabs: true,
+  showTitleBar: true,
   sessionHover: true,
   accent: null,
   uiFont: "",
