@@ -8,6 +8,7 @@ import { classHighlighter } from "@lezer/highlight";
 import { languages } from "@codemirror/language-data";
 import { homeAbbrev, openPath, readTextFile, renderMarkdown, writeTextFile } from "../ipc";
 import { convertFileSrc } from "../platform";
+import { htmlPreviewSrc } from "../htmlPreviewSrc";
 import Icon from "./Icon";
 import { Code, Eye } from "lucide-react";
 
@@ -387,7 +388,7 @@ export default function FileView({
               className="page-preview"
               title={homeAbbrev(path)}
               sandbox="allow-scripts"
-              src={convertFileSrc(path) + "?v=" + pageNonce}
+              src={htmlPreviewSrc(convertFileSrc(path)) + "?v=" + pageNonce}
             />
           ) : (
             previewErr ? <div className="empty-note">Can't render Markdown: {previewErr}</div> :
