@@ -81,9 +81,7 @@ const HOOK_EVENTS: [&str; 7] = [
 /// should not wait on us for it.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
-/// How long the phase drain waits before looking anyway. The inotify watch
-/// is what actually delivers — this is only there for the case where the
-/// watch could not be armed at all.
+/// Periodic recovery if the watcher cannot be armed or misses an event.
 const DRAIN_FALLBACK: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn data_dir() -> Option<PathBuf> {
@@ -434,40 +432,59 @@ pub(crate) fn hook_verdict(
     Some((session_id.to_string(), phase))
 }
 
-/// Watch the phase spool and drain it as it fills.
-///
-/// inotify, not a poll: a permission dialog reaching the phone half a second
-/// late is the whole difference this feature is for. The 2 s tick behind it
-/// only matters on a system where the watch could not be armed.
-pub fn start_hook_drain(app: tauri::AppHandle) {
+fn watch_hook_spool(
+    dir: &std::path::Path,
+    tx: tokio::sync::mpsc::Sender<()>,
+) -> notify::Result<notify::RecommendedWatcher> {
     use notify::Watcher;
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let Ok(event) = res else { return };
+        // Enumerating this directory generates Access(Open) on Linux. Waking
+        // on those reads makes the drain repeatedly wake itself, even when the
+        // spool is empty. Deleting consumed files must not wake it either.
+        let published = matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Modify(_)
+                | notify::EventKind::Access(notify::event::AccessKind::Close(
+                    notify::event::AccessMode::Write
+                ))
+        ) && event.paths.iter().any(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        });
+        if published {
+            // A drain reads the whole spool. One pending wake covers a burst;
+            // never accumulate a queue of redundant directory scans.
+            let _ = tx.try_send(());
+        }
+    })?;
+    watcher.watch(dir, notify::RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
+/// Watch the phase spool and drain it as it fills. The two-second fallback
+/// also recovers missed events if a watcher fails or overflows.
+pub fn start_hook_drain(app: tauri::AppHandle) {
     let Some(dir) = hook_spool_dir() else { return };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         crate::diag!("hook", "no phase spool at {}: {e}", dir.display());
         return;
     }
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
     // Kept alive alongside the watcher, so `rx.recv()` pends forever rather
     // than resolving instantly (and spinning the loop) when no watch armed.
     let keepalive = tx.clone();
-    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            let _ = tx.send(());
+    let watcher = match watch_hook_spool(&dir, tx) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            crate::diag!(
+                "hook",
+                "phase spool watch failed, falling back to poll: {e}"
+            );
+            None
         }
-    })
-    .ok()
-    .and_then(
-        |mut w| match w.watch(&dir, notify::RecursiveMode::NonRecursive) {
-            Ok(()) => Some(w),
-            Err(e) => {
-                crate::diag!(
-                    "hook",
-                    "phase spool watch failed, falling back to poll: {e}"
-                );
-                None
-            }
-        },
-    );
+    };
     tauri::async_runtime::spawn(async move {
         let _watcher = watcher;
         let _keepalive = keepalive;
@@ -639,6 +656,81 @@ pub fn drain_session_events(
 mod tests {
     use super::*;
     use crate::spine::registry::HookPhase;
+
+    #[cfg(target_os = "linux")]
+    struct TestSpool(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl TestSpool {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("aiterm-hooks-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestSpool {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Exercise actual inotify events: a fabricated event would miss the fact
+    // that merely enumerating an empty directory reports Access(Open).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hook_watcher_stays_idle_when_the_drain_reads_an_empty_spool() {
+        let spool = TestSpool::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let _watcher = watch_hook_spool(&spool.0, tx).unwrap();
+        for _ in 0..20 {
+            assert_eq!(std::fs::read_dir(&spool.0).unwrap().count(), 0);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "reading an empty spool must not schedule another drain"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hook_watcher_delivers_published_events_but_ignores_consumption() {
+        let spool = TestSpool::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let _watcher = watch_hook_spool(&spool.0, tx).unwrap();
+        let tmp = spool.0.join(".event.tmp");
+        let published = spool.0.join("event.json");
+        for _ in 0..2 {
+            std::fs::write(&tmp, r#"{"hook_event_name":"Stop"}"#).unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err(),
+                "an unpublished temporary file must not wake the drain"
+            );
+            std::fs::rename(&tmp, &published).unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("publishing a hook must wake the drain"),
+                Some(())
+            );
+            assert_eq!(std::fs::read_dir(&spool.0).unwrap().count(), 1);
+            assert!(std::fs::read_to_string(&published)
+                .unwrap()
+                .contains("Stop"));
+            std::fs::remove_file(&published).unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv())
+                    .await
+                    .is_err(),
+                "consuming a hook must not schedule another drain"
+            );
+        }
+    }
 
     /// The spool write and the drain agree on a format; this pins the half a
     /// test can reach without a live pty: parsing and expiry are exercised
