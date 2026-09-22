@@ -10,6 +10,20 @@ use tauri::{AppHandle, Emitter, State};
 #[derive(Default)]
 pub struct WatchState(pub Mutex<Option<RecommendedWatcher>>);
 
+/// Reading a watched directory or file is not a change. Inotify reports
+/// opens too; forwarding them makes our own explorer/session refresh trigger
+/// another refresh indefinitely, even with no writer active.
+fn send_change(
+    tx: &std::sync::mpsc::Sender<notify::Result<notify::Event>>,
+    result: notify::Result<notify::Event>,
+) {
+    if let Ok(event) = result {
+        if event.kind.is_create() || event.kind.is_modify() || event.kind.is_remove() {
+            let _ = tx.send(Ok(event));
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 struct FsChanged {
     git: bool,
@@ -41,7 +55,7 @@ pub async fn watch_project(
     let watcher = crate::run_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
         let mut watcher = notify::recommended_watcher(move |res| {
-            let _ = tx.send(res);
+            send_change(&tx, res);
         })
         .map_err(|e| e.to_string())?;
         watcher
@@ -112,7 +126,7 @@ pub fn watch_claude_projects(app: AppHandle) -> Result<(), String> {
 
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
+        send_change(&tx, res);
     })
     .map_err(|e| e.to_string())?;
     for dir in present {
@@ -139,4 +153,60 @@ pub fn watch_claude_projects(app: AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn refreshing_watched_files_stays_quiet_but_real_edits_are_delivered() {
+        let fixture =
+            Fixture(std::env::temp_dir().join(format!("aiterm-watch-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let path = fixture.0.join("transcript.jsonl");
+        std::fs::write(&path, "original").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |event| send_change(&tx, event)).unwrap();
+        watcher.watch(&fixture.0, RecursiveMode::Recursive).unwrap();
+
+        // Simulate explorer/session refreshes. The old callbacks forwarded
+        // these opens and kicked off another refresh after the debounce.
+        for _ in 0..10 {
+            assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(250)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        std::fs::write(&path, "changed").unwrap();
+        let event = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert!(event.kind.is_modify());
+        assert!(event.paths.contains(&path));
+        while rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
+
+        let renamed = fixture.0.join("renamed.jsonl");
+        std::fs::rename(&path, &renamed).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+        while rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
+        std::fs::remove_file(&renamed).unwrap();
+        assert!(rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .kind
+            .is_remove());
+    }
 }
