@@ -21,6 +21,18 @@ import { spineOverview, type SpineOverview } from "./ipc";
 
 const EVERY_MS = 2000;
 
+function sameOverview(previous: SpineOverview[], next: SpineOverview[]): boolean {
+  return previous.length === next.length && next.every((row, index) => {
+    const old = previous[index];
+    return old.session_id === row.session_id && old.agent === row.agent
+      && old.phase === row.phase && old.detail === row.detail
+      && old.turn_open === row.turn_open && old.turn_started_ts === row.turn_started_ts
+      && old.last_text === row.last_text
+      && old.last_tool?.title === row.last_tool?.title
+      && old.last_tool?.status === row.last_tool?.status;
+  });
+}
+
 export function useSpineOverview(active: boolean): Map<string, SpineOverview> {
   const [rows, setRows] = useState<SpineOverview[]>([]);
 
@@ -29,7 +41,9 @@ export function useSpineOverview(active: boolean): Map<string, SpineOverview> {
     let stopped = false;
     const read = () => {
       spineOverview()
-        .then((r) => { if (!stopped) setRows(r); })
+        .then((r) => {
+          if (!stopped) setRows(previous => sameOverview(previous, r) ? previous : r);
+        })
         // A failed read leaves the last answer standing: the board falls back
         // to the sessions list per row anyway, and blanking it on one missed
         // IPC would flicker the whole page.

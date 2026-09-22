@@ -10,7 +10,7 @@
  * friends already return null for those, and a generic placeholder would only
  * say "we could not identify this" in a spot meant to identify things.
  */
-import { useEffect, useReducer } from "react";
+import { useEffect, useMemo, useReducer } from "react";
 import { hasBrand, loadSvg, preferredVariant, svgFor, type Variant } from "../brand";
 
 export default function BrandIcon({
@@ -28,6 +28,9 @@ export default function BrandIcon({
   const known = hasBrand(n);
   const v: Variant = known ? (variant ?? preferredVariant(n)) : "mono";
   const svg = known ? svgFor(n, v) : undefined;
+  // React compares this prop by identity. A fresh wrapper would assign
+  // innerHTML again on every parent update, replacing an unchanged SVG tree.
+  const markup = useMemo(() => svg !== undefined ? { __html: svg } : undefined, [svg]);
   const [, bump] = useReducer((k: number) => k + 1, 0);
   useEffect(() => {
     if (!known || svg !== undefined) return;
@@ -42,7 +45,7 @@ export default function BrandIcon({
       style={{ fontSize: size }}
       title={title}
       aria-hidden={title ? undefined : true}
-      dangerouslySetInnerHTML={svg !== undefined ? { __html: svg } : undefined}
+      dangerouslySetInnerHTML={markup}
     />
   );
 }
