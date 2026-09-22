@@ -15,9 +15,9 @@ import { brandForAgent } from "../brand";
 import Icon from "./Icon";
 import { Plug, SquareTerminal } from "lucide-react";
 
-export default function AgentIcon({ agent, size = 16 }: { agent: string; size?: number }) {
+export default function AgentIcon({ agent, size = 16, mono = false }: { agent: string; size?: number; mono?: boolean }) {
   const brand = brandForAgent(agent);
-  if (brand) return <BrandIcon name={brand} size={size} className={`agent-icon ${agent}`} />;
+  if (brand) return <BrandIcon name={brand} size={size} variant={mono ? "mono" : undefined} className={`agent-icon ${agent}`} />;
 
   if (agent === "api") {
     // A socket: an endpoint you plug a key into, deliberately unlike any

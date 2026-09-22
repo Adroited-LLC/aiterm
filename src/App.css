@@ -770,8 +770,22 @@ body.dragging * { pointer-events: none; }
    window. Working/attention indicators carry the changing status. */
 .session-item.live .session-title { color: var(--text); }
 .session-item.live .agent-badge {
-  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--green, #3fb950) 55%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--brand, var(--green)) 35%, transparent);
 }
+.agent-badge { --working-color: #91caff; }
+.agent-badge[data-agent="codex"], .agent-badge[data-agent="openai"] { --working-color: #a3ffb4; }
+.agent-badge[data-agent="claude"] { --working-color: #ffc18a; }
+.agent-badge[data-agent="grok"] { --working-color: #e3b1ff; }
+.agent-badge[data-agent="opencode"] { --working-color: #8cf2ef; }
+.agent-badge[data-agent="gemini"], .agent-badge[data-agent="antigravity"] { --working-color: #a6c4ff; }
+.session-item.working .agent-badge {
+  color: var(--working-color);
+  background: color-mix(in srgb, var(--working-color) 20%, var(--bg-raised));
+  border-color: var(--working-color);
+  box-shadow: 0 0 0 1px var(--working-color);
+}
+.session-item.working .agent-badge .agent-icon { color: var(--working-color); }
+.session-item.working .badge-dot { background: var(--working-color); }
 .session-item.dragging { opacity: 0.45; }
 
 /* Single/ctrl-click selection — stronger than the project-wide .active tint. */

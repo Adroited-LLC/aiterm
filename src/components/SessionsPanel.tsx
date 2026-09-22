@@ -15,6 +15,7 @@ import { agentTint } from "../brand";
 import { TermProgress } from "./TerminalView";
 import { stableOrder } from "../order";
 import { followRekey } from "../selection";
+import { useWorkingSessions } from "../useWorkingSessions";
 
 import { fmtTimeShort, fullTime, useTimeFormat } from "../timefmt";
 
@@ -199,6 +200,7 @@ export default function SessionsPanel({
   trashed, onRestore, onTrashDelete, onTrashEmpty, onTrashSessions,
   hoverSummary = true,
 }: Props) {
+  const workingSessions = useWorkingSessions(runningSlots.size > 0 || liveSessions.size > 0);
   const [query, setQuery] = useState("");
   const [showNewSession, setShowNewSession] = useState(false);
   /** Brought-in session → the master it joined, from the same lineage store
@@ -868,6 +870,7 @@ export default function SessionsPanel({
       (!capsOf(s.agent).roster_liveness && runningSlots.has(s.id));
     const hasAttn =
       attentionSlots.has(s.id) || attentionSlots.has(`shell:${s.project_path}`);
+    const isWorking = isRunning && !hasAttn && workingSessions.has(s.id);
     // Same two slot keys the badge is looked up under, so the sentence and the
     // dot can never disagree about which row is asking.
     const notice = attentionText.get(s.id) ?? attentionText.get(`shell:${s.project_path}`);
@@ -910,6 +913,7 @@ export default function SessionsPanel({
           // via ctrl/shift-click (builds the `selected` set below).
           (isShowing ? " active" : "") +
           (isRunning ? " live" : "") +
+          (isWorking ? " working" : "") +
           (selected.has(s.id) ? " selected" : "") +
           (isShowing ? " showing" : "") +
           (isDragging ? " dragging" : "") +
@@ -938,15 +942,17 @@ export default function SessionsPanel({
         <div
           className={"agent-badge" + (s.agent === "claude" ? " claude" : "") + agentTint(s.agent).className}
           style={agentTint(s.agent).style}
+          data-agent={s.agent}
+          title={isWorking ? "Working" : undefined}
         >
-          <AgentIcon agent={s.agent} />
+          <AgentIcon agent={s.agent} mono={isWorking} />
           {/* Green: the session is running. Whether aiterm also has a tab for
               it is still tracked (`hasTab`, for the row's actions) but no
               longer drawn — the row already says so by other means. */}
           {(isRunning || hasAttn) && (
             <span
               className={"live-dot badge-dot" + (hasAttn ? " attn" : "")}
-              title={hasAttn ? notice ?? "Waiting for your input" : "Session is running"}
+              title={hasAttn ? notice ?? "Waiting for your input" : isWorking ? "Working" : "Session is open"}
             />
           )}
         </div>
